@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::server::run::engine::RunStartContext;
 use crate::server::tool_transport::{
-    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
+    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
     ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
     binding_event_fields,
 };
@@ -86,7 +86,6 @@ pub(crate) fn execution_bindings_from_edge_profile(
             cwd: Some(cwd),
             authority: edge_profile_workspace_authority(edge_profile)
                 .unwrap_or(WorkspaceAuthority::ReadWrite),
-            fallback_policy: FallbackPolicy::Disabled,
         }
     } else {
         WorkspaceBinding {
@@ -94,7 +93,6 @@ pub(crate) fn execution_bindings_from_edge_profile(
             display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
-            fallback_policy: FallbackPolicy::Disabled,
         }
     };
     let executor = match workspace.kind {
@@ -139,7 +137,6 @@ pub(crate) struct RunExecutionBindingSnapshot {
     pub workspace: Option<Value>,
     pub executor: Option<Value>,
     pub transport: Option<String>,
-    pub fallback_policy: Option<String>,
 }
 
 pub(crate) fn agent_working_dir_for_bindings(
@@ -295,9 +292,6 @@ fn workspace_binding_from_request(
             if let Some(authority) = binding.authority {
                 workspace.authority = workspace_authority_from_request(authority);
             }
-            if let Some(fallback_policy) = binding.fallback_policy {
-                workspace.fallback_policy = fallback_policy_from_request(fallback_policy);
-            }
             Some(workspace)
         }
         astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace => {
@@ -310,10 +304,6 @@ fn workspace_binding_from_request(
                     .authority
                     .map(workspace_authority_from_request)
                     .unwrap_or(WorkspaceAuthority::ReadWrite),
-                fallback_policy: binding
-                    .fallback_policy
-                    .map(fallback_policy_from_request)
-                    .unwrap_or(FallbackPolicy::Disabled),
             })
         }
         astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace => {
@@ -326,19 +316,12 @@ fn workspace_binding_from_request(
                     .authority
                     .map(workspace_authority_from_request)
                     .unwrap_or_else(|| cloud_workspace_default_authority(binding)),
-                fallback_policy: binding
-                    .fallback_policy
-                    .map(fallback_policy_from_request)
-                    .unwrap_or(FallbackPolicy::Disabled),
             })
         }
         astra_services::runs::WorkspaceBindingRequestKind::None => {
             let mut workspace = WorkspaceBinding::none();
             if let Some(display_name) = non_empty_string(binding.display_name.as_deref()) {
                 workspace.display_name = display_name;
-            }
-            if let Some(fallback_policy) = binding.fallback_policy {
-                workspace.fallback_policy = fallback_policy_from_request(fallback_policy);
             }
             Some(workspace)
         }
@@ -501,14 +484,6 @@ fn workspace_authority_from_request(
     }
 }
 
-fn fallback_policy_from_request(
-    fallback_policy: astra_services::runs::FallbackPolicyRequest,
-) -> FallbackPolicy {
-    match fallback_policy {
-        astra_services::runs::FallbackPolicyRequest::Disabled => FallbackPolicy::Disabled,
-    }
-}
-
 fn tool_transport_from_request(
     transport: astra_services::runs::ToolTransportKindRequest,
 ) -> ToolTransportKind {
@@ -626,14 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn fallback_policy_request_maps_all_runtime_variants() {
-        assert_eq!(
-            fallback_policy_from_request(astra_services::runs::FallbackPolicyRequest::Disabled),
-            FallbackPolicy::Disabled
-        );
-    }
-
-    #[test]
     fn request_uses_server_workspace_only_for_explicit_server_sandbox() {
         let request = test_request("hello");
 
@@ -651,7 +618,6 @@ mod tests {
         assert_eq!(workspace.display_name, "No file environment");
         assert_eq!(workspace.cwd, None);
         assert_eq!(workspace.authority, WorkspaceAuthority::None);
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
         assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
         assert_eq!(executor.executor_id, "server-control-plane");
         assert_eq!(executor.display_name, "Server control plane");
@@ -668,7 +634,6 @@ mod tests {
             root: Some("/client/claimed/path".to_string()),
             source: None,
             authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
         });
         request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
             kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
@@ -704,7 +669,6 @@ mod tests {
                 reference: None,
             }),
             authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
         });
         request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
             kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
@@ -738,7 +702,6 @@ mod tests {
                 },
             ),
             authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
         });
         request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
             kind: astra_services::runs::ExecutorBindingRequestKind::OrchestratorManaged,
@@ -804,7 +767,6 @@ mod tests {
             root: None,
             source: None,
             authority: None,
-            fallback_policy: None,
         });
 
         assert!(
@@ -838,8 +800,7 @@ mod tests {
                 "kind": "server_sandbox",
                 "display_name": "Server sandbox",
                 "cwd": "/stale/workspace",
-                "authority": "read_write",
-                "fallback_policy": "disabled"
+                "authority": "read_write"
             },
             "executor": {
                 "kind": "server_local",

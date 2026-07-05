@@ -1347,7 +1347,7 @@ impl DynamicAgentSpawner {
         else {
             return;
         };
-        for key in ["workspace", "executor", "transport", "fallback_policy"] {
+        for key in ["workspace", "executor", "transport"] {
             if let Some(value) = execution_metadata.get(key).cloned() {
                 metadata.entry(key.to_string()).or_insert(value);
             }
@@ -3865,16 +3865,14 @@ mod tests {
         context.execution_metadata = Some(serde_json::json!({
             "workspace": {
                 "kind": "edge_workspace",
-                "cwd": "/Users/xupeng/github/astra",
-                "fallback_policy": "disabled"
+                "cwd": "/Users/xupeng/github/astra"
             },
             "executor": {
                 "kind": "edge_agent",
                 "executor_id": "edge-macbook-1",
                 "transport": "edge_ws"
             },
-            "transport": "edge_ws",
-            "fallback_policy": "disabled"
+            "transport": "edge_ws"
         }));
 
         let launched = spawner.spawn(make_bg_input(), &context).await.unwrap();
@@ -3913,10 +3911,6 @@ mod tests {
             "{journal}"
         );
         assert!(journal.contains("\"transport\":\"edge_ws\""), "{journal}");
-        assert!(
-            journal.contains("\"fallback_policy\":\"disabled\""),
-            "{journal}"
-        );
     }
 
     #[tokio::test]
@@ -5402,16 +5396,14 @@ mod tests {
         context.execution_metadata = Some(serde_json::json!({
             "workspace": {
                 "kind": "edge_workspace",
-                "cwd": "/Users/xupeng/github/astra",
-                "fallback_policy": "disabled"
+                "cwd": "/Users/xupeng/github/astra"
             },
             "executor": {
                 "kind": "edge_agent",
                 "executor_id": "edge-macbook-1",
                 "transport": "edge_ws"
             },
-            "transport": "edge_ws",
-            "fallback_policy": "disabled"
+            "transport": "edge_ws"
         }));
 
         let result = spawner.spawn(make_bg_input(), &context).await.unwrap();
@@ -5448,7 +5440,6 @@ mod tests {
             assert_eq!(metadata["executor"]["kind"], "edge_agent");
             assert_eq!(metadata["executor"]["executor_id"], "edge-macbook-1");
             assert_eq!(metadata["transport"], "edge_ws");
-            assert_eq!(metadata["fallback_policy"], "disabled");
             match event.event_type {
                 ProgressEventType::AgentSpawned { .. } => saw_spawned = true,
                 ProgressEventType::Completed { .. } => saw_completed = true,

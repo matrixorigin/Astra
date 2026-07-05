@@ -291,13 +291,6 @@ pub enum WorkspaceAuthorityRequest {
     None,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FallbackPolicyRequest {
-    /// Never route a tool call away from the selected executor.
-    Disabled,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceBindingRequest {
     pub kind: WorkspaceBindingRequestKind,
@@ -309,8 +302,6 @@ pub struct WorkspaceBindingRequest {
     pub source: Option<WorkspaceSourceRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<WorkspaceAuthorityRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_policy: Option<FallbackPolicyRequest>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,7 +602,6 @@ pub struct RunStatusRecord {
     pub workspace: Option<serde_json::Value>,
     pub executor: Option<serde_json::Value>,
     pub transport: Option<String>,
-    pub fallback_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -633,7 +623,6 @@ pub struct RunProjectionRecord {
     pub workspace: Option<serde_json::Value>,
     pub executor: Option<serde_json::Value>,
     pub transport: Option<String>,
-    pub fallback_policy: Option<String>,
     pub run_event_high_watermark: i64,
     pub projection_event_idx: i64,
     pub projection_updated_at: String,
@@ -4588,7 +4577,6 @@ fn copy_execution_boundary_fields(
         "workspace",
         "executor",
         "transport",
-        "fallback_policy",
         "route",
         "success",
         "duration_ms",
@@ -4810,9 +4798,6 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 }
                 if let Some(transport) = data.get("transport").cloned() {
                     obj.insert("transport".to_string(), transport);
-                }
-                if let Some(fallback_policy) = data.get("fallback_policy").cloned() {
-                    obj.insert("fallback_policy".to_string(), fallback_policy);
                 }
             }
             out
@@ -6243,8 +6228,7 @@ mod tests {
                 "args": {"command": "ls"},
                 "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
                 "executor": {"kind": "server_local", "transport": "server_local"},
-                "transport": "server_local",
-                "fallback_policy": "disabled"
+                "transport": "server_local"
             }),
         ));
         assert_eq!(out["type"], "tool_call_start");
@@ -6254,7 +6238,6 @@ mod tests {
         assert_eq!(out["workspace"]["kind"], "server_sandbox");
         assert_eq!(out["executor"]["kind"], "server_local");
         assert_eq!(out["transport"], "server_local");
-        assert_eq!(out["fallback_policy"], "disabled");
     }
 
     #[test]
@@ -6269,8 +6252,7 @@ mod tests {
                 "duration_ms": 42,
                 "workspace": {"kind": "edge_workspace", "cwd": "/Users/xupeng/github/astra"},
                 "executor": {"kind": "edge_agent", "executor_id": "edge-1", "transport": "edge_ws"},
-                "transport": "edge_ws",
-                "fallback_policy": "disabled"
+                "transport": "edge_ws"
             }),
         ));
         assert_eq!(out["type"], "tool_call_end");
@@ -6282,7 +6264,6 @@ mod tests {
         assert_eq!(out["workspace"]["kind"], "edge_workspace");
         assert_eq!(out["executor"]["executor_id"], "edge-1");
         assert_eq!(out["transport"], "edge_ws");
-        assert_eq!(out["fallback_policy"], "disabled");
     }
 
     #[test]
@@ -6297,8 +6278,7 @@ mod tests {
                 "interactive_client": true,
                 "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
                 "executor": {"kind": "server_local", "status": "online"},
-                "transport": "server_local",
-                "fallback_policy": "disabled"
+                "transport": "server_local"
             }),
         ));
         assert_eq!(started["type"], "run_started");
@@ -6312,7 +6292,6 @@ mod tests {
         assert_eq!(started["executor"]["kind"], "server_local");
         assert_eq!(started["executor"]["status"], "online");
         assert_eq!(started["transport"], "server_local");
-        assert_eq!(started["fallback_policy"], "disabled");
 
         let finished = transform_run_event_for_client(make_event(
             "run_finished",
@@ -6603,7 +6582,7 @@ mod tests {
                 "type": "run_blocked",
                 "call_id": "c1",
                 "tool": "bash",
-                "reason": "fallback_disabled",
+                "reason": "executor_offline",
             }),
             json!({
                 "type": "run_blocked",
@@ -6629,8 +6608,7 @@ mod tests {
                 "message": "Workspace is not routed to an available executor.",
                 "workspace": {"kind": "cloud_workspace"},
                 "executor": {"kind": "orchestrator_managed", "status": "degraded"},
-                "transport": "sandbox_resident_agent",
-                "fallback_policy": "disabled"
+                "transport": "sandbox_resident_agent"
             },
             "index": 4
         }));
@@ -6645,8 +6623,7 @@ mod tests {
                 "message": "Workspace is not routed to an available executor.",
                 "workspace": {"kind": "cloud_workspace"},
                 "executor": {"kind": "orchestrator_managed", "status": "degraded"},
-                "transport": "sandbox_resident_agent",
-                "fallback_policy": "disabled"
+                "transport": "sandbox_resident_agent"
             })
         );
     }

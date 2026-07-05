@@ -1,23 +1,21 @@
 use serde_json::{Map, Value, json};
 
 use super::tool_execution_binding::{
-    ExecutorBinding, ExecutorStatus, FallbackPolicy, ToolExecutionRequest, ToolTransportKind,
-    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
-    capacity_provider_type_for_workspace_executor, runtime_execution_provider_id_for_executor,
+    ExecutorBinding, ExecutorStatus, ToolExecutionRequest, ToolTransportKind, WorkspaceAuthority,
+    WorkspaceBinding, WorkspaceBindingKind, capacity_provider_type_for_workspace_executor,
+    runtime_execution_provider_id_for_executor,
 };
 
 pub const TOOL_ERROR_KIND_APPROVAL_TIMEOUT: &str = "approval_timeout";
 pub const TOOL_ERROR_KIND_TOOL_TIMEOUT: &str = "tool_timeout";
 pub const TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH: &str = "workspace_path_mismatch";
 pub const TOOL_ERROR_KIND_AGENT_WAITING: &str = "agent_waiting";
-pub const TOOL_ERROR_KIND_FALLBACK_DISABLED: &str = "fallback_disabled";
 pub const TOOL_ERROR_KIND_EXECUTOR_OFFLINE: &str = "executor_offline";
 pub const RUN_BLOCKED_REASON_EXECUTOR_OFFLINE: &str = TOOL_ERROR_KIND_EXECUTOR_OFFLINE;
 pub const TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED: &str = "transport_disconnected";
 pub const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
 pub const TOOL_ERROR_KIND_CAPABILITY_DENIED: &str = "capability_denied";
 pub const RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED: &str = TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED;
-pub const RUN_BLOCKED_REASON_FALLBACK_DISABLED: &str = TOOL_ERROR_KIND_FALLBACK_DISABLED;
 pub const TOOL_ERROR_KIND_ROUTE_MISMATCH: &str = "route_mismatch";
 pub const RUN_BLOCKED_REASON_ROUTE_MISMATCH: &str = TOOL_ERROR_KIND_ROUTE_MISMATCH;
 
@@ -252,10 +250,6 @@ pub fn binding_event_fields(
         serde_json::to_value(executor.transport).unwrap_or(Value::Null),
     );
     fields.insert(
-        "fallback_policy".to_string(),
-        serde_json::to_value(workspace.fallback_policy).unwrap_or(Value::Null),
-    );
-    fields.insert(
         "capacity_provider_coverage".to_string(),
         serde_json::to_value(capacity_provider_coverage(workspace, executor))
             .unwrap_or(Value::Null),
@@ -417,7 +411,6 @@ mod tests {
                 display_name: "MacBook Pro".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: FallbackPolicy::Disabled,
             },
             &ExecutorBinding::edge_agent(
                 "edge-1",

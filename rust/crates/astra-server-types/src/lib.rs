@@ -432,7 +432,6 @@ pub struct RunStatusResponse {
     pub workspace: Option<serde_json::Value>,
     pub executor: Option<serde_json::Value>,
     pub transport: Option<String>,
-    pub fallback_policy: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -1134,7 +1133,6 @@ impl From<RunStatusRecord> for RunStatusResponse {
             workspace: value.workspace,
             executor: value.executor,
             transport: value.transport,
-            fallback_policy: value.fallback_policy,
         }
     }
 }

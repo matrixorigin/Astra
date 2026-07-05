@@ -282,7 +282,6 @@ mod tests {
                 display_name: String::new(),
                 cwd: None,
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: FallbackPolicy::Disabled,
             },
             workspace_record: None,
             runtime: None,

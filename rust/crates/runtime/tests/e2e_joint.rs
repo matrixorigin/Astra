@@ -377,7 +377,6 @@ impl RunLifecycleService for JointRunLifecycle {
             workspace: None,
             executor: None,
             transport: None,
-            fallback_policy: None,
         })
     }
 

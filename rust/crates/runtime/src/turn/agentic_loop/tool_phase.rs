@@ -53,8 +53,6 @@ pub(crate) enum TurnToolPhaseControl {
     Return(AgenticLoopOutcome),
 }
 
-const TOOL_ERROR_KIND_FALLBACK_DISABLED: &str = "fallback_disabled";
-
 fn execution_boundary_blocked_wait_reason(tool_results: &[Value]) -> Option<String> {
     tool_results.iter().find_map(|result| {
         let result = result.as_object()?;
@@ -74,7 +72,6 @@ fn execution_boundary_blocked_wait_reason(tool_results: &[Value]) -> Option<Stri
             Some(
                 TOOL_ERROR_KIND_EXECUTOR_OFFLINE
                 | TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
-                | TOOL_ERROR_KIND_FALLBACK_DISABLED
                 | TOOL_ERROR_KIND_ROUTE_MISMATCH,
             ) => Some(reason.to_string()),
             _ => None,

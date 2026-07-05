@@ -471,7 +471,6 @@ mod tests {
             display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
-            fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
         }
     }
 
@@ -764,7 +763,6 @@ mod tests {
                 display_name: "Edge workspace".to_string(),
                 cwd: Some("/Users/test/repo".to_string()),
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
             },
             &ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,
@@ -799,7 +797,6 @@ mod tests {
                 display_name: "Edge workspace".to_string(),
                 cwd: Some("/Users/test/repo".to_string()),
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
             },
             &ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,
@@ -877,7 +874,6 @@ mod tests {
                 display_name: "Edge workspace".to_string(),
                 cwd: Some("/Users/test/repo".to_string()),
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
             },
             &ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,
@@ -924,7 +920,6 @@ mod tests {
                 display_name: "Edge workspace".to_string(),
                 cwd: Some("/Users/test/repo".to_string()),
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
             },
             &ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,
@@ -953,7 +948,6 @@ mod tests {
                 display_name: "Edge workspace".to_string(),
                 cwd: Some("/Users/test/repo".to_string()),
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
             },
             &ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,
@@ -1008,7 +1002,6 @@ mod tests {
                 display_name: "Edge workspace".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
             },
             &ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,
@@ -1035,7 +1028,6 @@ mod tests {
                 display_name: "Edge workspace".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
             },
             &ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,
@@ -1096,7 +1088,6 @@ mod tests {
             display_name: "local".into(),
             cwd: Some("/tmp/test".into()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
         };
         let runtime_ws = runtime_env_workspace_binding(&workspace);
         assert_eq!(

@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 use super::tool_admission::resolve_tool_admission_for_binding;
 use super::tool_edge_transport::execute_edge_bound;
 use super::tool_execution_binding::{
-    ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy, ToolExecutionRequest,
-    ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
+    ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolTransportKind,
+    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
 };
 use super::tool_external_transport::{
     ExternalTransport, execute_gateway_relay, execute_sandbox_resident_agent,
@@ -521,7 +521,6 @@ fn no_workspace() -> WorkspaceBinding {
         display_name: "No file environment".to_string(),
         cwd: None,
         authority: WorkspaceAuthority::None,
-        fallback_policy: FallbackPolicy::Disabled,
     }
 }
 
@@ -537,17 +536,11 @@ mod tests {
     async fn disabled_tool_offers_are_offer_ids_with_idempotent_updates() {
         let svc = ToolExecutionService::new_for_test();
         assert!(svc.disabled_tool_offers().await.is_empty());
-        assert!(
-            !svc.is_tool_offer_disabled("web_fetch@server-builtin")
-                .await
-        );
+        assert!(!svc.is_tool_offer_disabled("web_fetch@server-builtin").await);
 
         svc.disable_tool_offer("web_fetch@server-builtin").await;
         svc.disable_tool_offer("web_search@server-builtin").await;
-        assert!(
-            svc.is_tool_offer_disabled("web_fetch@server-builtin")
-                .await
-        );
+        assert!(svc.is_tool_offer_disabled("web_fetch@server-builtin").await);
         assert!(!svc.disable_tool_offer("web_fetch@server-builtin").await);
 
         let list = svc.disabled_tool_offers().await;
@@ -556,10 +549,7 @@ mod tests {
         assert!(list.contains(&"web_search@server-builtin".to_string()));
 
         assert!(svc.enable_tool_offer("web_fetch@server-builtin").await);
-        assert!(
-            !svc.is_tool_offer_disabled("web_fetch@server-builtin")
-                .await
-        );
+        assert!(!svc.is_tool_offer_disabled("web_fetch@server-builtin").await);
         assert!(!svc.enable_tool_offer("web_fetch@server-builtin").await);
         assert!(!svc.enable_tool_offer("nonexistent@server-builtin").await);
     }

@@ -230,7 +230,6 @@ impl RunLifecycleService for RecordingLifecycle {
             workspace: None,
             executor: None,
             transport: None,
-            fallback_policy: None,
         })
     }
 

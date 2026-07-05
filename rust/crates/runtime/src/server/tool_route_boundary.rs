@@ -4,8 +4,8 @@ use serde_json::{Map, Value, json};
 
 use super::tool_binding_projection::is_server_runtime_tool;
 use super::tool_execution_binding::{
-    ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy, ToolExecutionRequest,
-    ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
+    ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolTransportKind,
+    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
 };
 use super::tool_route_selection::ToolExecutionRouteKind;
 use super::tool_transport_metadata::{binding_event_fields, delivered_binding_event_fields};
@@ -279,7 +279,6 @@ const RESULT_ROUTING_METADATA_FIELDS: &[&str] = &[
     "workspace",
     "executor",
     "transport",
-    "fallback_policy",
     "status",
     "skipped",
     "error_kind",
@@ -343,7 +342,6 @@ fn server_runtime_event_fields() -> Map<String, Value> {
         display_name: "No file environment".to_string(),
         cwd: None,
         authority: WorkspaceAuthority::None,
-        fallback_policy: FallbackPolicy::Disabled,
     };
     let executor = ExecutorBinding {
         kind: ExecutorBindingKind::ServerLocal,
@@ -387,9 +385,6 @@ fn request_scoped_mcp_event_fields_from_metadata(
         "transport".to_string(),
         Value::String("mcp_http".to_string()),
     );
-    if let Some(fallback_policy) = base_metadata.get("fallback_policy").cloned() {
-        fields.insert("fallback_policy".to_string(), fallback_policy);
-    }
     fields
 }
 
@@ -427,8 +422,5 @@ fn edge_ledger_event_fields_from_metadata(
         "transport".to_string(),
         Value::String("edge_ledger".to_string()),
     );
-    if let Some(fallback_policy) = base_metadata.get("fallback_policy").cloned() {
-        fields.insert("fallback_policy".to_string(), fallback_policy);
-    }
     fields
 }

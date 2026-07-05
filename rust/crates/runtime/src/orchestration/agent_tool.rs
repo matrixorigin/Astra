@@ -2266,8 +2266,7 @@ mod tests {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/xupeng/github/astra",
-                "authority": "read_write",
-                "fallback_policy": "disabled"
+                "authority": "read_write"
             },
             "executor": {
                 "kind": "edge_agent",
@@ -2276,8 +2275,7 @@ mod tests {
                 "transport": "edge_ws",
                 "status": "online"
             },
-            "transport": "edge_ws",
-            "fallback_policy": "disabled"
+            "transport": "edge_ws"
         }));
         let args = json!({
             "description": "Code quality review",

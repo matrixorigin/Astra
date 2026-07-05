@@ -322,7 +322,6 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
             workspace: None,
             executor: None,
             transport: None,
-            fallback_policy: None,
         })
     }
 

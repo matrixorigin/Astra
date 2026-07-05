@@ -981,7 +981,7 @@ async fn server_sandbox_routes_to_server_local_transport() {
 }
 
 #[tokio::test]
-async fn no_file_environment_local_code_blocks_without_server_fallback() {
+async fn no_file_environment_local_code_blocks_without_server_reroute() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let result = service
@@ -993,7 +993,6 @@ async fn no_file_environment_local_code_blocks_without_server_fallback() {
                     display_name: "No file environment".to_string(),
                     cwd: None,
                     authority: WorkspaceAuthority::None,
-                    fallback_policy: FallbackPolicy::Disabled,
                 },
                 ExecutorBinding::server_local(),
             ),
@@ -1121,7 +1120,6 @@ fn no_file_environment_binding_resolves_to_control_plane_tool_surface_only() {
             display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding::server_local(),
     );
@@ -1193,7 +1191,6 @@ async fn no_file_environment_mcp_retrieve_runs_as_request_scoped_mcp_without_run
             display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding::server_local(),
     );
@@ -1431,7 +1428,6 @@ fn orchestrator_managed_unknown_status_hides_project_tools_until_runtime_ready()
             display_name: "Snapshot".to_string(),
             cwd: Some("/snapshot".to_string()),
             authority: WorkspaceAuthority::ReadOnly,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1565,7 +1561,6 @@ fn orchestrator_managed_with_ready_runtime_routes_through_resident_agent() {
             display_name: "Personal workspace".to_string(),
             cwd: Some("/workspace/personal".to_string()),
             authority: WorkspaceAuthority::ReadOnly,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1602,7 +1597,6 @@ fn orchestrator_managed_enterprise_binding_preserves_executor_kind() {
             display_name: "Team workspace".to_string(),
             cwd: Some("/workspace/team".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1639,7 +1633,6 @@ fn cloud_workspace_with_runtime_bound_orchestrator_exposes_read_write_project_to
             display_name: "Team workspace".to_string(),
             cwd: Some("/cloud/volumes/team-volume-1".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1683,7 +1676,6 @@ fn explicit_runtime_binding_overrides_executor_inference() {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1725,7 +1717,6 @@ async fn gateway_relay_transport_fails_closed_until_adapter_is_configured() {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1789,7 +1780,6 @@ async fn gateway_relay_executes_through_configured_transport() {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1830,7 +1820,6 @@ async fn gateway_relay_receives_args_without_internal_tool_metadata() {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1959,7 +1948,6 @@ async fn sandbox_resident_agent_transport_fails_closed_until_adapter_is_configur
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -2026,7 +2014,6 @@ async fn sandbox_resident_agent_executes_through_configured_transport() {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -2061,7 +2048,6 @@ fn cloud_snapshot_request(tool_name: &str) -> ToolExecutionRequest {
             display_name: "Snapshot".to_string(),
             cwd: Some("/snapshot".to_string()),
             authority: WorkspaceAuthority::ReadOnly,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -2086,7 +2072,6 @@ fn openshell_gateway_request(tool_name: &str) -> ToolExecutionRequest {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -2265,8 +2250,7 @@ async fn orchestrator_managed_execute_timeout_reports_side_effect_uncertainty() 
 }
 
 #[tokio::test]
-async fn orchestrator_managed_without_sandbox_resident_agent_transport_does_not_fallback_to_local()
-{
+async fn orchestrator_managed_without_sandbox_resident_agent_transport_does_not_reroute_to_local() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
 
@@ -2294,7 +2278,7 @@ async fn orchestrator_managed_without_sandbox_resident_agent_transport_does_not_
 }
 
 #[tokio::test]
-async fn orchestrator_managed_transport_error_skips_local_fallback() {
+async fn orchestrator_managed_transport_error_skips_local_reroute() {
     let resident = Arc::new(StaticSandboxResidentAgentTransport::with_error(
         astra_runtime_env::RuntimeError::runtime_unavailable("orchestrator denied execution"),
     ));
@@ -2325,7 +2309,7 @@ async fn orchestrator_managed_transport_error_skips_local_fallback() {
 }
 
 #[tokio::test]
-async fn cloud_workspace_blocks_without_server_fallback() {
+async fn cloud_workspace_blocks_without_server_reroute() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let mut request = request(
@@ -2335,7 +2319,6 @@ async fn cloud_workspace_blocks_without_server_fallback() {
             display_name: "Cloud workspace".to_string(),
             cwd: Some("/checkout/repo".to_string()),
             authority: WorkspaceAuthority::ReadOnly,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding::server_local(),
     );
@@ -2383,7 +2366,7 @@ async fn cloud_workspace_blocks_without_server_fallback() {
 }
 
 #[tokio::test]
-async fn edge_offline_with_fallback_disabled_does_not_call_server_local() {
+async fn edge_offline_does_not_call_server_local() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let result = service
@@ -3309,7 +3292,6 @@ async fn request_scoped_mcp_cancel_reports_mcp_binding() {
             display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding::server_local(),
     );
@@ -3584,7 +3566,6 @@ fn edge_executor_id_returns_none_for_empty_id() {
             display_name: "test-ws".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         workspace_record: None,
         runtime: None,
@@ -3619,7 +3600,6 @@ fn edge_executor_id_rejects_whitespace_only_id() {
             display_name: "test-ws".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         workspace_record: None,
         runtime: None,
@@ -3654,7 +3634,6 @@ fn edge_executor_id_returns_some_for_valid_id() {
             display_name: "test-ws".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         workspace_record: None,
         runtime: None,

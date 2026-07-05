@@ -1011,7 +1011,6 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
             "display_name": "MacBook Pro",
             "cwd": "/Users/test/project",
             "authority": "read_write",
-            "fallback_policy": "disabled"
         },
         "executor": {
             "kind": "edge_agent",
@@ -1021,7 +1020,6 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
             "status": "online"
         },
         "transport": "edge_ws",
-        "fallback_policy": "disabled"
     });
     let output = super::agent_live_event_to_work_surface_sse(
         &AgentLiveEvent {
@@ -1037,7 +1035,6 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
     assert_eq!(output["workspace"]["kind"], "edge_workspace");
     assert_eq!(output["executor"]["kind"], "edge_agent");
     assert_eq!(output["transport"], "edge_ws");
-    assert_eq!(output["fallback_policy"], "disabled");
 
     let terminal = super::agent_live_event_to_work_surface_sse(
         &AgentLiveEvent {
@@ -3124,7 +3121,6 @@ fn cloud_git_source_maps_to_workspace_record_contract() {
             reference: None,
         }),
         authority: None,
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let provision_request = ok(cloud_workspace_provision_request_from_request(
@@ -3194,7 +3190,6 @@ fn cloud_persistent_volume_binding_maps_to_workspace_record_contract() {
             },
         ),
         authority: None,
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let provision_request = ok(cloud_workspace_provision_request_from_request(
@@ -3263,7 +3258,6 @@ fn cloud_scratch_source_maps_to_generic_workspace_record_contract() {
         root: None,
         source: Some(astra_services::runs::WorkspaceSourceRequest::Scratch),
         authority: None,
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let provision_request = ok(cloud_workspace_provision_request_from_request(
@@ -3298,7 +3292,6 @@ fn cloud_uploaded_snapshot_source_defaults_to_immutable_read_only() {
             },
         ),
         authority: None,
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let provision_request = ok(cloud_workspace_provision_request_from_request(
@@ -3337,7 +3330,6 @@ fn cloud_template_source_defaults_to_read_write_session_workspace() {
             template_id: "template-1".to_string(),
         }),
         authority: None,
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let provision_request = ok(cloud_workspace_provision_request_from_request(
@@ -3395,7 +3387,6 @@ fn cloud_dataset_and_artifact_sources_default_to_immutable_read_only() {
             root: None,
             source: Some(source),
             authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
         });
 
         let provision_request = ok(cloud_workspace_provision_request_from_request(
@@ -3427,7 +3418,6 @@ fn cloud_materialized_source_rejects_relative_root_before_provisioning() {
             template_id: "template-1".to_string(),
         }),
         authority: None,
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let error = err(cloud_workspace_provision_request_from_request(
@@ -3460,7 +3450,6 @@ fn cloud_materialized_source_rejects_empty_identifier() {
             },
         ),
         authority: None,
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let error = err(cloud_workspace_provision_request_from_request(
@@ -3488,7 +3477,6 @@ fn cloud_workspace_binding_requires_materialized_source() {
             reference: None,
         }),
         authority: None,
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let error = err(cloud_workspace_provision_request_from_request(
@@ -3516,7 +3504,6 @@ fn cloud_workspace_binding_rejects_missing_source() {
         root: None,
         source: None,
         authority: None,
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let error = err(cloud_workspace_provision_request_from_request(
@@ -3570,7 +3557,6 @@ fn request_execution_bindings_use_actual_server_workspace_for_server_sandbox() {
         root: Some("/client/claimed/path".to_string()),
         source: None,
         authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
     request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
         kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
@@ -3590,7 +3576,6 @@ fn request_execution_bindings_use_actual_server_workspace_for_server_sandbox() {
         Some("/tmp/astra-runtime-workspace")
     );
     assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-    assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
     assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
     assert_eq!(executor.executor_id, "server-local");
     assert_eq!(executor.display_name, "Requested executor");
@@ -3610,7 +3595,6 @@ fn server_workspace_binding_decision_uses_only_explicit_binding() {
         root: None,
         source: None,
         authority: None,
-        fallback_policy: None,
     });
     assert!(request_uses_server_workspace(&request));
 
@@ -3622,13 +3606,12 @@ fn server_workspace_binding_decision_uses_only_explicit_binding() {
             path: "/repo".to_string(),
         }),
         authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
     assert!(!request_uses_server_workspace(&request));
 }
 
 #[test]
-fn request_execution_bindings_keep_edge_workspace_without_server_fallback() {
+fn request_execution_bindings_keep_edge_workspace_without_server_reroute() {
     let mut request = test_request("review this repo");
     request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
         kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
@@ -3638,7 +3621,6 @@ fn request_execution_bindings_keep_edge_workspace_without_server_fallback() {
             path: "/Users/xupeng/github/astra".to_string(),
         }),
         authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
     request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
         kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
@@ -3654,7 +3636,6 @@ fn request_execution_bindings_keep_edge_workspace_without_server_fallback() {
     assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
     assert_eq!(workspace.display_name, "MacBook Pro");
     assert_eq!(workspace.cwd.as_deref(), Some("/Users/xupeng/github/astra"));
-    assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
     assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
     assert_eq!(executor.executor_id, "edge-macbook-1");
     assert_eq!(executor.transport, ToolTransportKind::EdgeWs);
@@ -3670,7 +3651,6 @@ fn workspace_binding_request_accepts_legacy_cwd_alias() {
             "display_name": "MacBook Pro",
             "cwd": "/Users/test/repo",
             "authority": "read_write",
-            "fallback_policy": "disabled"
         }))
         .expect("legacy cwd alias should deserialize"),
     );
@@ -3708,7 +3688,6 @@ fn edge_profile_execution_bindings_make_edge_provider_explicit() {
     assert_eq!(workspace.display_name, "MacBook Pro");
     assert_eq!(workspace.cwd.as_deref(), Some("/Users/xupeng/github/astra"));
     assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-    assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
     assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
     assert_eq!(executor.executor_id, "edge-macbook-1");
     assert_eq!(executor.display_name, "MacBook Pro");
@@ -3727,7 +3706,6 @@ fn missing_edge_profile_execution_bindings_emit_no_file_environment() {
     assert_eq!(workspace.kind, WorkspaceBindingKind::None);
     assert_eq!(workspace.display_name, "No file environment");
     assert_eq!(workspace.authority, WorkspaceAuthority::None);
-    assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
     assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
     assert_eq!(executor.executor_id, "server-control-plane");
     assert_eq!(executor.display_name, "Server control plane");
@@ -3762,7 +3740,6 @@ fn explicit_no_file_environment_binding_uses_server_control_plane_executor() {
         root: None,
         source: None,
         authority: None,
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let (workspace, executor) =
@@ -3771,7 +3748,6 @@ fn explicit_no_file_environment_binding_uses_server_control_plane_executor() {
     assert_eq!(workspace.kind, WorkspaceBindingKind::None);
     assert_eq!(workspace.display_name, "No file environment");
     assert_eq!(workspace.authority, WorkspaceAuthority::None);
-    assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
     assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
     assert_eq!(executor.executor_id, "server-control-plane");
     assert_eq!(executor.display_name, "Server control plane");
@@ -3787,7 +3763,6 @@ fn execution_bindings_from_metadata_rebases_server_sandbox_cwd() {
             "display_name": "Server sandbox",
             "cwd": "/tmp/parent-workspace",
             "authority": "read_write",
-            "fallback_policy": "disabled"
         },
         "executor": {
             "kind": "server_local",
@@ -4760,7 +4735,7 @@ fn streaming_final_replay_excludes_live_work_surface_events() {
         json!({"type": "agent_progress", "agent_id": "agent-1", "status": "started"}),
         json!({"type": "agent_live_event", "agent_id": "agent-1", "event_kind": "output_delta", "content": "child"}),
         json!({"type": "run_blocked", "call_id": "call-1", "reason": "transport_disconnected"}),
-        json!({"type": "run_blocked", "call_id": "call-2", "reason": "fallback_disabled"}),
+        json!({"type": "run_blocked", "call_id": "call-2", "reason": "executor_offline"}),
         json!({"type": "run_blocked", "call_id": "call-3", "reason": "route_mismatch"}),
         json!({"event_type": "text_done", "data": {"full_text": "hi"}}),
         json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
@@ -5167,7 +5142,6 @@ async fn create_run_rejects_invalid_server_workspace_session_id() {
         root: None,
         source: None,
         authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let err = err(svc.create_run("user-1".into(), req).await);
@@ -5190,7 +5164,6 @@ async fn stream_chat_rejects_invalid_server_workspace_session_id() {
         root: None,
         source: None,
         authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
 
     let err = err(svc.stream_chat("user-1".into(), req).await);
@@ -5292,7 +5265,6 @@ async fn get_run_status_returns_state() {
         "server-control-plane"
     );
     assert_eq!(status.transport.as_deref(), Some("server_local"));
-    assert_eq!(status.fallback_policy.as_deref(), Some("disabled"));
 }
 
 #[tokio::test]
@@ -5371,7 +5343,6 @@ async fn create_run_persists_interaction_mode_into_run_started_event() {
         "server-control-plane"
     );
     assert_eq!(durable.events[0]["data"]["transport"], "server_local");
-    assert_eq!(durable.events[0]["data"]["fallback_policy"], "disabled");
 }
 
 #[tokio::test]
@@ -5386,7 +5357,6 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
             path: "/Users/xupeng/github/astra".to_string(),
         }),
         authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-        fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
     });
     req.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
         kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
@@ -5418,7 +5388,6 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
         "edge-macbook-1"
     );
     assert_eq!(durable.events[0]["data"]["transport"], "edge_ws");
-    assert_eq!(durable.events[0]["data"]["fallback_policy"], "disabled");
 
     let status = ok(svc
         .get_run_status(run.run_id.clone(), "user-1".into())
@@ -5434,7 +5403,6 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
         "edge-macbook-1"
     );
     assert_eq!(status.transport.as_deref(), Some("edge_ws"));
-    assert_eq!(status.fallback_policy.as_deref(), Some("disabled"));
 }
 
 #[tokio::test]

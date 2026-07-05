@@ -123,7 +123,7 @@ use crate::server::run::handlers as run_handlers;
 use crate::server::runtime_mcp;
 use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
 use crate::server::tool_transport::{
-    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
+    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
     ToolExecutionService, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
     WorkspaceBindingKind, binding_event_fields,
 };
@@ -4036,9 +4036,6 @@ impl AgenticRunLifecycleService {
             if let Some(transport) = payload.get("transport").and_then(Value::as_str) {
                 snapshot.transport = Some(transport.to_string());
             }
-            if let Some(fallback_policy) = payload.get("fallback_policy").and_then(Value::as_str) {
-                snapshot.fallback_policy = Some(fallback_policy.to_string());
-            }
         }
         snapshot
     }
@@ -4054,7 +4051,6 @@ impl AgenticRunLifecycleService {
             workspace: binding.workspace,
             executor: binding.executor,
             transport: binding.transport,
-            fallback_policy: binding.fallback_policy,
         }
     }
 
@@ -4685,7 +4681,6 @@ fn server_workspace_binding_from_workspace_record(
             Some(record.root_or_volume_ref.clone())
         },
         authority: record.authority,
-        fallback_policy: FallbackPolicy::Disabled,
     }
 }
 
@@ -6560,7 +6555,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 workspace: binding.workspace.clone(),
                 executor: binding.executor.clone(),
                 transport: binding.transport.clone(),
-                fallback_policy: binding.fallback_policy.clone(),
                 run_event_high_watermark: run.last_event_idx,
                 projection_event_idx: projection.projection_event_idx,
                 projection_updated_at: projection.updated_at,
@@ -6592,7 +6586,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 workspace: binding.workspace,
                 executor: binding.executor,
                 transport: binding.transport,
-                fallback_policy: binding.fallback_policy,
                 run_event_high_watermark: run.last_event_idx,
                 projection_event_idx: run.last_event_idx,
                 projection_updated_at: run.updated_at.clone(),

@@ -34,7 +34,7 @@ use crate::server::tool_route_selection::{
     should_deliver_edge_bound_tools_via_client_ledger_for_binding, tool_execution_class,
 };
 use crate::server::tool_transport::{
-    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
+    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
     ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind, WorkspaceAuthority,
     WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
     capability_filter_edge_provided_tool_schemas_for_binding_with_context,
@@ -1486,7 +1486,6 @@ impl ServerAgenticLoopHostBuilder {
                     display_name: "No file environment".to_string(),
                     cwd: None,
                     authority: WorkspaceAuthority::None,
-                    fallback_policy: FallbackPolicy::Disabled,
                 },
                 ExecutorBinding::server_control_plane(),
             )
@@ -7149,7 +7148,6 @@ mod tests {
                 display_name: "Snapshot".to_string(),
                 cwd: Some("/snapshot".to_string()),
                 authority: WorkspaceAuthority::ReadOnly,
-                fallback_policy: FallbackPolicy::Disabled,
             },
             ExecutorBinding {
                 kind: ExecutorBindingKind::OrchestratorManaged,
@@ -8144,7 +8142,6 @@ mod tests {
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/test/project",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor": {
                 "kind": "edge_agent",
@@ -8154,7 +8151,6 @@ mod tests {
                 "status": "online"
             },
             "transport": "edge_ws",
-            "fallback_policy": "disabled"
         }));
         host.edge_callback_ledger.lock().await.insert(
             tool_callback_key("u-edge-meta", "r1"),
@@ -8183,7 +8179,6 @@ mod tests {
         assert_eq!(end["executor"]["transport"], "edge_ledger");
         assert_eq!(end["executor"]["status"], "online");
         assert_eq!(end["transport"], "edge_ledger");
-        assert_eq!(end["fallback_policy"], "disabled");
     }
 
     #[tokio::test]
@@ -10375,7 +10370,6 @@ mod tests {
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/test/project",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor": {
                 "kind": "edge_agent",
@@ -10385,7 +10379,6 @@ mod tests {
                 "status": "online"
             },
             "transport": "edge_ws",
-            "fallback_policy": "disabled"
         }));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         host.set_event_tx(tx);
@@ -10402,7 +10395,6 @@ mod tests {
         assert_eq!(event["workspace"]["cwd"], "/Users/test/project");
         assert_eq!(event["executor"]["kind"], "edge_agent");
         assert_eq!(event["transport"], "edge_ws");
-        assert_eq!(event["fallback_policy"], "disabled");
     }
 
     #[test]
@@ -10420,7 +10412,6 @@ mod tests {
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/test/project",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor": {
                 "kind": "edge_agent",
@@ -10430,7 +10421,6 @@ mod tests {
                 "status": "online"
             },
             "transport": "edge_ws",
-            "fallback_policy": "disabled"
         }));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         host.set_event_tx(tx);
@@ -10453,7 +10443,6 @@ mod tests {
         assert_eq!(event["executor"]["kind"], "edge_agent");
         assert_eq!(event["executor"]["executor_id"], "edge-1");
         assert_eq!(event["transport"], "edge_ws");
-        assert_eq!(event["fallback_policy"], "disabled");
     }
 
     #[test]
@@ -10471,7 +10460,6 @@ mod tests {
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/test/project",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor": {
                 "kind": "edge_agent",
@@ -10481,7 +10469,6 @@ mod tests {
                 "status": "online"
             },
             "transport": "edge_ws",
-            "fallback_policy": "disabled"
         }));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         host.set_event_tx(tx);
@@ -10516,7 +10503,6 @@ mod tests {
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/test/project",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor": {
                 "kind": "edge_agent",
@@ -10526,7 +10512,6 @@ mod tests {
                 "status": "online"
             },
             "transport": "edge_ws",
-            "fallback_policy": "disabled"
         }));
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         host.set_event_tx(tx);
@@ -10550,7 +10535,6 @@ mod tests {
         assert_eq!(event["executor"]["executor_id"], "request-scoped-mcp");
         assert_eq!(event["executor"]["display_name"], "MCP server");
         assert_eq!(event["transport"], "mcp_http");
-        assert_eq!(event["fallback_policy"], "disabled");
     }
 
     #[test]
@@ -10671,7 +10655,6 @@ mod tests {
                 "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
                 "executor": {"kind": "edge_agent", "display_name": "MacBook Pro"},
                 "transport": "edge_ws",
-                "fallback_policy": "disabled",
                 "agent_id": "must-not-overwrite",
             })),
         };
@@ -10681,7 +10664,6 @@ mod tests {
         assert_eq!(sse["workspace"]["kind"], "edge_workspace");
         assert_eq!(sse["executor"]["kind"], "edge_agent");
         assert_eq!(sse["transport"], "edge_ws");
-        assert_eq!(sse["fallback_policy"], "disabled");
     }
 
     #[test]

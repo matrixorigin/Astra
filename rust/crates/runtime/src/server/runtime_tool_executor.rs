@@ -1708,7 +1708,6 @@ mod tests {
                 display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding::server_local(),
         );
@@ -1742,7 +1741,6 @@ mod tests {
                 display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding::server_local(),
         );
@@ -1775,7 +1773,6 @@ mod tests {
                 display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding::server_local(),
         );
@@ -1802,7 +1799,6 @@ mod tests {
                 display_name: "Read-only server sandbox".to_string(),
                 cwd: Some(dir.path().display().to_string()),
                 authority: WorkspaceAuthority::ReadOnly,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding::server_local(),
         );
@@ -1846,7 +1842,6 @@ mod tests {
                 display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding::server_local(),
         );
@@ -2324,7 +2319,6 @@ mod tests {
                 display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding::server_local(),
         );
@@ -4050,7 +4044,6 @@ esac
                 display_name: "Cloud workspace".to_string(),
                 cwd: Some("/checkout/repo".to_string()),
                 authority: WorkspaceAuthority::ReadOnly,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding {
                 kind: crate::server::tool_transport::ExecutorBindingKind::OrchestratorManaged,
@@ -4166,7 +4159,6 @@ esac
         let metadata = result.metadata.expect("binding metadata");
         assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
         assert_eq!(metadata["executor"]["kind"], "edge_agent");
-        assert_eq!(metadata["fallback_policy"], "disabled");
     }
 
     #[tokio::test]
@@ -4283,7 +4275,6 @@ esac
         assert_eq!(routing["executor"]["executor_id"], "edge-macbook-1");
         assert_eq!(routing["executor"]["transport"], "edge_ws");
         assert_eq!(routing["transport"], "edge_ws");
-        assert_eq!(routing["fallback_policy"], "disabled");
 
         let started = events
             .iter()
@@ -4297,7 +4288,6 @@ esac
         assert_eq!(started["executor"]["kind"], "edge_agent");
         assert_eq!(started["executor"]["executor_id"], "edge-macbook-1");
         assert_eq!(started["transport"], "edge_ws");
-        assert_eq!(started["fallback_policy"], "disabled");
 
         let failed = events
             .iter()

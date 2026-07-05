@@ -242,7 +242,7 @@ fn merge_agent_live_execution_metadata(event: &mut Value, execution_metadata: Op
     let Some(metadata_obj) = execution_metadata.and_then(Value::as_object) else {
         return;
     };
-    for key in ["workspace", "executor", "transport", "fallback_policy"] {
+    for key in ["workspace", "executor", "transport"] {
         if let Some(value) = metadata_obj.get(key).cloned() {
             event_obj.entry(key.to_string()).or_insert(value);
         }

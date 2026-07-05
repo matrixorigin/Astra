@@ -569,7 +569,6 @@ fn ensure_test_edge_profile_for_edge_tools(payload: &mut Map<String, Value>) {
                 "display_name": "web-agent-e2e",
                 "cwd": "/tmp/astra-web-agent-e2e-edge",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             })
         });
     assert_eq!(
@@ -895,7 +894,6 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/xupeng/github/astra",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor_binding": {
                 "kind": "edge_agent",
@@ -949,7 +947,6 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     assert_eq!(workspace["workspace"]["cwd"], "/Users/xupeng/github/astra");
     assert_eq!(workspace["executor"]["kind"], "edge_agent");
     assert_eq!(workspace["transport"], "edge_ws");
-    assert_eq!(workspace["fallback_policy"], "disabled");
 
     let routing = find_events(&events, "tool_routing_decision")
         .into_iter()
@@ -981,7 +978,6 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     assert_eq!(live_output["executor"]["kind"], "edge_agent");
     assert_eq!(live_output["executor"]["executor_id"], "edge-macbook-1");
     assert_eq!(live_output["transport"], "edge_ws");
-    assert_eq!(live_output["fallback_policy"], "disabled");
 
     let spawned = find_event_type(&events, "agent_spawned");
     assert!(
@@ -993,7 +989,6 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     assert_eq!(spawned[0]["executor"]["kind"], "edge_agent");
     assert_eq!(spawned[0]["executor"]["executor_id"], "edge-macbook-1");
     assert_eq!(spawned[0]["transport"], "edge_ws");
-    assert_eq!(spawned[0]["fallback_policy"], "disabled");
 
     let completed = find_event_type(&events, "agent_completed");
     assert!(
@@ -1383,7 +1378,6 @@ async fn web_agent_stream_emits_workspace_and_executor_binding_snapshots() {
                 "kind": "server_sandbox",
                 "display_name": "Server sandbox",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor_binding": {
                 "kind": "server_local",
@@ -1410,7 +1404,6 @@ async fn web_agent_stream_emits_workspace_and_executor_binding_snapshots() {
     assert_eq!(workspace["workspace"]["kind"], "server_sandbox");
     assert_eq!(workspace["executor"]["kind"], "server_local");
     assert_eq!(workspace["transport"], "server_local");
-    assert_eq!(workspace["fallback_policy"], "disabled");
     assert!(
         workspace["workspace"]["cwd"].as_str().is_some_and(|cwd| {
             cwd.contains("astra-workspaces") && !cwd.contains("client/claimed")
@@ -1437,7 +1430,6 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
                 "kind": "server_sandbox",
                 "display_name": "Server sandbox",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor_binding": {
                 "kind": "server_local",
@@ -1466,7 +1458,6 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
     assert_eq!(tool_call["workspace"]["kind"], "server_sandbox");
     assert_eq!(tool_call["executor"]["kind"], "server_local");
     assert_eq!(tool_call["transport"], "server_local");
-    assert_eq!(tool_call["fallback_policy"], "disabled");
     assert!(
         tool_call["workspace"]["cwd"].as_str().is_some_and(|cwd| {
             cwd.contains("astra-workspaces") && !cwd.contains("client/claimed")
@@ -1489,7 +1480,6 @@ async fn edge_executor_offline_blocks_run_before_next_llm_round() {
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/xupeng/github/astra",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor_binding": {
                 "kind": "edge_agent",
@@ -1555,7 +1545,6 @@ async fn edge_executor_offline_child_spawn_blocks_parent_before_next_llm_round()
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/xupeng/github/astra",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor_binding": {
                 "kind": "edge_agent",
@@ -3768,7 +3757,6 @@ async fn a1_run_status_all_fields_text_only() {
         Some("server-control-plane")
     );
     assert_eq!(body["transport"].as_str(), Some("server_local"));
-    assert_eq!(body["fallback_policy"].as_str(), Some("disabled"));
 }
 
 #[tokio::test]

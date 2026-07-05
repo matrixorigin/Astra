@@ -226,7 +226,6 @@ fn web_without_file_environment_provider_filters_workspace_executor_candidates()
                 display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: astra_runtime_env::WorkspaceAuthority::None,
-                fallback_policy: crate::server::tool_execution_binding::FallbackPolicy::Disabled,
             },
             &crate::server::tool_execution_binding::ExecutorBinding::server_control_plane(),
             None,

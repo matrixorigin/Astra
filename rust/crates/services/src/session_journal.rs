@@ -55,7 +55,7 @@ fn merge_execution_boundary_metadata(
     let Some(execution_metadata) = execution_metadata.and_then(serde_json::Value::as_object) else {
         return;
     };
-    for key in ["workspace", "executor", "transport", "fallback_policy"] {
+    for key in ["workspace", "executor", "transport"] {
         if let Some(value) = execution_metadata.get(key).cloned() {
             metadata.entry(key.to_string()).or_insert(value);
         }

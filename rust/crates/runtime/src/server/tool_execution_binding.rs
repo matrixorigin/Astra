@@ -6,20 +6,12 @@ use serde_json::Value;
 // Re-export canonical workspace/environment types from astra-runtime-env.
 pub use astra_runtime_env::{ExecutorStatus, WorkspaceAuthority, WorkspaceBindingKind};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FallbackPolicy {
-    /// Never route a tool call away from the selected executor.
-    Disabled,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceBinding {
     pub kind: WorkspaceBindingKind,
     pub display_name: String,
     pub cwd: Option<String>,
     pub authority: WorkspaceAuthority,
-    pub fallback_policy: FallbackPolicy,
 }
 
 impl WorkspaceBinding {
@@ -29,7 +21,6 @@ impl WorkspaceBinding {
             display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
-            fallback_policy: FallbackPolicy::Disabled,
         }
     }
 
@@ -39,7 +30,6 @@ impl WorkspaceBinding {
             display_name: "Server sandbox".to_string(),
             cwd: Some(root.as_ref().display().to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         }
     }
 
@@ -53,7 +43,6 @@ impl WorkspaceBinding {
             display_name: display_name.into(),
             cwd: Some(cwd.into()),
             authority,
-            fallback_policy: FallbackPolicy::Disabled,
         }
     }
 
@@ -63,7 +52,6 @@ impl WorkspaceBinding {
             display_name: "Cloud workspace".to_string(),
             cwd: Some(root.into()),
             authority,
-            fallback_policy: FallbackPolicy::Disabled,
         }
     }
 }
@@ -436,7 +424,6 @@ mod tests {
                 display_name: "Cloud workspace".to_string(),
                 cwd: Some("/workspace".to_string()),
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: FallbackPolicy::Disabled,
             },
             ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,
