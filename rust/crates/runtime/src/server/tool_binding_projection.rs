@@ -6,8 +6,8 @@ use astra_turn_core::tool::schema::tool_schema_name;
 use serde_json::Value;
 
 use crate::server::tool_admission::{
-    active_provider_declarations_for_binding, has_explicit_runtime_executor_provider,
-    resolve_tool_admission_for_providers,
+    ToolAdmissionContext, active_provider_declarations_for_binding,
+    has_explicit_runtime_executor_provider, resolve_tool_admission_for_providers,
 };
 
 use super::tool_execution_binding::{
@@ -23,6 +23,22 @@ pub fn capability_filter_tool_schemas_for_binding(
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> Vec<Value> {
+    capability_filter_tool_schemas_for_binding_with_context(
+        schemas,
+        workspace,
+        executor,
+        runtime,
+        ToolAdmissionContext::default(),
+    )
+}
+
+pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
+    schemas: Vec<Value>,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    admission_context: ToolAdmissionContext,
+) -> Vec<Value> {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let providers = active_provider_declarations_for_binding(
         &schemas,
@@ -30,7 +46,7 @@ pub fn capability_filter_tool_schemas_for_binding(
         executor,
         runtime,
         &registry,
-        crate::server::tool_admission::ToolAdmissionContext::default(),
+        admission_context,
     );
     schemas
         .into_iter()
@@ -88,6 +104,22 @@ pub fn capability_filter_edge_provided_tool_schemas_for_binding(
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> Vec<Value> {
     capability_filter_tool_schemas_for_binding(schemas, workspace, executor, runtime)
+}
+
+pub(crate) fn capability_filter_edge_provided_tool_schemas_for_binding_with_context(
+    schemas: Vec<Value>,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    admission_context: ToolAdmissionContext,
+) -> Vec<Value> {
+    capability_filter_tool_schemas_for_binding_with_context(
+        schemas,
+        workspace,
+        executor,
+        runtime,
+        admission_context,
+    )
 }
 
 pub fn capability_filtered_server_tool_schemas(

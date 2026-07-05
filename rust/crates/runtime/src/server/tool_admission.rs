@@ -62,9 +62,21 @@ pub(crate) struct ToolAdmissionDecision {
     pub hidden_reason: Option<ToolHiddenReason>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ToolAdmissionContext {
+    pub server_service_provider_ready: bool,
+    pub control_plane_provider_ready: bool,
     pub request_scoped_mcp_provider_ready: bool,
+}
+
+impl Default for ToolAdmissionContext {
+    fn default() -> Self {
+        Self {
+            server_service_provider_ready: true,
+            control_plane_provider_ready: true,
+            request_scoped_mcp_provider_ready: false,
+        }
+    }
 }
 
 impl ToolAdmissionDecision {
@@ -208,10 +220,19 @@ pub(crate) fn active_provider_declarations_for_binding(
     registry: &astra_runtime_env::ToolRegistry,
     context: ToolAdmissionContext,
 ) -> Vec<CapacityProviderDeclaration> {
-    let mut providers = vec![
-        astra_runtime_env::server_service_provider("server-builtin", registry),
-        astra_runtime_env::control_plane_provider("server-control-plane", registry),
-    ];
+    let mut providers = Vec::new();
+    if context.server_service_provider_ready {
+        providers.push(astra_runtime_env::server_service_provider(
+            "server-builtin",
+            registry,
+        ));
+    }
+    if context.control_plane_provider_ready {
+        providers.push(astra_runtime_env::control_plane_provider(
+            "server-control-plane",
+            registry,
+        ));
+    }
 
     if has_explicit_runtime_executor_provider(workspace, executor, runtime) {
         providers.push(astra_runtime_env::runtime_workspace_provider(
@@ -221,7 +242,8 @@ pub(crate) fn active_provider_declarations_for_binding(
         ));
     }
 
-    if context.request_scoped_mcp_provider_ready || matches!(executor.kind, ExecutorBindingKind::Mcp)
+    if context.request_scoped_mcp_provider_ready
+        || matches!(executor.kind, ExecutorBindingKind::Mcp)
     {
         providers.push(astra_runtime_env::request_scoped_mcp_provider_from_schemas(
             "request-scoped-mcp",
@@ -579,6 +601,7 @@ mod tests {
             &registry(),
             ToolAdmissionContext {
                 request_scoped_mcp_provider_ready: true,
+                ..ToolAdmissionContext::default()
             },
         );
 

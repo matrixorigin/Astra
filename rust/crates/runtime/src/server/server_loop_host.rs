@@ -37,7 +37,7 @@ use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
     ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind, WorkspaceAuthority,
     WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
-    capability_filter_edge_provided_tool_schemas_for_binding,
+    capability_filter_edge_provided_tool_schemas_for_binding_with_context,
     capability_filtered_server_tool_schemas, projected_tool_end_event_fields,
     projected_tool_start_event_fields,
 };
@@ -1082,6 +1082,8 @@ pub struct ServerAgenticLoopHost {
     server_side_tools: bool,
     /// `true` when the visible wire surface was populated from the server catalog.
     server_catalog_tool_surface: bool,
+    /// `true` when server-owned providers are configured to offer tools.
+    server_provider_catalog_enabled: bool,
     /// `true` when the connected client can answer ask_user prompts.
     interactive_client: bool,
     /// Optional request-level interaction policy override.
@@ -1518,11 +1520,16 @@ impl ServerAgenticLoopHostBuilder {
         let tool_schemas = if self.edge_tools.is_empty() {
             server_catalog_tools
         } else {
-            let mut surface = capability_filter_edge_provided_tool_schemas_for_binding(
+            let mut surface = capability_filter_edge_provided_tool_schemas_for_binding_with_context(
                 self.edge_tools,
                 &schema_workspace,
                 &schema_executor,
                 schema_runtime.as_ref(),
+                ToolAdmissionContext {
+                    server_service_provider_ready: self.server_tool_catalog_enabled,
+                    control_plane_provider_ready: self.server_tool_catalog_enabled,
+                    ..ToolAdmissionContext::default()
+                },
             );
             append_server_owned_tool_schemas_unique(
                 &mut surface,
@@ -1580,6 +1587,7 @@ impl ServerAgenticLoopHostBuilder {
             current_deferred_tool_names: HashSet::new(),
             server_side_tools,
             server_catalog_tool_surface,
+            server_provider_catalog_enabled: self.server_tool_catalog_enabled,
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
             full_llm_capture: self.full_llm_capture,
@@ -3375,6 +3383,8 @@ impl ServerAgenticLoopHost {
             self.runtime_binding.as_ref(),
             registry,
             ToolAdmissionContext {
+                server_service_provider_ready: self.server_provider_catalog_enabled,
+                control_plane_provider_ready: self.server_provider_catalog_enabled,
                 request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
             },
         )
@@ -5768,6 +5778,19 @@ mod tests {
             "function": {
                 "name": ASK_USER_TOOL_NAME,
                 "description": "Ask the user for clarification",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }));
+        tools
+    }
+
+    fn sample_edge_tools_with_web_fetch() -> Vec<Value> {
+        let mut tools = sample_edge_tools();
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch URL content from the edge runtime",
                 "parameters": { "type": "object", "properties": {} }
             }
         }));
@@ -8814,6 +8837,43 @@ mod tests {
             candidate.offer_id == "web_fetch@server-builtin"
                 && candidate.reason == "CurrentProviderPreferred"
         }));
+    }
+
+    #[test]
+    fn disabled_server_catalog_removes_server_offer_candidates_for_shared_edge_tools() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_server_tool_catalog_enabled(false)
+        .with_edge_tools(sample_edge_tools_with_web_fetch())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let admission = host.tool_admission_snapshot_entries();
+        let web_fetch = admission
+            .iter()
+            .find(|entry| entry.tool_name == "web_fetch")
+            .expect("web_fetch admission entry");
+
+        assert!(web_fetch.visible);
+        assert_eq!(
+            web_fetch.selected_offer_id.as_deref(),
+            Some("web_fetch@edge-1")
+        );
+        assert_eq!(web_fetch.selected_route, "EdgeBound");
+        assert_eq!(web_fetch.candidates.len(), 1);
+        assert_eq!(web_fetch.candidates[0].offer_id, "web_fetch@edge-1");
+        assert!(web_fetch.candidates[0].selected);
+        assert!(
+            !web_fetch
+                .candidates
+                .iter()
+                .any(|candidate| candidate.offer_id == "web_fetch@server-builtin"),
+            "disabled server catalog must remove server offer candidates"
+        );
     }
 
     #[test]
