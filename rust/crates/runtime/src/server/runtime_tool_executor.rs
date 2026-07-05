@@ -2829,7 +2829,7 @@ mod tests {
     #[test]
     fn session_history_actions_are_advertised_on_session_tool() {
         let names: std::collections::HashSet<String> =
-            crate::capabilities::server_runtime_tool_schemas(
+            crate::capabilities::server_builtin_tool_schemas(
                 &crate::capabilities::full_server_capabilities_for_tests(),
             )
             .into_iter()
@@ -2851,7 +2851,7 @@ mod tests {
             "session must be accepted by RuntimeToolExecutor"
         );
 
-        let session_schema = crate::capabilities::server_runtime_tool_schemas(
+        let session_schema = crate::capabilities::server_builtin_tool_schemas(
             &crate::capabilities::full_server_capabilities_for_tests(),
         )
         .into_iter()

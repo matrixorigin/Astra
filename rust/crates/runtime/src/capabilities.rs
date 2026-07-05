@@ -187,18 +187,6 @@ pub fn server_builtin_tool_schemas(
     schemas
 }
 
-/// Compatibility wrapper for server-owned schemas.
-///
-/// Historically this function started from `all_tool_schemas()`. That made the
-/// server registry look like it owned workspace/process tools and relied on
-/// later filters to hide them. Keep the public name for call-site stability,
-/// but make the semantics provider-declared: server builtin only.
-pub fn server_runtime_tool_schemas(
-    capabilities: &astra_turn_core::capability::CapabilitySet,
-) -> Vec<Value> {
-    server_builtin_tool_schemas(capabilities)
-}
-
 /// Runtime/workspace executor schemas that require an explicit execution
 /// provider such as edge, server sandbox, or orchestrator-managed runtime.
 pub fn runtime_executor_tool_schemas(
@@ -775,7 +763,7 @@ mod tests {
     #[test]
     fn server_executed_tool_descriptions_do_not_reference_unavailable_job_tool() {
         let caps = lifecycle_server_capabilities(true, true);
-        let server_tools = server_runtime_tool_schemas(&caps);
+        let server_tools = server_builtin_tool_schemas(&caps);
         let remote_tools = cli_remote_tool_schemas(Vec::new(), &caps);
 
         for (surface, schemas) in [("web", server_tools), ("remote", remote_tools)] {
@@ -932,7 +920,7 @@ mod tests {
     #[test]
     fn server_executed_surfaces_hide_client_only_runtime_tools() {
         let caps = full_server_capabilities_for_tests();
-        let web = names(server_runtime_tool_schemas(&caps));
+        let web = names(server_builtin_tool_schemas(&caps));
         let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
         let local = names(cli_local_tool_schemas(
             astra_tools::schemas::all_tool_schemas(),
@@ -959,7 +947,7 @@ mod tests {
     #[test]
     fn server_executed_surfaces_advertise_server_reflect_tool() {
         let caps = full_server_capabilities_for_tests();
-        let web = names(server_runtime_tool_schemas(&caps));
+        let web = names(server_builtin_tool_schemas(&caps));
         let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
         let local = names(cli_local_tool_schemas(
             astra_tools::schemas::all_tool_schemas(),
@@ -982,7 +970,7 @@ mod tests {
     #[test]
     fn server_executed_surfaces_hide_reflect_without_reflect_service_capability() {
         let caps = lifecycle_server_capabilities(true, false);
-        let web = names(server_runtime_tool_schemas(&caps));
+        let web = names(server_builtin_tool_schemas(&caps));
         let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
 
         for (surface, names) in [("web", web), ("remote", remote)] {
@@ -1014,7 +1002,7 @@ mod tests {
         assert!(caps.has(Capability::ReflectService));
 
         // Web resolve with lifecycle caps advertises agent tool
-        let tool_names = names(server_runtime_tool_schemas(&caps));
+        let tool_names = names(server_builtin_tool_schemas(&caps));
         assert!(
             tool_names.contains(&"agent".to_string()),
             "production lifecycle must advertise agent tool"
