@@ -9,7 +9,7 @@ function runtimeWithEdges(edges: Array<Record<string, unknown>>) {
 }
 
 describe("verifyLiveWorkspaceSelection", () => {
-  it("rebinds a durable edge workspace selection to the live provider for the same cwd", async () => {
+  it("rejects a stale edge provider id even when cwd and hostname match", async () => {
     const selection = {
       kind: "edge_workspace" as const,
       edgeAgentId: "edge-old-random",
@@ -29,12 +29,7 @@ describe("verifyLiveWorkspaceSelection", () => {
           },
         ]) as never,
       ),
-    ).resolves.toEqual({
-      kind: "edge_workspace",
-      edgeAgentId: "edge-new-stable",
-      displayName: "macpro.local",
-      cwd: "/Users/test/astra",
-    });
+    ).rejects.toMatchObject({ status: 409 });
   });
 
   it("prefers an exact edge id match so a wrong cwd remains a hard error", async () => {
@@ -60,11 +55,11 @@ describe("verifyLiveWorkspaceSelection", () => {
     ).rejects.toMatchObject({ status: 409 });
   });
 
-  it("does not rebind a durable edge workspace selection to a different host with the same cwd", async () => {
+  it("canonicalizes cwd and display name only after the provider id matches", async () => {
     const selection = {
       kind: "edge_workspace" as const,
-      edgeAgentId: "edge-old-random",
-      displayName: "macpro.local",
+      edgeAgentId: "edge-1",
+      displayName: "old-name",
       cwd: "/Users/test/astra",
     };
 
@@ -73,13 +68,18 @@ describe("verifyLiveWorkspaceSelection", () => {
         selection,
         runtimeWithEdges([
           {
-            edge_agent_id: "edge-other-host",
-            hostname: "other.local",
-            workspace_dir: "/Users/test/astra",
+            edge_agent_id: "edge-1",
+            hostname: "macpro.local",
+            workspace_dir: "/Users/test//astra",
             connected_secs: 2,
           },
         ]) as never,
       ),
-    ).rejects.toMatchObject({ status: 409 });
+    ).resolves.toEqual({
+      kind: "edge_workspace",
+      edgeAgentId: "edge-1",
+      displayName: "macpro.local",
+      cwd: "/Users/test//astra",
+    });
   });
 });

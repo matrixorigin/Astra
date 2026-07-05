@@ -19,42 +19,13 @@ function edgeWorkspaceMatchesSelection(
   );
 }
 
-function edgeDisplayMatchesSelection(
-  edge: EdgeStatusEntry,
-  selection: Extract<WorkspaceSelection, { kind: "edge_workspace" }>,
-) {
-  const displayName = selection.displayName?.trim();
-  if (!displayName) {
-    return true;
-  }
-  return edge.hostname?.trim() === displayName;
-}
-
-function newestConnectedFirst(left: EdgeStatusEntry, right: EdgeStatusEntry) {
-  return left.connected_secs - right.connected_secs;
-}
-
 function resolveLiveEdgeForSelection(
   edges: EdgeStatusEntry[],
   selection: Extract<WorkspaceSelection, { kind: "edge_workspace" }>,
 ) {
-  const exact = edges.find(
+  return edges.find(
     (candidate) => candidate.edge_agent_id === selection.edgeAgentId,
   );
-  if (exact) {
-    return exact;
-  }
-
-  const sameWorkspace = edges
-    .filter((candidate) => edgeWorkspaceMatchesSelection(candidate, selection))
-    .sort(newestConnectedFirst);
-  const sameDisplay = sameWorkspace.filter((candidate) =>
-    edgeDisplayMatchesSelection(candidate, selection),
-  );
-  if (selection.displayName?.trim()) {
-    return sameDisplay[0];
-  }
-  return sameWorkspace[0];
 }
 
 export async function verifyLiveWorkspaceSelection(

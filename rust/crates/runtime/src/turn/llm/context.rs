@@ -1151,6 +1151,7 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
     }
 
     let visible_names: HashSet<&str> = visible_tool_schemas.iter().filter_map(tool_name).collect();
+    let current_names: HashSet<&str> = current_tool_schemas.iter().filter_map(tool_name).collect();
     let mut stabilized = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1158,7 +1159,7 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
         let Some(name) = tool_name(schema) else {
             continue;
         };
-        if visible_names.contains(name) {
+        if visible_names.contains(name) && current_names.contains(name) {
             push_unique_tool(&mut stabilized, &mut seen, schema);
         }
     }
@@ -1479,7 +1480,7 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn stabilize_tool_schemas_keeps_prior_tools_visible_mid_turn() {
+    fn stabilize_tool_schemas_does_not_restore_currently_pruned_tools_mid_turn() {
         let visible = vec![tool("bash"), tool("read_file"), tool("git")];
         let previous = vec![tool("bash"), tool("read_file"), tool("git")];
         let current = vec![tool("bash"), tool("read_file")];
@@ -1499,7 +1500,7 @@ mod context_cache_contract_tests {
             1,
         );
 
-        assert_eq!(tool_names(&stabilized), vec!["bash", "read_file", "git"]);
+        assert_eq!(tool_names(&stabilized), vec!["bash", "read_file"]);
     }
 
     #[test]

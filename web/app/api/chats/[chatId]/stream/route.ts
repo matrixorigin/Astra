@@ -516,30 +516,6 @@ export async function POST(
   }
   const workspaceSelection =
     requestedWorkspaceSelection ?? storedWorkspaceSelection;
-  if (
-    requestedWorkspaceSelection &&
-    !sameWorkspaceSelection(
-      requestedWorkspaceSelection,
-      storedWorkspaceSelection,
-    )
-  ) {
-    try {
-      const updated = await updateChatWorkspaceSelection(
-        ownerUserId,
-        chatId,
-        requestedWorkspaceSelection,
-      );
-      if (!updated) {
-        return NextResponse.json({ error: "chat not found" }, { status: 404 });
-      }
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "failed to persist workspace selection";
-      return NextResponse.json({ error: message }, { status: 502 });
-    }
-  }
 
   let runtimeSessionId = chatId;
   const hasPriorMessages = hasMessagesBeforePendingTurn(chat);
@@ -563,13 +539,17 @@ export async function POST(
       );
       if (
         liveWorkspaceSelection &&
-        !sameWorkspaceSelection(liveWorkspaceSelection, workspaceSelection)
+        (hasRequestedWorkspace ||
+          !sameWorkspaceSelection(liveWorkspaceSelection, storedWorkspaceSelection))
       ) {
-        await updateChatWorkspaceSelection(
+        const updated = await updateChatWorkspaceSelection(
           ownerUserId,
           chatId,
           liveWorkspaceSelection,
         );
+        if (!updated) {
+          throw new Error("chat not found");
+        }
       }
       const effectiveWorkspaceSelection =
         liveWorkspaceSelection ?? null;
