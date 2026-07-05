@@ -246,13 +246,28 @@ async fn handle_edge_connection(
                                         continue;
                                     }
                                 };
-                                dispatch_inflight
-                                    .track(InflightEdgeDispatch {
-                                        user_id: row.user_id.clone(),
-                                        edge_agent_id: row.edge_agent_id.clone(),
-                                        request_id: row.request_id.clone(),
-                                    })
+                                let inflight = InflightEdgeDispatch {
+                                    user_id: row.user_id.clone(),
+                                    edge_agent_id: row.edge_agent_id.clone(),
+                                    request_id: row.request_id.clone(),
+                                };
+                                if let Err(inflight) = dispatch_inflight.track(inflight).await {
+                                    tracing::warn!(
+                                        target: "astra_runtime::edge_ws",
+                                        user_id = %inflight.user_id,
+                                        edge_agent_id = %inflight.edge_agent_id,
+                                        request_id = %inflight.request_id,
+                                        "Edge dispatch relay rejected claimed dispatch because websocket cleanup is closing"
+                                    );
+                                    fail_inflight_edge_dispatches(
+                                        dispatch_svc.as_ref(),
+                                        std::slice::from_ref(&inflight),
+                                        "edge_ws_disconnected",
+                                    )
                                     .await;
+                                    stop_dispatch = true;
+                                    break;
+                                }
                                 if send_edge_msg(&dispatch_sink, msg).await.is_err() {
                                     dispatch_inflight.remove(&row.request_id).await;
                                     tracing::warn!(
@@ -429,11 +444,13 @@ async fn handle_edge_connection(
     forward_task.abort();
     // Drop cancel sender so the dispatch task can break its loop cleanly.
     drop(dispatch_cancel_tx);
+    inflight_dispatches.close_to_new_dispatches().await;
     if tokio::time::timeout(Duration::from_millis(250), &mut dispatch_task)
         .await
         .is_err()
     {
         dispatch_task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut dispatch_task).await;
     }
     let disconnected_dispatches = inflight_dispatches.drain().await;
     fail_inflight_edge_dispatches(
@@ -467,33 +484,48 @@ struct InflightEdgeDispatch {
 
 #[derive(Clone)]
 struct InflightEdgeDispatchTracker {
-    inner: Arc<tokio::sync::Mutex<HashMap<String, InflightEdgeDispatch>>>,
+    inner: Arc<tokio::sync::Mutex<InflightEdgeDispatchState>>,
+}
+
+#[derive(Default)]
+struct InflightEdgeDispatchState {
+    closing: bool,
+    dispatches: HashMap<String, InflightEdgeDispatch>,
 }
 
 impl Default for InflightEdgeDispatchTracker {
     fn default() -> Self {
         Self {
-            inner: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            inner: Arc::new(tokio::sync::Mutex::new(InflightEdgeDispatchState::default())),
         }
     }
 }
 
 impl InflightEdgeDispatchTracker {
-    async fn track(&self, dispatch: InflightEdgeDispatch) {
-        self.inner
-            .lock()
-            .await
+    async fn track(&self, dispatch: InflightEdgeDispatch) -> Result<(), InflightEdgeDispatch> {
+        let mut state = self.inner.lock().await;
+        if state.closing {
+            return Err(dispatch);
+        }
+        state
+            .dispatches
             .insert(dispatch.request_id.clone(), dispatch);
+        Ok(())
     }
 
     async fn remove(&self, request_id: &str) -> Option<InflightEdgeDispatch> {
-        self.inner.lock().await.remove(request_id)
+        self.inner.lock().await.dispatches.remove(request_id)
+    }
+
+    async fn close_to_new_dispatches(&self) {
+        self.inner.lock().await.closing = true;
     }
 
     async fn drain(&self) -> Vec<InflightEdgeDispatch> {
         self.inner
             .lock()
             .await
+            .dispatches
             .drain()
             .map(|(_, dispatch)| dispatch)
             .collect()
@@ -550,6 +582,50 @@ async fn fail_inflight_edge_dispatches(
         }
     }
     failed
+}
+
+#[cfg(test)]
+mod inflight_dispatch_tracker_tests {
+    use super::*;
+
+    fn dispatch(request_id: &str) -> InflightEdgeDispatch {
+        InflightEdgeDispatch {
+            user_id: "user-a".to_string(),
+            edge_agent_id: "edge-a".to_string(),
+            request_id: request_id.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_close_drains_existing_and_rejects_late_dispatches() {
+        let tracker = InflightEdgeDispatchTracker::default();
+        assert!(tracker.track(dispatch("req-1")).await.is_ok());
+
+        tracker.close_to_new_dispatches().await;
+
+        let rejected = tracker.track(dispatch("req-2")).await.unwrap_err();
+        assert_eq!(rejected.request_id, "req-2");
+
+        let drained = tracker.drain().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].request_id, "req-1");
+        assert!(tracker.drain().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracker_remove_is_idempotent_before_and_after_close() {
+        let tracker = InflightEdgeDispatchTracker::default();
+        assert!(tracker.track(dispatch("req-1")).await.is_ok());
+
+        assert_eq!(
+            tracker.remove("req-1").await.map(|dispatch| dispatch.request_id),
+            Some("req-1".to_string())
+        );
+        assert!(tracker.remove("req-1").await.is_none());
+
+        tracker.close_to_new_dispatches().await;
+        assert!(tracker.remove("req-2").await.is_none());
+    }
 }
 
 async fn fail_claimed_edge_dispatch(
@@ -875,7 +951,7 @@ mod tests {
     async fn inflight_tracker_lifecycle_covers_send_fail_deliver_and_disconnect_drain() {
         let tracker = InflightEdgeDispatchTracker::default();
 
-        tracker.track(inflight_dispatch("send-failed")).await;
+        assert!(tracker.track(inflight_dispatch("send-failed")).await.is_ok());
         let removed = tracker.remove("send-failed").await;
         assert!(
             removed.is_some(),
@@ -886,7 +962,7 @@ mod tests {
             "send-failed dispatch must not be failed again during disconnect cleanup"
         );
 
-        tracker.track(inflight_dispatch("delivered")).await;
+        assert!(tracker.track(inflight_dispatch("delivered")).await.is_ok());
         let delivered = tracker.remove("delivered").await;
         assert!(
             delivered.is_some(),
@@ -897,7 +973,7 @@ mod tests {
             "delivered dispatch must not be treated as orphaned on disconnect"
         );
 
-        tracker.track(inflight_dispatch("orphaned")).await;
+        assert!(tracker.track(inflight_dispatch("orphaned")).await.is_ok());
         let drained = tracker.drain().await;
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].request_id, "orphaned");
@@ -910,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn inflight_tracker_concurrent_remove_and_disconnect_drain_consume_once() {
         let tracker = InflightEdgeDispatchTracker::default();
-        tracker.track(inflight_dispatch("race")).await;
+        assert!(tracker.track(inflight_dispatch("race")).await.is_ok());
 
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
         let remove_tracker = tracker.clone();

@@ -278,7 +278,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         server_network("web_search", ToolLoadPolicy::Deferred),
         server_network("web_fetch", ToolLoadPolicy::Deferred),
         server_network_credentials("github", ToolLoadPolicy::Deferred),
-        project_read("publish_artifact", ToolLoadPolicy::Deferred),
+        project_write("publish_artifact", ToolLoadPolicy::Deferred),
         project_read("read_file", ToolLoadPolicy::AlwaysLoad),
         project_read("list_dir", ToolLoadPolicy::AlwaysLoad),
         project_read("grep", ToolLoadPolicy::AlwaysLoad),

@@ -127,7 +127,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "下载文件",
             "预览文件",
         ],
-        intents: &[IntentType::CodeRead],
+        intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
         binding_validation: RuntimeBindingValidation::None,

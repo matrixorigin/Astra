@@ -21,11 +21,11 @@ fn is_plan_internal_authoring_tool(tool_name: &str, args: &Value) -> bool {
     match tool_name {
         "memory" => matches!(
             args.get("action").and_then(Value::as_str),
-            Some("recall" | "expand" | "profile" | "remember")
+            Some("recall" | "expand" | "profile")
         ),
         "task" => matches!(
             args.get("action").and_then(Value::as_str),
-            Some("list" | "get" | "list_user" | "create" | "update")
+            Some("list" | "get" | "list_user")
         ),
         "task_output" | "task_list" => true,
         _ => false,
@@ -100,6 +100,15 @@ mod tests {
             ("run_script", json!({"script": "touch plan.txt"})),
             ("rollback_database_snapshots", json!({})),
             ("background_shell", json!({"command": "ls rust"})),
+            (
+                "task",
+                json!({"action": "create", "title": "draft plan item"}),
+            ),
+            ("task", json!({"action": "update", "task_id": "t1"})),
+            (
+                "memory",
+                json!({"action": "remember", "content": "plan context"}),
+            ),
         ] {
             assert!(
                 is_plan_mode_blocked_tool(tool, &args),
@@ -114,15 +123,9 @@ mod tests {
             ("list_dir", json!({"path": "src"})),
             ("enter_plan_mode", json!({})),
             ("exit_plan_mode", json!({"plan": "1. inspect"})),
-            (
-                "task",
-                json!({"action": "create", "title": "draft plan item"}),
-            ),
-            ("task", json!({"action": "update", "task_id": "t1"})),
-            (
-                "memory",
-                json!({"action": "remember", "content": "plan context"}),
-            ),
+            ("task", json!({"action": "list"})),
+            ("task", json!({"action": "get", "task_id": "t1"})),
+            ("memory", json!({"action": "recall", "query": "plan context"})),
         ] {
             assert!(
                 !is_plan_mode_blocked_tool(tool, &args),

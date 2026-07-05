@@ -761,11 +761,7 @@ impl RuntimeToolExecutor {
         }
 
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
-            return if self.tool_engine.contains(name) {
-                ToolAdmission::Ready
-            } else {
-                ToolAdmission::UnknownTool
-            };
+            return ToolAdmission::UnknownTool;
         };
 
         for capability in meta.requires {
@@ -821,7 +817,7 @@ impl RuntimeToolExecutor {
             return false;
         }
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
-            return self.tool_engine.contains(name);
+            return false;
         };
         meta.requires
             .iter()
