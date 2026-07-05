@@ -26,9 +26,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::{AgentProgressEvent, ProgressEventType};
 use crate::server::tool_route_selection::{
-    ToolExecutionOwner, ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding,
-    routing_decision_for_binding, runtime_tools_route_to_edge_provider,
-    should_deliver_edge_bound_tools_via_client_ledger_for_binding, tool_execution_owner,
+    ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding, routing_decision_for_binding,
+    runtime_tools_route_to_edge_provider,
+    should_deliver_edge_bound_tools_via_client_ledger_for_binding, tool_execution_class,
 };
 use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
@@ -1664,21 +1664,10 @@ fn append_server_owned_tool_schemas_unique(
         let Some(name) = tool_schema_name(&schema) else {
             continue;
         };
-        match tool_execution_owner(name, &registry) {
-            ToolExecutionOwner::ServerControlPlane
-            | ToolExecutionOwner::ServerRuntime
-            | ToolExecutionOwner::ServiceOrRuntime
-            | ToolExecutionOwner::TurnPipelineIntercept
-                if !server_builtin_tools_enabled =>
-            {
-                continue;
-            }
-            ToolExecutionOwner::ServerControlPlane
-            | ToolExecutionOwner::ServerRuntime
-            | ToolExecutionOwner::ServiceOrRuntime
-            | ToolExecutionOwner::RequestScopedMcp
-            | ToolExecutionOwner::TurnPipelineIntercept => {}
-            _ => continue,
+        if !tool_execution_class(name, &registry)
+            .include_from_server_catalog(server_builtin_tools_enabled)
+        {
+            continue;
         }
         if seen.insert(name.to_string()) {
             surface.push(schema);

@@ -6,7 +6,7 @@ use astra_turn_core::tool::schema::tool_schema_name;
 use serde_json::Value;
 
 use crate::server::tool_route_selection::{
-    ToolExecutionOwner, ToolExecutionRouteKind, routing_decision_for_binding, tool_execution_owner,
+    ToolExecutionRouteKind, routing_decision_for_binding, tool_execution_class,
 };
 
 use super::tool_execution_binding::{
@@ -68,13 +68,8 @@ fn tool_route_is_visible_for_binding(
     _runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> bool {
     let registry = astra_runtime_env::ToolRegistry::builtins();
-    match tool_execution_owner(tool_name, &registry) {
-        ToolExecutionOwner::ServerControlPlane
-        | ToolExecutionOwner::ServerRuntime
-        | ToolExecutionOwner::RequestScopedMcp
-        | ToolExecutionOwner::TurnPipelineIntercept => return true,
-        ToolExecutionOwner::Unknown => return false,
-        ToolExecutionOwner::ServiceOrRuntime | ToolExecutionOwner::RuntimeExecutor => {}
+    if let Some(visible) = tool_execution_class(tool_name, &registry).visibility_without_route() {
+        return visible;
     }
 
     !matches!(

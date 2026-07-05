@@ -34,10 +34,10 @@ impl ToolExecutionRouteKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolExecutionOwner {
+pub(crate) enum ToolExecutionClass {
     ServerControlPlane,
-    ServerRuntime,
-    ServiceOrRuntime,
+    ServerService,
+    SharedServiceOrRuntime,
     RuntimeExecutor,
     RequestScopedMcp,
     /// Virtual turn-pipeline tools are advertised as schemas but are consumed
@@ -45,6 +45,30 @@ pub(crate) enum ToolExecutionOwner {
     /// executor, edge transport, or MCP provider.
     TurnPipelineIntercept,
     Unknown,
+}
+
+impl ToolExecutionClass {
+    pub(crate) fn include_from_server_catalog(self, server_catalog_enabled: bool) -> bool {
+        match self {
+            Self::ServerControlPlane
+            | Self::ServerService
+            | Self::SharedServiceOrRuntime
+            | Self::TurnPipelineIntercept => server_catalog_enabled,
+            Self::RequestScopedMcp => true,
+            Self::RuntimeExecutor | Self::Unknown => false,
+        }
+    }
+
+    pub(crate) fn visibility_without_route(self) -> Option<bool> {
+        match self {
+            Self::ServerControlPlane
+            | Self::ServerService
+            | Self::RequestScopedMcp
+            | Self::TurnPipelineIntercept => Some(true),
+            Self::Unknown => Some(false),
+            Self::SharedServiceOrRuntime | Self::RuntimeExecutor => None,
+        }
+    }
 }
 
 /// Server-local adapters for workspace/runtime tools.
@@ -74,30 +98,30 @@ pub(crate) fn server_local_runtime_tool_supported(tool_name: &str) -> bool {
     SERVER_LOCAL_RUNTIME_TOOL_NAMES.contains(&tool_name)
 }
 
-pub(crate) fn tool_execution_owner(
+pub(crate) fn tool_execution_class(
     tool_name: &str,
     registry: &astra_runtime_env::ToolRegistry,
-) -> ToolExecutionOwner {
+) -> ToolExecutionClass {
     if tool_name.starts_with("mcp__") {
-        return ToolExecutionOwner::RequestScopedMcp;
+        return ToolExecutionClass::RequestScopedMcp;
     }
     if is_intercepted_turn_pipeline_tool(tool_name) {
-        return ToolExecutionOwner::TurnPipelineIntercept;
+        return ToolExecutionClass::TurnPipelineIntercept;
     }
 
     let Some(spec) = registry.get(tool_name) else {
-        return ToolExecutionOwner::Unknown;
+        return ToolExecutionClass::Unknown;
     };
 
     match spec.required.executor {
-        astra_runtime_env::RequiredExecutor::ControlPlane => ToolExecutionOwner::ServerControlPlane,
-        astra_runtime_env::RequiredExecutor::ServiceExecutor => ToolExecutionOwner::ServerRuntime,
+        astra_runtime_env::RequiredExecutor::ControlPlane => ToolExecutionClass::ServerControlPlane,
+        astra_runtime_env::RequiredExecutor::ServiceExecutor => ToolExecutionClass::ServerService,
         astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor => {
-            ToolExecutionOwner::ServiceOrRuntime
+            ToolExecutionClass::SharedServiceOrRuntime
         }
-        astra_runtime_env::RequiredExecutor::McpExecutor => ToolExecutionOwner::RequestScopedMcp,
+        astra_runtime_env::RequiredExecutor::McpExecutor => ToolExecutionClass::RequestScopedMcp,
         astra_runtime_env::RequiredExecutor::RuntimeExecutor
-        | astra_runtime_env::RequiredExecutor::None => ToolExecutionOwner::RuntimeExecutor,
+        | astra_runtime_env::RequiredExecutor::None => ToolExecutionClass::RuntimeExecutor,
     }
 }
 
@@ -124,39 +148,49 @@ pub(crate) fn routing_decision_for_binding(
     executor_transport: ToolTransportKind,
     registry: &astra_runtime_env::ToolRegistry,
 ) -> ToolExecutionRouteKind {
-    match tool_execution_owner(tool_name, registry) {
-        ToolExecutionOwner::ServerControlPlane => {
+    match tool_execution_class(tool_name, registry) {
+        ToolExecutionClass::ServerControlPlane => {
             return ToolExecutionRouteKind::ServerControlPlane;
         }
-        ToolExecutionOwner::ServerRuntime => return ToolExecutionRouteKind::ServerRuntime,
-        ToolExecutionOwner::RequestScopedMcp => return ToolExecutionRouteKind::RequestScopedMcp,
-        ToolExecutionOwner::TurnPipelineIntercept | ToolExecutionOwner::Unknown => {
+        ToolExecutionClass::ServerService => return ToolExecutionRouteKind::ServerRuntime,
+        ToolExecutionClass::RequestScopedMcp => return ToolExecutionRouteKind::RequestScopedMcp,
+        ToolExecutionClass::TurnPipelineIntercept | ToolExecutionClass::Unknown => {
             return ToolExecutionRouteKind::Unsupported;
         }
-        ToolExecutionOwner::ServiceOrRuntime => {
-            if matches!(executor_transport, ToolTransportKind::GatewayRelay) {
-                return ToolExecutionRouteKind::GatewayRelay;
-            }
-            if matches!(executor_transport, ToolTransportKind::SandboxResidentAgent) {
-                return ToolExecutionRouteKind::SandboxResidentAgent;
-            }
-            return match workspace_kind {
-                WorkspaceBindingKind::EdgeWorkspace => ToolExecutionRouteKind::EdgeBound,
-                WorkspaceBindingKind::ServerSandbox
-                    if server_local_runtime_tool_supported(tool_name) =>
-                {
-                    ToolExecutionRouteKind::ServerLocal
-                }
-                WorkspaceBindingKind::LocalFilesystem => ToolExecutionRouteKind::Unsupported,
-                WorkspaceBindingKind::CloudWorkspace
-                | WorkspaceBindingKind::None
-                | WorkspaceBindingKind::Unknown
-                | WorkspaceBindingKind::ServerSandbox => ToolExecutionRouteKind::ServerRuntime,
-            };
+        ToolExecutionClass::SharedServiceOrRuntime => {
+            return shared_service_or_runtime_route_for_binding(
+                tool_name,
+                workspace_kind,
+                executor_transport,
+            );
         }
-        ToolExecutionOwner::RuntimeExecutor => {}
+        ToolExecutionClass::RuntimeExecutor => {}
     }
 
+    runtime_executor_route_for_binding(tool_name, workspace_kind, executor_transport)
+}
+
+fn shared_service_or_runtime_route_for_binding(
+    tool_name: &str,
+    workspace_kind: WorkspaceBindingKind,
+    executor_transport: ToolTransportKind,
+) -> ToolExecutionRouteKind {
+    match runtime_executor_route_for_binding(tool_name, workspace_kind, executor_transport) {
+        ToolExecutionRouteKind::Unsupported
+            if matches!(workspace_kind, WorkspaceBindingKind::LocalFilesystem) =>
+        {
+            ToolExecutionRouteKind::Unsupported
+        }
+        ToolExecutionRouteKind::Unsupported => ToolExecutionRouteKind::ServerRuntime,
+        runtime_route => runtime_route,
+    }
+}
+
+fn runtime_executor_route_for_binding(
+    tool_name: &str,
+    workspace_kind: WorkspaceBindingKind,
+    executor_transport: ToolTransportKind,
+) -> ToolExecutionRouteKind {
     if matches!(executor_transport, ToolTransportKind::GatewayRelay) {
         return ToolExecutionRouteKind::GatewayRelay;
     }
@@ -273,8 +307,8 @@ mod tests {
     #[test]
     fn turn_pipeline_intercept_is_not_an_executor_owner() {
         assert_eq!(
-            tool_execution_owner(crate::turn::skill_tool::SKILL_TOOL_NAME, &registry()),
-            ToolExecutionOwner::TurnPipelineIntercept
+            tool_execution_class(crate::turn::skill_tool::SKILL_TOOL_NAME, &registry()),
+            ToolExecutionClass::TurnPipelineIntercept
         );
         assert_eq!(
             routing_decision_for_binding(
