@@ -117,7 +117,8 @@ impl DeploymentConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
-        validate_tool_offer_ids(&self.disabled_tool_offers)
+        validate_tool_offer_ids(&self.disabled_tool_offers)?;
+        validate_provider_allowed_tools(&self.provider_allowed_tools)
     }
 }
 
@@ -147,6 +148,26 @@ fn is_valid_tool_offer_tool_name(value: &str) -> bool {
 
 fn is_valid_tool_offer_provider_id(value: &str) -> bool {
     is_valid_tool_offer_identifier_part(value, true)
+}
+
+fn validate_provider_allowed_tools(
+    provider_allowed_tools: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    for (provider_id, tool_names) in provider_allowed_tools {
+        if !is_valid_tool_offer_provider_id(provider_id) {
+            return Err(format!(
+                "provider_allowed_tools keys must be concrete provider ids (got '{provider_id}')"
+            ));
+        }
+        for tool_name in tool_names {
+            if !is_valid_tool_offer_tool_name(tool_name) {
+                return Err(format!(
+                    "provider_allowed_tools values must be canonical tool names (got '{tool_name}' for provider '{provider_id}')"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_valid_tool_offer_identifier_part(value: &str, provider: bool) -> bool {
@@ -2167,6 +2188,33 @@ auth_mode = "legacy"
                 "disabled_tool_offers must reject ambiguous offer id {offer_id:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn deployment_rejects_ambiguous_provider_allowed_tools_entries() {
+        let invalid_provider = r#"
+            [deployment.provider_allowed_tools]
+            "edge@macpro" = ["bash"]
+            "#;
+        let error = ServerConfig::parse(invalid_provider).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("provider_allowed_tools keys must be concrete provider ids"),
+            "provider_allowed_tools must reject ambiguous provider ids: {error}"
+        );
+
+        let invalid_tool = r#"
+            [deployment.provider_allowed_tools]
+            "edge:macpro" = ["web.fetch"]
+            "#;
+        let error = ServerConfig::parse(invalid_tool).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("provider_allowed_tools values must be canonical tool names"),
+            "provider_allowed_tools must reject ambiguous tool names: {error}"
+        );
     }
 
     #[test]
