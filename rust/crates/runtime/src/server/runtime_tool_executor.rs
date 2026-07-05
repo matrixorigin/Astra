@@ -808,7 +808,7 @@ impl RuntimeToolExecutor {
 
     fn executor_tool_readiness_for_call(&self, name: &str, args: &Value) -> ExecutorToolReadiness {
         if name.starts_with("mcp__") {
-            if let Some(reason) = self.request_scoped_mcp_policy_denial(name) {
+            if let Some(reason) = self.request_scoped_mcp_admission_policy_denial(name) {
                 return ExecutorToolReadiness::RuntimeEnvironmentDenied(reason);
             }
             return self.mcp_executor_tool_readiness(name);
@@ -931,29 +931,37 @@ impl RuntimeToolExecutor {
         )
     }
 
-    fn request_scoped_mcp_policy_denial(
+    fn request_scoped_mcp_admission_policy_denial(
         &self,
         name: &str,
     ) -> Option<astra_runtime_env::ToolUnavailableReason> {
-        let context = self
-            .tool_execution_service
-            .tool_admission_context_snapshot();
-        let offer_id = astra_runtime_env::tool_offer_id(name, "request-scoped-mcp");
-        if context.disabled_tool_offers.contains(&offer_id) {
-            return Some(astra_runtime_env::ToolUnavailableReason::PolicyDenied(
-                "tool offer disabled by policy".to_string(),
-            ));
+        let schemas =
+            self.request_scoped_mcp_schemas_snapshot("request_scoped_mcp_policy_admission");
+        if schemas.is_empty() {
+            return None;
         }
-        if context
-            .provider_allowed_tools
-            .get("request-scoped-mcp")
-            .is_some_and(|allowed| !allowed.contains(name))
-        {
-            return Some(astra_runtime_env::ToolUnavailableReason::PolicyDenied(
-                "tool not allowed for selected provider".to_string(),
-            ));
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let executor = ExecutorBinding::request_scoped_mcp();
+        let mut context = self.tool_admission_context();
+        context.request_scoped_mcp_provider_ready = true;
+        let decision =
+            crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
+                name,
+                &schemas,
+                &WorkspaceBinding::none(),
+                &executor,
+                None,
+                &registry,
+                context,
+            );
+        match decision.hidden_reason {
+            Some(
+                ToolHiddenReason::DisabledOffer
+                | ToolHiddenReason::ProviderToolNotAllowed
+                | ToolHiddenReason::SchemaConflict,
+            ) => admission_hidden_reason_to_unavailable(decision.hidden_reason),
+            _ => None,
         }
-        None
     }
 
     fn mcp_executor_tool_readiness(&self, name: &str) -> ExecutorToolReadiness {
@@ -5487,6 +5495,32 @@ esac
             result.output
         );
         assert_eq!(parsed["missing"][0].as_str(), Some("mcp__calculator"));
+    }
+
+    #[tokio::test]
+    async fn disabled_request_scoped_mcp_offer_without_schema_does_not_create_offer() {
+        let (mut exec, _dir) = test_executor();
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_disabled_tool_offers(&["mcp__ghost__query@request-scoped-mcp".to_string()])
+                .build(),
+        );
+
+        assert!(
+            !exec.tool_runtime_ready("mcp__ghost__query"),
+            "a disabled selector must not synthesize a request-scoped MCP offer"
+        );
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__ghost__query"}))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "disabled selector without a schema must not synthesize a request-scoped MCP offer: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("mcp__ghost__query"));
     }
 
     #[tokio::test]
