@@ -523,6 +523,31 @@ mod tests {
     }
 
     #[test]
+    fn keyword_search_cannot_return_tools_outside_schema_pool() {
+        let schemas = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "description": "Search the current tool surface"
+            }
+        })];
+        let parsed = parse_result(&tool_search(
+            &schemas,
+            &json!({"query": "mo_query powershell database shell"}),
+        ));
+
+        assert_eq!(parsed["mode"].as_str(), Some("keyword"));
+        assert_eq!(parsed["total_tools"].as_u64(), Some(1));
+        let names = match_names(&parsed);
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "mo_query" || name == "powershell"),
+            "tool_search must rank only schemas provided by the current runtime surface: {parsed}"
+        );
+    }
+
+    #[test]
     fn select_mode_exact_match_returns_compact_schema() {
         let schemas = sample_schemas();
 

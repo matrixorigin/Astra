@@ -765,6 +765,34 @@ mod tests {
         assert!(!out.is_empty());
         assert!(report.visible_count > 0);
     }
+
+    #[test]
+    fn text_triggers_do_not_promote_deferred_or_unowned_tools() {
+        let schemas: Vec<Value> = TOOL_CATALOG
+            .iter()
+            .map(|tool| sample_schema(tool.name))
+            .collect();
+        let registry = ToolRegistry::new(schemas);
+
+        let (out, report) = registry.build_initial_surface_with_report_ctx(
+            "please use mo_query and powershell to inspect the database",
+            800,
+            &[],
+        );
+        let names = ToolRegistry::visible_names(&out);
+
+        assert!(
+            names.contains(&"tool_search".to_string()),
+            "tool_search should remain the explicit activation path: {names:?}"
+        );
+        for hidden in ["mo_query", "rollback_database_snapshots", "powershell"] {
+            assert!(
+                !names.contains(&hidden.to_string()),
+                "{hidden} must not become visible merely because the user text mentioned it"
+            );
+        }
+        assert_eq!(report.visible_count as usize, out.len());
+    }
 }
 
 #[cfg(test)]
