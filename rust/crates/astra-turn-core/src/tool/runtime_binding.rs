@@ -1,4 +1,5 @@
 use crate::capability::Capability;
+use astra_core::tool_offer::is_mcp_namespaced_tool_name;
 
 /// Whether a tool name is known to require a live runtime binding before it can
 /// execute.
@@ -7,7 +8,7 @@ use crate::capability::Capability;
 /// lets dispatch paths classify stale direct calls from resumed sessions as a
 /// missing binding instead of as a generic unknown/deferred-tool mistake.
 pub fn tool_name_requires_runtime_binding(name: &str) -> bool {
-    if name.starts_with("mcp__") {
+    if is_mcp_namespaced_tool_name(name) {
         return true;
     }
 
@@ -39,7 +40,7 @@ pub fn tool_name_requires_executor_binding(name: &str) -> bool {
 /// This intentionally names the real recovery path. `tool_search` can only
 /// select from runtimes that are already connected in the current turn.
 pub fn runtime_binding_denial_message(name: &str, action: Option<&str>) -> String {
-    if name.starts_with("mcp__") {
+    if is_mcp_namespaced_tool_name(name) {
         return format!(
             "Tool `{name}` is not available in this turn because no connected MCP server \
              currently provides it. Calling `tool_search(query=\"select:{name}\")` cannot \
@@ -96,6 +97,8 @@ mod tests {
         assert!(tool_name_requires_runtime_binding("agent_fanout"));
         assert!(tool_name_requires_runtime_binding("agent"));
         assert!(tool_name_requires_runtime_binding("mcp__weather"));
+        assert!(!tool_name_requires_runtime_binding("mcp__"));
+        assert!(!tool_name_requires_runtime_binding("mcp__bad/name"));
         assert!(!tool_name_requires_runtime_binding("github"));
         assert!(!tool_name_requires_runtime_binding("reflect"));
         assert!(!tool_name_requires_runtime_binding("definitely_unknown"));
@@ -156,5 +159,16 @@ mod tests {
             message.contains("cannot make it executable until that runtime is available"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn invalid_mcp_shaped_names_do_not_get_mcp_recovery_guidance() {
+        let message = runtime_binding_denial_message("mcp__bad/name", None);
+
+        assert!(
+            message.contains("required runtime capability is not connected"),
+            "{message}"
+        );
+        assert!(!message.contains("no connected MCP server"), "{message}");
     }
 }

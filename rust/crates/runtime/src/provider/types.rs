@@ -3,6 +3,7 @@
 //! These types describe *what* a provider can do and *what kind* of provider
 //! it is. They form the vocabulary used by the capability registry at L1.
 
+use astra_core::tool_offer::is_mcp_namespaced_tool_name;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -95,7 +96,7 @@ impl ToolCategory {
             "task_output" | "task_stop" | "task_list" => Some(Self::BackgroundTaskProcess),
             "agent" | "agent_fanout" => Some(Self::AgentDelegation),
             "symbols" | "lsp" | "find_definition" | "find_references" => Some(Self::Symbols),
-            _ if name.starts_with("mcp__") => Some(Self::McpProtocol),
+            _ if is_mcp_namespaced_tool_name(name) => Some(Self::McpProtocol),
             _ => None,
         }
     }
@@ -151,6 +152,8 @@ mod tests {
             ToolCategory::for_tool_name("mcp__node_repl__js"),
             Some(ToolCategory::McpProtocol)
         );
+        assert_eq!(ToolCategory::for_tool_name("mcp__"), None);
+        assert_eq!(ToolCategory::for_tool_name("mcp__bad/name"), None);
         assert_eq!(ToolCategory::for_tool_name("unknown_tool"), None);
     }
 }
