@@ -719,14 +719,14 @@ fn validate_runtime_tool_name(
             ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(tool_name)),
         ));
     }
-    let capability_check =
-        CapabilityResolver.check_tool(registry, tool_name, &binding.capabilities);
-    if matches!(capability_check, Err(ToolUnavailableReason::UnknownTool)) {
-        return capability_check
-            .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason));
-    }
-    validate_tool_surface_admission(binding, tool_name)?;
-    capability_check.map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
+    CapabilityResolver
+        .check_tool_for_surface(
+            registry,
+            tool_name,
+            &binding.capabilities,
+            &binding.tool_surface,
+        )
+        .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
 }
 
 fn validate_runtime_tool_call(
@@ -741,39 +741,15 @@ fn validate_runtime_tool_call(
             ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(tool_name)),
         ));
     }
-    let capability_check =
-        CapabilityResolver.check_tool_call(registry, tool_name, args, &binding.capabilities);
-    if matches!(capability_check, Err(ToolUnavailableReason::UnknownTool)) {
-        return capability_check
-            .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason));
-    }
-    validate_tool_surface_admission(binding, tool_name)?;
-    capability_check.map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
-}
-
-fn validate_tool_surface_admission(
-    binding: &RunBinding,
-    tool_name: &str,
-) -> Result<(), RuntimeError> {
-    if binding.tool_surface.contains(tool_name) {
-        return Ok(());
-    }
-    let reason = binding
-        .tool_surface
-        .denial_for(tool_name)
-        .cloned()
-        .or_else(|| {
-            binding
-                .tool_surface
-                .admission_for(tool_name)
-                .and_then(|admission| admission.hidden_reason.clone())
-        })
-        .unwrap_or_else(|| {
-            ToolUnavailableReason::ExecutorUnavailable(
-                "tool_not_selected_by_current_provider_surface".to_string(),
-            )
-        });
-    Err(RuntimeError::tool_unavailable(tool_name, reason))
+    CapabilityResolver
+        .check_tool_call_for_surface(
+            registry,
+            tool_name,
+            args,
+            &binding.capabilities,
+            &binding.tool_surface,
+        )
+        .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
 }
 
 #[async_trait]

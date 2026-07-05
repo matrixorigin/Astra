@@ -1582,7 +1582,13 @@ impl ToolExecutor {
         }
         let binding = self.runtime_environment_binding_for_tool(name, registry);
         astra_runtime_env::CapabilityResolver
-            .check_tool_call(registry, name, args, &binding.capabilities)
+            .check_tool_call_for_surface(
+                registry,
+                name,
+                args,
+                &binding.capabilities,
+                &binding.tool_surface,
+            )
             .err()
     }
 

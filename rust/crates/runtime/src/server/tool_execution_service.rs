@@ -489,11 +489,12 @@ impl ToolExecutionService {
                 ),
             )));
         }
-        match astra_runtime_env::CapabilityResolver.check_tool_call(
+        match astra_runtime_env::CapabilityResolver.check_tool_call_for_surface(
             &self.tool_registry,
             &request.tool_name,
             &request.args,
             &binding.capabilities,
+            &binding.tool_surface,
         ) {
             Ok(()) => Ok(binding),
             Err(reason) => Err(Box::new((binding, reason))),

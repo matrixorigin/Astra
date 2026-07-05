@@ -136,11 +136,12 @@ fn edge_result_runtime_environment_denial(execution: &HeadlessResolvedExecution)
         ));
     }
     astra_runtime_env::CapabilityResolver
-        .check_tool_call(
+        .check_tool_call_for_surface(
             &registry,
             &execution.name,
             &execution.args,
             &advertisement.binding.capabilities,
+            &advertisement.binding.tool_surface,
         )
         .err()
         .map(|reason| {
@@ -1085,6 +1086,54 @@ mod tests {
             pipeline.ctx.tool_results[0]
                 .to_string()
                 .contains("edge runtime capability denied"),
+            "got: {}",
+            pipeline.ctx.tool_results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn permit_execution_blocks_edge_result_when_tool_is_not_in_advertised_surface() {
+        let mut harness = PipelineHarness::new();
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut binding =
+            astra_runtime_env::RunBinding::edge_developer("/workspace/project", &registry);
+        assert!(
+            astra_runtime_env::CapabilityResolver
+                .check_tool_call(
+                    &registry,
+                    "grep",
+                    &json!({ "pattern": "headless" }),
+                    &binding.capabilities,
+                )
+                .is_ok(),
+            "test setup must keep aggregate capability available"
+        );
+        binding
+            .tool_surface
+            .tool_names
+            .retain(|name| name != "grep");
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(binding);
+        harness.edge_tool_round[0].tool_result_fields = Some(Map::from_iter([(
+            EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD.to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )]));
+        begin_recorded_turn(&mut harness, 1);
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::ShortCircuit => {}
+            _ => panic!("expected edge runtime surface denial"),
+        }
+        assert_eq!(pipeline.ctx.tool_results.len(), 1);
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("tool_not_selected_by_current_provider_surface"),
             "got: {}",
             pipeline.ctx.tool_results[0]
         );

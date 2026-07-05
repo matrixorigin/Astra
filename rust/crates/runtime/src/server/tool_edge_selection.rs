@@ -118,11 +118,12 @@ fn edge_advertised_tool_check(
         ))
     })?;
     astra_runtime_env::CapabilityResolver
-        .check_tool_call(
+        .check_tool_call_for_surface(
             registry,
             &request.tool_name,
             &request.args,
             &advert.binding.capabilities,
+            &advert.binding.tool_surface,
         )
         .map_err(|reason| Box::new((advert.binding, reason)))
 }

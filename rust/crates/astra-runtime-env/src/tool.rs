@@ -643,6 +643,17 @@ impl CapabilityResolver {
         self.check(spec, capabilities)
     }
 
+    pub fn check_tool_for_surface(
+        &self,
+        registry: &ToolRegistry,
+        tool_name: &str,
+        capabilities: &EffectiveCapabilitySet,
+        surface: &AvailableToolSurface,
+    ) -> Result<(), ToolUnavailableReason> {
+        check_surface_admits_tool(tool_name, surface)?;
+        self.check_tool(registry, tool_name, capabilities)
+    }
+
     pub fn check_tool_call(
         &self,
         registry: &ToolRegistry,
@@ -664,6 +675,22 @@ impl CapabilityResolver {
             .or(dynamic_spec.as_ref())
             .ok_or(ToolUnavailableReason::UnknownTool)?;
         self.check(spec, capabilities)
+    }
+
+    pub fn check_tool_call_for_surface(
+        &self,
+        registry: &ToolRegistry,
+        tool_name: &str,
+        args: &Value,
+        capabilities: &EffectiveCapabilitySet,
+        surface: &AvailableToolSurface,
+    ) -> Result<(), ToolUnavailableReason> {
+        let capability_check = self.check_tool_call(registry, tool_name, args, capabilities);
+        if matches!(capability_check, Err(ToolUnavailableReason::UnknownTool)) {
+            return capability_check;
+        }
+        check_surface_admits_tool(tool_name, surface)?;
+        capability_check
     }
 
     pub fn check(
@@ -820,6 +847,28 @@ impl CapabilityResolver {
 
         Ok(())
     }
+}
+
+fn check_surface_admits_tool(
+    tool_name: &str,
+    surface: &AvailableToolSurface,
+) -> Result<(), ToolUnavailableReason> {
+    if surface.contains(tool_name) {
+        return Ok(());
+    }
+    Err(surface
+        .denial_for(tool_name)
+        .cloned()
+        .or_else(|| {
+            surface
+                .admission_for(tool_name)
+                .and_then(|admission| admission.hidden_reason.clone())
+        })
+        .unwrap_or_else(|| {
+            ToolUnavailableReason::ExecutorUnavailable(
+                "tool_not_selected_by_current_provider_surface".to_string(),
+            )
+        }))
 }
 
 fn selected_provider_for_tool<'a>(
