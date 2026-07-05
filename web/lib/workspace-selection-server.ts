@@ -51,7 +51,10 @@ function resolveLiveEdgeForSelection(
   const sameDisplay = sameWorkspace.filter((candidate) =>
     edgeDisplayMatchesSelection(candidate, selection),
   );
-  return sameDisplay[0] ?? sameWorkspace[0];
+  if (selection.displayName?.trim()) {
+    return sameDisplay[0];
+  }
+  return sameWorkspace[0];
 }
 
 export async function verifyLiveWorkspaceSelection(

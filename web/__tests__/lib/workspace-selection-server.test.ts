@@ -59,4 +59,27 @@ describe("verifyLiveWorkspaceSelection", () => {
       ),
     ).rejects.toMatchObject({ status: 409 });
   });
+
+  it("does not rebind a durable edge workspace selection to a different host with the same cwd", async () => {
+    const selection = {
+      kind: "edge_workspace" as const,
+      edgeAgentId: "edge-old-random",
+      displayName: "macpro.local",
+      cwd: "/Users/test/astra",
+    };
+
+    await expect(
+      verifyLiveWorkspaceSelection(
+        selection,
+        runtimeWithEdges([
+          {
+            edge_agent_id: "edge-other-host",
+            hostname: "other.local",
+            workspace_dir: "/Users/test/astra",
+            connected_secs: 2,
+          },
+        ]) as never,
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+  });
 });
