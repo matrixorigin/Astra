@@ -354,13 +354,7 @@ fn server_runtime_event_fields() -> Map<String, Value> {
 }
 
 fn request_scoped_mcp_event_fields(workspace: &WorkspaceBinding) -> Map<String, Value> {
-    let executor = ExecutorBinding {
-        kind: ExecutorBindingKind::Mcp,
-        executor_id: "request-scoped-mcp".to_string(),
-        display_name: "MCP server".to_string(),
-        transport: ToolTransportKind::McpHttp,
-        status: ExecutorStatus::Unknown,
-    };
+    let executor = ExecutorBinding::request_scoped_mcp();
     binding_event_fields(workspace, &executor)
 }
 
@@ -376,9 +370,9 @@ fn request_scoped_mcp_event_fields_from_metadata(
         json!({
             "kind": "mcp",
             "executor_id": "request-scoped-mcp",
-            "display_name": "MCP server",
+            "display_name": "Request-scoped MCP",
             "transport": "mcp_http",
-            "status": "unknown",
+            "status": "online",
         }),
     );
     fields.insert(

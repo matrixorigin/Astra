@@ -11023,7 +11023,7 @@ mod tests {
         assert_eq!(event["workspace"]["cwd"], "/Users/test/project");
         assert_eq!(event["executor"]["kind"], "mcp");
         assert_eq!(event["executor"]["executor_id"], "request-scoped-mcp");
-        assert_eq!(event["executor"]["display_name"], "MCP server");
+        assert_eq!(event["executor"]["display_name"], "Request-scoped MCP");
         assert_eq!(event["transport"], "mcp_http");
     }
 

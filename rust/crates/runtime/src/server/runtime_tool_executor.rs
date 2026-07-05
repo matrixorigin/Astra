@@ -665,9 +665,9 @@ impl RuntimeToolExecutor {
                     crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
                         name,
                         &schemas,
-                        self.execution_binding.workspace(),
-                        self.execution_binding.executor(),
-                        self.execution_binding.runtime(),
+                        &WorkspaceBinding::none(),
+                        &ExecutorBinding::request_scoped_mcp(),
+                        None,
                         &registry,
                         context.clone(),
                     )
@@ -1337,8 +1337,19 @@ impl RuntimeToolExecutor {
     }
 
     fn tool_execution_request(&self, name: &str, args: &Value) -> ToolExecutionRequest {
-        self.execution_binding
-            .tool_execution_request(&self.user_id, &self.session_id, name, args)
+        let mut request = self.execution_binding.tool_execution_request(
+            &self.user_id,
+            &self.session_id,
+            name,
+            args,
+        );
+        if name.starts_with("mcp__") {
+            request.workspace = WorkspaceBinding::none();
+            request.workspace_record = None;
+            request.executor = ExecutorBinding::request_scoped_mcp();
+            request.runtime = None;
+        }
+        request
     }
 
     /// Swap the in-memory task store for a shared one (MatrixOne in
@@ -4090,7 +4101,7 @@ esac
         let metadata = result.metadata.as_ref().expect("mcp metadata");
         assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
         assert_eq!(metadata["executor"]["kind"], "mcp");
-        assert_eq!(metadata["executor"]["display_name"], "MCP server");
+        assert_eq!(metadata["executor"]["display_name"], "Request-scoped MCP");
         assert_eq!(metadata["transport"], "mcp_http");
 
         let mut events = Vec::new();

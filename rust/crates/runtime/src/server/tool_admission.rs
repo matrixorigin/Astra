@@ -155,8 +155,9 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     context: &ToolAdmissionContext,
 ) -> ToolAdmissionDecision {
     let class = tool_execution_class(tool_name, registry);
-    let route =
-        routing_decision_for_binding(tool_name, workspace.kind, executor.transport, registry);
+    let route = admission_route_for_binding_and_providers(
+        tool_name, workspace, executor, providers, registry,
+    );
 
     let mut raw_candidates = if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
         Vec::new()
@@ -282,6 +283,26 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
         route,
         hidden_reason,
     }
+}
+
+fn admission_route_for_binding_and_providers(
+    tool_name: &str,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    providers: &[CapacityProviderDeclaration],
+    registry: &astra_runtime_env::ToolRegistry,
+) -> ToolExecutionRouteKind {
+    let binding_route =
+        routing_decision_for_binding(tool_name, workspace.kind, executor.transport, registry);
+    if !matches!(binding_route, ToolExecutionRouteKind::Unsupported) {
+        return binding_route;
+    }
+
+    providers
+        .iter()
+        .find(|provider| provider.declares_tool(tool_name))
+        .map(|provider| route_for_provider_type(provider.provider_type, workspace.kind))
+        .unwrap_or(binding_route)
 }
 
 pub(crate) fn active_provider_declarations_for_binding(
@@ -833,8 +854,11 @@ mod tests {
         );
 
         assert!(!decision.visible);
-        assert_eq!(decision.route, ToolExecutionRouteKind::RequestScopedMcp);
-        assert_eq!(decision.hidden_reason, Some(ToolHiddenReason::NoProvider));
+        assert_eq!(decision.route, ToolExecutionRouteKind::Unsupported);
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::UnsupportedRoute)
+        );
         assert!(decision.selected_offer.is_none());
         assert!(decision.candidates.is_empty());
     }
@@ -850,6 +874,45 @@ mod tests {
             &schemas,
             &WorkspaceBinding::none(),
             &ExecutorBinding::server_local(),
+            None,
+            &registry(),
+            ToolAdmissionContext {
+                request_scoped_mcp_provider_ready: true,
+                ..ToolAdmissionContext::default()
+            },
+        );
+
+        assert!(decision.visible);
+        assert_eq!(decision.route, ToolExecutionRouteKind::RequestScopedMcp);
+        assert_eq!(
+            decision.selected_offer_id(),
+            Some("mcp__github__search@request-scoped-mcp")
+        );
+        let offer = decision.selected_offer.expect("selected offer");
+        assert_eq!(offer.provider_type, CapacityProviderType::RequestScopedMcp);
+        assert_eq!(offer.placement, "request");
+        assert_eq!(offer.scope, "request");
+        assert_eq!(offer.authority, "none");
+        assert!(offer.schema_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn request_scoped_mcp_tool_is_visible_with_explicit_mcp_executor() {
+        let schemas = vec![json!({
+            "type": "function",
+            "function": { "name": "mcp__github__search" }
+        })];
+        let decision = resolve_tool_admission_for_binding_with_context(
+            "mcp__github__search",
+            &schemas,
+            &WorkspaceBinding::none(),
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::Mcp,
+                executor_id: "request-scoped-mcp".to_string(),
+                display_name: "Request-scoped MCP".to_string(),
+                transport: ToolTransportKind::McpHttp,
+                status: ExecutorStatus::Online,
+            },
             None,
             &registry(),
             ToolAdmissionContext {

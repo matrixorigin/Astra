@@ -208,7 +208,7 @@ pub(crate) fn runtime_environment_binding_for_parts(
     let workspace_binding = runtime_env_workspace_binding(workspace);
     let executor_binding = runtime_env_executor_binding(tool_name, workspace, executor);
     let policy_intent = runtime_env_policy_intent(workspace, policy);
-    if tool_name.starts_with("mcp__") {
+    if is_explicit_request_scoped_mcp_binding(tool_name, executor) {
         let providers = vec![astra_runtime_env::request_scoped_mcp_provider(
             "request-scoped-mcp",
             [tool_name.to_string()],
@@ -229,6 +229,10 @@ pub(crate) fn runtime_environment_binding_for_parts(
         policy_intent,
         registry,
     )
+}
+
+fn is_explicit_request_scoped_mcp_binding(tool_name: &str, executor: &ExecutorBinding) -> bool {
+    tool_name.starts_with("mcp__") && matches!(executor.kind, ExecutorBindingKind::Mcp)
 }
 
 fn runtime_env_workspace_binding(
@@ -268,7 +272,7 @@ fn runtime_env_executor_binding(
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
 ) -> astra_runtime_env::ExecutorBinding {
-    let request_scoped_mcp = tool_name.starts_with("mcp__");
+    let request_scoped_mcp = is_explicit_request_scoped_mcp_binding(tool_name, executor);
     let server_owned_tool =
         is_server_control_plane_tool(tool_name) || is_server_runtime_tool(tool_name);
     let no_workspace_control_plane = matches!(workspace.kind, WorkspaceBindingKind::None)
@@ -323,7 +327,7 @@ fn runtime_env_executor_binding(
             executor.executor_id.clone()
         },
         display_name: if request_scoped_mcp {
-            "MCP server".to_string()
+            "Request-scoped MCP".to_string()
         } else if server_owned_tool {
             "Server runtime".to_string()
         } else {

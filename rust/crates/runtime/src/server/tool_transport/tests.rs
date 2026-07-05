@@ -1181,17 +1181,12 @@ fn server_sandbox_binding_reports_host_process_runtime_not_provider_runtime() {
 }
 
 #[tokio::test]
-async fn no_file_environment_mcp_retrieve_runs_as_request_scoped_mcp_without_runtime() {
+async fn mcp_prefixed_tool_is_not_request_scoped_mcp_without_explicit_executor() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let request = request(
         "mcp__rag__retrieve",
-        WorkspaceBinding {
-            kind: WorkspaceBindingKind::None,
-            display_name: "No file environment".to_string(),
-            cwd: None,
-            authority: WorkspaceAuthority::None,
-        },
+        WorkspaceBinding::none(),
         ExecutorBinding::server_local(),
     );
     let registry = astra_runtime_env::ToolRegistry::builtins();
@@ -1199,11 +1194,12 @@ async fn no_file_environment_mcp_retrieve_runs_as_request_scoped_mcp_without_run
 
     assert_eq!(
         service.routing_decision(&request),
-        ToolExecutionRouteKind::RequestScopedMcp
+        ToolExecutionRouteKind::Unsupported
     );
-    assert_eq!(
+    assert_ne!(
         binding.executor.kind,
-        astra_runtime_env::ExecutorBindingKind::RequestScopedMcp
+        astra_runtime_env::ExecutorBindingKind::RequestScopedMcp,
+        "mcp__ prefix alone must not synthesize a request-scoped MCP executor"
     );
     assert_eq!(
         binding.runtime.session_manager,
@@ -1213,25 +1209,31 @@ async fn no_file_environment_mcp_retrieve_runs_as_request_scoped_mcp_without_run
         binding.runtime.isolation_backend,
         astra_runtime_env::RuntimeIsolationBackend::None
     );
-    assert_eq!(
-        astra_runtime_env::CapabilityResolver.check_tool_call(
-            &registry,
-            "mcp__rag__retrieve",
-            &serde_json::json!({"query": "what is astra?"}),
-            &binding.capabilities,
-        ),
-        Ok(())
+    assert!(
+        !binding.tool_surface.contains("mcp__rag__retrieve"),
+        "mcp__ prefix alone must not expose a provider offer"
+    );
+    assert!(
+        astra_runtime_env::CapabilityResolver
+            .check_tool_call_for_surface(
+                &registry,
+                "mcp__rag__retrieve",
+                &serde_json::json!({"query": "what is astra?"}),
+                &binding.capabilities,
+                &binding.tool_surface,
+            )
+            .is_err(),
+        "tool surface must reject mcp__ names without an explicit MCP provider"
     );
 
     let result = service.execute(request, &local).await;
 
-    assert!(!result.is_error, "{result:?}");
-    assert_eq!(result.output, "local:mcp__rag__retrieve");
-    assert_eq!(local.calls(), 1);
-    let metadata = result.metadata.expect("mcp metadata");
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(local.calls(), 0);
+    let metadata = result.metadata.expect("unsupported mcp metadata");
+    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
     assert_eq!(metadata["workspace"]["kind"], "none");
-    assert_eq!(metadata["executor"]["kind"], "mcp");
-    assert_eq!(metadata["transport"], "mcp_http");
+    assert_ne!(metadata["executor"]["kind"], "mcp");
 }
 
 #[test]
@@ -3185,17 +3187,8 @@ async fn request_scoped_mcp_tools_bypass_edge_transport() {
     let local = CountingLocalTransport::new();
     let edge_request = request(
         "mcp__demo__search",
-        WorkspaceBinding::edge_workspace(
-            "MacBook Pro",
-            "/Users/test/project",
-            WorkspaceAuthority::ReadWrite,
-        ),
-        ExecutorBinding::edge_agent(
-            "edge-macbook-1",
-            "MacBook Pro",
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Offline,
-        ),
+        WorkspaceBinding::none(),
+        ExecutorBinding::request_scoped_mcp(),
     );
 
     assert_eq!(
@@ -3216,11 +3209,10 @@ async fn request_scoped_mcp_tools_bypass_edge_transport() {
         "request-scoped MCP tools must not dispatch to edge"
     );
     let metadata = result.metadata.expect("request-scoped MCP metadata");
-    assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
-    assert_eq!(metadata["workspace"]["cwd"], "/Users/test/project");
+    assert_eq!(metadata["workspace"]["kind"], "none");
     assert_eq!(metadata["executor"]["kind"], "mcp");
     assert_eq!(metadata["executor"]["executor_id"], "request-scoped-mcp");
-    assert_eq!(metadata["executor"]["display_name"], "MCP server");
+    assert_eq!(metadata["executor"]["display_name"], "Request-scoped MCP");
     assert_eq!(metadata["executor"]["transport"], "mcp_http");
     assert_eq!(metadata["transport"], "mcp_http");
 }
@@ -3236,13 +3228,7 @@ async fn disabled_request_scoped_mcp_offer_blocks_execution_without_schema_inven
             request(
                 "mcp__demo__search",
                 WorkspaceBinding::none(),
-                ExecutorBinding {
-                    kind: ExecutorBindingKind::Mcp,
-                    executor_id: "request-scoped-mcp".to_string(),
-                    display_name: "MCP server".to_string(),
-                    transport: ToolTransportKind::McpHttp,
-                    status: ExecutorStatus::Online,
-                },
+                ExecutorBinding::request_scoped_mcp(),
             ),
             &local,
         )
@@ -3272,13 +3258,7 @@ async fn request_scoped_mcp_provider_allowlist_blocks_unlisted_tool_without_sche
             request(
                 "mcp__demo__search",
                 WorkspaceBinding::none(),
-                ExecutorBinding {
-                    kind: ExecutorBindingKind::Mcp,
-                    executor_id: "request-scoped-mcp".to_string(),
-                    display_name: "MCP server".to_string(),
-                    transport: ToolTransportKind::McpHttp,
-                    status: ExecutorStatus::Online,
-                },
+                ExecutorBinding::request_scoped_mcp(),
             ),
             &local,
         )
@@ -3408,13 +3388,8 @@ async fn request_scoped_mcp_cancel_reports_mcp_binding() {
     cancel.cancel();
     let request = request(
         "mcp__rag__retrieve",
-        WorkspaceBinding {
-            kind: WorkspaceBindingKind::None,
-            display_name: "No file environment".to_string(),
-            cwd: None,
-            authority: WorkspaceAuthority::None,
-        },
-        ExecutorBinding::server_local(),
+        WorkspaceBinding::none(),
+        ExecutorBinding::request_scoped_mcp(),
     );
 
     let result = service

@@ -130,7 +130,13 @@ pub(crate) fn routing_decision_for_binding(
             return ToolExecutionRouteKind::ServerControlPlane;
         }
         ToolExecutionClass::ServerService => return ToolExecutionRouteKind::ServerRuntime,
-        ToolExecutionClass::RequestScopedMcp => return ToolExecutionRouteKind::RequestScopedMcp,
+        ToolExecutionClass::RequestScopedMcp => {
+            return if matches!(executor_transport, ToolTransportKind::McpHttp) {
+                ToolExecutionRouteKind::RequestScopedMcp
+            } else {
+                ToolExecutionRouteKind::Unsupported
+            };
+        }
         ToolExecutionClass::TurnPipelineIntercept | ToolExecutionClass::Unknown => {
             return ToolExecutionRouteKind::Unsupported;
         }
@@ -438,12 +444,28 @@ mod tests {
     }
 
     #[test]
-    fn mcp_prefix_routes_to_request_scoped_mcp() {
+    fn mcp_prefix_does_not_route_without_mcp_transport() {
         let req = make_request(
             "mcp__foo",
             WorkspaceBindingKind::None,
             ToolTransportKind::ServerLocal,
         );
+        assert_eq!(
+            routing_decision(&req, &registry()),
+            ToolExecutionRouteKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn mcp_executor_transport_routes_to_request_scoped_mcp() {
+        let mut req = make_request(
+            "mcp__foo",
+            WorkspaceBindingKind::None,
+            ToolTransportKind::McpHttp,
+        );
+        req.executor.kind = ExecutorBindingKind::Mcp;
+        req.executor.executor_id = "request-scoped-mcp".to_string();
+
         assert_eq!(
             routing_decision(&req, &registry()),
             ToolExecutionRouteKind::RequestScopedMcp

@@ -124,6 +124,16 @@ impl ExecutorBinding {
         }
     }
 
+    pub fn request_scoped_mcp() -> Self {
+        Self {
+            kind: ExecutorBindingKind::Mcp,
+            executor_id: "request-scoped-mcp".to_string(),
+            display_name: "Request-scoped MCP".to_string(),
+            transport: ToolTransportKind::McpHttp,
+            status: ExecutorStatus::Online,
+        }
+    }
+
     pub fn orchestrator_managed(
         executor_id: impl Into<String>,
         display_name: impl Into<String>,

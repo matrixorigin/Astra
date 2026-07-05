@@ -532,13 +532,7 @@ fn local_result_binding(
         ),
         ToolExecutionRouteKind::RequestScopedMcp => (
             request.workspace.clone(),
-            ExecutorBinding {
-                kind: ExecutorBindingKind::Mcp,
-                executor_id: "request-scoped-mcp".to_string(),
-                display_name: "MCP server".to_string(),
-                transport: ToolTransportKind::McpHttp,
-                status: ExecutorStatus::Unknown,
-            },
+            ExecutorBinding::request_scoped_mcp(),
             ToolTransportKind::McpHttp,
         ),
         _ => (
