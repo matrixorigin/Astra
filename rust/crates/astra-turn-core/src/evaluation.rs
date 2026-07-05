@@ -557,7 +557,10 @@ pub fn final_answer_relevance_signal(
     final_answer: &str,
 ) -> Option<EvalSignal> {
     let required = relevance_terms(latest_user_message);
-    if required.len() < 2 || final_answer.trim().is_empty() {
+    if required.len() < 2
+        || final_answer.trim().is_empty()
+        || answer_starts_with_direct_response(final_answer)
+    {
         return None;
     }
     let answer_terms = relevance_terms(final_answer);
@@ -592,6 +595,11 @@ fn relevance_terms(text: &str) -> std::collections::HashSet<String> {
         if chars.len() >= 2 {
             for window in chars.windows(2) {
                 terms.insert(window.iter().collect::<String>());
+            }
+            for ch in chars {
+                if !is_cjk_stop_char(ch) {
+                    terms.insert(ch.to_string());
+                }
             }
         }
         buf.clear();
@@ -643,6 +651,52 @@ fn is_relevance_stop_word(word: &str) -> bool {
             | "into"
             | "about"
             | "please"
+    )
+}
+
+fn is_cjk_stop_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '的' | '了'
+            | '是'
+            | '在'
+            | '我'
+            | '你'
+            | '他'
+            | '她'
+            | '它'
+            | '这'
+            | '那'
+            | '和'
+            | '与'
+            | '或'
+            | '及'
+            | '吗'
+            | '呢'
+            | '啊'
+            | '吧'
+    )
+}
+
+fn answer_starts_with_direct_response(final_answer: &str) -> bool {
+    let trimmed = final_answer
+        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '-' | '*' | '#'))
+        .to_ascii_lowercase();
+    matches!(
+        trimmed.as_str(),
+        s if s.starts_with("yes")
+            || s.starts_with("no")
+            || s.starts_with("not yet")
+            || s.starts_with("it is")
+            || s.starts_with("it isn't")
+            || s.starts_with("it is not")
+            || s.starts_with("是")
+            || s.starts_with("不是")
+            || s.starts_with("否")
+            || s.starts_with("不够")
+            || s.starts_with("够")
+            || s.starts_with("可以")
+            || s.starts_with("不能")
     )
 }
 
@@ -1575,6 +1629,18 @@ mod tests {
         );
 
         assert_eq!(signal, None);
+    }
+
+    #[test]
+    fn final_answer_relevance_accepts_direct_short_answers() {
+        assert_eq!(
+            final_answer_relevance_signal("相关的测试够硬核吗？", "不够，还缺全量在线回归。"),
+            None
+        );
+        assert_eq!(
+            final_answer_relevance_signal("are the tests robust enough?", "No, not yet."),
+            None
+        );
     }
 
     #[test]
