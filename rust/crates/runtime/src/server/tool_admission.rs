@@ -29,7 +29,6 @@ pub(crate) struct ToolOffer {
 pub(crate) enum ToolOfferCandidateReason {
     Selected,
     CurrentProviderPreferred,
-    ServerFallbackSelected,
     LowerPriority,
     RouteMismatch,
     UnsupportedRoute,
@@ -138,17 +137,8 @@ pub(crate) fn resolve_tool_admission_for_providers(
     registry: &astra_runtime_env::ToolRegistry,
 ) -> ToolAdmissionDecision {
     let class = tool_execution_class(tool_name, registry);
-    let mut route =
+    let route =
         routing_decision_for_binding(tool_name, workspace.kind, executor.transport, registry);
-    if matches!(class, ToolExecutionClass::SharedServiceOrRuntime)
-        && provider_for_route(tool_name, workspace, route, providers).is_none()
-        && providers.iter().any(|provider| {
-            provider.provider_type == CapacityProviderType::ServerService
-                && provider.declares_tool(tool_name)
-        })
-    {
-        route = ToolExecutionRouteKind::ServerRuntime;
-    }
 
     let raw_candidates = if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
         Vec::new()
@@ -365,11 +355,6 @@ fn candidate_reason(
     }
     if offer.route == selected_route {
         return ToolOfferCandidateReason::LowerPriority;
-    }
-    if matches!(selected_route, ToolExecutionRouteKind::ServerRuntime)
-        && matches!(offer.provider_type, CapacityProviderType::EdgeCapacity)
-    {
-        return ToolOfferCandidateReason::ServerFallbackSelected;
     }
     if matches!(
         offer.provider_type,
@@ -656,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_network_tool_records_server_fallback_candidate_reason() {
+    fn shared_network_tool_does_not_implicitly_fallback_when_selected_executor_offline() {
         let decision = resolve_tool_admission_for_binding(
             "web_fetch",
             &[],
@@ -675,15 +660,19 @@ mod tests {
             &registry(),
         );
 
-        assert!(decision.visible);
-        assert_eq!(decision.route, ToolExecutionRouteKind::ServerRuntime);
-        let offer = decision.selected_offer.as_ref().expect("selected offer");
-        assert_eq!(offer.provider_type, CapacityProviderType::ServerService);
+        assert!(!decision.visible);
+        assert_eq!(decision.route, ToolExecutionRouteKind::EdgeBound);
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::ProviderRouteMismatch)
+        );
+        assert!(decision.selected_offer.is_none());
         assert_eq!(decision.candidates.len(), 1);
         assert_eq!(
-            decision.candidates[0].reason,
-            ToolOfferCandidateReason::Selected
+            decision.candidates[0].offer.offer_id,
+            "web_fetch@server-builtin"
         );
+        assert!(!decision.candidates[0].selected);
     }
 
     #[test]

@@ -697,13 +697,13 @@ mod tests {
             None,
         ));
 
-        for expected in ["ask_user", "tool_search", "web_fetch"] {
+        for expected in ["ask_user", "tool_search"] {
             assert!(
                 names.contains(expected),
                 "{expected} should remain visible from server/control-plane providers"
             );
         }
-        for hidden in ["read_file", "write_file", "bash", "git"] {
+        for hidden in ["web_fetch", "read_file", "write_file", "bash", "git"] {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must be invisible when workspace and executor provider ownership disagree"
@@ -723,13 +723,13 @@ mod tests {
             Some(&runtime),
         ));
 
-        for expected in ["ask_user", "tool_search", "web_fetch"] {
+        for expected in ["ask_user", "tool_search"] {
             assert!(
                 names.contains(expected),
                 "{expected} should remain visible from server/control-plane providers"
             );
         }
-        for hidden in ["read_file", "write_file", "bash", "git"] {
+        for hidden in ["web_fetch", "read_file", "write_file", "bash", "git"] {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must be invisible when the explicit runtime binding is offline"
