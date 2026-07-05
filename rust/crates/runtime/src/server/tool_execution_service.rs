@@ -21,7 +21,8 @@ use super::tool_local_transport::{ServerLocalToolTransport, execute_local_transp
 use super::tool_route_boundary::{ToolRouteBoundary, route_binding_event_fields};
 use super::tool_route_selection::ToolExecutionRouteKind;
 use super::tool_transport_errors::{
-    capability_denied_result, unsupported_workspace_executor_result,
+    capability_denied_result, selected_offer_route_mismatch_result,
+    unsupported_workspace_executor_result,
 };
 use super::tool_transport_metadata::{
     cancelled_runtime_tool_result, cancelled_runtime_tool_result_for_binding,
@@ -349,6 +350,9 @@ impl ToolExecutionService {
                 return capability_denied_result(&transport_request, &err.0, err.1.clone());
             }
         };
+        if selected_offer_route_mismatch(&transport_request, route) {
+            return selected_offer_route_mismatch_result(&transport_request, &binding, route);
+        }
         if matches!(route, ToolExecutionRouteKind::RequestScopedMcp)
             && transport_request.selected_offer.is_none()
         {
@@ -520,6 +524,15 @@ impl ToolExecutionService {
             Err(reason) => Err(Box::new((binding, reason))),
         }
     }
+}
+
+fn selected_offer_route_mismatch(
+    request: &ToolExecutionRequest,
+    route: ToolExecutionRouteKind,
+) -> bool {
+    request.selected_offer.as_ref().is_some_and(|offer| {
+        !matches!(offer.route, ToolExecutionRouteKind::Unsupported) && offer.route != route
+    })
 }
 
 fn local_result_binding(

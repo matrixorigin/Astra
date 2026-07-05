@@ -3109,6 +3109,50 @@ async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
 }
 
 #[tokio::test]
+async fn selected_offer_route_mismatch_blocks_execution_without_provider_fallback() {
+    let service = ToolExecutionService::new_for_test();
+    let local = CountingLocalTransport::new();
+    let request = request(
+        "web_fetch",
+        WorkspaceBinding::none(),
+        ExecutorBinding::server_local(),
+    )
+    .with_selected_offer(SelectedToolOfferSnapshot::new_with_route(
+        "web_fetch",
+        "edge-selected",
+        ToolExecutionRouteKind::EdgeBound,
+    ));
+
+    assert_eq!(
+        service.routing_decision(&request),
+        ToolExecutionRouteKind::ServerRuntime,
+        "the binding alone would route web_fetch to the server"
+    );
+    let result = service.execute(request, &local).await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(
+        local.calls(),
+        0,
+        "selected offer route mismatch must block before server fallback execution"
+    );
+    assert!(
+        result.output.contains("Refusing to run"),
+        "{}",
+        result.output
+    );
+    let metadata = result.metadata.expect("route mismatch metadata");
+    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_ROUTE_MISMATCH);
+    assert_eq!(metadata["runtime_error"]["kind"], "route_mismatch");
+    assert_eq!(
+        metadata["selected_tool_offer"]["offer_id"],
+        "web_fetch@edge-selected"
+    );
+    assert_eq!(metadata["selected_tool_offer"]["route"], "edge_bound");
+    assert_eq!(metadata["actual_route"], "server_runtime");
+}
+
+#[tokio::test]
 async fn provider_allowlist_blocks_selected_edge_offer_without_server_reroute() {
     let dispatch = Arc::new(StaticEdgeDispatch::default());
     let service = ToolExecutionService::builder()

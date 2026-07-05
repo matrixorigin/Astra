@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use super::tool_execution_binding::{
     ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, WorkspaceBindingKind,
 };
+use super::tool_route_selection::ToolExecutionRouteKind;
 use super::tool_transport_metadata::{
     RUN_BLOCKED_REASON_EXECUTOR_OFFLINE, RUN_BLOCKED_REASON_ROUTE_MISMATCH,
     TOOL_ERROR_KIND_CAPABILITY_DENIED, attach_runtime_error_metadata,
@@ -149,6 +150,47 @@ pub(crate) fn unsupported_workspace_executor_result(
     );
     astra_tools::ToolResult {
         output: unsupported_workspace_executor_message(request),
+        metadata: Some(metadata),
+        is_error: true,
+        exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
+    }
+}
+
+pub(crate) fn selected_offer_route_mismatch_result(
+    request: &ToolExecutionRequest,
+    binding: &astra_runtime_env::RunBinding,
+    actual_route: ToolExecutionRouteKind,
+) -> astra_tools::ToolResult {
+    let selected = request
+        .selected_offer
+        .as_ref()
+        .expect("selected offer route mismatch requires a selected offer");
+    let message = format!(
+        "Error: selected tool offer '{}' requires route '{}' but this request resolved to route '{}'. Refusing to run the tool through a different provider.",
+        selected.offer_id,
+        selected.route.as_str(),
+        actual_route.as_str()
+    );
+    let mut degraded_executor = request.executor.clone();
+    degraded_executor.status = ExecutorStatus::Degraded;
+    let mut metadata = binding_event_fields(&request.workspace, &degraded_executor);
+    attach_runtime_policy_metadata(&mut metadata, binding);
+    attach_runtime_error_metadata(
+        &mut metadata,
+        &astra_runtime_env::RuntimeError::route_mismatch(message.clone()),
+        RUN_BLOCKED_REASON_ROUTE_MISMATCH,
+    );
+    metadata.insert(
+        "selected_tool_offer".to_string(),
+        json!({
+            "offer_id": selected.offer_id,
+            "provider_id": selected.provider_id,
+            "route": selected.route.as_str(),
+        }),
+    );
+    metadata.insert("actual_route".to_string(), json!(actual_route.as_str()));
+    astra_tools::ToolResult {
+        output: message,
         metadata: Some(metadata),
         is_error: true,
         exit_semantics: Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError),
