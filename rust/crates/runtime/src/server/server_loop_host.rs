@@ -30,8 +30,8 @@ use crate::server::tool_route_selection::{
 };
 use crate::server::tool_transport::{
     ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
-    ToolExecutionRequest, ToolPolicySnapshot, WorkspaceAuthority, WorkspaceBinding,
-    WorkspaceBindingKind, binding_event_fields,
+    ToolExecutionRequest, ToolPolicySnapshot, ToolTransportKind, WorkspaceAuthority,
+    WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
     capability_filter_edge_provided_tool_schemas_for_binding,
     capability_filtered_server_tool_schemas, projected_tool_end_event_fields,
     projected_tool_start_event_fields,
@@ -2684,6 +2684,34 @@ impl ServerAgenticLoopHost {
         }
     }
 
+    fn offline_edge_results_for_tool_calls(
+        &mut self,
+        tool_calls: &[Value],
+    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        if tool_calls.is_empty() {
+            return Vec::new();
+        }
+
+        use astra_turn_core::headless_tool_assembly::{
+            ensure_tool_call_ids, parse_flat_tool_call_event,
+        };
+
+        let ordered_tool_calls = ensure_tool_call_ids(tool_calls);
+        let mut results = Vec::new();
+        for tc in ordered_tool_calls.iter() {
+            if !tc.is_object() {
+                continue;
+            }
+            let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
+            if !self.edge_executor_offline_blocks_tool(&tool_name) {
+                continue;
+            }
+            self.valid_tools.insert(tool_name.clone());
+            results.push(self.edge_executor_offline_result(&request_id, &tool_name, &args));
+        }
+        results
+    }
+
     fn emit_edge_executor_offline_events(
         &mut self,
         request_id: &str,
@@ -2789,7 +2817,25 @@ impl ServerAgenticLoopHost {
     }
 
     fn should_deliver_edge_bound_tools_via_client_ledger(&self, state: &AgenticLoopState) -> bool {
-        self.event_tx.is_some() && state.runtime_tool_executor.is_none()
+        if self.event_tx.is_none() {
+            return false;
+        }
+        if matches!(self.executor_binding.status, ExecutorStatus::Offline)
+            && matches!(
+                self.workspace_binding.kind,
+                WorkspaceBindingKind::EdgeWorkspace
+            )
+            && matches!(self.executor_binding.kind, ExecutorBindingKind::EdgeAgent)
+        {
+            return true;
+        }
+        if matches!(
+            self.executor_binding.transport,
+            ToolTransportKind::EdgeLedger
+        ) {
+            return true;
+        }
+        state.runtime_tool_executor.is_none()
     }
 
     async fn maybe_deliver_edge_bound_tools_via_ledger(
@@ -2797,6 +2843,11 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
         tool_calls: &[Value],
     ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        let offline_results = self.offline_edge_results_for_tool_calls(tool_calls);
+        if !offline_results.is_empty() {
+            return offline_results;
+        }
+
         if !self.should_deliver_edge_bound_tools_via_client_ledger(state) {
             if self.event_tx.is_some()
                 && state.runtime_tool_executor.is_some()
@@ -3279,6 +3330,24 @@ impl ServerAgenticLoopHost {
         filter_tool_schemas_by_excluded_names(self.tool_schemas.clone(), restricted_tools)
     }
 
+    fn route_for_current_binding(&self, tool_name: &str) -> ToolExecutionRouteKind {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let request = ToolExecutionRequest {
+            user_id: self.user_id.clone(),
+            run_id: String::new(),
+            session_id: self.session_id.clone(),
+            tool_call_id: String::new(),
+            tool_name: tool_name.to_string(),
+            args: json!({}),
+            workspace: self.workspace_binding.clone(),
+            workspace_record: None,
+            executor: self.executor_binding.clone(),
+            runtime: self.runtime_binding.clone(),
+            policy: ToolPolicySnapshot::default(),
+        };
+        routing_decision(&request, &registry)
+    }
+
     fn runtime_ready_turn_tools(&self, tools: Vec<Value>, state: &AgenticLoopState) -> Vec<Value> {
         let Some(executor) = state.runtime_tool_executor.as_deref() else {
             return tools;
@@ -3286,10 +3355,19 @@ impl ServerAgenticLoopHost {
         tools
             .into_iter()
             .filter(|tool| {
-                tool.get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| executor.tool_runtime_ready(name))
+                let Some(name) = tool_schema_name(tool) else {
+                    return false;
+                };
+                match self.route_for_current_binding(name) {
+                    ToolExecutionRouteKind::EdgeBound
+                    | ToolExecutionRouteKind::GatewayRelay
+                    | ToolExecutionRouteKind::SandboxResidentAgent => true,
+                    ToolExecutionRouteKind::ServerLocal
+                    | ToolExecutionRouteKind::ServerControlPlane
+                    | ToolExecutionRouteKind::ServerRuntime
+                    | ToolExecutionRouteKind::RequestScopedMcp => executor.tool_runtime_ready(name),
+                    ToolExecutionRouteKind::Unsupported => false,
+                }
             })
             .collect()
     }
@@ -6725,6 +6803,66 @@ mod tests {
                 "{hidden} must not be admitted while hidden; unavailable tools should disappear from the model surface"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn offline_edge_blocking_does_not_require_sse_event_channel() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                crate::server::tool_transport::ExecutorStatus::Offline,
+            ),
+        )
+        .build();
+        assert!(
+            host.event_tx.is_none(),
+            "this regression guard covers headless/server-side subruns"
+        );
+        let state = create_test_state();
+        let tool_calls = vec![json!({
+            "id": "call-offline-headless-bash",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": serde_json::to_string(&json!({"command": "pwd"})).unwrap(),
+            }
+        })];
+
+        let results = host
+            .maybe_deliver_edge_bound_tools_via_ledger(&state, &tool_calls)
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].request_id, "call-offline-headless-bash");
+        assert_eq!(results[0].tool, "bash");
+        assert_eq!(results[0].status, "error");
+        let fields = results[0]
+            .tool_result_fields
+            .as_ref()
+            .expect("offline result must carry structured metadata");
+        assert_eq!(fields["error_kind"], "executor_offline");
+        assert_eq!(fields["blocked"], true);
+        assert!(
+            host.emitted_events.iter().any(|event| {
+                event["type"] == "run_blocked"
+                    && event["call_id"] == "call-offline-headless-bash"
+                    && event["reason"] == "executor_offline"
+            }),
+            "headless offline blocking must still be observable through buffered host events"
+        );
     }
 
     #[test]

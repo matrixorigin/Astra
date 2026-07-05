@@ -58,6 +58,23 @@ fn scripted(text: &str) -> Value {
     })
 }
 
+fn value_has_cache_control(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.contains_key("cache_control") || map.values().any(value_has_cache_control)
+        }
+        Value::Array(values) => values.iter().any(value_has_cache_control),
+        _ => false,
+    }
+}
+
+fn tool_cache_control_count(tools: &[Value]) -> usize {
+    tools
+        .iter()
+        .filter(|tool| value_has_cache_control(tool))
+        .count()
+}
+
 // ── (a) cache breakpoint placement is STABLE turn-over-turn ────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -95,7 +112,10 @@ async fn cache_breakpoint_persists_turn_over_turn() {
     let g = capture.lock().unwrap();
     assert_eq!(g.len(), 3, "three captured payloads, one per turn");
 
-    // Each turn must have Anthropic cache_control on system + last tool.
+    // Each turn must have Anthropic cache_control on system + exactly one tool
+    // schema. The tool marker sits at the stable always-load prefix boundary,
+    // which is not necessarily the absolute last tool once dynamic provider
+    // tools are appended.
     for (i, c) in g.iter().enumerate() {
         assert!(c.is_anthropic, "turn {i}: anthropic latched");
         assert!(c.cache_enabled, "turn {i}: cache enabled");
@@ -104,9 +124,10 @@ async fn cache_breakpoint_persists_turn_over_turn() {
             "turn {i}: system must carry cache_control (got {})",
             c.system_cache_control_count
         );
-        assert!(
-            c.last_tool_has_cache_control,
-            "turn {i}: last tool schema must carry cache_control"
+        assert_eq!(
+            tool_cache_control_count(&c.tools),
+            1,
+            "turn {i}: exactly one tool schema must carry cache_control"
         );
     }
 

@@ -36,7 +36,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tower::util::ServiceExt;
 
 use crate::test_support::{
@@ -531,14 +531,100 @@ fn normalize_chat_stream_payload(mut payload: Value) -> Value {
         return payload;
     };
     let legacy_model = object.remove("model");
-    if object.contains_key("selected_model") {
-        return payload;
+    if !object.contains_key("selected_model") {
+        let model = legacy_model
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| DEFAULT_SELECTED_MODEL.to_string());
+        object.insert("selected_model".to_string(), json!({ "model": model }));
     }
-    let model = legacy_model
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| DEFAULT_SELECTED_MODEL.to_string());
-    object.insert("selected_model".to_string(), json!({ "model": model }));
+    ensure_test_edge_profile_for_edge_tools(object);
     payload
+}
+
+fn ensure_test_edge_profile_for_edge_tools(payload: &mut Map<String, Value>) {
+    let Some(context) = payload.get_mut("context").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let has_edge_runtime_tools = context
+        .get("edge_tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(test_tool_requires_edge_runtime));
+    if !has_edge_runtime_tools || context.contains_key("edge_profile") {
+        return;
+    }
+    context.insert(
+        "edge_profile".to_string(),
+        json!({
+            "cwd": "/tmp/astra-web-agent-e2e-edge",
+            "edge_agent_id": "web-agent-e2e-edge",
+            "hostname": "web-agent-e2e",
+        }),
+    );
+    payload
+        .entry("workspace_binding".to_string())
+        .or_insert_with(|| {
+            json!({
+                "kind": "edge_workspace",
+                "display_name": "web-agent-e2e",
+                "cwd": "/tmp/astra-web-agent-e2e-edge",
+                "authority": "read_write",
+                "fallback_policy": "disabled"
+            })
+        });
+    payload
+        .entry("executor_binding".to_string())
+        .or_insert_with(|| {
+            json!({
+                "kind": "edge_agent",
+                "executor_id": "web-agent-e2e-edge",
+                "display_name": "web-agent-e2e",
+                "transport": "edge_ledger",
+                "status": "online"
+            })
+        });
+}
+
+fn test_tool_requires_edge_runtime(tool: &Value) -> bool {
+    let Some(name) = tool
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    matches!(
+        name,
+        "bash"
+            | "git"
+            | "glob"
+            | "grep"
+            | "list_dir"
+            | "publish_artifact"
+            | "read_file"
+            | "rollback_file_edits"
+            | "run_script"
+            | "str_replace"
+            | "symbols"
+            | "write_file"
+    )
+}
+
+fn test_tool_uses_client_ledger(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "bash"
+            | "git"
+            | "glob"
+            | "grep"
+            | "list_dir"
+            | "publish_artifact"
+            | "read_file"
+            | "rollback_file_edits"
+            | "run_script"
+            | "str_replace"
+            | "symbols"
+            | "write_file"
+    )
 }
 
 /// Send a POST /chat/stream request and collect all SSE events from the stream.
@@ -965,15 +1051,21 @@ async fn wait_for_sse(
     timeout_secs: u64,
 ) -> Value {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut seen = Vec::new();
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(event)) => {
                 if event.get("type").and_then(Value::as_str) == Some(event_type) {
                     return event;
                 }
+                seen.push(event);
             }
-            Ok(None) => panic!("stream ended without '{event_type}' event"),
-            Err(_) => panic!("timed out ({timeout_secs}s) waiting for '{event_type}' event"),
+            Ok(None) => panic!("stream ended without '{event_type}' event; seen={seen:#?}"),
+            Err(_) => {
+                panic!(
+                    "timed out ({timeout_secs}s) waiting for '{event_type}' event; seen={seen:#?}"
+                )
+            }
         }
     }
 }
@@ -1009,6 +1101,9 @@ async fn execute_mock_tool_turn(
     let approval_identity = wait_for_approval_identity(&mut rx).await;
 
     for step in steps {
+        if !test_tool_uses_client_ledger(step.tool_name) {
+            continue;
+        }
         if step.requires_approval {
             let approval = wait_for_sse(&mut rx, "approval_required", 5).await;
             assert_eq!(
