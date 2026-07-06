@@ -29,7 +29,10 @@ describe("verifyLiveWorkspaceSelection", () => {
           },
         ]) as never,
       ),
-    ).rejects.toMatchObject({ status: 409 });
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "workspace_edge_stale_selection",
+    });
   });
 
   it("prefers an exact edge id match so a wrong cwd remains a hard error", async () => {
@@ -52,7 +55,26 @@ describe("verifyLiveWorkspaceSelection", () => {
           },
         ]) as never,
       ),
-    ).rejects.toMatchObject({ status: 409 });
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "workspace_path_mismatch",
+    });
+  });
+
+  it("distinguishes an unavailable edge from a stale selected provider id", async () => {
+    const selection = {
+      kind: "edge_workspace" as const,
+      edgeAgentId: "edge-offline",
+      displayName: "macpro.local",
+      cwd: "/Users/test/astra",
+    };
+
+    await expect(
+      verifyLiveWorkspaceSelection(selection, runtimeWithEdges([]) as never),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "workspace_edge_unavailable",
+    });
   });
 
   it("canonicalizes cwd and display name only after the provider id matches", async () => {

@@ -22,6 +22,7 @@ import {
   type StreamEventState,
 } from "@/lib/api/stream-event-handler";
 import {
+  RuntimeClientError,
   WebRuntimeClient,
   readRuntimeErrorDetail,
   requireRuntimeClient,
@@ -236,6 +237,10 @@ function proxyRunStream(params: {
           }
           const message =
             error instanceof Error ? error.message : "Astra stream failed.";
+          const status =
+            error instanceof RuntimeClientError ? error.status : undefined;
+          const code =
+            error instanceof RuntimeClientError ? error.code : undefined;
           updateStreamingAssistantMessage(
             ownerUserId,
             chatId,
@@ -246,7 +251,7 @@ function proxyRunStream(params: {
             },
           );
           setChatActiveRun(ownerUserId, chatId, undefined);
-          enqueueFrame({ type: "error", message });
+          enqueueFrame({ type: "error", message, status, code });
           closeController();
           return;
         }
@@ -322,13 +327,7 @@ function proxyRunStream(params: {
             for (const frame of frames) {
               const event = eventFromSseFrame(frame);
               if (event) {
-                try {
-                  applyStreamEvent(event, ctx, state);
-                } catch (error) {
-                  if (error instanceof Error) {
-                    enqueueFrame({ type: "error", message: error.message });
-                  }
-                }
+                applyStreamEvent(event, ctx, state);
               }
             }
           }
@@ -340,13 +339,7 @@ function proxyRunStream(params: {
           if (buffer.trim()) {
             const event = eventFromSseFrame(buffer);
             if (event) {
-              try {
-                applyStreamEvent(event, ctx, state);
-              } catch (error) {
-                if (error instanceof Error) {
-                  enqueueFrame({ type: "error", message: error.message });
-                }
-              }
+              applyStreamEvent(event, ctx, state);
             }
           }
 
@@ -416,6 +409,8 @@ function proxyRunStream(params: {
           if (clientCancelled) {
             return;
           }
+          backendAbortController.abort();
+          await Promise.resolve(reader.cancel()).catch(() => undefined);
           const message =
             error instanceof Error ? error.message : "Astra stream failed.";
           setChatActiveRun(ownerUserId, chatId, undefined);

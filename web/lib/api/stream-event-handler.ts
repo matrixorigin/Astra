@@ -35,8 +35,11 @@ export interface StreamEventState {
 }
 
 function normalizeEventIndex(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+  if (value === undefined || value === null) {
     return null;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error("Malformed stream event index.");
   }
   return Math.trunc(value);
 }

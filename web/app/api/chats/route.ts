@@ -71,7 +71,10 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(result, { status: 201 });
   } catch (error) {
     if (error instanceof RuntimeClientError && error.status) {
-      return NextResponse.json({ error: error.detail }, { status: error.status });
+      return NextResponse.json(
+        { error: error.detail, code: error.code },
+        { status: error.status },
+      );
     }
     const message = error instanceof Error ? error.message : 'failed to create chat';
     const status = message.includes('authentication is missing') ? 401 : 502;

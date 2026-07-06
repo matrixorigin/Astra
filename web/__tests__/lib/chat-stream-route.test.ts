@@ -22,11 +22,21 @@ vi.mock("@/lib/runtime-client", () => ({
   RuntimeClientError: class RuntimeClientError extends Error {
     status?: number;
     detail: string;
+    code?: string;
 
-    constructor({ status, detail }: { status?: number; detail: string }) {
+    constructor({
+      status,
+      detail,
+      code,
+    }: {
+      status?: number;
+      detail: string;
+      code?: string;
+    }) {
       super(detail);
       this.status = status;
       this.detail = detail;
+      this.code = code;
     }
   },
   WebRuntimeClient: class WebRuntimeClient {},
@@ -855,6 +865,7 @@ describe("chat stream route proxy cancellation", () => {
     const second = await reader!.read();
     const secondText = new TextDecoder().decode(second.value);
     expect(secondText).toContain('"type":"error"');
+    expect(secondText).toContain('"code":"workspace_edge_unavailable"');
     expect(secondText).toContain("No alternate execution provider");
     expect(runtime.fetchResponse).not.toHaveBeenCalled();
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
@@ -1169,6 +1180,7 @@ describe("chat stream route proxy cancellation", () => {
     const second = await reader!.read();
     const secondText = new TextDecoder().decode(second.value);
     expect(secondText).toContain('"type":"error"');
+    expect(secondText).toContain('"code":"workspace_edge_stale_selection"');
     expect(secondText).toContain("No alternate execution provider");
     expect(runtime.fetchResponse).not.toHaveBeenCalled();
     expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
@@ -1649,6 +1661,72 @@ describe("chat existing run stream route", () => {
       expect.objectContaining({
         content: expect.stringContaining("wrong-session"),
         status: "failed",
+      }),
+    );
+  });
+
+  it("fails the local run state when a backend stream event has a malformed cursor", async () => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendFrameStream([
+      'data: {"type":"session_info","session_id":"runtime-session-1","run_id":"run-1"}\n\n',
+      'data: {"type":"run_input_queued","run_id":"run-1","index":"4"}\n\n',
+      'data: {"type":"text_done","full_text":"should not win"}\n\n',
+    ]);
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: vi.fn().mockResolvedValue({
+        ok: true,
+        body: backend.body,
+      }),
+    } as never);
+    const request = new Request(
+      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      { method: "GET" },
+    );
+    Object.defineProperty(request, "nextUrl", {
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+    });
+
+    const response = await GET(request as never, {
+      params: Promise.resolve({ chatId: "web-chat-1" }),
+    });
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    let body = "";
+    for (;;) {
+      const { done, value } = await reader!.read();
+      if (done) {
+        break;
+      }
+      body += new TextDecoder().decode(value);
+    }
+
+    expect(body).toContain("Malformed stream event index.");
+    expect(backend.cancel).toHaveBeenCalled();
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "web-chat-1",
+      undefined,
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "web-chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "Malformed stream event index.",
+        status: "failed",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
+      "user-a",
+      "web-chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "should not win",
+        status: "complete",
       }),
     );
   });

@@ -33,7 +33,7 @@ impl Drop for EdgeWsConnectionPermit {
     }
 }
 
-fn try_acquire_edge_ws_connection() -> Option<Arc<EdgeWsConnectionPermit>> {
+fn try_acquire_edge_ws_connection() -> Option<EdgeWsConnectionPermit> {
     loop {
         let current = EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire);
         if current >= MAX_EDGE_WS_CONNECTIONS {
@@ -43,7 +43,7 @@ fn try_acquire_edge_ws_connection() -> Option<Arc<EdgeWsConnectionPermit>> {
             .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            return Some(Arc::new(EdgeWsConnectionPermit));
+            return Some(EdgeWsConnectionPermit);
         }
     }
 }
@@ -60,11 +60,9 @@ pub(crate) async fn edge_ws_handler(
         )
             .into_response();
     };
-    let failed_upgrade_permit = permit.clone();
     ws.max_message_size(256 * 1024)
-        .on_failed_upgrade(move |error| {
+        .on_failed_upgrade(|error| {
             tracing::warn!(target: "astra::edge_ws", %error, "edge WebSocket upgrade failed");
-            drop(failed_upgrade_permit);
         })
         .on_upgrade(move |socket| handle_edge_connection(socket, state, permit))
         .into_response()
@@ -74,7 +72,7 @@ pub(crate) async fn edge_ws_handler(
 async fn handle_edge_connection(
     socket: WebSocket,
     state: AppState,
-    _permit: Arc<EdgeWsConnectionPermit>,
+    _permit: EdgeWsConnectionPermit,
 ) {
     let (ws_sink, mut ws_stream) = socket.split();
     let ws_sink = Arc::new(tokio::sync::Mutex::new(ws_sink));
@@ -1082,18 +1080,10 @@ mod tests {
     }
 
     #[test]
-    fn edge_ws_connection_permit_releases_after_all_upgrade_paths_drop() {
+    fn edge_ws_connection_permit_has_single_owner_and_releases_on_drop() {
         let previous = EDGE_WS_CONNECTION_COUNT.swap(0, Ordering::AcqRel);
         let permit = try_acquire_edge_ws_connection().expect("permit should be available");
         assert_eq!(EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire), 1);
-
-        let failed_upgrade_clone = permit.clone();
-        drop(failed_upgrade_clone);
-        assert_eq!(
-            EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire),
-            1,
-            "failed-upgrade callback clone must not release while the active upgrade owns the permit"
-        );
 
         drop(permit);
         assert_eq!(EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire), 0);

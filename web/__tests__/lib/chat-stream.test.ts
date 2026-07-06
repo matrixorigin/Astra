@@ -1,5 +1,6 @@
 import { TextDecoder, TextEncoder } from 'util';
 import { streamChatMessage, streamExistingChatRun } from '@/lib/api/chats';
+import type { WebApiError } from '@/lib/api/errors';
 
 const defaultPayload = {
   content: 'hello',
@@ -660,6 +661,38 @@ describe('streamChatMessage cancellation semantics', () => {
       '/api/chats/chat%20123/stream?runId=run%2F123&last_index=9&assistantMessageId=assistant-queued',
       { method: 'GET', signal: undefined },
     );
+  });
+
+  it('rejects malformed event indexes instead of silently dropping cursor state', async () => {
+    const onDone = vi.fn();
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_input_queued","run_id":"run-123","index":"4"}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, { onDone }),
+    ).rejects.toThrow('Malformed stream event index.');
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it('preserves structured stream error status and code', async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"error","message":"Edge selection is stale.","status":409,"code":"workspace_edge_stale_selection"}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {}),
+    ).rejects.toMatchObject({
+      status: 409,
+      detail: 'Edge selection is stale.',
+      code: 'workspace_edge_stale_selection',
+    } satisfies Partial<WebApiError>);
   });
 });
 

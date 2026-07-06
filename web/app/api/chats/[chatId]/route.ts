@@ -93,7 +93,10 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ c
       detail = await updateChatWorkspaceSelection(auth.user.user_id, chatId, workspaceSelection);
     } catch (error) {
       if (error instanceof RuntimeClientError && error.status) {
-        return NextResponse.json({ error: error.detail }, { status: error.status });
+        return NextResponse.json(
+          { error: error.detail, code: error.code },
+          { status: error.status },
+        );
       }
       const message = error instanceof Error ? error.message : 'failed to update chat environment';
       return NextResponse.json({ error: message }, { status: 502 });

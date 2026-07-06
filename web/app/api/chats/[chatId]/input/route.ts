@@ -95,7 +95,7 @@ export async function POST(
     }
     if (error instanceof RuntimeClientError && error.status) {
       return NextResponse.json(
-        { error: error.detail },
+        { error: error.detail, code: error.code },
         { status: error.status },
       );
     }

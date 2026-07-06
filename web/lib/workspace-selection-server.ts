@@ -42,11 +42,22 @@ export async function verifyLiveWorkspaceSelection(
   });
   const edge = resolveLiveEdgeForSelection(status.edges, selection);
   if (!edge) {
+    const replacement = status.edges.find((candidate) =>
+      edgeWorkspaceMatchesSelection(candidate, selection),
+    );
+    const providerLabel = selection.displayName ?? selection.edgeAgentId;
+    const code = replacement
+      ? "workspace_edge_stale_selection"
+      : "workspace_edge_unavailable";
+    const detail = replacement
+      ? `Execution provider ${providerLabel} is no longer the active connection for ${selection.cwd}. Choose the currently connected file environment (${replacement.hostname ?? replacement.edge_agent_id}) and retry. No alternate execution provider is available for this file environment.`
+      : `Execution provider ${providerLabel} is not connected or no longer registered. Reconnect it or choose an available file environment. No alternate execution provider is available for this file environment.`;
     throw new RuntimeClientError({
       operation: "verify edge workspace binding",
       path: PATH_EDGES_STATUS,
       status: 409,
-      detail: `Execution provider ${selection.displayName ?? selection.edgeAgentId} is offline. Reconnect it or choose an available file environment. No alternate execution provider is available for this file environment.`,
+      code,
+      detail,
     });
   }
 
@@ -62,6 +73,7 @@ export async function verifyLiveWorkspaceSelection(
       operation: "verify edge workspace binding",
       path: PATH_EDGES_STATUS,
       status: 409,
+      code: "workspace_path_mismatch",
       detail: `Execution provider ${edge.hostname ?? selection.displayName ?? selection.edgeAgentId} ${current}, not ${selection.cwd}. Choose the file environment that owns that path, then retry. No alternate execution provider is available for this file environment.`,
     });
   }

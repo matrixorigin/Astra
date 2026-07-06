@@ -226,6 +226,23 @@ describe("applyStreamEvent", () => {
     );
   });
 
+  it("fails closed on malformed event cursors", () => {
+    const state = makeState();
+
+    expect(() =>
+      applyStreamEvent(
+        {
+          type: "run_input_queued",
+          run_id: "run-1",
+          index: "12" as never,
+        },
+        ctx,
+        state,
+      ),
+    ).toThrow("Malformed stream event index.");
+    expect(mockSetChatActiveRun).not.toHaveBeenCalled();
+  });
+
   it("keeps execution-boundary run_waiting events blocked", () => {
     const state = makeState();
 

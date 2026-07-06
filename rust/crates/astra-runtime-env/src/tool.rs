@@ -328,6 +328,7 @@ pub enum ToolOfferCandidateReason {
     SchemaConflict,
     ToolNameConflict,
     AmbiguousProvider,
+    ProviderIdConflict,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -712,13 +713,12 @@ impl CapabilityResolver {
         capabilities: &EffectiveCapabilitySet,
         surface: &AvailableToolSurface,
     ) -> Result<(), ToolUnavailableReason> {
-        let capability_check = self.check_tool_call(registry, tool_name, args, capabilities);
-        if matches!(capability_check, Err(ToolUnavailableReason::UnknownTool)) {
-            return capability_check;
+        let dynamic_spec = dynamic_tool_spec(tool_name);
+        if registry.get(tool_name).or(dynamic_spec.as_ref()).is_none() {
+            return Err(ToolUnavailableReason::UnknownTool);
         }
-        capability_check?;
         check_surface_admits_tool(tool_name, surface)?;
-        Ok(())
+        self.check_tool_call(registry, tool_name, args, capabilities)
     }
 
     pub fn check(
@@ -1011,6 +1011,7 @@ enum ProviderToolConflictKind {
     SchemaContract,
     DynamicToolName,
     AmbiguousProvider,
+    ProviderIdCollision,
 }
 
 impl ProviderToolConflictKind {
@@ -1019,6 +1020,7 @@ impl ProviderToolConflictKind {
             Self::SchemaContract => "provider_schema_conflict",
             Self::DynamicToolName => "provider_tool_name_conflict",
             Self::AmbiguousProvider => "provider_owner_ambiguous",
+            Self::ProviderIdCollision => "provider_id_conflict",
         }
     }
 
@@ -1027,6 +1029,7 @@ impl ProviderToolConflictKind {
             Self::SchemaContract => ToolOfferCandidateReason::SchemaConflict,
             Self::DynamicToolName => ToolOfferCandidateReason::ToolNameConflict,
             Self::AmbiguousProvider => ToolOfferCandidateReason::AmbiguousProvider,
+            Self::ProviderIdCollision => ToolOfferCandidateReason::ProviderIdConflict,
         }
     }
 }
@@ -1036,6 +1039,7 @@ fn provider_conflicting_tools(
     capabilities: &EffectiveCapabilitySet,
     providers: &[CapacityProviderDeclaration],
 ) -> HashMap<String, ProviderToolConflictKind> {
+    let duplicate_provider_ids = duplicate_provider_ids(providers);
     let mut providers_by_tool: HashMap<String, Vec<&CapacityProviderDeclaration>> = HashMap::new();
     for provider in providers {
         for tool_name in &provider.tool_names {
@@ -1049,6 +1053,12 @@ fn provider_conflicting_tools(
     providers_by_tool
         .into_iter()
         .filter_map(|(tool_name, declaring_providers)| {
+            if declaring_providers
+                .iter()
+                .any(|provider| duplicate_provider_ids.contains(provider.provider_id.as_str()))
+            {
+                return Some((tool_name, ProviderToolConflictKind::ProviderIdCollision));
+            }
             if declaring_providers.len() <= 1 {
                 return None;
             }
@@ -1066,6 +1076,18 @@ fn provider_conflicting_tools(
                 .then_some((tool_name, ProviderToolConflictKind::AmbiguousProvider))
         })
         .collect()
+}
+
+fn duplicate_provider_ids(providers: &[CapacityProviderDeclaration]) -> HashSet<&str> {
+    let mut seen = HashSet::new();
+    let mut duplicates = HashSet::new();
+    for provider in providers {
+        let provider_id = provider.provider_id.as_str();
+        if !seen.insert(provider_id) {
+            duplicates.insert(provider_id);
+        }
+    }
+    duplicates
 }
 
 fn provider_schema_digest_conflicts(
@@ -1966,6 +1988,56 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_validation_uses_frozen_surface_before_live_capabilities() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        let server_only_surface = CapabilityResolver.available_tool_surface_for_providers(
+            &registry,
+            &binding.capabilities,
+            &server_providers(&registry),
+        );
+
+        assert_eq!(
+            CapabilityResolver.check_tool_call_for_surface(
+                &registry,
+                "bash",
+                &serde_json::json!({"command": "pwd"}),
+                &binding.capabilities,
+                &server_only_surface,
+            ),
+            Err(ToolUnavailableReason::ExecutorUnavailable(
+                "tool_not_selected_by_current_provider_surface".to_string()
+            )),
+            "runtime capability alone must not route a tool that was absent from the selected provider surface"
+        );
+    }
+
+    #[test]
+    fn selected_runtime_offer_is_rechecked_against_execution_time_capabilities() {
+        let registry = registry();
+        let binding = RunBinding::local_developer("/repo", &registry);
+        assert!(binding.tool_surface.contains("bash"));
+
+        let mut offline_capabilities = binding.capabilities;
+        offline_capabilities.executor.reachable = false;
+        offline_capabilities.executor.runtime_executor = false;
+
+        assert_eq!(
+            CapabilityResolver.check_tool_call_for_surface(
+                &registry,
+                "bash",
+                &serde_json::json!({"command": "pwd"}),
+                &offline_capabilities,
+                &binding.tool_surface,
+            ),
+            Err(ToolUnavailableReason::ExecutorUnavailable(
+                "runtime_executor_required".to_string()
+            )),
+            "a selected provider offer must still fail closed if its executor goes offline before execution"
+        );
+    }
+
+    #[test]
     fn schema_filter_keeps_local_service_and_project_tools_for_local_cli() {
         let registry = registry();
         let binding = RunBinding::local_developer("/repo", &registry);
@@ -2317,6 +2389,90 @@ mod tests {
                 .candidates
                 .iter()
                 .all(|candidate| candidate.reason == ToolOfferCandidateReason::AmbiguousProvider)
+        );
+    }
+
+    #[test]
+    fn duplicate_provider_id_hides_every_offer_from_that_identity() {
+        let registry = registry();
+        let providers = vec![
+            crate::mcp_provider("weather", ["mcp__weather__query".to_string()]),
+            crate::mcp_provider("weather", ["mcp__weather__forecast".to_string()]),
+        ];
+        let binding = RunBinding::resolve_with_provider_declarations(
+            WorkspaceBinding::none(),
+            ExecutorBinding {
+                kind: crate::ExecutorBindingKind::Mcp,
+                executor_id: "weather".to_string(),
+                display_name: "Weather MCP".to_string(),
+                transport: crate::ToolTransportKind::McpHttp,
+                status: crate::ExecutorStatus::Online,
+            },
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+            &providers,
+        );
+
+        for tool_name in ["mcp__weather__query", "mcp__weather__forecast"] {
+            let admission = binding
+                .tool_surface
+                .admission_for(tool_name)
+                .expect("duplicate-id MCP admission");
+            assert!(!binding.tool_surface.contains(tool_name));
+            assert!(!admission.visible);
+            assert!(admission.selected_offer_id.is_none());
+            assert_eq!(
+                binding.tool_surface.denial_for(tool_name),
+                Some(&ToolUnavailableReason::PolicyDenied(
+                    "provider_id_conflict".to_string()
+                ))
+            );
+            assert!(
+                admission.candidates.iter().all(|candidate| {
+                    !candidate.selected
+                        && candidate.reason == ToolOfferCandidateReason::ProviderIdConflict
+                }),
+                "all candidates from a colliding provider id must be non-selected"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_provider_id_filters_prompt_schemas() {
+        let registry = registry();
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::none(),
+            ExecutorBinding {
+                kind: crate::ExecutorBindingKind::Mcp,
+                executor_id: "weather".to_string(),
+                display_name: "Weather MCP".to_string(),
+                transport: crate::ToolTransportKind::McpHttp,
+                status: crate::ExecutorStatus::Online,
+            },
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+        );
+        let schemas = vec![
+            serde_json::json!({"type": "function", "function": {"name": "mcp__weather__query"}}),
+            serde_json::json!({"type": "function", "function": {"name": "mcp__weather__forecast"}}),
+        ];
+        let providers = vec![
+            crate::mcp_provider("weather", ["mcp__weather__query".to_string()]),
+            crate::mcp_provider("weather", ["mcp__weather__forecast".to_string()]),
+        ];
+
+        let filtered = CapabilityResolver.filter_tool_schemas_for_providers(
+            &registry,
+            schemas,
+            &binding.capabilities,
+            &providers,
+        );
+
+        assert!(
+            filtered.is_empty(),
+            "prompt-visible schemas must not keep tools whose offer ids collide"
         );
     }
 
