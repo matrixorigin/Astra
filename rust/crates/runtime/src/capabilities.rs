@@ -150,13 +150,10 @@ pub fn cli_local_tool_schemas(
             })
         })
         .collect::<Vec<_>>();
-    for schema in client_mcp {
-        if let Some(name) = tool_schema_name(&schema)
-            && astra_runtime_env::is_mcp_namespaced_tool_name(name)
-        {
-            pool.push(schema);
-        }
-    }
+    pool.extend(mcp_provider_tool_schemas(
+        "cli-request-scoped-mcp",
+        client_mcp,
+    ));
     astra_turn_core::tool_surface::resolve(CapabilitySurface::CliLocal, capabilities, &pool)
 }
 
@@ -167,9 +164,7 @@ pub fn cli_remote_tool_schemas(
     capabilities: &astra_turn_core::capability::CapabilitySet,
 ) -> Vec<Value> {
     let mut pool = server_builtin_tool_schemas(capabilities);
-    pool.extend(server_mcp.into_iter().filter(|schema| {
-        tool_schema_name(schema).is_some_and(astra_runtime_env::is_mcp_namespaced_tool_name)
-    }));
+    pool.extend(mcp_provider_tool_schemas("server-mcp", server_mcp));
     let mut schemas =
         astra_turn_core::tool_surface::resolve(CapabilitySurface::CliRemote, capabilities, &pool);
     if !capabilities.has(astra_turn_core::capability::Capability::ReflectService) {
@@ -181,6 +176,54 @@ pub fn cli_remote_tool_schemas(
         astra_tools::schemas::narrow_run_script_for_server(&mut schemas);
     }
     schemas
+}
+
+fn mcp_provider_tool_schemas(provider_id: &str, schemas: Vec<Value>) -> Vec<Value> {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let provider = astra_runtime_env::request_scoped_mcp_provider_from_schemas(
+        provider_id,
+        schemas.as_slice(),
+    );
+    astra_runtime_env::CapabilityResolver.filter_tool_schemas_for_providers(
+        &registry,
+        schemas,
+        &request_scoped_mcp_capabilities(),
+        &[provider],
+    )
+}
+
+fn request_scoped_mcp_capabilities() -> astra_runtime_env::EffectiveCapabilitySet {
+    astra_runtime_env::EffectiveCapabilitySet {
+        workspace: astra_runtime_env::WorkspaceCapabilities {
+            present: false,
+            readable: false,
+            writable: false,
+            persistent: false,
+        },
+        executor: astra_runtime_env::ExecutorCapabilities {
+            reachable: true,
+            control_plane: false,
+            server_service: false,
+            runtime_executor: false,
+            mcp_executor: true,
+        },
+        runtime: astra_runtime_env::RuntimeCapabilities {
+            runtime_has_process: false,
+            runtime_has_shell: false,
+            runtime_has_git: false,
+            runtime_has_lsp: false,
+            runtime_has_network: false,
+            runtime_has_credentials: false,
+        },
+        policy: astra_runtime_env::PolicyCapabilities {
+            filesystem_read: false,
+            filesystem_write: false,
+            network: astra_runtime_env::NetworkCapability::AllowList,
+            credentials: false,
+            approvals_required: false,
+            audit_required: true,
+        },
+    }
 }
 
 fn retain_server_executable_schemas(schemas: &mut Vec<Value>) {
@@ -571,6 +614,29 @@ mod tests {
         assert!(
             !tool_names.contains(&"mcp__docs__query".to_string()),
             "conflicting remote MCP schemas must be hidden instead of first-wins"
+        );
+    }
+
+    #[test]
+    fn mcp_schema_pool_requires_provider_admitted_function_schema() {
+        let tool_names = names(mcp_provider_tool_schemas(
+            "cli-request-scoped-mcp",
+            vec![
+                schema("mcp__zeta__query"),
+                schema("custom_plugin_tool"),
+                schema("mcp__bad/name"),
+                json!({"type": "custom", "function": {"name": "mcp__custom__bad"}}),
+                schema("mcp__alpha__query"),
+            ],
+        ));
+
+        assert_eq!(
+            tool_names,
+            vec![
+                "mcp__alpha__query".to_string(),
+                "mcp__zeta__query".to_string()
+            ],
+            "MCP schemas must be admitted as provider offers, fail closed for invalid/non-MCP schemas, and keep stable prompt order"
         );
     }
 
