@@ -2067,7 +2067,9 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
     if state.stall.any_intervention_active() {
         return None;
     }
-    if missing_browser_verification_evidence(state) {
+    let active_message =
+        astra_turn_core::chat_turn_heuristics::active_user_task_text(&state.message);
+    if missing_browser_verification_evidence(state, &active_message) {
         return Some(ExecutionRetryReason::MissingBrowserVerification);
     }
     if has_concrete_workspace_mutation(state) {
@@ -2090,16 +2092,16 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
         // completion is a high-risk silent no-op, so force exactly one retry.
         return Some(ExecutionRetryReason::MissingMutation);
     }
-    (user_confirmed_execution_from_recent_context(state)
+    (user_confirmed_execution_from_recent_context(state, &active_message)
         && (attempted_work_without_mutation || defers))
         .then_some(ExecutionRetryReason::MissingMutation)
 }
 
-fn missing_browser_verification_evidence(state: &AgenticLoopState) -> bool {
+fn missing_browser_verification_evidence(state: &AgenticLoopState, active_message: &str) -> bool {
     if state.final_text.trim().is_empty() {
         return false;
     }
-    if !message_requires_browser_verification(&state.message) {
+    if !message_requires_browser_verification(active_message) {
         return false;
     }
     if final_text_admits_browser_not_verified(&state.final_text) {
@@ -2413,8 +2415,11 @@ fn command_looks_like_verification(command: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn user_confirmed_execution_from_recent_context(state: &AgenticLoopState) -> bool {
-    if !looks_like_execution_confirmation(&state.message) {
+fn user_confirmed_execution_from_recent_context(
+    state: &AgenticLoopState,
+    active_message: &str,
+) -> bool {
+    if !looks_like_execution_confirmation(active_message) {
         return false;
     }
 
@@ -4387,6 +4392,31 @@ mod tests {
             ..Default::default()
         });
 
+        assert!(!should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn execution_retry_uses_active_user_text_not_runtime_scaffolding() {
+        let mut state = make_state();
+        state.message = concat!(
+            "review local changes",
+            "\n\n<system-reminder>\n",
+            "Previous runtime correction mentioned fix, apply, edit, and cleanup.\n",
+            "</system-reminder>"
+        )
+        .into();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
+        state.final_text = "I found one issue.".into();
+        state.total_tool_calls = 1;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"git diff --stat"}"#.into()),
+            ..Default::default()
+        });
+
+        assert!(!state.task_profile.mutates_workspace);
         assert!(!should_force_execution_retry(&state));
     }
 

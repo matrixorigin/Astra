@@ -185,7 +185,7 @@ fn is_prompt_internal_system_text(content: &str) -> bool {
 
 fn prompt_facing_content_for_role(role: &str, content: &str) -> Option<String> {
     let content = if role == "user" {
-        strip_user_runtime_scaffolding_affixes(content)
+        crate::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(content)
     } else {
         content.trim().to_string()
     };
@@ -196,56 +196,6 @@ fn prompt_facing_content_for_role(role: &str, content: &str) -> Option<String> {
         return None;
     }
     Some(content)
-}
-
-fn strip_user_runtime_scaffolding_affixes(content: &str) -> String {
-    let mut text = content.trim().to_string();
-    loop {
-        let trimmed = text.trim_start();
-        if !trimmed.starts_with(crate::runtime_scaffolding::SYSTEM_REMINDER_WRAPPER_PREFIX) {
-            break;
-        }
-        let Some(end) = trimmed.find("</system-reminder>") else {
-            break;
-        };
-        text = trimmed[end + "</system-reminder>".len()..]
-            .trim_start_matches(|ch: char| ch.is_whitespace())
-            .to_string();
-    }
-
-    loop {
-        let trimmed = text.trim_end();
-        let Some(start) = trimmed.rfind(crate::runtime_scaffolding::SYSTEM_REMINDER_WRAPPER_PREFIX)
-        else {
-            break;
-        };
-        let suffix = &trimmed[start..];
-        if !suffix
-            .trim_start()
-            .starts_with(crate::runtime_scaffolding::SYSTEM_REMINDER_WRAPPER_PREFIX)
-            || !suffix.trim_end().ends_with("</system-reminder>")
-        {
-            break;
-        }
-        text = trimmed[..start]
-            .trim_end_matches(|ch: char| ch.is_whitespace())
-            .to_string();
-    }
-
-    let trimmed = text.trim_start();
-    if trimmed.starts_with(crate::runtime_scaffolding::SESSION_RESUME_PREFIX) {
-        if let Some((_head, suffix)) = trimmed.rsplit_once("\n\n") {
-            let suffix = suffix.trim();
-            if !suffix.is_empty()
-                && !suffix.starts_with('-')
-                && crate::runtime_scaffolding::detect_runtime_scaffolding(suffix).is_none()
-            {
-                return suffix.to_string();
-            }
-        }
-    }
-
-    text.trim().to_string()
 }
 
 fn contains_tool_call_frame(msg: &Value) -> bool {

@@ -67,6 +67,62 @@ pub fn is_continuation_scaffolding_for_role(role: &str, content: &str) -> bool {
     matches!(role, "user" | "assistant" | "system") && detect_runtime_scaffolding(content).is_some()
 }
 
+/// Return the prompt-facing user text after removing runtime-owned wrappers.
+///
+/// This is the boundary between user intent and runtime telemetry. It must be
+/// used before intent classification, task-profile inference, answer-relevance
+/// checks, or any other decision that should be driven only by the latest real
+/// user request. The markers here are protocol-owned runtime prefixes, not
+/// natural-language intent heuristics.
+pub fn strip_user_runtime_scaffolding_affixes(content: &str) -> String {
+    let mut text = content.trim().to_string();
+    loop {
+        let trimmed = text.trim_start();
+        if !trimmed.starts_with(SYSTEM_REMINDER_WRAPPER_PREFIX) {
+            break;
+        }
+        let Some(end) = trimmed.find("</system-reminder>") else {
+            break;
+        };
+        text = trimmed[end + "</system-reminder>".len()..]
+            .trim_start_matches(|ch: char| ch.is_whitespace())
+            .to_string();
+    }
+
+    loop {
+        let trimmed = text.trim_end();
+        let Some(start) = trimmed.rfind(SYSTEM_REMINDER_WRAPPER_PREFIX) else {
+            break;
+        };
+        let suffix = &trimmed[start..];
+        if !suffix
+            .trim_start()
+            .starts_with(SYSTEM_REMINDER_WRAPPER_PREFIX)
+            || !suffix.trim_end().ends_with("</system-reminder>")
+        {
+            break;
+        }
+        text = trimmed[..start]
+            .trim_end_matches(|ch: char| ch.is_whitespace())
+            .to_string();
+    }
+
+    let trimmed = text.trim_start();
+    if trimmed.starts_with(SESSION_RESUME_PREFIX) {
+        if let Some((_head, suffix)) = trimmed.rsplit_once("\n\n") {
+            let suffix = suffix.trim();
+            if !suffix.is_empty()
+                && !suffix.starts_with('-')
+                && detect_runtime_scaffolding(suffix).is_none()
+            {
+                return suffix.to_string();
+            }
+        }
+    }
+
+    text.trim().to_string()
+}
+
 pub fn is_trailing_user_runtime_scaffolding(content: &str) -> bool {
     matches!(
         detect_runtime_scaffolding(content),
@@ -181,5 +237,32 @@ mod tests {
         assert!(!is_trailing_user_runtime_scaffolding(
             "## ⚠ Sequential Tool Calls Detected"
         ));
+    }
+
+    #[test]
+    fn strips_trailing_system_reminder_from_user_intent() {
+        let input = "review uncommitted changes\n\n<system-reminder>\nlast assistant: fix/apply/edit\n</system-reminder>";
+        assert_eq!(
+            strip_user_runtime_scaffolding_affixes(input),
+            "review uncommitted changes"
+        );
+    }
+
+    #[test]
+    fn strips_leading_system_reminder_from_user_intent() {
+        let input = "<system-reminder>\nbackground task update\n</system-reminder>\n\n修复这个问题";
+        assert_eq!(
+            strip_user_runtime_scaffolding_affixes(input),
+            "修复这个问题"
+        );
+    }
+
+    #[test]
+    fn extracts_real_suffix_from_session_resume_block() {
+        let input = "[session-resume:v1]\nHydrated previous session.\n\n我是让你review啊！";
+        assert_eq!(
+            strip_user_runtime_scaffolding_affixes(input),
+            "我是让你review啊！"
+        );
     }
 }

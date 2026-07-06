@@ -719,14 +719,16 @@ async fn maybe_inject_task_board_start_gate<H: AgenticLoopHost>(
         return false;
     }
 
+    let active_message =
+        astra_turn_core::chat_turn_heuristics::active_user_task_text(&state.message);
     let inferred_profile =
-        astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
+        astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&active_message);
     let profile = if state.task_profile == Default::default() {
         inferred_profile
     } else {
         state.task_profile
     };
-    if !should_require_task_board_for_message(&state.message, profile) {
+    if !should_require_task_board_for_message(&active_message, profile) {
         return false;
     }
 
