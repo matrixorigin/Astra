@@ -1027,4 +1027,14 @@ mod tests {
             Some(canonical_tool_schema_digest(&schema).as_str())
         );
     }
+
+    #[test]
+    #[should_panic(expected = "invalid capacity provider id")]
+    fn mcp_provider_from_schemas_rejects_user_label_delimiter_injection() {
+        let schema = serde_json::json!({
+            "type": "function",
+            "function": { "name": "mcp__github__search" }
+        });
+        let _ = mcp_provider_from_schemas("mcp@github", &[schema]);
+    }
 }
