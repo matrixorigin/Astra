@@ -94,6 +94,9 @@ impl ToolExecutionServiceBuilder {
     pub fn initial_disabled_tool_offers(mut self, tools: &[String]) -> Self {
         let mut set = HashSet::new();
         for t in tools {
+            validate_tool_offer_id(t).unwrap_or_else(|message| {
+                panic!("invalid deployment disabled_tool_offers: {message}")
+            });
             set.insert(t.clone());
         }
         self.disabled_tool_offers = Arc::new(RwLock::new(set));
@@ -104,6 +107,9 @@ impl ToolExecutionServiceBuilder {
         mut self,
         tools: HashMap<String, HashSet<String>>,
     ) -> Self {
+        validate_provider_allowed_tools(&tools).unwrap_or_else(|message| {
+            panic!("invalid deployment provider_allowed_tools: {message}")
+        });
         self.provider_allowed_tools = Arc::new(RwLock::new(tools));
         self
     }
@@ -180,12 +186,15 @@ impl ToolExecutionService {
 
     /// List currently disabled tool offers.
     pub async fn disabled_tool_offers(&self) -> Vec<String> {
-        self.disabled_tool_offers
+        let mut offers = self
+            .disabled_tool_offers
             .read()
             .await
             .iter()
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        offers.sort();
+        offers
     }
 
     pub fn disabled_tool_offers_handle(&self) -> Arc<RwLock<HashSet<String>>> {
@@ -658,6 +667,26 @@ fn validate_tool_offer_id(offer_id: &str) -> Result<(), String> {
     }
 }
 
+fn validate_provider_allowed_tools(
+    provider_allowed_tools: &HashMap<String, HashSet<String>>,
+) -> Result<(), String> {
+    for (provider_id, tool_names) in provider_allowed_tools {
+        if !astra_runtime_env::is_valid_provider_id(provider_id) {
+            return Err(format!(
+                "provider_allowed_tools keys must be concrete provider ids (got '{provider_id}')"
+            ));
+        }
+        for tool_name in tool_names {
+            if !astra_runtime_env::is_valid_tool_offer_tool_name(tool_name) {
+                return Err(format!(
+                    "provider_allowed_tools values must be canonical tool names (got '{tool_name}' for provider '{provider_id}')"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn no_workspace() -> WorkspaceBinding {
     WorkspaceBinding {
         kind: WorkspaceBindingKind::None,
@@ -695,9 +724,13 @@ mod tests {
         );
 
         let list = svc.disabled_tool_offers().await;
-        assert_eq!(list.len(), 2);
-        assert!(list.contains(&"web_fetch@server-builtin".to_string()));
-        assert!(list.contains(&"web_search@server-builtin".to_string()));
+        assert_eq!(
+            list,
+            vec![
+                "web_fetch@server-builtin".to_string(),
+                "web_search@server-builtin".to_string()
+            ]
+        );
 
         assert!(
             svc.enable_tool_offer("web_fetch@server-builtin")
@@ -730,5 +763,35 @@ mod tests {
         }
 
         assert!(svc.disabled_tool_offers().await.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid deployment disabled_tool_offers")]
+    fn builder_rejects_invalid_initial_disabled_tool_offers() {
+        let _ = ToolExecutionService::builder()
+            .initial_disabled_tool_offers(&["web_fetch".to_string()])
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "provider_allowed_tools keys must be concrete provider ids")]
+    fn builder_rejects_invalid_provider_allowed_tools_provider_id() {
+        let _ = ToolExecutionService::builder()
+            .initial_provider_allowed_tools(HashMap::from([(
+                "edge@macpro".to_string(),
+                HashSet::from(["web_fetch".to_string()]),
+            )]))
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "provider_allowed_tools values must be canonical tool names")]
+    fn builder_rejects_invalid_provider_allowed_tools_tool_name() {
+        let _ = ToolExecutionService::builder()
+            .initial_provider_allowed_tools(HashMap::from([(
+                "edge-macpro".to_string(),
+                HashSet::from(["web.fetch".to_string()]),
+            )]))
+            .build();
     }
 }
