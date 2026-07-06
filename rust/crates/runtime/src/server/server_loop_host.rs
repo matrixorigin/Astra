@@ -7077,6 +7077,45 @@ mod tests {
     }
 
     #[test]
+    fn builder_edge_surface_uses_advertised_runtime_tool_subset() {
+        let read_only_edge_tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })];
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(read_only_edge_tools)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        assert!(host.valid_tool_names().contains("read_file"));
+        assert!(
+            !host.valid_tool_names().contains("bash"),
+            "edge tools must come from the advertised runtime offer set, not the static registry"
+        );
+        let names = schema_names(&host.tool_schemas);
+        assert!(names.contains("read_file"));
+        assert!(
+            !names.contains("bash"),
+            "prompt-visible edge runtime tools must mirror the advertised offer set"
+        );
+        for expected in ["task", "session", "tool_search", "introspect"] {
+            assert!(
+                host.valid_tool_names().contains(expected),
+                "control-plane backbone tool {expected} must remain valid while runtime tools are provider-scoped"
+            );
+        }
+    }
+
+    #[test]
     fn sync_valid_tools_uses_final_wire_surface_not_candidate_edge_tools() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
