@@ -717,7 +717,7 @@ mod tests {
             ),
         ] {
             assert!(
-                names.contains(&"task".to_string()),
+                names.contains(&"task_board".to_string()),
                 "{surface} must expose the durable task-board backbone: {names:?}"
             );
         }
@@ -785,7 +785,7 @@ mod tests {
         for visible in [
             "ask_user",
             "agent",
-            "task",
+            "task_board",
             "session",
             "tool_search",
             "web_fetch",

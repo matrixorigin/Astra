@@ -249,7 +249,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("compress_context", MU, OR),
     tool("env", MU, OR),
     // ── Mutating — task management (immune to health avoidance) ───────
-    tool("task", MU, OR.union(ToolFlags::TASK_MGMT)),
+    tool("task_board", MU, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_output", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_list", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_stop", MU, OR.union(ToolFlags::TASK_MGMT)),
@@ -311,7 +311,7 @@ impl ToolRegistry {
     /// Returns the effective `ToolCategory` after inspecting `args` for
     /// consolidated tools.
     pub fn category_for(&self, name: &str, args: Option<&serde_json::Value>) -> ToolCategory {
-        if matches!(name, "memory" | "git" | "github" | "task") {
+        if matches!(name, "memory" | "git" | "github" | "task_board") {
             return classify(name, args).category;
         }
         self.category(name)
@@ -587,7 +587,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         }
     }
 
-    if name == "task" {
+    if name == "task_board" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
             Some("list" | "get" | "list_user") => {
                 meta_category = ToolCategory::ReadOnly;
@@ -686,7 +686,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
 
     let idempotency = if shell_read_only {
         ToolIdempotency::PureRead
-    } else if name == "task" {
+    } else if name == "task_board" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
             Some("list" | "get" | "list_user") => ToolIdempotency::PureRead,
             _ => ToolIdempotency::NonIdempotent,
@@ -977,18 +977,18 @@ mod tests {
         use serde_json::json;
 
         for action in ["list", "get", "list_user"] {
-            let read = classify("task", Some(&json!({"action": action})));
+            let read = classify("task_board", Some(&json!({"action": action})));
             assert_eq!(read.category, ToolCategory::ReadOnly);
             assert!(!read.approval_required);
             assert!(read.parallelizable);
         }
 
-        let update = classify("task", Some(&json!({"action": "update"})));
+        let update = classify("task_board", Some(&json!({"action": "update"})));
         assert_eq!(update.category, ToolCategory::Mutating);
         assert!(!update.approval_required);
 
         let stale_background = classify(
-            "task",
+            "task_board",
             Some(&json!({"action": "background_shell", "command": "npm run dev"})),
         );
         assert_eq!(stale_background.category, ToolCategory::Mutating);
@@ -2405,7 +2405,7 @@ mod tests {
             "compress_context",
             "env",
             "notebook_edit",
-            "task",
+            "task_board",
             "context_analysis",
             "diagnose",
             "rollback_file_edits",

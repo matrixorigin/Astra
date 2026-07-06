@@ -566,27 +566,14 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 35,
     },
     ToolMeta {
-        name: "task",
+        name: "task_board",
         description: "Durable session task board: create, update, list, get, stop, adopt, or archive task-board work.",
-        triggers: &[
-            "task",
-            "task board",
-            "checklist",
-            "todo",
-            "progress",
-            "open work",
-            "work item",
-            "任务",
-            "任务板",
-            "待办",
-            "清单",
-            "进度",
-        ],
+        triggers: &[],
         intents: &[IntentType::CodeEdit, IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
         binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 120,
+        schema_tokens: 160,
     },
     ToolMeta {
         name: "mo_query",
@@ -663,7 +650,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "task_output",
         description: "Read output and status for a specific typed background task by task_id.",
         triggers: &[
-            "task output",
+            "background task output",
             "background output",
             "shell output",
             "bg output",
@@ -678,7 +665,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "task_stop",
         description: "Stop a specific running typed background task by task_id.",
         triggers: &[
-            "task stop",
+            "background task stop",
             "stop background",
             "kill background",
             "cancel background",
@@ -693,7 +680,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "task_list",
         description: "List typed background tasks for this session.",
         triggers: &[
-            "task list",
+            "background task list",
             "background list",
             "list background",
             "bg tasks",
@@ -891,16 +878,23 @@ mod tests {
                 tool.name
             );
             assert!(
-                !tool.triggers.is_empty(),
-                "tool {} has no triggers",
-                tool.name
-            );
-            assert!(
                 !tool.intents.is_empty(),
                 "tool {} has no intents",
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn task_board_catalog_entry_does_not_use_text_triggers() {
+        let tool = TOOL_CATALOG
+            .iter()
+            .find(|tool| tool.name == "task_board")
+            .expect("task_board catalog entry");
+        assert!(
+            tool.triggers.is_empty(),
+            "task_board must be exposed by provider/schema policy, not prompt text matching"
+        );
     }
 
     #[test]
@@ -948,7 +942,7 @@ mod tests {
             "introspect",
             "compress_context",
             "rollback_session_state",
-            "task",
+            "task_board",
         ] {
             let tool = TOOL_CATALOG
                 .iter()

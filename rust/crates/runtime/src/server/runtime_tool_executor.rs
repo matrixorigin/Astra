@@ -5100,7 +5100,7 @@ esac
 
         let result = exec
             .execute_with_metadata(
-                "task",
+                "task_board",
                 &json!({
                     "action": "create",
                     "title": "live task board",

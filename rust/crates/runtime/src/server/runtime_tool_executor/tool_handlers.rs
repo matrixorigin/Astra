@@ -75,7 +75,7 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     register_handler_or_log!(engine, "tool_search", ToolSearchToolHandler);
     register_handler_or_log!(engine, "memory", MemoryToolHandler);
     register_handler_or_log!(engine, "session", SessionToolHandler);
-    register_handler_or_log!(engine, "task", TaskToolHandler);
+    register_handler_or_log!(engine, "task_board", TaskBoardToolHandler);
     register_handler_or_log!(engine, "agent", AgentToolHandler);
     register_handler_or_log!(engine, "agent_fanout", AgentFanoutToolHandler);
     register_handler_or_log!(engine, "ask_user", AskUserToolHandler);
@@ -220,10 +220,10 @@ impl ToolHandler<RuntimeToolExecutor> for SessionToolHandler {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct TaskToolHandler;
+struct TaskBoardToolHandler;
 
 #[async_trait]
-impl ToolHandler<RuntimeToolExecutor> for TaskToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for TaskBoardToolHandler {
     async fn execute(
         &self,
         context: &RuntimeToolExecutor,

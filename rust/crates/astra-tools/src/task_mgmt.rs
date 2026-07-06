@@ -3605,11 +3605,11 @@ mod tests {
             .update(&json!({"task_id": "task-1", "subtasks": []}))
             .await;
         assert!(
-            create_only_field_on_update.contains("unknown field 'subtasks' for task.update"),
+            create_only_field_on_update.contains("unknown field 'subtasks' for task_board.update"),
             "{create_only_field_on_update}"
         );
         assert!(
-            create_only_field_on_update.contains("field is valid for: task.create"),
+            create_only_field_on_update.contains("field is valid for: task_board.create"),
             "{create_only_field_on_update}"
         );
 

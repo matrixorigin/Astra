@@ -269,7 +269,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         control_plane("rollback_session_state", ToolLoadPolicy::Deferred),
         control_plane("session", ToolLoadPolicy::Deferred),
         control_plane("skill", ToolLoadPolicy::AlwaysLoad),
-        control_plane("task", ToolLoadPolicy::AlwaysLoad),
+        control_plane("task_board", ToolLoadPolicy::AlwaysLoad),
         control_plane("task_output", ToolLoadPolicy::Deferred),
         control_plane("task_stop", ToolLoadPolicy::Deferred),
         control_plane("task_list", ToolLoadPolicy::Deferred),
@@ -2162,7 +2162,7 @@ mod tests {
         let registry = registry();
         let binding = RunBinding::edge_developer("/repo", &registry);
         let schemas = vec![
-            serde_json::json!({"type": "function", "function": {"name": "task"}}),
+            serde_json::json!({"type": "function", "function": {"name": "task_board"}}),
             serde_json::json!({"type": "function", "function": {"name": "introspect"}}),
             serde_json::json!({"type": "function", "function": {"name": "reflect"}}),
             serde_json::json!({"type": "function", "function": {"name": "agent_fanout"}}),
@@ -2179,7 +2179,13 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "read_file"));
         assert!(names.iter().any(|name| name == "bash"));
-        for hidden in ["task", "introspect", "reflect", "agent_fanout", "memory"] {
+        for hidden in [
+            "task_board",
+            "introspect",
+            "reflect",
+            "agent_fanout",
+            "memory",
+        ] {
             assert!(
                 !names.iter().any(|name| name == hidden),
                 "{hidden} must not be prompt-visible without a matching provider binding: {names:?}"

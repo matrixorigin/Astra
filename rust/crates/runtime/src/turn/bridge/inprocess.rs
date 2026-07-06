@@ -4155,6 +4155,7 @@ impl InProcessChatTurnBridge {
                     event_id: user_query_event_id.clone(),
                     user_id: user_id.clone(),
                     session_id: session_id.clone(),
+                    run_id: Some(run_id.clone()),
                     agent_id: agent_id.clone(),
                     event_type: "user_query".to_string(),
                     content: content.clone(),
@@ -4173,6 +4174,7 @@ impl InProcessChatTurnBridge {
                 event_id: Uuid::now_v7().to_string(),
                 user_id: user_id.clone(),
                 session_id: session_id.clone(),
+                run_id: Some(run_id.clone()),
                 agent_id: agent_id.clone(),
                 event_type: "llm_response".to_string(),
                 content: llm_content.clone(),
@@ -4198,10 +4200,21 @@ impl InProcessChatTurnBridge {
                 for (index, tool_call) in all_round_tool_calls.iter().enumerate() {
                     if let Some(tc) = tool_call.as_object() {
                         let payload = build_tool_call_event_payload(tc, index, &reasoning);
+                        let tool_call_id = payload
+                            .metadata
+                            .get("tool_call_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string);
+                        let mut metadata = payload.metadata;
+                        metadata.insert("run_id".to_string(), Value::String(run_id.clone()));
                         events.push(TurnToolEventRecord {
                             event_id: Uuid::now_v7().to_string(),
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
+                            run_id: Some(run_id.clone()),
+                            tool_call_id,
                             agent_id: agent_id.clone(),
                             event_type: "tool_call".to_string(),
                             content: match payload.content {
@@ -4211,8 +4224,7 @@ impl InProcessChatTurnBridge {
                             parent_event_id: Some(user_query_event_id.clone()),
                             parent_event_ids: vec![user_query_event_id.clone()],
                             causal_chain_id: turn_chain_id.clone(),
-                            metadata: (!payload.metadata.is_empty())
-                                .then_some(Value::Object(payload.metadata)),
+                            metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
                             skill_name: (!payload.skill_name.is_empty())
                                 .then_some(payload.skill_name),
                             skill_version: None,
@@ -4224,10 +4236,21 @@ impl InProcessChatTurnBridge {
                     if let Some(tr) = tool_result.as_object() {
                         let payload =
                             build_tool_result_event_payload(tr, "edge", TOOL_RESULT_AUDIT_CHARS);
+                        let tool_call_id = payload
+                            .metadata
+                            .get("tool_call_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string);
+                        let mut metadata = payload.metadata;
+                        metadata.insert("run_id".to_string(), Value::String(run_id.clone()));
                         events.push(TurnToolEventRecord {
                             event_id: Uuid::now_v7().to_string(),
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
+                            run_id: Some(run_id.clone()),
+                            tool_call_id,
                             agent_id: agent_id.clone(),
                             event_type: "tool_result".to_string(),
                             content: match payload.content {
@@ -4237,8 +4260,7 @@ impl InProcessChatTurnBridge {
                             parent_event_id: Some(user_query_event_id.clone()),
                             parent_event_ids: vec![user_query_event_id.clone()],
                             causal_chain_id: turn_chain_id.clone(),
-                            metadata: (!payload.metadata.is_empty())
-                                .then_some(Value::Object(payload.metadata)),
+                            metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
                             skill_name: (!payload.skill_name.is_empty())
                                 .then_some(payload.skill_name),
                             skill_version: None,

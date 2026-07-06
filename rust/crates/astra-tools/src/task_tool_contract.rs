@@ -1,6 +1,8 @@
 use serde_json::Value;
 
-/// Public checklist actions exposed by the model-facing `task` schema.
+pub const TASK_BOARD_TOOL_NAME: &str = "task_board";
+
+/// Public checklist actions exposed by the model-facing `task_board` schema.
 ///
 /// Keep this list in schema order. Executors must not accept extra aliases:
 /// if the schema did not advertise an action, accepting it in one runtime
@@ -20,23 +22,23 @@ pub const TASK_ACTIONS_DISPLAY: &str = "create, update, list, get, stop, list_us
 
 pub fn task_missing_action_message() -> String {
     format!(
-        "missing required parameter `action` for `task`. Retry the same `task` tool with action set to one of: {TASK_ACTIONS_DISPLAY}."
+        "missing required parameter `action` for `task_board`. Retry the same `task_board` tool with action set to one of: {TASK_ACTIONS_DISPLAY}."
     )
 }
 
 pub fn task_action_type_message() -> &'static str {
-    "field 'action' for `task` must be a string"
+    "field 'action' for `task_board` must be a string"
 }
 
 pub fn task_unknown_action_message(action: &str) -> String {
-    format!("unknown `task` action '{action}'. Use one of: {TASK_ACTIONS_DISPLAY}.")
+    format!("unknown `task_board` action '{action}'. Use one of: {TASK_ACTIONS_DISPLAY}.")
 }
 
 pub fn task_action_from_args(args: &Value) -> Result<&str, String> {
     match args.get("action") {
-        Some(Value::String(action)) => Ok(action.as_str()),
+        Some(Value::String(action)) if !action.trim().is_empty() => Ok(action.as_str()),
+        Some(Value::String(_)) | None => Err(task_missing_action_message()),
         Some(_) => Err(task_action_type_message().to_string()),
-        None => Err(task_missing_action_message()),
     }
 }
 
@@ -100,13 +102,13 @@ pub fn unknown_task_field_message(action: &str, key: &str, allowed: &[&str]) -> 
             "; field is valid for: {}",
             other_actions
                 .iter()
-                .map(|action| format!("task.{action}"))
+                .map(|action| format!("task_board.{action}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
     };
     format!(
-        "unknown field '{key}' for task.{action} (valid: {}{})",
+        "unknown field '{key}' for task_board.{action} (valid: {}{})",
         allowed.join(", "),
         action_hint
     )
@@ -121,7 +123,7 @@ fn validate_task_tool_args_for_action_impl(
         return Ok(());
     };
     let Some(obj) = args.as_object() else {
-        return Err(format!("task.{action} arguments must be an object"));
+        return Err(format!("task_board.{action} arguments must be an object"));
     };
     for key in obj.keys() {
         if allow_runtime_private_fields && key.starts_with('_') {
@@ -189,7 +191,7 @@ mod tests {
     fn missing_action_message_is_retryable_invalid_args_contract() {
         let err = task_action_from_args(&json!({})).expect_err("missing action must fail");
         assert!(err.contains("missing required parameter `action`"));
-        assert!(err.contains("Retry the same `task` tool"));
+        assert!(err.contains("Retry the same `task_board` tool"));
         assert!(err.contains(TASK_ACTIONS_DISPLAY));
     }
 
@@ -200,8 +202,11 @@ mod tests {
             &json!({"action": "update", "task_id": "task-1", "subtasks": []}),
         )
         .expect_err("create-only field must fail on update");
-        assert!(err.contains("unknown field 'subtasks' for task.update"));
-        assert!(err.contains("field is valid for: task.create"), "{err}");
+        assert!(err.contains("unknown field 'subtasks' for task_board.update"));
+        assert!(
+            err.contains("field is valid for: task_board.create"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -380,7 +380,7 @@ pub const CAP_INTROSPECT: &str = "introspect";
 pub const CAP_TOOL_SEARCH: &str = "tool_search";
 pub const CAP_MO_QUERY: &str = "mo_query";
 pub const CAP_SESSION: &str = "session";
-pub const CAP_TASK: &str = "task";
+pub const CAP_TASK_BOARD: &str = "task_board";
 pub const CAP_PLAN: &str = "plan";
 pub const CAP_MULTI_AGENT: &str = "multi_agent";
 pub const CAP_POLICY: &str = "policy";
@@ -401,7 +401,7 @@ pub fn server_service_capabilities() -> Vec<String> {
 pub fn control_plane_capabilities(extra: impl IntoIterator<Item = &'static str>) -> Vec<String> {
     let mut capabilities = labels([
         CAP_SESSION,
-        CAP_TASK,
+        CAP_TASK_BOARD,
         CAP_PLAN,
         CAP_POLICY,
         CAP_AUDIT,
@@ -886,7 +886,8 @@ mod tests {
         assert!(!server.declares_tool("bash"));
 
         assert!(control.declares_tool("ask_user"));
-        assert!(control.declares_tool("task"));
+        assert!(control.declares_tool("task_board"));
+        assert!(!control.declares_tool("task"));
         assert!(!control.declares_tool("web_fetch"));
 
         assert!(cli.declares_tool("bash"));

@@ -89,7 +89,7 @@ impl ToolCategory {
             | "compress_context"
             | "memory"
             | "session"
-            | "task"
+            | "task_board"
             | "mo_query"
             | "rollback_database_snapshots"
             | "rollback_session_state" => Some(Self::StateManagement),
@@ -138,7 +138,7 @@ mod tests {
             Some(ToolCategory::StateManagement)
         );
         assert_eq!(
-            ToolCategory::for_tool_name("task"),
+            ToolCategory::for_tool_name("task_board"),
             Some(ToolCategory::StateManagement)
         );
         for local_background_tool in ["task_output", "task_stop", "task_list"] {

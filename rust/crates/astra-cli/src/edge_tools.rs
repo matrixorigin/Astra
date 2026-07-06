@@ -146,7 +146,7 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "session",
     "share_context",
     "symbol_search",
-    "task",
+    "task_board",
     "task_list",
     "task_output",
     "task_stop",
@@ -2978,7 +2978,7 @@ impl ToolExecutor {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task:create:{}",
+                    "task_board:create:{}",
                     public_args
                         .get("title")
                         .and_then(Value::as_str)
@@ -2989,6 +2989,55 @@ impl ToolExecutor {
         }
         output
     }
+
+    async fn execute_task_tool_args(&self, args: &Value) -> String {
+        let action = match astra_tools::task_tool_contract::task_action_from_args(args) {
+            Ok(action) => action,
+            Err(error) => return format!("Error: {error}"),
+        };
+        match action {
+            "create" => match Self::validate_task_tool_args_for_action("create", args) {
+                Ok(()) => self.task_action_create(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "list" => match Self::validate_task_tool_args_for_action("list", args) {
+                Ok(()) => self.task_list(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "get" => match Self::validate_task_tool_args_for_action("get", args) {
+                Ok(()) => self.task_get(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "update" => match Self::validate_task_tool_args_for_action("update", args) {
+                Ok(()) => self.task_action_update(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "stop" => match Self::validate_task_tool_args_for_action("stop", args) {
+                Ok(()) => self.task_action_stop(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "list_user" => match Self::validate_task_tool_args_for_action("list_user", args) {
+                Ok(()) => self.task_list_user(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "adopt" => match Self::validate_task_tool_args_for_action("adopt", args) {
+                Ok(()) => self.task_adopt(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "archive" => match Self::validate_task_tool_args_for_action("archive", args) {
+                Ok(()) => self.task_action_archive(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            other => match Self::validate_task_tool_args_for_action(other, args) {
+                Ok(()) => format!(
+                    "Error: {}",
+                    astra_tools::task_tool_contract::task_unknown_action_message(other)
+                ),
+                Err(error) => format!("Error: {error}"),
+            },
+        }
+    }
+
     async fn task_list(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("list", args).await {
             return output;
@@ -3027,7 +3076,7 @@ impl ToolExecutor {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task:update:{}",
+                    "task_board:update:{}",
                     public_args
                         .get("task_id")
                         .and_then(Value::as_str)
@@ -3062,7 +3111,7 @@ impl ToolExecutor {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task:stop:{}",
+                    "task_board:stop:{}",
                     public_args
                         .get("task_id")
                         .and_then(Value::as_str)
@@ -3074,7 +3123,7 @@ impl ToolExecutor {
         output
     }
 
-    /// `task(action='list_user')` — cross-session active list. Cloud
+    /// `task_board(action='list_user')` — cross-session active list. Cloud
     /// only: in-memory mode by definition has only one session, so
     /// the cross-session question is meaningless without a backing
     /// store that aggregates across users.
@@ -3084,7 +3133,7 @@ impl ToolExecutor {
             Err(err) => return err,
         };
         let Some(cloud_base) = self.cloud_base.clone() else {
-            return "Error: task(action='list_user') requires a cloud connection. \
+            return "Error: task_board(action='list_user') requires a cloud connection. \
                     The cross-session view is server-side only — set ASTRA_API_URL \
                     or sign in with `astra login` to enable it."
                 .to_string();
@@ -3120,14 +3169,14 @@ impl ToolExecutor {
         }
     }
 
-    /// `task(action='adopt', source_session_id, task_id)` — bring a
+    /// `task_board(action='adopt', source_session_id, task_id)` — bring a
     /// task from another of the user's sessions into the current
     /// session. Server-side it copies the row's title/description/
     /// metadata into a fresh todo here and marks the source migrated
     /// so the user doesn't see it twice. Cloud-only.
     async fn task_adopt(&self, args: &Value) -> String {
         if self.cloud_base.is_none() {
-            return "Error: task(action='adopt') requires a cloud connection.".to_string();
+            return "Error: task_board(action='adopt') requires a cloud connection.".to_string();
         }
         // Adopt is a write — route through the same execute endpoint.
         // Server-side dispatch will reject if source isn't owned by
@@ -3138,7 +3187,7 @@ impl ToolExecutor {
         }
     }
 
-    /// `task(action='archive', task_id?)` — either archive one
+    /// `task_board(action='archive', task_id?)` — either archive one
     /// current-session task immediately, or bulk-archive stale
     /// completed history in the current session.
     async fn task_action_archive(&self, args: &Value) -> String {
@@ -3165,7 +3214,7 @@ impl ToolExecutor {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task:archive:{}",
+                    "task_board:archive:{}",
                     public_args
                         .get("task_id")
                         .and_then(Value::as_str)
@@ -4871,67 +4920,7 @@ impl ToolExecutor {
                         }
                     }
                 }
-                // Task management (unified tool with action param)
-                "task" => {
-                    let action = match astra_tools::task_tool_contract::task_action_from_args(args)
-                    {
-                        Ok(action) => action,
-                        Err(error) => return format!("Error: {error}"),
-                    };
-                    match action {
-                        "create" => {
-                            match Self::validate_task_tool_args_for_action("create", args) {
-                                Ok(()) => self.task_action_create(args).await,
-                                Err(error) => format!("Error: {error}"),
-                            }
-                        }
-                        "list" => match Self::validate_task_tool_args_for_action("list", args) {
-                            Ok(()) => self.task_list(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
-                        "get" => match Self::validate_task_tool_args_for_action("get", args) {
-                            Ok(()) => self.task_get(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
-                        "update" => {
-                            match Self::validate_task_tool_args_for_action("update", args) {
-                                Ok(()) => self.task_action_update(args).await,
-                                Err(error) => format!("Error: {error}"),
-                            }
-                        }
-                        "stop" => match Self::validate_task_tool_args_for_action("stop", args) {
-                            Ok(()) => self.task_action_stop(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
-                        // Cross-session views (Phase 7): user_id-indexed
-                        // queries served by the server. Cloud-only;
-                        // offline mode returns an error since there's
-                        // nothing to aggregate across sessions.
-                        "list_user" => {
-                            match Self::validate_task_tool_args_for_action("list_user", args) {
-                                Ok(()) => self.task_list_user(args).await,
-                                Err(error) => format!("Error: {error}"),
-                            }
-                        }
-                        "adopt" => match Self::validate_task_tool_args_for_action("adopt", args) {
-                            Ok(()) => self.task_adopt(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
-                        "archive" => {
-                            match Self::validate_task_tool_args_for_action("archive", args) {
-                                Ok(()) => self.task_action_archive(args).await,
-                                Err(error) => format!("Error: {error}"),
-                            }
-                        }
-                        other => match Self::validate_task_tool_args_for_action(other, args) {
-                            Ok(()) => format!(
-                                "Error: {}",
-                                astra_tools::task_tool_contract::task_unknown_action_message(other)
-                            ),
-                            Err(error) => format!("Error: {error}"),
-                        },
-                    }
-                }
+                "task_board" => self.execute_task_tool_args(args).await,
                 "task_output" => self.task_output(args).await,
                 "task_stop" => self.task_kill_bg(args).await,
                 "task_list" => self.task_list_bg().await,
@@ -6409,11 +6398,11 @@ mod tests {
     async fn unknown_task_action_stays_inside_task_contract() {
         let executor = test_executor();
         let output = executor
-            .execute("task", &serde_json::json!({"action": "spawn_agents"}))
+            .execute("task_board", &serde_json::json!({"action": "spawn_agents"}))
             .await;
 
         assert!(
-            output.contains("unknown `task` action 'spawn_agents'"),
+            output.contains("unknown `task_board` action 'spawn_agents'"),
             "{output}"
         );
         assert!(output.contains("create, update, list"), "{output}");

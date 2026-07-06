@@ -23,7 +23,7 @@ fn is_plan_internal_authoring_tool(tool_name: &str, args: &Value) -> bool {
             args.get("action").and_then(Value::as_str),
             Some("recall" | "expand" | "profile" | "remember" | "update")
         ),
-        "task" => matches!(
+        "task_board" => matches!(
             args.get("action").and_then(Value::as_str),
             Some("create" | "update" | "list" | "get" | "list_user" | "adopt")
         ),
@@ -145,12 +145,12 @@ mod tests {
             ("enter_plan_mode", json!({})),
             ("exit_plan_mode", json!({"plan": "1. inspect"})),
             (
-                "task",
+                "task_board",
                 json!({"action": "create", "title": "draft plan item"}),
             ),
-            ("task", json!({"action": "update", "task_id": "t1"})),
-            ("task", json!({"action": "list"})),
-            ("task", json!({"action": "get", "task_id": "t1"})),
+            ("task_board", json!({"action": "update", "task_id": "t1"})),
+            ("task_board", json!({"action": "list"})),
+            ("task_board", json!({"action": "get", "task_id": "t1"})),
             (
                 "memory",
                 json!({"action": "remember", "content": "plan context"}),
@@ -201,7 +201,7 @@ mod tests {
             &json!({"task_id": "bg-shell-1"})
         ));
         assert!(is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "stop", "task_id": "bg-shell-1"})
         ));
     }

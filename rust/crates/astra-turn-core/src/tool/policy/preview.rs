@@ -19,8 +19,9 @@
 //! Only covers the **active** tool set shipped today (the names
 //! advertised in `astra-tools::schemas`). Retired separate names
 //! have been removed — the model now issues unified action-param
-//! calls (`task(action="create")`, `git(action="show")`,
-//! `memory(action="retrieve")`, `lsp(operation="hover")`) and we
+//! calls (`git(action="show")`, `memory(action="retrieve")`,
+//! `task_board(action="create")`,
+//! `lsp(operation="hover")`) and we
 //! don't maintain preview code for dead paths.
 //!
 //! ## Design
@@ -169,7 +170,7 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         "mo_query" => mo_query_preview(args, path_budget, verbose),
         "agent" => agent_preview(args, path_budget, verbose),
         "skill" => skill_preview(args, path_budget, verbose),
-        "task" => task_preview(args, path_budget, verbose),
+        "task_board" => task_preview(args, path_budget, verbose),
         "task_output" => background_task_output_preview(args, path_budget, verbose),
         "task_stop" => background_task_stop_preview(args, path_budget, verbose),
         "task_list" => "List background tasks".to_string(),
@@ -547,6 +548,15 @@ fn skill_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bo
 
 fn task_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    task_preview_for_action(action, args, path_budget, verbose)
+}
+
+fn task_preview_for_action(
+    action: &str,
+    args: &Value,
+    path_budget: impl Fn(usize) -> usize,
+    verbose: bool,
+) -> String {
     let trunc = |s: &str, b: usize| -> String {
         if verbose {
             s.to_string()
@@ -1130,7 +1140,7 @@ mod tests {
     fn task_action_create() {
         assert_eq!(
             p(
-                "task",
+                "task_board",
                 json!({"action": "create", "title": "Fix renderer drift"})
             ),
             r#"Creating task: "Fix renderer drift""#
@@ -1141,7 +1151,7 @@ mod tests {
     fn task_update_status() {
         assert_eq!(
             p(
-                "task",
+                "task_board",
                 json!({"action": "update", "task_id": "render-pass", "new_status": "in_progress"})
             ),
             "Updating task: render-pass -> in_progress"
@@ -1151,7 +1161,10 @@ mod tests {
     #[test]
     fn task_list_with_filter() {
         assert_eq!(
-            p("task", json!({"action": "list", "status_filter": "active"})),
+            p(
+                "task_board",
+                json!({"action": "list", "status_filter": "active"})
+            ),
             "Listing tasks: active"
         );
     }
@@ -1327,7 +1340,7 @@ mod tests {
     fn task_update_uses_canonical_new_status_field() {
         assert_eq!(
             p(
-                "task",
+                "task_board",
                 json!({"action": "update", "task_id": "t-1", "new_status": "completed"})
             ),
             "Updating task: t-1 -> completed"
@@ -1338,7 +1351,7 @@ mod tests {
     fn task_list_uses_canonical_status_filter_field() {
         assert_eq!(
             p(
-                "task",
+                "task_board",
                 json!({"action": "list", "status_filter": "pending"})
             ),
             "Listing tasks: pending"
@@ -1348,12 +1361,12 @@ mod tests {
     #[test]
     fn task_list_user_uses_canonical_user_status_field() {
         assert_eq!(
-            p("task", json!({"action": "list_user"})),
+            p("task_board", json!({"action": "list_user"})),
             "Listing cross-session tasks: active"
         );
         assert_eq!(
             p(
-                "task",
+                "task_board",
                 json!({"action": "list_user", "user_status": "paused"})
             ),
             "Listing cross-session tasks: paused"

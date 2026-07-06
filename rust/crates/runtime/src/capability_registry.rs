@@ -774,8 +774,8 @@ mod tests {
         .unwrap();
 
         let task_request = ToolRequest {
-            capability: ToolCapability::Named("task".into()),
-            tool_name: "task".into(),
+            capability: ToolCapability::Named("task_board".into()),
+            tool_name: "task_board".into(),
             tool_call_id: "call-task".into(),
             parameters: serde_json::Value::Null,
             isolation_required: IsolationIntent::None,
