@@ -6425,6 +6425,11 @@ mod tests {
                 "function": {"name": "mcp__docs__query", "arguments": r#"{"query":"astra"}"#}
             }),
             json!({
+                "id": "task-1",
+                "type": "function",
+                "function": {"name": "task", "arguments": r#"{"action":"create","title":"server task"}"#}
+            }),
+            json!({
                 "id": "unknown-1",
                 "type": "function",
                 "function": {"name": "totally_unknown", "arguments": "{}"}
@@ -6523,6 +6528,40 @@ mod tests {
         assert!(
             host.should_deliver_edge_bound_tools_via_client_ledger(&state),
             "the browser/client ledger remains available only for thin clients without a runtime executor"
+        );
+    }
+
+    #[tokio::test]
+    async fn thin_client_ledger_does_not_emit_server_owned_task_request() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-task-ledger".to_string(),
+            "s-task-ledger".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        host.set_event_tx(tx);
+        let state = create_test_state();
+
+        let task_call = json!({
+            "id": "task-1",
+            "type": "function",
+            "function": {"name": "task", "arguments": r#"{"action":"create","title":"server task"}"#}
+        });
+
+        let results = host
+            .maybe_deliver_edge_bound_tools_via_ledger(&state, &[task_call])
+            .await;
+
+        assert!(
+            results.is_empty(),
+            "server-owned task must not be converted into edge/client results"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "server-owned task must not emit a tool_request to thin clients"
         );
     }
 

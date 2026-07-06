@@ -88,6 +88,35 @@ pub(crate) struct HeadlessResolvedExecution {
 const EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD: &str =
     "runtime_environment_advertisement";
 const EDGE_RESULT_RUNTIME_ENVIRONMENT_FIELD: &str = "runtime_environment";
+const HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX: &str = "Error: headless edge protocol";
+
+fn server_owned_edge_result_should_be_rerouted(
+    execution: &HeadlessResolvedExecution,
+    runtime_executor_available: bool,
+) -> bool {
+    if !runtime_executor_available || !execution.is_edge_tool {
+        return false;
+    }
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    registry.get(&execution.name).is_some_and(|spec| {
+        matches!(
+            spec.required.executor,
+            astra_runtime_env::RequiredExecutor::ControlPlane
+                | astra_runtime_env::RequiredExecutor::ServiceExecutor
+        )
+    })
+}
+
+fn reroute_server_owned_edge_result_to_server_execution(execution: &mut HeadlessResolvedExecution) {
+    execution.result_str = format!(
+        "{HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX}: server-owned tool `{}` received a client/edge result and must execute on the server",
+        execution.name
+    );
+    execution.tool_result_fields = None;
+    execution.edge_duration_ms = 0;
+    execution.is_edge_tool = false;
+    execution.early_exit_ms = 0;
+}
 
 fn edge_result_runtime_environment_denial(execution: &HeadlessResolvedExecution) -> Option<String> {
     if !execution.is_edge_tool {
@@ -1178,6 +1207,67 @@ mod tests {
             result.contains("tool 'grep' is not in allowed_tools"),
             "got: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn server_owned_tool_ignores_edge_result_and_executes_on_server() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round[0] = EdgeToolExecResult {
+            request_id: "call-task".to_string(),
+            tool: "task".to_string(),
+            args: json!({ "action": "create", "title": "server-owned task" }),
+            output: "stale client-side task result".to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
+            status: "completed".to_string(),
+            duration_ms: 9,
+        };
+        harness.valid_tool_names = HashSet::from(["task".to_string()]);
+        begin_recorded_turn(&mut harness, 1);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
+
+        let executed = {
+            let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
+            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+                HeadlessPipelineStage::Continue(validated) => validated,
+                _ => panic!("expected validated execution"),
+            };
+            let permitted = match pipeline.permit_execution(validated).await {
+                HeadlessPipelineStage::Continue(permitted) => permitted,
+                _ => panic!("server-owned task must be rerouted instead of edge-denied"),
+            };
+
+            assert!(!permitted.execution.is_edge_tool);
+            assert!(permitted.execution.tool_result_fields.is_none());
+            assert!(
+                permitted
+                    .execution
+                    .result_str
+                    .starts_with(HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX),
+                "rerouted server-owned tools must use the server-executor sentinel"
+            );
+
+            pipeline.execute_execution(permitted).await
+        };
+
+        assert!(!executed.is_err, "got: {}", executed.execution.result_str);
+        assert!(
+            !executed
+                .execution
+                .result_str
+                .contains("edge runtime capability denied"),
+            "server-owned tool must not be failed by edge capability checks: {}",
+            executed.execution.result_str
+        );
+        assert!(
+            executed.execution.result_str.contains("server-owned task"),
+            "task should execute on the server executor, got: {}",
+            executed.execution.result_str
+        );
+        let tasks = server_exec.task_manager().snapshot().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "server-owned task");
     }
 
     #[tokio::test]

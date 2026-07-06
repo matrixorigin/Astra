@@ -17,7 +17,7 @@ use astra_turn_core::tool_result_semantics::{
 
 /// The sentinel error prefix emitted by `take_edge_output_for_tool_call_with_duration`
 /// when no edge agent matched the tool call.
-const EDGE_PROTOCOL_ERROR_PREFIX: &str = "Error: headless edge protocol";
+const EDGE_PROTOCOL_ERROR_PREFIX: &str = super::HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX;
 
 /// Pure execution: server-side tool execution + hydration.
 /// No &mut pipeline needed — only shared refs.

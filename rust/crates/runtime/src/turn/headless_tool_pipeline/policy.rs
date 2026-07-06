@@ -897,6 +897,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             mut execution,
             idem_key,
         } = validated;
+        if server_owned_edge_result_should_be_rerouted(
+            &execution,
+            self.ctx.runtime_tool_executor.is_some(),
+        ) {
+            tracing::warn!(
+                target: "astra_runtime::headless_tool_pipeline",
+                tool_name = %execution.name,
+                tool_call_id = %execution.id,
+                "ignored client/edge result for server-owned tool; rerouting to server executor"
+            );
+            reroute_server_owned_edge_result_to_server_execution(&mut execution);
+        }
         if let Some(err_msg) = edge_result_runtime_environment_denial(&execution) {
             emit_blocked_tool_result(
                 HeadlessBlockedTool {
