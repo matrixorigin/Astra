@@ -1058,7 +1058,7 @@ pub struct ToolExecutor {
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
     /// Shared tool executor for delegating unknown tools to astra-tools.
     default_executor: astra_tools::executor::DefaultToolExecutor,
-    /// Schemas declared by CLI-side providers except request-scoped MCP
+    /// Schemas declared by CLI-side providers except CLI MCP
     /// (server service, control plane, and CLI local executor). MCP schemas live
     /// in `mcp_runtime` so routing ownership and discovery data stay atomic.
     cli_local_provider_schemas: std::sync::RwLock<Vec<Value>>,
@@ -1607,7 +1607,7 @@ impl ToolExecutor {
             return astra_runtime_env::RunBinding::resolve_with_provider_declarations(
                 astra_runtime_env::WorkspaceBinding::none(),
                 astra_runtime_env::ExecutorBinding {
-                    kind: astra_runtime_env::ExecutorBindingKind::RequestScopedMcp,
+                    kind: astra_runtime_env::ExecutorBindingKind::Mcp,
                     executor_id: "cli-mcp".to_string(),
                     display_name: "CLI MCP server".to_string(),
                     transport: astra_runtime_env::ToolTransportKind::McpHttp,
@@ -6036,7 +6036,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_env_admission_requires_request_scoped_mcp_executor() {
+    fn cli_runtime_env_admission_requires_mcp_executor() {
         let executor = test_executor();
 
         let denial = executor
@@ -6051,7 +6051,7 @@ mod tests {
         );
         assert!(
             !executor.tool_has_runtime_binding("mcp__weather"),
-            "MCP schema must stay invisible without request-scoped MCP ownership"
+            "MCP schema must stay invisible without MCP provider ownership"
         );
     }
 

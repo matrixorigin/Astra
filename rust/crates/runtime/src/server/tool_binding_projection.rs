@@ -295,7 +295,7 @@ fn runtime_env_executor_binding(
                 | ExecutorBindingKind::Unknown
         );
     let kind = if request_scoped_mcp {
-        astra_runtime_env::ExecutorBindingKind::RequestScopedMcp
+        astra_runtime_env::ExecutorBindingKind::Mcp
     } else if server_owned_tool || no_workspace_control_plane {
         astra_runtime_env::ExecutorBindingKind::ControlPlane
     } else {

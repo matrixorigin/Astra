@@ -173,7 +173,7 @@ impl EffectiveCapabilitySet {
                     ),
                 mcp_executor: executor_reachable
                     && executor_transport_known
-                    && matches!(executor.kind, ExecutorBindingKind::RequestScopedMcp),
+                    && matches!(executor.kind, ExecutorBindingKind::Mcp),
             },
             runtime: RuntimeCapabilities {
                 runtime_has_process,

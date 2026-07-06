@@ -97,7 +97,7 @@ pub enum ExecutorBindingKind {
     LocalCli,
     EdgeAgent,
     OrchestratorManaged,
-    RequestScopedMcp,
+    Mcp,
     Unknown,
 }
 
@@ -843,6 +843,13 @@ mod tests {
         let kind = WorkspaceBindingKind::LocalFilesystem;
         let json = serde_json::to_string(&kind).unwrap();
         assert_eq!(json, "\"local_filesystem\"");
+    }
+
+    #[test]
+    fn mcp_executor_kind_uses_generic_label() {
+        let kind = ExecutorBindingKind::Mcp;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"mcp\"");
     }
 
     #[test]

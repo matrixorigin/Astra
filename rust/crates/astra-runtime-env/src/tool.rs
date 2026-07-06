@@ -1807,7 +1807,7 @@ mod tests {
         let unbound = RunBinding::resolve(
             WorkspaceBinding::none(),
             ExecutorBinding {
-                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                kind: crate::ExecutorBindingKind::Mcp,
                 executor_id: "mcp".to_string(),
                 display_name: "MCP server".to_string(),
                 transport: crate::ToolTransportKind::McpHttp,
@@ -1835,7 +1835,7 @@ mod tests {
         let bound = RunBinding::resolve_with_provider_declarations(
             WorkspaceBinding::none(),
             ExecutorBinding {
-                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                kind: crate::ExecutorBindingKind::Mcp,
                 executor_id: "mcp".to_string(),
                 display_name: "MCP server".to_string(),
                 transport: crate::ToolTransportKind::McpHttp,
@@ -2199,7 +2199,7 @@ mod tests {
         let binding = RunBinding::resolve(
             WorkspaceBinding::none(),
             ExecutorBinding {
-                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                kind: crate::ExecutorBindingKind::Mcp,
                 executor_id: "mcp".to_string(),
                 display_name: "MCP".to_string(),
                 transport: crate::ToolTransportKind::McpHttp,
@@ -2242,7 +2242,7 @@ mod tests {
         let binding = RunBinding::resolve_with_provider_declarations(
             WorkspaceBinding::none(),
             ExecutorBinding {
-                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                kind: crate::ExecutorBindingKind::Mcp,
                 executor_id: "mcp".to_string(),
                 display_name: "MCP".to_string(),
                 transport: crate::ToolTransportKind::McpHttp,
@@ -2280,7 +2280,7 @@ mod tests {
         let binding = RunBinding::resolve_with_provider_declarations(
             WorkspaceBinding::none(),
             ExecutorBinding {
-                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                kind: crate::ExecutorBindingKind::Mcp,
                 executor_id: "server-mcp".to_string(),
                 display_name: "Server MCP".to_string(),
                 transport: crate::ToolTransportKind::McpHttp,
@@ -2469,7 +2469,7 @@ mod tests {
         let binding = RunBinding::resolve(
             WorkspaceBinding::none(),
             ExecutorBinding {
-                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                kind: crate::ExecutorBindingKind::Mcp,
                 executor_id: "mcp".to_string(),
                 display_name: "MCP".to_string(),
                 transport: crate::ToolTransportKind::McpHttp,
@@ -2532,7 +2532,7 @@ mod tests {
         let binding = RunBinding::resolve(
             WorkspaceBinding::none(),
             ExecutorBinding {
-                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                kind: crate::ExecutorBindingKind::Mcp,
                 executor_id: "mcp".to_string(),
                 display_name: "MCP".to_string(),
                 transport: crate::ToolTransportKind::McpHttp,

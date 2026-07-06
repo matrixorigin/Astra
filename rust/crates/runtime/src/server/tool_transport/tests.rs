@@ -1211,8 +1211,8 @@ async fn mcp_prefixed_tool_is_not_request_scoped_mcp_without_explicit_executor()
     );
     assert_ne!(
         binding.executor.kind,
-        astra_runtime_env::ExecutorBindingKind::RequestScopedMcp,
-        "mcp__ prefix alone must not synthesize a request-scoped MCP executor"
+        astra_runtime_env::ExecutorBindingKind::Mcp,
+        "mcp__ prefix alone must not synthesize an MCP executor"
     );
     assert_eq!(
         binding.runtime.session_manager,
