@@ -48,8 +48,8 @@ use astra_services::runs::{
     RunStatusRecord, RuntimeAuthRequest, RuntimeProfileRequest, SelectedModelRequest,
     durable_run_status_kind,
 };
-use astra_services::session_restore::SessionRestoreService;
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
+use astra_services::session_restore::SessionRestoreService;
 use astra_services::skills::SkillService;
 use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
@@ -3281,9 +3281,8 @@ impl AgenticRunLifecycleService {
             );
         };
 
-        let restore = astra_services::session_restore::HybridRestoreService::new(
-            shared.get().clone(),
-        );
+        let restore =
+            astra_services::session_restore::HybridRestoreService::new(shared.get().clone());
         match restore.restore_session(user_id, session_id).await {
             Ok(Some(restored)) => {
                 astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(

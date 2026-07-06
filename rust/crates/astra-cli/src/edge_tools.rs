@@ -15,7 +15,6 @@ use std::{
 use astra_runtime::tool_sandbox::{
     SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
-use astra_runtime_env::CapacityProvider as _;
 use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
 use astra_turn_core::tool::deferred_activation::ToolSurfaceNames;
 
@@ -164,16 +163,10 @@ fn runtime_env_builtin_registry() -> &'static astra_runtime_env::ToolRegistry {
 fn local_runtime_tool_schemas(raw_schemas: Vec<Value>) -> Vec<Value> {
     let registry = runtime_env_builtin_registry();
     let binding = astra_runtime_env::RunBinding::local_developer(".", registry);
-    let providers = vec![
-        astra_runtime_env::server_service_provider("cli-server-service", registry),
-        astra_runtime_env::control_plane_provider("cli-control-plane", registry),
-        astra_runtime_env::cli_local_provider("local-cli", registry),
-    ];
-    astra_runtime_env::CapabilityResolver.filter_tool_schemas_for_providers(
+    astra_runtime_env::CapabilityResolver.filter_tool_schemas_for_binding(
         registry,
         raw_schemas,
-        &binding.capabilities,
-        &providers,
+        &binding,
     )
 }
 
@@ -1530,27 +1523,10 @@ impl ToolExecutor {
             if !spec.load_policy.is_public_schema_policy() {
                 return false;
             }
-            if !self.cli_builtin_providers_declare_tool(name, registry) {
-                return false;
-            }
             return self.tool_has_runtime_binding(name);
         }
 
         self.cli_local_provider_schema_has_name(name) && self.tool_has_runtime_binding(name)
-    }
-
-    fn cli_builtin_providers_declare_tool(
-        &self,
-        name: &str,
-        registry: &astra_runtime_env::ToolRegistry,
-    ) -> bool {
-        [
-            astra_runtime_env::server_service_provider("cli-server-service", registry),
-            astra_runtime_env::control_plane_provider("cli-control-plane", registry),
-            astra_runtime_env::cli_local_provider("local-cli", registry),
-        ]
-        .iter()
-        .any(|provider| provider.declares_tool(name))
     }
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {

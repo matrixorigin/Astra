@@ -886,15 +886,23 @@ impl RuntimeToolExecutor {
     ) -> Option<astra_runtime_env::ToolUnavailableReason> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         registry.get(name)?;
+        let admission_context = self.tool_admission_context();
+        let providers = crate::server::tool_admission::active_provider_declarations_for_binding(
+            &[],
+            self.execution_binding.workspace(),
+            self.execution_binding.executor(),
+            self.execution_binding.runtime(),
+            &registry,
+            &admission_context,
+        );
         let admission =
-            crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
+            crate::server::tool_admission::resolve_tool_admission_for_providers_with_context(
                 name,
-                &[],
                 self.execution_binding.workspace(),
                 self.execution_binding.executor(),
-                self.execution_binding.runtime(),
+                &providers,
                 &registry,
-                self.tool_admission_context(),
+                &admission_context,
             );
         if let Some(reason) = admission_hidden_reason_to_unavailable(admission.hidden_reason) {
             return Some(reason);
@@ -910,13 +918,14 @@ impl RuntimeToolExecutor {
         }) {
             return None;
         }
-        let binding = crate::server::tool_binding_projection::runtime_environment_binding_for_parts(
+        let binding = crate::server::tool_binding_projection::runtime_environment_binding_for_parts_with_provider_declarations(
             name,
             self.execution_binding.workspace(),
             self.execution_binding.executor(),
             self.execution_binding.runtime().cloned(),
             &ToolPolicySnapshot::default(),
             &registry,
+            &providers,
         );
         astra_runtime_env::CapabilityResolver
             .check_tool_call_for_surface(
@@ -1964,6 +1973,41 @@ mod tests {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must not be advertised without a workspace runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_executor_denies_control_plane_tools_when_catalog_is_unbound() {
+        let (mut exec, dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "Edge workspace",
+                dir.path().display().to_string(),
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "Edge workspace",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+        exec.server_service_tools_enabled = false;
+        exec.control_plane_tools_enabled = false;
+
+        let names = schema_name_set(exec.tool_schemas());
+
+        assert!(exec.tool_runtime_ready("read_file"));
+        assert!(exec.tool_runtime_ready("bash"));
+        for hidden in ["task", "introspect", "reflect", "agent_fanout", "memory"] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must not be prompt-visible without a bound control-plane/server provider: {names:?}"
+            );
+            assert!(
+                !exec.tool_runtime_ready(hidden),
+                "{hidden} must not be runtime-ready without a bound control-plane/server provider"
             );
         }
     }

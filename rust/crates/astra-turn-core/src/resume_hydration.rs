@@ -56,7 +56,13 @@ pub fn build_resume_hydration_hint_from_prompt_messages(messages: &[Value]) -> O
 
     lines.push(String::new());
     lines.push("Compact transcript summary:".to_string());
-    for entry in entries.iter().rev().take(MAX_SUMMARY_ITEMS).collect::<Vec<_>>().into_iter().rev()
+    for entry in entries
+        .iter()
+        .rev()
+        .take(MAX_SUMMARY_ITEMS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
     {
         lines.push(format!(
             "- {}: {}",
@@ -98,8 +104,12 @@ If the user asks what happened, state that the stored session context was unavai
 
 pub fn merge_resume_hints(first: Option<String>, second: Option<String>) -> Option<String> {
     match (
-        first.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
-        second.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        first
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        second
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     ) {
         (Some(a), Some(b)) if a == b => Some(a),
         (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),

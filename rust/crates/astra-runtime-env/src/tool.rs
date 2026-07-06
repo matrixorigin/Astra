@@ -596,6 +596,19 @@ impl CapabilityResolver {
         })
     }
 
+    pub fn filter_tool_schemas_for_binding(
+        &self,
+        registry: &ToolRegistry,
+        schemas: Vec<Value>,
+        binding: &crate::RunBinding,
+    ) -> Vec<Value> {
+        let prompt_schema_conflicts =
+            astra_core::tool_schema::prompt_schema_conflicting_tool_names(&schemas);
+        self.filter_tool_schemas_impl(registry, schemas, &binding.capabilities, |tool_name| {
+            !prompt_schema_conflicts.contains(tool_name) && binding.tool_surface.contains(tool_name)
+        })
+    }
+
     fn filter_tool_schemas_impl(
         &self,
         registry: &ToolRegistry,
@@ -1951,6 +1964,36 @@ mod tests {
         assert!(names.iter().any(|name| name == "tool_search"));
         assert!(!names.iter().any(|name| name == "bash"));
         assert!(!names.iter().any(|name| name == "read_file"));
+    }
+
+    #[test]
+    fn binding_schema_filter_hides_control_plane_tools_without_control_plane_binding() {
+        let registry = registry();
+        let binding = RunBinding::edge_developer("/repo", &registry);
+        let schemas = vec![
+            serde_json::json!({"type": "function", "function": {"name": "task"}}),
+            serde_json::json!({"type": "function", "function": {"name": "introspect"}}),
+            serde_json::json!({"type": "function", "function": {"name": "reflect"}}),
+            serde_json::json!({"type": "function", "function": {"name": "agent_fanout"}}),
+            serde_json::json!({"type": "function", "function": {"name": "memory"}}),
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
+            serde_json::json!({"type": "function", "function": {"name": "bash"}}),
+        ];
+
+        let names: Vec<String> = CapabilityResolver
+            .filter_tool_schemas_for_binding(&registry, schemas, &binding)
+            .into_iter()
+            .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+            .collect();
+
+        assert!(names.iter().any(|name| name == "read_file"));
+        assert!(names.iter().any(|name| name == "bash"));
+        for hidden in ["task", "introspect", "reflect", "agent_fanout", "memory"] {
+            assert!(
+                !names.iter().any(|name| name == hidden),
+                "{hidden} must not be prompt-visible without a matching provider binding: {names:?}"
+            );
+        }
     }
 
     #[test]

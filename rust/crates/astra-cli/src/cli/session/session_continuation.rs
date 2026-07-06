@@ -12,9 +12,7 @@ use serde_json::{Value, json};
 ///
 /// Returns `None` if the session has no checkpoint (first turn) or
 /// the checkpoint is unreadable.
-pub(crate) fn load_session_messages_for_continuation(
-    session_id: &str,
-) -> Option<Vec<Value>> {
+pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<Value>> {
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
     match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
         Ok(Some(cp)) if !cp.messages.is_empty() => {
@@ -62,9 +60,7 @@ fn heavy_checkpoint_prompt_state(
 /// turn boundaries. Without this, harness nudges (injected as "user" role)
 /// bias the model toward tool usage on the next turn even when the user's
 /// new message is purely conversational.
-pub(crate) fn sanitize_continuation_messages(
-    mut msgs: Vec<Value>,
-) -> Vec<Value> {
+pub(crate) fn sanitize_continuation_messages(mut msgs: Vec<Value>) -> Vec<Value> {
     msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(msgs);
     msgs.retain(|m| {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
@@ -98,7 +94,10 @@ pub(crate) fn transcript_history_pairs_for_session(session_id: &str) -> Vec<(Str
 }
 
 fn transcript_events_to_messages(events: &[TurnEvent]) -> Vec<Value> {
-    events.iter().filter_map(transcript_event_to_message).collect()
+    events
+        .iter()
+        .filter_map(transcript_event_to_message)
+        .collect()
 }
 
 fn transcript_event_to_message(event: &TurnEvent) -> Option<Value> {
@@ -356,21 +355,18 @@ mod tests {
             },
         ];
 
-        let messages = super::sanitize_continuation_messages(super::transcript_events_to_messages(
-            &events,
-        ));
+        let messages =
+            super::sanitize_continuation_messages(super::transcript_events_to_messages(&events));
         let pairs = super::history_pairs_from_messages(&messages);
 
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "review current branch");
-        assert!(
-            messages
-                .iter()
-                .any(|msg| msg["content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("[Runtime tool result]\ngit: diff --stat | 202 files changed"))
-        );
+        assert!(messages.iter().any(|msg| {
+            msg["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("[Runtime tool result]\ngit: diff --stat | 202 files changed")
+        }));
         assert_eq!(pairs[0].1, "I found a large runtime change set.");
     }
 

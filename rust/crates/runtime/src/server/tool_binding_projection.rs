@@ -94,20 +94,22 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
             {
                 return true;
             }
-            let binding = runtime_environment_binding_for_parts(
+            let binding = runtime_environment_binding_for_parts_with_provider_declarations(
                 tool_name,
                 workspace,
                 executor,
                 runtime.cloned(),
                 &ToolPolicySnapshot::default(),
                 &registry,
+                &providers,
             );
             astra_runtime_env::CapabilityResolver
-                .check_tool_call(
+                .check_tool_call_for_surface(
                     &registry,
                     tool_name,
                     &serde_json::json!({}),
                     &binding.capabilities,
+                    &binding.tool_surface,
                 )
                 .is_ok()
         })
@@ -239,6 +241,26 @@ pub(crate) fn runtime_environment_binding_for_parts(
         runtime,
         policy_intent,
         registry,
+    )
+}
+
+pub(crate) fn runtime_environment_binding_for_parts_with_provider_declarations(
+    tool_name: &str,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<astra_runtime_env::RuntimeBinding>,
+    policy: &ToolPolicySnapshot,
+    registry: &astra_runtime_env::ToolRegistry,
+    providers: &[astra_runtime_env::CapacityProviderDeclaration],
+) -> astra_runtime_env::RunBinding {
+    let runtime = runtime.unwrap_or_else(|| runtime_env_runtime_binding(workspace, executor));
+    astra_runtime_env::RunBinding::resolve_with_provider_declarations(
+        runtime_env_workspace_binding(workspace),
+        runtime_env_executor_binding(tool_name, workspace, executor),
+        runtime,
+        runtime_env_policy_intent(workspace, policy),
+        registry,
+        providers,
     )
 }
 
@@ -952,6 +974,49 @@ mod tests {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must still require an explicit request-scoped provider"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_projection_hides_control_plane_tools_when_provider_is_unbound() {
+        let names = schema_names(capability_filter_tool_schemas_for_binding_with_context(
+            vec![
+                schema("task"),
+                schema("introspect"),
+                schema("reflect"),
+                schema("agent_fanout"),
+                schema("memory"),
+                schema("read_file"),
+                schema("bash"),
+            ],
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+            ToolAdmissionContext {
+                server_service_provider_ready: false,
+                control_plane_provider_ready: false,
+                ..ToolAdmissionContext::default()
+            },
+        ));
+
+        assert!(names.contains("read_file"), "{names:?}");
+        assert!(names.contains("bash"), "{names:?}");
+        for hidden in ["task", "introspect", "reflect", "agent_fanout", "memory"] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must not be prompt-visible without a bound provider: {names:?}"
             );
         }
     }
