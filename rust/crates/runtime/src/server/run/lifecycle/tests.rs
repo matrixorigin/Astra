@@ -2111,6 +2111,17 @@ fn test_service() -> AgenticRunLifecycleService {
     .with_model_service(Arc::new(ActiveTestModelService))
 }
 
+#[tokio::test]
+async fn server_resume_hydration_failure_is_not_prompt_facing() {
+    let service = test_service();
+
+    let hint = service
+        .session_resume_hydration_hint_for_session("user-1", "session-1", true)
+        .await;
+
+    assert_eq!(hint, None);
+}
+
 fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycleService {
     let engine = RunEngine::new(store);
     AgenticRunLifecycleService::new(

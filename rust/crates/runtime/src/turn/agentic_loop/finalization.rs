@@ -953,6 +953,7 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_factual_retry = false;
     state.stall.factual_retry_fallback_text = None;
     state.stall.forced_execution_retry = false;
+    state.stall.forced_answer_relevance_retry = false;
     state.stall.forced_execution_escalation = false;
     state.stall.forced_parallel_batching = false;
     state.stall.forced_round_budget_phase1 = false;

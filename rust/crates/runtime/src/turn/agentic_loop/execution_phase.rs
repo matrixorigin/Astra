@@ -564,6 +564,56 @@ async fn maybe_judge_factual_retry_fallback<H: AgenticLoopHost>(
     .await
 }
 
+fn has_successful_real_tool_evidence(state: &AgenticLoopState) -> bool {
+    state.total_evidence_tool_calls > 0
+        || state.stall.tool_call_records.iter().any(|record| {
+            record.ok && !record.is_synthetic_placeholder() && !record.was_blocked_by_policy()
+        })
+}
+
+fn should_force_answer_relevance_retry(state: &AgenticLoopState) -> bool {
+    if state.stall.forced_answer_relevance_retry
+        || state.final_text.trim().is_empty()
+        || !has_successful_real_tool_evidence(state)
+    {
+        return false;
+    }
+
+    astra_turn_core::evaluation::final_answer_relevance_signal(
+        state.message.as_str(),
+        state.final_text.as_str(),
+    )
+    .is_some()
+}
+
+fn remove_trailing_assistant_final_answer(messages: &mut Vec<serde_json::Value>, final_text: &str) {
+    let Some(last) = messages.last() else {
+        return;
+    };
+    let is_matching_final = last
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|role| role == "assistant")
+        && last
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| content.trim() == final_text.trim());
+    if is_matching_final {
+        messages.pop();
+    }
+}
+
+fn answer_relevance_retry_message(latest_user_message: &str) -> String {
+    format!(
+        "[final-answer-relevance:v1]\n\
+         The previous final answer did not answer the latest user request.\n\
+         Latest user request: {latest_user_message}\n\
+         Use the already available tool results and answer that request directly now. \
+         Do not discuss resume state, degraded context, workspace readiness, or waiting for \
+         another instruction unless the user explicitly asked about those topics."
+    )
+}
+
 pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -1761,6 +1811,37 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     &turn_result,
                     prep.turn_start_time,
                     Some("unfinished_tasks"),
+                );
+                state.step_recorder.end_turn(false);
+                try_write_heavy_checkpoint(state);
+                return Ok(TurnExecutionControl::ContinueLoop);
+            }
+
+            if should_force_answer_relevance_retry(state) {
+                let rejected_final = state.final_text.clone();
+                let retry_message = answer_relevance_retry_message(&state.message);
+                state.stall.forced_answer_relevance_retry = true;
+                remove_trailing_assistant_final_answer(&mut state.messages, &rejected_final);
+                state.final_text.clear();
+                state.final_text_streamed = false;
+                state.push_volatile(super::host::VolatileKind::Corrective, retry_message);
+                tracing::warn!(
+                    target: "astra::loop_guard",
+                    tier = "final_answer_relevance_retry",
+                    round = state.llm_rounds_completed,
+                    "final answer did not answer latest user request; forcing one synthesis retry"
+                );
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        "↻ Final answer missed the latest request; retrying synthesis.".to_string(),
+                    );
+                }
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("final_answer_relevance_retry"),
                 );
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);

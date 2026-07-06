@@ -1282,7 +1282,10 @@ mod tests {
         assert!(lines.is_empty(), "tombstones must not render: {lines:?}");
 
         let summary = render_collapsed_summary(&tasks, 80);
-        assert!(summary.is_none(), "tombstones must not render collapsed summary");
+        assert!(
+            summary.is_none(),
+            "tombstones must not render collapsed summary"
+        );
     }
 
     #[test]

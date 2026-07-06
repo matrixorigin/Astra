@@ -3276,38 +3276,53 @@ impl AgenticRunLifecycleService {
         }
 
         let Some(shared) = &self.shared_pool else {
-            return Some(
-                astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
-                    "resume requested but shared MatrixOne pool is not configured",
-                ),
+            tracing::warn!(
+                target: "astra_runtime::resume_hydration",
+                user_id,
+                session_id,
+                "resume hydration skipped: shared MatrixOne pool is not configured"
             );
+            return None;
         };
 
         let restore =
             astra_services::session_restore::HybridRestoreService::new(shared.get().clone());
         match restore.restore_session(user_id, session_id).await {
             Ok(Some(restored)) => {
-                astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+                match astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
                     &restored.conversation_messages,
-                )
-                .or_else(|| {
-                    Some(
-                        astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
-                            "session restore returned no prompt-facing transcript/history",
-                        ),
-                    )
-                })
+                ) {
+                    Some(hint) => Some(hint),
+                    None => {
+                        tracing::warn!(
+                            target: "astra_runtime::resume_hydration",
+                            user_id,
+                            session_id,
+                            "resume hydration skipped: restored session has no prompt-facing transcript"
+                        );
+                        None
+                    }
+                }
             }
-            Ok(None) => Some(
-                astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
-                    "session restore returned no resumable state",
-                ),
-            ),
-            Err(error) => Some(
-                astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(&format!(
-                    "session restore failed: {error}"
-                )),
-            ),
+            Ok(None) => {
+                tracing::warn!(
+                    target: "astra_runtime::resume_hydration",
+                    user_id,
+                    session_id,
+                    "resume hydration skipped: session restore returned no resumable state"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::resume_hydration",
+                    user_id,
+                    session_id,
+                    error = %error,
+                    "resume hydration skipped: session restore failed"
+                );
+                None
+            }
         }
     }
 

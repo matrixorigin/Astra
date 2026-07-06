@@ -5385,7 +5385,8 @@ mod tests {
 
         for (idx, status) in statuses.into_iter().enumerate() {
             let task_id = format!("task-{}", idx + 1);
-            m.create(&json!({"title": format!("status {status}")})).await;
+            m.create(&json!({"title": format!("status {status}")}))
+                .await;
             set_task_status_fixture(&m, &task_id, status).await;
 
             let out = m

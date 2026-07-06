@@ -926,6 +926,11 @@ pub struct StallTrackingState {
     /// Whether an execution-retry was forced after a mutating/confirmed task
     /// attempted to finish without applying any concrete workspace mutation.
     pub forced_execution_retry: bool,
+    /// Whether a final-answer relevance retry was forced after successful tool
+    /// evidence existed but the text-only synthesis answered stale runtime
+    /// scaffolding or an older question instead of the latest user request.
+    /// One-shot per turn.
+    pub forced_answer_relevance_retry: bool,
     /// Whether a mid-loop execution escalation was injected after a mutating
     /// task accumulated enough read-only tool calls without producing any
     /// workspace mutation. One-shot per turn.
@@ -1063,6 +1068,7 @@ impl StallTrackingState {
             || self.forced_exploration_family_corrective
             || self.forced_execution_escalation
             || self.forced_execution_retry
+            || self.forced_answer_relevance_retry
     }
 
     /// Whether the loop is already under *any* mid-loop intervention
@@ -4060,6 +4066,43 @@ pub(crate) mod tests {
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn off_target_final_after_successful_tool_retries_synthesis() {
+        let bad_answer = "Session context was unavailable or incomplete in this runtime \
+            (degraded resume — no prior prompt-facing history restored). Workspace is bound \
+            and ready at /Users/xupeng/github/astra with the executor online.\n\n\
+            Awaiting your next instruction.";
+        let good_answer = "当前目录下的子目录包括 rust、web、plans。";
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("list_dir", "rust/\nweb/\nplans/\n")],
+                20,
+                10,
+                Some(50),
+            ),
+            text_result(bad_answer, 15, 5, Some(30)),
+            text_result(good_answer, 15, 5, Some(30)),
+        ]);
+        let mut state = make_state();
+        state.message = "有哪些子目录".to_string();
+        state
+            .messages
+            .push(json!({"role": "user", "content": state.message.clone()}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
+        assert_eq!(host.current_turn, 3);
+        assert_eq!(state.final_text, good_answer);
+        assert!(
+            !state.messages.iter().any(|msg| msg
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("Session context was unavailable"))),
+            "{:?}",
+            state.messages
+        );
     }
 
     #[tokio::test]
