@@ -3783,6 +3783,49 @@ impl JournalEvent {
         self
     }
 
+    /// Attach structured user-input events that arrived after the turn had
+    /// already started. The top-level `user_input` remains the human-readable
+    /// turn input; this metadata preserves individual mid-turn input events for
+    /// resume/session-history projections.
+    pub fn with_deferred_user_inputs<'a, I>(mut self, inputs: I) -> Self
+    where
+        I: IntoIterator<Item = (usize, &'a str)>,
+    {
+        let redacted = journal_content_redact_enabled();
+        let events = inputs
+            .into_iter()
+            .filter_map(|(event_index, content)| {
+                let content = content.trim();
+                if content.is_empty() {
+                    return None;
+                }
+                let content = if redacted {
+                    journal_content_marker(content)
+                } else {
+                    truncate(content, 500)
+                };
+                Some(serde_json::json!({
+                    "event_index": event_index,
+                    "content": content,
+                }))
+            })
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            return self;
+        }
+
+        let metadata = self.metadata.get_or_insert_with(|| serde_json::json!({}));
+        if !metadata.is_object() {
+            *metadata = serde_json::json!({
+                "previous_metadata": metadata.clone(),
+            });
+        }
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("deferred_user_inputs".into(), serde_json::Value::Array(events));
+        }
+        self
+    }
+
     /// Turn error event.
     pub fn turn_error(
         session_id: Option<&str>,

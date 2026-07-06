@@ -3854,6 +3854,7 @@ All acceptance checks pass:
             final_state: "completed".into(),
             interruption_kind: None,
             final_messages: Vec::new(),
+            deferred_user_inputs: Vec::new(),
             background_agent_results: Vec::new(),
         };
 

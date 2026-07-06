@@ -178,6 +178,7 @@ fn extend_runtime_sidecar_events(
     result: &StreamResult,
     learning_snap: &TurnLearningSnapshot,
 ) {
+    let latest_user_input = result.latest_user_input(line);
     for (stall_type, _) in &result.stall_events {
         let confidence = stall_type_confidence(stall_type);
         if confidence == 0.0 {
@@ -217,7 +218,7 @@ fn extend_runtime_sidecar_events(
         state.session_id.as_deref(),
         Some(state.turn),
         "cli_repl",
-        line,
+        &latest_user_input,
         &state.recent_tools,
         &result.tool_call_records,
         result.stall_events.len(),
@@ -257,11 +258,12 @@ fn build_primary_turn_event(
     };
     turn_observability_events.extend(bridge_pipeline_events);
 
+    let effective_user_input = result.effective_user_input(line);
     let mut turn_event = session_journal::JournalEvent::turn(
         state.session_id.as_deref(),
         state.turn,
         astra_core::model_override::normalize_model_override(state.model.as_deref()),
-        line,
+        &effective_user_input,
         &result.full_text,
         result.tool_calls_count,
         result.prompt_tokens,
@@ -286,6 +288,12 @@ fn build_primary_turn_event(
     )
     .with_memoria_time(result.memoria_ms)
     .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
+    turn_event = turn_event.with_deferred_user_inputs(
+        result
+            .deferred_user_inputs
+            .iter()
+            .map(|input| (input.event_index, input.content.as_str())),
+    );
 
     let git_root = session_recovery::session_workspace_git_root(state.session_id.as_deref());
     let (git_head, git_branch) = cli_utils::git_snapshot(git_root.as_deref());

@@ -192,12 +192,13 @@ pub(crate) fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<Str
         .iter()
         .filter_map(|signal| match signal {
             EvalSignal::ToolOutcomeFailure { class, count } => Some(format!("{class} x{count}")),
+            EvalSignal::BlockedToolCall { count } => Some(format!("blocked_tool x{count}")),
             _ => None,
         })
         .collect::<Vec<_>>();
     if !outcome_failures.is_empty() {
         return Some(format!(
-            "Turn finished with unresolved tool outcome failure(s): {}. Treat the final answer as incomplete until validation passes.",
+            "Turn finished with unresolved tool/runtime failure(s): {}. Treat the final answer as incomplete until validation passes or the provider surface changes.",
             outcome_failures.join(", ")
         ));
     }
@@ -223,6 +224,7 @@ fn turn_evaluation_signal_reason(signal: &EvalSignal) -> Option<&'static str> {
         EvalSignal::StallDetected => Some("stall/divergence was detected"),
         EvalSignal::VerdictWarning => Some("TurnGuard emitted a warning"),
         EvalSignal::NoToolsNeeded => Some("needed tools were not used"),
+        EvalSignal::BlockedToolCall { .. } => Some("tool calls were blocked before execution"),
         EvalSignal::HighCostLowYield { .. } => Some("high-cost exploration produced low yield"),
         EvalSignal::LlmRoundChurn { .. } => Some("too many LLM rounds were used"),
         EvalSignal::PromptGrowthChurn { .. } => Some("prompt size ballooned across rounds"),

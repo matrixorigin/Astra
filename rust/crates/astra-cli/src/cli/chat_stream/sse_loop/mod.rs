@@ -1140,6 +1140,15 @@ pub(crate) async fn stream_chat_sse(
         let _ = tx.send(StreamEvent::VerdictReport(verdict_events));
     }
 
+    let deferred_user_inputs = state
+        .deferred_input
+        .delivered_user_inputs()
+        .iter()
+        .map(|input| crate::cli::stream::streaming_types::DeferredStreamUserInput {
+            event_index: input.event_index,
+            content: input.content.clone(),
+        })
+        .collect::<Vec<_>>();
     let final_messages = std::mem::take(&mut state.messages);
 
     let result = build_stream_result(StreamResultBuild {
@@ -1176,6 +1185,7 @@ pub(crate) async fn stream_chat_sse(
         llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
         interruption: state.interruption.as_ref().map(|i| i.to_json()),
         final_messages,
+        deferred_user_inputs,
     });
     Ok(result)
 }

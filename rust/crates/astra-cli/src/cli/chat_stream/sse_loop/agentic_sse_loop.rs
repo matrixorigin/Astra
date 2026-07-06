@@ -17,6 +17,7 @@ use astra_turn_core::tool_registry_report::ToolSelectionReport;
 use crossterm::style::Stylize;
 use serde_json::Value;
 
+use crate::cli::stream::streaming_types::DeferredStreamUserInput;
 use crate::explain_dag::ExplainTurnMeta;
 use crate::{ExplainMode, StreamResult, VerdictEvent};
 
@@ -172,6 +173,7 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) llm_rounds: Option<u32>,
     pub(crate) interruption: Option<serde_json::Value>,
     pub(crate) final_messages: Vec<serde_json::Value>,
+    pub(crate) deferred_user_inputs: Vec<DeferredStreamUserInput>,
 }
 
 pub(crate) fn resolved_tool_metrics<I>(
@@ -269,6 +271,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         llm_rounds,
         interruption,
         final_messages,
+        deferred_user_inputs,
     } = ctx;
     let (tool_calls_count, tools_used) =
         resolved_tool_metrics(tool_calls_count, tools_used, &tool_call_records);
@@ -354,6 +357,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         final_state,
         interruption_kind,
         final_messages,
+        deferred_user_inputs,
         background_agent_results: Vec::new(),
     }
 }
@@ -409,6 +413,7 @@ mod tests {
             llm_rounds: None,
             interruption: None,
             final_messages: Vec::new(),
+            deferred_user_inputs: Vec::new(),
         }
     }
 

@@ -6,6 +6,12 @@
 /// Re-export of the verdict audit event type for convenience.
 pub(crate) type VerdictEvent = astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeferredStreamUserInput {
+    pub(crate) event_index: usize,
+    pub(crate) content: String,
+}
+
 /// Partial data rescued from `AgenticLoopState` when a turn fails.
 /// Enables enriched error logging, failure learning, and post-mortem analysis.
 #[derive(Debug, Default)]
@@ -132,12 +138,39 @@ pub(crate) struct StreamResult {
     pub(crate) interruption_kind: Option<String>,
     /// Full messages array after this turn — used by CslManager for persistence.
     pub(crate) final_messages: Vec<serde_json::Value>,
+    /// Structured user input events delivered while the turn was already active.
+    /// This is the durable fact source for mid-turn user input; `final_messages`
+    /// is only a prompt projection fallback.
+    pub(crate) deferred_user_inputs: Vec<DeferredStreamUserInput>,
     /// Results from background-spawned agents collected after the agentic
     /// loop ended. Each entry is (agent_id, result_text).
     pub(crate) background_agent_results: Vec<(String, String)>,
 }
 
 impl StreamResult {
+    /// User input that should represent this committed turn in durable history.
+    ///
+    /// The runtime can ingest deferred user messages while a turn is executing.
+    /// Those messages are already appended to `final_messages` as prompt-facing
+    /// user messages, so durable history must derive from final prompt history
+    /// instead of only the original line submitted at turn start.
+    pub(crate) fn effective_user_input(&self, primary_line: &str) -> String {
+        if !self.deferred_user_inputs.is_empty() {
+            return effective_user_input_from_deferred(primary_line, &self.deferred_user_inputs);
+        }
+        effective_user_input_from_messages(primary_line, &self.final_messages)
+    }
+
+    /// Latest user instruction that should drive follow-up suggestions,
+    /// relevance checks, and continuation anchors. If deferred input arrived,
+    /// this is the final deferred user message, not the original turn line.
+    pub(crate) fn latest_user_input(&self, primary_line: &str) -> String {
+        if let Some(input) = self.deferred_user_inputs.last() {
+            return input.content.clone();
+        }
+        latest_user_input_from_messages(primary_line, &self.final_messages)
+    }
+
     /// Filled by the REPL after the agentic loop returns (routing + entity-learn eligibility).
     pub(crate) fn set_repl_learning_journal_fields(
         &mut self,
@@ -146,6 +179,141 @@ impl StreamResult {
     ) {
         self.routing_domain_hint = routing_domain_hint;
         self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
+    }
+}
+
+fn effective_user_input_from_deferred(
+    primary_line: &str,
+    inputs: &[DeferredStreamUserInput],
+) -> String {
+    let primary = primary_line.trim();
+    let mut parts = Vec::new();
+    if !primary.is_empty() {
+        parts.push(primary.to_string());
+    }
+    parts.extend(
+        inputs
+            .iter()
+            .map(|input| input.content.trim())
+            .filter(|content| !content.is_empty())
+            .map(ToString::to_string),
+    );
+    parts.join("\n\n")
+}
+
+fn effective_user_input_from_messages(
+    primary_line: &str,
+    messages: &[serde_json::Value],
+) -> String {
+    user_inputs_from_current_turn(primary_line, messages).join("\n\n")
+}
+
+fn latest_user_input_from_messages(primary_line: &str, messages: &[serde_json::Value]) -> String {
+    user_inputs_from_current_turn(primary_line, messages)
+        .last()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn user_inputs_from_current_turn(
+    primary_line: &str,
+    messages: &[serde_json::Value],
+) -> Vec<String> {
+    let primary = primary_line.trim();
+    if primary.is_empty() {
+        return Vec::new();
+    }
+    let user_contents = messages
+        .iter()
+        .filter_map(|message| {
+            let role = message.get("role")?.as_str()?;
+            if role != "user" {
+                return None;
+            }
+            let content = message.get("content")?.as_str()?.trim();
+            (!content.is_empty()).then(|| content.to_string())
+        })
+        .collect::<Vec<_>>();
+
+    let Some(start) = user_contents
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, content)| (content.trim() == primary).then_some(idx))
+        .last()
+    else {
+        return vec![primary.to_string()];
+    };
+
+    user_contents[start..].to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DeferredStreamUserInput, effective_user_input_from_deferred,
+        effective_user_input_from_messages, latest_user_input_from_messages,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn effective_user_input_prefers_structured_deferred_events() {
+        let inputs = vec![
+            DeferredStreamUserInput {
+                event_index: 4,
+                content: "2".to_string(),
+            },
+            DeferredStreamUserInput {
+                event_index: 5,
+                content: "3".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            effective_user_input_from_deferred("1", &inputs),
+            "1\n\n2\n\n3"
+        );
+    }
+
+    #[test]
+    fn effective_user_input_includes_deferred_messages_after_primary_line() {
+        let messages = vec![
+            json!({"role": "user", "content": "old"}),
+            json!({"role": "assistant", "content": "old answer"}),
+            json!({"role": "user", "content": "1"}),
+            json!({"role": "assistant", "content": "working"}),
+            json!({"role": "user", "content": "2"}),
+        ];
+
+        assert_eq!(
+            effective_user_input_from_messages("1", &messages),
+            "1\n\n2"
+        );
+        assert_eq!(latest_user_input_from_messages("1", &messages), "2");
+    }
+
+    #[test]
+    fn effective_user_input_uses_last_matching_primary_line() {
+        let messages = vec![
+            json!({"role": "user", "content": "repeat"}),
+            json!({"role": "assistant", "content": "old answer"}),
+            json!({"role": "user", "content": "repeat"}),
+            json!({"role": "user", "content": "deferred"}),
+        ];
+
+        assert_eq!(
+            effective_user_input_from_messages("repeat", &messages),
+            "repeat\n\ndeferred"
+        );
+    }
+
+    #[test]
+    fn effective_user_input_falls_back_to_primary_when_history_was_compacted() {
+        let messages = vec![json!({"role": "assistant", "content": "summary"})];
+
+        assert_eq!(
+            effective_user_input_from_messages("current", &messages),
+            "current"
+        );
     }
 }
 
@@ -184,6 +352,7 @@ impl Default for StreamResult {
             final_state: "completed".to_string(),
             interruption_kind: None,
             final_messages: Vec::new(),
+            deferred_user_inputs: Vec::new(),
             background_agent_results: Vec::new(),
         }
     }

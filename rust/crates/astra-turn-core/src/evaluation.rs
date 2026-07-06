@@ -81,6 +81,11 @@ pub enum EvalSignal {
     /// (`test_failure`, `env_failure`, `execution_error`). Carries the
     /// normalized result class and number of unresolved streams.
     ToolOutcomeFailure { class: String, count: usize },
+    /// One or more tool calls were rejected before execution by policy or
+    /// runtime admission. They are not material `tools_used`, but they are
+    /// still user-visible failed tool attempts and must not be evaluated as
+    /// healthy execution.
+    BlockedToolCall { count: usize },
     /// The final answer had no lexical overlap with the latest user request,
     /// so tool success alone is not enough to call the turn successful.
     FinalAnswerOffTarget {
@@ -375,12 +380,12 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
 ) -> TurnEvaluation {
     // Synthetic placeholders (skill skipped/deferred, surgically removed
     // parallel tool calls) are audit-only records that do NOT represent real
-    // tool execution. Filtering them here is the single choke-point that
-    // keeps tool_error_rate, RepeatToolCall, EmptyToolOutput, and the
-    // success/quality verdict honest.
+    // tool execution. Blocked calls are different: they did not execute, but
+    // they are real user-visible failed tool attempts and must contribute to
+    // tool_error_rate so health cannot claim all tools were healthy.
     let tool_calls = tool_call_records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder() && !record.was_blocked_by_policy())
+        .filter(|record| !record.is_synthetic_placeholder())
         .map(|record| ToolCallInfo {
             name: record.name.clone(),
             // Prefer the *untruncated* args for the repeat-key. `args_preview`
@@ -530,6 +535,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
 
     revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
     align_high_cost_low_yield_verdict(&mut eval, &tool_calls, telemetry);
+    apply_blocked_tool_failures(&mut eval, tool_call_records);
     apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records);
     calibrate_confidence_after_quality_penalties(&mut eval);
 
@@ -717,6 +723,7 @@ fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
             | EvalSignal::ExplorationFamilyChurn { .. }
             | EvalSignal::HighCostLowYield { .. }
             | EvalSignal::ToolOutcomeFailure { .. }
+            | EvalSignal::BlockedToolCall { .. }
             | EvalSignal::FinalAnswerOffTarget { .. }
     )
 }
@@ -900,6 +907,33 @@ fn unresolved_tool_outcome_failure_counts(
         *counts.entry(class.clone()).or_insert(0) += 1;
     }
     counts
+}
+
+fn apply_blocked_tool_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
+    let blocked = records
+        .iter()
+        .filter(|record| !record.is_synthetic_placeholder() && record.was_blocked_by_policy())
+        .count();
+    if blocked == 0 {
+        return;
+    }
+
+    eval.signals
+        .retain(|signal| !matches!(signal, EvalSignal::AllToolsHealthy));
+    eval.signals
+        .push(EvalSignal::BlockedToolCall { count: blocked });
+    let penalty = (0.20 + 0.08 * blocked.saturating_sub(1) as f64).clamp(0.20, 0.45);
+    eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
+    eval.confidence = (eval.confidence + 0.15).clamp(0.0, 1.0);
+
+    let real_call_count = records
+        .iter()
+        .filter(|record| !record.is_synthetic_placeholder())
+        .count()
+        .max(1);
+    if blocked == real_call_count || blocked.saturating_mul(2) >= real_call_count {
+        eval.success = false;
+    }
 }
 
 fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
@@ -1498,6 +1532,11 @@ pub fn eval_signal_to_json_with_thresholds(
                 "Detected {count} unresolved tool outcome failure(s) classified as `{class}`"
             ),
         }),
+        EvalSignal::BlockedToolCall { count } => json!({
+            "kind": "blocked_tool_call",
+            "count": count,
+            "message": format!("Detected {count} blocked tool call(s)"),
+        }),
         EvalSignal::FinalAnswerOffTarget {
             matched_terms,
             required_terms,
@@ -1547,7 +1586,7 @@ pub fn build_turn_evaluation_journal_event(
         // the user-visible tool_call_count — they are audit-only records.
         tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder() && !r.was_blocked_by_policy())
+            .filter(|r| !r.is_synthetic_placeholder())
             .count(),
         eval_signals_to_json_with_thresholds(&eval.signals, eval.thresholds),
     )
@@ -1673,6 +1712,72 @@ mod tests {
                 .iter()
                 .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
             "tool success must not mask an off-target final answer"
+        );
+    }
+
+    #[test]
+    fn blocked_tool_calls_are_evaluation_failures_not_healthy_execution() {
+        let records = vec![ToolCallRecord {
+            name: "memory".to_string(),
+            ok: false,
+            ms: 4,
+            error: Some("blocked_tool: executor is unavailable: service_executor_required".into()),
+            ..Default::default()
+        }];
+
+        let eval = evaluate_tool_call_records(
+            "what were my previous inputs?",
+            &[],
+            &records,
+            0,
+            false,
+            0.0,
+        );
+
+        assert!(!eval.success);
+        assert!(
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::ToolErrorRate(rate) if (*rate - 1.0).abs() < f64::EPSILON)),
+            "blocked calls must contribute to tool_error_rate: {:?}",
+            eval.signals
+        );
+        assert!(
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::BlockedToolCall { count: 1 })),
+            "blocked calls need an explicit diagnostic signal: {:?}",
+            eval.signals
+        );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
+            "blocked calls must not coexist with all_tools_healthy"
+        );
+
+        let event = build_turn_evaluation_journal_event(
+            Some("session-blocked"),
+            Some(1),
+            "cli_repl",
+            "what were my previous inputs?",
+            &[],
+            &records,
+            0,
+            false,
+            0.0,
+            &eval,
+        );
+        let metadata = event.metadata.expect("turn evaluation metadata");
+        assert_eq!(metadata["tool_call_count"], 1);
+        assert!(
+            metadata["signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|signal| signal["kind"] == "blocked_tool_call"),
+            "journal metadata must surface blocked tools: {metadata:?}"
         );
     }
 

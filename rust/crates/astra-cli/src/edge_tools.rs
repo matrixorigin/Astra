@@ -1628,12 +1628,27 @@ impl ToolExecutor {
 
     fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
         let runtime = self.mcp_runtime_snapshot("mcp_runtime_binding");
+        let schema_declared = runtime.schemas.iter().any(|schema| {
+            astra_turn_core::tool::schema::tool_schema_name(schema)
+                .is_some_and(|schema_name| schema_name == name)
+        });
+        if !schema_declared {
+            return false;
+        }
         let Some(manager) = &runtime.manager else {
             return false;
         };
-        manager
-            .try_read()
-            .is_ok_and(|manager| manager.find_tool_by_mcp_name(name).is_some())
+        match manager.try_read() {
+            Ok(manager) => manager.find_tool_by_mcp_name(name).is_some(),
+            Err(_) => {
+                tracing::debug!(
+                    target: "astra_cli::tool_binding",
+                    tool = %name,
+                    "MCP registry busy while checking runtime binding; preserving schema-declared availability"
+                );
+                true
+            }
+        }
     }
 
     fn capability_has_runtime_binding(

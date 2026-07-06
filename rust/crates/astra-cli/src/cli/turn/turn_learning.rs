@@ -108,6 +108,12 @@ pub(crate) fn turn_quality_feedback_from_eval(
                     "Unresolved tool outcome failure: {class} x{count}; do not report completion until a matching validation command succeeds."
                 ));
             }
+            EvalSignal::BlockedToolCall { count } => {
+                saw_stall_issue = true;
+                findings.push(format!(
+                    "{count} tool call(s) were blocked before execution; do not retry the same unavailable tool surface without changing provider or approach."
+                ));
+            }
             EvalSignal::ExplorationFamilyChurn { streak, .. } => {
                 saw_batching_issue = true;
                 findings.push(format!(
