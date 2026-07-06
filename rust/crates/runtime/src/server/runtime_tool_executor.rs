@@ -227,6 +227,10 @@ pub struct RuntimeToolExecutor {
     /// plan-mode state write through this so the next turn's system prompt
     /// reflects current state instead of the loop-start snapshot.
     plan_resume_hint_handle: Option<Arc<std::sync::RwLock<Option<String>>>>,
+    /// Shared handle to the loop host's authoritative plan authoring gate.
+    /// This is intentionally separate from the prompt hint: ordinary session
+    /// resume text must never activate plan-mode tool blocking.
+    plan_authoring_active_handle: Option<Arc<std::sync::RwLock<bool>>>,
 
     // ── MCP and external tool integration ─────────────────────────────────────
     /// MCP client manager for forwarding `mcp__*` tool calls to connected
@@ -343,6 +347,7 @@ impl RuntimeToolExecutor {
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
+            plan_authoring_active_handle: None,
             request_scoped_mcp_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             current_searchable_tool_names: Arc::new(std::sync::RwLock::new(None)),
@@ -1219,6 +1224,12 @@ impl RuntimeToolExecutor {
     /// hint untouched — useful for test executors without a host.
     pub fn set_plan_resume_hint_handle(&mut self, handle: Arc<std::sync::RwLock<Option<String>>>) {
         self.plan_resume_hint_handle = Some(handle);
+    }
+
+    /// Inject the host's plan authoring gate handle so enter/exit_plan_mode
+    /// can update the same boolean used by the headless permission gate.
+    pub fn set_plan_authoring_active_handle(&mut self, handle: Arc<std::sync::RwLock<bool>>) {
+        self.plan_authoring_active_handle = Some(handle);
     }
 
     /// Set the approval gate for interactive tool execution.
@@ -9244,6 +9255,12 @@ esac
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);
         exec.session_id = "no-active-plan".to_string();
+        let stale_hint = Arc::new(std::sync::RwLock::new(Some(
+            "[plan-resume] goal=\"stale\"".to_string(),
+        )));
+        let stale_authoring = Arc::new(std::sync::RwLock::new(true));
+        exec.set_plan_resume_hint_handle(Arc::clone(&stale_hint));
+        exec.set_plan_authoring_active_handle(Arc::clone(&stale_authoring));
 
         let result = exec
             .execute("exit_plan_mode", &json!({"approved": true}))
@@ -9251,6 +9268,14 @@ esac
         assert!(
             result.contains("nothing to exit"),
             "no-active-plan path should return a soft note, got: {result}"
+        );
+        assert!(
+            stale_hint.read().expect("hint lock").is_none(),
+            "exit_plan_mode without an active plan must clear stale prompt plan state"
+        );
+        assert!(
+            !*stale_authoring.read().expect("authoring lock"),
+            "exit_plan_mode without an active plan must clear stale plan-mode gate state"
         );
     }
 

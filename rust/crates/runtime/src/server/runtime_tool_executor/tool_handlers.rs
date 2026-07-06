@@ -328,6 +328,7 @@ impl ToolHandler<RuntimeToolExecutor> for EnterPlanModeToolHandler {
                 &context.user_id,
                 context.plan_mode_cache.as_ref(),
                 context.plan_resume_hint_handle.as_ref(),
+                context.plan_authoring_active_handle.as_ref(),
                 args,
             )
             .await,
@@ -359,6 +360,7 @@ impl ToolHandler<RuntimeToolExecutor> for ExitPlanModeToolHandler {
                 &context.session_id,
                 context.plan_mode_cache.as_ref(),
                 context.plan_resume_hint_handle.as_ref(),
+                context.plan_authoring_active_handle.as_ref(),
                 args,
             )
             .await,

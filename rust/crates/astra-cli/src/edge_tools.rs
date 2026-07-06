@@ -4600,10 +4600,9 @@ impl ToolExecutor {
         } else if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
             format!(
                 "Error: Tool '{name}' is blocked while plan mode is active. \
-                 The agent must call `exit_plan_mode` with an approved plan \
-                 before any write operation. This mirrors the reference agent's plan \
-                 mode: the plan is authored with read-only tools, approved by \
-                 the user, then execution proceeds with writes unlocked."
+                 Use read-only tools to finish the plan, then call \
+                 `exit_plan_mode(plan='...')` to submit it through the trusted \
+                 plan-review overlay before write tools can run."
             )
         } else {
             match name {

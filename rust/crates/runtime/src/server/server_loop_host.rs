@@ -1113,6 +1113,10 @@ pub struct ServerAgenticLoopHost {
     /// exit_plan_mode) can refresh it. `None` means no active plan; reads
     /// are cheap (one RwLock read) so `build_system_prompt` stays sync.
     plan_resume_hint: Arc<std::sync::RwLock<Option<String>>>,
+    /// Authoritative plan-mode write gate state. This is deliberately not
+    /// derived from `plan_resume_hint`, because normal session-resume text
+    /// can be prompt-visible without meaning the session is in plan mode.
+    plan_authoring_active: Arc<std::sync::RwLock<bool>>,
     /// Bounded task-board digest loaded before the turn starts. This is a
     /// scan hint, not an instruction to create or update tasks every turn.
     task_board_resume_hint: Option<String>,
@@ -1240,6 +1244,7 @@ pub struct ServerAgenticLoopHostBuilder {
     static_tool_catalog_admissible: bool,
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     plan_resume_hint: Option<String>,
+    plan_authoring_active: bool,
     task_board_resume_hint: Option<String>,
     server_service_tool_catalog_enabled: bool,
     control_plane_tool_catalog_enabled: bool,
@@ -1294,6 +1299,7 @@ impl ServerAgenticLoopHostBuilder {
             static_tool_catalog_admissible: true,
             event_tx: None,
             plan_resume_hint: None,
+            plan_authoring_active: false,
             task_board_resume_hint: None,
             server_service_tool_catalog_enabled: true,
             control_plane_tool_catalog_enabled: true,
@@ -1350,6 +1356,11 @@ impl ServerAgenticLoopHostBuilder {
     /// before the loop starts so the first and subsequent turns both see it.
     pub fn with_plan_resume_hint(mut self, hint: Option<String>) -> Self {
         self.plan_resume_hint = hint;
+        self
+    }
+
+    pub fn with_plan_authoring_active(mut self, active: bool) -> Self {
+        self.plan_authoring_active = active;
         self
     }
 
@@ -1685,6 +1696,7 @@ impl ServerAgenticLoopHostBuilder {
             }),
             agent_live_mirror: None,
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
+            plan_authoring_active: Arc::new(std::sync::RwLock::new(self.plan_authoring_active)),
             task_board_resume_hint: self.task_board_resume_hint,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
@@ -1868,8 +1880,8 @@ impl ServerAgenticLoopHost {
         summary
             .lines()
             .map(|line| {
-                if line.starts_with("- Plan resume: ") {
-                    format!("- Plan resume: {plan_line}")
+                if line.starts_with("- Resume context: ") {
+                    format!("- Resume context: {plan_line}")
                 } else {
                     line.to_string()
                 }
@@ -1884,6 +1896,10 @@ impl ServerAgenticLoopHost {
     /// new plan state instead of the snapshot baked at loop start.
     pub(crate) fn plan_resume_hint_handle(&self) -> Arc<std::sync::RwLock<Option<String>>> {
         Arc::clone(&self.plan_resume_hint)
+    }
+
+    pub(crate) fn plan_authoring_active_handle(&self) -> Arc<std::sync::RwLock<bool>> {
+        Arc::clone(&self.plan_authoring_active)
     }
 
     /// Inject an LLM-based turn intent judge.
@@ -2074,6 +2090,19 @@ impl ServerAgenticLoopHost {
         }
     }
 
+    fn read_plan_authoring_active(&self) -> bool {
+        match self.plan_authoring_active.read() {
+            Ok(guard) => *guard,
+            Err(poisoned) => {
+                astra_core::agent_warn!(
+                    "pipeline",
+                    "plan_authoring_active RwLock poisoned — using recovered plan-mode write gate value"
+                );
+                *poisoned.into_inner()
+            }
+        }
+    }
+
     fn render_turn_start_lifecycle_summary(
         &self,
         state: &AgenticLoopState,
@@ -2144,7 +2173,7 @@ impl ServerAgenticLoopHost {
                 executor_binding_summary(&self.executor_binding)
             ),
             format!("- Session: {session_id} · run: {run_id} · model: {model}"),
-            format!("- Plan resume: {plan_line}"),
+            format!("- Resume context: {plan_line}"),
             format!(
                 "- Task board: {}",
                 self.task_board_resume_hint
@@ -4252,7 +4281,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn plan_mode_active(&self, _state: &AgenticLoopState) -> bool {
-        self.read_plan_resume_hint().is_some()
+        self.read_plan_authoring_active()
     }
 
     fn render_final_text(&mut self, text: &str) {
@@ -8087,7 +8116,7 @@ mod tests {
             "executor binding must be explicit: {text}"
         );
         assert!(
-            text.contains("Plan resume: [plan-resume] goal=\"stabilize\""),
+            text.contains("Resume context: [plan-resume] goal=\"stabilize\""),
             "plan resume digest must be visible in lifecycle summary: {text}"
         );
         assert!(
@@ -8227,7 +8256,7 @@ mod tests {
             "executor binding should be surfaced in lifecycle summary: {summary}"
         );
         assert!(
-            summary.contains("Plan resume: none"),
+            summary.contains("Resume context: none"),
             "summary should clearly report missing resume hint: {summary}"
         );
     }
@@ -8257,7 +8286,7 @@ mod tests {
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
             .expect("round 0 pipeline should succeed");
         let round0_text = pipeline_outcome_text(&round0);
-        assert!(round0_text.contains("Plan resume: [plan-resume] goal=\"initial\""));
+        assert!(round0_text.contains("Resume context: [plan-resume] goal=\"initial\""));
         assert!(round0_text.contains("this_turn=0"));
 
         state.current_round_index = 3;
@@ -8273,12 +8302,57 @@ mod tests {
             .expect("round 3 pipeline should succeed");
         let round3_text = pipeline_outcome_text(&round3);
         assert!(
-            round3_text.contains("Plan resume: [plan-resume] goal=\"mutated\""),
+            round3_text.contains("Resume context: [plan-resume] goal=\"mutated\""),
             "plan line must refresh when the shared plan hint changes: {round3_text}"
         );
         assert!(
             round3_text.contains("this_turn=0"),
             "delegation counters should remain turn-start snapshot values: {round3_text}"
+        );
+    }
+
+    #[test]
+    fn session_resume_hint_does_not_activate_plan_mode_gate() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-session-resume".to_string(),
+            "s-session-resume".to_string(),
+        )
+        .with_plan_resume_hint(Some(
+            "[session-resume:v1]\nHydrated previous session context.".to_string(),
+        ))
+        .build();
+        let state = create_test_state();
+
+        assert!(
+            !<ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::plan_mode_active(
+                &host,
+                &state,
+            ),
+            "prompt-visible resume context must not lock agent/agent_fanout behind plan mode"
+        );
+    }
+
+    #[test]
+    fn plan_authoring_flag_activates_plan_mode_gate() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-plan-authoring".to_string(),
+            "s-plan-authoring".to_string(),
+        )
+        .with_plan_resume_hint(Some("[plan-resume] goal=\"draft\"".to_string()))
+        .with_plan_authoring_active(true)
+        .build();
+        let state = create_test_state();
+
+        assert!(
+            <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::plan_mode_active(
+                &host,
+                &state,
+            ),
+            "active plan authoring flag is the authoritative tool-gate state"
         );
     }
 

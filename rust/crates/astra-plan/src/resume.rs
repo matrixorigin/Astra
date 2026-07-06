@@ -7,6 +7,12 @@ use crate::{repository::PlanRepository, state::PlanModeState};
 const MAX_PLAN_RESUME_GOAL_CHARS: usize = 160;
 const MAX_PLAN_RESUME_SUBTASK_CHARS: usize = 80;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanResumeSnapshot {
+    pub authoring_active: bool,
+    pub prompt_hint: Option<String>,
+}
+
 fn truncate_plan_resume_text(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for (i, ch) in text.chars().enumerate() {
@@ -72,6 +78,40 @@ pub fn plan_resume_prompt_hint(state: &PlanModeState) -> Option<String> {
     Some(format!("\n\n## Active Plan\n{digest}\n\n{guidance}"))
 }
 
+pub fn plan_mode_authoring_active(state: &PlanModeState) -> bool {
+    let has_subtasks = !state.plan.subtasks.is_empty();
+    let any_in_progress = state
+        .plan
+        .subtasks
+        .iter()
+        .any(|subtask| subtask.status == TaskStatus::InProgress);
+    let items_done = state.plan.items_done() > 0;
+    let progress_complete = state.plan.progress_pct() == 100;
+    !has_subtasks || (!any_in_progress && !items_done && !progress_complete)
+}
+
+pub async fn plan_resume_snapshot_for_session(
+    repo: &dyn PlanRepository,
+    user_id: &str,
+    session_id: &str,
+) -> PlanResumeSnapshot {
+    let Some(plan_id) = repo
+        .active_plan_for_session(user_id, session_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return PlanResumeSnapshot::default();
+    };
+    let Ok(state) = repo.load(user_id, &plan_id).await else {
+        return PlanResumeSnapshot::default();
+    };
+    PlanResumeSnapshot {
+        authoring_active: plan_mode_authoring_active(&state),
+        prompt_hint: plan_resume_prompt_hint(&state),
+    }
+}
+
 /// Fetch the rendered system-prompt section for the session's active plan, if
 /// one exists. Returns `None` when the session has no active plan. Swallows
 /// any repo errors to `None` so that a transient DB hiccup does not block chat
@@ -81,13 +121,9 @@ pub async fn plan_resume_hint_for_session(
     user_id: &str,
     session_id: &str,
 ) -> Option<String> {
-    let plan_id = repo
-        .active_plan_for_session(user_id, session_id)
+    plan_resume_snapshot_for_session(repo, user_id, session_id)
         .await
-        .ok()
-        .flatten()?;
-    let state = repo.load(user_id, &plan_id).await.ok()?;
-    plan_resume_prompt_hint(&state)
+        .prompt_hint
 }
 
 #[cfg(test)]
@@ -144,5 +180,31 @@ mod tests {
             !hint.contains("resume from the in-progress subtask"),
             "{hint}"
         );
+    }
+
+    #[test]
+    fn plan_mode_authoring_active_tracks_authoring_not_prompt_presence() {
+        let empty_draft = PlanModeState::new("Draft provider model".into());
+        assert!(plan_mode_authoring_active(&empty_draft));
+        assert!(plan_resume_prompt_hint(&empty_draft).is_some());
+
+        let mut pending_draft = PlanModeState::new("Draft provider model".into());
+        pending_draft.plan.subtasks = vec![SubtaskPlan {
+            id: "design".into(),
+            title: "Design provider routing".into(),
+            status: TaskStatus::Pending,
+            ..Default::default()
+        }];
+        assert!(plan_mode_authoring_active(&pending_draft));
+
+        let mut executing_plan = pending_draft.clone();
+        executing_plan.plan.subtasks[0].status = TaskStatus::InProgress;
+        assert!(!plan_mode_authoring_active(&executing_plan));
+        assert!(plan_resume_prompt_hint(&executing_plan).is_some());
+
+        let mut completed_plan = pending_draft;
+        completed_plan.plan.subtasks[0].status = TaskStatus::Completed;
+        assert!(!plan_mode_authoring_active(&completed_plan));
+        assert!(plan_resume_prompt_hint(&completed_plan).is_some());
     }
 }

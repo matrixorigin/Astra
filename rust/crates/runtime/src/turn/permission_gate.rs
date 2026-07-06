@@ -222,8 +222,8 @@ pub async fn check_tool_permission_in_plan_mode(
                 "tool '{tool_name}' is blocked while plan mode is active. \
                  Plan mode is a read-only authoring phase — use only read tools \
                  already visible in the current turn, then \
-                 call `exit_plan_mode(plan='...', approved=true)` to exit and \
-                 unlock writes."
+                 call `exit_plan_mode(plan='...')` to submit the plan for \
+                 trusted user approval."
             ),
         };
     }

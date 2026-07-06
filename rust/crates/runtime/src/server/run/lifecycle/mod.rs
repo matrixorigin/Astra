@@ -3171,6 +3171,7 @@ impl AgenticRunLifecycleService {
         static_tool_catalog_admissible: bool,
         execution_bindings: Option<&ExecutionBindingSnapshot>,
         plan_resume_hint: Option<String>,
+        plan_authoring_active: bool,
         task_board_resume_hint: Option<String>,
     ) -> server_loop_host::ServerAgenticLoopHost {
         let mut builder = ServerAgenticLoopHostBuilder::new(
@@ -3194,6 +3195,7 @@ impl AgenticRunLifecycleService {
         .with_interaction_mode(request.interaction_mode)
         .with_interactive_client(request.interactive_client)
         .with_plan_resume_hint(plan_resume_hint)
+        .with_plan_authoring_active(plan_authoring_active)
         .with_task_board_resume_hint(task_board_resume_hint);
 
         if let Some(pool) = &self.shared_pool {
@@ -4906,14 +4908,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         // Spawn background agentic loop.
-        // Look up the plan-resume hint up-front so the system prompt on every
-        // turn reminds the LLM a plan is in flight. Missing pool → None, missing
-        // active plan → None, transient errors → None (best-effort).
-        let plan_resume_hint = if let Some(shared) = &self.shared_pool {
+        // Load plan state as structured data: prompt hint for context, plus
+        // an independent authoring flag for the tool gate. Ordinary session
+        // resume context must not activate plan-mode blocking.
+        let plan_resume_snapshot = if let Some(shared) = &self.shared_pool {
             let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-            astra_plan::plan_resume_hint_for_session(&repo, &user_id, &session_id).await
+            astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
         } else {
-            None
+            astra_plan::PlanResumeSnapshot::default()
         };
         let session_resume_hint = self
             .session_resume_hydration_hint_for_session(
@@ -4924,8 +4926,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await;
         let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
             session_resume_hint,
-            plan_resume_hint,
+            plan_resume_snapshot.prompt_hint,
         );
+        let plan_authoring_active = plan_resume_snapshot.authoring_active;
         let task_board_resume_hint = self
             .task_board_resume_hint_for_session(&user_id, &session_id)
             .await;
@@ -4940,6 +4943,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             !agent_binding_mode,
             execution_bindings.as_ref(),
             plan_resume_hint,
+            plan_authoring_active,
             task_board_resume_hint,
         );
         if let Some(snapshot) = execution_bindings.as_ref() {
@@ -5131,6 +5135,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // Share the host's plan-resume hint slot so tool-triggered
             // plan-mode changes refresh the system prompt mid-run.
             executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());
+            executor.set_plan_authoring_active_handle(host.plan_authoring_active_handle());
             if let Some(observability_session) = loop_state.telemetry.observability_session.clone()
             {
                 executor.set_observability_session(observability_session);
@@ -5805,11 +5810,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             None
         };
 
-        let plan_resume_hint = if let Some(shared) = &self.shared_pool {
+        let plan_resume_snapshot = if let Some(shared) = &self.shared_pool {
             let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-            astra_plan::plan_resume_hint_for_session(&repo, &user_id, &session_id).await
+            astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
         } else {
-            None
+            astra_plan::PlanResumeSnapshot::default()
         };
         let session_resume_hint = self
             .session_resume_hydration_hint_for_session(
@@ -5820,8 +5825,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await;
         let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
             session_resume_hint,
-            plan_resume_hint,
+            plan_resume_snapshot.prompt_hint,
         );
+        let plan_authoring_active = plan_resume_snapshot.authoring_active;
         let task_board_resume_hint = self
             .task_board_resume_hint_for_session(&user_id, &session_id)
             .await;
@@ -5836,6 +5842,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             !agent_binding_mode,
             execution_bindings.as_ref(),
             plan_resume_hint,
+            plan_authoring_active,
             task_board_resume_hint,
         );
         self.configure_host_approval_audit_context(
@@ -8148,6 +8155,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 ));
             }
             executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());
+            executor.set_plan_authoring_active_handle(host.plan_authoring_active_handle());
             if let Some(obs) = loop_state.telemetry.observability_session.clone() {
                 executor.set_observability_session(obs);
             }
