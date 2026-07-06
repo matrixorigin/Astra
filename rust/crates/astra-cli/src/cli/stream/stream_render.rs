@@ -1159,21 +1159,28 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
-    fn edge_runtime_environment_advertisement(&self) -> Value {
-        astra_thin_client::edge_runtime_environment_capabilities(
-            &self.edge_agent_id,
-            self.executor.project_root.to_string_lossy().as_ref(),
-        )
+    fn cli_runtime_environment_advertisement(&self) -> Value {
+        static REGISTRY: std::sync::OnceLock<astra_runtime_env::ToolRegistry> =
+            std::sync::OnceLock::new();
+        let registry = REGISTRY.get_or_init(astra_runtime_env::ToolRegistry::builtins);
+        let binding = astra_runtime_env::RunBinding::local_developer(
+            self.executor.project_root.to_string_lossy().to_string(),
+            registry,
+        );
+        serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            binding,
+        ))
+        .expect("CLI runtime environment advertisement serializes")
     }
 
-    fn edge_tool_result_fields_with_runtime(
+    fn tool_result_fields_with_cli_runtime(
         &self,
         fields: Option<Map<String, Value>>,
     ) -> Map<String, Value> {
         let mut fields = fields.unwrap_or_default();
         fields
             .entry("runtime_environment_advertisement".to_string())
-            .or_insert_with(|| self.edge_runtime_environment_advertisement());
+            .or_insert_with(|| self.cli_runtime_environment_advertisement());
         fields
     }
 
@@ -1239,7 +1246,7 @@ impl<'a> CliSseStreamHost<'a> {
             });
         }
 
-        let tool_result_fields = self.edge_tool_result_fields_with_runtime(tool_result_fields);
+        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
         let result = EdgeToolExecResult {
             request_id: request_id.to_string(),
             tool: tool.to_string(),
@@ -1979,7 +1986,7 @@ impl<'a> CliSseStreamHost<'a> {
             });
         }
 
-        let tool_result_fields = self.edge_tool_result_fields_with_runtime(tool_result_fields);
+        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
         let result = EdgeToolExecResult {
             request_id: req.request_id.clone(),
             tool: req.tool.clone(),
@@ -3643,7 +3650,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.render
                 .tool_done(idx, tool, args, &status, duration_ms, &output);
         }
-        let tool_result_fields = self.edge_tool_result_fields_with_runtime(tool_result_fields);
+        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
         self.edge_tool_round.push(EdgeToolExecResult {
             request_id: request_id.to_string(),
             tool: tool.to_string(),
@@ -4433,7 +4440,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
 
             let tool_result_fields =
-                self.edge_tool_result_fields_with_runtime(outcome.tool_result_fields);
+                self.tool_result_fields_with_cli_runtime(outcome.tool_result_fields);
             let result = EdgeToolExecResult {
                 request_id: req.request_id.clone(),
                 tool: req.tool.clone(),
@@ -10436,6 +10443,26 @@ mod tests {
         assert_eq!(
             runtime_environment["binding"]["workspace"]["cwd"],
             temp.path().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            runtime_environment["binding"]["executor"]["kind"],
+            "local_cli"
+        );
+        let advertisement: astra_runtime_env::RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(runtime_environment.clone())
+                .expect("runtime advertisement should deserialize");
+        assert!(advertisement.binding.tool_surface.contains("task"));
+        assert!(
+            astra_runtime_env::CapabilityResolver
+                .check_tool_call_for_surface(
+                    &astra_runtime_env::ToolRegistry::builtins(),
+                    "task",
+                    &serde_json::json!({"action": "list"}),
+                    &advertisement.binding.capabilities,
+                    &advertisement.binding.tool_surface,
+                )
+                .is_ok(),
+            "CLI task results must not be rejected as control_plane_required"
         );
         assert!(
             result
