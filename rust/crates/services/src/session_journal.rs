@@ -1040,13 +1040,16 @@ impl ToolCallRecord {
         if self.surgically_removed == Some(true) {
             return true;
         }
+        if self.is_structured_noop_or_cached_result() {
+            return true;
+        }
 
         let Some(result_preview) = self.result_preview.as_deref() else {
             return false;
         };
 
         result_preview.starts_with("Skipped:")
-            || result_preview.starts_with("Deferred:")
+            || (self.error.is_none() && result_preview.starts_with("Deferred:"))
             || (self.name == "skill"
                 && result_preview.starts_with("Skill '")
                 && result_preview.contains(" was already loaded (turn "))
@@ -7882,6 +7885,21 @@ mod tests {
             assert!(
                 base_tool_record("read_file", false, Some("Deferred: skill invoked"))
                     .is_synthetic_placeholder()
+            );
+            let deferred_protocol_failure = ToolCallRecord {
+                name: "agent_fanout".into(),
+                ok: false,
+                ms: 0,
+                error: Some("tool_not_admitted".into()),
+                result_preview: Some(
+                    "Deferred: Error: Tool 'agent_fanout' is not available in this turn yet."
+                        .into(),
+                ),
+                ..Default::default()
+            };
+            assert!(
+                !deferred_protocol_failure.is_synthetic_placeholder(),
+                "not-admitted deferred calls are protocol failures, not synthetic placeholders"
             );
             assert!(
                 base_tool_record(

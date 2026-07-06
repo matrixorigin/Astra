@@ -1795,25 +1795,28 @@ mod tests {
     }
 
     #[test]
-    fn digest_does_not_flag_deferred_not_admitted_placeholders_as_failures() {
+    fn digest_flags_deferred_not_admitted_as_protocol_failure() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _g = JournalDirGuard::new(tmp.path());
 
         let sid = "test-deferred-tool-00000000-0000-0000-0000-000000000013";
         fs::write(
             journal_path_for_test(sid),
-            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"agent_fanout","ok":true,"ms":0,"error":"tool_not_admitted","result_preview":"Deferred: Error: Tool 'agent_fanout' is not available in this turn yet. First call tool_search with query=\"select:agent_fanout\"."},{"name":"bash","ok":true,"ms":5,"result_preview":"ok"}]}"#,
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"agent_fanout","ok":false,"ms":0,"error":"tool_not_admitted","result_preview":"Deferred: Error: Tool 'agent_fanout' is not available in this turn yet. First call tool_search with query=\"select:agent_fanout\"."},{"name":"bash","ok":true,"ms":5,"result_preview":"ok"}]}"#,
         )
         .expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
         assert_eq!(
-            d.aggregates.tool_calls_failed, 0,
-            "deferred activation placeholders must not count as failures"
+            d.aggregates.tool_calls_failed, 1,
+            "deferred activation misses are protocol failures and must be visible"
         );
         assert!(
-            d.failed_tool_calls.is_empty(),
-            "deferred activation placeholders must not appear in failed_tool_calls"
+            d.failed_tool_calls
+                .iter()
+                .any(|failure| failure.tool == "agent_fanout"
+                    && failure.error_preview.contains("tool_not_admitted")),
+            "deferred activation misses must appear in failed_tool_calls"
         );
     }
 

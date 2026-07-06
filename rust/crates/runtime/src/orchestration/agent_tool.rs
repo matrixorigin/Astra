@@ -1114,7 +1114,7 @@ async fn render_agent_fanout_results(
         "group_id": group_id,
         "title": updated.title,
         "target_count": updated.target_count,
-        "delivery_contract": "Results are in results[].result. When this output is persisted, read the persisted JSON without line ranges or parse it structurally, then present the substantive findings instead of only reporting the artifact path.",
+        "delivery_contract": "Results are in results[].result. If this output is persisted, use the Tool result id or artifact://session/tool-result/... handle from the persisted-output wrapper through runtime artifact recovery. Do not search for or copy physical filesystem paths.",
         "results": results,
     });
     let obj = response.as_object_mut().unwrap();
@@ -2869,6 +2869,13 @@ mod tests {
             value["delivery_contract"]
                 .as_str()
                 .is_some_and(|text| text.contains("results[].result")),
+            "{result}"
+        );
+        assert!(
+            value["delivery_contract"].as_str().is_some_and(|text| {
+                text.contains("artifact://session/tool-result")
+                    && text.contains("Do not search for or copy physical filesystem paths")
+            }),
             "{result}"
         );
         assert!(

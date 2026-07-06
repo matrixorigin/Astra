@@ -25,6 +25,13 @@ pub const MAX_RECENT_PATHS: usize = 5;
 /// Maximum number of distinct shell commands to surface.
 pub const MAX_RECENT_COMMANDS: usize = 3;
 
+fn references_internal_tool_result_artifact(value: &str) -> bool {
+    let value = value.replace('\\', "/");
+    value.starts_with("artifact://session/tool-result/")
+        || (value.contains(".astra/sessions/") && value.contains("/tool-results/"))
+        || value.contains(".astra/tool-results/")
+}
+
 /// Extracted hints from recent tool calls.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecentArgHints {
@@ -94,7 +101,9 @@ where
         let args = normalize_llm_function_arguments(raw_args);
         if hints.paths.len() < MAX_RECENT_PATHS {
             if let Some(p) = path_hint_from_args(&args) {
-                if !hints.paths.iter().any(|existing| existing == &p) {
+                if !references_internal_tool_result_artifact(&p)
+                    && !hints.paths.iter().any(|existing| existing == &p)
+                {
                     hints.paths.push(p);
                 }
             }
@@ -102,7 +111,9 @@ where
         if hints.commands.len() < MAX_RECENT_COMMANDS {
             if let Some(c) = command_hint_from_args(&args) {
                 let owned = c.to_string();
-                if !hints.commands.iter().any(|existing| existing == &owned) {
+                if !references_internal_tool_result_artifact(&owned)
+                    && !hints.commands.iter().any(|existing| existing == &owned)
+                {
                     hints.commands.push(owned);
                 }
             }
@@ -232,6 +243,30 @@ mod tests {
         let a = json!({"file_path": "ignored.rs", "cmd": "ignored-cmd"});
         let hints = build_recent_arg_hints([("read_file", &a)]);
         assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn internal_tool_result_artifacts_do_not_enter_recent_hints() {
+        let physical = json!({
+            "path": "/home/me/.astra/sessions/v1/users/b64-wrong/sessions/s1/tool-results/call_abc.txt"
+        });
+        let logical = json!({
+            "path": "artifact://session/tool-result/call_abc"
+        });
+        let command = json!({
+            "command": "cat /home/me/.astra/sessions/v1/users/b64-wrong/sessions/s1/tool-results/call_abc.txt"
+        });
+        let normal = json!({"path": "src/lib.rs"});
+
+        let hints = build_recent_arg_hints([
+            ("read_file", &physical),
+            ("read_file", &logical),
+            ("bash", &command),
+            ("read_file", &normal),
+        ]);
+
+        assert_eq!(hints.paths, vec!["src/lib.rs".to_string()]);
+        assert!(hints.commands.is_empty());
     }
 
     #[test]
