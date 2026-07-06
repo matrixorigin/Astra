@@ -659,7 +659,25 @@ fn apply_policy_tool_allowlist(policy: &PolicyIntent, tool_surface: &mut Availab
             ));
         }
     }
-    tool_surface.denials.extend(policy_denials);
+    let mut merged_denials = std::collections::BTreeMap::new();
+    for denial in tool_surface.denials.drain(..) {
+        merged_denials.insert(denial.tool_name, denial.reason);
+    }
+    for denial in policy_denials {
+        merged_denials.insert(denial.tool_name, denial.reason);
+    }
+    tool_surface.denials = merged_denials
+        .into_iter()
+        .map(|(tool_name, reason)| ToolDenial { tool_name, reason })
+        .collect();
+    tool_surface.tool_names.sort();
+    tool_surface.tool_names.dedup();
+    tool_surface
+        .admissions
+        .sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+    tool_surface
+        .admissions
+        .dedup_by(|a, b| a.tool_name == b.tool_name);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -706,6 +724,45 @@ mod tests {
         assert!(
             value["binding"]["tool_surface"].get("admissions").is_none(),
             "selected provider offers are runtime evidence and must not churn prompt/runtime advertisement bytes"
+        );
+    }
+
+    #[test]
+    fn policy_allowlist_canonicalizes_tool_surface_denials() {
+        let policy = PolicyIntent::local_developer().with_allowed_tools(["read_file"]);
+        let mut surface = AvailableToolSurface {
+            tool_names: vec![
+                "write_file".to_string(),
+                "read_file".to_string(),
+                "bash".to_string(),
+            ],
+            denials: vec![
+                ToolDenial {
+                    tool_name: "z_hidden".to_string(),
+                    reason: ToolUnavailableReason::UnknownTool,
+                },
+                ToolDenial {
+                    tool_name: "bash".to_string(),
+                    reason: ToolUnavailableReason::UnknownTool,
+                },
+            ],
+            admissions: vec![],
+        };
+
+        apply_policy_tool_allowlist(&policy, &mut surface);
+
+        assert_eq!(surface.tool_names, vec!["read_file"]);
+        let denied_names: Vec<_> = surface
+            .denials
+            .iter()
+            .map(|denial| denial.tool_name.as_str())
+            .collect();
+        assert_eq!(denied_names, vec!["bash", "write_file", "z_hidden"]);
+        assert_eq!(
+            surface.denial_for("bash"),
+            Some(&ToolUnavailableReason::PolicyDenied(
+                PolicyIntent::disallowed_tool_reason("bash")
+            ))
         );
     }
 

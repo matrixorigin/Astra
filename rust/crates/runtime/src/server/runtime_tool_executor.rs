@@ -2211,6 +2211,53 @@ mod tests {
         assert_eq!(names, vec!["mcp__alpha__query", "mcp__zeta__query"]);
     }
 
+    #[test]
+    fn tool_search_pool_is_byte_stable_for_permuted_request_scoped_mcp_schemas() {
+        let alpha = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__alpha__query",
+                "description": "Alpha query.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        let zeta = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__zeta__query",
+                "description": "Zeta query.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+
+        let (mut first, _first_dir) = test_executor();
+        first.set_request_scoped_mcp_schemas(vec![zeta.clone(), alpha.clone()]);
+        first.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "docs",
+                &["mcp__alpha__query", "mcp__zeta__query"],
+            ),
+        ));
+
+        let (mut second, _second_dir) = test_executor();
+        second.set_request_scoped_mcp_schemas(vec![alpha, zeta]);
+        second.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "docs",
+                &["mcp__alpha__query", "mcp__zeta__query"],
+            ),
+        ));
+
+        let first_pool = first.current_tool_search_pool_schemas();
+        let second_pool = second.current_tool_search_pool_schemas();
+
+        assert_eq!(
+            serde_json::to_vec(&first_pool).expect("serialize first tool_search pool"),
+            serde_json::to_vec(&second_pool).expect("serialize second tool_search pool"),
+            "tool_search must not depend on request-scoped MCP list_tools order"
+        );
+    }
+
     #[tokio::test]
     async fn service_unready_tools_are_not_advertised_or_executable() {
         let (exec, _dir) = test_executor();
