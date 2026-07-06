@@ -475,6 +475,20 @@ impl StepRecorder {
         }
     }
 
+    pub fn begin_act_with_slots(&mut self, slots: Vec<ExecutionSlotSpec>) {
+        self.transition_phase(StepAction::Act);
+        if let Some(ref mut step) = self.current_step {
+            step.execution.cursor = ExecutionCursor::for_act_slots(slots);
+            // Initialize Act result so record_tokens() can populate it.
+            step.execution.result = Some(StepResult::Act {
+                tool_results_count: 0,
+                assistant_text: None,
+                tokens_in: 0,
+                tokens_out: 0,
+            });
+        }
+    }
+
     /// Record start of a tool execution (within ACT phase).
     /// Optionally accepts an idempotency key for cache correlation.
     pub fn begin_tool(&mut self, tool_name: &str, call_id: &str) {
@@ -1604,6 +1618,50 @@ mod tests {
         assert_eq!(step.execution.cursor.slots[0].state, SlotState::Completed);
         assert_eq!(step.execution.cursor.slots[1].state, SlotState::Completed);
         assert!(step.execution.cursor.all_slots_done());
+    }
+
+    #[test]
+    fn recorder_act_prepopulates_pending_tool_slots() {
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
+        rec.begin_turn(0);
+        rec.begin_act_with_slots(vec![
+            ExecutionSlotSpec {
+                tool_name: "web_fetch".into(),
+                call_id: "call-1".into(),
+                idempotency_key: Some("idem-1".into()),
+                args_preview: Some("url=https://example.com".into()),
+            },
+            ExecutionSlotSpec {
+                tool_name: "task".into(),
+                call_id: "call-2".into(),
+                idempotency_key: None,
+                args_preview: Some("action=update".into()),
+            },
+        ]);
+
+        let step = rec.current_step().unwrap();
+        assert_eq!(step.execution.cursor.phase, StepAction::Act);
+        assert_eq!(step.execution.cursor.slots.len(), 2);
+        assert_eq!(step.execution.cursor.slots[0].tool_name, "web_fetch");
+        assert_eq!(step.execution.cursor.slots[0].call_id, "call-1");
+        assert_eq!(step.execution.cursor.slots[0].state, SlotState::Pending);
+        assert_eq!(
+            step.execution.cursor.slots[0].idempotency_key.as_deref(),
+            Some("idem-1")
+        );
+        assert_eq!(
+            step.execution.cursor.slots[0].args_preview.as_deref(),
+            Some("url=https://example.com")
+        );
+        assert_eq!(step.execution.cursor.slots[1].tool_name, "task");
+        assert_eq!(step.execution.cursor.slots[1].call_id, "call-2");
+        assert!(
+            step.execution
+                .cursor
+                .slots
+                .iter()
+                .all(|slot| !slot.tool_name.is_empty() && !slot.call_id.is_empty())
+        );
     }
 
     #[test]

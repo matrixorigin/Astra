@@ -310,26 +310,6 @@ fn validate_task_can_start_after_projected_edges(
     ))
 }
 
-fn validate_single_in_progress_slot(tasks: &[SessionTask], task_id: &str) -> Result<(), String> {
-    let conflicting: Vec<&SessionTask> = tasks
-        .iter()
-        .filter(|task| task.id != task_id && task.status.is_in_progress())
-        .collect();
-    if conflicting.is_empty() {
-        return Ok(());
-    }
-
-    let active = conflicting
-        .iter()
-        .map(|task| format!("{} '{}'", task.id, task.title))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(format!(
-        "task '{}' cannot start because another task is already in_progress: {}. Complete, pause, or stop the current in_progress task before starting another",
-        task_id, active
-    ))
-}
-
 fn validate_subtask_dependencies_resolved(
     task: &SessionTask,
     subtask_id: &str,
@@ -2556,10 +2536,6 @@ impl TaskManager {
             })
             .collect();
 
-        if filtered.is_empty() {
-            return format!("No tasks found with status '{}'", status_filter);
-        }
-
         json!({
             "count": filtered.len(),
             "tasks": filtered
@@ -2831,11 +2807,6 @@ impl TaskManager {
                             validate_subtask_dependencies_resolved(&projected_task, st_id)?;
                         }
                         reconcile_subtask_completion(&mut projected_task);
-                        if projected_task.status.is_in_progress()
-                            && !tasks[task_index].status.is_in_progress()
-                        {
-                            validate_single_in_progress_slot(&tasks, &task_id)?;
-                        }
 
                         let task = &mut tasks[task_index];
                         let Some(subtask) = task.subtasks.iter_mut().find(|st| st.id == st_id)
@@ -2906,7 +2877,7 @@ impl TaskManager {
                             json!({
                                 "success": true,
                                 "task_id": task_id,
-                                "previous_status": previous_status,
+                                "previous_status": previous_status.to_string(),
                                 "status": "deleted",
                                 "message": format!("Task '{}' hidden from active views; audit tombstone retained", task_id)
                             })
@@ -2997,9 +2968,6 @@ impl TaskManager {
                             || !proposed_blocks.is_empty()
                             || !remove_blocked_by.is_empty()
                             || !remove_blocks.is_empty();
-                        if starting_now {
-                            validate_single_in_progress_slot(&tasks, &task_id)?;
-                        }
                         if starting_now || dependency_edges_changed {
                             validate_task_can_start_after_projected_edges(
                                 &tasks,
@@ -3566,6 +3534,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_empty_board_returns_stable_json_shape() {
+        let m = mgr();
+
+        let list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "active"})).await).unwrap();
+
+        assert_eq!(list["count"], 0, "{list}");
+        assert_eq!(list["tasks"].as_array().map(Vec::len), Some(0), "{list}");
+    }
+
+    #[tokio::test]
     async fn create_rejects_blank_title_and_wrong_type_top_level_fields() {
         let m = mgr();
 
@@ -3615,8 +3594,9 @@ mod tests {
         }
 
         let list = m.list(&json!({"status_filter": "all"})).await;
-        assert!(
-            list.starts_with("No tasks"),
+        let list: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            list["count"], 0,
             "invalid create attempts must not persist tasks: {list}"
         );
     }
@@ -3656,8 +3636,9 @@ mod tests {
         }
 
         let list = m.list(&json!({"status_filter": "all"})).await;
-        assert!(
-            list.starts_with("No tasks"),
+        let list: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            list["count"], 0,
             "oversized create attempts must not persist tasks: {list}"
         );
     }
@@ -3727,8 +3708,9 @@ mod tests {
         );
 
         let list = m.list(&json!({"status_filter": "all"})).await;
-        assert!(
-            list.starts_with("No tasks"),
+        let list: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            list["count"], 0,
             "unknown-field attempts must not create or mutate tasks: {list}"
         );
     }
@@ -3925,8 +3907,9 @@ mod tests {
         );
 
         let list = m.list(&json!({"status_filter": "all"})).await;
-        assert!(
-            list.starts_with("No tasks"),
+        let list: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            list["count"], 0,
             "malformed create attempts must not persist partial tasks: {list}"
         );
     }
@@ -4793,7 +4776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_rejects_second_in_progress_parent_task() {
+    async fn update_allows_multiple_independent_in_progress_parent_tasks() {
         let m = mgr();
         m.create(&json!({"title": "first"})).await;
         m.create(&json!({"title": "second"})).await;
@@ -4805,32 +4788,16 @@ mod tests {
         let second = m
             .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
             .await;
-        assert!(second.starts_with("Error:"), "{second}");
-        assert!(
-            second.contains("already in_progress")
-                && second.contains("task-1")
-                && second.contains("pause"),
-            "second in_progress refusal should name the current running task and recovery path: {second}"
-        );
-        let task_2: SessionTask =
-            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
-        assert_eq!(
-            task_2.status,
-            SessionTaskStatusKind::Pending,
-            "rejected second start must not mutate the second task"
-        );
-
-        let pause_first = m
-            .update(&json!({"task_id": "task-1", "new_status": "paused"}))
-            .await;
-        assert!(!pause_first.starts_with("Error:"), "{pause_first}");
-        let second = m
-            .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
-            .await;
         assert!(
             second.contains("\"success\":true") && second.contains("\"status\":\"in_progress\""),
-            "{second}"
+            "independent tasks should be allowed to run concurrently; ordering belongs in dependency edges: {second}"
         );
+        let task_1: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        let task_2: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
+        assert_eq!(task_1.status, SessionTaskStatusKind::InProgress);
+        assert_eq!(task_2.status, SessionTaskStatusKind::InProgress);
     }
 
     #[tokio::test]
@@ -4852,7 +4819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subtask_start_rejects_when_another_parent_is_in_progress() {
+    async fn subtask_start_allows_independent_parent_concurrency() {
         let m = mgr();
         m.create(&json!({"title": "running parent"})).await;
         m.create(&json!({
@@ -4872,15 +4839,15 @@ mod tests {
                 "new_status": "in_progress"
             }))
             .await;
-        assert!(subtask_start.starts_with("Error:"), "{subtask_start}");
         assert!(
-            subtask_start.contains("already in_progress") && subtask_start.contains("task-1"),
-            "subtask start should respect the single in_progress parent slot: {subtask_start}"
+            subtask_start.contains("\"success\":true")
+                && subtask_start.contains("\"status\":\"in_progress\""),
+            "a subtask in one task should not be blocked by an unrelated in_progress task: {subtask_start}"
         );
         let task_2: SessionTask =
             serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
-        assert_eq!(task_2.status, SessionTaskStatusKind::Pending);
-        assert_eq!(task_2.subtasks[0].status, SessionTaskStatusKind::Pending);
+        assert_eq!(task_2.status, SessionTaskStatusKind::InProgress);
+        assert_eq!(task_2.subtasks[0].status, SessionTaskStatusKind::InProgress);
     }
 
     #[tokio::test]
@@ -5403,7 +5370,10 @@ mod tests {
         assert_eq!(deleted_list["count"], 10, "{deleted_list}");
         let active_list: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "active"})).await).unwrap();
-        assert_eq!(active_list["count"], 0, "{active_list}");
+        assert_eq!(
+            active_list["count"], 0,
+            "deleted tombstones must not remain active: {active_list}"
+        );
 
         let revive = m
             .update(&json!({"task_id": "task-1", "new_status": "pending"}))
@@ -6568,8 +6538,9 @@ mod tests {
             .collect();
         assert!(archived_titles.contains(&"alpha"), "{archived_list}");
         let active_out = m.list(&json!({"status_filter": "active"})).await;
-        assert!(
-            active_out.starts_with("No tasks"),
+        let active_out: Value = serde_json::from_str(&active_out).unwrap();
+        assert_eq!(
+            active_out["count"], 0,
             "no active tasks should remain after archive; got: {active_out}"
         );
     }

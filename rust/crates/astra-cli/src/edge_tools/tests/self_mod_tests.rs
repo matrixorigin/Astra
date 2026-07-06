@@ -208,7 +208,8 @@ async fn shared_task_manager_and_session_state_journal_survive_across_executors(
     );
 
     let listed_after = exe_a.execute("task", &json!({"action": "list"})).await;
-    assert_eq!(listed_after, "No tasks found with status 'all'");
+    let listed_after_json: Value = serde_json::from_str(&listed_after).unwrap();
+    assert_eq!(listed_after_json["count"], 0);
 }
 
 // ─── P4: P3 seams wired into SelfModel snapshot ─────────────────────────────

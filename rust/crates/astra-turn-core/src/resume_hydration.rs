@@ -262,7 +262,8 @@ mod tests {
         assert!(hint.contains("Treat this as the same session"));
         assert!(hint.contains("active_objective: 3agents review current branch changes"));
         assert!(hint.contains("last_assistant_state: Continuing the branch review"));
-        assert!(hint.contains("[Runtime tool result]"));
+        assert!(!hint.contains("[Runtime tool result]"));
+        assert!(!hint.contains("202 files changed"));
     }
 
     #[test]

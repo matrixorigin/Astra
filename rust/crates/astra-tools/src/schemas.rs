@@ -1053,7 +1053,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "title": {"type": "string", "description": "(create/update) Title."},
                         "description": {"type": "string", "description": "(create/update) Done."},
                         "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in current session."},
-                        "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only) New task/subtask status. Do not send `status`. Only one parent task may be in_progress; `paused` frees that slot; `deleted` hides the task from active views while keeping an audit tombstone."},
+                        "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only) New task/subtask status. Do not send `status`. Multiple independent parent tasks may be in_progress concurrently; use add_blocked_by/add_blocks to model ordering. `paused` keeps work open; `deleted` hides the task from active views while keeping an audit tombstone."},
                         "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","deleted","all","active"], "description": "(list only) Use `status_filter: \"all\"` to list all tasks, including audit tombstones; use `deleted` to inspect deleted tombstones; do not send an `all` boolean. `active` = pending + in_progress + paused."},
                         "subtask_id": {"type": "string", "description": "(update) Subtask id; use with task_id + new_status, optional reason."},
                         "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
@@ -1697,8 +1697,9 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(
-            new_status_desc.contains("Only one parent task may be in_progress"),
-            "new_status should teach the single in_progress task invariant: {new_status_desc}"
+            new_status_desc.contains("Multiple independent parent tasks may be in_progress")
+                && new_status_desc.contains("add_blocked_by/add_blocks"),
+            "new_status should teach dependency-driven task ordering instead of a global active slot: {new_status_desc}"
         );
         assert!(
             new_status_desc.contains("Do not send `status`"),

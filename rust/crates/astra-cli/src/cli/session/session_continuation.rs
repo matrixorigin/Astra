@@ -105,30 +105,7 @@ fn transcript_event_to_message(event: &TurnEvent) -> Option<Value> {
         TurnEvent::User { text, .. } => non_empty_message("user", text),
         TurnEvent::Assistant { markdown, .. } => non_empty_message("assistant", markdown),
         TurnEvent::System { text, .. } => non_empty_message("system", text),
-        TurnEvent::Tool {
-            name,
-            description,
-            output_summary,
-            output,
-            ..
-        } => {
-            let detail = output
-                .as_deref()
-                .or(output_summary.as_deref())
-                .unwrap_or_default()
-                .trim();
-            let description = description.trim();
-            let body = match (description.is_empty(), detail.is_empty()) {
-                (true, true) => "completed".to_string(),
-                (false, true) => description.to_string(),
-                (true, false) => detail.to_string(),
-                (false, false) => format!("{description} | {detail}"),
-            };
-            Some(json!({
-                "role": "system",
-                "content": format!("[Runtime tool result]\n{}: {}", name.trim(), body),
-            }))
-        }
+        TurnEvent::Tool { .. } => None,
         TurnEvent::Thinking { .. } | TurnEvent::TurnSummary { .. } => None,
     }
 }
@@ -363,7 +340,7 @@ mod tests {
 
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "review current branch");
-        assert!(messages.iter().any(|msg| {
+        assert!(!messages.iter().any(|msg| {
             msg["content"]
                 .as_str()
                 .unwrap_or_default()
@@ -402,20 +379,14 @@ mod tests {
             json!({"role": "tool", "content": "+line", "tool_call_id": "2"}),
         ];
         let result = super::sanitize_continuation_messages(msgs);
-        assert_eq!(result.len(), 5);
+        assert_eq!(result.len(), 3);
         assert_eq!(result[2]["content"], "hi");
-        assert!(
-            result[3]["content"]
+        assert!(result.iter().all(|message| {
+            !message["content"]
                 .as_str()
-                .unwrap()
-                .contains("[Runtime tool result]\ngit: M file.rs")
-        );
-        assert!(
-            result[4]["content"]
-                .as_str()
-                .unwrap()
-                .contains("[Runtime tool result]\ngit: +line")
-        );
+                .unwrap_or_default()
+                .contains("[Runtime tool result]")
+        }));
     }
 
     #[test]

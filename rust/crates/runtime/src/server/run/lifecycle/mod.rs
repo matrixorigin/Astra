@@ -7835,6 +7835,74 @@ impl ServerSubRunExecutor {
 }
 
 impl ServerSubRunExecutor {
+    fn durable_run_engine(&self) -> Option<RunEngine> {
+        let shared_pool = self.shared_pool.as_ref()?;
+        let run_store = Arc::new(astra_services::runs::DatabaseRunStateStore::new(
+            shared_pool.clone(),
+        ));
+        let projection_store = Arc::new(DatabaseStateProjectionStore::new(shared_pool.clone()));
+        Some(RunEngine::new(run_store).with_projection_store(projection_store))
+    }
+
+    async fn ensure_durable_subrun_started(&self, config: &SubRunConfig) -> Result<(), String> {
+        let Some(run_engine) = self.durable_run_engine() else {
+            return Ok(());
+        };
+        if run_engine
+            .load_run(&config.user_id, &config.run_id)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        run_engine
+            .start_run_ext(
+                &config.run_id,
+                &config.user_id,
+                &config.session_id,
+                config.context.get("parent_run_id").and_then(Value::as_str),
+                config.context.get("delegation_id").and_then(Value::as_str),
+                Some(config.agent_profile.agent_id.as_str()),
+                None,
+            )
+            .await
+    }
+
+    async fn persist_durable_subrun_terminal_status(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) {
+        let Some(run_engine) = self.durable_run_engine() else {
+            return;
+        };
+        if let Err(error) = run_engine
+            .persist_status_if_current(
+                user_id,
+                run_id,
+                &[STATUS_RUNNING],
+                status,
+                waiting_for,
+                error_message,
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "astra_runtime::subrun",
+                user_id,
+                session_id,
+                run_id,
+                status,
+                error = %error,
+                "failed to persist durable subrun terminal status"
+            );
+        }
+    }
+
     /// Provision a workspace directory for a delegation sub-run.
     ///
     /// Sub-runs get a subdirectory under the parent session workspace to
@@ -7901,6 +7969,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
             project_root_from_delegation_context,
         };
         use astra_turn_core::turn_guard::TurnGuard;
+
+        self.ensure_durable_subrun_started(&config).await?;
+        let durable_user_id = config.user_id.clone();
+        let durable_session_id = config.session_id.clone();
+        let durable_run_id = config.run_id.clone();
 
         // Build edge profile from agent's system prompt and metadata.
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
@@ -8326,6 +8399,65 @@ impl SubRunExecutor for ServerSubRunExecutor {
         );
 
         let prompt_tokens = loop_state.provider_input_tokens();
+        match &outcome {
+            Ok(AgenticLoopOutcome::Completed) => {
+                let status = server_subrun_completed_status(&loop_state);
+                self.persist_durable_subrun_terminal_status(
+                    &durable_user_id,
+                    &durable_session_id,
+                    &durable_run_id,
+                    status,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            Ok(AgenticLoopOutcome::Cancelled) => {
+                self.persist_durable_subrun_terminal_status(
+                    &durable_user_id,
+                    &durable_session_id,
+                    &durable_run_id,
+                    STATUS_PAUSED,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            Ok(AgenticLoopOutcome::Waiting(reason)) => {
+                self.persist_durable_subrun_terminal_status(
+                    &durable_user_id,
+                    &durable_session_id,
+                    &durable_run_id,
+                    STATUS_WAITING,
+                    Some(reason.as_str()),
+                    None,
+                )
+                .await;
+            }
+            Ok(AgenticLoopOutcome::Error(err)) => {
+                self.persist_durable_subrun_terminal_status(
+                    &durable_user_id,
+                    &durable_session_id,
+                    &durable_run_id,
+                    STATUS_FAILED,
+                    None,
+                    Some(err.as_str()),
+                )
+                .await;
+            }
+            Err(err) => {
+                let error = err.to_string();
+                self.persist_durable_subrun_terminal_status(
+                    &durable_user_id,
+                    &durable_session_id,
+                    &durable_run_id,
+                    STATUS_FAILED,
+                    None,
+                    Some(error.as_str()),
+                )
+                .await;
+            }
+        }
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => {
                 let status = server_subrun_completed_status(&loop_state);

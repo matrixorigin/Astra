@@ -1058,9 +1058,7 @@ fn provider_conflicting_tools(
 
             let dynamic_spec = dynamic_tool_spec(&tool_name);
             let registry_spec = registry.get(&tool_name);
-            let Some(spec) = registry_spec.or(dynamic_spec.as_ref()) else {
-                return None;
-            };
+            let spec = registry_spec.or(dynamic_spec.as_ref())?;
             if registry_spec.is_none() {
                 return Some((tool_name, ProviderToolConflictKind::DynamicToolName));
             }
