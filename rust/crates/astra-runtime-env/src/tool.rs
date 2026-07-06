@@ -948,7 +948,10 @@ fn provider_type_matches_requirement(
                 || provider_type.is_runtime_executor()
         }
         RequiredExecutor::RuntimeExecutor => provider_type.is_runtime_executor(),
-        RequiredExecutor::McpExecutor => provider_type == CapacityProviderType::RequestScopedMcp,
+        RequiredExecutor::McpExecutor => matches!(
+            provider_type,
+            CapacityProviderType::RequestScopedMcp | CapacityProviderType::McpProvider
+        ),
     }
 }
 
@@ -2264,6 +2267,44 @@ mod tests {
         assert_eq!(
             admission.selected_offer_id.as_deref(),
             Some("mcp__weather@mcp")
+        );
+    }
+
+    #[test]
+    fn generic_mcp_provider_surface_includes_provider_bound_dynamic_tool() {
+        let registry = registry();
+        let providers = vec![crate::mcp_provider(
+            "server-mcp",
+            ["mcp__github__search".to_string()],
+        )];
+        let binding = RunBinding::resolve_with_provider_declarations(
+            WorkspaceBinding::none(),
+            ExecutorBinding {
+                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                executor_id: "server-mcp".to_string(),
+                display_name: "Server MCP".to_string(),
+                transport: crate::ToolTransportKind::McpHttp,
+                status: crate::ExecutorStatus::Online,
+            },
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+            &providers,
+        );
+        let admission = binding
+            .tool_surface
+            .admission_for("mcp__github__search")
+            .expect("dynamic MCP admission");
+
+        assert!(binding.tool_surface.contains("mcp__github__search"));
+        assert!(admission.visible);
+        assert_eq!(
+            admission.selected_provider_type,
+            Some(crate::CapacityProviderType::McpProvider)
+        );
+        assert_eq!(
+            admission.selected_offer_id.as_deref(),
+            Some("mcp__github__search@server-mcp")
         );
     }
 

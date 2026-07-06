@@ -489,6 +489,7 @@ fn selected_unready_offer_for_route(
         CapacityProviderType::ServerService
             | CapacityProviderType::ControlPlane
             | CapacityProviderType::RequestScopedMcp
+            | CapacityProviderType::McpProvider
             | CapacityProviderType::CliLocal
             | CapacityProviderType::Unknown
     ) {
@@ -541,7 +542,9 @@ fn executor_id_for_offer(
     match provider.provider_type {
         CapacityProviderType::ServerService => "server-service".to_string(),
         CapacityProviderType::ControlPlane => "server-control-plane".to_string(),
-        CapacityProviderType::RequestScopedMcp => provider.provider_id.clone(),
+        CapacityProviderType::RequestScopedMcp | CapacityProviderType::McpProvider => {
+            provider.provider_id.clone()
+        }
         CapacityProviderType::EdgeCapacity
         | CapacityProviderType::Sandbox
         | CapacityProviderType::OrchestratorManagedRuntime
@@ -562,6 +565,7 @@ fn placement_for_offer(provider: &CapacityProviderDeclaration) -> String {
             "server".to_string()
         }
         CapacityProviderType::RequestScopedMcp => "request".to_string(),
+        CapacityProviderType::McpProvider => format!("mcp:{}", provider.provider_id),
         CapacityProviderType::EdgeCapacity => format!("edge:{}", provider.provider_id),
         CapacityProviderType::Sandbox => format!("sandbox:{}", provider.provider_id),
         CapacityProviderType::OrchestratorManagedRuntime => {
@@ -575,6 +579,7 @@ fn placement_for_offer(provider: &CapacityProviderDeclaration) -> String {
 fn scope_for_offer(provider: &CapacityProviderDeclaration) -> String {
     match provider.provider_type {
         CapacityProviderType::RequestScopedMcp => "request".to_string(),
+        CapacityProviderType::McpProvider => "session".to_string(),
         CapacityProviderType::EdgeCapacity
         | CapacityProviderType::Sandbox
         | CapacityProviderType::OrchestratorManagedRuntime
@@ -608,6 +613,7 @@ fn authority_for_offer(
         CapacityProviderType::ServerService
         | CapacityProviderType::ControlPlane
         | CapacityProviderType::RequestScopedMcp
+        | CapacityProviderType::McpProvider
         | CapacityProviderType::Unknown => "none",
     }
 }
@@ -682,6 +688,7 @@ fn route_for_provider_type(
         CapacityProviderType::ServerService => ToolExecutionRouteKind::ServerRuntime,
         CapacityProviderType::ControlPlane => ToolExecutionRouteKind::ServerControlPlane,
         CapacityProviderType::RequestScopedMcp => ToolExecutionRouteKind::RequestScopedMcp,
+        CapacityProviderType::McpProvider => ToolExecutionRouteKind::Unsupported,
         CapacityProviderType::EdgeCapacity => ToolExecutionRouteKind::EdgeBound,
         CapacityProviderType::Sandbox => match workspace_kind {
             WorkspaceBindingKind::ServerSandbox => ToolExecutionRouteKind::ServerLocal,

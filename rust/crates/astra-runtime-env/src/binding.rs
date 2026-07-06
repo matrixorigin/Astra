@@ -613,6 +613,7 @@ fn default_runtime_provider_id(
         CapacityProviderType::ServerService
         | CapacityProviderType::ControlPlane
         | CapacityProviderType::RequestScopedMcp
+        | CapacityProviderType::McpProvider
         | CapacityProviderType::Unknown => executor.executor_id.clone(),
     }
 }

@@ -15,6 +15,7 @@ pub enum CapacityProviderType {
     ServerService,
     ControlPlane,
     RequestScopedMcp,
+    McpProvider,
     EdgeCapacity,
     Sandbox,
     OrchestratorManagedRuntime,
@@ -29,6 +30,7 @@ impl CapacityProviderType {
             Self::ServerService => "server_service",
             Self::ControlPlane => "control_plane",
             Self::RequestScopedMcp => "request_scoped_mcp",
+            Self::McpProvider => "mcp_provider",
             Self::EdgeCapacity => "edge_capacity",
             Self::Sandbox => "sandbox",
             Self::OrchestratorManagedRuntime => "orchestrator_managed_runtime",
@@ -557,11 +559,34 @@ pub fn request_scoped_mcp_provider_from_schemas(
     provider_id: impl Into<String>,
     schemas: &[Value],
 ) -> CapacityProviderDeclaration {
-    let mut declaration = CapacityProviderDeclaration::new(
-        CapacityProviderType::RequestScopedMcp,
-        provider_id,
-        Vec::<String>::new(),
-    );
+    mcp_provider_from_schemas_for_type(CapacityProviderType::RequestScopedMcp, provider_id, schemas)
+}
+
+pub fn mcp_provider(
+    provider_id: impl Into<String>,
+    tool_names: impl IntoIterator<Item = String>,
+) -> CapacityProviderDeclaration {
+    let tool_names = tool_names
+        .into_iter()
+        .map(canonical_mcp_tool_name)
+        .collect::<Vec<_>>();
+    CapacityProviderDeclaration::new(CapacityProviderType::McpProvider, provider_id, tool_names)
+}
+
+pub fn mcp_provider_from_schemas(
+    provider_id: impl Into<String>,
+    schemas: &[Value],
+) -> CapacityProviderDeclaration {
+    mcp_provider_from_schemas_for_type(CapacityProviderType::McpProvider, provider_id, schemas)
+}
+
+fn mcp_provider_from_schemas_for_type(
+    provider_type: CapacityProviderType,
+    provider_id: impl Into<String>,
+    schemas: &[Value],
+) -> CapacityProviderDeclaration {
+    let mut declaration =
+        CapacityProviderDeclaration::new(provider_type, provider_id, Vec::<String>::new());
     for schema in schemas {
         let Some(tool_name) = tool_schema_name(schema) else {
             continue;
@@ -597,6 +622,10 @@ fn canonical_request_scoped_mcp_tool_name(tool_name: impl Into<String>) -> Strin
     canonical_declared_tool_name_for_provider(CapacityProviderType::RequestScopedMcp, tool_name)
 }
 
+fn canonical_mcp_tool_name(tool_name: impl Into<String>) -> String {
+    canonical_declared_tool_name_for_provider(CapacityProviderType::McpProvider, tool_name)
+}
+
 fn validate_provider_id(provider_id: impl Into<String>) -> Result<String, String> {
     let provider_id = provider_id.into();
     if !is_valid_provider_id(&provider_id) {
@@ -613,11 +642,13 @@ fn validate_declared_tool_name_for_provider(
     if !is_valid_tool_offer_tool_name(&tool_name) {
         return Err(format!("invalid provider-declared tool name: {tool_name}"));
     }
-    if provider_type == CapacityProviderType::RequestScopedMcp
-        && !is_mcp_namespaced_tool_name(&tool_name)
+    if matches!(
+        provider_type,
+        CapacityProviderType::RequestScopedMcp | CapacityProviderType::McpProvider
+    ) && !is_mcp_namespaced_tool_name(&tool_name)
     {
         return Err(format!(
-            "request-scoped MCP provider tool name must be namespaced: {tool_name}"
+            "MCP provider tool name must be namespaced: {tool_name}"
         ));
     }
     Ok(tool_name)
@@ -632,6 +663,9 @@ mod tests {
         let value = serde_json::to_value(CapacityProviderType::OrchestratorManagedRuntime)
             .expect("serialize provider type");
         assert_eq!(value, "orchestrator_managed_runtime");
+        let mcp = serde_json::to_value(CapacityProviderType::McpProvider)
+            .expect("serialize MCP provider type");
+        assert_eq!(mcp, "mcp_provider");
     }
 
     #[test]
@@ -763,7 +797,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("request-scoped MCP provider tool name must be namespaced")
+                .contains("MCP provider tool name must be namespaced")
         );
     }
 
@@ -915,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "request-scoped MCP provider tool name must be namespaced")]
+    #[should_panic(expected = "MCP provider tool name must be namespaced")]
     fn request_scoped_mcp_provider_rejects_non_mcp_tool_names_without_compatibility_offer() {
         let _ = request_scoped_mcp_provider("mcp", ["web_fetch".to_string()]);
     }
@@ -973,6 +1007,23 @@ mod tests {
         assert!(provider.declares_tool("mcp__weather__query"));
         assert_eq!(
             provider.schema_digest_for_tool("mcp__weather__query"),
+            Some(canonical_tool_schema_digest(&schema).as_str())
+        );
+    }
+
+    #[test]
+    fn mcp_provider_from_schemas_uses_generic_mcp_provider_type() {
+        let schema = serde_json::json!({
+            "type": "function",
+            "function": { "name": "mcp__github__search" }
+        });
+        let provider = mcp_provider_from_schemas("server-mcp", &[schema.clone()]);
+
+        assert_eq!(provider.provider_type, CapacityProviderType::McpProvider);
+        assert_eq!(provider.provider_id, "server-mcp");
+        assert!(provider.declares_tool("mcp__github__search"));
+        assert_eq!(
+            provider.schema_digest_for_tool("mcp__github__search"),
             Some(canonical_tool_schema_digest(&schema).as_str())
         );
     }

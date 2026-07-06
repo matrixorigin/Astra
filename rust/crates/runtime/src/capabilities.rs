@@ -180,10 +180,7 @@ pub fn cli_remote_tool_schemas(
 
 fn mcp_provider_tool_schemas(provider_id: &str, schemas: Vec<Value>) -> Vec<Value> {
     let registry = astra_runtime_env::ToolRegistry::builtins();
-    let provider = astra_runtime_env::request_scoped_mcp_provider_from_schemas(
-        provider_id,
-        schemas.as_slice(),
-    );
+    let provider = astra_runtime_env::mcp_provider_from_schemas(provider_id, schemas.as_slice());
     astra_runtime_env::CapabilityResolver.filter_tool_schemas_for_providers(
         &registry,
         schemas,
