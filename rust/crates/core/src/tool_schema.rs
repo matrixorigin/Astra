@@ -57,6 +57,23 @@ pub fn retain_tool_schemas_by_names(schemas: &mut Vec<Value>, allowed_names: &Ha
         .retain(|schema| tool_schema_name(schema).is_some_and(|name| allowed_names.contains(name)));
 }
 
+/// Sort prompt-visible function schemas by canonical tool name.
+///
+/// This is stable for equal names: if equivalent duplicate schemas share a
+/// name, the caller's first schema stays first so dedupe keeps the same bytes.
+/// Provider/executor metadata must not be part of this sort key because that
+/// would churn prompt-cache bytes.
+pub fn sort_tool_schemas_by_name(schemas: &mut [Value]) {
+    schemas.sort_by(
+        |left, right| match (tool_schema_name(left), tool_schema_name(right)) {
+            (Some(left), Some(right)) => left.cmp(right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        },
+    );
+}
+
 /// Return tool names whose prompt-visible schemas contain conflicting
 /// contracts.
 ///
@@ -217,6 +234,18 @@ mod tests {
             schemas.is_empty(),
             "empty search surface must not leak global schemas"
         );
+    }
+
+    #[test]
+    fn sort_tool_schemas_by_name_is_stable_for_equal_names() {
+        let shorthand = json!({"function": {"name": "mcp__docs__query"}});
+        let explicit = json!({"type": "function", "function": {"name": "mcp__docs__query"}});
+        let weather = json!({"type": "function", "function": {"name": "mcp__weather__query"}});
+        let mut schemas = vec![weather.clone(), shorthand.clone(), explicit.clone()];
+
+        sort_tool_schemas_by_name(&mut schemas);
+
+        assert_eq!(schemas, vec![shorthand, explicit, weather]);
     }
 
     #[test]

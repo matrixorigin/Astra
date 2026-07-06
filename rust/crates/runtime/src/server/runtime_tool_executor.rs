@@ -681,7 +681,7 @@ impl RuntimeToolExecutor {
         let mut context = self.tool_admission_context();
         context.request_scoped_mcp_provider_ready = !schemas.is_empty();
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        schemas
+        let mut ready = schemas
             .iter()
             .filter(|schema| {
                 tool_schema_name(schema).is_some_and(|name| {
@@ -701,7 +701,9 @@ impl RuntimeToolExecutor {
                 })
             })
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        astra_core::tool_schema::sort_tool_schemas_by_name(&mut ready);
+        ready
     }
 
     /// Record a direct deferred call as an activation intent. Called when the
@@ -2173,6 +2175,40 @@ mod tests {
             mcp_metadata["capabilities"][0].as_str(),
             Some("mcp__calculator")
         );
+    }
+
+    #[test]
+    fn ready_request_scoped_mcp_schemas_are_sorted_for_cache_stability() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__zeta__query",
+                    "description": "Zeta query.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__alpha__query",
+                    "description": "Alpha query.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+        ]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "docs",
+                &["mcp__alpha__query", "mcp__zeta__query"],
+            ),
+        ));
+
+        let schemas = exec.ready_request_scoped_mcp_schemas();
+        let names: Vec<_> = schemas.iter().filter_map(tool_schema_name).collect();
+
+        assert_eq!(names, vec!["mcp__alpha__query", "mcp__zeta__query"]);
     }
 
     #[tokio::test]

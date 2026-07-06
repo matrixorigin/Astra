@@ -604,7 +604,7 @@ impl CapabilityResolver {
         mut provider_declares: impl FnMut(&str) -> bool,
     ) -> Vec<Value> {
         let mut seen = HashSet::new();
-        schemas
+        let filtered: Vec<Value> = schemas
             .into_iter()
             .filter(|schema| {
                 let Some(tool_name) = tool_schema_name(schema) else {
@@ -626,7 +626,19 @@ impl CapabilityResolver {
                 self.check_tool_call(registry, tool_name, &Value::Null, capabilities)
                     .is_ok()
             })
-            .collect()
+            .collect();
+        let mut catalog_schemas = Vec::new();
+        let mut dynamic_schemas = Vec::new();
+        for schema in filtered {
+            if tool_schema_name(&schema).is_some_and(|name| registry.get(name).is_some()) {
+                catalog_schemas.push(schema);
+            } else {
+                dynamic_schemas.push(schema);
+            }
+        }
+        astra_core::tool_schema::sort_tool_schemas_by_name(&mut dynamic_schemas);
+        catalog_schemas.extend(dynamic_schemas);
+        catalog_schemas
     }
 
     pub fn check_tool(
@@ -2407,6 +2419,69 @@ mod tests {
             filtered,
             vec![schemas[0].clone()],
             "dedupe must keep the first canonical schema bytes stable"
+        );
+    }
+
+    #[test]
+    fn filter_tool_schemas_for_providers_is_byte_stable_for_permuted_dynamic_schemas() {
+        let registry = registry();
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::none(),
+            ExecutorBinding {
+                kind: crate::ExecutorBindingKind::RequestScopedMcp,
+                executor_id: "mcp".to_string(),
+                display_name: "MCP".to_string(),
+                transport: crate::ToolTransportKind::McpHttp,
+                status: crate::ExecutorStatus::Online,
+            },
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+        );
+        let provider = crate::request_scoped_mcp_provider(
+            "mcp",
+            [
+                "mcp__alpha__query".to_string(),
+                "mcp__zeta__query".to_string(),
+            ],
+        );
+        let alpha = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__alpha__query",
+                "description": "Alpha query"
+            }
+        });
+        let zeta = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__zeta__query",
+                "description": "Zeta query"
+            }
+        });
+
+        let first = CapabilityResolver.filter_tool_schemas_for_providers(
+            &registry,
+            vec![zeta.clone(), alpha.clone()],
+            &binding.capabilities,
+            std::slice::from_ref(&provider),
+        );
+        let second = CapabilityResolver.filter_tool_schemas_for_providers(
+            &registry,
+            vec![alpha.clone(), zeta.clone()],
+            &binding.capabilities,
+            &[provider],
+        );
+
+        assert_eq!(
+            first,
+            vec![alpha, zeta],
+            "provider-aware dynamic schemas must be ordered by canonical tool name"
+        );
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first schemas"),
+            serde_json::to_vec(&second).expect("serialize second schemas"),
+            "provider-aware schema filtering must not depend on MCP discovery order"
         );
     }
 

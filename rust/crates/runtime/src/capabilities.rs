@@ -945,6 +945,46 @@ mod tests {
     }
 
     #[test]
+    fn cli_local_catalog_is_byte_stable_for_permuted_mcp_inputs() {
+        let caps = full_server_capabilities_for_tests();
+        let alpha = schema("mcp__alpha__query");
+        let zeta = schema("mcp__zeta__query");
+
+        let first = cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            vec![zeta.clone(), alpha.clone()],
+            &caps,
+        );
+        let second = cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            vec![alpha, zeta],
+            &caps,
+        );
+
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first tool schema list"),
+            serde_json::to_vec(&second).expect("serialize second tool schema list"),
+            "CLI local prompt schemas must not depend on MCP list_tools order"
+        );
+    }
+
+    #[test]
+    fn cli_remote_catalog_is_byte_stable_for_permuted_mcp_inputs() {
+        let caps = full_server_capabilities_for_tests();
+        let alpha = schema("mcp__server_alpha__query");
+        let zeta = schema("mcp__server_zeta__query");
+
+        let first = cli_remote_tool_schemas(vec![zeta.clone(), alpha.clone()], &caps);
+        let second = cli_remote_tool_schemas(vec![alpha, zeta], &caps);
+
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first tool schema list"),
+            serde_json::to_vec(&second).expect("serialize second tool schema list"),
+            "CLI remote prompt schemas must not depend on MCP list_tools order"
+        );
+    }
+
+    #[test]
     fn cli_local_prompt_schemas_do_not_embed_provider_or_route_metadata() {
         let caps = full_server_capabilities_for_tests();
         let schemas = cli_local_tool_schemas(
