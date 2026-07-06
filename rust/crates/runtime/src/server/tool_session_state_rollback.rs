@@ -413,25 +413,23 @@ async fn rollback_session_state_turn(
         }
     }
     let success = !restored.is_empty() && failed.is_empty();
-    if !restored.is_empty()
-        && failed.is_empty()
-        && let Err(error) = publish_current_workspace()
-    {
-        return serde_json::json!({
-            "success": false,
-            "scope": scope,
-            "turn_index": turn_index,
-            "restored": restored,
-            "failed": [{
+    let mut warnings = Vec::new();
+    if !restored.is_empty() && failed.is_empty() {
+        if let Err(error) = publish_current_workspace() {
+            warnings.push(serde_json::json!({
                 "error": error,
                 "kind": "workspace_artifact_publish"
-            }],
-            "summary": "Restored session state locally but failed to publish workspace artifact",
-        })
-        .to_string();
+            }));
+        }
     }
     let summary = if plan.is_empty() {
         format!("No recorded session-state rollback handles found for turn {turn_index}")
+    } else if failed.is_empty() && !warnings.is_empty() {
+        format!(
+            "Restored {} recorded session-state mutation{} for turn {turn_index}; workspace artifact publish warning recorded",
+            restored.len(),
+            if restored.len() == 1 { "" } else { "s" },
+        )
     } else if failed.is_empty() {
         format!(
             "Restored {} recorded session-state mutation{} for turn {turn_index}",
@@ -453,6 +451,7 @@ async fn rollback_session_state_turn(
         "turn_index": turn_index,
         "restored": restored,
         "failed": failed,
+        "warnings": warnings,
         "summary": summary,
     })
     .to_string()
@@ -731,7 +730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_rollback_session_state_reports_publish_failure_after_restore() {
+    async fn execute_rollback_session_state_keeps_restore_success_when_publish_fails() {
         let journal = Mutex::new(SessionStateRollbackJournal::default());
         record(
             &journal,
@@ -759,8 +758,9 @@ mod tests {
         .await;
 
         let value: Value = serde_json::from_str(&output).expect("rollback json");
-        assert_eq!(value["success"], false);
-        assert_eq!(value["failed"][0]["kind"], "workspace_artifact_publish");
-        assert_eq!(value["failed"][0]["error"], "publish failed");
+        assert_eq!(value["success"], true);
+        assert_eq!(value["failed"].as_array().map(Vec::len), Some(0));
+        assert_eq!(value["warnings"][0]["kind"], "workspace_artifact_publish");
+        assert_eq!(value["warnings"][0]["error"], "publish failed");
     }
 }

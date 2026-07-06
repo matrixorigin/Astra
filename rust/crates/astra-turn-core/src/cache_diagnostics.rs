@@ -1086,6 +1086,11 @@ fn fingerprint_system_blocks(
 fn hash_cache_control_state(system_blocks: &[SystemBlockFingerprint]) -> u64 {
     let mut h = DefaultHasher::new();
     for block in system_blocks {
+        if block.cache_control_hash == 0 {
+            continue;
+        }
+        block.kind.hash(&mut h);
+        block.scope.hash(&mut h);
         block.cache_control_hash.hash(&mut h);
     }
     h.finish()
@@ -1640,6 +1645,57 @@ mod tests {
         assert!(
             event.is_none(),
             "changing only CacheScope::None system blocks must not count as a cache-prefix break"
+        );
+    }
+
+    #[test]
+    fn adding_no_cache_system_block_does_not_claim_cache_control_changed() {
+        use crate::section_types::{CacheScope, SectionKind};
+
+        let stable = SerializedSystemBlock {
+            kind: SectionKind::Identity,
+            scope: CacheScope::Session,
+            text: "stable prefix".into(),
+            cache_control: Some(json!({"type": "ephemeral"})),
+        };
+        let volatile = SerializedSystemBlock {
+            kind: SectionKind::RuntimeVolatile,
+            scope: CacheScope::None,
+            text: "volatile tail".into(),
+            cache_control: None,
+        };
+        let working_memory = SerializedSystemBlock {
+            kind: SectionKind::WorkingMemory,
+            scope: CacheScope::None,
+            text: "dynamic memory".into(),
+            cache_control: None,
+        };
+
+        let mut det = CacheBreakDetector::new();
+        det.record_turn(
+            PromptStateSnapshot::capture_serialized(
+                &[stable.clone(), volatile.clone()],
+                &[],
+                "anthropic",
+                "claude",
+                8_000,
+            ),
+            None,
+        );
+        let event = det.record_turn(
+            PromptStateSnapshot::capture_serialized(
+                &[stable, volatile, working_memory],
+                &[],
+                "anthropic",
+                "claude",
+                8_000,
+            ),
+            None,
+        );
+
+        assert!(
+            event.is_none(),
+            "adding no-cache system blocks must not be classified as cache-control drift"
         );
     }
 
