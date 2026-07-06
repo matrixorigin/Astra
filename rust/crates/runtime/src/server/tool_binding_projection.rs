@@ -165,7 +165,7 @@ pub(crate) fn capability_filtered_server_tool_schemas_with_context(
 ) -> Vec<Value> {
     let mut pool = crate::capabilities::server_builtin_tool_schemas(capabilities);
     if has_explicit_runtime_executor_provider(workspace, executor, runtime) {
-        extend_tool_schema_pool_unique(
+        extend_tool_schema_pool_prefer_extra_for_duplicates(
             &mut pool,
             crate::capabilities::runtime_executor_tool_schemas(capabilities),
         );
@@ -179,15 +179,22 @@ pub(crate) fn capability_filtered_server_tool_schemas_with_context(
     )
 }
 
-fn extend_tool_schema_pool_unique(pool: &mut Vec<Value>, extra: Vec<Value>) {
-    let mut seen: HashSet<String> = pool
+fn extend_tool_schema_pool_prefer_extra_for_duplicates(pool: &mut Vec<Value>, extra: Vec<Value>) {
+    let mut index_by_name = pool
         .iter()
-        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
-        .collect();
+        .enumerate()
+        .filter_map(|(index, schema)| {
+            tool_schema_name(schema).map(|name| (name.to_string(), index))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     for schema in extra {
-        if let Some(name) = tool_schema_name(&schema)
-            && seen.insert(name.to_string())
-        {
+        let Some(name) = tool_schema_name(&schema).map(str::to_string) else {
+            continue;
+        };
+        if let Some(index) = index_by_name.get(&name).copied() {
+            pool[index] = schema;
+        } else {
+            index_by_name.insert(name, pool.len());
             pool.push(schema);
         }
     }
@@ -542,6 +549,12 @@ mod tests {
         })
     }
 
+    fn schema_with_description(tool_name: &str, description: &str) -> Value {
+        let mut schema = schema(tool_name);
+        schema["function"]["description"] = Value::String(description.to_string());
+        schema
+    }
+
     fn schema_names(schemas: Vec<Value>) -> HashSet<String> {
         schemas
             .into_iter()
@@ -585,6 +598,31 @@ mod tests {
             transport: ToolTransportKind::EdgeWs,
             status: ExecutorStatus::Online,
         }
+    }
+
+    #[test]
+    fn runtime_schema_replaces_duplicate_server_schema_without_reordering() {
+        let mut pool = vec![
+            schema_with_description("ask_user", "server ask"),
+            schema_with_description("web_fetch", "server fetch"),
+            schema_with_description("memory", "server memory"),
+        ];
+
+        extend_tool_schema_pool_prefer_extra_for_duplicates(
+            &mut pool,
+            vec![
+                schema_with_description("web_fetch", "runtime fetch"),
+                schema_with_description("bash", "runtime bash"),
+            ],
+        );
+
+        let names = pool
+            .iter()
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["ask_user", "web_fetch", "memory", "bash"]);
+        assert_eq!(pool[1]["function"]["description"], "runtime fetch");
+        assert_eq!(pool[3]["function"]["description"], "runtime bash");
     }
 
     #[test]

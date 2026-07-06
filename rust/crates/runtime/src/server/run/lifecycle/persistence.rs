@@ -2083,10 +2083,11 @@ fn build_server_loop_observer_request(
         return None;
     }
 
-    let turn_count = state
-        .session_turn
-        .max(state.max_turns.saturating_sub(state.remaining_turns) as u32)
-        as i64;
+    let turn_count = if state.session_turn > 0 {
+        state.session_turn
+    } else {
+        state.max_turns.saturating_sub(state.remaining_turns) as u32
+    } as i64;
     Some(TurnObserverRequest {
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
@@ -2443,7 +2444,23 @@ mod tests {
         assert_eq!(request.user_id, "user-1");
         assert_eq!(request.session_id, "session-1");
         assert_eq!(request.messages.len(), 2);
-        assert_eq!(request.turn_count, 4);
+        assert_eq!(request.turn_count, 3);
+    }
+
+    #[test]
+    fn server_loop_observer_turn_count_does_not_use_agent_loop_rounds_when_session_turn_exists() {
+        let mut state = observer_test_state();
+        state.session_turn = 1;
+        state.max_turns = 12;
+        state.remaining_turns = 10;
+        let request = build_server_loop_observer_request("user-1", "session-1", &state)
+            .expect("observer request");
+
+        assert_eq!(
+            request.turn_count, 1,
+            "observer turn_count is a session/user-turn sequence, not the \
+             number of LLM/tool-loop rounds consumed inside this turn",
+        );
     }
 
     #[test]

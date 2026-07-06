@@ -10421,7 +10421,7 @@ mod tests {
         );
         assert_eq!(
             llm_events[0]["metadata"]["request_summary"]["message_count"].as_u64(),
-            Some(3)
+            Some(2)
         );
         assert!(
             llm_events[0]["metadata"]["prompt_request_id"]
@@ -10431,6 +10431,14 @@ mod tests {
         assert_eq!(
             llm_events[0]["metadata"]["request_summary"]["message_roles"][0]["role"].as_str(),
             Some("system")
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["request_summary"]["message_roles"][1]["role"].as_str(),
+            Some("user")
+        );
+        assert_eq!(
+            llm_events[0]["metadata"]["request"]["messages"][1]["role"].as_str(),
+            Some("user")
         );
         assert_eq!(
             llm_events[1]["metadata"]["response"]["outcome"].as_str(),

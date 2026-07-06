@@ -119,80 +119,122 @@ fn build_host_with_tools(
 
 // ── pc-tool-schema-churn ────────────────────────────────────────────────────
 //
-// When the tool catalogue changes between hosts the cacheable prefix hash
-// MUST differ, so the provider-side cache entry is invalidated. This
-// consolidates three earlier tests:
-//   * tool-count change    (extra tool appended)
-//   * tool-order swap      (same set, different order)
-//   * tool-description edit (same name, different description)
-// All three are forms of "the tool schema changed, so the cached prefix
-// must change too". We run each sub-scenario through the same assertion.
+// When a runtime provider supplies a schema for a server-available tool, the
+// runtime provider owns the wire schema. This is the concrete cache-sensitive
+// duplicate-provider case: edge/CLI `web_fetch` must beat server `web_fetch`
+// without relying on server fallback.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
-async fn tool_schema_changes_invalidate_cacheable_prefix() {
+async fn duplicate_runtime_web_fetch_schema_overrides_server_schema() {
+    unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
+
+    let baseline = sample_edge_tools();
+    let mut edge_web_fetch = sample_edge_tools();
+    edge_web_fetch.push(tool_named(
+        "web_fetch",
+        "EDGE web_fetch schema should override server schema",
+    ));
+    let cap_base = Arc::new(Mutex::new(Vec::new()));
+    let cap_changed = Arc::new(Mutex::new(Vec::new()));
+    let mut host_base = build_host_with_tools(
+        vec![scripted_round("a")],
+        Some(("anthropic", "claude-sonnet-4")),
+        baseline,
+        cap_base.clone(),
+    );
+    let mut host_changed = build_host_with_tools(
+        vec![scripted_round("b")],
+        Some(("anthropic", "claude-sonnet-4")),
+        edge_web_fetch,
+        cap_changed.clone(),
+    );
+    let mut s1 = make_test_loop_state();
+    let mut s2 = make_test_loop_state();
+    s1.max_turn_input_tokens = 200_000;
+    s2.max_turn_input_tokens = 200_000;
+    host_base.run_one_mock_turn_for_test(&mut s1).await.unwrap();
+    host_changed
+        .run_one_mock_turn_for_test(&mut s2)
+        .await
+        .unwrap();
+
+    let a = cap_base.lock().unwrap();
+    let b = cap_changed.lock().unwrap();
+    assert_ne!(
+        tool_description(&a[0].tools, "web_fetch"),
+        tool_description(&b[0].tools, "web_fetch"),
+        "edge-provided duplicate web_fetch schema must replace the server schema in the wire payload",
+    );
+    assert_eq!(
+        tool_description(&b[0].tools, "web_fetch").as_deref(),
+        Some("EDGE web_fetch schema should override server schema"),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(prompt_cache_env)]
+async fn tool_schema_input_order_jitter_does_not_churn_wire_tools() {
     unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
 
     let baseline = vec![
         tool_named("bash", "Execute a bash command"),
         tool_named("read_file", "Read a file"),
+        tool_named("custom_cache_probe", "Custom cache probe"),
     ];
-    let cases: &[(&str, Vec<Value>)] = &[
-        (
-            "write_tool_appended",
-            vec![
-                tool_named("bash", "Execute a bash command"),
-                tool_named("read_file", "Read a file"),
-                tool_named("write_file", "Write a file"),
-            ],
-        ),
-        (
-            "order_swapped",
-            vec![
-                tool_named("read_file", "Read a file"),
-                tool_named("bash", "Execute a bash command"),
-            ],
-        ),
-        (
-            "description_edited",
-            vec![
-                tool_named("bash", "Execute a bash command (v2)"),
-                tool_named("read_file", "Read a file"),
-            ],
-        ),
+    let order_swapped = vec![
+        tool_named("custom_cache_probe", "Custom cache probe"),
+        tool_named("read_file", "Read a file"),
+        tool_named("bash", "Execute a bash command"),
     ];
+    let cap_base = Arc::new(Mutex::new(Vec::new()));
+    let cap_changed = Arc::new(Mutex::new(Vec::new()));
+    let mut host_base = build_host_with_tools(
+        vec![scripted_round("a")],
+        Some(("anthropic", "claude-sonnet-4")),
+        baseline,
+        cap_base.clone(),
+    );
+    let mut host_changed = build_host_with_tools(
+        vec![scripted_round("b")],
+        Some(("anthropic", "claude-sonnet-4")),
+        order_swapped,
+        cap_changed.clone(),
+    );
+    let mut s1 = make_test_loop_state();
+    let mut s2 = make_test_loop_state();
+    s1.max_turn_input_tokens = 200_000;
+    s2.max_turn_input_tokens = 200_000;
+    host_base.run_one_mock_turn_for_test(&mut s1).await.unwrap();
+    host_changed
+        .run_one_mock_turn_for_test(&mut s2)
+        .await
+        .unwrap();
 
-    for (label, changed) in cases {
-        let cap_base = Arc::new(Mutex::new(Vec::new()));
-        let cap_changed = Arc::new(Mutex::new(Vec::new()));
-        let mut host_base = build_host_with_tools(
-            vec![scripted_round("a")],
-            Some(("anthropic", "claude-sonnet-4")),
-            baseline.clone(),
-            cap_base.clone(),
-        );
-        let mut host_changed = build_host_with_tools(
-            vec![scripted_round("b")],
-            Some(("anthropic", "claude-sonnet-4")),
-            changed.clone(),
-            cap_changed.clone(),
-        );
-        let mut s1 = make_test_loop_state();
-        let mut s2 = make_test_loop_state();
-        s1.max_turn_input_tokens = 200_000;
-        s2.max_turn_input_tokens = 200_000;
-        host_base.run_one_mock_turn_for_test(&mut s1).await.unwrap();
-        host_changed
-            .run_one_mock_turn_for_test(&mut s2)
-            .await
-            .unwrap();
+    let a = cap_base.lock().unwrap();
+    let b = cap_changed.lock().unwrap();
+    assert_eq!(
+        a[0].tools, b[0].tools,
+        "same tool set in a different request order must not churn the provider wire schema",
+    );
+}
 
-        let a = cap_base.lock().unwrap();
-        let b = cap_changed.lock().unwrap();
-        assert_ne!(
-            a[0].tools, b[0].tools,
-            "[{label}] tool schema change must surface in captured tools payload"
-        );
-    }
+fn tool_description(tools: &[Value], name: &str) -> Option<String> {
+    tools
+        .iter()
+        .find(|tool| {
+            tool.get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                == Some(name)
+        })
+        .and_then(|tool| {
+            tool.get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("description"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 // ── pc-disabled-flag ─────────────────────────────────────────────────────────
@@ -584,11 +626,12 @@ async fn single_tail_breakpoint_count_position_and_bytes_invariants() {
     let g = capture.lock().unwrap();
     assert_eq!(g.len(), 4);
 
-    let expected = [vec![0], vec![2], vec![4], vec![6]];
-    for (round, (captured, expected_idx)) in g.iter().zip(expected.iter()).enumerate() {
+    for (round, captured) in g.iter().enumerate() {
+        let marker_index = single_message_marker_index(captured);
+        let last_non_system = last_non_system_message_index(captured);
         assert_eq!(
-            captured.message_cache_control_indices,
-            *expected_idx,
+            marker_index,
+            last_non_system,
             "round {} must emit exactly one marker on the latest user tail",
             round + 1,
         );
@@ -612,6 +655,26 @@ async fn single_tail_breakpoint_count_position_and_bytes_invariants() {
             "round 4 historical message[{i}] bytes must equal round 3",
         );
     }
+}
+
+fn single_message_marker_index(captured: &CapturedLlmRequest) -> usize {
+    assert_eq!(
+        captured.message_cache_control_indices.len(),
+        1,
+        "captured request must carry exactly one message cache marker"
+    );
+    captured.message_cache_control_indices[0]
+}
+
+fn last_non_system_message_index(captured: &CapturedLlmRequest) -> usize {
+    captured
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.get("role").and_then(Value::as_str) != Some("system"))
+        .map(|(index, _)| index)
+        .expect("captured request must contain a non-system message")
 }
 
 // ── pc-provider-neutral-noop ───────────────────────────────────────────────

@@ -575,12 +575,15 @@ fn should_force_answer_relevance_retry(state: &AgenticLoopState) -> bool {
     if state.stall.forced_answer_relevance_retry
         || state.final_text.trim().is_empty()
         || !has_successful_real_tool_evidence(state)
+        || state.budget_wrapup_injected
+        || state.stall.hard_intervention_active()
     {
         return false;
     }
 
+    let latest_user_message = answer_relevance_latest_user_message(state);
     astra_turn_core::evaluation::final_answer_relevance_signal(
-        state.message.as_str(),
+        latest_user_message.as_str(),
         state.final_text.as_str(),
     )
     .is_some()
@@ -592,11 +595,27 @@ fn is_answer_relevance_retry_exhausted(state: &AgenticLoopState) -> bool {
     if !state.stall.forced_answer_relevance_retry || state.final_text.trim().is_empty() {
         return false;
     }
+    let latest_user_message = answer_relevance_latest_user_message(state);
     astra_turn_core::evaluation::final_answer_relevance_signal(
-        state.message.as_str(),
+        latest_user_message.as_str(),
         state.final_text.as_str(),
     )
     .is_some()
+}
+
+fn answer_relevance_latest_user_message(state: &AgenticLoopState) -> String {
+    state
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .filter(|message| !is_execution_corrective_message(message))
+        .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+        .map(astra_turn_core::chat_turn_heuristics::active_user_task_text)
+        .find(|content| !content.trim().is_empty())
+        .unwrap_or_else(|| {
+            astra_turn_core::chat_turn_heuristics::active_user_task_text(state.message.as_str())
+        })
 }
 
 fn remove_trailing_assistant_final_answer(messages: &mut Vec<serde_json::Value>, final_text: &str) {
@@ -1832,7 +1851,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
             if should_force_answer_relevance_retry(state) {
                 let rejected_final = state.final_text.clone();
-                let retry_message = answer_relevance_retry_message(&state.message);
+                let latest_user_message = answer_relevance_latest_user_message(state);
+                let retry_message = answer_relevance_retry_message(&latest_user_message);
                 state.stall.forced_answer_relevance_retry = true;
                 remove_trailing_assistant_final_answer(&mut state.messages, &rejected_final);
                 state.final_text.clear();

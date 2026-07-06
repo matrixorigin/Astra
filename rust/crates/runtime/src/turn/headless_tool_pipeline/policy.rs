@@ -13,8 +13,9 @@ use astra_turn_core::headless_tool_assembly::{
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
     journal_record_blocked_tool, journal_record_cross_turn_cache_hit,
-    journal_record_duplicate_within_turn, journal_record_suppressed_tool_retry,
-    journal_record_tool_not_admitted, journal_record_unknown_tool,
+    journal_record_deferred_activation_hint, journal_record_duplicate_within_turn,
+    journal_record_suppressed_tool_retry, journal_record_tool_not_admitted,
+    journal_record_unknown_tool,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
@@ -783,14 +784,22 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
             if is_prompt_deferred {
-                self.ctx
-                    .tool_call_records
-                    .push(journal_record_tool_not_admitted(
+                let record = if skip_reason == "direct_deferred_call_activated" {
+                    journal_record_deferred_activation_hint(
                         execution.name.clone(),
-                        args_preview,
+                        args_preview.clone(),
                         &err_msg,
                         execution.early_exit_ms,
-                    ));
+                    )
+                } else {
+                    journal_record_tool_not_admitted(
+                        execution.name.clone(),
+                        args_preview.clone(),
+                        &err_msg,
+                        execution.early_exit_ms,
+                    )
+                };
+                self.ctx.tool_call_records.push(record);
             } else {
                 self.ctx.tool_call_records.push(journal_record_unknown_tool(
                     execution.name.clone(),

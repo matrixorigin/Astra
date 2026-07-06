@@ -150,6 +150,19 @@ pub fn journal_record_tool_not_admitted(
 }
 
 #[must_use]
+pub fn journal_record_deferred_activation_hint(
+    name: String,
+    args_preview: Option<String>,
+    reason: &str,
+    tool_elapsed_ms: u64,
+) -> ToolCallRecord {
+    let mut record = journal_record_tool_not_admitted(name, args_preview, reason, tool_elapsed_ms);
+    record.ok = true;
+    record.result_class = Some(NOOP_OR_CACHED_RESULT_CLASS.to_string());
+    record
+}
+
+#[must_use]
 pub fn journal_record_blocked_tool(
     name: String,
     reason: String,
@@ -472,6 +485,28 @@ mod tests {
         assert!(!r.is_synthetic_placeholder());
         assert_eq!(r.result_class.as_deref(), None);
         assert!(!r.is_structured_noop_or_cached_result());
+    }
+
+    #[test]
+    fn deferred_activation_hint_record_is_synthetic_success() {
+        let r = journal_record_deferred_activation_hint(
+            "memory".into(),
+            Some("{}".into()),
+            "Tool 'memory' requires activation first",
+            3,
+        );
+        assert!(r.ok);
+        assert_eq!(r.ms, 3);
+        assert_eq!(r.error.as_deref(), Some("tool_not_admitted"));
+        assert_eq!(r.args_preview.as_deref(), Some("{}"));
+        assert!(
+            r.result_preview
+                .as_deref()
+                .is_some_and(|preview| preview.starts_with("Deferred:"))
+        );
+        assert!(r.is_synthetic_placeholder());
+        assert_eq!(r.result_class.as_deref(), Some(NOOP_OR_CACHED_RESULT_CLASS));
+        assert!(r.is_structured_noop_or_cached_result());
     }
 
     #[test]

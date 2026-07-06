@@ -389,7 +389,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     // tool_error_rate so health cannot claim all tools were healthy.
     let tool_calls = tool_call_records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder())
+        .filter(|record| !record.is_synthetic_placeholder() || counts_as_noop_metric_record(record))
         .map(|record| ToolCallInfo {
             name: record.name.clone(),
             // Prefer the *untruncated* args for the repeat-key. `args_preview`
@@ -567,13 +567,18 @@ pub fn final_answer_relevance_signal(
     final_answer: &str,
 ) -> Option<EvalSignal> {
     let required = relevance_terms(latest_user_message);
-    if required.len() < 2
-        || final_answer.trim().is_empty()
-        || answer_starts_with_direct_response(final_answer)
-    {
+    if required.len() < 2 || final_answer.trim().is_empty() {
         return None;
     }
     let answer_terms = relevance_terms(final_answer);
+    if answer_starts_with_direct_response(final_answer)
+        || answer_is_concise_work_status(&answer_terms)
+    {
+        return None;
+    }
+    if !answer_has_stale_work_artifact(final_answer, &answer_terms) {
+        return None;
+    }
     let matched = required
         .iter()
         .filter(|term| answer_terms.contains(*term))
@@ -586,6 +591,138 @@ pub fn final_answer_relevance_signal(
     } else {
         None
     }
+}
+
+fn answer_is_concise_work_status(answer_terms: &std::collections::HashSet<String>) -> bool {
+    // Lexical relevance is a high-precision old-answer detector, not a
+    // semantic judge. A short status/completion answer after tool work
+    // ("Done.", "Reported to parent.", "Fan-out complete.") is too small to
+    // prove task drift, so forcing another LLM round is overkill and commonly
+    // burns the remaining scripted/real turn budget. Keep flagging contentful
+    // off-target syntheses such as stale diffs, line counts, or summaries.
+    const MAX_CONCISE_STATUS_TERMS: usize = 8;
+    const WORK_STATUS_TERMS: &[&str] = &[
+        "analyzed",
+        "analysed",
+        "complete",
+        "completed",
+        "done",
+        "finished",
+        "fixed",
+        "following",
+        "implemented",
+        "passed",
+        "read",
+        "recovered",
+        "reported",
+        "updated",
+        "written",
+    ];
+
+    !answer_terms.is_empty()
+        && answer_terms.len() <= MAX_CONCISE_STATUS_TERMS
+        && WORK_STATUS_TERMS
+            .iter()
+            .any(|term| answer_terms.contains(*term))
+}
+
+fn answer_has_stale_work_artifact(
+    final_answer: &str,
+    answer_terms: &std::collections::HashSet<String>,
+) -> bool {
+    // This guard is intentionally conservative: lexical non-overlap is not
+    // enough to prove drift. Only force a retry when the answer looks like a
+    // concrete stale work artifact from another turn (diff stats, commits,
+    // file/line counts, build/test failure summaries, etc.) or a runtime
+    // scaffolding fallback ("session context unavailable", "awaiting your
+    // next instruction") that clearly did not answer the user. Generic short
+    // synthesis like "Here is my summary." or "Final answer from skill output."
+    // may be low quality, but it is not a reliable stale-answer signal.
+    const STALE_WORK_ARTIFACT_TERMS: &[&str] = &[
+        "branch",
+        "branches",
+        "build",
+        "changed",
+        "commit",
+        "commits",
+        "coverage",
+        "delete",
+        "deleted",
+        "deletions",
+        "diff",
+        "error",
+        "errors",
+        "fail",
+        "failed",
+        "failures",
+        "file",
+        "files",
+        "insertions",
+        "line",
+        "lines",
+        "patch",
+        "test",
+        "tests",
+        "workspace",
+    ];
+
+    if final_answer.chars().any(|ch| ch.is_ascii_digit()) {
+        return true;
+    }
+    if answer_has_runtime_scaffolding_artifact(answer_terms) {
+        return true;
+    }
+    STALE_WORK_ARTIFACT_TERMS
+        .iter()
+        .filter(|term| answer_terms.contains(**term))
+        .take(2)
+        .count()
+        >= 2
+}
+
+fn answer_has_runtime_scaffolding_artifact(
+    answer_terms: &std::collections::HashSet<String>,
+) -> bool {
+    const RUNTIME_CONTEXT_TERMS: &[&str] = &[
+        "context",
+        "executor",
+        "history",
+        "prompt",
+        "resume",
+        "runtime",
+        "session",
+        "workspace",
+    ];
+    const NON_ANSWER_TERMS: &[&str] = &[
+        "awaiting",
+        "bound",
+        "degraded",
+        "incomplete",
+        "instruction",
+        "prior",
+        "restored",
+        "unavailable",
+    ];
+
+    let context_terms = RUNTIME_CONTEXT_TERMS
+        .iter()
+        .filter(|term| answer_terms.contains(**term))
+        .take(2)
+        .count();
+    let has_non_answer_term = NON_ANSWER_TERMS
+        .iter()
+        .any(|term| answer_terms.contains(*term));
+
+    context_terms >= 2 && has_non_answer_term
+}
+
+fn counts_as_noop_metric_record(record: &ToolCallRecord) -> bool {
+    record.ok
+        && matches!(
+            record.error.as_deref(),
+            Some("cached_cross_turn" | "duplicate_within_turn")
+        )
+        && record.is_noop_or_cached_result()
 }
 
 fn relevance_terms(text: &str) -> std::collections::HashSet<String> {
@@ -1683,6 +1820,63 @@ mod tests {
         assert_eq!(
             final_answer_relevance_signal("are the tests robust enough?", "No, not yet."),
             None
+        );
+    }
+
+    #[test]
+    fn final_answer_relevance_accepts_concise_work_status_answers() {
+        for answer in [
+            "Done.",
+            "Reported to parent.",
+            "Read the file.",
+            "Fan-out complete.",
+            "Mixed delegation + tool complete.",
+            "Done! Tests written based on delegation results.",
+        ] {
+            assert_eq!(
+                final_answer_relevance_signal("test query", answer),
+                None,
+                "concise work status should not force another LLM round: {answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn final_answer_relevance_accepts_generic_short_synthesis() {
+        for answer in [
+            "Here is my summary.",
+            "Compacted result.",
+            "Final answer from skill output.",
+        ] {
+            assert_eq!(
+                final_answer_relevance_signal("analyze code", answer),
+                None,
+                "generic synthesis is not a high-confidence stale answer: {answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn final_answer_relevance_accepts_concise_tool_result_summaries() {
+        assert_eq!(
+            final_answer_relevance_signal("git status", "Workspace is clean."),
+            None
+        );
+    }
+
+    #[test]
+    fn final_answer_relevance_flags_runtime_scaffolding_instead_of_answer() {
+        let signal = final_answer_relevance_signal(
+            "有哪些子目录",
+            "Session context was unavailable or incomplete in this runtime \
+             (degraded resume — no prior prompt-facing history restored). \
+             Workspace is bound and ready with the executor online.\n\n\
+             Awaiting your next instruction.",
+        );
+
+        assert!(
+            matches!(signal, Some(EvalSignal::FinalAnswerOffTarget { .. })),
+            "runtime scaffolding fallback must be treated as off-target: {signal:?}"
         );
     }
 

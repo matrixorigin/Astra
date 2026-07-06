@@ -717,8 +717,8 @@ impl CapabilityResolver {
         if registry.get(tool_name).or(dynamic_spec.as_ref()).is_none() {
             return Err(ToolUnavailableReason::UnknownTool);
         }
-        check_surface_admits_tool(tool_name, surface)?;
         self.check_tool_call(registry, tool_name, args, capabilities)
+            .and_then(|()| check_surface_admits_tool(tool_name, surface))
     }
 
     pub fn check(
@@ -2034,6 +2034,33 @@ mod tests {
                 "runtime_executor_required".to_string()
             )),
             "a selected provider offer must still fail closed if its executor goes offline before execution"
+        );
+    }
+
+    #[test]
+    fn missing_runtime_executor_is_reported_before_provider_surface_miss() {
+        let registry = registry();
+        let binding = RunBinding::resolve(
+            WorkspaceBinding::none(),
+            ExecutorBinding::control_plane(),
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+        );
+        assert!(!binding.tool_surface.contains("read_file"));
+
+        assert_eq!(
+            CapabilityResolver.check_tool_call_for_surface(
+                &registry,
+                "read_file",
+                &serde_json::json!({"path": "README.md"}),
+                &binding.capabilities,
+                &binding.tool_surface,
+            ),
+            Err(ToolUnavailableReason::ExecutorUnavailable(
+                "runtime_executor_required".to_string()
+            )),
+            "hard runtime capability denials must stay more specific than provider surface misses"
         );
     }
 

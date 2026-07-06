@@ -1085,12 +1085,11 @@ fn fingerprint_system_blocks(
 
 fn hash_cache_control_state(system_blocks: &[SystemBlockFingerprint]) -> u64 {
     let mut h = DefaultHasher::new();
-    for block in system_blocks {
+    for (index, block) in system_blocks.iter().enumerate() {
         if block.cache_control_hash == 0 {
             continue;
         }
-        block.kind.hash(&mut h);
-        block.scope.hash(&mut h);
+        index.hash(&mut h);
         block.cache_control_hash.hash(&mut h);
     }
     h.finish()
