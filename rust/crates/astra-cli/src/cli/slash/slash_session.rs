@@ -5258,10 +5258,16 @@ async fn prepared_fork_restore_from_journal(
         }
     }
 
-    // Fall back to journal-based history for pre-CSL sessions.
-    Ok(prepared_fork_restore_from_restored_journal(
-        restored_journal,
-    ))
+    // Fall back to prompt-facing transcript before journal summary. The
+    // transcript records visible user/assistant/tool stages even when a long
+    // turn did not reach a final journal Turn event, so it is the better resume
+    // source for interrupted or abandoned work.
+    let mut prepared = prepared_fork_restore_from_restored_journal(restored_journal);
+    let transcript_history = session_continuation::transcript_history_pairs_for_session(session_id);
+    if transcript_history.len() > prepared.history.len() || prepared.history.is_empty() {
+        prepared.history = transcript_history;
+    }
+    Ok(prepared)
 }
 
 async fn load_prepared_fork_restore(
@@ -5727,6 +5733,31 @@ async fn apply_restored_session(
     state.continuation_anchor = session_projection::merge_continuation_anchor_with_session_memory(
         state.continuation_anchor.take(),
         session_memory.as_deref(),
+    );
+    let session_resume_hydration = (if !restored.conversation_messages.is_empty() {
+        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+            &restored.conversation_messages,
+        )
+    } else if let Some(transcript_messages) =
+        session_continuation::load_transcript_messages_for_continuation(&restored.session_id)
+    {
+        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+            &transcript_messages,
+        )
+    } else {
+        let history_messages = session_projection::history_as_messages(&state.history);
+        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+            &history_messages,
+        )
+    })
+    .unwrap_or_else(|| {
+        astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+            "resume restored session metadata but no prompt-facing transcript/history",
+        )
+    });
+    state.resume_guidance = astra_turn_core::resume_hydration::merge_resume_hints(
+        Some(session_resume_hydration),
+        state.resume_guidance.take(),
     );
 
     if let Some(ref json) = restored.executing_plan_json {

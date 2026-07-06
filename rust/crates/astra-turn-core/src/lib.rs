@@ -74,6 +74,7 @@ pub mod reasoning_capabilities;
 pub mod recent_arg_hints;
 pub mod recovery_state;
 pub mod response_guard;
+pub mod resume_hydration;
 pub mod routing;
 pub mod routing_engine;
 pub mod routing_metrics;

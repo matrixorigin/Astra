@@ -48,6 +48,7 @@ use astra_services::runs::{
     RunStatusRecord, RuntimeAuthRequest, RuntimeProfileRequest, SelectedModelRequest,
     durable_run_status_kind,
 };
+use astra_services::session_restore::SessionRestoreService;
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
 use astra_services::{
@@ -3262,6 +3263,53 @@ impl AgenticRunLifecycleService {
         );
     }
 
+    async fn session_resume_hydration_hint_for_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        resume_requested: bool,
+    ) -> Option<String> {
+        if !resume_requested {
+            return None;
+        }
+
+        let Some(shared) = &self.shared_pool else {
+            return Some(
+                astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                    "resume requested but shared MatrixOne pool is not configured",
+                ),
+            );
+        };
+
+        let restore = astra_services::session_restore::HybridRestoreService::new(
+            shared.get().clone(),
+        );
+        match restore.restore_session(user_id, session_id).await {
+            Ok(Some(restored)) => {
+                astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+                    &restored.conversation_messages,
+                )
+                .or_else(|| {
+                    Some(
+                        astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                            "session restore returned no prompt-facing transcript/history",
+                        ),
+                    )
+                })
+            }
+            Ok(None) => Some(
+                astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                    "session restore returned no resumable state",
+                ),
+            ),
+            Err(error) => Some(
+                astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(&format!(
+                    "session restore failed: {error}"
+                )),
+            ),
+        }
+    }
+
     async fn task_board_resume_hint_for_session(
         &self,
         user_id: &str,
@@ -4868,6 +4916,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
+        let session_resume_hint = self
+            .session_resume_hydration_hint_for_session(
+                &user_id,
+                &session_id,
+                request.session_id.is_some(),
+            )
+            .await;
+        let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
+            session_resume_hint,
+            plan_resume_hint,
+        );
         let task_board_resume_hint = self
             .task_board_resume_hint_for_session(&user_id, &session_id)
             .await;
@@ -5753,6 +5812,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
+        let session_resume_hint = self
+            .session_resume_hydration_hint_for_session(
+                &user_id,
+                &session_id,
+                request.session_id.is_some(),
+            )
+            .await;
+        let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
+            session_resume_hint,
+            plan_resume_hint,
+        );
         let task_board_resume_hint = self
             .task_board_resume_hint_for_session(&user_id, &session_id)
             .await;

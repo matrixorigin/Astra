@@ -3,6 +3,9 @@
 //!
 //! Used by one-shot mode (`-m "..." --session-id <id>`) to provide multi-turn continuity.
 
+use crate::tui::turn_event::TurnEvent;
+use serde_json::{Value, json};
+
 /// Load conversation messages from a session's latest heavy checkpoint.
 /// Used by one-shot mode (`-m "..." --session-id <id>`) to provide
 /// conversation history that the model needs for multi-turn continuity.
@@ -11,7 +14,7 @@
 /// the checkpoint is unreadable.
 pub(crate) fn load_session_messages_for_continuation(
     session_id: &str,
-) -> Option<Vec<serde_json::Value>> {
+) -> Option<Vec<Value>> {
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
     match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
         Ok(Some(cp)) if !cp.messages.is_empty() => {
@@ -32,7 +35,7 @@ pub(crate) fn load_session_messages_for_continuation(
             );
             None
         }
-        _ => None,
+        _ => load_transcript_messages_for_continuation(session_id),
     }
 }
 
@@ -60,8 +63,8 @@ fn heavy_checkpoint_prompt_state(
 /// bias the model toward tool usage on the next turn even when the user's
 /// new message is purely conversational.
 pub(crate) fn sanitize_continuation_messages(
-    mut msgs: Vec<serde_json::Value>,
-) -> Vec<serde_json::Value> {
+    mut msgs: Vec<Value>,
+) -> Vec<Value> {
     msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(msgs);
     msgs.retain(|m| {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
@@ -74,8 +77,70 @@ pub(crate) fn sanitize_continuation_messages(
 
 /// Extract text content from a message regardless of format.
 /// Handles both string content and array-format content blocks.
-pub(crate) fn extract_text_content(msg: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_text_content(msg: &Value) -> Option<String> {
     astra_turn_core::prompt_facing::extract_text_content(msg)
+}
+
+pub(crate) fn load_transcript_messages_for_continuation(session_id: &str) -> Option<Vec<Value>> {
+    let events = crate::tui::transcript_jsonl::load(session_id);
+    let messages = transcript_events_to_messages(&events);
+    if messages.is_empty() {
+        None
+    } else {
+        Some(sanitize_continuation_messages(messages))
+    }
+}
+
+pub(crate) fn transcript_history_pairs_for_session(session_id: &str) -> Vec<(String, String)> {
+    load_transcript_messages_for_continuation(session_id)
+        .map(|messages| history_pairs_from_messages(&messages))
+        .unwrap_or_default()
+}
+
+fn transcript_events_to_messages(events: &[TurnEvent]) -> Vec<Value> {
+    events.iter().filter_map(transcript_event_to_message).collect()
+}
+
+fn transcript_event_to_message(event: &TurnEvent) -> Option<Value> {
+    match event {
+        TurnEvent::User { text, .. } => non_empty_message("user", text),
+        TurnEvent::Assistant { markdown, .. } => non_empty_message("assistant", markdown),
+        TurnEvent::System { text, .. } => non_empty_message("system", text),
+        TurnEvent::Tool {
+            name,
+            description,
+            output_summary,
+            output,
+            ..
+        } => {
+            let detail = output
+                .as_deref()
+                .or(output_summary.as_deref())
+                .unwrap_or_default()
+                .trim();
+            let description = description.trim();
+            let body = match (description.is_empty(), detail.is_empty()) {
+                (true, true) => "completed".to_string(),
+                (false, true) => description.to_string(),
+                (true, false) => detail.to_string(),
+                (false, false) => format!("{description} | {detail}"),
+            };
+            Some(json!({
+                "role": "system",
+                "content": format!("[Runtime tool result]\n{}: {}", name.trim(), body),
+            }))
+        }
+        TurnEvent::Thinking { .. } | TurnEvent::TurnSummary { .. } => None,
+    }
+}
+
+fn non_empty_message(role: &str, text: &str) -> Option<Value> {
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(json!({"role": role, "content": text}))
+    }
 }
 
 /// Reconstruct CLI `(user, assistant)` history pairs from OpenAI-style messages.
@@ -84,7 +149,7 @@ pub(crate) fn extract_text_content(msg: &serde_json::Value) -> Option<String> {
 /// - ignore tool/system messages,
 /// - ignore assistant tool-call stubs that have no visible text,
 /// - concatenate multiple visible assistant chunks in the same turn.
-pub(crate) fn history_pairs_from_messages(msgs: &[serde_json::Value]) -> Vec<(String, String)> {
+pub(crate) fn history_pairs_from_messages(msgs: &[Value]) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut current_user = String::new();
     let mut current_assistant = String::new();
@@ -130,6 +195,7 @@ pub(crate) fn history_pairs_from_messages(msgs: &[serde_json::Value]) -> Vec<(St
 }
 #[cfg(test)]
 mod tests {
+    use crate::tui::turn_event::{ToolStatus, TurnEvent};
     use astra_pipeline::step_protocol::{ExecutionCursor, StepCheckpoint};
     use serde_json::json;
 
@@ -199,6 +265,7 @@ mod tests {
             json!({"role": "user", "content": "\n\n✓ Previous round: 2 tools executed in parallel — excellent."}),
             json!({"role": "user", "content": "[attention:v1]\ngoal: stale goal\ncurrent_todo: none"}),
             json!({"role": "user", "content": "[working-set:v1]\ngoal: stale\npending_work: none"}),
+            json!({"role": "user", "content": "[session-resume:v1]\nHydrated previous session context"}),
             json!({"role": "user", "content": "[session-anchor] Goal: stale. State: t1."}),
             json!({"role": "system", "content": "[attention:v1]\ngoal: stale system-role manifest"}),
             json!({"role": "system", "content": "[session-anchor] Goal: stale. State: t1."}),
@@ -265,6 +332,46 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0]["content"], "hello");
         assert_eq!(result[1]["content"], "still here");
+    }
+
+    #[test]
+    fn transcript_events_restore_prompt_facing_stage_history() {
+        let events = vec![
+            TurnEvent::User {
+                ts: None,
+                text: "review current branch".into(),
+            },
+            TurnEvent::Tool {
+                ts: None,
+                name: "git".into(),
+                description: "diff --stat".into(),
+                status: ToolStatus::Success,
+                duration_ms: 10,
+                output_summary: Some("202 files changed".into()),
+                output: None,
+            },
+            TurnEvent::Assistant {
+                ts: None,
+                markdown: "I found a large runtime change set.".into(),
+            },
+        ];
+
+        let messages = super::sanitize_continuation_messages(super::transcript_events_to_messages(
+            &events,
+        ));
+        let pairs = super::history_pairs_from_messages(&messages);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "review current branch");
+        assert!(
+            messages
+                .iter()
+                .any(|msg| msg["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("[Runtime tool result]\ngit: diff --stat | 202 files changed"))
+        );
+        assert_eq!(pairs[0].1, "I found a large runtime change set.");
     }
 
     #[test]

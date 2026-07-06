@@ -34,6 +34,7 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
     "Tools used:",
     "[Self-check",
     "[attention:v1]",
+    "[session-resume:v1]",
     "[session-anchor]",
     "[working-set:v1]",
     // Batching / parallel feedback
@@ -214,6 +215,10 @@ mod tests {
         assert!(is_runtime_scaffolding_message(&msg(
             "user",
             "[session-anchor]\nResume previous task state"
+        )));
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "[session-resume:v1]\nHydrated previous session context"
         )));
     }
 
