@@ -4070,6 +4070,18 @@ esac
                 .edge_registry_service(Arc::new(PanicEdgeRegistry))
                 .build(),
         );
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__demo__search",
+                "description": "Search the demo MCP source.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }
+        })]);
         assert!(
             exec.tool_engine.contains("mcp__demo__search"),
             "mcp__* calls should be owned by the ToolEngine prefix handler"
@@ -4088,6 +4100,32 @@ esac
         assert_eq!(parsed["retryable"], false);
         assert!(
             parsed["error"].as_str().unwrap().contains("MCP server"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_mcp_shaped_tool_names_do_not_reach_dynamic_handler() {
+        let (exec, _dir) = test_executor();
+
+        assert!(
+            !exec.tool_engine.contains("mcp__bad/name"),
+            "validated MCP prefix handler must not accept non-canonical MCP names"
+        );
+
+        let result = exec
+            .execute_with_metadata("mcp__bad/name", &json!({"query": "hello"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolNotFound.as_str()
+        );
+        assert!(
+            parsed["error"].as_str().unwrap().contains("Unknown tool"),
             "{}",
             result.output
         );
@@ -4192,6 +4230,18 @@ esac
             "/Users/test/project",
             WorkspaceAuthority::ReadWrite,
         );
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__demo__search",
+                "description": "Search the demo MCP source.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }
+        })]);
 
         let result = exec
             .execute_with_metadata(
@@ -4217,7 +4267,10 @@ esac
             result.output
         );
         let metadata = result.metadata.as_ref().expect("mcp metadata");
-        assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+        assert_eq!(
+            metadata["workspace"]["kind"], "none",
+            "request-scoped MCP execution must not inherit an unrelated edge workspace binding"
+        );
         assert_eq!(metadata["executor"]["kind"], "mcp");
         assert_eq!(metadata["executor"]["display_name"], "Request-scoped MCP");
         assert_eq!(metadata["transport"], "mcp_http");
@@ -4233,7 +4286,10 @@ esac
             .expect("tool_routing_decision");
         assert_eq!(routing["route"], "request_scoped_mcp");
         assert_eq!(routing["run_id"], "run-mcp");
-        assert_eq!(routing["workspace"]["kind"], "edge_workspace");
+        assert_eq!(
+            routing["workspace"]["kind"], "none",
+            "routing events must report the selected request-scoped MCP offer, not the ambient edge workspace"
+        );
         assert_eq!(routing["executor"]["kind"], "mcp");
         assert_eq!(routing["transport"], "mcp_http");
 

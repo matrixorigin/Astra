@@ -47,7 +47,15 @@ pub trait DynamicToolHandler<C>: Send + Sync {
 #[derive(Clone)]
 struct PrefixHandler<C> {
     prefix: String,
+    name_validator: Option<fn(&str) -> bool>,
     handler: Arc<dyn DynamicToolHandler<C>>,
+}
+
+impl<C> PrefixHandler<C> {
+    fn matches(&self, name: &str) -> bool {
+        name.starts_with(&self.prefix)
+            && self.name_validator.is_none_or(|validator| validator(name))
+    }
 }
 
 #[derive(Clone)]
@@ -116,6 +124,30 @@ impl<C> ToolEngine<C> {
     where
         H: DynamicToolHandler<C> + 'static,
     {
+        self.register_prefix_handler_impl(prefix, None, handler)
+    }
+
+    pub fn register_prefix_handler_with_validator<H>(
+        &mut self,
+        prefix: impl Into<String>,
+        name_validator: fn(&str) -> bool,
+        handler: H,
+    ) -> Result<(), ToolEngineRegistrationError>
+    where
+        H: DynamicToolHandler<C> + 'static,
+    {
+        self.register_prefix_handler_impl(prefix, Some(name_validator), handler)
+    }
+
+    fn register_prefix_handler_impl<H>(
+        &mut self,
+        prefix: impl Into<String>,
+        name_validator: Option<fn(&str) -> bool>,
+        handler: H,
+    ) -> Result<(), ToolEngineRegistrationError>
+    where
+        H: DynamicToolHandler<C> + 'static,
+    {
         let prefix = prefix.into();
         let normalized = prefix.trim();
         if normalized.is_empty() {
@@ -132,6 +164,7 @@ impl<C> ToolEngine<C> {
         }
         self.prefix_handlers.push(PrefixHandler {
             prefix: normalized.to_string(),
+            name_validator,
             handler: Arc::new(handler),
         });
         Ok(())
@@ -139,10 +172,7 @@ impl<C> ToolEngine<C> {
 
     pub fn contains(&self, name: &str) -> bool {
         self.handlers.contains_key(name)
-            || self
-                .prefix_handlers
-                .iter()
-                .any(|entry| name.starts_with(&entry.prefix))
+            || self.prefix_handlers.iter().any(|entry| entry.matches(name))
     }
 
     pub fn handler_names(&self) -> impl Iterator<Item = &str> {
@@ -173,7 +203,7 @@ impl<C> ToolEngine<C> {
         let handler = self
             .prefix_handlers
             .iter()
-            .find(|entry| name.starts_with(&entry.prefix))?;
+            .find(|entry| entry.matches(name))?;
         Some(
             AssertUnwindSafe(handler.handler.execute(name, context, args, cancel_token))
                 .catch_unwind()
@@ -337,6 +367,34 @@ mod tests {
 
         assert_eq!(result.output, "ctx:mcp__demo__search:ok");
         assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn validated_prefix_handler_rejects_invalid_dynamic_tool_names() {
+        let mut engine = ToolEngine::new();
+        engine
+            .register_prefix_handler_with_validator(
+                "mcp__",
+                astra_core::tool_offer::is_mcp_namespaced_tool_name,
+                DynamicEchoHandler,
+            )
+            .unwrap();
+
+        assert!(engine.contains("mcp__demo__search"));
+        assert!(!engine.contains("mcp__"));
+        assert!(!engine.contains("mcp__bad/name"));
+
+        assert!(
+            engine
+                .execute(
+                    "mcp__bad/name",
+                    &TestContext { prefix: "ctx" },
+                    &json!({"value": "bad"}),
+                    None,
+                )
+                .await
+                .is_none()
+        );
     }
 
     #[test]

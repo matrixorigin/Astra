@@ -98,7 +98,11 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     register_handler_or_log!(engine, "publish_artifact", PublishArtifactToolHandler);
     register_handler_or_log!(engine, "run_script", RunScriptToolHandler);
 
-    if let Err(error) = engine.register_prefix_handler("mcp__", McpToolHandler) {
+    if let Err(error) = engine.register_prefix_handler_with_validator(
+        "mcp__",
+        astra_core::tool_offer::is_mcp_namespaced_tool_name,
+        McpToolHandler,
+    ) {
         tracing::error!(
             target: "astra_runtime::tool_engine",
             error = %error,
