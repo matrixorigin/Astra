@@ -11,11 +11,11 @@ use astra_server_types::edge_ws_protocol::*;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
-use futures_util::StreamExt;
 use futures_util::stream::SplitSink;
+use futures_util::StreamExt;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -1005,12 +1005,10 @@ mod tests {
     async fn inflight_tracker_lifecycle_covers_send_fail_deliver_and_disconnect_drain() {
         let tracker = InflightEdgeDispatchTracker::default();
 
-        assert!(
-            tracker
-                .track(inflight_dispatch("send-failed"))
-                .await
-                .is_ok()
-        );
+        assert!(tracker
+            .track(inflight_dispatch("send-failed"))
+            .await
+            .is_ok());
         let removed = tracker.remove("send-failed").await;
         assert!(
             removed.is_some(),

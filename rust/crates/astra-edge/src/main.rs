@@ -15,7 +15,7 @@ use astra_runtime_env::{
     ToolRegistry, WorkspaceAuthority, WorkspaceBinding,
 };
 use astra_server_types::edge_ws_protocol::{
-    EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EdgeClientMessage, EdgeServerMessage,
+    EdgeClientMessage, EdgeServerMessage, EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS,
 };
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
@@ -84,7 +84,10 @@ fn normalized_hostname() -> String {
 }
 
 fn default_edge_id(workspace_dir: &Path) -> String {
-    let workspace = canonical_workspace_dir(workspace_dir);
+    let workspace = canonical_workspace_dir(workspace_dir).unwrap_or_else(|_| {
+        // Fall back to the non-canonical path for edge ID stability
+        workspace_dir.to_path_buf()
+    });
     let mut hasher = Sha256::new();
     hasher.update(workspace.to_string_lossy().as_bytes());
     let digest = hasher.finalize();
@@ -194,7 +197,7 @@ fn resolve_token(args: &Args) -> Result<String, String> {
 
 fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     let raw_server_url = args.server_url.clone().unwrap_or_else(default_server_url);
-    let workspace_dir = canonical_workspace_dir(&args.workspace_dir);
+    let workspace_dir = canonical_workspace_dir(&args.workspace_dir)?;
     let token = resolve_token(&args)?;
     let edge_id = args
         .edge_id
@@ -209,15 +212,19 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     })
 }
 
-fn canonical_workspace_dir(workspace_dir: &Path) -> PathBuf {
-    workspace_dir
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_dir.to_path_buf())
+fn canonical_workspace_dir(workspace_dir: &Path) -> Result<PathBuf, String> {
+    workspace_dir.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize workspace directory '{}': {error}",
+            workspace_dir.display()
+        )
+    })
 }
 
 fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Value {
     let registry = ToolRegistry::builtins();
     let workspace = canonical_workspace_dir(workspace)
+        .unwrap_or_else(|_| workspace.to_path_buf())
         .to_string_lossy()
         .to_string();
     let binding = RunBinding::resolve(
@@ -255,7 +262,9 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
 
     // Send auth
     let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
-    let workspace = canonical_workspace_dir(&config.workspace_dir);
+    let workspace = canonical_workspace_dir(&config.workspace_dir).map_err(|e| {
+        Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, e)) as Box<dyn std::error::Error>
+    })?;
     let auth_msg = EdgeClientMessage::Auth {
         token: config.token.clone(),
         edge_agent_id: config.edge_id.clone(),
@@ -340,7 +349,12 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                             }) => {
                                 tracing::info!(tool = %tool, request_id = %request_id, "Executing tool");
                                 let start = Instant::now();
-                                let result = astra_tools::ToolExecutor::execute(&executor, &tool, &tool_args).await;
+                                let result = astra_tools::ToolExecutor::execute(
+                                    &executor,
+                                    &tool,
+                                    &tool_args,
+                                )
+                                .await;
                                 let output = result.output;
                                 let is_error = result.is_error;
                                 let tool_result_fields = result.metadata;
@@ -368,7 +382,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                             Ok(EdgeServerMessage::ToolCancel { request_id }) => {
                                 tracing::warn!(
                                     request_id = %request_id,
-                                    "Server cancelled tool request; edge has no in-flight cancel hook yet — ignoring"
+                                    "Server cancelled tool request, but edge has no in-flight cancellation hook yet; ignoring"
                                 );
                             }
                             Ok(EdgeServerMessage::Closing { reason }) => {
@@ -453,12 +467,29 @@ async fn main() {
                 );
             }
             Err(e) => {
+                let err_str = e.to_string();
+                // Permanent errors: authentication failures, invalid config
+                let is_permanent = err_str.contains("Authentication failed")
+                    || err_str.contains("401")
+                    || err_str.contains("403")
+                    || err_str.contains("invalid token");
+                if is_permanent {
+                    tracing::error!(
+                        error = %e,
+                        "Permanent authentication failure — not retrying"
+                    );
+                    exit_with_error = true;
+                    break;
+                }
                 tracing::error!(error = %e, "Connection error");
                 if !config.reconnect {
                     exit_with_error = true;
                     break;
                 }
-                tracing::info!(delay = reconnect_delay_secs, "Reconnecting...");
+                tracing::info!(
+                    delay = reconnect_delay_secs,
+                    "Reconnecting..."
+                );
             }
         }
         // Exponential backoff with jitter
@@ -502,13 +533,11 @@ mod tests {
             value["binding"]["capabilities"]["runtime"]["runtime_has_git"],
             true
         );
-        assert!(
-            value["binding"]["tool_surface"]["tool_names"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|name| name.as_str() == Some("bash"))
-        );
+        assert!(value["binding"]["tool_surface"]["tool_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name.as_str() == Some("bash")));
     }
 
     #[test]

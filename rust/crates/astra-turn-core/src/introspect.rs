@@ -276,12 +276,12 @@ pub struct ToolAdmissionCandidateSnapshotEntry {
     pub scope: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub authority: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schema_digest: String,
     pub route: String,
     pub readiness: String,
     pub selected: bool,
     pub reason: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub schema_digest: String,
 }
 
 /// Text output depth chosen from the normalized observation-plane request.
@@ -1070,11 +1070,12 @@ mod tests {
                         placement: "edge:edge-1".to_string(),
                         scope: "workspace".to_string(),
                         authority: "read_write".to_string(),
+                        schema_digest: "sha256:edge".to_string(),
                         route: "EdgeBound".to_string(),
                         readiness: "ready".to_string(),
                         selected: true,
                         reason: "Selected".to_string(),
-                        schema_digest: "sha256:edge".to_string(),
+
                     },
                     ToolAdmissionCandidateSnapshotEntry {
                         offer_id: "web_fetch@server-builtin".to_string(),
@@ -1084,11 +1085,12 @@ mod tests {
                         placement: "server".to_string(),
                         scope: "session".to_string(),
                         authority: "none".to_string(),
+                        schema_digest: "sha256:server".to_string(),
                         route: "ServerRuntime".to_string(),
                         readiness: "ready".to_string(),
                         selected: false,
                         reason: "CurrentProviderPreferred".to_string(),
-                        schema_digest: "sha256:server".to_string(),
+
                     },
                 ],
             }],

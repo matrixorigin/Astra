@@ -3629,11 +3629,11 @@ impl ServerAgenticLoopHost {
                                 placement: candidate.offer.placement,
                                 scope: candidate.offer.scope,
                                 authority: candidate.offer.authority,
+                                schema_digest: candidate.offer.schema_digest,
                                 route: format!("{:?}", candidate.offer.route),
                                 readiness: candidate.offer.readiness.to_string(),
                                 selected: candidate.selected,
                                 reason: format!("{:?}", candidate.reason),
-                                schema_digest: candidate.offer.schema_digest,
                             }
                         })
                         .collect(),

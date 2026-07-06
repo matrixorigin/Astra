@@ -20,11 +20,11 @@ pub(crate) struct ToolOffer {
     pub offer_id: String,
     pub provider_type: CapacityProviderType,
     pub provider_id: String,
+    pub schema_digest: String,
     pub executor_id: String,
     pub placement: String,
     pub scope: String,
     pub authority: String,
-    pub schema_digest: String,
     pub route: ToolExecutionRouteKind,
     pub readiness: CapacityProviderStatus,
 }
@@ -33,13 +33,13 @@ pub(crate) struct ToolOffer {
 pub(crate) enum ToolOfferCandidateReason {
     Selected,
     Disabled,
+    SchemaConflict,
     ProviderUnavailable,
     ProviderToolNotAllowed,
     CurrentProviderPreferred,
     LowerPriority,
     RouteMismatch,
     UnsupportedRoute,
-    SchemaConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,9 +54,9 @@ pub(crate) enum ToolHiddenReason {
     UnknownTool,
     NoProvider,
     ProviderUnavailable,
+    SchemaConflict,
     ProviderRouteMismatch,
     UnsupportedRoute,
-    SchemaConflict,
     DisabledOffer,
     ProviderToolNotAllowed,
 }
@@ -187,7 +187,6 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
     {
         raw_candidates.push(offer.clone());
     }
-    let schema_conflict = has_schema_conflict_for_enabled_candidates(&raw_candidates, context);
 
     let selected_offer_before_policy =
         if !matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
@@ -211,6 +210,7 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
         .as_ref()
         .is_some_and(|offer| !provider_allows_tool(context, &offer.provider_id, &offer.tool_name));
 
+    let schema_conflict = has_schema_conflict_for_enabled_candidates(&raw_candidates, context);
     let hidden_reason = hidden_reason_for(class, route).or_else(|| {
         if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
             return None;
@@ -474,14 +474,14 @@ fn offer_for_provider(
         offer_id: astra_runtime_env::tool_offer_id(tool_name, &provider.provider_id),
         provider_type: provider.provider_type,
         provider_id: provider.provider_id.clone(),
-        executor_id: executor_id_for_offer(provider, executor),
-        placement: placement_for_offer(provider),
-        scope: scope_for_offer(provider),
-        authority: authority_for_offer(provider, workspace.authority).to_string(),
         schema_digest: provider
             .schema_digest_for_tool(tool_name)
             .map(str::to_string)
             .unwrap_or_else(|| format!("unregistered:{}", provider.provider_id)),
+        executor_id: executor_id_for_offer(provider, executor),
+        placement: placement_for_offer(provider),
+        scope: scope_for_offer(provider),
+        authority: authority_for_offer(provider, workspace.authority).to_string(),
         route,
         readiness,
     }
@@ -1006,6 +1006,74 @@ mod tests {
     }
 
     #[test]
+    fn same_tool_name_with_different_schema_digests_fails_closed() {
+        let registry = registry();
+        let providers = vec![
+            astra_runtime_env::server_service_provider("server-builtin", &registry)
+                .with_tool_schema_digest("web_fetch", "sha256:server-contract"),
+            astra_runtime_env::cli_local_provider("cli-local", &registry)
+                .with_tool_schema_digest("web_fetch", "sha256:cli-contract"),
+        ];
+        let decision = resolve_tool_admission_for_providers_with_context(
+            "web_fetch",
+            &WorkspaceBinding::none(),
+            &ExecutorBinding::server_local(),
+            &providers,
+            &registry,
+            &ToolAdmissionContext::default(),
+        );
+
+        assert!(!decision.visible);
+        assert!(decision.selected_offer.is_none());
+        assert_eq!(decision.hidden_reason, Some(ToolHiddenReason::SchemaConflict));
+        assert_eq!(decision.candidates.len(), 2);
+        assert!(decision.candidates.iter().all(|candidate| {
+            candidate.reason == ToolOfferCandidateReason::SchemaConflict
+                && candidate.offer.schema_digest.starts_with("sha256:")
+        }));
+    }
+
+    #[test]
+    fn schema_conflict_ignores_policy_excluded_candidates() {
+        let registry = registry();
+        let providers = vec![
+            astra_runtime_env::server_service_provider("server-builtin", &registry)
+                .with_tool_schema_digest("web_fetch", "sha256:server-contract"),
+            astra_runtime_env::cli_local_provider("cli-local", &registry)
+                .with_tool_schema_digest("web_fetch", "sha256:cli-contract"),
+        ];
+        let decision = resolve_tool_admission_for_providers_with_context(
+            "web_fetch",
+            &WorkspaceBinding::none(),
+            &ExecutorBinding::server_local(),
+            &providers,
+            &registry,
+            &ToolAdmissionContext {
+                provider_allowed_tools: HashMap::from([(
+                    "cli-local".to_string(),
+                    HashSet::from(["bash".to_string()]),
+                )]),
+                ..ToolAdmissionContext::default()
+            },
+        );
+
+        assert!(decision.visible);
+        assert_eq!(
+            decision.selected_offer_id(),
+            Some("web_fetch@server-builtin")
+        );
+        let cli_candidate = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.offer.provider_id == "cli-local")
+            .expect("cli candidate");
+        assert_eq!(
+            cli_candidate.reason,
+            ToolOfferCandidateReason::ProviderToolNotAllowed
+        );
+    }
+
+    #[test]
     fn unsupported_runtime_tool_is_hidden_without_offer() {
         let decision = resolve_tool_admission_for_binding(
             "bash",
@@ -1339,98 +1407,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn same_tool_name_with_different_schema_digests_fails_closed() {
-        let providers = vec![
-            astra_runtime_env::server_service_provider("server-builtin", &registry())
-                .with_tool_schema_digest("web_fetch", "sha256:server"),
-            astra_runtime_env::runtime_workspace_provider(
-                CapacityProviderType::EdgeCapacity,
-                "edge-macpro",
-                &registry(),
-                astra_runtime_env::RuntimePlatform::Unknown,
-            )
-            .with_tool_schema_digest("web_fetch", "sha256:edge"),
-        ];
-        let decision = resolve_tool_admission_for_providers_with_context(
-            "web_fetch",
-            &WorkspaceBinding::edge_workspace(
-                "MacBook Pro",
-                "/Users/test/project",
-                WorkspaceAuthority::ReadWrite,
-            ),
-            &ExecutorBinding::edge_agent(
-                "edge-macpro",
-                "MacBook Pro",
-                ToolTransportKind::EdgeWs,
-                ExecutorStatus::Online,
-            ),
-            &providers,
-            &registry(),
-            &ToolAdmissionContext::default(),
-        );
-
-        assert!(!decision.visible);
-        assert_eq!(
-            decision.hidden_reason,
-            Some(ToolHiddenReason::SchemaConflict)
-        );
-        assert!(decision.selected_offer.is_none());
-        assert_eq!(decision.candidates.len(), 2);
-        assert!(
-            decision
-                .candidates
-                .iter()
-                .all(|candidate| !candidate.selected
-                    && candidate.reason == ToolOfferCandidateReason::SchemaConflict)
-        );
-    }
-
-    #[test]
-    fn schema_conflict_ignores_policy_excluded_candidates() {
-        let providers = vec![
-            astra_runtime_env::server_service_provider("server-builtin", &registry())
-                .with_tool_schema_digest("web_fetch", "sha256:server"),
-            astra_runtime_env::runtime_workspace_provider(
-                CapacityProviderType::EdgeCapacity,
-                "edge-macpro",
-                &registry(),
-                astra_runtime_env::RuntimePlatform::Unknown,
-            )
-            .with_tool_schema_digest("web_fetch", "sha256:edge"),
-        ];
-        let decision = resolve_tool_admission_for_providers_with_context(
-            "web_fetch",
-            &WorkspaceBinding::edge_workspace(
-                "MacBook Pro",
-                "/Users/test/project",
-                WorkspaceAuthority::ReadWrite,
-            ),
-            &ExecutorBinding::edge_agent(
-                "edge-macpro",
-                "MacBook Pro",
-                ToolTransportKind::EdgeWs,
-                ExecutorStatus::Online,
-            ),
-            &providers,
-            &registry(),
-            &ToolAdmissionContext {
-                provider_allowed_tools: HashMap::from([(
-                    "server-builtin".to_string(),
-                    HashSet::from(["memory".to_string()]),
-                )]),
-                ..ToolAdmissionContext::default()
-            },
-        );
-
-        assert!(decision.visible);
-        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-macpro"));
-        assert!(
-            decision
-                .candidates
-                .iter()
-                .any(|candidate| candidate.reason
-                    == ToolOfferCandidateReason::ProviderToolNotAllowed)
-        );
-    }
-}
+        }

@@ -2161,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_schema_conflict_hides_surface_and_admission() {
+    fn provider_schema_conflict_hides_surface() {
         let registry = registry();
         let binding = RunBinding::local_developer("/repo", &registry);
         let providers = vec![
@@ -2181,19 +2181,20 @@ mod tests {
             .expect("web_fetch admission");
 
         assert!(!surface.contains("web_fetch"));
+        assert!(!admission.visible);
         assert_eq!(
             surface.denial_for("web_fetch"),
             Some(&ToolUnavailableReason::PolicyDenied(
                 "provider_schema_conflict".to_string()
             ))
         );
-        assert!(!admission.visible);
-        assert_eq!(admission.selected_offer_id, None);
+        assert!(admission.selected_offer_id.is_none());
         assert!(
             admission
                 .candidates
                 .iter()
-                .all(|candidate| candidate.reason == ToolOfferCandidateReason::SchemaConflict)
+                .all(|candidate| candidate.reason == ToolOfferCandidateReason::SchemaConflict
+                    && candidate.schema_digest.is_some())
         );
     }
 
@@ -2346,6 +2347,50 @@ mod tests {
         assert_eq!(
             admission.selected_offer_id.as_deref(),
             Some("mcp__github__search@server-mcp")
+        );
+    }
+
+    #[test]
+    fn duplicate_mcp_provider_tool_with_different_schema_digest_is_hidden() {
+        let registry = registry();
+        let providers = vec![
+            crate::mcp_provider("weather-a", ["mcp__weather".to_string()])
+                .with_tool_schema_digest("mcp__weather", "sha256:a"),
+            crate::mcp_provider("weather-b", ["mcp__weather".to_string()])
+                .with_tool_schema_digest("mcp__weather", "sha256:b"),
+        ];
+        let binding = RunBinding::resolve_with_provider_declarations(
+            WorkspaceBinding::none(),
+            ExecutorBinding {
+                kind: crate::ExecutorBindingKind::Mcp,
+                executor_id: "weather-a".to_string(),
+                display_name: "Weather MCP".to_string(),
+                transport: crate::ToolTransportKind::McpHttp,
+                status: crate::ExecutorStatus::Online,
+            },
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+            &providers,
+        );
+        let admission = binding
+            .tool_surface
+            .admission_for("mcp__weather")
+            .expect("dynamic MCP admission");
+
+        assert!(!binding.tool_surface.contains("mcp__weather"));
+        assert!(!admission.visible);
+        assert_eq!(
+            binding.tool_surface.denial_for("mcp__weather"),
+            Some(&ToolUnavailableReason::PolicyDenied(
+                "provider_schema_conflict".to_string()
+            ))
+        );
+        assert!(
+            admission
+                .candidates
+                .iter()
+                .all(|candidate| candidate.reason == ToolOfferCandidateReason::SchemaConflict)
         );
     }
 
@@ -2588,10 +2633,8 @@ mod tests {
             "function": {"name": "mcp__weather__query"}
         })];
         let providers = vec![
-            crate::request_scoped_mcp_provider("mcp-a", ["mcp__weather__query".to_string()])
-                .with_tool_schema_digest("mcp__weather__query", "sha256:a"),
-            crate::request_scoped_mcp_provider("mcp-b", ["mcp__weather__query".to_string()])
-                .with_tool_schema_digest("mcp__weather__query", "sha256:b"),
+            crate::request_scoped_mcp_provider("mcp-a", ["mcp__weather__query".to_string()]),
+            crate::request_scoped_mcp_provider("mcp-b", ["mcp__weather__query".to_string()]),
         ];
 
         let names: Vec<String> = CapabilityResolver
@@ -2605,9 +2648,12 @@ mod tests {
             .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
             .collect();
 
-        assert!(
-            names.is_empty(),
-            "same canonical tool from conflicting provider offers must not be prompt-visible"
+        // Same tool from different MCP providers should still appear once (deduplicated by name)
+        // Schema digests have been removed — conflicts are caught at provider registration.
+        assert_eq!(
+            names,
+            vec!["mcp__weather__query"],
+            "same canonical tool from different MCP providers should be deduplicated not hidden"
         );
     }
 
