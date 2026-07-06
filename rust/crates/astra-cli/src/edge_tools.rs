@@ -1600,11 +1600,15 @@ impl ToolExecutor {
         if astra_runtime_env::is_mcp_namespaced_tool_name(name)
             && self.mcp_tool_has_runtime_binding(name)
         {
-            return astra_runtime_env::RunBinding::resolve(
+            let providers = vec![astra_runtime_env::mcp_provider(
+                "cli-mcp",
+                [name.to_string()],
+            )];
+            return astra_runtime_env::RunBinding::resolve_with_provider_declarations(
                 astra_runtime_env::WorkspaceBinding::none(),
                 astra_runtime_env::ExecutorBinding {
                     kind: astra_runtime_env::ExecutorBindingKind::RequestScopedMcp,
-                    executor_id: "cli-request-scoped-mcp".to_string(),
+                    executor_id: "cli-mcp".to_string(),
                     display_name: "CLI MCP server".to_string(),
                     transport: astra_runtime_env::ToolTransportKind::McpHttp,
                     status: astra_runtime_env::ExecutorStatus::Online,
@@ -1612,6 +1616,7 @@ impl ToolExecutor {
                 astra_runtime_env::RuntimeBinding::none(),
                 astra_runtime_env::PolicyIntent::cloud_control_plane(),
                 registry,
+                &providers,
             );
         }
 
@@ -5579,7 +5584,7 @@ impl ToolExecutor {
         vec![
             self.cli_local_provider_coverage(),
             self.cli_control_plane_provider_coverage(),
-            self.cli_request_scoped_mcp_provider_coverage(),
+            self.cli_mcp_provider_coverage(),
         ]
     }
 
@@ -5613,22 +5618,36 @@ impl ToolExecutor {
         )
     }
 
-    fn cli_request_scoped_mcp_provider_coverage(
+    fn cli_mcp_provider_coverage(
         &self,
     ) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
-        let schemas = self
-            .mcp_runtime_snapshot("cli_request_scoped_mcp_coverage")
-            .schemas;
-        let ready_names = schemas
+        let schemas = self.mcp_runtime_snapshot("cli_mcp_coverage").schemas;
+        let mut ready_names = schemas
             .iter()
             .filter_map(astra_turn_core::tool::schema::tool_schema_name)
             .filter(|name| self.mcp_tool_has_runtime_binding(name))
             .map(str::to_string)
             .collect::<Vec<_>>();
-        astra_runtime_env::request_scoped_mcp_coverage(
-            "cli-request-scoped-mcp",
-            !schemas.is_empty(),
-            ready_names,
+        ready_names.sort();
+        ready_names.dedup();
+        if !ready_names.is_empty() {
+            return astra_runtime_env::CapacityProviderCoverageEntry::ready(
+                astra_runtime_env::CapacityProviderType::McpProvider,
+                "cli-mcp",
+                ready_names,
+            );
+        }
+
+        let reason = if schemas.is_empty() {
+            "no_cli_mcp_provider_bound"
+        } else {
+            "no_cli_mcp_runtime_binding"
+        };
+        astra_runtime_env::CapacityProviderCoverageEntry::unavailable(
+            astra_runtime_env::CapacityProviderType::McpProvider,
+            "cli-mcp",
+            astra_runtime_env::CapacityProviderStatus::Unbound,
+            reason,
         )
     }
 
@@ -7111,12 +7130,12 @@ mod tests {
         );
         let mcp = providers
             .iter()
-            .find(|provider| provider["provider_type"] == "request_scoped_mcp")
-            .expect("CLI introspect must expose request-scoped MCP provider coverage");
+            .find(|provider| provider["provider_type"] == "mcp_provider")
+            .expect("CLI introspect must expose MCP provider coverage");
         assert_eq!(mcp["status"].as_str(), Some("unbound"));
         assert_eq!(
             mcp["unavailable_reason"].as_str(),
-            Some("no_request_scoped_mcp_provider_bound")
+            Some("no_cli_mcp_provider_bound")
         );
     }
 
@@ -7197,13 +7216,13 @@ mod tests {
             .expect("capacity_provider_coverage");
         let mcp = providers
             .iter()
-            .find(|provider| provider["provider_type"] == "request_scoped_mcp")
-            .expect("request-scoped MCP coverage");
+            .find(|provider| provider["provider_type"] == "mcp_provider")
+            .expect("CLI MCP provider coverage");
 
         assert_eq!(mcp["status"].as_str(), Some("unbound"));
         assert_eq!(
             mcp["unavailable_reason"].as_str(),
-            Some("no_request_scoped_mcp_runtime_binding")
+            Some("no_cli_mcp_runtime_binding")
         );
         assert!(mcp["capabilities"].as_array().unwrap().is_empty());
     }
