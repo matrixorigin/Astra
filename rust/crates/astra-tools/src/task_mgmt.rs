@@ -1343,13 +1343,17 @@ fn validate_parent_status_transition(
     if new_status == previous_status || new_status == SessionTaskStatusKind::Deleted {
         return Ok(());
     }
-    // Terminal tasks cannot be moved backward.
+    // Terminal/tombstone tasks cannot be moved backward. Every persisted
+    // status may still transition to Deleted above so users can clear the
+    // task board without losing the audit tombstone.
     if matches!(
         previous_status,
         SessionTaskStatusKind::Completed
             | SessionTaskStatusKind::Failed
             | SessionTaskStatusKind::Cancelled
             | SessionTaskStatusKind::Archived
+            | SessionTaskStatusKind::Deleted
+            | SessionTaskStatusKind::Migrated
     ) {
         return Err(format!(
             "task is already terminal ({previous_status}); create a new task for follow-up work, or use new_status='deleted' to hide it from active views while keeping an audit tombstone"
@@ -1365,14 +1369,17 @@ fn validate_subtask_status_transition(
     if new_status == previous_status || new_status == SessionTaskStatusKind::Deleted {
         return Ok(());
     }
-    // Terminal subtasks cannot be moved backward, except for the
+    // Terminal/tombstone subtasks cannot be moved backward, except for the
     // Completed→Pending reversal that triggers parent auto-complete undo.
+    // Every persisted status may still transition to Deleted above.
     if matches!(
         previous_status,
         SessionTaskStatusKind::Completed
             | SessionTaskStatusKind::Failed
             | SessionTaskStatusKind::Cancelled
             | SessionTaskStatusKind::Archived
+            | SessionTaskStatusKind::Deleted
+            | SessionTaskStatusKind::Migrated
     ) && !(previous_status == SessionTaskStatusKind::Completed
         && new_status == SessionTaskStatusKind::Pending)
     {
@@ -5357,6 +5364,52 @@ mod tests {
         assert!(
             !task_b.blocked_by.contains(&"task-1".to_string()),
             "b still references a: {task_b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_is_available_from_every_persisted_parent_status() {
+        let m = mgr();
+        let statuses = [
+            SessionTaskStatusKind::Pending,
+            SessionTaskStatusKind::InProgress,
+            SessionTaskStatusKind::Paused,
+            SessionTaskStatusKind::Completed,
+            SessionTaskStatusKind::Failed,
+            SessionTaskStatusKind::Cancelled,
+            SessionTaskStatusKind::Archived,
+            SessionTaskStatusKind::Deleted,
+            SessionTaskStatusKind::Migrated,
+            SessionTaskStatusKind::Other,
+        ];
+
+        for (idx, status) in statuses.into_iter().enumerate() {
+            let task_id = format!("task-{}", idx + 1);
+            m.create(&json!({"title": format!("status {status}")})).await;
+            set_task_status_fixture(&m, &task_id, status).await;
+
+            let out = m
+                .update(&json!({"task_id": task_id, "new_status": "deleted"}))
+                .await;
+            assert!(
+                !out.starts_with("Error:"),
+                "{status} should be clearable to deleted: {out}"
+            );
+        }
+
+        let deleted_list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "deleted"})).await).unwrap();
+        assert_eq!(deleted_list["count"], 10, "{deleted_list}");
+        let active_list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "active"})).await).unwrap();
+        assert_eq!(active_list["count"], 0, "{active_list}");
+
+        let revive = m
+            .update(&json!({"task_id": "task-1", "new_status": "pending"}))
+            .await;
+        assert!(
+            revive.starts_with("Error:"),
+            "deleted tombstones must not be revived by status update: {revive}"
         );
     }
 
