@@ -2085,6 +2085,16 @@ pub fn runtime_manifest_for_model(
 }
 
 impl AgenticLoopState {
+    /// Only the root access-surface loop owns the session-level composite
+    /// snapshot pointer. Delegated/sub-agent loops may share the same
+    /// `session_id` for evidence and replay, but their internal checkpoints are
+    /// implementation detail and must not become the parent conversation's
+    /// current resumable state.
+    #[must_use]
+    pub fn owns_session_composite_snapshot(&self) -> bool {
+        self.recursion_depth == 0 && self.delegation_chain.is_empty()
+    }
+
     /// Provider-reported total tokens consumed by this loop.
     ///
     /// The four run-level token buckets are disjoint. Any budget, governor, or
@@ -3123,6 +3133,19 @@ pub(crate) mod tests {
 
         assert_eq!(state.provider_input_tokens(), 127);
         assert_eq!(state.provider_total_tokens(), 140);
+    }
+
+    #[test]
+    fn only_root_loop_owns_session_composite_snapshot() {
+        let mut state = make_state();
+        assert!(state.owns_session_composite_snapshot());
+
+        state.recursion_depth = 1;
+        assert!(!state.owns_session_composite_snapshot());
+
+        state.recursion_depth = 0;
+        state.delegation_chain = vec!["orchestrator".to_string()];
+        assert!(!state.owns_session_composite_snapshot());
     }
 
     /// Unwind-safe cleanup guard for tests that write under

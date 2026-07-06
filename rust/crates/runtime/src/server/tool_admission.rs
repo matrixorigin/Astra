@@ -1025,7 +1025,10 @@ mod tests {
 
         assert!(!decision.visible);
         assert!(decision.selected_offer.is_none());
-        assert_eq!(decision.hidden_reason, Some(ToolHiddenReason::SchemaConflict));
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::SchemaConflict)
+        );
         assert_eq!(decision.candidates.len(), 2);
         assert!(decision.candidates.iter().all(|candidate| {
             candidate.reason == ToolOfferCandidateReason::SchemaConflict
@@ -1406,5 +1409,4 @@ mod tests {
             ToolOfferCandidateReason::ProviderToolNotAllowed
         );
     }
-
-        }
+}

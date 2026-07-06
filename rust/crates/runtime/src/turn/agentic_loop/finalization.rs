@@ -428,6 +428,20 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         return;
     }
 
+    if !state.owns_session_composite_snapshot() {
+        tracing::debug!(
+            session_id = %sid,
+            run_id = state.current_run_id.as_deref().unwrap_or_default(),
+            recursion_depth = state.recursion_depth,
+            delegation_chain = ?state.delegation_chain,
+            self_agent_id = %state.self_agent_id,
+            checkpoint = ckpt_num,
+            "wrote delegated heavy checkpoint without promoting it to the session composite snapshot"
+        );
+        state.stall.last_heavy_checkpoint = Some(cp);
+        return;
+    }
+
     let turn = session_turn_number(state);
     let mut snapshot =
         astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
@@ -1676,6 +1690,77 @@ mod tests {
                 .expect("read checkpoint")
                 .expect("heavy checkpoint");
         assert_eq!(heavy.blocked_tools, vec!["write_file".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial(session_journal_dir)]
+    fn root_heavy_checkpoint_promotes_session_composite_snapshot() {
+        let user_id = "test-user";
+        let session_id = format!("root-composite-{}", uuid::Uuid::new_v4());
+        let sessions_dir = tempfile::tempdir().expect("temp sessions dir");
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
+        let _guard = SessionDirGuard::new(user_id, &session_id);
+        let mut state = make_state();
+        state.context_manifest_user_id = Some(user_id.to_string());
+        state.current_session_id = Some(session_id.clone());
+        state.session_turn = 7;
+        state.step_recorder.begin_turn(0);
+
+        try_write_heavy_checkpoint(&mut state);
+
+        let index =
+            astra_pipeline::step_checkpoint::read_composite_snapshot_index(user_id, &session_id)
+                .expect("read composite index");
+        assert_eq!(index.snapshots.len(), 1);
+        assert_eq!(index.snapshots[0].session_id, session_id);
+        assert_eq!(index.snapshots[0].turn, 7);
+        assert!(
+            state.last_composite_snapshot.is_some(),
+            "root loop must expose the current session composite snapshot"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(session_journal_dir)]
+    fn delegated_heavy_checkpoint_does_not_promote_session_composite_snapshot() {
+        let user_id = "test-user";
+        let session_id = format!("delegated-composite-{}", uuid::Uuid::new_v4());
+        let sessions_dir = tempfile::tempdir().expect("temp sessions dir");
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
+        let _guard = SessionDirGuard::new(user_id, &session_id);
+        let mut state = make_state();
+        state.context_manifest_user_id = Some(user_id.to_string());
+        state.current_session_id = Some(session_id.clone());
+        state.current_run_id = Some("child-run".to_string());
+        state.session_turn = 7;
+        state.recursion_depth = 1;
+        state.delegation_chain = vec!["orchestrator".to_string()];
+        state.self_agent_id = "headline-agent".to_string();
+        state.step_recorder.begin_turn(0);
+
+        try_write_heavy_checkpoint(&mut state);
+
+        let heavy =
+            astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(user_id, &session_id)
+                .expect("read checkpoint")
+                .expect("delegated heavy checkpoint");
+        assert_eq!(heavy.budget_remaining_rounds, state.remaining_turns as u32);
+
+        let index =
+            astra_pipeline::step_checkpoint::read_composite_snapshot_index(user_id, &session_id)
+                .expect("read composite index");
+        assert!(
+            index.snapshots.is_empty(),
+            "delegated checkpoints must not become the parent session timeline"
+        );
+        assert!(
+            state.last_composite_snapshot.is_none(),
+            "delegated loop must not claim parent session current snapshot"
+        );
+        assert!(
+            state.stall.last_heavy_checkpoint.is_some(),
+            "delegated loop still keeps its own heavy checkpoint for local recovery"
+        );
     }
 
     #[tokio::test]

@@ -260,8 +260,12 @@ pub fn evaluate_turn(
         // All reported ok, but none produced fresh evidence.
         confidence += 0.05;
     } else if error_rate < 0.5 {
-        // Some errors but mostly ok
-        quality += 0.1;
+        // Partial failures can still leave enough evidence for the model to
+        // answer, but the turn is not operationally successful. Keep the
+        // quality signal moderate while making the final success verdict
+        // depend on zero failed tools below.
+        quality -= 0.05;
+        confidence += 0.1;
     } else {
         // Majority errors
         quality -= 0.2;
@@ -315,7 +319,7 @@ pub fn evaluate_turn(
     }
 
     // ─── Determine success ──────────────────────────────────────────────
-    let success = error_rate < 0.5 && quality > 0.3;
+    let success = error_count == 0 && quality > 0.3;
 
     TurnEvaluation {
         success,
@@ -1825,7 +1829,7 @@ mod tests {
                 .any(|s| matches!(s, EvalSignal::ToolErrorRate(r) if *r > 0.9))
         );
 
-        // mixed success → moderate
+        // mixed success → evidence may remain, but the turn verdict is not healthy
         let mixed = evaluate_turn(
             &[ok_call("bash"), err_call("grep"), ok_call("read_file")],
             0,
@@ -1833,13 +1837,49 @@ mod tests {
             0.3,
             false,
         );
-        assert!(mixed.success);
+        assert!(
+            !mixed.success,
+            "any real tool error must prevent a healthy success verdict"
+        );
+        assert!(
+            !mixed.signals.contains(&EvalSignal::AllToolsHealthy),
+            "partial failure must not be labelled all-tools-healthy"
+        );
         assert!(
             mixed
                 .signals
                 .iter()
                 .any(|s| matches!(s, EvalSignal::ToolErrorRate(_)))
         );
+    }
+
+    #[test]
+    fn low_tool_error_rate_is_not_successful() {
+        let eval = evaluate_turn(
+            &[
+                ok_call("web_fetch"),
+                ok_call("web_fetch"),
+                ok_call("run_script"),
+                ok_call("agent"),
+                err_call("web_fetch"),
+            ],
+            0,
+            false,
+            0.2,
+            false,
+        );
+
+        assert!(
+            !eval.success,
+            "one failed tool in an otherwise productive turn still needs visible diagnosis"
+        );
+        assert!(
+            eval.signals.iter().any(
+                |s| matches!(s, EvalSignal::ToolErrorRate(rate) if *rate > 0.0 && *rate < 0.5)
+            ),
+            "the evaluator should retain the partial-failure rate signal"
+        );
+        assert!(!eval.signals.contains(&EvalSignal::AllToolsHealthy));
     }
 
     #[test]

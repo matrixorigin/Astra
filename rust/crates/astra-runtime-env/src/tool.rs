@@ -2189,13 +2189,9 @@ mod tests {
             ))
         );
         assert!(admission.selected_offer_id.is_none());
-        assert!(
-            admission
-                .candidates
-                .iter()
-                .all(|candidate| candidate.reason == ToolOfferCandidateReason::SchemaConflict
-                    && candidate.schema_digest.is_some())
-        );
+        assert!(admission.candidates.iter().all(|candidate| candidate.reason
+            == ToolOfferCandidateReason::SchemaConflict
+            && candidate.schema_digest.is_some()));
     }
 
     #[test]

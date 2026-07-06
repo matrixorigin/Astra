@@ -628,14 +628,12 @@ pub fn maybe_persist_large_output(
     format!(
         "<persisted-output>\n\
          Output too large ({} bytes, ~{} lines) for context window. \
-         Full output saved to: {}\n\n\
+         Full output was persisted as an internal tool-result artifact outside the workspace.\n\n\
          Preview (first ~{} bytes):\n\
          {}\n...\n\
-         </persisted-output>\n\
-         Use read_file with start_line/end_line to read specific sections of the persisted file.",
+         </persisted-output>",
         output.len(),
         total_lines,
-        filepath.display(),
         PERSIST_PREVIEW_BYTES,
         preview,
     )
@@ -1181,6 +1179,8 @@ mod tests {
         let result = maybe_persist_large_output(s, AGGREGATE_SOFT_LIMIT + 1, "bash");
         // Must not panic; if it succeeded, the preview was built safely
         assert!(result.contains("<persisted-output>"));
+        assert!(!result.contains("Full output saved to:"));
+        assert!(!result.contains("Use read_file"));
     }
 
     #[test]
@@ -1192,6 +1192,8 @@ mod tests {
         assert!(s.len() > PERSIST_THRESHOLD);
         let result = maybe_persist_large_output(s, AGGREGATE_SOFT_LIMIT + 1, "bash");
         assert!(result.contains("<persisted-output>"));
+        assert!(!result.contains("Full output saved to:"));
+        assert!(!result.contains("Use read_file"));
     }
 
     // ── porcelain_status_codes ─────────────────────────────────────────

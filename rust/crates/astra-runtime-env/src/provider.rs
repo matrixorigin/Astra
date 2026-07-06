@@ -6,7 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    tool_schema_name, RequiredExecutor, RuntimePlatform, ToolRegistry, ToolSpec, WorkspaceAuthority,
+    RequiredExecutor, RuntimePlatform, ToolRegistry, ToolSpec, WorkspaceAuthority, tool_schema_name,
 };
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -753,9 +753,11 @@ mod tests {
                 "tool_names": ["bash"]
             }))
             .expect_err("invalid provider id must fail deserialization");
-        assert!(invalid_provider
-            .to_string()
-            .contains("invalid capacity provider id"));
+        assert!(
+            invalid_provider
+                .to_string()
+                .contains("invalid capacity provider id")
+        );
 
         let invalid_tool =
             serde_json::from_value::<CapacityProviderDeclaration>(serde_json::json!({
@@ -764,9 +766,11 @@ mod tests {
                 "tool_names": ["web.fetch"]
             }))
             .expect_err("invalid tool name must fail deserialization");
-        assert!(invalid_tool
-            .to_string()
-            .contains("invalid provider-declared tool name"));
+        assert!(
+            invalid_tool
+                .to_string()
+                .contains("invalid provider-declared tool name")
+        );
     }
 
     #[test]
@@ -796,9 +800,11 @@ mod tests {
         }))
         .expect_err("request-scoped MCP must not advertise canonical non-MCP tools implicitly");
 
-        assert!(error
-            .to_string()
-            .contains("MCP provider tool name must be namespaced"));
+        assert!(
+            error
+                .to_string()
+                .contains("MCP provider tool name must be namespaced")
+        );
     }
 
     #[test]
@@ -813,9 +819,11 @@ mod tests {
         }))
         .expect_err("schema digest keys must be scoped to declared tools");
 
-        assert!(error
-            .to_string()
-            .contains("provider schema digest key must reference a declared tool name"));
+        assert!(
+            error
+                .to_string()
+                .contains("provider schema digest key must reference a declared tool name")
+        );
     }
 
     #[test]

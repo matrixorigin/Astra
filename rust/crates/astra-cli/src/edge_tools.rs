@@ -373,8 +373,8 @@ const AGGREGATE_SOFT_LIMIT: usize = 120_000;
 
 /// Per-tool persistence threshold (chars). When a single tool result exceeds
 /// this AND aggregate output is above the soft limit, the result is persisted
-/// to disk and replaced with a preview + file path. The model can use
-/// `read_file` with `start_line/end_line` to access specific parts.
+/// as an internal artifact and replaced with a preview. The artifact path is
+/// not part of the workspace filesystem contract.
 /// Global default for large-output persistence threshold (50K).
 const PERSIST_THRESHOLD: usize = 50_000;
 
@@ -5071,12 +5071,9 @@ impl ToolExecutor {
     ///
     /// When a single tool result exceeds `PERSIST_THRESHOLD` AND cumulative
     /// output this turn is above `AGGREGATE_SOFT_LIMIT`, the full output is
-    /// written to `~/.astra/tool-results/<hash>.txt` and replaced with a
-    /// ~2KB preview + file path. The model can use `read_file` with
-    /// `start_line/end_line` to access specific parts of the persisted file.
-    ///
-    /// Large results are persisted to a temp file and replaced with a
-    /// ~2KB preview + file path.
+    /// written to an internal artifact and replaced with a ~2KB preview. The
+    /// artifact path is intentionally not exposed to the model because it is
+    /// outside the workspace filesystem contract.
     fn maybe_persist_large_output(&self, output: String, _tool_name: &str) -> String {
         // Skip small outputs
         if output.len() < PERSIST_THRESHOLD {
@@ -5131,14 +5128,12 @@ impl ToolExecutor {
         format!(
             "<persisted-output>\n\
              Output too large ({} bytes, ~{} lines) for context window. \
-             Full output saved to: {}\n\n\
+             Full output was persisted as an internal tool-result artifact outside the workspace.\n\n\
              Preview (first ~{} bytes):\n\
              {}\n...\n\
-             </persisted-output>\n\
-             Use read_file with start_line/end_line to read specific sections of the persisted file.",
+             </persisted-output>",
             output.len(),
             total_lines,
-            filepath.display(),
             PERSIST_PREVIEW_BYTES,
             preview,
         )
@@ -5773,9 +5768,9 @@ impl ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        BgTaskCommand, BgTaskOutputSnapshot, ToolExecutor, all_tool_schemas,
-        detect_git_remote_repos, extract_github_owner_repo, file_checkpoint_dir_for,
-        format_background_task_error, format_background_task_output,
+        AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputSnapshot, PERSIST_THRESHOLD, ToolExecutor,
+        all_tool_schemas, detect_git_remote_repos, extract_github_owner_repo,
+        file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
         format_background_task_output_timeout, format_background_task_stop_error, memoria,
         parse_memory_search_contents, utf16_col_to_char_idx,
     };
@@ -5882,6 +5877,24 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }
         })
+    }
+
+    #[test]
+    fn edge_large_output_reference_does_not_expose_unreadable_filesystem_path() {
+        let executor = test_executor();
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_SOFT_LIMIT + 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let output = "x".repeat(PERSIST_THRESHOLD + 100);
+
+        let rendered = executor.maybe_persist_large_output(output, "bash");
+
+        assert!(rendered.contains("<persisted-output>"));
+        assert!(rendered.contains("internal tool-result artifact"));
+        assert!(!rendered.contains("Full output saved to:"));
+        assert!(!rendered.contains("Use read_file"));
+        assert!(!rendered.contains(".astra/tool-results"));
     }
 
     #[test]

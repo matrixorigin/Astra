@@ -1075,7 +1075,6 @@ mod tests {
                         readiness: "ready".to_string(),
                         selected: true,
                         reason: "Selected".to_string(),
-
                     },
                     ToolAdmissionCandidateSnapshotEntry {
                         offer_id: "web_fetch@server-builtin".to_string(),
@@ -1090,7 +1089,6 @@ mod tests {
                         readiness: "ready".to_string(),
                         selected: false,
                         reason: "CurrentProviderPreferred".to_string(),
-
                     },
                 ],
             }],

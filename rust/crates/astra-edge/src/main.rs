@@ -15,7 +15,7 @@ use astra_runtime_env::{
     ToolRegistry, WorkspaceAuthority, WorkspaceBinding,
 };
 use astra_server_types::edge_ws_protocol::{
-    EdgeClientMessage, EdgeServerMessage, EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS,
+    EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EdgeClientMessage, EdgeServerMessage,
 };
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
@@ -486,10 +486,7 @@ async fn main() {
                     exit_with_error = true;
                     break;
                 }
-                tracing::info!(
-                    delay = reconnect_delay_secs,
-                    "Reconnecting..."
-                );
+                tracing::info!(delay = reconnect_delay_secs, "Reconnecting...");
             }
         }
         // Exponential backoff with jitter
@@ -533,11 +530,13 @@ mod tests {
             value["binding"]["capabilities"]["runtime"]["runtime_has_git"],
             true
         );
-        assert!(value["binding"]["tool_surface"]["tool_names"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|name| name.as_str() == Some("bash")));
+        assert!(
+            value["binding"]["tool_surface"]["tool_names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name.as_str() == Some("bash"))
+        );
     }
 
     #[test]
