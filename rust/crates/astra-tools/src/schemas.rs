@@ -439,7 +439,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree","push"],
+                            "enum": crate::git_tool_contract::GIT_ACTIONS,
                             "description": "Git operation to perform"
                         },
                         "path": {
@@ -1382,7 +1382,7 @@ mod tests {
                 .iter()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>(),
-            vec!["start", "get_results", "stop_slot"]
+            crate::agent_tool_contract::AGENT_FANOUT_ACTIONS
         );
         assert_eq!(
             params["x-astra-per-action-required"]["start"],
@@ -1438,6 +1438,15 @@ mod tests {
                 .unwrap_or("")
                 .contains("Never prefill this on spawn"),
             "agent_id field must explicitly forbid spawn-time prefill"
+        );
+        assert_eq!(
+            params["properties"]["action"]["enum"]
+                .as_array()
+                .expect("agent action enum")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            crate::agent_tool_contract::AGENT_ACTIONS
         );
     }
 
@@ -1815,6 +1824,48 @@ mod tests {
     }
 
     #[test]
+    fn github_schema_action_enum_matches_executor_contract() {
+        let schemas = all_tool_schemas();
+        let github = find_schema(&schemas, "github").expect("github schema");
+        let actions = github["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("github action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actions, crate::github_tool_contract::GITHUB_ACTIONS);
+    }
+
+    #[test]
+    fn git_schema_action_enum_matches_executor_contract() {
+        let schemas = all_tool_schemas();
+        let git = find_schema(&schemas, "git").expect("git schema");
+        let actions = git["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("git action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actions, crate::git_tool_contract::GIT_ACTIONS);
+    }
+
+    #[test]
+    fn memory_schema_action_enum_matches_executor_contract() {
+        let schemas = all_tool_schemas();
+        let memory = find_schema(&schemas, "memory").expect("memory schema");
+        let actions = memory["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("memory action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actions, crate::memory_tool_contract::MEMORY_ACTIONS);
+    }
+
+    #[test]
     fn plan_schema_uses_semantic_guidance_not_lexical_triggers() {
         let schemas = all_tool_schemas();
         let enter =
@@ -2121,37 +2172,14 @@ mod tests {
     fn session_schema_exposes_only_lifecycle_and_history_actions() {
         let schemas = all_tool_schemas();
         let session = find_schema(&schemas, "session").expect("session schema");
-        let mut actions = session["function"]["parameters"]["properties"]["action"]["enum"]
+        let actions = session["function"]["parameters"]["properties"]["action"]["enum"]
             .as_array()
             .expect("session action enum")
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
 
-        actions.sort_unstable();
-        assert_eq!(
-            actions,
-            [
-                "config",
-                "history_around",
-                "history_page",
-                "history_search",
-                "sleep",
-            ],
-            "session action surface must stay narrow and current"
-        );
-        for current in [
-            "config",
-            "sleep",
-            "history_page",
-            "history_search",
-            "history_around",
-        ] {
-            assert!(
-                actions.contains(&current),
-                "session must expose current action {current}"
-            );
-        }
+        assert_eq!(actions, crate::session_tool_contract::SESSION_ACTIONS);
         let props = session["function"]["parameters"]["properties"]
             .as_object()
             .expect("session properties");

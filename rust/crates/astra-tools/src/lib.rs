@@ -7,10 +7,12 @@
 //! Both the CLI (`CliToolExecutor`) and the server (`ServerToolExecutor`) depend
 //! on this crate and compose its `DefaultToolExecutor` with their own wrappers.
 
+pub mod agent_tool_contract;
 pub mod ask_user;
 pub mod display_sixel;
 pub mod memoria;
 pub mod schemas;
+pub mod session_tool_contract;
 pub mod web_fetch;
 pub mod web_search;
 
@@ -30,7 +32,10 @@ pub mod fs_ops;
 pub mod fuzzy_replacer;
 pub mod git_gix;
 pub mod git_ops;
+pub mod git_tool_contract;
 pub mod github;
+pub mod github_tool_contract;
+pub mod memory_tool_contract;
 pub mod passive_cargo_check;
 pub mod passive_tsc_check;
 pub mod plan_task_mirror;
@@ -495,13 +500,25 @@ fn git_stash_action_requires_approval(args: &Value) -> bool {
 /// Returns `true` if this exact tool invocation requires user approval.
 pub fn tool_requires_approval(tool_name: &str, args: &Value) -> bool {
     match tool_name {
-        "git" => args
-            .get("action")
-            .and_then(Value::as_str)
+        "git" => crate::git_tool_contract::git_action_from_args(args)
+            .ok()
             .is_some_and(|action| match action {
-                "commit" | "revert_commit" | "push" => true,
-                "stash" => git_stash_action_requires_approval(args),
-                _ => false,
+                crate::git_tool_contract::GitAction::Commit
+                | crate::git_tool_contract::GitAction::RevertCommit
+                | crate::git_tool_contract::GitAction::Push => true,
+                crate::git_tool_contract::GitAction::Stash => {
+                    git_stash_action_requires_approval(args)
+                }
+                crate::git_tool_contract::GitAction::Status
+                | crate::git_tool_contract::GitAction::Diff
+                | crate::git_tool_contract::GitAction::Log
+                | crate::git_tool_contract::GitAction::Show
+                | crate::git_tool_contract::GitAction::Blame
+                | crate::git_tool_contract::GitAction::FileHistory
+                | crate::git_tool_contract::GitAction::LogSearch
+                | crate::git_tool_contract::GitAction::Contributors
+                | crate::git_tool_contract::GitAction::CheckoutFile
+                | crate::git_tool_contract::GitAction::Worktree => false,
             }),
         "github" => args
             .get("action")

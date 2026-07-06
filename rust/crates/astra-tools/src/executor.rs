@@ -557,25 +557,10 @@ impl DefaultToolExecutor {
             "git" => outcome_to_result(crate::git_gix::git_dispatch(pr, args)),
 
             // ── GitHub API ───────────────────────────────────────────
-            "github" => {
-                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                match action {
-                    "list_prs" | "get_pr" | "ci_status" | "list_issues" | "get_issue"
-                    | "repo_stats" | "create_issue" => {
-                        self.dispatch_github_action(action, args).await
-                    }
-                    "" => ToolResult::error(
-                        "Missing required parameter: action. Use one of: \
-                         list_prs, get_pr, ci_status, list_issues, get_issue, \
-                         repo_stats, create_issue"
-                            .to_string(),
-                    ),
-                    other => ToolResult::error(format!(
-                        "Unknown github action: '{other}'. Valid: list_prs, get_pr, \
-                         ci_status, list_issues, get_issue, repo_stats, create_issue"
-                    )),
-                }
-            }
+            "github" => match crate::github_tool_contract::github_action_from_args(args) {
+                Ok(action) => self.dispatch_github_action(action, args).await,
+                Err(error) => ToolResult::error(format!("Error: {error}")),
+            },
 
             // ── Code intelligence (tree-sitter) ──────────────────────
             "symbols" => self.dispatch_symbols(args),
@@ -634,14 +619,18 @@ impl DefaultToolExecutor {
 
             // ── Memory tools (require configured endpoint) ───────────
             "memory" => {
-                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let action = match crate::memory_tool_contract::memory_action_from_args(args) {
+                    Ok(action) => action,
+                    Err(error) => return ToolResult::error(format!("Error: {error}")),
+                };
                 ToolResult::error(format!(
-                    "Error: Memory tool (action='{action}') is not available — the memoria \
+                    "Error: Memory tool (action='{}') is not available — the memoria \
                      service endpoint is not configured in this session.\n\n\
                      This usually means the session was started without `--memoria-url` or \
                      the MEMORIA_URL environment variable is unset.\n\
                      Workaround: skip memory operations for now, or ask the user to \
-                     configure the memoria endpoint and restart."
+                     configure the memoria endpoint and restart.",
+                    action.as_str()
                 ))
             }
 
@@ -670,38 +659,45 @@ impl DefaultToolExecutor {
     }
 
     /// Dispatch the consolidated GitHub tool via the optional GitHubClient.
-    async fn dispatch_github_action(&self, action: &str, args: &Value) -> ToolResult {
+    async fn dispatch_github_action(
+        &self,
+        action: crate::github_tool_contract::GithubAction,
+        args: &Value,
+    ) -> ToolResult {
         let client = match &self.github_client {
             Some(c) => c,
             None => {
                 if !self.http_client_available {
                     return ToolResult::error(format!(
-                        "Error: github(action='{action}') failed — HTTP client could not be built.\n\n\
+                        "Error: github(action='{}') failed — HTTP client could not be built.\n\n\
                          This is a system configuration issue (proxy, TLS, network). \
                          Check server logs for 'failed to build HTTP client' errors.\n\n\
                          GitHub integration requires a working HTTP client. \
-                         Once the infrastructure issue is resolved, this tool will function normally."
+                         Once the infrastructure issue is resolved, this tool will function normally.",
+                        action.as_str()
                     ));
                 }
                 return ToolResult::error(format!(
-                    "Error: github(action='{action}') failed — no GitHub token is configured.\n\n\
+                    "Error: github(action='{}') failed — no GitHub token is configured.\n\n\
                      To fix, do ONE of:\n\
                      1. Run `gh auth login` in a terminal (gh CLI stores the token)\n\
                      2. Set the GITHUB_TOKEN environment variable before starting this session\n\n\
                      If you are running in CI, ensure the token is injected into the runtime.\n\
-                     After authentication, restart the session to enable GitHub integration."
+                     After authentication, restart the session to enable GitHub integration.",
+                    action.as_str()
                 ));
             }
         };
         let output = match action {
-            "list_prs" => client.list_prs(args).await,
-            "get_pr" => client.get_pr(args).await,
-            "ci_status" => client.ci_status(args).await,
-            "list_issues" => client.list_issues(args).await,
-            "get_issue" => client.get_issue(args).await,
-            "repo_stats" => client.repo_stats(args).await,
-            "create_issue" => client.create_issue(args).await,
-            _ => return ToolResult::error(format!("Error: Unknown github action '{action}'")),
+            crate::github_tool_contract::GithubAction::ListPrs => client.list_prs(args).await,
+            crate::github_tool_contract::GithubAction::GetPr => client.get_pr(args).await,
+            crate::github_tool_contract::GithubAction::CiStatus => client.ci_status(args).await,
+            crate::github_tool_contract::GithubAction::RepoStats => client.repo_stats(args).await,
+            crate::github_tool_contract::GithubAction::ListIssues => client.list_issues(args).await,
+            crate::github_tool_contract::GithubAction::GetIssue => client.get_issue(args).await,
+            crate::github_tool_contract::GithubAction::CreateIssue => {
+                client.create_issue(args).await
+            }
         };
         string_to_result(output)
     }
@@ -750,17 +746,27 @@ fn mark_result_cached(result: &mut ToolResult) {
 fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
     match name {
         "write_file" | "str_replace" | "multi_edit" | "delete_file" => true,
-        "git" => args
-            .get("action")
-            .and_then(Value::as_str)
+        "git" => crate::git_tool_contract::git_action_from_args(args)
+            .ok()
             .is_some_and(|action| match action {
-                "commit" | "revert_commit" | "push" => true,
-                "stash" => args
+                crate::git_tool_contract::GitAction::Commit
+                | crate::git_tool_contract::GitAction::RevertCommit
+                | crate::git_tool_contract::GitAction::Push => true,
+                crate::git_tool_contract::GitAction::Stash => args
                     .get("stash_action")
                     .or_else(|| args.get("sub_action"))
                     .and_then(Value::as_str)
                     .is_some_and(git_stash_action_mutates_workspace),
-                _ => false,
+                crate::git_tool_contract::GitAction::CheckoutFile
+                | crate::git_tool_contract::GitAction::Worktree => true,
+                crate::git_tool_contract::GitAction::Status
+                | crate::git_tool_contract::GitAction::Diff
+                | crate::git_tool_contract::GitAction::Log
+                | crate::git_tool_contract::GitAction::Show
+                | crate::git_tool_contract::GitAction::Blame
+                | crate::git_tool_contract::GitAction::FileHistory
+                | crate::git_tool_contract::GitAction::LogSearch
+                | crate::git_tool_contract::GitAction::Contributors => false,
             }),
         _ => false,
     }

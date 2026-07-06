@@ -110,7 +110,8 @@ async fn unsupported_session_state_actions_are_rejected_on_cli_edge_executor() {
         assert!(
             result.contains("unknown `session` action")
                 && result.contains("history_page")
-                && result.contains("rollback_session_state"),
+                && result.contains("top-level tool")
+                && !result.contains("ask_user"),
             "{action}: {result}"
         );
     }
@@ -188,6 +189,28 @@ async fn execute_with_metadata_marks_structured_str_replace_failure_as_error() {
     assert_eq!(
         astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(&outcome.output),
         "failed"
+    );
+}
+
+#[tokio::test]
+async fn execute_with_metadata_git_missing_action_fails_closed() {
+    let executor = test_executor();
+    let outcome = executor
+        .execute_with_metadata("git", &json!({"path": "."}))
+        .await;
+
+    assert!(outcome.is_error, "{outcome:?}");
+    assert!(
+        outcome
+            .output
+            .contains("missing required parameter `action` for `git`"),
+        "{}",
+        outcome.output
+    );
+    assert!(
+        !outcome.output.contains("On branch") && !outcome.output.contains("##"),
+        "missing action must not be silently treated as git status: {}",
+        outcome.output
     );
 }
 

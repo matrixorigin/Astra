@@ -4442,37 +4442,48 @@ impl ToolExecutor {
             return outcome;
         }
         if name == "git" {
-            let action = args
-                .get("action")
-                .and_then(Value::as_str)
-                .unwrap_or("status");
+            let action = match astra_tools::git_tool_contract::git_action_from_args(args) {
+                Ok(action) => action,
+                Err(error) => return ToolExecutionOutcome::error(format!("Error: {error}")),
+            };
             match action {
-                "commit" => {
+                astra_tools::git_tool_contract::GitAction::Commit => {
                     let mut outcome = self.commit_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
-                "revert_commit" => {
+                astra_tools::git_tool_contract::GitAction::RevertCommit => {
                     let mut outcome = self.revert_commit_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
-                "stash" => {
+                astra_tools::git_tool_contract::GitAction::Stash => {
                     let stash_args = git_stash_action_args(args);
                     let mut outcome = self.stash_with_metadata(&stash_args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
-                "worktree" => {
+                astra_tools::git_tool_contract::GitAction::Worktree => {
                     let mut outcome = self.worktree_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
-                _ => {} // Other git actions handled in execute() below
+                astra_tools::git_tool_contract::GitAction::Status
+                | astra_tools::git_tool_contract::GitAction::Diff
+                | astra_tools::git_tool_contract::GitAction::Log
+                | astra_tools::git_tool_contract::GitAction::Show
+                | astra_tools::git_tool_contract::GitAction::Blame
+                | astra_tools::git_tool_contract::GitAction::FileHistory
+                | astra_tools::git_tool_contract::GitAction::LogSearch
+                | astra_tools::git_tool_contract::GitAction::Contributors
+                | astra_tools::git_tool_contract::GitAction::CheckoutFile
+                | astra_tools::git_tool_contract::GitAction::Push => {
+                    // Other git actions are handled by execute_run below.
+                }
             }
         }
         self.execute_run(name, args).await.into_outcome()
@@ -4569,43 +4580,58 @@ impl ToolExecutor {
                 "grep" => self.grep(args),
                 "glob" => self.glob(args),
                 "git" => {
-                    let action = args
-                        .get("action")
-                        .and_then(Value::as_str)
-                        .unwrap_or("status");
+                    let action = match astra_tools::git_tool_contract::git_action_from_args(args) {
+                        Ok(action) => action,
+                        Err(error) => return format!("Error: {error}"),
+                    };
                     match action {
-                        "status" => git_gix::status(&self.project_root, args),
-                        "diff" => git_gix::diff(
+                        astra_tools::git_tool_contract::GitAction::Status => {
+                            git_gix::status(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Diff => git_gix::diff(
                             &self.project_root,
                             args,
                             self.get_budget_pressure(),
                             self.aggregate_output_bytes
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        "log" => git_gix::log(&self.project_root, args),
-                        "show" => git_gix::show(
+                        astra_tools::git_tool_contract::GitAction::Log => {
+                            git_gix::log(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Show => git_gix::show(
                             &self.project_root,
                             args,
                             self.get_budget_pressure(),
                             self.aggregate_output_bytes
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        "blame" => git_gix::blame(&self.project_root, args),
-                        "file_history" => git_gix::file_history(&self.project_root, args),
-                        "log_search" => git_gix::log_search(&self.project_root, args),
-                        "contributors" => git_gix::contributors(&self.project_root, args),
-                        "commit" => self.commit(args),
-                        "revert_commit" => self.revert_commit(args),
-                        "stash" => {
+                        astra_tools::git_tool_contract::GitAction::Blame => {
+                            git_gix::blame(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::FileHistory => {
+                            git_gix::file_history(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::LogSearch => {
+                            git_gix::log_search(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Contributors => {
+                            git_gix::contributors(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Commit => self.commit(args),
+                        astra_tools::git_tool_contract::GitAction::RevertCommit => {
+                            self.revert_commit(args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Stash => {
                             let stash_args = git_stash_action_args(args);
                             self.stash(&stash_args)
                         }
-                        "checkout_file" => self.checkout_file(args),
-                        "worktree" => self.worktree(args),
-                        "push" => git_gix::push(&self.project_root, args),
-                        _ => format!(
-                            "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree, push"
-                        ),
+                        astra_tools::git_tool_contract::GitAction::CheckoutFile => {
+                            self.checkout_file(args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Worktree => self.worktree(args),
+                        astra_tools::git_tool_contract::GitAction::Push => {
+                            git_gix::push(&self.project_root, args)
+                        }
                     }
                 }
                 "find_definition" => self.find_definition(args),
@@ -4621,19 +4647,33 @@ impl ToolExecutor {
                 "symbols" => self.symbols(args),
                 "mo_query" => self.mo_query(args),
                 "github" => {
-                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    let action =
+                        match astra_tools::github_tool_contract::github_action_from_args(args) {
+                            Ok(action) => action,
+                            Err(error) => return format!("Error: {error}"),
+                        };
                     match action {
-                        "list_prs" => self.list_prs(args).await,
-                        "get_pr" => self.get_pr(args).await,
-                        "ci_status" => self.ci_status(args).await,
-                        "list_issues" => self.list_issues(args).await,
-                        "get_issue" => self.get_issue(args).await,
-                        "repo_stats" => self.repo_stats(args).await,
-                        "create_issue" => self.github_create_issue(args).await,
-                        "" => "Error: missing required parameter 'action'. Use one of: list_prs, get_pr, ci_status, list_issues, get_issue, repo_stats, create_issue".to_string(),
-                        other => format!(
-                            "Error: unknown github action '{other}'. Use one of: list_prs, get_pr, ci_status, list_issues, get_issue, repo_stats, create_issue"
-                        ),
+                        astra_tools::github_tool_contract::GithubAction::ListPrs => {
+                            self.list_prs(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::GetPr => {
+                            self.get_pr(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::CiStatus => {
+                            self.ci_status(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::RepoStats => {
+                            self.repo_stats(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::ListIssues => {
+                            self.list_issues(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::GetIssue => {
+                            self.get_issue(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::CreateIssue => {
+                            self.github_create_issue(args).await
+                        }
                     }
                 }
                 "web_fetch" => {
@@ -4646,13 +4686,13 @@ impl ToolExecutor {
                     astra_tools::web_fetch::fetch_with_cache_scope(None, args, &cache_scope).await
                 }
                 "memory" => {
-                    let op = match args.get("action").and_then(|v| v.as_str()) {
-                        Some(a) => a,
-                        None => return "Error: missing required parameter `action`. \
-                             Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string(),
-                    };
+                    let action =
+                        match astra_tools::memory_tool_contract::memory_action_from_args(args) {
+                            Ok(action) => action,
+                            Err(error) => return format!("Error: {error}"),
+                        };
                     let clean_args = self.memory_args_with_context(args);
-                    self.memoria_call(op, &clean_args).await
+                    self.memoria_call(action.as_str(), &clean_args).await
                 }
                 "enter_plan_mode" => self.enter_plan_mode_remote(args).await,
                 "exit_plan_mode" => self.exit_plan_mode_remote(args).await,
@@ -4748,9 +4788,13 @@ impl ToolExecutor {
                 }
                 // ── Consolidated agent tool ──────────────────────────────────
                 "agent" => {
-                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    let action =
+                        match astra_tools::agent_tool_contract::agent_action_from_args(args) {
+                            Ok(action) => action,
+                            Err(error) => return format!("Error: {error}"),
+                        };
                     match action {
-                        "run_chain" => {
+                        astra_tools::agent_tool_contract::AgentAction::RunChain => {
                             match serde_json::from_value::<
                                 astra_turn_core::tool_registry_chain::ToolChain,
                             >(args.clone())
@@ -4776,21 +4820,21 @@ impl ToolExecutor {
                                 Err(e) => format!("Error: Invalid chain format: {e}"),
                             }
                         }
-                        "spawn" => {
+                        astra_tools::agent_tool_contract::AgentAction::Spawn => {
                             agent_spawning::handle_agent_spawn_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )
                             .await
                         }
-                        "get_result" => {
+                        astra_tools::agent_tool_contract::AgentAction::GetResult => {
                             agent_spawning::handle_agent_get_result_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )
                             .await
                         }
-                        "send_message" => {
+                        astra_tools::agent_tool_contract::AgentAction::SendMessage => {
                             let ctx = self
                                 .send_message_context
                                 .lock()
@@ -4798,25 +4842,6 @@ impl ToolExecutor {
                                 .and_then(|g| g.clone());
                             agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
                         }
-                        _ if action.is_empty() && args.get("spawn").is_some() => {
-                            "Error: invalid agent call shape. Use the top-level \
-                             `action='spawn'` field, not a `spawn` wrapper key. \
-                             Example: agent(action='spawn', description='...', \
-                             prompt='...'). For parallel \
-                             fan-out, use agent_fanout(action='start', target_count=N, \
-                             slots=[...]); do not pass `agents:[...]`."
-                                .to_string()
-                        }
-                        _ if action.is_empty() && args.get("agents").is_some() => {
-                            "Error: unsupported `agents` batch payload for `agent`. \
-                             Each `agent(action='spawn', ...)` call launches exactly \
-                             one child. Use `agent_fanout(action='start', target_count=N, \
-                             slots=[...])` for atomic parallel fan-out."
-                                .to_string()
-                        }
-                        _ => format!(
-                            "Error: unknown agent action '{action}'. Use one of: spawn, get_result, run_chain, send_message"
-                        ),
                     }
                 }
                 "agent_fanout" => {
@@ -4825,14 +4850,25 @@ impl ToolExecutor {
                 }
                 // ── Consolidated session tool ──────────────────────────────
                 "session" => {
-                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    let action =
+                        match astra_tools::session_tool_contract::session_action_from_args(args) {
+                            Ok(action) => action,
+                            Err(error) => return format!("Error: {error}"),
+                        };
                     match action {
-                        "config" => self.adjust_config(args),
-                        "sleep" => self.sleep_tool(args).await,
-                        "history_page" | "history_search" => self.render_session_history(args),
-                        "history_around" => self.render_session_history_around(args),
-                        "" => "Missing required parameter: action. Use: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, compress_context, ask_user, enter_plan_mode, exit_plan_mode.".to_string(),
-                        other => format!("Error: unknown `session` action '{other}'. Valid: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, compress_context, ask_user, enter_plan_mode, exit_plan_mode."),
+                        astra_tools::session_tool_contract::SessionAction::Config => {
+                            self.adjust_config(args)
+                        }
+                        astra_tools::session_tool_contract::SessionAction::Sleep => {
+                            self.sleep_tool(args).await
+                        }
+                        astra_tools::session_tool_contract::SessionAction::HistoryPage
+                        | astra_tools::session_tool_contract::SessionAction::HistorySearch => {
+                            self.render_session_history(args)
+                        }
+                        astra_tools::session_tool_contract::SessionAction::HistoryAround => {
+                            self.render_session_history_around(args)
+                        }
                     }
                 }
                 // Task management (unified tool with action param)
@@ -6370,22 +6406,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_task_action_points_parallel_agents_to_agent_fanout() {
+    async fn unknown_task_action_stays_inside_task_contract() {
         let executor = test_executor();
         let output = executor
             .execute("task", &serde_json::json!({"action": "spawn_agents"}))
             .await;
 
-        assert!(output.contains("agent_fanout(action='start'"), "{output}");
-        assert!(output.contains("returns results by default"), "{output}");
-        assert!(output.contains("Ctrl+B"), "{output}");
         assert!(
-            !output.contains("agent_fanout(action='get_results'"),
+            output.contains("unknown `task` action 'spawn_agents'"),
             "{output}"
+        );
+        assert!(output.contains("create, update, list"), "{output}");
+        assert!(
+            !output.contains("agent_fanout"),
+            "task must not route unknown actions to agent orchestration: {output}"
         );
         assert!(!output.contains("run_in_background: true"), "{output}");
         assert!(!output.contains("run_in_background=true"), "{output}");
-        assert!(!output.contains("agent(action='get_result'"), "{output}");
+        assert!(!output.contains("agent(action="), "{output}");
     }
 
     fn bg_snapshot(
@@ -6731,7 +6769,7 @@ mod tests {
         executor.set_current_activatable_tool_names(HashSet::new());
         let injected = executor.execute("session", &serde_json::json!({})).await;
         assert!(
-            injected.contains("Missing required parameter: action"),
+            injected.contains("missing required parameter `action` for `session`"),
             "visible schema must allow the real executor path; got: {injected}"
         );
         assert_eq!(

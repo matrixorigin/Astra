@@ -2683,7 +2683,9 @@ mod tests {
 
         assert!(result.is_error, "{result:?}");
         assert!(
-            result.output.contains("Missing required parameter: action"),
+            result
+                .output
+                .contains("missing required parameter `action` for `github`"),
             "{result:?}"
         );
         assert!(

@@ -174,10 +174,11 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
                 "Memory tool not executed: run was cancelled".to_string(),
             );
         }
-        let Some(op) = args.get("action").and_then(Value::as_str) else {
-            return astra_tools::ToolResult::error(
-                "Error: missing required parameter `action`. Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string(),
-            );
+        let action = match astra_tools::memory_tool_contract::memory_action_from_args(args) {
+            Ok(action) => action,
+            Err(error) => {
+                return astra_tools::ToolResult::error(format!("Error: {error}"));
+            }
         };
         let isolated_args = memory_args_with_context(
             args,
@@ -185,7 +186,10 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
             &context.user_id,
             context.journal_turn_index.load(Ordering::Relaxed),
         );
-        let output = context.memoria_client.call(op, &isolated_args).await;
+        let output = context
+            .memoria_client
+            .call(action.as_str(), &isolated_args)
+            .await;
         if output.starts_with("Error") {
             astra_tools::ToolResult::error(output)
         } else {
