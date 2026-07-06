@@ -6,6 +6,7 @@
 use std::time::SystemTime;
 
 use super::fanout_group::{AgentFanoutSlotIdentity, AgentFanoutSlotStatus};
+use crate::interruption::InterruptionKind;
 
 pub const AGENT_FINISH_REASON_NORMAL: &str = "normal";
 
@@ -97,7 +98,11 @@ pub fn agent_finish_reason_is_normal(finish_reason: Option<&str>) -> bool {
 }
 
 pub fn agent_completion_is_interrupted(finish_reason: Option<&str>) -> bool {
-    !agent_finish_reason_is_normal(finish_reason)
+    let reason = agent_finish_reason_text(finish_reason);
+    if reason == AGENT_FINISH_REASON_NORMAL {
+        return false;
+    }
+    InterruptionKind::from_label(reason).is_some()
 }
 
 pub fn agent_finish_reason_is_parent_budget(reason: &str) -> bool {
@@ -119,10 +124,10 @@ pub fn project_agent_status_to_fanout_slot(status: &AgentStatus) -> AgentFanoutS
             finish_reason,
         } => {
             let reason = agent_finish_reason_text(finish_reason.as_deref());
-            if reason == AGENT_FINISH_REASON_NORMAL {
-                (AgentFanoutSlotStatus::Completed, None)
-            } else {
+            if agent_completion_is_interrupted(Some(reason)) {
                 (AgentFanoutSlotStatus::Failed, Some(reason.to_string()))
+            } else {
+                (AgentFanoutSlotStatus::Completed, None)
             }
         }
         AgentStatus::Interrupted { finish_reason, .. } => {
@@ -213,6 +218,12 @@ mod tests {
         assert!(!agent_completion_is_interrupted(Some("")));
         assert!(agent_completion_is_interrupted(Some("budget_exhausted")));
         assert!(agent_completion_is_interrupted(Some("empty_completion")));
+        assert!(agent_completion_is_interrupted(Some("stream_transport")));
+        assert!(agent_completion_is_interrupted(Some("executor_dropped")));
+        assert!(
+            !agent_completion_is_interrupted(Some("completed_with_warnings")),
+            "unknown future successful completion reasons must not be reclassified as interrupted"
+        );
 
         assert!(agent_finish_reason_is_parent_budget("budget_exhausted"));
         assert!(agent_finish_reason_is_parent_budget(" context_overflow "));
@@ -248,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn fanout_projection_treats_only_normal_completion_as_completed() {
+    fn fanout_projection_treats_known_interrupted_completion_as_failed() {
         let completed = AgentStatus::Completed {
             result: "done".to_string(),
             finish_reason: Some("normal".to_string()),
@@ -267,6 +278,18 @@ mod tests {
             projection.terminal_reason.as_deref(),
             Some("empty_completion")
         );
+
+        let future_success = AgentStatus::Completed {
+            result: "partial with warning".to_string(),
+            finish_reason: Some("completed_with_warnings".to_string()),
+        };
+        let projection = project_agent_status_to_fanout_slot(&future_success);
+        assert_eq!(
+            projection.status,
+            AgentFanoutSlotStatus::Completed,
+            "future non-normal success reasons should remain completed unless they match the interruption taxonomy"
+        );
+        assert!(projection.terminal_reason.is_none());
     }
 
     #[test]

@@ -10,28 +10,38 @@ use serde_json::{Value, json};
 /// Used by one-shot mode (`-m "..." --session-id <id>`) to provide
 /// conversation history that the model needs for multi-turn continuity.
 ///
-/// Returns `None` if the session has no checkpoint (first turn) or
-/// the checkpoint is unreadable.
+/// Falls back to the prompt-facing transcript if the checkpoint is missing,
+/// unreadable, or sanitizes to no usable history. Returns `None` only when
+/// both stores have no prompt-facing history.
 pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<Value>> {
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
     match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
         Ok(Some(cp)) if !cp.messages.is_empty() => {
             let prompt_state = heavy_checkpoint_prompt_state(&cp);
-            Some(
+            let messages =
                 astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
                     cp.messages,
                     &prompt_state,
-                ),
-            )
+                );
+            if messages.is_empty() {
+                tracing::warn!(
+                    user_id = %user_id,
+                    session_id = %session_id,
+                    "continuation checkpoint sanitized to no prompt-facing messages; falling back to transcript"
+                );
+                load_transcript_messages_for_continuation(session_id)
+            } else {
+                Some(messages)
+            }
         }
         Err(error) => {
             tracing::warn!(
                 user_id = %user_id,
                 session_id = %session_id,
                 error = %error,
-                "failed to read continuation checkpoint"
+                "failed to read continuation checkpoint; falling back to transcript"
             );
-            None
+            load_transcript_messages_for_continuation(session_id)
         }
         _ => load_transcript_messages_for_continuation(session_id),
     }
@@ -229,6 +239,71 @@ mod tests {
     fn load_session_messages_returns_none_for_missing_session() {
         let messages = super::load_session_messages_for_continuation("nonexistent-session-xyz-42");
         assert!(messages.is_none());
+    }
+
+    #[test]
+    fn load_session_messages_falls_back_to_transcript_when_checkpoint_errors() {
+        let session_id = format!("test-session-cont-corrupt-{}", uuid::Uuid::new_v4());
+        let mut checkpoint = StepCheckpoint::heavy(
+            "s1".to_string(),
+            "t1".to_string(),
+            "astra-cli".to_string(),
+            ExecutionCursor::default(),
+        );
+        let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+            unreachable!("StepCheckpoint::heavy must create a heavy checkpoint");
+        };
+        heavy.messages = vec![
+            json!({"role": "user", "content": "checkpoint history"}),
+            json!({"role": "assistant", "content": "checkpoint answer"}),
+        ];
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        let path = astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
+            &session_id,
+            9,
+            &checkpoint,
+        )
+        .unwrap();
+        let encoded = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            encoded.replacen(
+                &format!(r#""user_id":"{user_id}""#),
+                r#""user_id":"wrong-owner""#,
+                1,
+            ),
+        )
+        .unwrap();
+
+        crate::tui::transcript_jsonl::append(
+            &session_id,
+            &TurnEvent::User {
+                ts: None,
+                text: "transcript question".into(),
+            },
+        );
+        crate::tui::transcript_jsonl::append(
+            &session_id,
+            &TurnEvent::Assistant {
+                ts: None,
+                markdown: "transcript answer".into(),
+            },
+        );
+
+        let messages = super::load_session_messages_for_continuation(&session_id)
+            .expect("corrupt checkpoint should fall back to transcript");
+
+        let _ = std::fs::remove_dir_all(
+            astra_pipeline::step_checkpoint::owner_session_dir_for(&user_id, &session_id).unwrap(),
+        );
+        if let Some(path) = crate::tui::transcript_jsonl::transcript_path(&session_id) {
+            let _ = std::fs::remove_file(path);
+        }
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "transcript question");
+        assert_eq!(messages[1]["content"], "transcript answer");
     }
 
     #[test]

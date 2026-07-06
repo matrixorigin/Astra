@@ -309,6 +309,9 @@ pub fn render_completed_agent_result(
     finish_reason: Option<&str>,
 ) -> String {
     let reason = agent_finish_reason_text(finish_reason);
+    // This wire payload only reports whether the child result is complete.
+    // Resume behavior belongs to the structured InterruptionRecord, where
+    // `resume_mode` can distinguish Continue from Settle.
     let interrupted = agent_completion_is_interrupted(Some(reason));
     let mut body = json!({
         "status": if interrupted {
@@ -576,6 +579,31 @@ mod tests {
                 .as_str()
                 .is_some_and(|hint| hint.contains("Do not fabricate"))
         );
+    }
+
+    #[test]
+    fn completed_agent_result_only_marks_known_interruptions_incomplete() {
+        let warning = render_completed_agent_result(
+            "a1",
+            "done with warning",
+            Some("completed_with_warnings"),
+        );
+        let parsed: Value = serde_json::from_str(&warning).unwrap();
+        assert_eq!(
+            parsed["status"],
+            AgentToolResultStatusKind::Completed.as_str()
+        );
+        assert_eq!(parsed["finish_reason"], "completed_with_warnings");
+        assert_eq!(parsed["incomplete"], false);
+
+        let interrupted = render_completed_agent_result("a1", "partial", Some("empty_completion"));
+        let parsed: Value = serde_json::from_str(&interrupted).unwrap();
+        assert_eq!(
+            parsed["status"],
+            AgentToolResultStatusKind::Interrupted.as_str()
+        );
+        assert_eq!(parsed["finish_reason"], "empty_completion");
+        assert_eq!(parsed["incomplete"], true);
     }
 
     #[test]
