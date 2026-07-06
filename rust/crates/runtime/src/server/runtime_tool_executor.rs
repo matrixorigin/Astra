@@ -3717,6 +3717,16 @@ esac
                 && unknown.contains("update"),
             "server task tool should mark unknown actions as tool errors: {unknown}"
         );
+
+        let hidden_alias = exec
+            .execute("task", &json!({"action": "cancel", "task_id": "task-1"}))
+            .await;
+        assert!(
+            hidden_alias.starts_with("Error:")
+                && hidden_alias.contains("unknown `task` action")
+                && hidden_alias.contains("cancel"),
+            "server must not accept schema-hidden task action aliases: {hidden_alias}"
+        );
     }
 
     #[tokio::test]

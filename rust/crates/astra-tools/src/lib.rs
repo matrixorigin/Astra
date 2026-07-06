@@ -42,6 +42,7 @@ pub mod run_script;
 pub mod shell_ops;
 pub mod task_mgmt;
 pub mod task_mgmt_matrixone;
+pub mod task_tool_contract;
 pub mod tool_engine;
 pub mod tool_result_status;
 pub mod tool_search;

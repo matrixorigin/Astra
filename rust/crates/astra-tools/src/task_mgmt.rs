@@ -1380,95 +1380,13 @@ fn is_reversible_auto_completed_parent(task: &SessionTask) -> bool {
             .unwrap_or(false)
 }
 
-fn task_actions_allowing_field(field: &str, current_action: &str) -> Vec<&'static str> {
-    const TASK_ACTION_FIELDS: &[(&str, &[&str])] = &[
-        (
-            "create",
-            &[
-                "action",
-                "title",
-                "description",
-                "subtasks",
-                "active_form",
-                "owner",
-                "metadata",
-                "add_blocks",
-                "add_blocked_by",
-            ],
-        ),
-        ("list", &["action", "status_filter"]),
-        ("get", &["action", "task_id"]),
-        (
-            "update",
-            &[
-                "action",
-                "task_id",
-                "new_status",
-                "title",
-                "description",
-                "subtask_id",
-                "active_form",
-                "owner",
-                "metadata",
-                "add_blocks",
-                "add_blocked_by",
-                "remove_blocks",
-                "remove_blocked_by",
-                "reason",
-                "error_message",
-            ],
-        ),
-        ("stop", &["action", "task_id", "reason"]),
-        (
-            "archive",
-            &["action", "task_id", "older_than_days", "reason"],
-        ),
-    ];
-
-    TASK_ACTION_FIELDS
-        .iter()
-        .filter_map(|(action, fields)| {
-            (*action != current_action && fields.contains(&field)).then_some(*action)
-        })
-        .collect()
-}
-
-fn unknown_task_field_message(action: &str, key: &str, allowed: &[&str]) -> String {
-    let other_actions = task_actions_allowing_field(key, action);
-    let action_hint = if other_actions.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "; field is valid for: {}",
-            other_actions
-                .iter()
-                .map(|action| format!("task.{action}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    format!(
-        "unknown field '{key}' for task.{action} (valid: {}{})",
-        allowed.join(", "),
-        action_hint
-    )
-}
-
 fn validate_allowed_fields(args: &Value, action: &str, allowed: &[&str]) -> Result<(), String> {
-    let Some(obj) = args.as_object() else {
-        return Err(format!("task.{action} arguments must be an object"));
-    };
-    for key in obj.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(unknown_task_field_message(action, key, allowed));
-        }
-    }
-    if let Some(action_value) = obj.get("action")
-        && !action_value.is_string()
-    {
-        return Err("field 'action' must be a string".to_string());
-    }
-    Ok(())
+    debug_assert_eq!(
+        crate::task_tool_contract::task_action_allowed_fields(action),
+        Some(allowed),
+        "TaskManager field list for task.{action} must match task_tool_contract"
+    );
+    crate::task_tool_contract::validate_public_task_tool_args_for_action(action, args)
 }
 
 fn validate_string_chars(text: &str, field: &str, max: usize) -> Result<(), String> {

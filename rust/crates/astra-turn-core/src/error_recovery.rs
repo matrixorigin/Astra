@@ -135,6 +135,16 @@ pub fn build_recovery_message(
         && category == ErrorCategory::ToolInvalidArgs
         && (error_lower.contains("missing 'path' parameter")
             || error_lower.contains("missing 'content' parameter"));
+    let task_action_shape_error = tool_name == "task"
+        && matches!(
+            category,
+            ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest
+        )
+        && ((error_lower.contains("missing required parameter")
+            && error_lower.contains("action")
+            && error_lower.contains("task"))
+            || error_lower.contains("unknown `task` action")
+            || error_lower.contains("field 'action' for `task`"));
 
     let mut msg = match category {
         ErrorCategory::Network
@@ -161,6 +171,11 @@ pub fn build_recovery_message(
                 "⚠ ask_user failed: invalid questionnaire arguments. You chose ask_user because user clarification is required. Retry the SAME ask_user tool immediately with corrected questionnaire args. Do NOT continue implementation, guess defaults, or act as if the user already answered. Use a top-level `questions` array, for example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}.".to_string()
             } else if write_file_missing_args {
                 "⚠ write_file failed: invalid arguments. Retry the same tool with both `path` and `content` for writes, or `path` + `delete=true` for deletes. Do NOT switch to bash or python just to write or delete this file.".to_string()
+            } else if task_action_shape_error {
+                format!(
+                    "⚠ task failed: invalid arguments. Retry the same `task` tool with a valid `action` value before answering. Valid actions: {}.",
+                    astra_tools::task_tool_contract::TASK_ACTIONS_DISPLAY
+                )
             } else {
                 format!(
                     "⚠ {} failed: invalid arguments. \
@@ -702,6 +717,16 @@ mod tests {
             !alts_section.to_lowercase().contains("bash"),
             "bash must not be an alternative"
         );
+
+        // task missing/invalid action → retry the same structured tool with
+        // the shared action contract instead of switching tools or answering
+        // as if task management succeeded.
+        let err = "Error: missing required parameter `action` for `task`.";
+        let cat = classify_error(err);
+        assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
+        let msg = build_recovery_message("task", err, cat, &[]);
+        assert!(msg.contains("Retry the same `task` tool"));
+        assert!(msg.contains(astra_tools::task_tool_contract::TASK_ACTIONS_DISPLAY));
 
         // write_file missing content → editing alternatives
         let err = "Error: Missing 'content' parameter. Retry write_file. Do not switch to bash.";

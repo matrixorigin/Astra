@@ -249,6 +249,24 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         "wrong-type action must be actionable: {bad_action_type}"
     );
 
+    let missing_action = exe.execute("task", &json!({})).await;
+    assert!(
+        missing_action.starts_with("Error:")
+            && missing_action.contains("missing required parameter `action`")
+            && missing_action.contains("Retry the same `task` tool"),
+        "missing task action should be a recoverable argument-contract error: {missing_action}"
+    );
+
+    let hidden_cancel_alias = exe
+        .execute("task", &json!({"action": "cancel", "task_id": "task-1"}))
+        .await;
+    assert!(
+        hidden_cancel_alias.starts_with("Error:")
+            && hidden_cancel_alias.contains("unknown `task` action")
+            && hidden_cancel_alias.contains("cancel"),
+        "CLI must not accept schema-hidden task action aliases: {hidden_cancel_alias}"
+    );
+
     let create_typo = exe
         .execute(
             "task",

@@ -2389,103 +2389,8 @@ impl ToolExecutor {
 
     // ─── Task management methods (delegated to task_mgmt module) ────────────
 
-    fn task_action_allowed_fields(action: &str) -> Option<&'static [&'static str]> {
-        match action {
-            "create" => Some(&[
-                "action",
-                "title",
-                "description",
-                "subtasks",
-                "active_form",
-                "owner",
-                "metadata",
-                "add_blocks",
-                "add_blocked_by",
-            ]),
-            "list" => Some(&["action", "status_filter"]),
-            "get" => Some(&["action", "task_id"]),
-            "update" => Some(&[
-                "action",
-                "task_id",
-                "new_status",
-                "status",
-                "title",
-                "description",
-                "subtask_id",
-                "active_form",
-                "owner",
-                "metadata",
-                "add_blocks",
-                "add_blocked_by",
-                "remove_blocks",
-                "remove_blocked_by",
-                "reason",
-                "error_message",
-            ]),
-            "stop" => Some(&["action", "task_id", "reason"]),
-            "list_user" => Some(&["action", "user_status"]),
-            "adopt" => Some(&["action", "source_session_id", "task_id"]),
-            "archive" => Some(&["action", "task_id", "older_than_days", "reason"]),
-            _ => None,
-        }
-    }
-
-    fn task_actions_allowing_field(field: &str, current_action: &str) -> Vec<&'static str> {
-        const TASK_ACTIONS: &[&str] = &[
-            "create",
-            "list",
-            "get",
-            "update",
-            "stop",
-            "list_user",
-            "adopt",
-            "archive",
-        ];
-        TASK_ACTIONS
-            .iter()
-            .copied()
-            .filter(|action| *action != current_action)
-            .filter(|action| {
-                Self::task_action_allowed_fields(action)
-                    .is_some_and(|allowed| allowed.contains(&field))
-            })
-            .collect()
-    }
-
-    fn task_unknown_field_message(action: &str, key: &str, allowed: &[&str]) -> String {
-        let other_actions = Self::task_actions_allowing_field(key, action);
-        let action_hint = if other_actions.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "; field is valid for: {}",
-                other_actions
-                    .iter()
-                    .map(|action| format!("task.{action}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        format!(
-            "unknown field '{key}' for task.{action} (valid: {}{})",
-            allowed.join(", "),
-            action_hint
-        )
-    }
-
     fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
-        let Some(allowed) = Self::task_action_allowed_fields(action) else {
-            return Ok(());
-        };
-        let Some(obj) = args.as_object() else {
-            return Err(format!("task.{action} arguments must be an object"));
-        };
-        for key in obj.keys() {
-            if !allowed.contains(&key.as_str()) {
-                return Err(Self::task_unknown_field_message(action, key, allowed));
-            }
-        }
-        Ok(())
+        astra_tools::task_tool_contract::validate_runtime_task_tool_args_for_action(action, args)
     }
 
     fn task_output_json(output: &str) -> Option<Value> {
@@ -3060,7 +2965,8 @@ impl ToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.create(args).await;
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        let output = self.task_manager.create(&public_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3073,10 +2979,13 @@ impl ToolExecutor {
                 snapshot,
                 format!(
                     "task:create:{}",
-                    args.get("title").and_then(Value::as_str).unwrap_or("task")
+                    public_args
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("task")
                 ),
             );
-            self.record_task_lifecycle_event("create", args, &output);
+            self.record_task_lifecycle_event("create", &public_args, &output);
         }
         output
     }
@@ -3084,13 +2993,15 @@ impl ToolExecutor {
         if let Some(output) = self.route_task_action("list", args).await {
             return output;
         }
-        self.task_manager.list(args).await
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        self.task_manager.list(&public_args).await
     }
     async fn task_get(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("get", args).await {
             return output;
         }
-        self.task_manager.get(args).await
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        self.task_manager.get(&public_args).await
     }
     async fn task_action_update(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("update", args).await {
@@ -3103,7 +3014,8 @@ impl ToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.update(args).await;
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        let output = self.task_manager.update(&public_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3116,12 +3028,13 @@ impl ToolExecutor {
                 snapshot,
                 format!(
                     "task:update:{}",
-                    args.get("task_id")
+                    public_args
+                        .get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("task")
                 ),
             );
-            self.record_task_lifecycle_event("update", args, &output);
+            self.record_task_lifecycle_event("update", &public_args, &output);
         }
         output
     }
@@ -3136,7 +3049,8 @@ impl ToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.stop(args).await;
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        let output = self.task_manager.stop(&public_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3149,12 +3063,13 @@ impl ToolExecutor {
                 snapshot,
                 format!(
                     "task:stop:{}",
-                    args.get("task_id")
+                    public_args
+                        .get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("task")
                 ),
             );
-            self.record_task_lifecycle_event("stop", args, &output);
+            self.record_task_lifecycle_event("stop", &public_args, &output);
         }
         output
     }
@@ -3237,7 +3152,8 @@ impl ToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.archive(args).await;
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        let output = self.task_manager.archive(&public_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3250,12 +3166,13 @@ impl ToolExecutor {
                 snapshot,
                 format!(
                     "task:archive:{}",
-                    args.get("task_id")
+                    public_args
+                        .get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("bulk")
                 ),
             );
-            self.record_task_lifecycle_event("archive", args, &output);
+            self.record_task_lifecycle_event("archive", &public_args, &output);
         }
         output
     }
@@ -4920,18 +4837,18 @@ impl ToolExecutor {
                 }
                 // Task management (unified tool with action param)
                 "task" => {
-                    let action_value = args.get("action");
-                    let action = match action_value {
-                        Some(Value::String(action)) => action.as_str(),
-                        Some(_) => return "Error: field 'action' must be a string".to_string(),
-                        None => "",
+                    let action = match astra_tools::task_tool_contract::task_action_from_args(args)
+                    {
+                        Ok(action) => action,
+                        Err(error) => return format!("Error: {error}"),
                     };
                     match action {
-                        "create" => match Self::validate_task_tool_args_for_action("create", args)
-                        {
-                            Ok(()) => self.task_action_create(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
+                        "create" => {
+                            match Self::validate_task_tool_args_for_action("create", args) {
+                                Ok(()) => self.task_action_create(args).await,
+                                Err(error) => format!("Error: {error}"),
+                            }
+                        }
                         "list" => match Self::validate_task_tool_args_for_action("list", args) {
                             Ok(()) => self.task_list(args).await,
                             Err(error) => format!("Error: {error}"),
@@ -4940,11 +4857,12 @@ impl ToolExecutor {
                             Ok(()) => self.task_get(args).await,
                             Err(error) => format!("Error: {error}"),
                         },
-                        "update" => match Self::validate_task_tool_args_for_action("update", args)
-                        {
-                            Ok(()) => self.task_action_update(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
+                        "update" => {
+                            match Self::validate_task_tool_args_for_action("update", args) {
+                                Ok(()) => self.task_action_update(args).await,
+                                Err(error) => format!("Error: {error}"),
+                            }
+                        }
                         "stop" => match Self::validate_task_tool_args_for_action("stop", args) {
                             Ok(()) => self.task_action_stop(args).await,
                             Err(error) => format!("Error: {error}"),
@@ -4969,9 +4887,11 @@ impl ToolExecutor {
                                 Err(error) => format!("Error: {error}"),
                             }
                         }
-                        "" => "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive. For typed background tasks use `task_output`, `task_list`, or `task_stop`.".to_string(),
                         other => match Self::validate_task_tool_args_for_action(other, args) {
-                            Ok(()) => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For typed background tasks use `task_output`, `task_list`, or `task_stop`. For parallel sub-agents use `agent_fanout(action='start', target_count=N, slots=[...])`; it returns results by default. Backgrounding is user-controlled with Ctrl+B while the live tool is running."),
+                            Ok(()) => format!(
+                                "Error: {}",
+                                astra_tools::task_tool_contract::task_unknown_action_message(other)
+                            ),
                             Err(error) => format!("Error: {error}"),
                         },
                     }

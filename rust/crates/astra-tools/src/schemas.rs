@@ -1610,9 +1610,22 @@ mod tests {
         let action_enum = properties["action"]["enum"]
             .as_array()
             .expect("task action enum");
+        let actions = action_enum
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            crate::task_tool_contract::TASK_ACTIONS,
+            "task schema action enum must match the shared executor contract exactly"
+        );
         assert!(
             action_enum.iter().any(|v| v.as_str() == Some("archive")),
             "task schema should expose archive as a structured action"
+        );
+        assert!(
+            !action_enum.iter().any(|v| v.as_str() == Some("cancel")),
+            "task cancellation is action=stop; cancel must not be a hidden server-only alias"
         );
         assert!(
             properties["older_than_days"]["description"]
