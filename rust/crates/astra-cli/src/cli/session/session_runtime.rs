@@ -1039,10 +1039,9 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
             continue;
         }
         let user_input = restored_turn_user_input(&event);
-        restored.history.push((
-            user_input,
-            event.assistant_output.unwrap_or_default(),
-        ));
+        restored
+            .history
+            .push((user_input, event.assistant_output.unwrap_or_default()));
         restored.turn = restored
             .turn
             .max(event.turn.unwrap_or(restored.turn.saturating_add(1)));

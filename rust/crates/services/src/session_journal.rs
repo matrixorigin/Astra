@@ -3821,7 +3821,10 @@ impl JournalEvent {
             });
         }
         if let Some(obj) = metadata.as_object_mut() {
-            obj.insert("deferred_user_inputs".into(), serde_json::Value::Array(events));
+            obj.insert(
+                "deferred_user_inputs".into(),
+                serde_json::Value::Array(events),
+            );
         }
         self
     }

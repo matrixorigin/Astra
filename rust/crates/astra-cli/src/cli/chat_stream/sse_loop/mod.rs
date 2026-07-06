@@ -1144,10 +1144,12 @@ pub(crate) async fn stream_chat_sse(
         .deferred_input
         .delivered_user_inputs()
         .iter()
-        .map(|input| crate::cli::stream::streaming_types::DeferredStreamUserInput {
-            event_index: input.event_index,
-            content: input.content.clone(),
-        })
+        .map(
+            |input| crate::cli::stream::streaming_types::DeferredStreamUserInput {
+                event_index: input.event_index,
+                content: input.content.clone(),
+            },
+        )
         .collect::<Vec<_>>();
     let final_messages = std::mem::take(&mut state.messages);
 

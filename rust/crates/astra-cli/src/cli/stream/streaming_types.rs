@@ -237,9 +237,7 @@ fn user_inputs_from_current_turn(
 
     let Some(start) = user_contents
         .iter()
-        .enumerate()
-        .filter_map(|(idx, content)| (content.trim() == primary).then_some(idx))
-        .last()
+        .rposition(|content| content.trim() == primary)
     else {
         return vec![primary.to_string()];
     };
@@ -248,7 +246,7 @@ fn user_inputs_from_current_turn(
 }
 
 #[cfg(test)]
-mod tests {
+mod user_input_tests {
     use super::{
         DeferredStreamUserInput, effective_user_input_from_deferred,
         effective_user_input_from_messages, latest_user_input_from_messages,
@@ -284,10 +282,7 @@ mod tests {
             json!({"role": "user", "content": "2"}),
         ];
 
-        assert_eq!(
-            effective_user_input_from_messages("1", &messages),
-            "1\n\n2"
-        );
+        assert_eq!(effective_user_input_from_messages("1", &messages), "1\n\n2");
         assert_eq!(latest_user_input_from_messages("1", &messages), "2");
     }
 
