@@ -90,32 +90,51 @@ pub fn plan_mode_authoring_active(state: &PlanModeState) -> bool {
     !has_subtasks || (!any_in_progress && !items_done && !progress_complete)
 }
 
+/// Build a plan-resume snapshot for the session's active plan, if any.
+///
+/// Repository failures degrade to `PlanResumeSnapshot::default()` (no hint,
+/// no authoring flag) so a transient DB hiccup can't block a chat turn — the
+/// worst-case failure mode is a missing hint on one turn. Failures are logged
+/// at `warn!` level so they remain diagnosable without paging on a degraded
+/// optional hint path.
 pub async fn plan_resume_snapshot_for_session(
     repo: &dyn PlanRepository,
     user_id: &str,
     session_id: &str,
 ) -> PlanResumeSnapshot {
-    let Some(plan_id) = repo
-        .active_plan_for_session(user_id, session_id)
-        .await
-        .ok()
-        .flatten()
-    else {
-        return PlanResumeSnapshot::default();
+    let plan_id = match repo.active_plan_for_session(user_id, session_id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return PlanResumeSnapshot::default(),
+        Err(err) => {
+            tracing::warn!(
+                %session_id,
+                error = %err,
+                "plan resume: failed to query active plan; skipping hint"
+            );
+            return PlanResumeSnapshot::default();
+        }
     };
-    let Ok(state) = repo.load(user_id, &plan_id).await else {
-        return PlanResumeSnapshot::default();
-    };
-    PlanResumeSnapshot {
-        authoring_active: plan_mode_authoring_active(&state),
-        prompt_hint: plan_resume_prompt_hint(&state),
+    match repo.load(user_id, &plan_id).await {
+        Ok(state) => PlanResumeSnapshot {
+            authoring_active: plan_mode_authoring_active(&state),
+            prompt_hint: plan_resume_prompt_hint(&state),
+        },
+        Err(err) => {
+            tracing::warn!(
+                %session_id,
+                %plan_id,
+                error = %err,
+                "plan resume: active plan exists but load failed; skipping hint"
+            );
+            PlanResumeSnapshot::default()
+        }
     }
 }
 
 /// Fetch the rendered system-prompt section for the session's active plan, if
-/// one exists. Returns `None` when the session has no active plan. Swallows
-/// any repo errors to `None` so that a transient DB hiccup does not block chat
-/// turns — the worst-case failure mode is a missing hint on one turn.
+/// one exists. Returns `None` when the session has no active plan or the
+/// repository lookup fails (the failure is logged by
+/// [`plan_resume_snapshot_for_session`]).
 pub async fn plan_resume_hint_for_session(
     repo: &dyn PlanRepository,
     user_id: &str,

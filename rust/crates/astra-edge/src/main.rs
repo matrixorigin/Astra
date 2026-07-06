@@ -221,12 +221,13 @@ fn canonical_workspace_dir(workspace_dir: &Path) -> Result<PathBuf, String> {
     })
 }
 
+/// Build the runtime-environment capability advertisement for this edge.
+///
+/// Callers must pass an already-canonical `workspace` path; `run_edge_agent`
+/// enforces this via [`canonical_workspace_dir`] before calling here.
 fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Value {
     let registry = ToolRegistry::builtins();
-    let workspace = canonical_workspace_dir(workspace)
-        .unwrap_or_else(|_| workspace.to_path_buf())
-        .to_string_lossy()
-        .to_string();
+    let workspace = workspace.to_string_lossy().to_string();
     let binding = RunBinding::resolve(
         WorkspaceBinding::edge_workspace(workspace, WorkspaceAuthority::ReadWrite),
         ExecutorBinding::edge_agent(edge_id.to_string()),
@@ -508,7 +509,8 @@ mod tests {
 
     #[test]
     fn edge_runtime_environment_capabilities_describe_local_edge_runtime() {
-        let value = edge_runtime_environment_capabilities("edge-test", Path::new("/workspace/app"));
+        let workspace = canonical_workspace_dir(Path::new(".")).expect("canonical test workspace");
+        let value = edge_runtime_environment_capabilities("edge-test", &workspace);
 
         assert_eq!(
             value["schema_version"],
@@ -516,6 +518,10 @@ mod tests {
         );
         assert_eq!(value["binding"]["workspace"]["kind"], "edge_workspace");
         assert_eq!(value["binding"]["workspace"]["authority"], "read_write");
+        assert_eq!(
+            value["binding"]["workspace"]["cwd"],
+            workspace.to_string_lossy().as_ref()
+        );
         assert_eq!(value["binding"]["executor"]["kind"], "edge_agent");
         assert_eq!(value["binding"]["executor"]["executor_id"], "edge-test");
         assert_eq!(

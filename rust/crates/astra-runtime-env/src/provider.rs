@@ -209,6 +209,10 @@ impl CapacityProvider for CapacityProviderDeclaration {
 }
 
 impl CapacityProviderDeclaration {
+    /// Construct a declaration. Panics via [`canonical_provider_id`] /
+    /// [`canonical_declared_tool_name_for_provider`] if the provider id or any
+    /// tool name is invalid — those helpers are the single source of truth for
+    /// what a well-formed identifier looks like.
     pub fn new(
         provider_type: CapacityProviderType,
         provider_id: impl Into<String>,
@@ -231,6 +235,8 @@ impl CapacityProviderDeclaration {
         }
     }
 
+    /// Construct a declaration from a ToolRegistry, filtering by predicate.
+    /// Same panic contract as [`Self::new`].
     pub fn from_registry(
         provider_type: CapacityProviderType,
         provider_id: impl Into<String>,

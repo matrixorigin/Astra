@@ -13,7 +13,7 @@ mod types;
 
 pub use connection::{CallLogEntry, McpConnection};
 pub use error::McpError;
-pub use manager::McpClientManager;
+pub use manager::{McpClientManager, McpToolCollision, McpToolCollisionSource};
 pub use rmcp::model::Tool as McpTool;
 pub use tools::{
     MAX_DESCRIPTION_LENGTH, MAX_RESULT_CONTENT_LENGTH, extract_result_text,
