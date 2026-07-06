@@ -6493,7 +6493,9 @@ mod tests {
         );
 
         let dir = tempfile::TempDir::new().unwrap();
-        let executor = Arc::new(runtime_tool_executor_with_agent_context(dir.path()));
+        let mut runtime_executor = runtime_tool_executor_with_agent_context(dir.path());
+        runtime_executor.set_execution_binding_snapshot(edge_runtime_snapshot());
+        let executor = Arc::new(runtime_executor);
         let mut state = create_test_state();
         state.runtime_tool_executor = Some(executor);
 
@@ -6546,6 +6548,7 @@ mod tests {
             "task",
             "session",
             "tool_search",
+            "web_search",
             "memory",
         ] {
             assert!(
@@ -6564,8 +6567,6 @@ mod tests {
         for hidden in [
             "mo_query",
             "rollback_database_snapshots",
-            "web_fetch",
-            "web_search",
             "powershell",
             "display_sixel",
             "task_output",
@@ -7234,15 +7235,15 @@ mod tests {
         let _visible = host.visible_turn_tools(&mut state);
 
         assert!(
-            executor
+            !executor
                 .current_activatable_tool_names_snapshot()
                 .contains("agent_fanout"),
-            "executor must mirror edge-profile deferred names"
+            "already-visible backbone tools must not be duplicated into deferred activation"
         );
         assert!(
-            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
+            !<ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
                 .contains("agent_fanout"),
-            "validator must see the same deferred manifest"
+            "validator must see the final deferred set after visible-tool overlap is removed"
         );
 
         let result = executor
@@ -8506,6 +8507,7 @@ mod tests {
             "u-batch".to_string(),
             "s-batch".to_string(),
         )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         host.set_approval_audit_context(test_approval_audit_context("u-batch"));
         // Register write_file as a valid tool so the edge ledger delivery path admits it.
@@ -8656,6 +8658,7 @@ mod tests {
             "u-edge-meta".to_string(),
             "s-edge-meta".to_string(),
         )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         // Register read_file as a valid tool so the edge ledger delivery path admits it.
         host.install_runtime_tool_schemas(vec![json!({
@@ -8719,6 +8722,7 @@ mod tests {
             "u-mixed".to_string(),
             "s-mixed".to_string(),
         )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         // Register read_file and write_file as valid tools so the edge ledger delivery path admits them.
         host.install_runtime_tool_schemas(vec![
@@ -9624,11 +9628,39 @@ mod tests {
         let policy =
             TurnInteractionPolicy::from_tool_schemas(TurnInteractionMode::Headless, &final_tools);
 
-        assert_eq!(
-            policy.visible_tool_names,
-            vec!["bash".to_string(), "read_file".to_string()]
-        );
-        assert_eq!(policy.evidence_tool_names, policy.visible_tool_names);
+        let expected_visible = vec![
+            "bash",
+            "read_file",
+            "introspect",
+            "reflect",
+            "tool_search",
+            "session",
+            "compress_context",
+            "rollback_session_state",
+            "task",
+            "agent",
+            "agent_fanout",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "get_agent_info",
+            "notify",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let expected_evidence = vec![
+            "bash",
+            "read_file",
+            "agent",
+            "agent_fanout",
+            "get_agent_info",
+            "notify",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(policy.visible_tool_names, expected_visible);
+        assert_eq!(policy.evidence_tool_names, expected_evidence);
         assert!(!policy.allow_ask_user);
     }
 
@@ -9659,18 +9691,41 @@ mod tests {
         let policy =
             TurnInteractionPolicy::from_tool_schemas(host.turn_interaction_mode(), &final_tools);
 
-        assert_eq!(
-            policy.visible_tool_names,
-            vec![
-                "bash".to_string(),
-                "read_file".to_string(),
-                "ask_user".to_string()
-            ]
-        );
-        assert_eq!(
-            policy.evidence_tool_names,
-            vec!["bash".to_string(), "read_file".to_string()]
-        );
+        let expected_visible_without_ask_user = vec![
+            "bash",
+            "read_file",
+            "introspect",
+            "reflect",
+            "tool_search",
+            "session",
+            "compress_context",
+            "rollback_session_state",
+            "task",
+            "agent",
+            "agent_fanout",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "get_agent_info",
+            "notify",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let expected_evidence = vec![
+            "bash",
+            "read_file",
+            "agent",
+            "agent_fanout",
+            "get_agent_info",
+            "notify",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let mut expected_visible = expected_visible_without_ask_user;
+        expected_visible.insert(2, "ask_user".to_string());
+        assert_eq!(policy.visible_tool_names, expected_visible);
+        assert_eq!(policy.evidence_tool_names, expected_evidence);
         assert!(policy.allow_ask_user);
     }
 

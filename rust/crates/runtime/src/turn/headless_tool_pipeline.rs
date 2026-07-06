@@ -2932,6 +2932,7 @@ mod tests {
     #[tokio::test]
     async fn semantic_dedup_does_not_block_git_action_diff_path_after_stat_only() {
         let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
         harness.valid_tool_names.insert("git".to_string());
 
         let dir = tempfile::TempDir::new().unwrap();

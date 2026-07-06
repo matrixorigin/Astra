@@ -159,7 +159,7 @@ pub(crate) fn resolve_tool_admission_for_providers_with_context(
 ) -> ToolAdmissionDecision {
     let class = tool_execution_class(tool_name, registry);
     let route = admission_route_for_binding_and_providers(
-        tool_name, workspace, executor, providers, registry,
+        tool_name, workspace, executor, providers, registry, context,
     );
 
     let mut raw_candidates = if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
@@ -294,10 +294,16 @@ fn admission_route_for_binding_and_providers(
     executor: &ExecutorBinding,
     providers: &[CapacityProviderDeclaration],
     registry: &astra_runtime_env::ToolRegistry,
+    context: &ToolAdmissionContext,
 ) -> ToolExecutionRouteKind {
     let class = tool_execution_class(tool_name, registry);
     if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
         return ToolExecutionRouteKind::Unsupported;
+    }
+    if matches!(class, ToolExecutionClass::SharedServiceOrRuntime) {
+        return shared_service_or_runtime_route_for_providers(
+            tool_name, workspace, executor, providers, registry, context,
+        );
     }
     let binding_route =
         routing_decision_for_binding(tool_name, workspace.kind, executor.transport, registry);
@@ -309,6 +315,47 @@ fn admission_route_for_binding_and_providers(
     {
         return ToolExecutionRouteKind::RequestScopedMcp;
     }
+    binding_route
+}
+
+fn shared_service_or_runtime_route_for_providers(
+    tool_name: &str,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    providers: &[CapacityProviderDeclaration],
+    registry: &astra_runtime_env::ToolRegistry,
+    context: &ToolAdmissionContext,
+) -> ToolExecutionRouteKind {
+    let binding_route =
+        routing_decision_for_binding(tool_name, workspace.kind, executor.transport, registry);
+    let binding_provider_type = provider_type_for_route(binding_route, workspace.kind);
+    let binding_selects_runtime_provider =
+        binding_provider_type.is_some_and(CapacityProviderType::is_runtime_executor);
+
+    if binding_selects_runtime_provider {
+        let runtime_provider_declares_tool = if let Some(runtime_declared_tool_names) =
+            context.runtime_declared_tool_names.as_ref()
+        {
+            runtime_declared_tool_names.contains(tool_name)
+        } else {
+            true
+        };
+        if runtime_provider_declares_tool {
+            return binding_route;
+        }
+    }
+
+    if matches!(workspace.kind, WorkspaceBindingKind::LocalFilesystem) {
+        return binding_route;
+    }
+
+    if providers.iter().any(|provider| {
+        provider.provider_type == CapacityProviderType::ServerService
+            && provider.declares_tool(tool_name)
+    }) {
+        return ToolExecutionRouteKind::ServerRuntime;
+    }
+
     binding_route
 }
 

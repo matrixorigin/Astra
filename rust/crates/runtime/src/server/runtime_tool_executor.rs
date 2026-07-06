@@ -3086,7 +3086,7 @@ mod tests {
 
         let names = schema_name_set(exec.tool_schemas());
 
-        for visible in ["agent", "tool_search", "web_search", "memory"] {
+        for visible in ["agent", "tool_search", "memory"] {
             assert!(
                 names.contains(visible),
                 "{visible} should remain visible because it runs on the server"
@@ -3099,6 +3099,8 @@ mod tests {
             "git",
             "symbols",
             "run_script",
+            "web_fetch",
+            "web_search",
         ] {
             assert!(
                 !names.contains(hidden),
