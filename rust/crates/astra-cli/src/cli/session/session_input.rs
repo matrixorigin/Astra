@@ -14,7 +14,8 @@ pub(crate) fn apply_resume_context(
     resume_guidance: Option<String>,
 ) -> String {
     if let Some(guidance) = resume_guidance {
-        effective_line = format!("{guidance}\n\n{effective_line}");
+        effective_line =
+            format!("{effective_line}\n\n<system-reminder>\n{guidance}\n</system-reminder>");
     }
     effective_line
 }
@@ -278,13 +279,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_resume_context_prepends_resume_guidance() {
+    fn apply_resume_context_preserves_user_message_before_resume_guidance() {
         let effective = apply_resume_context(
             "continue".to_string(),
             Some("Resume the interrupted turn before answering.".to_string()),
         );
-        assert!(effective.starts_with("Resume the interrupted turn before answering."));
-        assert!(effective.ends_with("\n\ncontinue"));
+        assert!(effective.starts_with("continue\n\n<system-reminder>"));
+        assert!(effective.contains("Resume the interrupted turn before answering."));
+        assert!(effective.ends_with("</system-reminder>"));
     }
 
     #[test]
@@ -469,7 +471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_effective_line_drains_notifications_and_prepends_resume_guidance() {
+    async fn finalize_effective_line_drains_notifications_and_keeps_user_first() {
         let mut state = SessionState {
             diagnostics_context: Some("<diag/>".into()),
             pending_bg_notifications: vec![
@@ -486,7 +488,10 @@ mod tests {
         )
         .await;
 
-        assert!(finalized.starts_with("Resume the interrupted task."));
+        assert!(finalized.starts_with("<system-reminder>\nBackground task updates"));
+        assert!(
+            finalized.contains("\n\ncontinue\n\n<system-reminder>\nResume the interrupted task.")
+        );
         assert!(finalized.contains("Background task updates since your last turn:"));
         assert!(!finalized.contains("Background command updates"));
         assert!(finalized.contains("bg-shell-1 completed"));

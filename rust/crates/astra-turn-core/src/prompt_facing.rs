@@ -69,16 +69,16 @@ pub fn sanitize_prompt_facing_messages(messages: Vec<Value>) -> Vec<Value> {
             }
         }
 
-        let Some(content) = extract_text_content(&msg) else {
+        let Some(raw_content) = extract_text_content(&msg) else {
+            continue;
+        };
+        let Some(content) = prompt_facing_content_for_role(role, &raw_content) else {
             continue;
         };
         if content.trim().is_empty() {
             continue;
         }
         if role == "system" && content.trim_start().starts_with(RUNTIME_RECAP_PREFIX) {
-            continue;
-        }
-        if crate::runtime_scaffolding::is_continuation_scaffolding_for_role(role, &content) {
             continue;
         }
 
@@ -121,10 +121,8 @@ pub fn user_visible_message(msg: &Value) -> Option<Value> {
     if !matches!(role, "user" | "assistant" | "system") {
         return None;
     }
-    let content = extract_text_content(msg)?;
-    if crate::runtime_scaffolding::is_continuation_scaffolding_for_role(role, &content) {
-        return None;
-    }
+    let raw_content = extract_text_content(msg)?;
+    let content = prompt_facing_content_for_role(role, &raw_content)?;
     if role == "system" && is_prompt_internal_system_text(&content) {
         return None;
     }
@@ -197,6 +195,71 @@ fn is_compaction_boundary_text(content: &str) -> bool {
 fn is_prompt_internal_system_text(content: &str) -> bool {
     let trimmed = content.trim_start();
     trimmed.starts_with(TOOL_RECAP_PREFIX) || trimmed.starts_with(RUNTIME_RECAP_PREFIX)
+}
+
+fn prompt_facing_content_for_role(role: &str, content: &str) -> Option<String> {
+    let content = if role == "user" {
+        strip_user_runtime_scaffolding_affixes(content)
+    } else {
+        content.trim().to_string()
+    };
+    if content.trim().is_empty() {
+        return None;
+    }
+    if crate::runtime_scaffolding::is_continuation_scaffolding_for_role(role, &content) {
+        return None;
+    }
+    Some(content)
+}
+
+fn strip_user_runtime_scaffolding_affixes(content: &str) -> String {
+    let mut text = content.trim().to_string();
+    loop {
+        let trimmed = text.trim_start();
+        if !trimmed.starts_with(crate::runtime_scaffolding::SYSTEM_REMINDER_WRAPPER_PREFIX) {
+            break;
+        }
+        let Some(end) = trimmed.find("</system-reminder>") else {
+            break;
+        };
+        text = trimmed[end + "</system-reminder>".len()..]
+            .trim_start_matches(|ch: char| ch.is_whitespace())
+            .to_string();
+    }
+
+    loop {
+        let trimmed = text.trim_end();
+        let Some(start) = trimmed.rfind(crate::runtime_scaffolding::SYSTEM_REMINDER_WRAPPER_PREFIX)
+        else {
+            break;
+        };
+        let suffix = &trimmed[start..];
+        if !suffix
+            .trim_start()
+            .starts_with(crate::runtime_scaffolding::SYSTEM_REMINDER_WRAPPER_PREFIX)
+            || !suffix.trim_end().ends_with("</system-reminder>")
+        {
+            break;
+        }
+        text = trimmed[..start]
+            .trim_end_matches(|ch: char| ch.is_whitespace())
+            .to_string();
+    }
+
+    let trimmed = text.trim_start();
+    if trimmed.starts_with(crate::runtime_scaffolding::SESSION_RESUME_PREFIX) {
+        if let Some((_head, suffix)) = trimmed.rsplit_once("\n\n") {
+            let suffix = suffix.trim();
+            if !suffix.is_empty()
+                && !suffix.starts_with('-')
+                && crate::runtime_scaffolding::detect_runtime_scaffolding(suffix).is_none()
+            {
+                return suffix.to_string();
+            }
+        }
+    }
+
+    text.trim().to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -555,6 +618,60 @@ mod tests {
         assert!(!joined.contains("ERROR BUDGET"));
         assert!(!joined.contains("Self-Status"));
         assert!(!joined.contains("Tools used:"));
+    }
+
+    #[test]
+    fn preserves_real_user_text_after_leading_system_reminder() {
+        let messages = vec![
+            json!({"role": "user", "content": "<system-reminder>\n## Session Memory Advisory\nstale memory\n</system-reminder>\n\n你知道我们之前做什么？"}),
+            json!({"role": "assistant", "content": "We reviewed the branch."}),
+        ];
+
+        let got = sanitize_prompt_facing_messages(messages);
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "你知道我们之前做什么？"}),
+                json!({"role": "assistant", "content": "We reviewed the branch."}),
+            ]
+        );
+    }
+
+    #[test]
+    fn strips_trailing_system_reminder_without_mutating_user_text() {
+        let messages = vec![
+            json!({"role": "user", "content": "继续修复\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            json!({"role": "assistant", "content": "Continuing."}),
+        ];
+
+        let got = sanitize_prompt_facing_messages(messages);
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "继续修复"}),
+                json!({"role": "assistant", "content": "Continuing."}),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_user_suffix_after_legacy_leading_resume_hint() {
+        let messages = vec![
+            json!({"role": "user", "content": "[session-resume:v1]\nResume context hydration was requested but no prior prompt-facing history could be restored.\nReason: degraded\nTreat this as a degraded resume.\n\n之前我说的话？"}),
+            json!({"role": "assistant", "content": "I should recover the journal."}),
+        ];
+
+        let got = sanitize_prompt_facing_messages(messages);
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "之前我说的话？"}),
+                json!({"role": "assistant", "content": "I should recover the journal."}),
+            ]
+        );
     }
 
     #[test]

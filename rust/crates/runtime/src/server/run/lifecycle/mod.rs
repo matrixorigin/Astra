@@ -3269,6 +3269,7 @@ impl AgenticRunLifecycleService {
         &self,
         user_id: &str,
         session_id: &str,
+        run_id: &str,
         resume_requested: bool,
     ) -> Option<String> {
         if !resume_requested {
@@ -3289,22 +3290,53 @@ impl AgenticRunLifecycleService {
             astra_services::session_restore::HybridRestoreService::new(shared.get().clone());
         match restore.restore_session(user_id, session_id).await {
             Ok(Some(restored)) => {
-                match astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-                    &restored.conversation_messages,
-                ) {
-                    Some(hint) => Some(hint),
-                    None => {
-                        tracing::warn!(
-                            target: "astra_runtime::resume_hydration",
-                            user_id,
-                            session_id,
-                            "resume hydration skipped: restored session has no prompt-facing transcript"
-                        );
-                        None
-                    }
+                if let Some(hint) =
+                    astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+                        &restored.conversation_messages,
+                    )
+                {
+                    return Some(hint);
                 }
+                let transcript_messages = self
+                    .restore_transcript_prompt_messages(
+                        user_id,
+                        session_id,
+                        run_id,
+                        "hybrid_restore_unusable",
+                    )
+                    .await;
+                if let Some(hint) = Self::session_resume_hydration_hint_from_sources(
+                    &restored.conversation_messages,
+                    &transcript_messages,
+                ) {
+                    return Some(hint);
+                }
+                tracing::warn!(
+                    target: "astra_runtime::resume_hydration",
+                    user_id,
+                    session_id,
+                    "resume hydration degraded: restored session has no prompt-facing transcript"
+                );
+                Some(
+                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                        "resume restored session metadata but no prompt-facing transcript/history",
+                    ),
+                )
             }
             Ok(None) => {
+                let transcript_messages = self
+                    .restore_transcript_prompt_messages(
+                        user_id,
+                        session_id,
+                        run_id,
+                        "hybrid_restore_empty",
+                    )
+                    .await;
+                if let Some(hint) =
+                    Self::session_resume_hydration_hint_from_sources(&[], &transcript_messages)
+                {
+                    return Some(hint);
+                }
                 tracing::warn!(
                     target: "astra_runtime::resume_hydration",
                     user_id,
@@ -3318,6 +3350,19 @@ impl AgenticRunLifecycleService {
                 )
             }
             Err(error) => {
+                let transcript_messages = self
+                    .restore_transcript_prompt_messages(
+                        user_id,
+                        session_id,
+                        run_id,
+                        "hybrid_restore_failed",
+                    )
+                    .await;
+                if let Some(hint) =
+                    Self::session_resume_hydration_hint_from_sources(&[], &transcript_messages)
+                {
+                    return Some(hint);
+                }
                 tracing::warn!(
                     target: "astra_runtime::resume_hydration",
                     user_id,
@@ -3332,6 +3377,20 @@ impl AgenticRunLifecycleService {
                 )
             }
         }
+    }
+
+    fn session_resume_hydration_hint_from_sources(
+        primary_messages: &[Value],
+        transcript_messages: &[Value],
+    ) -> Option<String> {
+        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+            primary_messages,
+        )
+        .or_else(|| {
+            astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+                transcript_messages,
+            )
+        })
     }
 
     async fn task_board_resume_hint_for_session(
@@ -4944,6 +5003,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .session_resume_hydration_hint_for_session(
                 &user_id,
                 &session_id,
+                &run_id,
                 request.session_id.is_some(),
             )
             .await;
@@ -5843,6 +5903,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .session_resume_hydration_hint_for_session(
                 &user_id,
                 &session_id,
+                &run_id,
                 request.session_id.is_some(),
             )
             .await;

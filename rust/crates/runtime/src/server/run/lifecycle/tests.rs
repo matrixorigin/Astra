@@ -2116,10 +2116,51 @@ async fn server_resume_hydration_failure_is_not_prompt_facing() {
     let service = test_service();
 
     let hint = service
-        .session_resume_hydration_hint_for_session("user-1", "session-1", true)
+        .session_resume_hydration_hint_for_session("user-1", "session-1", "run-1", true)
         .await;
 
     assert_eq!(hint, None);
+}
+
+#[test]
+fn server_resume_hydration_uses_transcript_when_primary_restore_is_not_viable() {
+    let primary = vec![json!({"role": "user", "content": "继续"})];
+    let transcript = vec![
+        json!({"role": "user", "content": "review branch changes"}),
+        json!({"role": "assistant", "content": "The review found resume continuity issues."}),
+    ];
+
+    let hint = AgenticRunLifecycleService::session_resume_hydration_hint_from_sources(
+        &primary,
+        &transcript,
+    )
+    .expect("transcript fallback should provide viable resume context");
+
+    assert!(hint.contains("active_objective: review branch changes"));
+    assert!(hint.contains("last_assistant_state: The review found resume continuity issues."));
+}
+
+#[test]
+fn server_resume_hydration_prefers_primary_restore_when_viable() {
+    let primary = vec![
+        json!({"role": "user", "content": "primary goal"}),
+        json!({"role": "assistant", "content": "primary state"}),
+    ];
+    let transcript = vec![
+        json!({"role": "user", "content": "transcript goal"}),
+        json!({"role": "assistant", "content": "transcript state"}),
+    ];
+
+    let hint = AgenticRunLifecycleService::session_resume_hydration_hint_from_sources(
+        &primary,
+        &transcript,
+    )
+    .expect("primary restore should provide viable resume context");
+
+    assert!(hint.contains("active_objective: primary goal"));
+    assert!(hint.contains("last_assistant_state: primary state"));
+    assert!(!hint.contains("transcript goal"));
+    assert!(!hint.contains("transcript state"));
 }
 
 fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycleService {
