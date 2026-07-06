@@ -150,10 +150,7 @@ pub fn cli_local_tool_schemas(
             })
         })
         .collect::<Vec<_>>();
-    pool.extend(mcp_provider_tool_schemas(
-        "cli-request-scoped-mcp",
-        client_mcp,
-    ));
+    pool.extend(mcp_provider_tool_schemas("cli-mcp", client_mcp));
     astra_turn_core::tool_surface::resolve(CapabilitySurface::CliLocal, capabilities, &pool)
 }
 
@@ -184,12 +181,12 @@ fn mcp_provider_tool_schemas(provider_id: &str, schemas: Vec<Value>) -> Vec<Valu
     astra_runtime_env::CapabilityResolver.filter_tool_schemas_for_providers(
         &registry,
         schemas,
-        &request_scoped_mcp_capabilities(),
+        &mcp_provider_capabilities(),
         &[provider],
     )
 }
 
-fn request_scoped_mcp_capabilities() -> astra_runtime_env::EffectiveCapabilitySet {
+fn mcp_provider_capabilities() -> astra_runtime_env::EffectiveCapabilitySet {
     astra_runtime_env::EffectiveCapabilitySet {
         workspace: astra_runtime_env::WorkspaceCapabilities {
             present: false,
@@ -617,7 +614,7 @@ mod tests {
     #[test]
     fn mcp_schema_pool_requires_provider_admitted_function_schema() {
         let tool_names = names(mcp_provider_tool_schemas(
-            "cli-request-scoped-mcp",
+            "cli-mcp",
             vec![
                 schema("mcp__zeta__query"),
                 schema("custom_plugin_tool"),
