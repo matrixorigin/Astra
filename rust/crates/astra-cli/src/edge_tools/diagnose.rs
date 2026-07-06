@@ -176,7 +176,7 @@ impl ToolExecutor {
                     ),
                     ("search", vec!["grep", "glob", "symbols", "lsp"]),
                     ("git", vec!["git"]),
-                    ("tasks", vec!["task"]),
+                    ("tasks", vec!["task_board"]),
                     ("utility", vec!["bash", "web_fetch", "sleep", "ask_user"]),
                 ];
                 let mut cat_status = serde_json::Map::new();

@@ -10,7 +10,7 @@ use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use super::super::agentic_loop::host::{AgenticLoopState, DELEGATE_TOOL_NAME, HostTurnResult};
 
 pub(crate) const CONTROL_PLANE_TOOLS: &[&str] = &[
-    "task",
+    "task_board",
     "session",
     "introspect",
     "notify",
@@ -1036,7 +1036,7 @@ mod tests {
     fn runtime_tool_allowlist_notice_lists_all_request_permitted_tools() {
         let mut state = make_state();
         state.skills.request_constraints.allowed_tools = Some(
-            ["read_file", "task", "notify", "ask_user"]
+            ["read_file", "task_board", "notify", "ask_user"]
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -1046,7 +1046,7 @@ mod tests {
 
         // All requested tools appear in the callable list.
         assert!(notice.contains("read_file"));
-        assert!(notice.contains("task"));
+        assert!(notice.contains("task_board"));
         assert!(notice.contains("notify"));
         assert!(notice.contains("ask_user"));
         // No separate control-plane exemption clause needed — they are
@@ -1172,7 +1172,7 @@ mod tests {
             json!({
                 "id": "call-task",
                 "type": "function",
-                "function": { "name": "task", "arguments": r#"{"action":"list"}"# }
+                "function": { "name": "task_board", "arguments": r#"{"action":"list"}"# }
             }),
             json!({
                 "id": "call-notify",
@@ -1196,7 +1196,7 @@ mod tests {
             &tool_calls,
             false,
             &HashSet::from([
-                "task".to_string(),
+                "task_board".to_string(),
                 "notify".to_string(),
                 "ask_user".to_string(),
                 "str_replace".to_string(),
@@ -1229,14 +1229,14 @@ mod tests {
         let tool_calls = vec![json!({
             "id": "call-task",
             "type": "function",
-            "function": { "name": "task", "arguments": r#"{"action":"list"}"# }
+            "function": { "name": "task_board", "arguments": r#"{"action":"list"}"# }
         })];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
             &empty_host_turn_result(),
             &tool_calls,
             false,
-            &HashSet::from(["task".to_string(), "bash".to_string()]),
+            &HashSet::from(["task_board".to_string(), "bash".to_string()]),
         )
         .await;
 

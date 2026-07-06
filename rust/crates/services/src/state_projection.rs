@@ -431,7 +431,7 @@ pub struct PlanTodoSeed {
 pub trait PlanTodoSink: Send + Sync + std::fmt::Debug {
     async fn seed(&self, todos: Vec<PlanTodoSeed>) -> Result<(), String>;
     /// U-6: mark prior plan's seeded rows as `superseded` so they
-    /// don't show alongside the new plan's items in `task.list`.
+    /// don't show alongside the new plan's items in `task_board.list`.
     /// `keep_plan_id` is the active plan whose rows MUST stay
     /// active.
     async fn supersede_other_plans(
@@ -1376,7 +1376,7 @@ impl DatabaseStateProjectionStore {
     /// that does NOT belong to `keep_plan_id` as `superseded`. Used
     /// when the user re-enters plan mode with a fresh plan: the prior
     /// plan's seeded items would otherwise stay `active` and pollute
-    /// `task.list` results next to the new plan's items.
+    /// `task_board.list` results next to the new plan's items.
     ///
     /// Returns the number of rows transitioned. `keep_plan_id` is
     /// the new active plan; passing `None` would supersede every

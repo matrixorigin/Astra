@@ -920,7 +920,7 @@ fn friendly_tool_display_name(name: &str) -> String {
         "str_replace" => "Replace text".into(),
         "grep" | "glob" => "Search".into(),
         "list_dir" => "List directory".into(),
-        "task" => "Task".into(),
+        "task_board" => "Task".into(),
         "memory" => "Memory".into(),
         "tool_search" => "Tool search".into(),
         _ => humanize_tool_name(name),

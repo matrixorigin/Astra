@@ -1703,7 +1703,7 @@ mod tests {
             "Compiling astra-cli v0.1.0\nwarning: unused import"
         ));
         assert!(!result_body_signals_failure("2 errors found in the file"));
-        // JSON that's successful (e.g. task.create output) must
+        // JSON that's successful (e.g. task_board.create output) must
         // stay ok.
         assert!(!result_body_signals_failure(
             r#"{"success":true,"task_id":"task-1"}"#

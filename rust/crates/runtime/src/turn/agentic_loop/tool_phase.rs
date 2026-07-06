@@ -507,7 +507,7 @@ pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
             // session state
             | "adjust_config"
             | "compress_context"
-            | "task"
+            | "task_board"
     )
 }
 
@@ -535,7 +535,7 @@ fn tool_record_is_server_mutator(record: &ToolCallRecord) -> bool {
 }
 
 fn task_tool_call_is_session_state_mutator(tool_call: &Value) -> bool {
-    if tool_call_name(tool_call) != Some("task") {
+    if tool_call_name(tool_call) != Some("task_board") {
         return false;
     }
     matches!(
@@ -2987,7 +2987,7 @@ esac
         // Session-state mutators
         assert!(is_server_mutator_tool_name("adjust_config"));
         assert!(is_server_mutator_tool_name("compress_context"));
-        assert!(is_server_mutator_tool_name("task"));
+        assert!(is_server_mutator_tool_name("task_board"));
 
         // Common read-only tools must NOT be classified as mutators.
         for name in [
@@ -3047,19 +3047,19 @@ esac
     fn task_round_mutator_detection_uses_task_action_only() {
         assert!(server_session_state_mutator_in_round(&[json!({
             "function": {
-                "name": "task",
+                "name": "task_board",
                 "arguments": "{\"action\":\"create\",\"title\":\"ship\"}"
             }
         })]));
         assert!(server_session_state_mutator_in_round(&[json!({
             "function": {
-                "name": "task",
+                "name": "task_board",
                 "arguments": "{\"action\":\"archive\",\"task_id\":\"task-1\"}"
             }
         })]));
         assert!(!server_session_state_mutator_in_round(&[json!({
             "function": {
-                "name": "task",
+                "name": "task_board",
                 "arguments": "{\"action\":\"list\"}"
             }
         })]));

@@ -26,7 +26,7 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "brief" => "Brief",
         "share_context" => "Sharing context",
         "query_context" => "Querying context",
-        "task" => "Task",
+        "task_board" => "Task",
         "get_agent_info" => "Getting agent info",
         "reflect" => "Reflecting",
         "context_analysis" => "Analyzing context",

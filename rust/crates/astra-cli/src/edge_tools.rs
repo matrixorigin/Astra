@@ -7002,10 +7002,13 @@ mod tests {
                 "subtasks": []
             }),
         )
-        .expect_err("task.update must reject create-only subtasks");
+        .expect_err("task_board.update must reject create-only subtasks");
 
-        assert!(err.contains("unknown field 'subtasks' for task.update"));
-        assert!(err.contains("field is valid for: task.create"), "{err}");
+        assert!(err.contains("unknown field 'subtasks' for task_board.update"));
+        assert!(
+            err.contains("field is valid for: task_board.create"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

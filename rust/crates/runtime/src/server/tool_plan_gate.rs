@@ -366,9 +366,9 @@ mod tests {
             ("git", json!({"action": "status"})),
             ("git", json!({"action": "diff"})),
             ("github", json!({"action": "list_prs"})),
-            ("task", json!({"action": "list"})),
+            ("task_board", json!({"action": "list"})),
             (
-                "task",
+                "task_board",
                 json!({"action": "create", "title": "draft plan item"}),
             ),
             (
@@ -390,7 +390,7 @@ mod tests {
             &json!({"task_id": "bg-shell-1"})
         ));
         assert!(is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "stop", "task_id": "bg-shell-1"})
         ));
         assert!(is_plan_mode_blocked_tool(

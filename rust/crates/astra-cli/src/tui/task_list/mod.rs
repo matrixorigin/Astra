@@ -1461,7 +1461,7 @@ mod tests {
     }
 
     /// REGRESSION: model emits one parent task with 5 subtasks via
-    /// `task.create({subtasks: [...]})`, but the dashboard only ever
+    /// `task_board.create({subtasks: [...]})`, but the dashboard only ever
     /// rendered the parent line — subtasks were invisible. This test
     /// pins inline rendering: parent line first, then one indented
     /// row per subtask, with status icons reflecting each subtask's

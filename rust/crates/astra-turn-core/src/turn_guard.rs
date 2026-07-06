@@ -1166,18 +1166,18 @@ mod tests {
         let mut guard = TurnGuard::new();
         let errors = [
             "Error: field 'subtask_id' only supports new_status updates; unsupported with subtask_id: reason",
-            "Error: Tool 'task' is not available in this turn. Call only tools visible in this turn's `tools[]`.",
+            "Error: Tool 'task_board' is not available in this turn. Call only tools visible in this turn's `tools[]`.",
             "Error: unsupported output_mode 'xml'. Use 'content', 'files_with_matches', or 'count'.",
         ];
 
         for error in errors {
-            let quality = guard.record_tool_result("task", error);
+            let quality = guard.record_tool_result("task_board", error);
             assert_eq!(quality, super::result_quality::ResultQuality::Error);
         }
 
         let health = guard
             .health
-            .get("task")
+            .get("task_board")
             .expect("task health should be tracked");
         assert_eq!(health.total_calls, errors.len());
         assert_eq!(health.total_failures, errors.len());
@@ -1186,7 +1186,7 @@ mod tests {
             "caller-fixable contract errors must not count toward tool quarantine"
         );
         assert!(
-            !guard.health.is_avoidance_advised("task"),
+            !guard.health.is_avoidance_advised("task_board"),
             "bad tool-call shape must not hide a healthy task tool"
         );
     }

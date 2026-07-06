@@ -495,7 +495,7 @@ fn edge_tool_is_cacheable_read(tool: &str, args: &Value) -> bool {
             | "web_search"
             | "web_fetch"
             | "memory"
-            | "task"
+            | "task_board"
             | "agent"
             | "mo_query"
     ) {
@@ -6182,7 +6182,7 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "tool_search" => format!("Searching tools: {preview}"),
         "enter_plan_mode" => format!("Enter plan mode: \"{preview}\""),
         "exit_plan_mode" => "Exit plan mode".to_string(),
-        "task" => format_task_display_from_preview(preview),
+        "task_board" => format_task_display_from_preview(preview),
         "mo_query" => format!("MatrixOne query: \"{preview}\""),
         // `memory` is action-aware; when we only have the preview string (not the
         // parsed args), surface it generically. Callers that have the full args
@@ -8364,21 +8364,24 @@ mod tests {
             format_tool_display_from_preview("rollback_database_snapshots", Some("snap_123")),
             "Revert DB snapshots: snap_123"
         );
-        // task
+        // task board
         assert_eq!(
-            format_tool_display_from_preview("task", Some("create \"Fix renderer drift\"")),
+            format_tool_display_from_preview("task_board", Some("create \"Fix renderer drift\"")),
             "Creating task: \"Fix renderer drift\""
         );
         assert_eq!(
-            format_tool_display_from_preview("task", Some("update render-pass -> in_progress")),
+            format_tool_display_from_preview(
+                "task_board",
+                Some("update render-pass -> in_progress")
+            ),
             "Updating task: render-pass -> in_progress"
         );
         assert_eq!(
-            format_tool_display_from_preview("task", Some("list active")),
+            format_tool_display_from_preview("task_board", Some("list active")),
             "Listing tasks: active"
         );
         assert_eq!(
-            format_tool_display_from_preview("task", Some("list_user paused")),
+            format_tool_display_from_preview("task_board", Some("list_user paused")),
             "Listing cross-session tasks: paused"
         );
         assert_eq!(
@@ -10451,12 +10454,12 @@ mod tests {
         let advertisement: astra_runtime_env::RuntimeEnvironmentAdvertisement =
             serde_json::from_value(runtime_environment.clone())
                 .expect("runtime advertisement should deserialize");
-        assert!(advertisement.binding.tool_surface.contains("task"));
+        assert!(advertisement.binding.tool_surface.contains("task_board"));
         assert!(
             astra_runtime_env::CapabilityResolver
                 .check_tool_call_for_surface(
                     &astra_runtime_env::ToolRegistry::builtins(),
-                    "task",
+                    "task_board",
                     &serde_json::json!({"action": "list"}),
                     &advertisement.binding.capabilities,
                     &advertisement.binding.tool_surface,

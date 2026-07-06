@@ -1308,7 +1308,7 @@ mod tests {
     fn error_streak_preview_truncates_on_utf8_char_boundary() {
         let error = format!("{}⚠ task returned an error", "x".repeat(199));
         let samples = [ToolCallSample {
-            name: "task.create",
+            name: "task_board.create",
             ok: false,
             round: Some(1),
             file_path: None,

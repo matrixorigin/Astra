@@ -355,7 +355,7 @@ pub async fn ensure_plan_step_task(request: PlanStepTaskRequest<'_>) -> Result<S
         .ok_or_else(|| {
             format!(
                 "approved plan step '{}' for '{goal}' was not visible in task board after \
-                 task.create",
+                 task_board.create",
                 subtask.id
             )
         })

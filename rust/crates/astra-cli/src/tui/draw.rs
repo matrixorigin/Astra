@@ -253,7 +253,7 @@ pub(crate) fn active_viewport(
         }
     });
     // Pump the observer before reading its snapshot. Without this,
-    // mid-turn `task.create` / `task.update` calls land in
+    // mid-turn `task_board.create` / `task_board.update` calls land in
     // `session_todos` but never propagate into the snapshot until
     // the outer-tick branch fires `maybe_refresh()` — which can
     // be 30+ seconds for a long agentic loop. The observer's own
@@ -273,7 +273,7 @@ pub(crate) fn active_viewport(
     // This is the critical fix: previously, resolve_board_visibility
     // only ran in the outer-tick, so in-turn draws always saw the
     // stale `board_expanded = false` from turn start. Now every draw
-    // self-corrects — if task.create lands mid-turn, the board opens
+    // self-corrects — if task_board.create lands mid-turn, the board opens
     // on the very next frame (≤50ms).
     let has_tasks = !snap.tasks.is_empty();
     let (resolved_expanded, _reset_pin) = super::board_pin::resolve_board_visibility(

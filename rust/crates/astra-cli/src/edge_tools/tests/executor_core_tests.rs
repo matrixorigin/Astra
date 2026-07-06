@@ -441,7 +441,7 @@ async fn task_background_actions_are_plain_unknown_task_actions() {
     for action in ["background_shell", "background_agent", "output", "kill"] {
         let result = executor
             .execute(
-                "task",
+                "task_board",
                 &json!({
                     "action": action,
                     "command": "echo hi",
@@ -456,7 +456,7 @@ async fn task_background_actions_are_plain_unknown_task_actions() {
              a red banner — got: {result}"
         );
         assert!(
-            result.contains("unknown `task` action") && result.contains(action),
+            result.contains("unknown `task_board` action") && result.contains(action),
             "task.{action} must be rejected by the ordinary unknown-action path. Got: {result}"
         );
         assert!(

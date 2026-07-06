@@ -577,7 +577,7 @@ fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                     }
                 }
                 "delegate" => obj
-                    .get("task")
+                    .get("task_board")
                     .and_then(|v| v.as_str())
                     .map(|t| format!("delegate: {}", truncate_str(t, 36))),
                 "run_chain" => obj
@@ -658,7 +658,7 @@ fn fmt_utility_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                 _ => None,
             }
         }
-        "task" => task_tool_detail(obj),
+        "task_board" => task_tool_detail(obj),
         "get_agent_info" => obj
             .get("dimension")
             .and_then(|v| v.as_str())
@@ -1245,7 +1245,7 @@ mod tests {
     #[test]
     fn tool_call_detail_task_create_shows_title() {
         let detail = tool_call_detail(
-            "task",
+            "task_board",
             &json!({"action": "create", "title": "Fix renderer drift"}),
         );
         assert_eq!(detail.as_deref(), Some("Fix renderer drift"));
@@ -1254,7 +1254,7 @@ mod tests {
     #[test]
     fn tool_call_detail_task_update_shows_status() {
         let detail = tool_call_detail(
-            "task",
+            "task_board",
             &json!({"action": "update", "task_id": "render-pass", "new_status": "in_progress"}),
         );
         assert_eq!(detail.as_deref(), Some("render-pass -> in_progress"));

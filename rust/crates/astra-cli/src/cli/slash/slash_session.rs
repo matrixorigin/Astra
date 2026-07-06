@@ -8591,7 +8591,7 @@ mod resume_tests {
         let child_state = session_runtime::RestoredSessionState {
             history: vec![("child-q".into(), "child-a".into())],
             turn: 1,
-            recent_tools: vec!["task".into()],
+            recent_tools: vec!["task_board".into()],
             total_prompt_tokens: 10,
             total_completion_tokens: 20,
             total_cache_read_tokens: 30,
@@ -8772,7 +8772,7 @@ mod resume_tests {
         let child_state = session_runtime::RestoredSessionState {
             history: vec![("child-q".into(), "child-a".into())],
             turn: 1,
-            recent_tools: vec!["task".into()],
+            recent_tools: vec!["task_board".into()],
             total_prompt_tokens: 10,
             total_completion_tokens: 20,
             total_cache_read_tokens: 30,
@@ -8826,7 +8826,7 @@ mod resume_tests {
         let child_state = session_runtime::RestoredSessionState {
             history: vec![("child-q".into(), "child-a".into())],
             turn: 1,
-            recent_tools: vec!["task".into()],
+            recent_tools: vec!["task_board".into()],
             total_prompt_tokens: 10,
             total_completion_tokens: 20,
             total_cache_read_tokens: 30,
@@ -8879,7 +8879,7 @@ mod resume_tests {
         let child_state = session_runtime::RestoredSessionState {
             history: vec![("child-q".into(), "child-a".into())],
             turn: 1,
-            recent_tools: vec!["task".into()],
+            recent_tools: vec!["task_board".into()],
             total_prompt_tokens: 10,
             total_completion_tokens: 20,
             total_cache_read_tokens: 30,

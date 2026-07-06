@@ -782,7 +782,7 @@ mod tests {
     }
 
     /// REGRESSION (Phase 4 / problem 1): the in-turn `do_draw` path
-    /// must observe a task.create within UI-perceptible latency.
+    /// must observe a task_board.create within UI-perceptible latency.
     /// Pre-fix `FAST_POLL` was 250ms; user-reported behaviour was
     /// "task board never appears until the turn ends" because the
     /// outer-tick branch was the only place `maybe_refresh` ran.

@@ -870,7 +870,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `agent(spawn)` + `agent(get_result)`: one synchronous or background sub-agent you plan to collect results from.
          - `agent_fanout`: fixed-size parallel sub-agent groups with target-count accounting.
          - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
-         - `task`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
+         - `task_board`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
                 "parameters": {
                     "type": "object",
                     "properties": {

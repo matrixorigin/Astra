@@ -1878,7 +1878,7 @@ enum CellKind {
 /// calls stream back with `parent_tool_use_id` set. Extend this
 /// allowlist when a new delegate-style tool lands.
 ///
-/// The `task` tool (session_todos) is intentionally NOT included:
+/// The `task_board` tool (session_todos) is intentionally NOT included:
 /// it is a flat TODO tracker that never emits children, so a tree
 /// header would be noise.
 fn is_task_like_tool(name: &str) -> bool {

@@ -6158,7 +6158,7 @@ mod tests {
         .build();
 
         let names = schema_names(&host.tool_schemas);
-        for expected in ["ask_user", "task", "tool_search", "introspect"] {
+        for expected in ["ask_user", "task_board", "tool_search", "introspect"] {
             assert!(
                 names.contains(expected),
                 "control-plane backbone tool {expected} must remain visible when server-service capacity is disabled: {names:?}"
@@ -6456,7 +6456,7 @@ mod tests {
             json!({
                 "id": "task-1",
                 "type": "function",
-                "function": {"name": "task", "arguments": r#"{"action":"create","title":"server task"}"#}
+                "function": {"name": "task_board", "arguments": r#"{"action":"create","title":"server task"}"#}
             }),
             json!({
                 "id": "unknown-1",
@@ -6577,7 +6577,7 @@ mod tests {
         let task_call = json!({
             "id": "task-1",
             "type": "function",
-            "function": {"name": "task", "arguments": r#"{"action":"create","title":"server task"}"#}
+            "function": {"name": "task_board", "arguments": r#"{"action":"create","title":"server task"}"#}
         });
 
         let results = host
@@ -6613,7 +6613,7 @@ mod tests {
         for expected in [
             "bash",
             "read_file",
-            "task",
+            "task_board",
             "session",
             "tool_search",
             "web_search",
@@ -6666,7 +6666,7 @@ mod tests {
             names.contains("bash"),
             "edge-declared runtime tools should remain visible"
         );
-        for expected in ["task", "session", "tool_search", "introspect"] {
+        for expected in ["task_board", "session", "tool_search", "introspect"] {
             assert!(
                 names.contains(expected),
                 "control-plane backbone tool {expected} must remain visible with edge tools: {names:?}"
@@ -7130,7 +7130,7 @@ mod tests {
 
         assert!(host.valid_tool_names().contains("bash"));
         assert!(host.valid_tool_names().contains("read_file"));
-        for expected in ["task", "session", "tool_search", "introspect"] {
+        for expected in ["task_board", "session", "tool_search", "introspect"] {
             assert!(
                 host.valid_tool_names().contains(expected),
                 "control-plane backbone tool {expected} must remain valid with server-service capacity disabled: {:?}",
@@ -7177,7 +7177,7 @@ mod tests {
             !names.contains("bash"),
             "prompt-visible edge runtime tools must mirror the advertised offer set"
         );
-        for expected in ["task", "session", "tool_search", "introspect"] {
+        for expected in ["task_board", "session", "tool_search", "introspect"] {
             assert!(
                 host.valid_tool_names().contains(expected),
                 "control-plane backbone tool {expected} must remain valid while runtime tools are provider-scoped"
@@ -9750,7 +9750,7 @@ mod tests {
             "session",
             "compress_context",
             "rollback_session_state",
-            "task",
+            "task_board",
             "agent",
             "agent_fanout",
             "enter_plan_mode",
@@ -9813,7 +9813,7 @@ mod tests {
             "session",
             "compress_context",
             "rollback_session_state",
-            "task",
+            "task_board",
             "agent",
             "agent_fanout",
             "enter_plan_mode",

@@ -45,7 +45,7 @@ pub(crate) async fn finalize_effective_line(
 
     const TURNS_SINCE_TASK_USE_THRESHOLD: u32 = 10;
     const TURNS_BETWEEN_REMINDERS: u32 = 10;
-    if state.recent_tools.iter().any(|tool| tool == "task") {
+    if state.recent_tools.iter().any(|tool| tool == "task_board") {
         state.turns_since_task_use = 0;
     } else {
         state.turns_since_task_use += 1;
@@ -60,7 +60,7 @@ pub(crate) async fn finalize_effective_line(
                 format!(
                     "<system-reminder>\n\
                 The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, \
-                consider using task(action='create') to add new tasks and task(action='update', task_id='...', new_status='...') to update task status \
+                consider using task_board(action='create') to add new tasks and task_board(action='update', task_id='...', new_status='...') to update task status \
                 (set new_status='in_progress' when starting, new_status='completed' when done, or new_status='paused' when waiting). Also consider cleaning up the task list if it has become stale. \
                 Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable. \
                 Make sure that you NEVER mention this reminder to the user\n\
@@ -72,7 +72,7 @@ pub(crate) async fn finalize_effective_line(
             Err(error) => Some(format!(
                 "<system-reminder>\n\
                 Task board state could not be loaded while checking whether a task reminder is needed: {error}\n\
-                Do not assume there are no open tasks. If task tracking is relevant to the current work, retry task(action='list') or continue without task updates if unrelated. \
+                Do not assume there are no open tasks. If task tracking is relevant to the current work, retry task_board(action='list') or continue without task updates if unrelated. \
                 This reminder is throttled; never mention it to the user.\n\
                 </system-reminder>"
             )),

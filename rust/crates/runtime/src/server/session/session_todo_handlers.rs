@@ -4,7 +4,7 @@
 //! so edge clients (CLI, web agent) never connect to MO directly. The
 //! TaskManager business logic (cycle detection, parent reconciliation,
 //! id allocation) lives on the server; clients send the raw action +
-//! args from the LLM `task` tool and receive the rendered string output.
+//! args from the LLM `task_board` tool and receive the rendered string output.
 //!
 //! Endpoints:
 //! - `POST /sessions/{session_id}/todos:execute` — run a TaskManager
@@ -34,11 +34,11 @@ const SESSION_TODO_OWNER_LOCK_SQL: &str =
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecuteTodoRequest {
-    /// `task` tool action: `create | update | list | get | stop | archive`.
+    /// `task_board` tool action: `create | update | list | get | stop | archive`.
     /// Internal callers may also use `fork_copy`; it is not advertised
     /// in the model-facing task schema.
     pub action: String,
-    /// Action arguments — same shape the LLM emits to the `task` tool.
+    /// Action arguments — same shape the LLM emits to the `task_board` tool.
     /// Unknown fields are rejected by action-specific validation.
     #[serde(default)]
     pub args: serde_json::Value,
@@ -172,12 +172,12 @@ fn required_adopt_string(args: &serde_json::Value, field: &str) -> Result<String
 
 fn validate_adopt_args(args: &serde_json::Value) -> Result<(), String> {
     let Some(obj) = args.as_object() else {
-        return Err("task.adopt arguments must be an object".to_string());
+        return Err("task_board.adopt arguments must be an object".to_string());
     };
     for key in obj.keys() {
         if !["action", "source_session_id", "task_id"].contains(&key.as_str()) {
             return Err(format!(
-                "unknown field '{key}' for task.adopt (valid: action, source_session_id, task_id)"
+                "unknown field '{key}' for task_board.adopt (valid: action, source_session_id, task_id)"
             ));
         }
     }
@@ -1027,7 +1027,7 @@ async fn adopt_task_into_session(
                 "source_session_id": source_session,
                 "target_session_id": target_session,
                 "task_id": source_task_id,
-                "message": "Task is already in the current session; continue with task.update/task.get."
+                "message": "Task is already in the current session; continue with task_board.update/task_board.get."
             })
         );
     }
@@ -2513,7 +2513,7 @@ mod tests {
                 && update_response.output.contains("unknown field")
                 && update_response.output.contains("status")
                 && update_response.output.contains("new_status"),
-            "cloud task.update should reject the old status argument: {}",
+            "cloud task_board.update should reject the old status argument: {}",
             update_response.output
         );
 

@@ -71,10 +71,10 @@ pub(crate) enum TaskMutationKind {
 impl TaskMutationKind {
     pub(crate) fn event_reason(self) -> &'static str {
         match self {
-            Self::Create => "task.create",
-            Self::Update => "task.update",
-            Self::Stop => "task.stop",
-            Self::Archive => "task.archive",
+            Self::Create => "task_board.create",
+            Self::Update => "task_board.update",
+            Self::Stop => "task_board.stop",
+            Self::Archive => "task_board.archive",
         }
     }
 
@@ -169,7 +169,7 @@ pub(crate) async fn task_list_user(task_manager: &TaskManager, args: &Value) -> 
 }
 
 pub(crate) fn task_adopt_requires_http_endpoint_result() -> String {
-    "Error: task(action='adopt') requires the HTTP /sessions/{session_id}/todos:execute endpoint so the source migrate and target clone use the transactional MatrixOne CAS path"
+    "Error: task_board(action='adopt') requires the HTTP /sessions/{session_id}/todos:execute endpoint so the source migrate and target clone use the transactional MatrixOne CAS path"
         .to_string()
 }
 
@@ -305,7 +305,7 @@ fn task_tool_result(output: String, rollback: Option<TaskMutationRollback>) -> T
     }
 }
 
-/// Server-side entry point for the `task` tool. Delegates to
+/// Server-side entry point for the `task_board` tool. Delegates to
 /// [`execute_task_tool`] and records rollback handles plus task-board
 /// work-surface snapshots on the executor.
 pub(super) async fn execute_with_executor(
@@ -390,8 +390,11 @@ mod tests {
         )
         .expect_err("subtasks are create-only");
 
-        assert!(err.contains("unknown field 'subtasks' for task.update"));
-        assert!(err.contains("field is valid for: task.create"), "{err}");
+        assert!(err.contains("unknown field 'subtasks' for task_board.update"));
+        assert!(
+            err.contains("field is valid for: task_board.create"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -400,13 +403,13 @@ mod tests {
             "update",
             &json!({"action": "update", "task_id": "task-1", "new_status": "failed", "reason": "blocked"}),
         )
-        .expect("task.update supports reason");
+        .expect("task_board.update supports reason");
 
         validate_task_tool_args_for_action(
             "archive",
             &json!({"action": "archive", "task_id": "task-1", "reason": "old history"}),
         )
-        .expect("task.archive supports reason");
+        .expect("task_board.archive supports reason");
     }
 
     #[test]
@@ -457,8 +460,8 @@ mod tests {
 
     #[test]
     fn mutation_kind_produces_stable_event_reasons_and_rollback_labels() {
-        assert_eq!(TaskMutationKind::Create.event_reason(), "task.create");
-        assert_eq!(TaskMutationKind::Update.event_reason(), "task.update");
+        assert_eq!(TaskMutationKind::Create.event_reason(), "task_board.create");
+        assert_eq!(TaskMutationKind::Update.event_reason(), "task_board.update");
         assert_eq!(
             TaskMutationKind::Create.rollback_label(&json!({"title": "ship"})),
             "task:create:ship"
@@ -486,7 +489,7 @@ mod tests {
             .rollback
             .expect("successful mutation should produce rollback");
         assert_eq!(rollback.label, "task:create:ship");
-        assert_eq!(rollback.event_reason, "task.create");
+        assert_eq!(rollback.event_reason, "task_board.create");
     }
 
     #[tokio::test]
@@ -525,7 +528,10 @@ mod tests {
             execute_task_tool(&manager, &json!({"action": "cancel", "task_id": "task-1"})).await;
         assert!(hidden_alias.result.is_error, "{hidden_alias:?}");
         assert!(
-            hidden_alias.result.output.contains("unknown `task` action")
+            hidden_alias
+                .result
+                .output
+                .contains("unknown `task_board` action")
                 && hidden_alias.result.output.contains("cancel"),
             "schema-hidden action aliases must fail closed: {hidden_alias:?}"
         );
@@ -562,6 +568,6 @@ mod tests {
         assert!(outcome.result.output.contains("\"success\":true"));
         let rollback = outcome.rollback.expect("successful create rollback");
         assert_eq!(rollback.label, "task:create:ship");
-        assert_eq!(rollback.event_reason, "task.create");
+        assert_eq!(rollback.event_reason, "task_board.create");
     }
 }

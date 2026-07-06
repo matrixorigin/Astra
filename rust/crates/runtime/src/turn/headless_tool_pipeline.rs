@@ -1214,14 +1214,14 @@ mod tests {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round[0] = EdgeToolExecResult {
             request_id: "call-task".to_string(),
-            tool: "task".to_string(),
+            tool: "task_board".to_string(),
             args: json!({ "action": "create", "title": "server-owned task" }),
             output: "stale client-side task result".to_string(),
             tool_result_fields: Some(edge_runtime_environment_fields()),
             status: "completed".to_string(),
             duration_ms: 9,
         };
-        harness.valid_tool_names = HashSet::from(["task".to_string()]);
+        harness.valid_tool_names = HashSet::from(["task_board".to_string()]);
         begin_recorded_turn(&mut harness, 1);
 
         let dir = tempfile::TempDir::new().unwrap();

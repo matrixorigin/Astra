@@ -1294,7 +1294,7 @@ fn normalize_update_status(args: &Value) -> Result<Option<SessionTaskStatusKind>
     let raw_new_status = args.get("new_status");
     if args.get("status").is_some() {
         return Err(
-            "field 'status' is not supported for task.update; use 'new_status'".to_string(),
+            "field 'status' is not supported for task_board.update; use 'new_status'".to_string(),
         );
     }
     let Some(raw_status) = raw_new_status else {
@@ -1384,7 +1384,7 @@ fn validate_allowed_fields(args: &Value, action: &str, allowed: &[&str]) -> Resu
     debug_assert_eq!(
         crate::task_tool_contract::task_action_allowed_fields(action),
         Some(allowed),
-        "TaskManager field list for task.{action} must match task_tool_contract"
+        "TaskManager field list for task_board.{action} must match task_tool_contract"
     );
     crate::task_tool_contract::validate_public_task_tool_args_for_action(action, args)
 }
@@ -1462,7 +1462,7 @@ fn parse_create_subtasks(
         for key in obj.keys() {
             if !["id", "title", "description", "depends_on", "owner"].contains(&key.as_str()) {
                 return Err(format!(
-                    "unknown field 'subtasks[{index}].{key}' for task.create"
+                    "unknown field 'subtasks[{index}].{key}' for task_board.create"
                 ));
             }
         }
@@ -2263,7 +2263,7 @@ impl TaskManager {
                                 "duplicate_title": dup.title,
                                 "duplicate_status": dup.status,
                                 "message": format!(
-                                    "Refused: an open task with the same normalized title already exists (id={}). Use task(action='update') or task(action='get') instead of creating a duplicate.",
+                                    "Refused: an open task with the same normalized title already exists (id={}). Use task_board(action='update') or task_board(action='get') instead of creating a duplicate.",
                                     dup.id
                                 ),
                             })
@@ -2288,7 +2288,7 @@ impl TaskManager {
                             format!(
                                 "Error: task counter desync — id '{task_id}' already exists. \
                                  The session's counter may need to be reset. \
-                                 Contact support or use `task(action='list')` to see the \
+                                 Contact support or use `task_board(action='list')` to see the \
                                  current task list and manually continue from the last id."
                             ),
                             json!({
@@ -2427,7 +2427,7 @@ impl TaskManager {
                     entry["blocked_by"] = json!(t.blocked_by);
                 }
                 // U-5: surface the failure reason inline so the model
-                // sees "why" without a follow-up `task.get`. Only on
+                // sees "why" without a follow-up `task_board.get`. Only on
                 // failed rows; other statuses don't have an
                 // error_message so the field would be confusing noise.
                 if t.status.is_failed() {
@@ -2668,7 +2668,7 @@ impl TaskManager {
                 || error_message.is_some()
                 || reason.is_some();
             if !has_parent_update {
-                return "Error: task.update requires at least one update field: new_status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message".to_string();
+                return "Error: task_board.update requires at least one update field: new_status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message".to_string();
             }
         }
         let sid = self.sid();
@@ -2835,7 +2835,7 @@ impl TaskManager {
                                     "duplicate_status": dup.status,
                                     "task_id": task_id,
                                     "message": format!(
-                                        "Refused: renaming task '{}' would duplicate open task '{}' (id={}). Use task(action='update') or task(action='get') on the existing task instead.",
+                                        "Refused: renaming task '{}' would duplicate open task '{}' (id={}). Use task_board(action='update') or task_board(action='get') on the existing task instead.",
                                         task_id,
                                         dup.title,
                                         dup.id
@@ -3833,9 +3833,9 @@ mod tests {
     }
 
     /// U-5 (unhappy path): when a task is marked `failed` with an
-    /// `error_message`, `task.list` must surface that reason as
+    /// `error_message`, `task_board.list` must surface that reason as
     /// `error_preview` (truncated to ~80 chars). Pre-fix the model
-    /// had to call `task.get(id)` to see why something failed —
+    /// had to call `task_board.get(id)` to see why something failed —
     /// most models don't, so the failure context was lost.
     #[tokio::test]
     async fn list_surfaces_failure_reason_for_failed_tasks() {
@@ -6233,7 +6233,7 @@ mod tests {
 
     // ── U-8: status_filter SQL pushdown ──────────────────────────────
     //
-    // Pre-fix: `task.list(status_filter='active')` called
+    // Pre-fix: `task_board.list(status_filter='active')` called
     // `store.load()` (all rows) then filtered in Rust. With 5 000
     // tasks and the index `idx_session_todos_owner_session_status_updated`,
     // the DB can answer "active only" in a single index scan instead
@@ -6243,13 +6243,13 @@ mod tests {
     // production uses the index.
     //
     // These tests pin:
-    //   (a) `task.list(status_filter='active')` returns only open-work
+    //   (a) `task_board.list(status_filter='active')` returns only open-work
     //       rows (pending/in_progress/paused), even on the in-memory store
     //       (correctness — same before and after, but now via a
     //       dedicated path that the MO impl overrides).
-    //   (b) `task.list(status_filter='completed')` still works
+    //   (b) `task_board.list(status_filter='completed')` still works
     //       after the refactor.
-    //   (c) `task.list` with no filter still returns all rows.
+    //   (c) `task_board.list` with no filter still returns all rows.
 
     // ── U-8 spy test pin ──────────────────────────────────────────────
     // When status_filter='active', the store's load_active is used, not
@@ -6427,7 +6427,7 @@ mod tests {
         assert!(
             legacy.contains("unknown field 'status'")
                 && !legacy.contains("valid: action, status_filter, status"),
-            "status must not remain a recognized task.list argument: {legacy}"
+            "status must not remain a recognized task_board.list argument: {legacy}"
         );
     }
 

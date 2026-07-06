@@ -30,7 +30,10 @@ async fn task_tool_create_is_executable() {
     let (_dir, exe) = setup();
 
     let unified = exe
-        .execute("task", &json!({"action": "create", "title": "new surface"}))
+        .execute(
+            "task_board",
+            &json!({"action": "create", "title": "new surface"}),
+        )
         .await;
     let parsed = parse_task_json(&unified);
     assert_eq!(parsed["success"], true);
@@ -43,7 +46,7 @@ async fn task_list_user_rejects_invalid_status_before_cloud_call() {
 
     let typo = exe
         .execute(
-            "task",
+            "task_board",
             &json!({"action": "list_user", "user_status": "cancelledd"}),
         )
         .await;
@@ -53,7 +56,10 @@ async fn task_list_user_rejects_invalid_status_before_cloud_call() {
     );
 
     let wrong_type = exe
-        .execute("task", &json!({"action": "list_user", "user_status": true}))
+        .execute(
+            "task_board",
+            &json!({"action": "list_user", "user_status": true}),
+        )
         .await;
     assert!(
         wrong_type.contains("user_status") && wrong_type.contains("string"),
@@ -62,7 +68,7 @@ async fn task_list_user_rejects_invalid_status_before_cloud_call() {
 
     let unknown_field = exe
         .execute(
-            "task",
+            "task_board",
             &json!({"action": "list_user", "user_status": "active", "limit": 10}),
         )
         .await;
@@ -123,7 +129,7 @@ async fn cloud_task_notify_only_fires_for_successful_mutations() {
 
     let list = exe
         .execute(
-            "task",
+            "task_board",
             &json!({"action": "list", "status_filter": "active"}),
         )
         .await;
@@ -133,12 +139,12 @@ async fn cloud_task_notify_only_fires_for_successful_mutations() {
             rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ),
-        "read-only task.list must not wake the task-board observer"
+        "read-only task_board.list must not wake the task-board observer"
     );
 
     let refused = exe
         .execute(
-            "task",
+            "task_board",
             &json!({"action": "update", "task_id": "task-2", "title": "duplicate"}),
         )
         .await;
@@ -153,7 +159,7 @@ async fn cloud_task_notify_only_fires_for_successful_mutations() {
 
     let updated = exe
         .execute(
-            "task",
+            "task_board",
             &json!({"action": "update", "task_id": "task-2", "new_status": "completed"}),
         )
         .await;
@@ -240,7 +246,7 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
     let (_dir, exe) = setup();
 
     let bad_action_type = exe
-        .execute("task", &json!({"action": true, "title": "Typo"}))
+        .execute("task_board", &json!({"action": true, "title": "Typo"}))
         .await;
     assert!(
         bad_action_type.starts_with("Error:")
@@ -249,27 +255,30 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         "wrong-type action must be actionable: {bad_action_type}"
     );
 
-    let missing_action = exe.execute("task", &json!({})).await;
+    let missing_action = exe.execute("task_board", &json!({})).await;
     assert!(
         missing_action.starts_with("Error:")
             && missing_action.contains("missing required parameter `action`")
-            && missing_action.contains("Retry the same `task` tool"),
+            && missing_action.contains("Retry the same `task_board` tool"),
         "missing task action should be a recoverable argument-contract error: {missing_action}"
     );
 
     let hidden_cancel_alias = exe
-        .execute("task", &json!({"action": "cancel", "task_id": "task-1"}))
+        .execute(
+            "task_board",
+            &json!({"action": "cancel", "task_id": "task-1"}),
+        )
         .await;
     assert!(
         hidden_cancel_alias.starts_with("Error:")
-            && hidden_cancel_alias.contains("unknown `task` action")
+            && hidden_cancel_alias.contains("unknown `task_board` action")
             && hidden_cancel_alias.contains("cancel"),
         "CLI must not accept schema-hidden task action aliases: {hidden_cancel_alias}"
     );
 
     let create_typo = exe
         .execute(
-            "task",
+            "task_board",
             &json!({"action": "create", "title": "Typo", "titel": "wrong"}),
         )
         .await;
@@ -282,7 +291,7 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
 
     let create_dependency_removal_field = exe
         .execute(
-            "task",
+            "task_board",
             &json!({
                 "action": "create",
                 "title": "Blocked task",
@@ -292,8 +301,8 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         .await;
     assert!(
         create_dependency_removal_field.starts_with("Error:")
-            && create_dependency_removal_field.contains("task.create")
-            && create_dependency_removal_field.contains("task.update")
+            && create_dependency_removal_field.contains("task_board.create")
+            && create_dependency_removal_field.contains("task_board.update")
             && create_dependency_removal_field.contains("unknown field 'remove_blocked_by'"),
         "create dependency-removal misuse should explain the two-step repair: {create_dependency_removal_field}"
     );
@@ -303,7 +312,7 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         .collect::<Vec<_>>();
     let oversized = exe
         .execute(
-            "task",
+            "task_board",
             &json!({
                 "action": "create",
                 "title": "Oversized checklist",
@@ -320,7 +329,7 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
 
     let oversized_title = exe
         .execute(
-            "task",
+            "task_board",
             &json!({
                 "action": "create",
                 "title": "x".repeat(astra_tools::task_mgmt::MAX_TASK_TITLE_CHARS + 1)
@@ -336,7 +345,7 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
 
     let blank_owner = exe
         .execute(
-            "task",
+            "task_board",
             &json!({"action": "create", "title": "Blank owner", "owner": "   "}),
         )
         .await;
@@ -348,7 +357,10 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
     );
 
     let seed = exe
-        .execute("task", &json!({"action": "create", "title": "Seed task"}))
+        .execute(
+            "task_board",
+            &json!({"action": "create", "title": "Seed task"}),
+        )
         .await;
     assert!(
         !seed.starts_with("Error:") && seed.contains("\"task-1\""),
@@ -357,7 +369,7 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
 
     let create_with_dependency = exe
         .execute(
-            "task",
+            "task_board",
             &json!({
                 "action": "create",
                 "title": "Blocked task",
@@ -368,12 +380,12 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
     assert!(
         !create_with_dependency.starts_with("Error:")
             && create_with_dependency.contains("\"task-2\""),
-        "task.create should accept dependency edges atomically: {create_with_dependency}"
+        "task_board.create should accept dependency edges atomically: {create_with_dependency}"
     );
 
     let update_typo = exe
         .execute(
-            "task",
+            "task_board",
             &json!({"action": "update", "task_id": "task-1", "state": "paused"}),
         )
         .await;
@@ -386,7 +398,7 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
 
     let update_status_field = exe
         .execute(
-            "task",
+            "task_board",
             &json!({"action": "update", "task_id": "task-1", "status": "paused"}),
         )
         .await;
@@ -395,23 +407,23 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
             && update_status_field.contains("unknown field")
             && update_status_field.contains("status")
             && update_status_field.contains("new_status"),
-        "task.update should reject the old status alias with an actionable hint: {update_status_field}"
+        "task_board.update should reject the old status alias with an actionable hint: {update_status_field}"
     );
 
     let list_status_field = exe
-        .execute("task", &json!({"action": "list", "status": "active"}))
+        .execute("task_board", &json!({"action": "list", "status": "active"}))
         .await;
     assert!(
         list_status_field.starts_with("Error:")
             && list_status_field.contains("unknown field")
             && list_status_field.contains("status")
             && !list_status_field.contains("status_filter, status"),
-        "status must not remain a recognized task.list argument: {list_status_field}"
+        "status must not remain a recognized task_board.list argument: {list_status_field}"
     );
 
     let adopt_typo = exe
         .execute(
-            "task",
+            "task_board",
             &json!({
                 "action": "adopt",
                 "source_session_id": "source",
@@ -430,13 +442,13 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
 
     let unknown_background_action = exe
         .execute(
-            "task",
+            "task_board",
             &json!({"action": "background_shell", "command": "echo hi"}),
         )
         .await;
     assert!(
         unknown_background_action.starts_with("Error:")
-            && unknown_background_action.contains("unknown `task` action")
+            && unknown_background_action.contains("unknown `task_board` action")
             && unknown_background_action.contains("background_shell"),
         "background_shell should be an ordinary unknown task action: {unknown_background_action}"
     );
@@ -774,7 +786,7 @@ async fn task_action_stop_cancels_subtasks() {
     assert_eq!(parsed["cancelled_subtasks"], 2);
 }
 
-// ── task(action=archive) tests ────────────────────────────────────────────
+// ── task_board(action=archive) tests ────────────────────────────────────────────
 
 #[tokio::test]
 async fn task_archive_works_without_cloud_connection() {

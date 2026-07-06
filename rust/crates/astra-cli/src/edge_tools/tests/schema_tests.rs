@@ -465,9 +465,9 @@ fn mo_query_schema_requires_sql() {
 }
 
 #[test]
-fn task_schema_requires_title_and_task_id() {
+fn task_board_schema_requires_title_and_task_id() {
     let schemas = all_tool_schemas();
-    let task = tool_schema(&schemas, "task");
+    let task = tool_schema(&schemas, "task_board");
     assert_eq!(
         conditional_required_for(task, "create"),
         vec!["title".to_string()]
@@ -486,23 +486,23 @@ fn task_schema_requires_title_and_task_id() {
     );
 }
 
-/// `task` is the durable checklist surface. Background execution control lives
+/// `task_board` is the durable checklist surface. Background execution control lives
 /// on typed `task_output` / `task_stop` / `task_list` tools, not the checklist
 /// action enum and not a generic job action union.
 #[test]
-fn task_schema_does_not_advertise_background_actions() {
+fn task_board_schema_does_not_advertise_background_actions() {
     let schemas = all_tool_schemas();
-    let task = tool_schema(&schemas, "task");
+    let task = tool_schema(&schemas, "task_board");
     let actions: Vec<&str> = task["function"]["parameters"]["properties"]["action"]["enum"]
         .as_array()
-        .expect("task.action must be an enum")
+        .expect("task_board.action must be an enum")
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
     for banned in &["background_shell", "background_agent", "output", "kill"] {
         assert!(
             !actions.contains(banned),
-            "task.action enum still advertises `{banned}` — it must move to \
+            "task_board.action enum still advertises `{banned}` — it must move to \
              typed background task control tools. Got: {actions:?}"
         );
     }

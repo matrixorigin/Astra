@@ -135,7 +135,7 @@ pub fn build_recovery_message(
         && category == ErrorCategory::ToolInvalidArgs
         && (error_lower.contains("missing 'path' parameter")
             || error_lower.contains("missing 'content' parameter"));
-    let task_action_shape_error = tool_name == "task"
+    let task_action_shape_error = tool_name == "task_board"
         && matches!(
             category,
             ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest
@@ -143,8 +143,8 @@ pub fn build_recovery_message(
         && ((error_lower.contains("missing required parameter")
             && error_lower.contains("action")
             && error_lower.contains("task"))
-            || error_lower.contains("unknown `task` action")
-            || error_lower.contains("field 'action' for `task`"));
+            || error_lower.contains("unknown `task_board` action")
+            || error_lower.contains("field 'action' for `task_board`"));
 
     let mut msg = match category {
         ErrorCategory::Network
@@ -173,7 +173,7 @@ pub fn build_recovery_message(
                 "⚠ write_file failed: invalid arguments. Retry the same tool with both `path` and `content` for writes, or `path` + `delete=true` for deletes. Do NOT switch to bash or python just to write or delete this file.".to_string()
             } else if task_action_shape_error {
                 format!(
-                    "⚠ task failed: invalid arguments. Retry the same `task` tool with a valid `action` value before answering. Valid actions: {}.",
+                    "⚠ task_board failed: invalid arguments. Retry the same `task_board` tool with a valid `action` value before answering. Valid actions: {}.",
                     astra_tools::task_tool_contract::TASK_ACTIONS_DISPLAY
                 )
             } else {
@@ -721,11 +721,11 @@ mod tests {
         // task missing/invalid action → retry the same structured tool with
         // the shared action contract instead of switching tools or answering
         // as if task management succeeded.
-        let err = "Error: missing required parameter `action` for `task`.";
+        let err = "Error: missing required parameter `action` for `task_board`.";
         let cat = classify_error(err);
         assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
-        let msg = build_recovery_message("task", err, cat, &[]);
-        assert!(msg.contains("Retry the same `task` tool"));
+        let msg = build_recovery_message("task_board", err, cat, &[]);
+        assert!(msg.contains("Retry the same `task_board` tool"));
         assert!(msg.contains(astra_tools::task_tool_contract::TASK_ACTIONS_DISPLAY));
 
         // write_file missing content → editing alternatives

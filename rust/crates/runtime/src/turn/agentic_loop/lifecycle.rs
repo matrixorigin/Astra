@@ -621,7 +621,7 @@ fn recent_activity_supports_budget_extension(state: &AgenticLoopState) -> bool {
     mutating_progress || distinct_recent_turns >= 2
 }
 
-const TASK_BOARD_START_GATE_MESSAGE: &str = "[task-board:start] This is broad multi-step or delegated work. Before broad analysis, file exploration, or spawning agents, create 3-7 concrete leaf tasks with task(action='create'), then mark exactly one first task in_progress with task(action='update', new_status='in_progress'). Keep the task board current as tasks complete, fail, pause, or are no longer needed.";
+const TASK_BOARD_START_GATE_MESSAGE: &str = "[task-board:start] This is broad multi-step or delegated work. Before broad analysis, file exploration, or spawning agents, create 3-7 concrete leaf tasks with task_board(action='create'), then mark exactly one first task in_progress with task_board(action='update', new_status='in_progress'). Keep the task board current as tasks complete, fail, pause, or are no longer needed.";
 
 fn message_contains_any(message: &str, terms: &[&str]) -> bool {
     terms.iter().any(|term| message.contains(term))
@@ -710,7 +710,7 @@ async fn maybe_inject_task_board_start_gate<H: AgenticLoopHost>(
     host: &H,
     state: &mut AgenticLoopState,
 ) -> bool {
-    if !host.valid_tool_names().contains("task") {
+    if !host.valid_tool_names().contains("task_board") {
         return false;
     }
 
@@ -2107,7 +2107,7 @@ mod tests {
 
     #[tokio::test]
     async fn preamble_requires_task_board_before_broad_agent_review() {
-        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["task", "agent_fanout"]);
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["task_board", "agent_fanout"]);
         let mut state = make_state();
         state.message = "3 agents review这个分支的changes. 第一性原则，不考虑兼容".to_string();
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
@@ -2121,7 +2121,7 @@ mod tests {
             .expect("broad delegated review should receive task-board start gate");
         assert!(
             gate.content.contains("Before broad analysis")
-                && gate.content.contains("task(action='create')")
+                && gate.content.contains("task_board(action='create')")
                 && gate.content.contains("in_progress"),
             "{:?}",
             state.volatile_pending
@@ -2130,7 +2130,7 @@ mod tests {
 
     #[tokio::test]
     async fn preamble_does_not_require_new_task_board_when_one_is_active() {
-        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["task", "agent_fanout"]);
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["task_board", "agent_fanout"]);
         let mut state = make_state();
         state.message = "multi-agent review current branch changes from first principles".into();
         state.hooks.task_board_snapshot = TaskBoardSnapshot {

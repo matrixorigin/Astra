@@ -548,7 +548,7 @@ mod tests {
         record(
             &journal,
             5,
-            "task".to_string(),
+            "task_board".to_string(),
             SessionStateRollbackAction::TaskState {
                 snapshot: task_snapshot(),
             },
@@ -578,7 +578,7 @@ mod tests {
         let mut journal = SessionStateRollbackJournal::default();
         journal.record(
             1,
-            "task".to_string(),
+            "task_board".to_string(),
             SessionStateRollbackAction::TaskState {
                 snapshot: task_snapshot(),
             },
@@ -735,7 +735,7 @@ mod tests {
         record(
             &journal,
             4,
-            "task".to_string(),
+            "task_board".to_string(),
             SessionStateRollbackAction::TaskState {
                 snapshot: task_snapshot(),
             },

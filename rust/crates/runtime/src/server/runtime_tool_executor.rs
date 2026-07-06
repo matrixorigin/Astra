@@ -2010,7 +2010,13 @@ mod tests {
 
         assert!(exec.tool_runtime_ready("read_file"));
         assert!(exec.tool_runtime_ready("bash"));
-        for hidden in ["task", "introspect", "reflect", "agent_fanout", "memory"] {
+        for hidden in [
+            "task_board",
+            "introspect",
+            "reflect",
+            "agent_fanout",
+            "memory",
+        ] {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must not be prompt-visible without a bound control-plane/server provider: {names:?}"
@@ -3489,7 +3495,7 @@ esac
             "title": "live second",
             "_tool_call_id": "call-live"
         });
-        let first_key = IdempotencyKey::semantic("task", &public_first_args);
+        let first_key = IdempotencyKey::semantic("task_board", &public_first_args);
         {
             let executor = exec
                 .exactly_once_executor
@@ -3514,7 +3520,7 @@ esac
             executor.cache_mut().record(
                 &first_key,
                 CachedToolResult {
-                    tool_name: "task".to_string(),
+                    tool_name: "task_board".to_string(),
                     output: "cached-first".to_string(),
                     is_error: false,
                     cached_at: 1,
@@ -3524,20 +3530,22 @@ esac
         }
 
         let first = exec
-            .execute_local_with_metadata("task", &replay_first_args, None)
+            .execute_local_with_metadata("task_board", &replay_first_args, None)
             .await;
         assert_eq!(first.output, "cached-first");
 
         let second = exec
-            .execute_local_with_metadata("task", &second_args, None)
+            .execute_local_with_metadata("task_board", &second_args, None)
             .await;
         assert!(
             second.output.contains("\"success\":true"),
             "second tool should execute normally: {second:?}"
         );
 
-        let second_key =
-            IdempotencyKey::semantic("task", &json!({"action": "create", "title": "live second"}));
+        let second_key = IdempotencyKey::semantic(
+            "task_board",
+            &json!({"action": "create", "title": "live second"}),
+        );
         let executor = exec
             .exactly_once_executor
             .as_ref()
@@ -3593,7 +3601,7 @@ esac
 
         let created = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "create", "title": "server archive"}),
             )
             .await;
@@ -3603,7 +3611,7 @@ esac
         );
         let started = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "update", "task_id": "task-1", "new_status": "in_progress"}),
             )
             .await;
@@ -3613,7 +3621,7 @@ esac
         );
         let completed = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "update", "task_id": "task-1", "new_status": "completed"}),
             )
             .await;
@@ -3623,7 +3631,10 @@ esac
         );
 
         let archived = exec
-            .execute("task", &json!({"action": "archive", "task_id": "task-1"}))
+            .execute(
+                "task_board",
+                &json!({"action": "archive", "task_id": "task-1"}),
+            )
             .await;
         assert!(
             !archived.contains("Unknown task action"),
@@ -3636,7 +3647,7 @@ esac
 
         let list = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "list", "status_filter": "archived"}),
             )
             .await;
@@ -3650,11 +3661,11 @@ esac
     async fn task_executes_from_tool_engine_registry() {
         let (exec, _dir) = test_executor();
         assert!(
-            exec.tool_engine.contains("task"),
+            exec.tool_engine.contains("task_board"),
             "consolidated task should be registered in ToolEngine for server-local execution"
         );
 
-        let result = exec.execute_with_metadata("task", &json!({})).await;
+        let result = exec.execute_with_metadata("task_board", &json!({})).await;
         assert!(result.is_error, "{result:?}");
         assert!(
             result.output.contains("missing required parameter")
@@ -3683,11 +3694,14 @@ esac
         );
 
         let unified = exec
-            .execute("task", &json!({"action": "create", "title": "new surface"}))
+            .execute(
+                "task_board",
+                &json!({"action": "create", "title": "new surface"}),
+            )
             .await;
         assert!(
             unified.contains("\"success\":true") && unified.contains("task-1"),
-            "unified task(action=create) should remain the executable surface: {unified}"
+            "unified task_board(action=create) should remain the executable surface: {unified}"
         );
     }
 
@@ -3695,7 +3709,7 @@ esac
     async fn consolidated_task_tool_rejects_bad_action_shape_on_server_executor() {
         let (exec, _dir) = test_executor();
 
-        let missing = exec.execute("task", &json!({})).await;
+        let missing = exec.execute("task_board", &json!({})).await;
         assert!(
             missing.starts_with("Error:")
                 && missing.contains("missing required parameter")
@@ -3704,7 +3718,7 @@ esac
             "server task tool must not default missing action to list: {missing}"
         );
 
-        let wrong_type = exec.execute("task", &json!({"action": true})).await;
+        let wrong_type = exec.execute("task_board", &json!({"action": true})).await;
         assert!(
             wrong_type.starts_with("Error:")
                 && wrong_type.contains("field 'action'")
@@ -3712,20 +3726,25 @@ esac
             "server task tool should reject non-string action: {wrong_type}"
         );
 
-        let unknown = exec.execute("task", &json!({"action": "complete"})).await;
+        let unknown = exec
+            .execute("task_board", &json!({"action": "complete"}))
+            .await;
         assert!(
             unknown.starts_with("Error:")
-                && unknown.contains("unknown `task` action")
+                && unknown.contains("unknown `task_board` action")
                 && unknown.contains("update"),
             "server task tool should mark unknown actions as tool errors: {unknown}"
         );
 
         let hidden_alias = exec
-            .execute("task", &json!({"action": "cancel", "task_id": "task-1"}))
+            .execute(
+                "task_board",
+                &json!({"action": "cancel", "task_id": "task-1"}),
+            )
             .await;
         assert!(
             hidden_alias.starts_with("Error:")
-                && hidden_alias.contains("unknown `task` action")
+                && hidden_alias.contains("unknown `task_board` action")
                 && hidden_alias.contains("cancel"),
             "server must not accept schema-hidden task action aliases: {hidden_alias}"
         );
@@ -3737,7 +3756,7 @@ esac
 
         let list_user_typo = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "list_user", "user_status": "active", "limit": 10}),
             )
             .await;
@@ -3749,7 +3768,10 @@ esac
         );
 
         let create_blocker = exec
-            .execute("task", &json!({"action": "create", "title": "Blocker"}))
+            .execute(
+                "task_board",
+                &json!({"action": "create", "title": "Blocker"}),
+            )
             .await;
         assert!(
             !create_blocker.starts_with("Error:") && create_blocker.contains("task-1"),
@@ -3758,7 +3780,7 @@ esac
 
         let create_dependency_field = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({
                     "action": "create",
                     "title": "Blocked task",
@@ -3775,7 +3797,7 @@ esac
 
         let update_status_field = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "update", "task_id": "task-1", "status": "paused"}),
             )
             .await;
@@ -3784,23 +3806,23 @@ esac
                 && update_status_field.contains("unknown field")
                 && update_status_field.contains("status")
                 && !update_status_field.contains("new_status, status"),
-            "server task.update must not recognize the old status argument: {update_status_field}"
+            "server task_board.update must not recognize the old status argument: {update_status_field}"
         );
 
         let list_status_field = exec
-            .execute("task", &json!({"action": "list", "status": "active"}))
+            .execute("task_board", &json!({"action": "list", "status": "active"}))
             .await;
         assert!(
             list_status_field.starts_with("Error:")
                 && list_status_field.contains("unknown field")
                 && list_status_field.contains("status")
                 && !list_status_field.contains("status_filter, status"),
-            "server task.list must not recognize the old status argument: {list_status_field}"
+            "server task_board.list must not recognize the old status argument: {list_status_field}"
         );
 
         let adopt_typo = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({
                     "action": "adopt",
                     "source_session_id": "source",
@@ -3846,7 +3868,9 @@ esac
         let (exec, _dir) = test_executor();
         let exec = exec.with_task_store(store);
 
-        let active = exec.execute("task", &json!({"action": "list_user"})).await;
+        let active = exec
+            .execute("task_board", &json!({"action": "list_user"}))
+            .await;
         assert!(
             active.contains("\"total\":2")
                 && active.contains("active cross-session task")
@@ -3860,7 +3884,7 @@ esac
 
         let completed = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "list_user", "user_status": "completed"}),
             )
             .await;
@@ -3871,7 +3895,7 @@ esac
 
         let typo = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "list_user", "user_status": "cancelledd"}),
             )
             .await;
@@ -3881,7 +3905,10 @@ esac
         );
 
         let wrong_type = exec
-            .execute("task", &json!({"action": "list_user", "user_status": true}))
+            .execute(
+                "task_board",
+                &json!({"action": "list_user", "user_status": true}),
+            )
             .await;
         assert!(
             wrong_type.contains("user_status") && wrong_type.contains("string"),
@@ -3938,7 +3965,7 @@ esac
 
         let out = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "create", "title": "must not mutate"}),
             )
             .await;
@@ -3961,7 +3988,7 @@ esac
         let (exec, _dir) = test_executor();
         let out = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({
                     "action": "adopt",
                     "source_session_id": "source",
@@ -5122,7 +5149,7 @@ esac
             .expect("task_board_snapshot");
         assert_eq!(snapshot["session_id"], "test-session");
         assert_eq!(snapshot["run_id"], "run-task");
-        assert_eq!(snapshot["reason"], "task.create");
+        assert_eq!(snapshot["reason"], "task_board.create");
         assert_eq!(snapshot["workspace"]["kind"], "server_sandbox");
         assert_eq!(snapshot["executor"]["kind"], "server_local");
         assert_eq!(snapshot["transport"], "server_local");
@@ -5590,7 +5617,7 @@ esac
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|m| m["name"].as_str() == Some("task")),
+                .any(|m| m["name"].as_str() == Some("task_board")),
             "durable task-board backbone must be searchable in production server surface; got: {}",
             task.output
         );
@@ -7922,21 +7949,21 @@ esac
         ));
         assert!(!is_plan_mode_blocked_tool("task_list", &json!({})));
 
-        // Consolidated `task` tool: block only destructive actions
+        // Consolidated `task_board` tool: block only destructive actions
         assert!(is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "stop", "task_id": "bg-shell-1"})
         ));
         assert!(!is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "create", "title": "new task"})
         ));
         assert!(!is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "list"})
         ));
         assert!(!is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "update", "task_id": "bg-shell-1", "new_status": "in_progress"})
         ));
 
