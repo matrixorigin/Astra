@@ -9326,7 +9326,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
-        .with_edge_tools(sample_edge_tools())
+        .with_edge_tools(sample_edge_tools_with_web_fetch())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
@@ -9517,7 +9517,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
-        .with_edge_tools(sample_edge_tools())
+        .with_edge_tools(sample_edge_tools_with_web_fetch())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_disabled_tool_offers(disabled_handle)
         .build();

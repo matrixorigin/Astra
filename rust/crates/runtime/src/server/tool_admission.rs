@@ -296,6 +296,9 @@ fn admission_route_for_binding_and_providers(
     registry: &astra_runtime_env::ToolRegistry,
 ) -> ToolExecutionRouteKind {
     let class = tool_execution_class(tool_name, registry);
+    if matches!(class, ToolExecutionClass::TurnPipelineIntercept) {
+        return ToolExecutionRouteKind::Unsupported;
+    }
     let binding_route =
         routing_decision_for_binding(tool_name, workspace.kind, executor.transport, registry);
     if matches!(class, ToolExecutionClass::SharedServiceOrRuntime)
@@ -304,6 +307,7 @@ fn admission_route_for_binding_and_providers(
             ToolExecutionRouteKind::Unsupported | ToolExecutionRouteKind::ServerRuntime
         )
         && provider_for_route(tool_name, workspace, binding_route, providers).is_none()
+        && !selected_runtime_route_is_unavailable(binding_route, executor.status)
         && providers.iter().any(|provider| {
             provider.provider_type == CapacityProviderType::ServerService
                 && provider.declares_tool(tool_name)
@@ -320,6 +324,22 @@ fn admission_route_for_binding_and_providers(
         .find(|provider| provider.declares_tool(tool_name))
         .map(|provider| route_for_provider_type(provider.provider_type, workspace.kind))
         .unwrap_or(binding_route)
+}
+
+fn selected_runtime_route_is_unavailable(
+    route: ToolExecutionRouteKind,
+    executor_status: ExecutorStatus,
+) -> bool {
+    matches!(
+        route,
+        ToolExecutionRouteKind::ServerLocal
+            | ToolExecutionRouteKind::EdgeBound
+            | ToolExecutionRouteKind::GatewayRelay
+            | ToolExecutionRouteKind::SandboxResidentAgent
+    ) && matches!(
+        executor_status,
+        ExecutorStatus::Offline | ExecutorStatus::Unknown
+    )
 }
 
 pub(crate) fn active_provider_declarations_for_binding(
