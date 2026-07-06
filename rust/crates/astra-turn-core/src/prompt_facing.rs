@@ -109,6 +109,35 @@ pub fn sanitize_prompt_facing_messages_with_state(
     trim_to_recent_messages(out)
 }
 
+pub fn sanitize_user_visible_messages(messages: Vec<Value>) -> Vec<Value> {
+    messages
+        .into_iter()
+        .filter_map(|msg| user_visible_message(&msg))
+        .collect()
+}
+
+pub fn user_visible_message(msg: &Value) -> Option<Value> {
+    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(role, "user" | "assistant" | "system") {
+        return None;
+    }
+    let content = extract_text_content(msg)?;
+    if crate::runtime_scaffolding::is_continuation_scaffolding_for_role(role, &content) {
+        return None;
+    }
+    if role == "system" && is_prompt_internal_system_text(&content) {
+        return None;
+    }
+    let content = sanitize_user_visible_text(&content);
+    if content.trim().is_empty() {
+        return None;
+    }
+    Some(json!({
+        "role": role,
+        "content": content,
+    }))
+}
+
 pub fn runtime_recap_message(state: &SessionStateCompact) -> Option<Value> {
     let mut lines = Vec::new();
     if !state.recent_tools.is_empty() {
@@ -163,6 +192,11 @@ fn is_compaction_boundary_text(content: &str) -> bool {
         || trimmed.starts_with("[Conversation summary")
         || trimmed.starts_with("Context was compacted before this point.")
         || trimmed.starts_with("前文上下文已压缩")
+}
+
+fn is_prompt_internal_system_text(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with(TOOL_RECAP_PREFIX) || trimmed.starts_with(RUNTIME_RECAP_PREFIX)
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +314,54 @@ fn compact_tool_result(content: &str) -> String {
     out
 }
 
+fn sanitize_user_visible_text(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            strip_escape_sequence(&mut chars);
+            continue;
+        }
+        if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+            continue;
+        }
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
+fn strip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    match chars.peek().copied() {
+        Some('[') => {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ('@'..='~').contains(&ch) {
+                    break;
+                }
+            }
+        }
+        Some(']') => {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '\u{7}' {
+                    break;
+                }
+                if ch == '\u{1b}' && chars.peek().copied() == Some('\\') {
+                    chars.next();
+                    break;
+                }
+            }
+        }
+        Some(_) => {
+            chars.next();
+        }
+        None => {}
+    }
+}
+
 fn trim_to_recent_messages(mut messages: Vec<Value>) -> Vec<Value> {
     if messages.len() <= MAX_PROMPT_FACING_MESSAGES {
         return messages;
@@ -320,7 +402,7 @@ fn is_prefixed_system_message(msg: &Value, prefix: &str) -> bool {
 mod tests {
     use super::{
         runtime_recap_message, sanitize_prompt_facing_messages,
-        sanitize_prompt_facing_messages_with_state,
+        sanitize_prompt_facing_messages_with_state, sanitize_user_visible_messages,
     };
     use crate::conversation_log::{DelegationCompact, SessionStateCompact};
     use serde_json::json;
@@ -581,5 +663,29 @@ mod tests {
         let recap = got[1]["content"].as_str().unwrap();
         assert!(recap.contains("Recent tools: bash"));
         assert!(!recap.contains("stale"));
+    }
+
+    #[test]
+    fn user_visible_messages_drop_prompt_internal_recaps_and_control_bytes() {
+        let messages = vec![
+            json!({"role": "user", "content": "hello\u{0}"}),
+            json!({"role": "system", "content": "[Runtime tool result]\nread_file: secret trace"}),
+            json!({"role": "system", "content": "[Session runtime recap]\nRecent tools: bash"}),
+            json!({"role": "tool", "content": "raw tool output"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "assistant", "content": "\u{1b}[31mdone\u{1b}[0m"}),
+            json!({"role": "system", "content": "visible status"}),
+        ];
+
+        let got = sanitize_user_visible_messages(messages);
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "hello"}),
+                json!({"role": "assistant", "content": "done"}),
+                json!({"role": "system", "content": "visible status"}),
+            ]
+        );
     }
 }

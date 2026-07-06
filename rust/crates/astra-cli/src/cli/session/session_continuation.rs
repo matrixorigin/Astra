@@ -149,11 +149,13 @@ fn non_empty_message(role: &str, text: &str) -> Option<Value> {
 /// - ignore assistant tool-call stubs that have no visible text,
 /// - concatenate multiple visible assistant chunks in the same turn.
 pub(crate) fn history_pairs_from_messages(msgs: &[Value]) -> Vec<(String, String)> {
+    let visible_msgs =
+        astra_turn_core::prompt_facing::sanitize_user_visible_messages(msgs.to_vec());
     let mut pairs = Vec::new();
     let mut current_user = String::new();
     let mut current_assistant = String::new();
 
-    for msg in msgs {
+    for msg in &visible_msgs {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let text = extract_text_content(msg).unwrap_or_default();
         match role {
@@ -368,6 +370,24 @@ mod tests {
                 .contains("[Runtime tool result]\ngit: diff --stat | 202 files changed")
         }));
         assert_eq!(pairs[0].1, "I found a large runtime change set.");
+    }
+
+    #[test]
+    fn history_pairs_use_user_visible_projection_not_prompt_recaps() {
+        let msgs = vec![
+            json!({"role": "user", "content": "continue\u{0}"}),
+            json!({"role": "system", "content": "[Runtime tool result]\nbash: binary-looking trace"}),
+            json!({"role": "system", "content": "[Session runtime recap]\nRecent tools: bash"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "assistant", "content": "\u{1b}[32mvisible answer\u{1b}[0m"}),
+            json!({"role": "tool", "content": "raw tool payload"}),
+        ];
+
+        let pairs = super::history_pairs_from_messages(&msgs);
+
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "continue");
+        assert_eq!(pairs[0].1, "visible answer");
     }
 
     #[test]
