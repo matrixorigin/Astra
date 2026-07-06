@@ -301,45 +301,15 @@ fn admission_route_for_binding_and_providers(
     }
     let binding_route =
         routing_decision_for_binding(tool_name, workspace.kind, executor.transport, registry);
-    if matches!(class, ToolExecutionClass::SharedServiceOrRuntime)
-        && !matches!(
-            binding_route,
-            ToolExecutionRouteKind::Unsupported | ToolExecutionRouteKind::ServerRuntime
-        )
-        && provider_for_route(tool_name, workspace, binding_route, providers).is_none()
-        && !selected_runtime_route_is_unavailable(binding_route, executor.status)
+    if matches!(binding_route, ToolExecutionRouteKind::Unsupported)
         && providers.iter().any(|provider| {
-            provider.provider_type == CapacityProviderType::ServerService
+            provider.provider_type == CapacityProviderType::RequestScopedMcp
                 && provider.declares_tool(tool_name)
         })
     {
-        return ToolExecutionRouteKind::ServerRuntime;
+        return ToolExecutionRouteKind::RequestScopedMcp;
     }
-    if !matches!(binding_route, ToolExecutionRouteKind::Unsupported) {
-        return binding_route;
-    }
-
-    providers
-        .iter()
-        .find(|provider| provider.declares_tool(tool_name))
-        .map(|provider| route_for_provider_type(provider.provider_type, workspace.kind))
-        .unwrap_or(binding_route)
-}
-
-fn selected_runtime_route_is_unavailable(
-    route: ToolExecutionRouteKind,
-    executor_status: ExecutorStatus,
-) -> bool {
-    matches!(
-        route,
-        ToolExecutionRouteKind::ServerLocal
-            | ToolExecutionRouteKind::EdgeBound
-            | ToolExecutionRouteKind::GatewayRelay
-            | ToolExecutionRouteKind::SandboxResidentAgent
-    ) && matches!(
-        executor_status,
-        ExecutorStatus::Offline | ExecutorStatus::Unknown
-    )
+    binding_route
 }
 
 pub(crate) fn active_provider_declarations_for_binding(

@@ -48,12 +48,23 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
         &registry,
         &admission_context,
     );
+    let prompt_schema_conflicts =
+        astra_core::tool_schema::prompt_schema_conflicting_tool_names(&schemas);
+    let mut seen_mcp_tool_names = HashSet::new();
     schemas
         .into_iter()
         .filter(|schema| {
             let Some(tool_name) = tool_schema_name(schema) else {
                 return false;
             };
+            if astra_runtime_env::is_mcp_namespaced_tool_name(tool_name) {
+                if prompt_schema_conflicts.contains(tool_name) {
+                    return false;
+                }
+                if !seen_mcp_tool_names.insert(tool_name.to_string()) {
+                    return false;
+                }
+            }
             if !providers
                 .iter()
                 .any(|provider| provider.declares_tool(tool_name))
@@ -620,6 +631,48 @@ mod tests {
         ));
 
         assert_eq!(names, HashSet::from(["mcp__weather".to_string()]));
+    }
+
+    #[test]
+    fn mcp_executor_fails_closed_for_conflicting_mcp_schemas() {
+        let names = schema_names(capability_filter_tool_schemas_for_binding(
+            vec![
+                schema("ask_user"),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"}
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"}
+                            }
+                        }
+                    }
+                }),
+            ],
+            &no_workspace(),
+            &mcp_executor(),
+            None,
+        ));
+
+        assert!(names.contains("ask_user"));
+        assert!(
+            !names.contains("mcp__weather"),
+            "conflicting MCP schemas for one canonical tool must fail closed"
+        );
     }
 
     #[test]
