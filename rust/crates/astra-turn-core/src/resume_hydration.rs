@@ -27,6 +27,15 @@ pub fn build_resume_hydration_hint_from_prompt_messages(messages: &[Value]) -> O
         return None;
     }
 
+    // Minimum viability: require at least one user message AND one assistant message.
+    // A hint built from user-only or assistant-only history provides no meaningful
+    // continuity context and risks the model hallucinating prior state.
+    let has_user = entries.iter().any(|e| e.role == "user");
+    let has_assistant = entries.iter().any(|e| e.role == "assistant");
+    if !has_user || !has_assistant {
+        return None;
+    }
+
     let active_objective = latest_substantive_user(&entries);
     let last_assistant_state = latest_assistant(&entries);
     let mut lines = vec![
@@ -100,6 +109,34 @@ Reason: {reason}\n\
 Treat this as a degraded resume, not proof of a new session. Do not claim this is a new session. \
 If the user asks what happened, state that the stored session context was unavailable or incomplete in this runtime."
     )
+}
+
+pub fn build_resume_hydration_failure_hint_for_error(error: &str) -> String {
+    build_resume_hydration_failure_hint(sanitize_resume_restore_error(error))
+}
+
+fn sanitize_resume_restore_error(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("timeout")
+        || normalized.contains("timed out")
+        || normalized.contains("deadline")
+    {
+        "storage timeout while restoring session"
+    } else if normalized.contains("permission")
+        || normalized.contains("forbidden")
+        || normalized.contains("denied")
+        || normalized.contains("unauthorized")
+    {
+        "insufficient storage permissions while restoring session"
+    } else if normalized.contains("connect")
+        || normalized.contains("connection")
+        || normalized.contains("unreachable")
+        || normalized.contains("refused")
+    {
+        "session storage connectivity issue during restore"
+    } else {
+        "session restore infrastructure issue"
+    }
 }
 
 pub fn merge_resume_hints(first: Option<String>, second: Option<String>) -> Option<String> {
@@ -229,12 +266,37 @@ mod tests {
     }
 
     #[test]
+    fn resume_hydration_refuses_user_only_or_assistant_only_history() {
+        let user_only = vec![json!({"role": "user", "content": "继续"})];
+        let assistant_only = vec![json!({"role": "assistant", "content": "好的，继续进行"})];
+
+        assert!(
+            build_resume_hydration_hint_from_prompt_messages(&user_only).is_none(),
+            "user-only messages should not create resume hints"
+        );
+        assert!(
+            build_resume_hydration_hint_from_prompt_messages(&assistant_only).is_none(),
+            "assistant-only messages should not create resume hints"
+        );
+    }
+
+    #[test]
     fn resume_hydration_failure_forbids_new_session_claim() {
         let hint = build_resume_hydration_failure_hint("checkpoint unavailable");
 
         assert!(hint.contains("degraded resume"));
         assert!(hint.contains("Do not claim this is a new session"));
         assert!(hint.contains("checkpoint unavailable"));
+    }
+
+    #[test]
+    fn resume_hydration_failure_hint_does_not_echo_diagnostic_payload() {
+        let hint = build_resume_hydration_failure_hint_for_error(
+            "engine restore: sqlx error: table agent_events does not exist",
+        );
+        assert!(hint.contains("hydration was requested"));
+        assert!(!hint.contains("sqlx"));
+        assert!(!hint.contains("does not exist"));
     }
 
     #[test]

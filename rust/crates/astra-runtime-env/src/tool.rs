@@ -326,6 +326,8 @@ pub enum ToolOfferCandidateReason {
     ProviderTypeMismatch,
     CapabilityUnavailable,
     SchemaConflict,
+    ToolNameConflict,
+    AmbiguousProvider,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,7 +417,7 @@ impl CapabilityResolver {
         capabilities: &EffectiveCapabilitySet,
         providers: &[CapacityProviderDeclaration],
     ) -> AvailableToolSurface {
-        let provider_schema_conflicts = provider_schema_conflicting_tool_names(providers);
+        let provider_conflicts = provider_conflicting_tools(registry, capabilities, providers);
         let mut tool_names = Vec::new();
         let mut denials = Vec::new();
         let mut admissions = Vec::new();
@@ -440,12 +442,12 @@ impl CapabilityResolver {
             {
                 continue;
             }
-            let schema_conflicted = provider_schema_conflicts.contains(&spec.name);
+            let provider_conflict = provider_conflicts.get(&spec.name).copied();
             let mut admission =
-                self.admission_for_spec(spec, capabilities, providers, schema_conflicted);
-            if schema_conflicted {
+                self.admission_for_spec(spec, capabilities, providers, provider_conflict);
+            if let Some(conflict) = provider_conflict {
                 let reason =
-                    ToolUnavailableReason::PolicyDenied("provider_schema_conflict".to_string());
+                    ToolUnavailableReason::PolicyDenied(conflict.denial_code().to_string());
                 admission.visible = false;
                 admission.selected_offer_id = None;
                 admission.selected_provider_type = None;
@@ -495,13 +497,13 @@ impl CapabilityResolver {
         spec: &ToolSpec,
         capabilities: &EffectiveCapabilitySet,
         providers: &[CapacityProviderDeclaration],
-        schema_conflicted: bool,
+        provider_conflict: Option<ProviderToolConflictKind>,
     ) -> ToolSurfaceAdmission {
         let declared_candidates: Vec<&CapacityProviderDeclaration> = providers
             .iter()
             .filter(|provider| provider.declares_tool(&spec.name))
             .collect();
-        let selected_provider = if schema_conflicted {
+        let selected_provider = if provider_conflict.is_some() {
             None
         } else {
             selected_provider_for_tool(spec, capabilities, &declared_candidates)
@@ -510,7 +512,7 @@ impl CapabilityResolver {
             selected_provider.map(|provider| offer_id(spec.name.as_str(), provider));
         let selected_provider_type = selected_provider.map(|provider| provider.provider_type);
         let selected_provider_id = selected_provider.map(|provider| provider.provider_id.clone());
-        let hidden_reason = if selected_provider.is_none() && !schema_conflicted {
+        let hidden_reason = if selected_provider.is_none() && provider_conflict.is_none() {
             Some(ToolUnavailableReason::ExecutorUnavailable(
                 "no_matching_provider_offer".to_string(),
             ))
@@ -522,8 +524,8 @@ impl CapabilityResolver {
             .map(|provider| {
                 let offer_id = offer_id(spec.name.as_str(), provider);
                 let selected = selected_offer_id.as_deref() == Some(offer_id.as_str());
-                let reason = if schema_conflicted {
-                    ToolOfferCandidateReason::SchemaConflict
+                let reason = if let Some(conflict) = provider_conflict {
+                    conflict.candidate_reason()
                 } else if selected {
                     ToolOfferCandidateReason::Selected
                 } else if provider_type_matches_requirement(
@@ -581,11 +583,11 @@ impl CapabilityResolver {
         capabilities: &EffectiveCapabilitySet,
         providers: &[CapacityProviderDeclaration],
     ) -> Vec<Value> {
-        let provider_schema_conflicts = provider_schema_conflicting_tool_names(providers);
+        let provider_conflicts = provider_conflicting_tools(registry, capabilities, providers);
         let prompt_schema_conflicts =
             astra_core::tool_schema::prompt_schema_conflicting_tool_names(&schemas);
         self.filter_tool_schemas_impl(registry, schemas, capabilities, |tool_name| {
-            if provider_schema_conflicts.contains(tool_name)
+            if provider_conflicts.contains_key(tool_name)
                 || prompt_schema_conflicts.contains(tool_name)
             {
                 return false;
@@ -1004,24 +1006,116 @@ fn offer_id(tool_name: &str, provider: &CapacityProviderDeclaration) -> String {
 
 pub use astra_core::tool_schema::tool_schema_name;
 
-fn provider_schema_conflicting_tool_names(
-    providers: &[CapacityProviderDeclaration],
-) -> HashSet<String> {
-    let mut digests_by_tool: HashMap<String, HashSet<String>> = HashMap::new();
-    for provider in providers {
-        for tool_name in &provider.tool_names {
-            if let Some(digest) = provider.schema_digest_for_tool(tool_name) {
-                digests_by_tool
-                    .entry(tool_name.clone())
-                    .or_default()
-                    .insert(digest.to_string());
-            }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderToolConflictKind {
+    SchemaContract,
+    DynamicToolName,
+    AmbiguousProvider,
+}
+
+impl ProviderToolConflictKind {
+    const fn denial_code(self) -> &'static str {
+        match self {
+            Self::SchemaContract => "provider_schema_conflict",
+            Self::DynamicToolName => "provider_tool_name_conflict",
+            Self::AmbiguousProvider => "provider_owner_ambiguous",
         }
     }
-    digests_by_tool
+
+    const fn candidate_reason(self) -> ToolOfferCandidateReason {
+        match self {
+            Self::SchemaContract => ToolOfferCandidateReason::SchemaConflict,
+            Self::DynamicToolName => ToolOfferCandidateReason::ToolNameConflict,
+            Self::AmbiguousProvider => ToolOfferCandidateReason::AmbiguousProvider,
+        }
+    }
+}
+
+fn provider_conflicting_tools(
+    registry: &ToolRegistry,
+    capabilities: &EffectiveCapabilitySet,
+    providers: &[CapacityProviderDeclaration],
+) -> HashMap<String, ProviderToolConflictKind> {
+    let mut providers_by_tool: HashMap<String, Vec<&CapacityProviderDeclaration>> = HashMap::new();
+    for provider in providers {
+        for tool_name in &provider.tool_names {
+            providers_by_tool
+                .entry(tool_name.clone())
+                .or_default()
+                .push(provider);
+        }
+    }
+
+    providers_by_tool
         .into_iter()
-        .filter_map(|(tool_name, digests)| (digests.len() > 1).then_some(tool_name))
+        .filter_map(|(tool_name, declaring_providers)| {
+            if declaring_providers.len() <= 1 {
+                return None;
+            }
+            if provider_schema_digest_conflicts(&tool_name, &declaring_providers) {
+                return Some((tool_name, ProviderToolConflictKind::SchemaContract));
+            }
+
+            let dynamic_spec = dynamic_tool_spec(&tool_name);
+            let registry_spec = registry.get(&tool_name);
+            let Some(spec) = registry_spec.or(dynamic_spec.as_ref()) else {
+                return None;
+            };
+            if registry_spec.is_none() {
+                return Some((tool_name, ProviderToolConflictKind::DynamicToolName));
+            }
+            (!provider_selection_is_unambiguous(spec, capabilities, &declaring_providers))
+                .then_some((tool_name, ProviderToolConflictKind::AmbiguousProvider))
+        })
         .collect()
+}
+
+fn provider_schema_digest_conflicts(
+    tool_name: &str,
+    providers: &[&CapacityProviderDeclaration],
+) -> bool {
+    let digests: HashSet<&str> = providers
+        .iter()
+        .filter_map(|provider| provider.schema_digest_for_tool(tool_name))
+        .collect();
+    digests.len() > 1
+}
+
+fn provider_selection_is_unambiguous(
+    spec: &ToolSpec,
+    capabilities: &EffectiveCapabilitySet,
+    providers: &[&CapacityProviderDeclaration],
+) -> bool {
+    let mut best_rank = None;
+    let mut best_count = 0usize;
+    for provider in providers {
+        if !provider_type_matches_requirement(spec.required.executor, provider.provider_type)
+            || !provider_capability_ready(
+                spec.required.executor,
+                capabilities,
+                provider.provider_type,
+            )
+        {
+            continue;
+        }
+        let rank =
+            provider_selection_rank(spec.required.executor, capabilities, provider.provider_type);
+        match best_rank {
+            None => {
+                best_rank = Some(rank);
+                best_count = 1;
+            }
+            Some(current) if rank < current => {
+                best_rank = Some(rank);
+                best_count = 1;
+            }
+            Some(current) if rank == current => {
+                best_count += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    best_count == 1
 }
 
 fn control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
@@ -2195,6 +2289,40 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_builtin_provider_at_same_rank_is_ambiguous() {
+        let registry = registry();
+        let binding = RunBinding::cloud_control_plane(&registry);
+        let providers = vec![
+            crate::server_service_provider("server-a", &registry),
+            crate::server_service_provider("server-b", &registry),
+        ];
+
+        let surface = CapabilityResolver.available_tool_surface_for_providers(
+            &registry,
+            &binding.capabilities,
+            &providers,
+        );
+        let admission = surface
+            .admission_for("web_fetch")
+            .expect("web_fetch admission");
+
+        assert!(!surface.contains("web_fetch"));
+        assert!(!admission.visible);
+        assert_eq!(
+            surface.denial_for("web_fetch"),
+            Some(&ToolUnavailableReason::PolicyDenied(
+                "provider_owner_ambiguous".to_string()
+            ))
+        );
+        assert!(
+            admission
+                .candidates
+                .iter()
+                .all(|candidate| candidate.reason == ToolOfferCandidateReason::AmbiguousProvider)
+        );
+    }
+
+    #[test]
     fn provider_type_mismatch_is_a_diagnosed_hidden_offer_not_silent_visibility() {
         let registry = registry();
         let binding = RunBinding::local_developer("/repo", &registry);
@@ -2387,6 +2515,48 @@ mod tests {
                 .candidates
                 .iter()
                 .all(|candidate| candidate.reason == ToolOfferCandidateReason::SchemaConflict)
+        );
+    }
+
+    #[test]
+    fn duplicate_mcp_provider_tool_without_digest_is_hidden_from_surface() {
+        let registry = registry();
+        let providers = vec![
+            crate::mcp_provider("weather-a", ["mcp__weather".to_string()]),
+            crate::mcp_provider("weather-b", ["mcp__weather".to_string()]),
+        ];
+        let binding = RunBinding::resolve_with_provider_declarations(
+            WorkspaceBinding::none(),
+            ExecutorBinding {
+                kind: crate::ExecutorBindingKind::Mcp,
+                executor_id: "weather-a".to_string(),
+                display_name: "Weather MCP".to_string(),
+                transport: crate::ToolTransportKind::McpHttp,
+                status: crate::ExecutorStatus::Online,
+            },
+            RuntimeBinding::none(),
+            PolicyIntent::cloud_control_plane(),
+            &registry,
+            &providers,
+        );
+        let admission = binding
+            .tool_surface
+            .admission_for("mcp__weather")
+            .expect("dynamic MCP admission");
+
+        assert!(!binding.tool_surface.contains("mcp__weather"));
+        assert!(!admission.visible);
+        assert_eq!(
+            binding.tool_surface.denial_for("mcp__weather"),
+            Some(&ToolUnavailableReason::PolicyDenied(
+                "provider_tool_name_conflict".to_string()
+            ))
+        );
+        assert!(
+            admission
+                .candidates
+                .iter()
+                .all(|candidate| candidate.reason == ToolOfferCandidateReason::ToolNameConflict)
         );
     }
 
@@ -2644,12 +2814,12 @@ mod tests {
             .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
             .collect();
 
-        // Same tool from different MCP providers should still appear once (deduplicated by name)
-        // Schema digests have been removed — conflicts are caught at provider registration.
+        // Same tool from different MCP providers with different schemas should be HIDDEN (not deduplicated)
+        // to prevent malicious provider from replacing a legitimate tool path.
         assert_eq!(
             names,
-            vec!["mcp__weather__query"],
-            "same canonical tool from different MCP providers should be deduplicated not hidden"
+            Vec::<String>::new(),
+            "same canonical tool from different MCP providers should be hidden"
         );
     }
 

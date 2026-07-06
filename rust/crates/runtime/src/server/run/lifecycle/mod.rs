@@ -3311,7 +3311,11 @@ impl AgenticRunLifecycleService {
                     session_id,
                     "resume hydration skipped: session restore returned no resumable state"
                 );
-                None
+                Some(
+                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                        "session restore returned no resumable state",
+                    ),
+                )
             }
             Err(error) => {
                 tracing::warn!(
@@ -3321,7 +3325,11 @@ impl AgenticRunLifecycleService {
                     error = %error,
                     "resume hydration skipped: session restore failed"
                 );
-                None
+                Some(
+                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint_for_error(
+                        &error,
+                    ),
+                )
             }
         }
     }

@@ -170,6 +170,7 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
 }
 
 fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
+    queue!(writer, SetAttribute(Attribute::Reset))?;
     queue!(writer, Clear(ClearType::UntilNewLine))?;
 
     let mut content_width = 0usize;
@@ -213,18 +214,29 @@ fn write_styled_span(
     content: &str,
     style: &ratatui::style::Style,
 ) -> io::Result<()> {
+    apply_style_from_clean_state(writer, style)?;
+    queue!(writer, Print(content))?;
+    Ok(())
+}
+
+fn apply_style_from_clean_state(
+    writer: &mut impl Write,
+    style: &ratatui::style::Style,
+) -> io::Result<()> {
     queue!(
         writer,
+        SetAttribute(Attribute::Reset),
         SetColors(Colors::new(
             style.fg.map(Into::into).unwrap_or(CColor::Reset),
             style.bg.map(Into::into).unwrap_or(CColor::Reset),
         ))
     )?;
 
+    if style.add_modifier.contains(Modifier::REVERSED) {
+        queue!(writer, SetAttribute(Attribute::Reverse))?;
+    }
     if style.add_modifier.contains(Modifier::BOLD) {
         queue!(writer, SetAttribute(Attribute::Bold))?;
-    } else {
-        queue!(writer, SetAttribute(Attribute::NormalIntensity))?;
     }
     if style.add_modifier.contains(Modifier::DIM) {
         queue!(writer, SetAttribute(Attribute::Dim))?;
@@ -235,7 +247,52 @@ fn write_styled_span(
     if style.add_modifier.contains(Modifier::UNDERLINED) {
         queue!(writer, SetAttribute(Attribute::Underlined))?;
     }
+    if style.add_modifier.contains(Modifier::CROSSED_OUT) {
+        queue!(writer, SetAttribute(Attribute::CrossedOut))?;
+    }
+    if style.add_modifier.contains(Modifier::SLOW_BLINK) {
+        queue!(writer, SetAttribute(Attribute::SlowBlink))?;
+    }
+    if style.add_modifier.contains(Modifier::RAPID_BLINK) {
+        queue!(writer, SetAttribute(Attribute::RapidBlink))?;
+    }
 
-    queue!(writer, Print(content))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_history_line;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+
+    #[test]
+    fn write_history_line_isolates_terminal_style_per_span() {
+        let mut out = Vec::new();
+        let line = Line::from(vec![
+            Span::styled("link", Style::default().add_modifier(Modifier::UNDERLINED)),
+            Span::raw(" normal"),
+        ]);
+
+        write_history_line(&mut out, &line).expect("history line should render");
+        let rendered = String::from_utf8(out).expect("rendered bytes should be utf8");
+
+        assert!(
+            rendered.starts_with("\x1b[0m"),
+            "history line must start from clean SGR state; rendered={rendered:?}"
+        );
+
+        let link_end = rendered.find("link").expect("link text present") + "link".len();
+        let normal_start = rendered.find(" normal").expect("normal text present");
+        assert!(
+            rendered[link_end..normal_start].contains("\x1b[0m"),
+            "non-underlined span must reset style after an underlined span; rendered={rendered:?}"
+        );
+
+        let reset_count = rendered.matches("\x1b[0m").count();
+        assert!(
+            reset_count >= 4,
+            "line start, each span, and line end must each reset SGR state; rendered={rendered:?}"
+        );
+    }
 }
