@@ -1124,7 +1124,7 @@ mod tests {
 
         let alice_admission = crate::server::tool_admission::resolve_tool_admission_for_binding(
             "web_fetch",
-            &[canonical_schema.clone()],
+            std::slice::from_ref(&canonical_schema),
             &workspace,
             &alice,
             None,

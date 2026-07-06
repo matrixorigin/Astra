@@ -137,6 +137,7 @@ pub struct CapacityProviderDeclaration {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CapacityProviderDeclarationWire {
     provider_type: CapacityProviderType,
     provider_id: String,
@@ -773,16 +774,21 @@ mod tests {
     }
 
     #[test]
-    fn provider_declaration_deserialization_ignores_legacy_dynamic_prefixes() {
-        let provider: CapacityProviderDeclaration = serde_json::from_value(serde_json::json!({
+    fn provider_declaration_deserialization_rejects_legacy_dynamic_prefixes() {
+        let error = serde_json::from_value::<CapacityProviderDeclaration>(serde_json::json!({
             "provider_type": "request_scoped_mcp",
             "provider_id": "mcp",
             "tool_names": [],
             "dynamic_prefixes": ["mcp__"]
         }))
-        .expect("unknown legacy dynamic prefix field should not affect provider declaration");
+        .expect_err("legacy dynamic_prefixes must fail instead of being silently ignored");
 
-        assert!(!provider.declares_tool("mcp__ghost__query"));
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `dynamic_prefixes`"),
+            "legacy dynamic_prefixes must be rejected explicitly: {error}"
+        );
     }
 
     #[test]
@@ -1002,7 +1008,8 @@ mod tests {
             "type": "function",
             "function": { "name": "mcp__weather__query" }
         });
-        let provider = request_scoped_mcp_provider_from_schemas("mcp", &[schema.clone()]);
+        let provider =
+            request_scoped_mcp_provider_from_schemas("mcp", std::slice::from_ref(&schema));
 
         assert!(provider.declares_tool("mcp__weather__query"));
         assert_eq!(
@@ -1017,7 +1024,7 @@ mod tests {
             "type": "function",
             "function": { "name": "mcp__github__search" }
         });
-        let provider = mcp_provider_from_schemas("server-mcp", &[schema.clone()]);
+        let provider = mcp_provider_from_schemas("server-mcp", std::slice::from_ref(&schema));
 
         assert_eq!(provider.provider_type, CapacityProviderType::McpProvider);
         assert_eq!(provider.provider_id, "server-mcp");

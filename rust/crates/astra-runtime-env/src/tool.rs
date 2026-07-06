@@ -701,9 +701,7 @@ impl CapabilityResolver {
         if matches!(capability_check, Err(ToolUnavailableReason::UnknownTool)) {
             return capability_check;
         }
-        if capability_check.is_err() {
-            return capability_check;
-        }
+        capability_check?;
         check_surface_admits_tool(tool_name, surface)?;
         Ok(())
     }

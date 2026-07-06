@@ -120,13 +120,14 @@ function waitForStreamWork(ms = 0) {
 }
 
 async function waitUntil(predicate: () => boolean) {
-  for (let index = 0; index < 20; index += 1) {
-    if (predicate()) {
-      return;
-    }
-    await waitForStreamWork(0);
-  }
-  throw new Error("condition was not met");
+  await vi.waitFor(
+    () => {
+      if (!predicate()) {
+        throw new Error("condition was not met");
+      }
+    },
+    { interval: 5, timeout: 1000 },
+  );
 }
 
 const connectedEdge = {
@@ -1093,16 +1094,10 @@ describe("chat stream route proxy cancellation", () => {
     await reader?.cancel();
   });
 
-  it("rebinds a recovered pending turn to the live edge for the same workspace", async () => {
+  it("rejects a recovered pending turn when its edge provider id is stale", async () => {
     const storedWorkspace = {
       kind: "edge_workspace" as const,
       edgeAgentId: "edge-old-random",
-      displayName: "MacBook Pro",
-      cwd: "/Users/test/astra",
-    };
-    const liveWorkspace = {
-      kind: "edge_workspace" as const,
-      edgeAgentId: "edge-new-stable",
       displayName: "MacBook Pro",
       cwd: "/Users/test/astra",
     };
@@ -1166,22 +1161,24 @@ describe("chat stream route proxy cancellation", () => {
     );
 
     const reader = response.body?.getReader();
-    await reader?.read();
-    await waitUntil(() => runtime.fetchResponse.mock.calls.length > 0);
-    expect(mockUpdateChatWorkspaceSelection).toHaveBeenCalledWith(
+    expect(reader).toBeDefined();
+    const first = await reader!.read();
+    expect(new TextDecoder().decode(first.value)).toContain(
+      '"type":"local_messages"',
+    );
+    const second = await reader!.read();
+    const secondText = new TextDecoder().decode(second.value);
+    expect(secondText).toContain('"type":"error"');
+    expect(secondText).toContain("No alternate execution provider");
+    expect(runtime.fetchResponse).not.toHaveBeenCalled();
+    expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
-      liveWorkspace,
-    );
-    const fetchCalls = runtime.fetchResponse.mock.calls as unknown as Array<
-      [unknown, { json?: Record<string, unknown> }]
-    >;
-    expect(fetchCalls[0]?.[1].json).toEqual(
+      "assistant-1",
       expect.objectContaining({
-        executor_binding: expect.objectContaining({
-          kind: "edge_agent",
-          executor_id: "edge-new-stable",
-        }),
+        content: expect.stringContaining("No alternate execution provider"),
+        status: "failed",
       }),
     );
     await reader?.cancel();

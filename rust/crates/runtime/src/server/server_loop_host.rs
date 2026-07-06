@@ -6546,7 +6546,6 @@ mod tests {
             "task",
             "session",
             "tool_search",
-            "web_search",
             "memory",
         ] {
             assert!(
@@ -6565,6 +6564,8 @@ mod tests {
         for hidden in [
             "mo_query",
             "rollback_database_snapshots",
+            "web_fetch",
+            "web_search",
             "powershell",
             "display_sixel",
             "task_output",
