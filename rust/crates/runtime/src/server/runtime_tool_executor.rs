@@ -1332,12 +1332,14 @@ impl RuntimeToolExecutor {
         &self,
     ) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
         let schemas = self.request_scoped_mcp_schemas_snapshot("request_scoped_mcp_coverage");
-        let ready_names = schemas
+        let mut ready_names = schemas
             .iter()
             .filter_map(tool_schema_name)
             .filter(|name| self.mcp_tool_has_runtime_binding(name))
             .map(str::to_string)
             .collect::<Vec<_>>();
+        ready_names.sort();
+        ready_names.dedup();
         astra_runtime_env::request_scoped_mcp_coverage(
             "request-scoped-mcp",
             !schemas.is_empty(),
@@ -2174,6 +2176,46 @@ mod tests {
         assert_eq!(
             mcp_metadata["capabilities"][0].as_str(),
             Some("mcp__calculator")
+        );
+    }
+
+    #[test]
+    fn capacity_provider_coverage_sorts_request_scoped_mcp_capabilities() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__zeta__query",
+                    "description": "Zeta query.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__alpha__query",
+                    "description": "Alpha query.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+        ]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "docs",
+                &["mcp__alpha__query", "mcp__zeta__query"],
+            ),
+        ));
+
+        let coverage = exec.capacity_provider_coverage();
+        let mcp = provider_coverage_status(&coverage, "request_scoped_mcp");
+
+        assert_eq!(
+            mcp.capabilities,
+            vec![
+                "mcp__alpha__query".to_string(),
+                "mcp__zeta__query".to_string()
+            ]
         );
     }
 

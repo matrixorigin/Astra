@@ -13,7 +13,7 @@
 //!       → post_tool_policy(): stall/dedup/guard
 //! ```
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -3573,13 +3573,15 @@ impl ServerAgenticLoopHost {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let mut snapshot_schemas = self.admission_tool_schemas.clone();
         append_tool_schemas_unique(&mut snapshot_schemas, self.tool_schemas.clone());
-        let mut seen = HashSet::new();
-        snapshot_schemas
+        let tool_names = snapshot_schemas
             .iter()
             .filter_map(tool_schema_name)
-            .filter(|name| seen.insert((*name).to_string()))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        tool_names
+            .into_iter()
             .map(|name| {
-                let decision = self.admission_for_current_binding(name, &registry);
+                let decision = self.admission_for_current_binding(&name, &registry);
                 astra_turn_core::introspect::ToolAdmissionSnapshotEntry {
                     tool_name: decision.tool_name.clone(),
                     visible: decision.visible,
@@ -9359,6 +9361,33 @@ mod tests {
                 && candidate.scope == "session"
                 && candidate.authority == "none"
         }));
+    }
+
+    #[test]
+    fn tool_admission_snapshot_entries_are_sorted_for_stable_introspect() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools_with_web_fetch())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let admission = host.tool_admission_snapshot_entries();
+        let names: Vec<_> = admission
+            .iter()
+            .map(|entry| entry.tool_name.as_str())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+
+        assert_eq!(
+            names, sorted,
+            "introspect admission entries must not depend on provider/schema assembly order"
+        );
     }
 
     #[test]
