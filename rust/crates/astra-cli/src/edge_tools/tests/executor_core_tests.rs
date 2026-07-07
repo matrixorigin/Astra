@@ -366,10 +366,17 @@ async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
             }),
         )
         .await;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&result).expect("agent action errors must stay structured JSON");
+    assert_eq!(parsed["status"].as_str(), Some("failed"), "got: {result}");
+    assert_eq!(
+        parsed["error_kind"].as_str(),
+        Some(astra_core::ErrorKind::ToolInvalidArgs.as_str()),
+        "got: {result}"
+    );
     assert!(
-        result.starts_with("Error"),
-        "blocked delegate action must return an Error: prefix so the TUI renders \
-         it as a failure (red banner), not as a normal tool result. Got: {result}"
+        parsed["error"].as_str().unwrap_or("").contains("delegate"),
+        "blocked delegate action error must name the bad action. Got: {result}"
     );
     assert!(
         result.contains("spawn"),
@@ -420,7 +427,14 @@ async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
             }),
         )
         .await;
-    assert!(result.starts_with("Error:"), "got: {result}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&result).expect("agent wrapper errors must stay structured JSON");
+    assert_eq!(parsed["status"].as_str(), Some("failed"), "got: {result}");
+    assert_eq!(
+        parsed["error_kind"].as_str(),
+        Some(astra_core::ErrorKind::ToolInvalidArgs.as_str()),
+        "got: {result}"
+    );
     assert!(
         result.contains("action='spawn'") || result.contains("\"action\":\"spawn\""),
         "error must show the correct top-level action shape so the model can recover. Got: {result}"

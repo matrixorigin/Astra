@@ -187,7 +187,7 @@ function normalizeEventIndex(value: unknown): number | null {
     return null;
   }
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    throw new Error("Malformed stream event index.");
+    return null;
   }
   return Math.trunc(value);
 }

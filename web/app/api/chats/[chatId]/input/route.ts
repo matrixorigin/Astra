@@ -10,6 +10,7 @@ import { RuntimeClientError } from "@/lib/runtime-client";
 import {
   normalizeWorkspaceSelection,
   sameWorkspaceSelection,
+  validateWorkspaceAuthority,
 } from "@/lib/workspace-authority";
 
 const MAX_DEFERRED_INPUT_CHARS = 20_000;
@@ -81,6 +82,19 @@ export async function POST(
         code: "workspace_active_run_immutable",
       },
       { status: 409 },
+    );
+  }
+  const workspaceAuthorityError = validateWorkspaceAuthority(
+    body.content,
+    requestedWorkspaceSelection ?? storedWorkspaceSelection,
+  );
+  if (workspaceAuthorityError) {
+    return NextResponse.json(
+      {
+        error: workspaceAuthorityError.error,
+        code: workspaceAuthorityError.code,
+      },
+      { status: workspaceAuthorityError.status },
     );
   }
   try {

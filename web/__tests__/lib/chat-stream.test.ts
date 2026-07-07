@@ -663,19 +663,20 @@ describe('streamChatMessage cancellation semantics', () => {
     );
   });
 
-  it('rejects malformed event indexes instead of silently dropping cursor state', async () => {
+  it('ignores malformed event indexes without aborting stream consumption', async () => {
     const onDone = vi.fn();
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
         'data: {"type":"run_input_queued","run_id":"run-123","index":"4"}\n\n',
+        'data: {"type":"text_done","full_text":"continued"}\n\n',
       ]),
     });
 
     await expect(
       streamChatMessage('chat-123', defaultPayload, { onDone }),
-    ).rejects.toThrow('Malformed stream event index.');
-    expect(onDone).not.toHaveBeenCalled();
+    ).resolves.toBe('continued');
+    expect(onDone).toHaveBeenCalledWith('continued');
   });
 
   it('preserves structured stream error status and code', async () => {

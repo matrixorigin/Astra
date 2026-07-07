@@ -31,7 +31,7 @@ use crate::server::tool_admission::{
 };
 use crate::server::tool_route_selection::{
     ToolExecutionRouteKind, edge_bound_route_is_offline_for_binding, routing_decision_for_binding,
-    runtime_tools_route_to_edge_provider,
+    runtime_binding_can_use_client_ledger,
     should_deliver_edge_bound_tools_via_client_ledger_for_binding,
 };
 use crate::server::tool_transport::{
@@ -1534,12 +1534,11 @@ impl ServerAgenticLoopHostBuilder {
         let any_server_catalog_enabled =
             self.server_service_tool_catalog_enabled || self.control_plane_tool_catalog_enabled;
         let auto_server_catalog = any_server_catalog_enabled && self.edge_tools.is_empty();
-        let routes_workspace_tools_to_edge = runtime_tools_route_to_edge_provider(
+        let routes_workspace_tools_to_client_ledger = runtime_binding_can_use_client_ledger(
             binding_snapshot.workspace.kind,
-            binding_snapshot.executor.kind,
             binding_snapshot.executor.transport,
         );
-        let server_side_tools = auto_server_catalog && !routes_workspace_tools_to_edge;
+        let server_side_tools = auto_server_catalog && !routes_workspace_tools_to_client_ledger;
         let schema_workspace = binding_snapshot.workspace.clone();
         let schema_executor = binding_snapshot.executor.clone();
         let schema_runtime = binding_snapshot.runtime.clone();
@@ -2829,7 +2828,6 @@ impl ServerAgenticLoopHost {
         edge_bound_route_is_offline_for_binding(
             tool_name,
             self.workspace_binding.kind,
-            self.executor_binding.kind,
             self.executor_binding.status,
             self.executor_binding.transport,
             &registry,
@@ -3043,7 +3041,6 @@ impl ServerAgenticLoopHost {
     fn should_deliver_edge_bound_tools_via_client_ledger(&self, state: &AgenticLoopState) -> bool {
         should_deliver_edge_bound_tools_via_client_ledger_for_binding(
             self.workspace_binding.kind,
-            self.executor_binding.kind,
             self.executor_binding.transport,
             self.executor_binding.status,
             state.runtime_tool_executor.is_some(),

@@ -92,7 +92,7 @@ describe("chat deferred input route workspace authority", () => {
     } as never);
   });
 
-  it("queues local-code deferred input without workspace authority", async () => {
+  it("rejects explicit local paths in deferred input without workspace authority", async () => {
     mockGetChatHydrated.mockResolvedValue(activeChat() as never);
     const { POST } = await import("@/app/api/chats/[chatId]/input/route");
 
@@ -101,8 +101,13 @@ describe("chat deferred input route workspace authority", () => {
       { params: Promise.resolve({ chatId: "chat-1" }) },
     );
 
-    expect(response.status).toBe(200);
-    expect(mockQueueDeferredRunInput).toHaveBeenCalledTimes(1);
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      code: "workspace_required",
+      error:
+        "The referenced path requires a file environment: ~/project. Select the environment that contains it, then retry.",
+    });
+    expect(mockQueueDeferredRunInput).not.toHaveBeenCalled();
   });
 
   it("queues local-code deferred input on server sandbox", async () => {
@@ -118,6 +123,26 @@ describe("chat deferred input route workspace authority", () => {
 
     expect(response.status).toBe(200);
     expect(mockQueueDeferredRunInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects explicit host paths in deferred input on server sandbox", async () => {
+    mockGetChatHydrated.mockResolvedValue(
+      activeChat({ kind: "server_sandbox" }) as never,
+    );
+    const { POST } = await import("@/app/api/chats/[chatId]/input/route");
+
+    const response = await POST(
+      postInput({ content: "read /etc/passwd" }),
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The selected Server sandbox is an isolated workspace and cannot access host path: /etc/passwd. Use a relative path inside the sandbox, or select an Edge workspace rooted at that host path.",
+    });
+    expect(mockQueueDeferredRunInput).not.toHaveBeenCalled();
   });
 
   it("rejects attempts to change workspace with deferred input", async () => {

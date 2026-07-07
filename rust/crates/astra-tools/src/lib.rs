@@ -35,6 +35,7 @@ pub mod git_ops;
 pub mod git_tool_contract;
 pub mod github;
 pub mod github_tool_contract;
+pub mod internal_artifacts;
 pub mod memory_tool_contract;
 pub mod passive_cargo_check;
 pub mod passive_tsc_check;

@@ -1675,6 +1675,9 @@ function toolFailureMessage(tool: ToolSurfaceItem) {
   if (tool.errorKind === "workspace_executor_unavailable") {
     return WORKSPACE_EXECUTION_BLOCKED_MESSAGE;
   }
+  if (tool.errorKind === "workspace_path_mismatch") {
+    return "Path is outside the selected file environment. Server sandbox cannot access host paths; use a relative sandbox path or select the matching Edge workspace.";
+  }
   if (tool.blocked) {
     return "Tool blocked. Resolve the execution environment before retrying.";
   }

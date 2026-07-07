@@ -34,6 +34,7 @@ import {
   normalizeWorkspaceSelection,
   resolveWorkspaceBindings,
   sameWorkspaceSelection,
+  validateWorkspaceAuthority,
 } from "@/lib/workspace-authority";
 import { verifyLiveWorkspaceSelection } from "@/lib/workspace-selection-server";
 
@@ -138,6 +139,27 @@ function normalizedLastIndex(value: string | null) {
     return null;
   }
   return Math.trunc(parsed);
+}
+
+function isMalformedStreamEventIndexError(error: unknown) {
+  return (
+    error instanceof Error && error.message === "Malformed stream event index."
+  );
+}
+
+function applyBackendStreamEvent(
+  event: import("@astra/sdk").StreamEvent,
+  ctx: StreamEventContext,
+  state: StreamEventState,
+) {
+  try {
+    applyStreamEvent(event, ctx, state);
+  } catch (error) {
+    if (isMalformedStreamEventIndexError(error)) {
+      return;
+    }
+    throw error;
+  }
 }
 
 function proxyRunStream(params: {
@@ -327,7 +349,7 @@ function proxyRunStream(params: {
             for (const frame of frames) {
               const event = eventFromSseFrame(frame);
               if (event) {
-                applyStreamEvent(event, ctx, state);
+                applyBackendStreamEvent(event, ctx, state);
               }
             }
           }
@@ -339,7 +361,7 @@ function proxyRunStream(params: {
           if (buffer.trim()) {
             const event = eventFromSseFrame(buffer);
             if (event) {
-              applyStreamEvent(event, ctx, state);
+              applyBackendStreamEvent(event, ctx, state);
             }
           }
 
@@ -511,6 +533,19 @@ export async function POST(
   }
   const workspaceSelection =
     requestedWorkspaceSelection ?? storedWorkspaceSelection;
+  const workspaceAuthorityError = validateWorkspaceAuthority(
+    body.content,
+    workspaceSelection,
+  );
+  if (workspaceAuthorityError) {
+    return NextResponse.json(
+      {
+        error: workspaceAuthorityError.error,
+        code: workspaceAuthorityError.code,
+      },
+      { status: workspaceAuthorityError.status },
+    );
+  }
 
   let runtimeSessionId = chatId;
   const hasPriorMessages = hasMessagesBeforePendingTurn(chat);

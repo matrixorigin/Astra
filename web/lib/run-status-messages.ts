@@ -58,7 +58,7 @@ export function blockedRunMessage(reason: string) {
     case "approval_timeout":
       return "Approval timed out. Review the pending approval and retry the tool.";
     case "workspace_path_mismatch":
-      return "The referenced path is outside the selected file environment. Choose the environment that contains it or use a path inside the current one.";
+      return "The referenced path is outside the selected file environment. If you selected Server sandbox, use a relative path inside it; for host paths like ~/project, select the matching Edge workspace.";
     default:
       return "Tool execution is blocked. Review the execution environment before retrying.";
   }

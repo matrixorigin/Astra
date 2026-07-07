@@ -7,6 +7,8 @@ import {
   sameWorkspaceSelection,
   normalizeSlashPath,
   resolveWorkspaceBindings,
+  extractLocalPathMentions,
+  validateWorkspaceAuthority,
 } from "@/lib/workspace-authority";
 import type { WorkspaceSelection } from "@/lib/api/types";
 
@@ -63,6 +65,12 @@ describe("edgeWorkspaceBinding", () => {
       edgeWorkspaceBinding(edgeSelection({ displayName: null })),
     ).toHaveProperty("display_name", "agent-1");
   });
+
+  it("passes explicit read-only authority through an edge workspace binding", () => {
+    expect(
+      edgeWorkspaceBinding(edgeSelection({ authority: "read_only" })),
+    ).toHaveProperty("authority", "read_only");
+  });
 });
 
 describe("edgeExecutorBinding", () => {
@@ -91,6 +99,23 @@ describe("normalizeWorkspaceSelection", () => {
   it("returns server_sandbox selection", () => {
     expect(normalizeWorkspaceSelection({ kind: "server_sandbox" })).toEqual({
       kind: "server_sandbox",
+    });
+  });
+
+  it("preserves explicit workspace authority", () => {
+    expect(
+      normalizeWorkspaceSelection({
+        kind: "edge_workspace",
+        edgeAgentId: "agent-1",
+        cwd: "/Users/test/project",
+        authority: "read_only",
+      }),
+    ).toEqual({
+      kind: "edge_workspace",
+      edgeAgentId: "agent-1",
+      displayName: null,
+      cwd: "/Users/test/project",
+      authority: "read_only",
     });
   });
 
@@ -234,6 +259,15 @@ describe("sameWorkspaceSelection", () => {
     // Both null and undefined displayName normalize to null via ?? null
     expect(sameWorkspaceSelection(a, b)).toBe(true);
   });
+
+  it("treats authority as part of the workspace binding identity", () => {
+    expect(
+      sameWorkspaceSelection(
+        edgeSelection({ authority: "read_only" }),
+        edgeSelection({ authority: "read_write" }),
+      ),
+    ).toBe(false);
+  });
 });
 
 // ─── normalizeSlashPath ─────────────────────────────────────────────
@@ -274,6 +308,100 @@ describe("normalizeSlashPath", () => {
 
   it("returns empty string for root path made of only ..", () => {
     expect(normalizeSlashPath("../..")).toBe("");
+  });
+});
+
+// ─── validateWorkspaceAuthority ────────────────────────────────────
+
+describe("validateWorkspaceAuthority", () => {
+  it("extracts deterministic local filesystem paths without treating routes as files", () => {
+    expect(
+      extractLocalPathMentions(
+        "review /Users/test/project/src/lib.rs then call /api/chats",
+      ),
+    ).toEqual(["/Users/test/project/src/lib.rs"]);
+  });
+
+  it("detects local roots case-insensitively so host paths cannot be smuggled by casing", () => {
+    expect(
+      extractLocalPathMentions("review /USERS/test/project/src/lib.rs"),
+    ).toEqual(["/USERS/test/project/src/lib.rs"]);
+  });
+
+  it("allows explicit paths inside the selected edge workspace", () => {
+    expect(
+      validateWorkspaceAuthority(
+        "review /Users/test/project/src/lib.rs",
+        edgeSelection(),
+      ),
+    ).toBeNull();
+  });
+
+  it("allows case variants for case-insensitive edge workspace roots", () => {
+    expect(
+      validateWorkspaceAuthority(
+        "review /USERS/test/project/src/lib.rs",
+        edgeSelection(),
+      ),
+    ).toBeNull();
+  });
+
+  it("expands home paths against the selected edge workspace owner", () => {
+    expect(
+      validateWorkspaceAuthority("review ~/project/src/lib.rs", edgeSelection()),
+    ).toBeNull();
+  });
+
+  it("rejects explicit paths outside the selected edge workspace before a run starts", () => {
+    expect(
+      validateWorkspaceAuthority(
+        "review /Users/test/other/src/lib.rs",
+        edgeSelection(),
+      ),
+    ).toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The referenced path is outside the selected file environment: /Users/test/other/src/lib.rs. Choose the environment that contains it or use a path inside the current one.",
+      status: 409,
+    });
+  });
+
+  it("rejects case-varied traversal that resolves outside the selected edge workspace", () => {
+    expect(
+      validateWorkspaceAuthority(
+        "review /USERS/test/project/../../../etc/passwd",
+        edgeSelection(),
+      ),
+    ).toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The referenced path is outside the selected file environment: /USERS/test/project/../../../etc/passwd. Choose the environment that contains it or use a path inside the current one.",
+      status: 409,
+    });
+  });
+
+  it("rejects explicit host paths for server sandbox before a run starts", () => {
+    expect(
+      validateWorkspaceAuthority("read /etc/passwd", {
+        kind: "server_sandbox",
+      }),
+    ).toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The selected Server sandbox is an isolated workspace and cannot access host path: /etc/passwd. Use a relative path inside the sandbox, or select an Edge workspace rooted at that host path.",
+      status: 409,
+    });
+  });
+
+  it("rejects explicit local paths when no file environment is selected", () => {
+    expect(
+      validateWorkspaceAuthority("read /Users/test/project/README.md", null),
+    ).toEqual({
+      code: "workspace_required",
+      error:
+        "The referenced path requires a file environment: /Users/test/project/README.md. Select the environment that contains it, then retry.",
+      status: 409,
+    });
   });
 });
 

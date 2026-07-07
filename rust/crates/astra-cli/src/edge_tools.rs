@@ -4881,11 +4881,18 @@ impl ToolExecutor {
                 }
                 // ── Consolidated agent tool ──────────────────────────────────
                 "agent" => {
-                    let action =
-                        match astra_tools::agent_tool_contract::agent_action_from_args(args) {
-                            Ok(action) => action,
-                            Err(error) => return format!("Error: {error}"),
-                        };
+                    let action = match astra_tools::agent_tool_contract::agent_action_from_args(
+                        args,
+                    ) {
+                        Ok(action) => action,
+                        Err(error) => {
+                            return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_error_with_kind(
+                                    None,
+                                    &error,
+                                    Some(astra_core::ErrorKind::ToolInvalidArgs),
+                                );
+                        }
+                    };
                     match action {
                         astra_tools::agent_tool_contract::AgentAction::RunChain => {
                             match serde_json::from_value::<

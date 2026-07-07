@@ -194,38 +194,32 @@ fn runtime_executor_route_for_binding(
     ToolExecutionRouteKind::Unsupported
 }
 
-pub(crate) fn runtime_tools_route_to_edge_provider(
+pub(crate) fn runtime_binding_can_use_client_ledger(
     workspace_kind: WorkspaceBindingKind,
-    executor_kind: ExecutorBindingKind,
     executor_transport: ToolTransportKind,
 ) -> bool {
     matches!(workspace_kind, WorkspaceBindingKind::EdgeWorkspace)
-        || matches!(executor_kind, ExecutorBindingKind::EdgeAgent)
         || matches!(executor_transport, ToolTransportKind::EdgeLedger)
 }
 
 pub(crate) fn edge_bound_route_is_offline_for_binding(
     tool_name: &str,
     workspace_kind: WorkspaceBindingKind,
-    executor_kind: ExecutorBindingKind,
     executor_status: ExecutorStatus,
     executor_transport: ToolTransportKind,
     registry: &astra_runtime_env::ToolRegistry,
 ) -> bool {
-    runtime_tools_route_to_edge_provider(workspace_kind, executor_kind, executor_transport)
-        && matches!(
-            routing_decision_for_binding(tool_name, workspace_kind, executor_transport, registry),
-            ToolExecutionRouteKind::EdgeBound
-        )
-        && matches!(
-            executor_status,
-            ExecutorStatus::Offline | ExecutorStatus::Unknown
-        )
+    matches!(
+        routing_decision_for_binding(tool_name, workspace_kind, executor_transport, registry),
+        ToolExecutionRouteKind::EdgeBound
+    ) && matches!(
+        executor_status,
+        ExecutorStatus::Offline | ExecutorStatus::Unknown
+    )
 }
 
 pub(crate) fn should_deliver_edge_bound_tools_via_client_ledger_for_binding(
     workspace_kind: WorkspaceBindingKind,
-    executor_kind: ExecutorBindingKind,
     executor_transport: ToolTransportKind,
     executor_status: ExecutorStatus,
     runtime_executor_available: bool,
@@ -234,7 +228,7 @@ pub(crate) fn should_deliver_edge_bound_tools_via_client_ledger_for_binding(
     if !event_channel_available {
         return false;
     }
-    if runtime_tools_route_to_edge_provider(workspace_kind, executor_kind, executor_transport)
+    if runtime_binding_can_use_client_ledger(workspace_kind, executor_transport)
         && matches!(
             executor_status,
             ExecutorStatus::Offline | ExecutorStatus::Unknown
@@ -307,31 +301,22 @@ mod tests {
 
     #[test]
     fn edge_provider_delivery_policy_lives_in_route_layer() {
-        assert!(runtime_tools_route_to_edge_provider(
+        assert!(runtime_binding_can_use_client_ledger(
             WorkspaceBindingKind::EdgeWorkspace,
-            ExecutorBindingKind::ServerLocal,
             ToolTransportKind::ServerLocal,
         ));
-        assert!(runtime_tools_route_to_edge_provider(
+        assert!(runtime_binding_can_use_client_ledger(
             WorkspaceBindingKind::ServerSandbox,
-            ExecutorBindingKind::EdgeAgent,
-            ToolTransportKind::EdgeWs,
-        ));
-        assert!(runtime_tools_route_to_edge_provider(
-            WorkspaceBindingKind::ServerSandbox,
-            ExecutorBindingKind::ServerLocal,
             ToolTransportKind::EdgeLedger,
         ));
-        assert!(!runtime_tools_route_to_edge_provider(
+        assert!(!runtime_binding_can_use_client_ledger(
             WorkspaceBindingKind::ServerSandbox,
-            ExecutorBindingKind::ServerLocal,
             ToolTransportKind::ServerLocal,
         ));
 
         assert!(edge_bound_route_is_offline_for_binding(
             "read_file",
             WorkspaceBindingKind::EdgeWorkspace,
-            ExecutorBindingKind::EdgeAgent,
             ExecutorStatus::Unknown,
             ToolTransportKind::EdgeWs,
             &registry(),
@@ -339,7 +324,6 @@ mod tests {
         assert!(edge_bound_route_is_offline_for_binding(
             "web_search",
             WorkspaceBindingKind::EdgeWorkspace,
-            ExecutorBindingKind::EdgeAgent,
             ExecutorStatus::Unknown,
             ToolTransportKind::EdgeWs,
             &registry(),
@@ -347,7 +331,6 @@ mod tests {
         assert!(!edge_bound_route_is_offline_for_binding(
             "memory",
             WorkspaceBindingKind::EdgeWorkspace,
-            ExecutorBindingKind::EdgeAgent,
             ExecutorStatus::Unknown,
             ToolTransportKind::EdgeWs,
             &registry(),
@@ -356,7 +339,6 @@ mod tests {
         assert!(
             !should_deliver_edge_bound_tools_via_client_ledger_for_binding(
                 WorkspaceBindingKind::EdgeWorkspace,
-                ExecutorBindingKind::EdgeAgent,
                 ToolTransportKind::EdgeWs,
                 ExecutorStatus::Offline,
                 true,
@@ -366,7 +348,6 @@ mod tests {
         assert!(
             should_deliver_edge_bound_tools_via_client_ledger_for_binding(
                 WorkspaceBindingKind::EdgeWorkspace,
-                ExecutorBindingKind::EdgeAgent,
                 ToolTransportKind::EdgeWs,
                 ExecutorStatus::Offline,
                 true,
@@ -376,7 +357,6 @@ mod tests {
         assert!(
             !should_deliver_edge_bound_tools_via_client_ledger_for_binding(
                 WorkspaceBindingKind::EdgeWorkspace,
-                ExecutorBindingKind::EdgeAgent,
                 ToolTransportKind::EdgeWs,
                 ExecutorStatus::Online,
                 true,
@@ -386,7 +366,6 @@ mod tests {
         assert!(
             should_deliver_edge_bound_tools_via_client_ledger_for_binding(
                 WorkspaceBindingKind::EdgeWorkspace,
-                ExecutorBindingKind::EdgeAgent,
                 ToolTransportKind::EdgeWs,
                 ExecutorStatus::Online,
                 false,
@@ -396,12 +375,32 @@ mod tests {
         assert!(
             should_deliver_edge_bound_tools_via_client_ledger_for_binding(
                 WorkspaceBindingKind::EdgeWorkspace,
-                ExecutorBindingKind::EdgeAgent,
                 ToolTransportKind::EdgeLedger,
                 ExecutorStatus::Online,
                 true,
                 true,
             )
+        );
+    }
+
+    #[test]
+    fn edge_executor_label_without_edge_route_does_not_trigger_edge_policy() {
+        assert!(!edge_bound_route_is_offline_for_binding(
+            "read_file",
+            WorkspaceBindingKind::ServerSandbox,
+            ExecutorStatus::Offline,
+            ToolTransportKind::EdgeWs,
+            &registry(),
+        ));
+        assert!(
+            !should_deliver_edge_bound_tools_via_client_ledger_for_binding(
+                WorkspaceBindingKind::ServerSandbox,
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Offline,
+                true,
+                true,
+            ),
+            "edge delivery policy must follow the selected route, not executor labels"
         );
     }
 

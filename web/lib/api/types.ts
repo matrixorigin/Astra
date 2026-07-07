@@ -71,15 +71,19 @@ export type ComposerOptions = {
   style?: string;
 };
 
+export type WorkspaceAuthority = 'read_only' | 'read_write';
+
 export type WorkspaceSelection =
   | {
       kind: 'server_sandbox';
+      authority?: WorkspaceAuthority;
     }
   | {
       kind: 'edge_workspace';
       edgeAgentId: string;
       displayName?: string | null;
       cwd: string;
+      authority?: WorkspaceAuthority;
     };
 
 export type EdgeStatusResponse = {

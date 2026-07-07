@@ -90,6 +90,10 @@ pub fn render_agent_runtime_binding_error(tool_name: &str, action: &str) -> Stri
     render_agent_tool_error_with_kind(None, &error, Some(astra_core::ErrorKind::ToolBinding))
 }
 
+fn render_agent_tool_contract_error(message: &str) -> String {
+    render_agent_tool_error_with_kind(None, message, Some(astra_core::ErrorKind::ToolInvalidArgs))
+}
+
 #[derive(Default)]
 struct FanoutStartTerminalCauses {
     cancelled_by_user: usize,
@@ -245,7 +249,7 @@ pub struct AgentToolContext {
 pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> String {
     let action = match agent_action_from_args(args) {
         Ok(action) => action,
-        Err(error) => return render_agent_tool_error(None, &error),
+        Err(error) => return render_agent_tool_contract_error(&error),
     };
     match action {
         AgentAction::Spawn => handle_agent_spawn_action(args, ctx).await,
@@ -266,17 +270,14 @@ pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentToolContex
             if args.get("action").is_none()
                 || args.get("action").and_then(Value::as_str) == Some("")
             {
-                return render_agent_tool_error(
-                    None,
-                    &format!(
-                        "{error} Do not retry with empty args {{}}. Choose one of three canonical shapes:\n\
+                return render_agent_tool_contract_error(&format!(
+                    "{error} Do not retry with empty args {{}}. Choose one of three canonical shapes:\n\
                          {FANOUT_START_SHAPE}\n\
                          {FANOUT_GET_RESULTS_SHAPE}\n\
                          {FANOUT_STOP_SLOT_SHAPE}"
-                    ),
-                );
+                ));
             }
-            return render_agent_tool_error(None, &error);
+            return render_agent_tool_contract_error(&error);
         }
     };
     match action {
@@ -298,7 +299,7 @@ pub async fn recover_agent_fanout_tool_result(
 ) -> String {
     let action = match agent_fanout_action_from_args(args) {
         Ok(action) => action,
-        Err(error) => return render_agent_tool_error(None, &error),
+        Err(error) => return render_agent_tool_contract_error(&error),
     };
     let Some(ctx) = ctx else {
         return render_agent_runtime_binding_error("agent_fanout", action.as_str());
@@ -3549,6 +3550,11 @@ mod tests {
     #[tokio::test]
     async fn agent_fanout_empty_args_returns_executable_canonical_shapes() {
         let result = handle_agent_fanout_tool(&json!({}), None).await;
+        let value: Value = serde_json::from_str(&result).expect("fanout error must stay JSON");
+        assert_eq!(
+            value["error_kind"].as_str(),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+        );
         assert!(
             result.contains("missing required parameter `action` for `agent_fanout`"),
             "{result}"

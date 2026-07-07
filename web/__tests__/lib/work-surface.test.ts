@@ -1405,7 +1405,7 @@ describe('work surface reducer', () => {
     expect(state.blocked).toMatchObject({
       reason: 'workspace_path_mismatch',
       message:
-        'The referenced path is outside the selected file environment. Choose the environment that contains it or use a path inside the current one.',
+        'The referenced path is outside the selected file environment. If you selected Server sandbox, use a relative path inside it; for host paths like ~/project, select the matching Edge workspace.',
       callId: 'call-path',
       tool: 'bash',
       transport: 'server_local',

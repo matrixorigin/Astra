@@ -404,6 +404,131 @@ describe("chat stream route proxy cancellation", () => {
     );
   });
 
+  it("rejects explicit paths outside the selected edge workspace before opening a backend run", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "review /Users/test/other/src/lib.rs",
+          workspace: {
+            kind: "edge_workspace",
+            edgeAgentId: "edge-1",
+            displayName: "MacBook Pro",
+            cwd: "/Users/test/astra",
+          },
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    await expect(response.json()).resolves.toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The referenced path is outside the selected file environment: /Users/test/other/src/lib.rs. Choose the environment that contains it or use a path inside the current one.",
+    });
+    expect(response.status).toBe(409);
+    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
+    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
+  });
+
+  it("rejects explicit host paths on server sandbox before opening a backend run", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "read /etc/passwd",
+          workspace: { kind: "server_sandbox" },
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    await expect(response.json()).resolves.toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The selected Server sandbox is an isolated workspace and cannot access host path: /etc/passwd. Use a relative path inside the sandbox, or select an Edge workspace rooted at that host path.",
+    });
+    expect(response.status).toBe(409);
+    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
+    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
+  });
+
+  it("ignores malformed event indexes without aborting an otherwise valid backend stream", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendFrameStream([
+      'data: {"type":"run_started","run_id":"run-soft","index":"bad"}\n\n',
+      'data: {"type":"text_done","full_text":"done"}\n\n',
+    ]);
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: vi.fn().mockResolvedValue({
+        ok: true,
+        body: backend.body,
+      }),
+    } as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "hello",
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    for (;;) {
+      const { done } = await reader!.read();
+      if (done) {
+        break;
+      }
+    }
+
+    expect(backend.cancel).not.toHaveBeenCalled();
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "done",
+        status: "complete",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ status: "failed" }),
+    );
+  });
+
   it("returns local SSE messages before the backend stream connection resolves", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     let resolveFetch: (value: {
@@ -627,7 +752,7 @@ describe("chat stream route proxy cancellation", () => {
       new Request("http://web.test/api/chats/chat-1/stream", {
         method: "POST",
         body: JSON.stringify({
-          content: "review ~/project",
+          content: "summarize the current plan",
           options: {
             model: "sonnet-4.6-adaptive",
             webSearch: false,
@@ -1704,8 +1829,9 @@ describe("chat existing run stream route", () => {
       body += new TextDecoder().decode(value);
     }
 
-    expect(body).toContain("Malformed stream event index.");
-    expect(backend.cancel).toHaveBeenCalled();
+    expect(body).not.toContain("Malformed stream event index.");
+    expect(body).toContain("should not win");
+    expect(backend.cancel).not.toHaveBeenCalled();
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
       "user-a",
       "web-chat-1",
@@ -1716,8 +1842,8 @@ describe("chat existing run stream route", () => {
       "web-chat-1",
       "assistant-1",
       expect.objectContaining({
-        content: "Malformed stream event index.",
-        status: "failed",
+        content: "should not win",
+        status: "complete",
       }),
     );
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
@@ -1725,8 +1851,8 @@ describe("chat existing run stream route", () => {
       "web-chat-1",
       "assistant-1",
       expect.objectContaining({
-        content: "should not win",
-        status: "complete",
+        content: "Malformed stream event index.",
+        status: "failed",
       }),
     );
   });
