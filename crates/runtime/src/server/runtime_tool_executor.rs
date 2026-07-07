@@ -106,9 +106,59 @@ enum ExecutorToolReadiness {
     UnknownTool,
     MissingRuntimeBinding,
     RuntimeBindingBusy(&'static str),
-    RuntimeEnvironmentDenied(astra_runtime_env::ToolUnavailableReason),
+    RuntimeEnvironmentDenied(RuntimeEnvironmentDenial),
     MissingCapability(Capability),
     MissingService(Capability),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeEnvironmentDenialKind {
+    UnknownTool,
+    ProviderUnavailable,
+    SchemaConflict,
+    ProviderRouteMismatch,
+    UnsupportedRoute,
+    ExecutorUnavailable,
+    WorkspaceUnavailable,
+    RuntimeCapabilityMissing,
+    RuntimeSurfaceDenied,
+    PolicyDenied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeEnvironmentDenial {
+    kind: RuntimeEnvironmentDenialKind,
+    reason: astra_runtime_env::ToolUnavailableReason,
+}
+
+impl RuntimeEnvironmentDenial {
+    fn new(
+        kind: RuntimeEnvironmentDenialKind,
+        reason: astra_runtime_env::ToolUnavailableReason,
+    ) -> Self {
+        Self { kind, reason }
+    }
+
+    fn from_unavailable_reason(reason: astra_runtime_env::ToolUnavailableReason) -> Self {
+        let kind = match &reason {
+            astra_runtime_env::ToolUnavailableReason::UnknownTool => {
+                RuntimeEnvironmentDenialKind::UnknownTool
+            }
+            astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(_) => {
+                RuntimeEnvironmentDenialKind::ExecutorUnavailable
+            }
+            astra_runtime_env::ToolUnavailableReason::WorkspaceUnavailable(_) => {
+                RuntimeEnvironmentDenialKind::WorkspaceUnavailable
+            }
+            astra_runtime_env::ToolUnavailableReason::RuntimeCapabilityMissing(_) => {
+                RuntimeEnvironmentDenialKind::RuntimeCapabilityMissing
+            }
+            astra_runtime_env::ToolUnavailableReason::PolicyDenied(_) => {
+                RuntimeEnvironmentDenialKind::PolicyDenied
+            }
+        };
+        Self { kind, reason }
+    }
 }
 
 /// Per-turn mutation accounting for self-modifying session config tools.
@@ -841,16 +891,16 @@ impl RuntimeToolExecutor {
 
     fn executor_tool_readiness_for_call(&self, name: &str, args: &Value) -> ExecutorToolReadiness {
         if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
-            if let Some(reason) = self.request_scoped_mcp_admission_policy_denial(name) {
-                return ExecutorToolReadiness::RuntimeEnvironmentDenied(reason);
+            if let Some(denial) = self.request_scoped_mcp_admission_policy_denial(name) {
+                return ExecutorToolReadiness::RuntimeEnvironmentDenied(denial);
             }
             return self.mcp_executor_tool_readiness(name);
         }
 
         let runtime_registry = astra_runtime_env::ToolRegistry::builtins();
         let runtime_registry_knows_tool = runtime_registry.get(name).is_some();
-        if let Some(reason) = self.runtime_environment_tool_denial(name, args) {
-            return ExecutorToolReadiness::RuntimeEnvironmentDenied(reason);
+        if let Some(denial) = self.runtime_environment_tool_denial(name, args) {
+            return ExecutorToolReadiness::RuntimeEnvironmentDenied(denial);
         }
 
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
@@ -888,7 +938,7 @@ impl RuntimeToolExecutor {
         &self,
         name: &str,
         args: &Value,
-    ) -> Option<astra_runtime_env::ToolUnavailableReason> {
+    ) -> Option<RuntimeEnvironmentDenial> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         registry.get(name)?;
         let admission_context = self.tool_admission_context();
@@ -900,17 +950,17 @@ impl RuntimeToolExecutor {
             &registry,
             &admission_context,
         );
-        let admission =
-            crate::server::tool_admission::resolve_tool_admission_for_providers_with_context(
-                name,
-                self.execution_binding.workspace(),
-                self.execution_binding.executor(),
-                &providers,
-                &registry,
-                &admission_context,
-            );
-        if let Some(reason) = admission_hidden_reason_to_unavailable(admission.hidden_reason) {
-            return Some(reason);
+        let admission = crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
+            name,
+            &[],
+            self.execution_binding.workspace(),
+            self.execution_binding.executor(),
+            self.execution_binding.runtime(),
+            &registry,
+            admission_context,
+        );
+        if let Some(denial) = admission_hidden_reason_to_denial(admission.hidden_reason) {
+            return Some(denial);
         }
         if matches!(
             admission.selected_route(),
@@ -941,6 +991,7 @@ impl RuntimeToolExecutor {
                 &binding.tool_surface,
             )
             .err()
+            .map(RuntimeEnvironmentDenial::from_unavailable_reason)
     }
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
@@ -976,7 +1027,7 @@ impl RuntimeToolExecutor {
     fn request_scoped_mcp_admission_policy_denial(
         &self,
         name: &str,
-    ) -> Option<astra_runtime_env::ToolUnavailableReason> {
+    ) -> Option<RuntimeEnvironmentDenial> {
         let schemas =
             self.request_scoped_mcp_schemas_snapshot("request_scoped_mcp_policy_admission");
         if schemas.is_empty() {
@@ -1001,7 +1052,7 @@ impl RuntimeToolExecutor {
                 ToolHiddenReason::DisabledOffer
                 | ToolHiddenReason::ProviderToolNotAllowed
                 | ToolHiddenReason::SchemaConflict,
-            ) => admission_hidden_reason_to_unavailable(decision.hidden_reason),
+            ) => admission_hidden_reason_to_denial(decision.hidden_reason),
             _ => None,
         }
     }
@@ -1091,16 +1142,24 @@ impl RuntimeToolExecutor {
     fn runtime_environment_denial_error_result(
         &self,
         name: &str,
-        reason: &astra_runtime_env::ToolUnavailableReason,
+        denial: &RuntimeEnvironmentDenial,
     ) -> astra_tools::ToolResult {
+        let (reason_kind, user_action, provider_action, resumable) =
+            runtime_environment_denial_ux(denial.kind);
         tool_result_from_output(
             json!({
                 "status": "failed",
                 "error": format!(
-                    "Tool `{name}` is not available for this run binding: {reason}. Select a workspace, executor, runtime, or policy that provides the required capability."
+                    "Tool `{name}` is not available for this run binding: {}. {user_action}",
+                    denial.reason
                 ),
                 "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
-                "runtime_env_reason": reason,
+                "tool_name": name,
+                "runtime_env_reason": denial.reason,
+                "reason_kind": reason_kind,
+                "user_action": user_action,
+                "provider_action": provider_action,
+                "resumable": resumable,
                 "retryable": false,
             })
             .to_string(),
@@ -1200,8 +1259,8 @@ impl RuntimeToolExecutor {
             ExecutorToolReadiness::RuntimeBindingBusy(provider) => {
                 Some(self.runtime_binding_busy_error_result(name, provider))
             }
-            ExecutorToolReadiness::RuntimeEnvironmentDenied(reason) => {
-                Some(self.runtime_environment_denial_error_result(name, &reason))
+            ExecutorToolReadiness::RuntimeEnvironmentDenied(denial) => {
+                Some(self.runtime_environment_denial_error_result(name, &denial))
             }
             ExecutorToolReadiness::MissingCapability(capability) => {
                 Some(self.capability_unavailable_error_result(name, capability))
@@ -1428,8 +1487,7 @@ impl RuntimeToolExecutor {
             {
                 let mut context = self.tool_admission_context();
                 context.request_scoped_mcp_provider_ready = true;
-                let decision =
-                    crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
+                let decision = crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
                         &request.tool_name,
                         &schemas,
                         &request.workspace,
@@ -1736,35 +1794,241 @@ fn remove_prompt_schema_conflicts(pool: &mut Vec<Value>) {
     pool.retain(|schema| tool_schema_name(schema).is_none_or(|name| !conflicts.contains(name)));
 }
 
-fn admission_hidden_reason_to_unavailable(
+fn admission_hidden_reason_to_denial(
     reason: Option<ToolHiddenReason>,
-) -> Option<astra_runtime_env::ToolUnavailableReason> {
+) -> Option<RuntimeEnvironmentDenial> {
     use astra_runtime_env::ToolUnavailableReason;
     match reason? {
-        ToolHiddenReason::UnknownTool => Some(ToolUnavailableReason::UnknownTool),
-        ToolHiddenReason::NoProvider => Some(ToolUnavailableReason::ExecutorUnavailable(
-            "no capacity provider declares this tool for the current binding".to_string(),
+        ToolHiddenReason::UnknownTool => Some(RuntimeEnvironmentDenial::new(
+            RuntimeEnvironmentDenialKind::UnknownTool,
+            ToolUnavailableReason::UnknownTool,
         )),
-        ToolHiddenReason::ProviderUnavailable => Some(ToolUnavailableReason::ExecutorUnavailable(
-            "the selected capacity provider is not ready for this binding".to_string(),
+        ToolHiddenReason::NoProvider => Some(RuntimeEnvironmentDenial::new(
+            RuntimeEnvironmentDenialKind::ProviderUnavailable,
+            ToolUnavailableReason::ExecutorUnavailable(
+                "no capacity provider declares this tool for the current binding".to_string(),
+            ),
         )),
-        ToolHiddenReason::SchemaConflict => Some(ToolUnavailableReason::PolicyDenied(
-            "conflicting tool schemas for this name".to_string(),
+        ToolHiddenReason::ProviderUnavailable => Some(RuntimeEnvironmentDenial::new(
+            RuntimeEnvironmentDenialKind::ProviderUnavailable,
+            ToolUnavailableReason::ExecutorUnavailable(
+                "the selected capacity provider is not ready for this binding".to_string(),
+            ),
         )),
-        ToolHiddenReason::ProviderRouteMismatch => {
-            Some(ToolUnavailableReason::ExecutorUnavailable(
+        ToolHiddenReason::RuntimeSurfaceDenied => Some(RuntimeEnvironmentDenial::new(
+            RuntimeEnvironmentDenialKind::RuntimeSurfaceDenied,
+            ToolUnavailableReason::PolicyDenied(
+                "runtime surface denies this tool for the selected provider binding".to_string(),
+            ),
+        )),
+        ToolHiddenReason::SchemaConflict => Some(RuntimeEnvironmentDenial::new(
+            RuntimeEnvironmentDenialKind::SchemaConflict,
+            ToolUnavailableReason::PolicyDenied(
+                "conflicting tool schemas for this name".to_string(),
+            ),
+        )),
+        ToolHiddenReason::ProviderRouteMismatch => Some(RuntimeEnvironmentDenial::new(
+            RuntimeEnvironmentDenialKind::ProviderRouteMismatch,
+            ToolUnavailableReason::ExecutorUnavailable(
                 "no capacity provider matches the selected execution route".to_string(),
-            ))
+            ),
+        )),
+        ToolHiddenReason::UnsupportedRoute => Some(RuntimeEnvironmentDenial::new(
+            RuntimeEnvironmentDenialKind::UnsupportedRoute,
+            ToolUnavailableReason::ExecutorUnavailable(
+                "tool has no supported execution route for the current binding".to_string(),
+            ),
+        )),
+        ToolHiddenReason::DisabledOffer => Some(RuntimeEnvironmentDenial::new(
+            RuntimeEnvironmentDenialKind::PolicyDenied,
+            ToolUnavailableReason::PolicyDenied("tool offer disabled by policy".to_string()),
+        )),
+        ToolHiddenReason::ProviderToolNotAllowed => Some(RuntimeEnvironmentDenial::new(
+            RuntimeEnvironmentDenialKind::PolicyDenied,
+            ToolUnavailableReason::PolicyDenied(
+                "tool not allowed for selected provider".to_string(),
+            ),
+        )),
+    }
+}
+
+fn runtime_environment_denial_ux(
+    kind: RuntimeEnvironmentDenialKind,
+) -> (&'static str, &'static str, &'static str, bool) {
+    match kind {
+        RuntimeEnvironmentDenialKind::UnknownTool => (
+            "unknown_tool",
+            "Use a tool that is advertised in the current turn surface.",
+            "refresh_tool_surface",
+            false,
+        ),
+        RuntimeEnvironmentDenialKind::ProviderUnavailable => (
+            "provider_unavailable",
+            "Reconnect the selected provider, choose a different execution environment, or enable an explicit fallback policy.",
+            "reconnect_or_rebind_provider",
+            true,
+        ),
+        RuntimeEnvironmentDenialKind::SchemaConflict => (
+            "schema_conflict",
+            "Refresh the tool surface or choose a provider set with a single schema for this tool.",
+            "refresh_tool_surface",
+            true,
+        ),
+        RuntimeEnvironmentDenialKind::ProviderRouteMismatch => (
+            "provider_route_mismatch",
+            "Choose the provider that owns this tool route or refresh the current tool surface.",
+            "rebind_provider_for_route",
+            true,
+        ),
+        RuntimeEnvironmentDenialKind::UnsupportedRoute => (
+            "unsupported_route",
+            "Choose an execution environment that supports this tool route.",
+            "bind_supported_route",
+            true,
+        ),
+        RuntimeEnvironmentDenialKind::ExecutorUnavailable => (
+            "executor_unavailable",
+            "Choose an execution environment that can run this tool.",
+            "bind_executor",
+            true,
+        ),
+        RuntimeEnvironmentDenialKind::WorkspaceUnavailable => (
+            "workspace_unavailable",
+            "Select or reconnect a workspace that grants this tool's required authority.",
+            "bind_workspace",
+            true,
+        ),
+        RuntimeEnvironmentDenialKind::RuntimeCapabilityMissing => (
+            "runtime_capability_missing",
+            "Choose a runtime provider that supplies this capability.",
+            "bind_runtime_capability",
+            true,
+        ),
+        RuntimeEnvironmentDenialKind::RuntimeSurfaceDenied => (
+            "runtime_surface_denied",
+            "Choose a read-write workspace/runtime, adjust policy, or ask the agent to continue without this mutation.",
+            "change_policy_or_workspace_authority",
+            true,
+        ),
+        RuntimeEnvironmentDenialKind::PolicyDenied => (
+            "policy_denied",
+            "Adjust policy or choose an allowed action.",
+            "change_policy",
+            true,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod runtime_environment_denial_kind_tests {
+    use super::*;
+
+    #[test]
+    fn admission_hidden_reasons_keep_precise_denial_kinds() {
+        let cases = [
+            (
+                ToolHiddenReason::UnknownTool,
+                RuntimeEnvironmentDenialKind::UnknownTool,
+                "unknown_tool",
+            ),
+            (
+                ToolHiddenReason::NoProvider,
+                RuntimeEnvironmentDenialKind::ProviderUnavailable,
+                "provider_unavailable",
+            ),
+            (
+                ToolHiddenReason::ProviderUnavailable,
+                RuntimeEnvironmentDenialKind::ProviderUnavailable,
+                "provider_unavailable",
+            ),
+            (
+                ToolHiddenReason::RuntimeSurfaceDenied,
+                RuntimeEnvironmentDenialKind::RuntimeSurfaceDenied,
+                "runtime_surface_denied",
+            ),
+            (
+                ToolHiddenReason::SchemaConflict,
+                RuntimeEnvironmentDenialKind::SchemaConflict,
+                "schema_conflict",
+            ),
+            (
+                ToolHiddenReason::ProviderRouteMismatch,
+                RuntimeEnvironmentDenialKind::ProviderRouteMismatch,
+                "provider_route_mismatch",
+            ),
+            (
+                ToolHiddenReason::UnsupportedRoute,
+                RuntimeEnvironmentDenialKind::UnsupportedRoute,
+                "unsupported_route",
+            ),
+            (
+                ToolHiddenReason::DisabledOffer,
+                RuntimeEnvironmentDenialKind::PolicyDenied,
+                "policy_denied",
+            ),
+            (
+                ToolHiddenReason::ProviderToolNotAllowed,
+                RuntimeEnvironmentDenialKind::PolicyDenied,
+                "policy_denied",
+            ),
+        ];
+
+        for (hidden_reason, expected_kind, expected_reason_kind) in cases {
+            let denial = admission_hidden_reason_to_denial(Some(hidden_reason))
+                .expect("hidden reason should map to a denial");
+            assert_eq!(denial.kind, expected_kind);
+
+            let (reason_kind, _, _, _) = runtime_environment_denial_ux(denial.kind);
+            assert_eq!(reason_kind, expected_reason_kind);
+            assert_ne!(reason_kind, "executor_unavailable");
         }
-        ToolHiddenReason::UnsupportedRoute => Some(ToolUnavailableReason::ExecutorUnavailable(
-            "tool has no supported execution route for the current binding".to_string(),
-        )),
-        ToolHiddenReason::DisabledOffer => Some(ToolUnavailableReason::PolicyDenied(
-            "tool offer disabled by policy".to_string(),
-        )),
-        ToolHiddenReason::ProviderToolNotAllowed => Some(ToolUnavailableReason::PolicyDenied(
-            "tool not allowed for selected provider".to_string(),
-        )),
+    }
+
+    #[test]
+    fn unavailable_reasons_keep_precise_denial_kinds() {
+        let cases = [
+            (
+                astra_runtime_env::ToolUnavailableReason::UnknownTool,
+                RuntimeEnvironmentDenialKind::UnknownTool,
+                "unknown_tool",
+            ),
+            (
+                astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(
+                    "executor offline".to_string(),
+                ),
+                RuntimeEnvironmentDenialKind::ExecutorUnavailable,
+                "executor_unavailable",
+            ),
+            (
+                astra_runtime_env::ToolUnavailableReason::WorkspaceUnavailable(
+                    "workspace missing".to_string(),
+                ),
+                RuntimeEnvironmentDenialKind::WorkspaceUnavailable,
+                "workspace_unavailable",
+            ),
+            (
+                astra_runtime_env::ToolUnavailableReason::RuntimeCapabilityMissing(
+                    "filesystem_write".to_string(),
+                ),
+                RuntimeEnvironmentDenialKind::RuntimeCapabilityMissing,
+                "runtime_capability_missing",
+            ),
+            (
+                astra_runtime_env::ToolUnavailableReason::PolicyDenied(
+                    "filesystem_write".to_string(),
+                ),
+                RuntimeEnvironmentDenialKind::PolicyDenied,
+                "policy_denied",
+            ),
+        ];
+
+        for (unavailable_reason, expected_kind, expected_reason_kind) in cases {
+            let denial = RuntimeEnvironmentDenial::from_unavailable_reason(unavailable_reason);
+            assert_eq!(denial.kind, expected_kind);
+
+            let (reason_kind, _, _, _) = runtime_environment_denial_ux(denial.kind);
+            assert_eq!(reason_kind, expected_reason_kind);
+        }
     }
 }
 
@@ -2127,6 +2391,102 @@ mod tests {
         assert_eq!(
             value["runtime_env_reason"],
             json!({"PolicyDenied": "filesystem_write"})
+        );
+    }
+
+    #[test]
+    fn provider_visibility_decision_blocks_write_file_on_read_only_workspace() {
+        let (mut exec, dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::ServerSandbox,
+                display_name: "Read-only server sandbox".to_string(),
+                cwd: Some(dir.path().display().to_string()),
+                authority: WorkspaceAuthority::ReadOnly,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        let readiness = exec.executor_tool_readiness_for_call(
+            "write_file",
+            &json!({"path": "x.txt", "content": "x"}),
+        );
+        assert!(
+            matches!(
+                readiness,
+                ExecutorToolReadiness::RuntimeEnvironmentDenied(RuntimeEnvironmentDenial {
+                    kind: RuntimeEnvironmentDenialKind::RuntimeSurfaceDenied,
+                    reason: astra_runtime_env::ToolUnavailableReason::PolicyDenied(_),
+                })
+            ),
+            "write_file must be denied by the provider visibility decision before execution: {readiness:?}"
+        );
+
+        let blocked = exec
+            .executor_readiness_preflight_result(
+                "write_file",
+                &json!({"path": "x.txt", "content": "x"}),
+            )
+            .expect("write_file must be blocked before execution on read-only workspace");
+        assert!(blocked.is_error, "{blocked:?}");
+        assert!(
+            blocked.output.contains("runtime surface denies this tool"),
+            "{}",
+            blocked.output
+        );
+        let value: Value = serde_json::from_str(&blocked.output).unwrap();
+        assert_eq!(value["reason_kind"], "runtime_surface_denied");
+        assert_eq!(
+            value["provider_action"],
+            "change_policy_or_workspace_authority"
+        );
+        assert_eq!(value["resumable"], true);
+        assert!(
+            value["user_action"]
+                .as_str()
+                .unwrap()
+                .contains("read-write workspace"),
+            "{}",
+            blocked.output
+        );
+    }
+
+    #[test]
+    fn provider_unavailable_denial_gives_reconnect_or_rebind_action() {
+        let (mut exec, dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "Edge workspace",
+                dir.path().display().to_string(),
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "Edge workspace",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Offline,
+            ),
+        );
+
+        let blocked = exec
+            .executor_readiness_preflight_result(
+                "web_fetch",
+                &json!({"url": "https://example.com"}),
+            )
+            .expect(
+                "edge-owned web_fetch must be blocked while the selected edge provider is offline",
+            );
+        assert!(blocked.is_error, "{blocked:?}");
+        let value: Value = serde_json::from_str(&blocked.output).unwrap();
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["reason_kind"], "provider_unavailable");
+        assert_eq!(value["provider_action"], "reconnect_or_rebind_provider");
+        assert_eq!(value["resumable"], true);
+        assert_eq!(value["retryable"], false);
+        assert!(
+            value["user_action"].as_str().unwrap().contains("Reconnect"),
+            "{}",
+            blocked.output
         );
     }
 

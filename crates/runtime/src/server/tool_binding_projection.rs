@@ -6,9 +6,10 @@ use astra_turn_core::tool::schema::tool_schema_name;
 use serde_json::Value;
 
 use crate::server::tool_admission::{
-    ToolAdmissionContext, active_provider_declarations_for_binding,
-    has_explicit_runtime_executor_provider,
+    ToolAdmissionContext, ToolAdmissionDecision, ToolHiddenReason,
+    active_provider_declarations_for_binding, has_explicit_runtime_executor_provider,
 };
+use crate::server::tool_route_selection::ToolExecutionRouteKind;
 
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolPolicySnapshot,
@@ -71,49 +72,114 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
             {
                 return false;
             }
-            let admission =
-                crate::server::tool_admission::resolve_tool_admission_for_providers_with_context(
-                    tool_name,
-                    workspace,
-                    executor,
-                    &providers,
-                    &registry,
-                    &admission_context,
-                );
-            if !admission.visible {
-                return false;
-            }
-            if admission.selected_route()
-                == super::tool_route_selection::ToolExecutionRouteKind::ServerRuntime
-                && registry.get(tool_name).is_some_and(|spec| {
-                    matches!(
-                        spec.required.executor,
-                        astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
-                    )
-                })
-            {
-                return true;
-            }
-            let binding = runtime_environment_binding_for_parts_with_provider_declarations(
+            let admission = resolve_tool_visibility_for_providers_with_context(
                 tool_name,
                 workspace,
                 executor,
-                runtime.cloned(),
-                &ToolPolicySnapshot::default(),
-                &registry,
+                runtime,
                 &providers,
+                &registry,
+                &admission_context,
             );
-            astra_runtime_env::CapabilityResolver
-                .check_tool_call_for_surface(
-                    &registry,
-                    tool_name,
-                    &serde_json::json!({}),
-                    &binding.capabilities,
-                    &binding.tool_surface,
-                )
-                .is_ok()
+            admission.visible
         })
         .collect()
+}
+
+pub(crate) fn resolve_tool_visibility_for_binding_with_context(
+    tool_name: &str,
+    schemas: &[Value],
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    registry: &astra_runtime_env::ToolRegistry,
+    admission_context: ToolAdmissionContext,
+) -> ToolAdmissionDecision {
+    let providers = active_provider_declarations_for_binding(
+        schemas,
+        workspace,
+        executor,
+        runtime,
+        registry,
+        &admission_context,
+    );
+    resolve_tool_visibility_for_providers_with_context(
+        tool_name,
+        workspace,
+        executor,
+        runtime,
+        &providers,
+        registry,
+        &admission_context,
+    )
+}
+
+pub(crate) fn resolve_tool_visibility_for_providers_with_context(
+    tool_name: &str,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    providers: &[astra_runtime_env::CapacityProviderDeclaration],
+    registry: &astra_runtime_env::ToolRegistry,
+    admission_context: &ToolAdmissionContext,
+) -> ToolAdmissionDecision {
+    let mut admission =
+        crate::server::tool_admission::resolve_tool_admission_for_providers_with_context(
+            tool_name,
+            workspace,
+            executor,
+            providers,
+            registry,
+            admission_context,
+        );
+    if admission.visible
+        && !runtime_surface_allows_selected_decision(
+            &admission, workspace, executor, runtime, providers, registry,
+        )
+    {
+        admission.visible = false;
+        admission.hidden_reason = Some(ToolHiddenReason::RuntimeSurfaceDenied);
+    }
+    admission
+}
+
+fn runtime_surface_allows_selected_decision(
+    admission: &ToolAdmissionDecision,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    providers: &[astra_runtime_env::CapacityProviderDeclaration],
+    registry: &astra_runtime_env::ToolRegistry,
+) -> bool {
+    let tool_name = admission.tool_name.as_str();
+    if admission.selected_route() == ToolExecutionRouteKind::ServerRuntime
+        && registry.get(tool_name).is_some_and(|spec| {
+            matches!(
+                spec.required.executor,
+                astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
+            )
+        })
+    {
+        return true;
+    }
+    let binding = runtime_environment_binding_for_parts_with_provider_declarations(
+        tool_name,
+        workspace,
+        executor,
+        runtime.cloned(),
+        &ToolPolicySnapshot::default(),
+        registry,
+        providers,
+    );
+    astra_runtime_env::CapabilityResolver
+        .check_tool_call_for_surface(
+            registry,
+            tool_name,
+            &serde_json::json!({}),
+            &binding.capabilities,
+            &binding.tool_surface,
+        )
+        .is_ok()
 }
 
 pub fn capability_filter_edge_provided_tool_schemas_for_binding(
@@ -1452,6 +1518,327 @@ mod tests {
         assert_eq!(
             runtime_ws.kind,
             astra_runtime_env::WorkspaceBindingKind::Unknown
+        );
+    }
+}
+
+#[cfg(test)]
+mod provider_decision_projection_tests {
+    use super::*;
+    use crate::server::tool_execution_binding::{
+        ExecutorBinding, ExecutorStatus, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
+    };
+    use serde_json::json;
+
+    fn schema(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "test schema",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        })
+    }
+
+    fn edge_executor() -> ExecutorBinding {
+        ExecutorBinding::edge_agent(
+            "edge-1",
+            "Edge",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        )
+    }
+
+    fn edge_runtime() -> astra_runtime_env::RuntimeBinding {
+        astra_runtime_env::RuntimeBinding::host_process("edge-host")
+    }
+
+    #[test]
+    fn provider_decision_is_projection_source_for_read_only_workspace_denial() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let workspace =
+            WorkspaceBinding::edge_workspace("Edge", "/repo", WorkspaceAuthority::ReadOnly);
+        let executor = edge_executor();
+        let runtime = edge_runtime();
+        let schemas = vec![schema("write_file")];
+
+        let raw_admission =
+            crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
+                "write_file",
+                &schemas,
+                &workspace,
+                &executor,
+                Some(&runtime),
+                &registry,
+                ToolAdmissionContext::default(),
+            );
+        assert!(
+            raw_admission.visible,
+            "provider ownership alone should see the edge offer before runtime surface policy is applied"
+        );
+
+        let decision = resolve_tool_visibility_for_binding_with_context(
+            "write_file",
+            &schemas,
+            &workspace,
+            &executor,
+            Some(&runtime),
+            &registry,
+            ToolAdmissionContext::default(),
+        );
+        assert!(!decision.visible);
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::RuntimeSurfaceDenied)
+        );
+        assert_eq!(decision.selected_route(), ToolExecutionRouteKind::EdgeBound);
+        assert_eq!(decision.selected_offer_id(), Some("write_file@edge-1"));
+
+        let projected = capability_filter_tool_schemas_for_binding_with_context(
+            schemas,
+            &workspace,
+            &executor,
+            Some(&runtime),
+            ToolAdmissionContext::default(),
+        );
+        assert!(
+            projected.is_empty(),
+            "projection must consume the same provider decision instead of running a private filter"
+        );
+    }
+
+    #[test]
+    fn provider_decision_prefers_edge_web_fetch_over_server_offer() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let workspace =
+            WorkspaceBinding::edge_workspace("Edge", "/repo", WorkspaceAuthority::ReadWrite);
+        let executor = edge_executor();
+        let runtime = edge_runtime();
+        let schemas = vec![schema("web_fetch")];
+
+        let decision = resolve_tool_visibility_for_binding_with_context(
+            "web_fetch",
+            &schemas,
+            &workspace,
+            &executor,
+            Some(&runtime),
+            &registry,
+            ToolAdmissionContext::default(),
+        );
+
+        assert!(decision.visible);
+        assert_eq!(decision.selected_route(), ToolExecutionRouteKind::EdgeBound);
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-1"));
+        assert!(decision.candidates.iter().any(|candidate| {
+            candidate.offer.offer_id == "web_fetch@server-builtin"
+                && !candidate.selected
+                && matches!(
+                    candidate.reason,
+                    crate::server::tool_admission::ToolOfferCandidateReason::CurrentProviderPreferred
+                )
+        }));
+    }
+
+    #[test]
+    fn provider_decision_reports_offline_edge_without_server_fallback() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let workspace =
+            WorkspaceBinding::edge_workspace("Edge", "/repo", WorkspaceAuthority::ReadWrite);
+        let executor = ExecutorBinding::edge_agent(
+            "edge-1",
+            "Edge",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Offline,
+        );
+        let runtime = edge_runtime();
+        let schemas = vec![schema("web_fetch")];
+
+        let decision = resolve_tool_visibility_for_binding_with_context(
+            "web_fetch",
+            &schemas,
+            &workspace,
+            &executor,
+            Some(&runtime),
+            &registry,
+            ToolAdmissionContext::default(),
+        );
+
+        assert!(!decision.visible);
+        assert_eq!(
+            decision.hidden_reason,
+            Some(ToolHiddenReason::ProviderUnavailable)
+        );
+        assert_eq!(decision.selected_route(), ToolExecutionRouteKind::EdgeBound);
+        assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-1"));
+        assert!(decision.candidates.iter().any(|candidate| {
+            candidate.offer.offer_id == "web_fetch@server-builtin"
+                && !candidate.selected
+                && matches!(
+                    candidate.reason,
+                    crate::server::tool_admission::ToolOfferCandidateReason::CurrentProviderPreferred
+                )
+        }));
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_provider_decision_tests {
+    use super::*;
+    use crate::server::tool_execution_binding::{
+        ExecutorBinding, ExecutorStatus, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
+    };
+    use serde_json::{Value, json};
+
+    fn schema(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "stable schema",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {"type": "string"}
+                    }
+                }
+            }
+        })
+    }
+
+    fn names_and_schemas(schemas: Vec<Value>) -> Vec<(String, String)> {
+        schemas
+            .into_iter()
+            .map(|schema| {
+                let name = tool_schema_name(&schema).expect("schema name").to_string();
+                let bytes = serde_json::to_string(&schema).expect("schema json");
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    fn edge_workspace(authority: WorkspaceAuthority) -> WorkspaceBinding {
+        WorkspaceBinding::edge_workspace("Edge", "/repo", authority)
+    }
+
+    fn edge_executor(status: ExecutorStatus) -> ExecutorBinding {
+        ExecutorBinding::edge_agent("edge-1", "Edge", ToolTransportKind::EdgeWs, status)
+    }
+
+    fn edge_runtime() -> astra_runtime_env::RuntimeBinding {
+        astra_runtime_env::RuntimeBinding::host_process("edge-host")
+    }
+
+    #[test]
+    fn provider_state_does_not_leak_into_prompt_visible_tool_schema() {
+        let runtime = edge_runtime();
+        let schemas = vec![schema("web_fetch")];
+
+        let online_surface = capability_filter_tool_schemas_for_binding_with_context(
+            schemas.clone(),
+            &edge_workspace(WorkspaceAuthority::ReadWrite),
+            &edge_executor(ExecutorStatus::Online),
+            Some(&runtime),
+            ToolAdmissionContext::default(),
+        );
+        let offline_surface = capability_filter_tool_schemas_for_binding_with_context(
+            schemas,
+            &edge_workspace(WorkspaceAuthority::ReadWrite),
+            &edge_executor(ExecutorStatus::Offline),
+            Some(&runtime),
+            ToolAdmissionContext::default(),
+        );
+
+        assert_eq!(online_surface.len(), 1);
+        assert!(offline_surface.is_empty());
+        let rendered = serde_json::to_string(&online_surface[0]).unwrap();
+        for forbidden in [
+            "provider_id",
+            "provider_type",
+            "selected_route",
+            "hidden_reason",
+            "reason_kind",
+            "offline",
+            "reconnect",
+            "fallback",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "provider decision detail `{forbidden}` must stay out of prompt-visible tool schema: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_policy_changes_visibility_not_schema_bytes_for_surviving_tools() {
+        let runtime = edge_runtime();
+        let schemas = vec![schema("read_file"), schema("write_file")];
+        let read_write =
+            names_and_schemas(capability_filter_tool_schemas_for_binding_with_context(
+                schemas.clone(),
+                &edge_workspace(WorkspaceAuthority::ReadWrite),
+                &edge_executor(ExecutorStatus::Online),
+                Some(&runtime),
+                ToolAdmissionContext::default(),
+            ));
+        let read_only = names_and_schemas(capability_filter_tool_schemas_for_binding_with_context(
+            schemas,
+            &edge_workspace(WorkspaceAuthority::ReadOnly),
+            &edge_executor(ExecutorStatus::Online),
+            Some(&runtime),
+            ToolAdmissionContext::default(),
+        ));
+
+        assert!(read_write.iter().any(|(name, _)| name == "write_file"));
+        assert!(!read_only.iter().any(|(name, _)| name == "write_file"));
+        let read_write_read_file = read_write
+            .iter()
+            .find(|(name, _)| name == "read_file")
+            .expect("read_file in read-write surface");
+        let read_only_read_file = read_only
+            .iter()
+            .find(|(name, _)| name == "read_file")
+            .expect("read_file in read-only surface");
+        assert_eq!(
+            read_write_read_file.1, read_only_read_file.1,
+            "policy changes must not rewrite surviving prompt-visible schemas"
+        );
+    }
+
+    #[test]
+    fn edge_and_server_shared_tool_schema_bytes_are_provider_selection_stable() {
+        let runtime = edge_runtime();
+        let edge_schema = schema("web_fetch");
+        let no_edge_surface = capability_filtered_server_tool_schemas_with_context(
+            &astra_turn_core::capability::CapabilitySet::all(),
+            &WorkspaceBinding::none(),
+            &ExecutorBinding::server_control_plane(),
+            None,
+            ToolAdmissionContext::default(),
+        );
+        let server_web_fetch = no_edge_surface
+            .into_iter()
+            .find(|schema| tool_schema_name(schema) == Some("web_fetch"))
+            .expect("server web_fetch schema");
+        let edge_surface = capability_filter_tool_schemas_for_binding_with_context(
+            vec![edge_schema.clone(), server_web_fetch.clone()],
+            &edge_workspace(WorkspaceAuthority::ReadWrite),
+            &edge_executor(ExecutorStatus::Online),
+            Some(&runtime),
+            ToolAdmissionContext::default(),
+        );
+        let selected = edge_surface
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("web_fetch"))
+            .expect("edge selected web_fetch schema");
+
+        assert_eq!(
+            serde_json::to_string(selected).unwrap(),
+            serde_json::to_string(&edge_schema).unwrap(),
+            "provider selection must choose an existing provider schema without injecting route/admission metadata"
         );
     }
 }

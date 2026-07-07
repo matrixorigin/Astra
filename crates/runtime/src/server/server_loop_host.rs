@@ -1852,7 +1852,8 @@ fn append_server_owned_tool_schemas_unique(
             }
             _ => {}
         }
-        let admission = resolve_tool_admission_for_binding_with_context(
+        let admission =
+            crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
             name,
             &candidates,
             workspace,
@@ -1861,14 +1862,22 @@ fn append_server_owned_tool_schemas_unique(
             &registry,
             admission_context.clone(),
         );
-        if !matches!(
-            admission.selected_route(),
-            ToolExecutionRouteKind::ServerRuntime | ToolExecutionRouteKind::ServerControlPlane
-        ) {
+        if !admission.visible {
+            tracing::debug!(
+                tool_name = %name,
+                selected_route = ?admission.selected_route(),
+                hidden_reason = ?admission.hidden_reason,
+                "server-owned tool omitted from prompt surface by provider visibility decision"
+            );
             continue;
         }
-        if seen.insert(name.to_string()) {
-            surface.push(schema);
+        match admission.selected_route() {
+            ToolExecutionRouteKind::ServerRuntime | ToolExecutionRouteKind::ServerControlPlane => {
+                if seen.insert(name.to_string()) {
+                    surface.push(schema);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -3640,7 +3649,7 @@ impl ServerAgenticLoopHost {
         tool_name: &str,
         registry: &astra_runtime_env::ToolRegistry,
     ) -> crate::server::tool_admission::ToolAdmissionDecision {
-        resolve_tool_admission_for_binding_with_context(
+        crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
             tool_name,
             &self.tool_schemas,
             &self.workspace_binding,

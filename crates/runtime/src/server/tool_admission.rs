@@ -54,6 +54,7 @@ pub(crate) enum ToolHiddenReason {
     UnknownTool,
     NoProvider,
     ProviderUnavailable,
+    RuntimeSurfaceDenied,
     SchemaConflict,
     ProviderRouteMismatch,
     UnsupportedRoute,
