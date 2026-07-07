@@ -1,10 +1,13 @@
 //! Capability-driven tool surface resolution.
 
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::capability::CapabilitySet;
 use crate::tool::registry::meta::TOOL_CATALOG;
-use crate::tool::schema::tool_schema_name;
+use crate::tool::schema::{
+    prompt_schema_conflicting_tool_names, sort_tool_schemas_by_name, tool_schema_name,
+};
 
 /// User-facing execution surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,10 +52,14 @@ pub fn resolve_with_diagnostics(
     let _ = surface;
     let mut schemas = Vec::new();
     let mut missing_schemas = Vec::new();
-    let mut emitted = std::collections::HashSet::new();
+    let mut emitted = HashSet::new();
+    let conflicting_names = prompt_schema_conflicting_tool_names(all_schemas);
 
     for meta in TOOL_CATALOG {
         if !capabilities.has_all(meta.requires) {
+            continue;
+        }
+        if conflicting_names.contains(meta.name) {
             continue;
         }
         if let Some(schema) = find_schema(all_schemas, meta.name) {
@@ -63,19 +70,25 @@ pub fn resolve_with_diagnostics(
         }
     }
 
-    // Pass through plugin/MCP schemas not present in TOOL_CATALOG. If a plugin
-    // collides with a catalog name, the catalog filter remains authoritative
-    // and the plugin entry is dropped instead of bypassing capability gates.
+    // Pass through plugin/MCP schemas not present in TOOL_CATALOG. Sort this
+    // dynamic tail by canonical tool name so MCP list_tools order cannot churn
+    // prompt-cache bytes. Catalog tools above intentionally keep catalog order.
+    let mut passthrough = Vec::new();
     for schema in all_schemas {
         let Some(name) = tool_schema_name(schema) else {
             continue;
         };
+        if conflicting_names.contains(name) {
+            continue;
+        }
         if emitted.contains(name) || TOOL_CATALOG.iter().any(|meta| meta.name == name) {
             continue;
         }
-        schemas.push(schema.clone());
+        passthrough.push(schema.clone());
         emitted.insert(name.to_string());
     }
+    sort_tool_schemas_by_name(&mut passthrough);
+    schemas.extend(passthrough);
 
     ResolveOutcome {
         schemas,
@@ -189,6 +202,95 @@ mod tests {
             .collect();
 
         assert_eq!(catalog_names, expected);
+    }
+
+    #[test]
+    fn resolve_sorts_passthrough_tools_for_prompt_cache_stability() {
+        let first = resolve(
+            Surface::CliLocal,
+            &CapabilitySet::empty(),
+            &[
+                schema("mcp__zeta__query"),
+                schema("bash"),
+                schema("mcp__alpha__query"),
+            ],
+        );
+        let second = resolve(
+            Surface::CliLocal,
+            &CapabilitySet::empty(),
+            &[
+                schema("mcp__alpha__query"),
+                schema("bash"),
+                schema("mcp__zeta__query"),
+            ],
+        );
+
+        assert_eq!(
+            names(&first),
+            vec![
+                "bash".to_string(),
+                "mcp__alpha__query".to_string(),
+                "mcp__zeta__query".to_string()
+            ]
+        );
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first schemas"),
+            serde_json::to_vec(&second).expect("serialize second schemas"),
+            "pass-through plugin/MCP schemas must be byte-stable across provider list order"
+        );
+    }
+
+    #[test]
+    fn resolve_fails_closed_for_same_name_prompt_schema_conflict() {
+        let pool = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "script": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            schema("read_file"),
+        ];
+
+        let visible = names(&resolve(Surface::CliLocal, &CapabilitySet::empty(), &pool));
+
+        assert_eq!(
+            visible,
+            vec!["read_file".to_string()],
+            "same-name conflicting prompt schemas must not first-win into the model surface"
+        );
+    }
+
+    #[test]
+    fn resolve_dedupes_equivalent_function_shorthand_without_changing_first_schema_bytes() {
+        let shorthand = json!({"function": {"name": "bash"}});
+        let explicit = json!({"type": "function", "function": {"name": "bash"}});
+        let resolved = resolve(
+            Surface::CliLocal,
+            &CapabilitySet::empty(),
+            &[shorthand.clone(), explicit],
+        );
+
+        assert_eq!(names(&resolved), vec!["bash".to_string()]);
+        assert_eq!(resolved, vec![shorthand]);
     }
 
     #[test]

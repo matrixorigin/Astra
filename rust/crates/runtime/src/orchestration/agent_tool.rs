@@ -15,6 +15,9 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 
+use astra_tools::agent_tool_contract::{
+    AgentAction, AgentFanoutAction, agent_action_from_args, agent_fanout_action_from_args,
+};
 use astra_turn_core::orchestration::agent_result_wire::{
     render_agent_tool_error, render_agent_tool_error_with_kind, render_unknown_agent_result,
     render_wait_for_agent_status, render_wait_timeout_outcome,
@@ -85,6 +88,10 @@ pub fn render_agent_runtime_binding_error(tool_name: &str, action: &str) -> Stri
         Some(action),
     );
     render_agent_tool_error_with_kind(None, &error, Some(astra_core::ErrorKind::ToolBinding))
+}
+
+fn render_agent_tool_contract_error(message: &str) -> String {
+    render_agent_tool_error_with_kind(None, message, Some(astra_core::ErrorKind::ToolInvalidArgs))
 }
 
 #[derive(Default)]
@@ -240,49 +247,43 @@ pub struct AgentToolContext {
 /// the caller before/after this function. This shared handler intentionally
 /// owns spawn/get_result validation and rendering.
 pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> String {
-    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    let action = match agent_action_from_args(args) {
+        Ok(action) => action,
+        Err(error) => return render_agent_tool_contract_error(&error),
+    };
     match action {
-        "spawn" => handle_agent_spawn_action(args, ctx).await,
-        "get_result" => handle_agent_get_result_action(args, ctx).await,
-        "send_message" => render_agent_runtime_binding_error("agent", "send_message"),
-        other if other.is_empty() && args.get("spawn").is_some() => render_agent_tool_error(
+        AgentAction::Spawn => handle_agent_spawn_action(args, ctx).await,
+        AgentAction::GetResult => handle_agent_get_result_action(args, ctx).await,
+        AgentAction::SendMessage => render_agent_runtime_binding_error("agent", "send_message"),
+        AgentAction::RunChain => render_agent_tool_error(
             None,
-            "Invalid agent call shape. Use the top-level `action='spawn'` field, not a `spawn` wrapper key. Example: agent(action='spawn', description='...', prompt='...').",
-        ),
-        other if other.is_empty() && args.get("agents").is_some() => render_agent_tool_error(
-            None,
-            "Unsupported `agents` batch payload for `agent`. Each `agent(action='spawn', ...)` call launches exactly one child. Use `agent_fanout(action='start', target_count=N, slots=[...])` for atomic parallel fan-out.",
-        ),
-        other => render_agent_tool_error(
-            None,
-            &format!("Unknown agent action: '{other}'. Use one of: spawn, get_result, run_chain"),
+            "agent.run_chain is owned by the executor chain engine and cannot be handled by the shared agent lifecycle handler.",
         ),
     }
 }
 
 /// Handle the atomic `agent_fanout` tool.
 pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentToolContext>) -> String {
-    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    let action = match agent_fanout_action_from_args(args) {
+        Ok(action) => action,
+        Err(error) => {
+            if args.get("action").is_none()
+                || args.get("action").and_then(Value::as_str) == Some("")
+            {
+                return render_agent_tool_contract_error(&format!(
+                    "{error} Do not retry with empty args {{}}. Choose one of three canonical shapes:\n\
+                         {FANOUT_START_SHAPE}\n\
+                         {FANOUT_GET_RESULTS_SHAPE}\n\
+                         {FANOUT_STOP_SLOT_SHAPE}"
+                ));
+            }
+            return render_agent_tool_contract_error(&error);
+        }
+    };
     match action {
-        "start" => handle_agent_fanout_start_action(args, ctx).await,
-        "get_results" => handle_agent_fanout_get_results_action(args, ctx).await,
-        "stop_slot" => handle_agent_fanout_stop_slot_action(args, ctx).await,
-        "" => render_agent_tool_error(
-            None,
-            &format!(
-                "Missing required field: action. Do not retry with empty args {{}}. \
-                 Choose one of three canonical shapes:\n\
-                 {FANOUT_START_SHAPE}\n\
-                 {FANOUT_GET_RESULTS_SHAPE}\n\
-                 {FANOUT_STOP_SLOT_SHAPE}"
-            ),
-        ),
-        other => render_agent_tool_error(
-            None,
-            &format!(
-                "Unknown agent_fanout action: '{other}'. Use one of: start, get_results, stop_slot"
-            ),
-        ),
+        AgentFanoutAction::Start => handle_agent_fanout_start_action(args, ctx).await,
+        AgentFanoutAction::GetResults => handle_agent_fanout_get_results_action(args, ctx).await,
+        AgentFanoutAction::StopSlot => handle_agent_fanout_stop_slot_action(args, ctx).await,
     }
 }
 
@@ -296,11 +297,14 @@ pub async fn recover_agent_fanout_tool_result(
     tool_call_id: Option<&str>,
     ctx: Option<&AgentToolContext>,
 ) -> String {
-    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-    let Some(ctx) = ctx else {
-        return render_agent_runtime_binding_error("agent_fanout", action);
+    let action = match agent_fanout_action_from_args(args) {
+        Ok(action) => action,
+        Err(error) => return render_agent_tool_contract_error(&error),
     };
-    if action == "get_results" {
+    let Some(ctx) = ctx else {
+        return render_agent_runtime_binding_error("agent_fanout", action.as_str());
+    };
+    if action == AgentFanoutAction::GetResults {
         let mut get_args = args.clone();
         if let Some(tool_call_id) = tool_call_id
             && let Some(object) = get_args.as_object_mut()
@@ -312,18 +316,10 @@ pub async fn recover_agent_fanout_tool_result(
         }
         return handle_agent_fanout_get_results_action(&get_args, Some(ctx)).await;
     }
-    if action == "stop_slot" {
+    if action == AgentFanoutAction::StopSlot {
         return render_agent_tool_error(
             None,
             "Cannot recover missing agent_fanout.stop_slot result because stop_slot has side effects. Recovery never replays control actions that can mutate child-agent state; call agent_fanout(action='get_results', group_id=...) to inspect the current group.",
-        );
-    }
-    if action != "start" {
-        return render_agent_tool_error(
-            None,
-            &format!(
-                "Cannot recover missing agent_fanout result for unknown action '{action}'. Use one of: start, get_results, stop_slot."
-            ),
         );
     }
 
@@ -1114,7 +1110,7 @@ async fn render_agent_fanout_results(
         "group_id": group_id,
         "title": updated.title,
         "target_count": updated.target_count,
-        "delivery_contract": "Results are in results[].result. When this output is persisted, read the persisted JSON without line ranges or parse it structurally, then present the substantive findings instead of only reporting the artifact path.",
+        "delivery_contract": "Results are in results[].result. If this output is persisted, use the Tool result id or artifact://session/tool-result/... handle from the persisted-output wrapper through runtime artifact recovery. Do not search for or copy physical filesystem paths.",
         "results": results,
     });
     let obj = response.as_object_mut().unwrap();
@@ -1541,18 +1537,7 @@ fn fanout_get_results_status_label(group: &AgentFanoutGroupProjection) -> &'stat
 }
 
 fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
-    match status {
-        AgentFanoutSlotStatus::Planned => "planned",
-        AgentFanoutSlotStatus::SpawnAccepted => "spawn_accepted",
-        AgentFanoutSlotStatus::SpawnRejected => "spawn_rejected",
-        AgentFanoutSlotStatus::Running => "running",
-        AgentFanoutSlotStatus::Completed => "completed",
-        AgentFanoutSlotStatus::Interrupted => "interrupted",
-        AgentFanoutSlotStatus::Failed => "failed",
-        AgentFanoutSlotStatus::CancelledByUser => "cancelled_by_user",
-        AgentFanoutSlotStatus::CancelledByParentBudget => "cancelled_by_parent_budget",
-        AgentFanoutSlotStatus::TimedOut => "timed_out",
-    }
+    status.as_str()
 }
 
 /// Handle `agent(action='spawn')`.
@@ -2277,8 +2262,7 @@ mod tests {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/xupeng/github/astra",
-                "authority": "read_write",
-                "fallback_policy": "disabled"
+                "authority": "read_write"
             },
             "executor": {
                 "kind": "edge_agent",
@@ -2287,8 +2271,7 @@ mod tests {
                 "transport": "edge_ws",
                 "status": "online"
             },
-            "transport": "edge_ws",
-            "fallback_policy": "disabled"
+            "transport": "edge_ws"
         }));
         let args = json!({
             "description": "Code quality review",
@@ -2882,6 +2865,13 @@ mod tests {
             value["delivery_contract"]
                 .as_str()
                 .is_some_and(|text| text.contains("results[].result")),
+            "{result}"
+        );
+        assert!(
+            value["delivery_contract"].as_str().is_some_and(|text| {
+                text.contains("artifact://session/tool-result")
+                    && text.contains("Do not search for or copy physical filesystem paths")
+            }),
             "{result}"
         );
         assert!(
@@ -3560,8 +3550,13 @@ mod tests {
     #[tokio::test]
     async fn agent_fanout_empty_args_returns_executable_canonical_shapes() {
         let result = handle_agent_fanout_tool(&json!({}), None).await;
+        let value: Value = serde_json::from_str(&result).expect("fanout error must stay JSON");
+        assert_eq!(
+            value["error_kind"].as_str(),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+        );
         assert!(
-            result.contains("Missing required field: action"),
+            result.contains("missing required parameter `action` for `agent_fanout`"),
             "{result}"
         );
         assert!(result.contains("Do not retry with empty args"), "{result}");

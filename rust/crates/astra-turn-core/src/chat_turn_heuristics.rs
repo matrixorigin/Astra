@@ -282,8 +282,14 @@ fn contains_workspace_evidence_signal(q: &str) -> bool {
 }
 
 #[must_use]
+pub fn active_user_task_text(input: &str) -> String {
+    crate::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(input)
+}
+
+#[must_use]
 pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
-    let q = input.to_lowercase();
+    let active_input = active_user_task_text(input);
+    let q = active_input.to_lowercase();
     let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
     let has_explicit_mutation_directive =
         contains_any_keyword(&q, EXPLICIT_MUTATION_DIRECTIVE_TERMS);
@@ -426,7 +432,8 @@ pub fn is_session_not_found_error(error: &str) -> bool {
 /// (review, explain, search, summarize, inspect) should not be forced through
 /// an extra verification round, while implementation/editing tasks should.
 pub fn looks_like_mutating_task(input: &str) -> bool {
-    let q = input.to_lowercase();
+    let active_input = active_user_task_text(input);
+    let q = active_input.to_lowercase();
     let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
     let has_read_only = contains_any_keyword(&q, ANALYSIS_TERMS);
     let has_explicit_mutation_directive =
@@ -688,6 +695,32 @@ mod tests {
         assert!(!profile.verification_required);
         // Pure mutating still works
         let profile = infer_task_execution_profile("fix the compilation error");
+        assert!(profile.verification_required);
+    }
+
+    #[test]
+    fn runtime_scaffolding_does_not_pollute_task_profile() {
+        let review_with_runtime_tail = concat!(
+            "review uncommitted changes\n\n",
+            "<system-reminder>\n",
+            "last assistant state mentioned fix/apply/edit/cleanup many times\n",
+            "</system-reminder>"
+        );
+        let profile = infer_task_execution_profile(review_with_runtime_tail);
+        assert!(
+            !profile.mutates_workspace,
+            "runtime scaffolding must not turn a review request into mutation"
+        );
+        assert!(!profile.verification_required);
+
+        let fix_with_runtime_tail = concat!(
+            "fix the broken auth check\n\n",
+            "<system-reminder>\n",
+            "last assistant state was review-only\n",
+            "</system-reminder>"
+        );
+        let profile = infer_task_execution_profile(fix_with_runtime_tail);
+        assert!(profile.mutates_workspace);
         assert!(profile.verification_required);
     }
 

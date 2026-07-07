@@ -152,11 +152,23 @@ fn lifecycle_token_usage_json(
         .saturating_add(cached_input_tokens)
         .saturating_add(cache_creation_tokens);
     let total_tokens = usage.total_tokens();
+    let cache_hit_ratio = if billable_input == 0 {
+        0.0
+    } else {
+        cached_input_tokens as f64 / billable_input as f64
+    };
     let mut usage_json = usage.to_json_map();
     usage_json.insert("prompt".into(), Value::from(billable_input));
     usage_json.insert("completion".into(), Value::from(output_tokens));
     usage_json.insert("cache_read".into(), Value::from(cached_input_tokens));
     usage_json.insert("cache_write".into(), Value::from(cache_creation_tokens));
+    usage_json.insert("raw_prompt_tokens".into(), Value::from(billable_input));
+    usage_json.insert("uncached_input_tokens".into(), Value::from(input_tokens));
+    usage_json.insert("effective_input_tokens".into(), Value::from(input_tokens));
+    usage_json.insert(
+        "prompt_cache_hit_ratio".into(),
+        Value::from(cache_hit_ratio),
+    );
     usage_json.insert("total".into(), Value::from(total_tokens));
     Some(Value::Object(usage_json))
 }
@@ -1125,6 +1137,7 @@ async fn persist_server_loop_core_events_impl(
             event_id: event.event_id.clone(),
             user_id: event.user_id.clone(),
             session_id: event.session_id.clone(),
+            run_id: Some(run_id.to_string()),
             agent_id: event.agent_id.clone(),
             event_type: "user_query".to_string(),
             content: event.content.clone().unwrap_or_default(),
@@ -1143,6 +1156,7 @@ async fn persist_server_loop_core_events_impl(
                 event_id: event.event_id.clone(),
                 user_id: event.user_id.clone(),
                 session_id: event.session_id.clone(),
+                run_id: Some(run_id.to_string()),
                 agent_id: event.agent_id.clone(),
                 event_type: "llm_response".to_string(),
                 content: event.content.clone().unwrap_or_default(),
@@ -1903,6 +1917,8 @@ async fn persist_server_loop_tool_events(
             event_id: Uuid::now_v7().to_string(),
             user_id: user_id.to_string(),
             session_id: session_id.to_string(),
+            run_id: state.current_run_id.clone(),
+            tool_call_id: None,
             agent_id: agent_id.map(|s| s.to_string()),
             event_type: "tool_call".to_string(),
             content: format!("server-loop tool: {tool_name}"),
@@ -2083,10 +2099,11 @@ fn build_server_loop_observer_request(
         return None;
     }
 
-    let turn_count = state
-        .session_turn
-        .max(state.max_turns.saturating_sub(state.remaining_turns) as u32)
-        as i64;
+    let turn_count = if state.session_turn > 0 {
+        state.session_turn
+    } else {
+        state.max_turns.saturating_sub(state.remaining_turns) as u32
+    } as i64;
     Some(TurnObserverRequest {
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
@@ -2443,7 +2460,23 @@ mod tests {
         assert_eq!(request.user_id, "user-1");
         assert_eq!(request.session_id, "session-1");
         assert_eq!(request.messages.len(), 2);
-        assert_eq!(request.turn_count, 4);
+        assert_eq!(request.turn_count, 3);
+    }
+
+    #[test]
+    fn server_loop_observer_turn_count_does_not_use_agent_loop_rounds_when_session_turn_exists() {
+        let mut state = observer_test_state();
+        state.session_turn = 1;
+        state.max_turns = 12;
+        state.remaining_turns = 10;
+        let request = build_server_loop_observer_request("user-1", "session-1", &state)
+            .expect("observer request");
+
+        assert_eq!(
+            request.turn_count, 1,
+            "observer turn_count is a session/user-turn sequence, not the \
+             number of LLM/tool-loop rounds consumed inside this turn",
+        );
     }
 
     #[test]
@@ -2496,6 +2529,13 @@ mod tests {
         assert_eq!(usage["completion"], 5);
         assert_eq!(usage["cache_read"], 4);
         assert_eq!(usage["cache_write"], 3);
+        assert_eq!(usage["raw_prompt_tokens"], 17);
+        assert_eq!(usage["uncached_input_tokens"], 10);
+        assert_eq!(usage["effective_input_tokens"], 10);
+        assert_eq!(
+            usage["prompt_cache_hit_ratio"],
+            serde_json::json!(4.0 / 17.0)
+        );
         assert_eq!(usage["total"], 22);
         assert!(
             usage.get("cache_read_tokens").is_none(),

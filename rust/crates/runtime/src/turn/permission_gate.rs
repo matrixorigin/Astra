@@ -222,8 +222,8 @@ pub async fn check_tool_permission_in_plan_mode(
                 "tool '{tool_name}' is blocked while plan mode is active. \
                  Plan mode is a read-only authoring phase — use only read tools \
                  already visible in the current turn, then \
-                 call `exit_plan_mode(plan='...', approved=true)` to exit and \
-                 unlock writes."
+                 call `exit_plan_mode(plan='...')` to submit the plan for \
+                 trusted user approval."
             ),
         };
     }
@@ -842,11 +842,11 @@ mod tests {
     // ── Phase 2: plan-mode write-tool gate ──────────────────────────────
     //
     // While the session is in plan mode (active_plan_id != None), all
-    // mutating tools (str_replace, write_file, bash, git commit, etc.)
+    // mutating invocations (str_replace, write_file, bash touch, git commit, etc.)
     // must be denied at the gate with a redirect to `exit_plan_mode`.
-    // Read-only tools stay allowed when they are already part of the current
-    // tool surface, so the model can still use existing evidence to write a
-    // good plan. Plan mode never grants a workspace or new read tools.
+    // Read-only invocations stay allowed through the current tool surface, so
+    // the model can keep investigating without schema churn. Plan mode never
+    // grants a workspace or a provider binding; it only overlays write policy.
     //
     // reference-agent references: plan-mode write block enforces "DO NOT
     // write or edit any files yet. This is a read-only exploration and
@@ -888,7 +888,7 @@ mod tests {
                 );
             }
             other => panic!(
-                "bash in plan mode must be denied (it's a write/exec tool). \
+                "mutating bash in plan mode must be denied. \
                  Got {other:?}"
             ),
         }
@@ -912,7 +912,10 @@ mod tests {
             ("rollback_session_state", Some(r#"{"scope":"last_turn"}"#)),
             ("adjust_config", Some(r#"{"key":"model","value":"fast"}"#)),
             ("compress_context", Some(r#"{"target_tokens":1000}"#)),
-            ("task", Some(r#"{"action":"stop","task_id":"bg-shell-1"}"#)),
+            (
+                "task_board",
+                Some(r#"{"action":"stop","task_id":"bg-shell-1"}"#),
+            ),
         ] {
             let result = check_tool_permission_in_plan_mode(
                 tool,
@@ -931,7 +934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_mode_blocks_shell_even_when_args_look_read_only() {
+    async fn plan_mode_allows_read_only_shell_but_blocks_mutating_shell() {
         let inherited = InheritedPermissions {
             mode: PermissionMode::Auto,
             ..Default::default()
@@ -950,8 +953,25 @@ mod tests {
             )
             .await;
             assert!(
+                is_allowed(&result),
+                "read-only shell command `{command}` must remain available during plan authoring. Got: {result:?}"
+            );
+        }
+
+        for command in ["touch plan.txt", "git push origin main"] {
+            let args = serde_json::json!({ "command": command }).to_string();
+            let result = check_tool_permission_in_plan_mode(
+                "bash",
+                Some(&args),
+                Some(&ctx),
+                None,
+                Duration::from_secs(1),
+                true,
+            )
+            .await;
+            assert!(
                 matches!(result, PermissionCheckResult::Denied { .. }),
-                "shell command `{command}` must be blocked during plan authoring because bash is an unstructured execute surface. Got: {result:?}"
+                "mutating shell command `{command}` must be blocked during plan authoring. Got: {result:?}"
             );
         }
     }

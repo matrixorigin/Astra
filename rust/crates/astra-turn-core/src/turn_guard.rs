@@ -321,6 +321,34 @@ impl TurnGuard {
         source_error_kind: Option<astra_core::ErrorKind>,
     ) -> ResultQuality {
         let quality = result_quality::classify_result(result_str);
+        self.record_tool_result_quality_with_kind(tool_name, result_str, source_error_kind, quality)
+    }
+
+    /// Record a tool result whose execution layer has already determined that
+    /// the call failed. This is needed for structured JSON errors that later
+    /// receive appended recovery guidance, because the appended text can make
+    /// the visible body no longer parse as JSON.
+    pub fn record_failed_tool_result_with_kind(
+        &mut self,
+        tool_name: &str,
+        result_str: &str,
+        source_error_kind: Option<astra_core::ErrorKind>,
+    ) -> ResultQuality {
+        self.record_tool_result_quality_with_kind(
+            tool_name,
+            result_str,
+            source_error_kind,
+            ResultQuality::Error,
+        )
+    }
+
+    fn record_tool_result_quality_with_kind(
+        &mut self,
+        tool_name: &str,
+        result_str: &str,
+        source_error_kind: Option<astra_core::ErrorKind>,
+        quality: ResultQuality,
+    ) -> ResultQuality {
         match quality {
             ResultQuality::Success => {
                 self.health.record_success(tool_name);
@@ -1138,18 +1166,18 @@ mod tests {
         let mut guard = TurnGuard::new();
         let errors = [
             "Error: field 'subtask_id' only supports new_status updates; unsupported with subtask_id: reason",
-            "Error: Tool 'task' is not available in this turn. Call only tools visible in this turn's `tools[]`.",
+            "Error: Tool 'task_board' is not available in this turn. Call only tools visible in this turn's `tools[]`.",
             "Error: unsupported output_mode 'xml'. Use 'content', 'files_with_matches', or 'count'.",
         ];
 
         for error in errors {
-            let quality = guard.record_tool_result("task", error);
+            let quality = guard.record_tool_result("task_board", error);
             assert_eq!(quality, super::result_quality::ResultQuality::Error);
         }
 
         let health = guard
             .health
-            .get("task")
+            .get("task_board")
             .expect("task health should be tracked");
         assert_eq!(health.total_calls, errors.len());
         assert_eq!(health.total_failures, errors.len());
@@ -1158,7 +1186,7 @@ mod tests {
             "caller-fixable contract errors must not count toward tool quarantine"
         );
         assert!(
-            !guard.health.is_avoidance_advised("task"),
+            !guard.health.is_avoidance_advised("task_board"),
             "bad tool-call shape must not hide a healthy task tool"
         );
     }

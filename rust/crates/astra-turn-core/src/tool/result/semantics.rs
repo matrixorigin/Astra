@@ -276,6 +276,11 @@ const INFRASTRUCTURE_ERROR_PATTERNS: &[&str] = &[
     "runtime binding is unavailable",
     "no executor attached",
     "no multi-agent executor attached",
+    "transport disconnected",
+    "transport 'edge_ws' disconnected",
+    "executor offline",
+    "offline or unreachable",
+    "no alternate execution provider",
 ];
 
 /// Timeout/transient error patterns — soft for read-only tools, hard for mutation tools.
@@ -346,7 +351,19 @@ pub fn classify_tool_error(tool: &str, output: &str) -> ToolErrorSeverity {
         }
     }
 
-    // Check transient errors — severity depends on tool type
+    // Check execution-infrastructure errors before soft errors. These failures
+    // are not recoverable by tweaking args, and counting them as soft makes the
+    // journal report a failed executor binding as `ok=true`.
+    for pattern in INFRASTRUCTURE_ERROR_PATTERNS {
+        if lower.contains(pattern) {
+            return ToolErrorSeverity::InfrastructureError;
+        }
+    }
+
+    // Check transient errors — severity depends on tool type.
+    // This intentionally runs after infrastructure matching: a disconnected
+    // executor transport may contain "timed out", but it is not a benign
+    // read-only timeout the model can fix by changing path arguments.
     for pattern in TRANSIENT_ERROR_PATTERNS {
         if lower.contains(pattern) {
             let is_mutation = is_mutation_tool(tool);
@@ -357,15 +374,6 @@ pub fn classify_tool_error(tool: &str, output: &str) -> ToolErrorSeverity {
                 // Read-only tool timeout is recoverable
                 ToolErrorSeverity::SoftError
             };
-        }
-    }
-
-    // Check execution-infrastructure errors before soft errors. These failures
-    // are not recoverable by tweaking args, and counting them as soft makes the
-    // journal report a failed executor binding as `ok=true`.
-    for pattern in INFRASTRUCTURE_ERROR_PATTERNS {
-        if lower.contains(pattern) {
-            return ToolErrorSeverity::InfrastructureError;
         }
     }
 
@@ -1115,6 +1123,17 @@ if let Err(e) = writeln!(file, "{line}") {
             ToolErrorSeverity::InfrastructureError
         );
         assert!(!tool_error_triggers_rollback("agent_fanout", output));
+    }
+
+    #[test]
+    fn classify_edge_transport_disconnected_as_infrastructure_error() {
+        let output = "Error: transport 'edge_ws' disconnected or timed out while executing tool 'list_dir' on executor 'macpro.local'. Reconnect the executor transport and retry; no alternate execution provider is available for this file environment.";
+
+        assert_eq!(
+            classify_tool_error("list_dir", output),
+            ToolErrorSeverity::InfrastructureError
+        );
+        assert!(!tool_error_triggers_rollback("list_dir", output));
     }
 
     #[test]

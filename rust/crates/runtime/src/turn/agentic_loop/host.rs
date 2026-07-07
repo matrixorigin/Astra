@@ -291,13 +291,24 @@ pub trait AgenticLoopHost: Send {
         String::new()
     }
 
+    /// Host-provided structured tool-admission metadata for introspect/UI/audit.
+    ///
+    /// This must not mutate prompt-visible schemas. Hosts that have provider
+    /// bindings can expose selected offers and hidden candidates here.
+    fn tool_admission_snapshot(
+        &self,
+        _state: &AgenticLoopState,
+    ) -> Vec<astra_turn_core::introspect::ToolAdmissionSnapshotEntry> {
+        Vec::new()
+    }
+
     /// Receive the latest normalized runtime snapshot for the `introspect`
     /// tool.
     ///
     /// The runtime owns snapshot construction because the authoritative token,
     /// round, cache, and stall fields live in [`AgenticLoopState`]. Hosts only
     /// decide where to publish the snapshot: the CLI stores it on its local
-    /// [`ToolExecutor`], while server mode uses [`ServerToolExecutor`] below.
+    /// [`ToolExecutor`], while server mode uses [`RuntimeToolExecutor`] below.
     fn on_introspect_snapshot(
         &mut self,
         _snapshot: &astra_turn_core::introspect::IntrospectSnapshot,
@@ -451,17 +462,32 @@ pub(crate) fn publish_introspect_snapshot<H: AgenticLoopHost + ?Sized>(
     lifecycle_summary: String,
     inspection: Option<&crate::turn::inspection_service::InspectionService<'_>>,
 ) {
-    let snapshot = build_introspect_snapshot(state, lifecycle_summary, inspection);
+    let snapshot = build_introspect_snapshot_with_tool_admission(
+        state,
+        lifecycle_summary,
+        inspection,
+        host.tool_admission_snapshot(state),
+    );
     host.on_introspect_snapshot(&snapshot);
-    if let Some(executor) = state.server_tool_executor.as_deref() {
+    if let Some(executor) = state.runtime_tool_executor.as_deref() {
         executor.update_introspect_snapshot(snapshot);
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_introspect_snapshot(
     state: &AgenticLoopState,
     lifecycle_summary: String,
     inspection: Option<&crate::turn::inspection_service::InspectionService<'_>>,
+) -> astra_turn_core::introspect::IntrospectSnapshot {
+    build_introspect_snapshot_with_tool_admission(state, lifecycle_summary, inspection, Vec::new())
+}
+
+fn build_introspect_snapshot_with_tool_admission(
+    state: &AgenticLoopState,
+    lifecycle_summary: String,
+    inspection: Option<&crate::turn::inspection_service::InspectionService<'_>>,
+    tool_admission: Vec<astra_turn_core::introspect::ToolAdmissionSnapshotEntry>,
 ) -> astra_turn_core::introspect::IntrospectSnapshot {
     let total_in = state.provider_input_tokens();
     let cache_ratio = if total_in > 0 {
@@ -614,6 +640,12 @@ pub(crate) fn build_introspect_snapshot(
         tool_health,
         working_memory_summary: working_mem,
         lifecycle_summary,
+        tool_admission,
+        capacity_provider_coverage: state
+            .runtime_tool_executor
+            .as_deref()
+            .map(|executor| executor.capacity_provider_coverage())
+            .unwrap_or_default(),
         total_input_tokens: state.provider_input_tokens(),
         total_output_tokens: state.total_completion,
         cache_read_tokens: state.total_cache_read,
@@ -894,6 +926,11 @@ pub struct StallTrackingState {
     /// Whether an execution-retry was forced after a mutating/confirmed task
     /// attempted to finish without applying any concrete workspace mutation.
     pub forced_execution_retry: bool,
+    /// Whether a final-answer relevance retry was forced after successful tool
+    /// evidence existed but the text-only synthesis answered stale runtime
+    /// scaffolding or an older question instead of the latest user request.
+    /// One-shot per turn.
+    pub forced_answer_relevance_retry: bool,
     /// Whether a mid-loop execution escalation was injected after a mutating
     /// task accumulated enough read-only tool calls without producing any
     /// workspace mutation. One-shot per turn.
@@ -1031,6 +1068,7 @@ impl StallTrackingState {
             || self.forced_exploration_family_corrective
             || self.forced_execution_escalation
             || self.forced_execution_retry
+            || self.forced_answer_relevance_retry
     }
 
     /// Whether the loop is already under *any* mid-loop intervention
@@ -1268,6 +1306,14 @@ impl TaskBoardSnapshot {
         self.in_progress_count > 0 || self.paused_count > 0 || self.blocked_count > 0
     }
 
+    /// Whether the final run settlement must wait for explicit external/user
+    /// intervention. In-progress tasks still deserve one reconciliation round,
+    /// but they are bookkeeping until they become paused or dependency-blocked.
+    #[must_use]
+    pub fn requires_settlement_intervention(&self) -> bool {
+        self.paused_count > 0 || self.blocked_count > 0
+    }
+
     #[must_use]
     pub fn has_any_tracked_tasks(&self) -> bool {
         self.tracked_count > 0
@@ -1460,6 +1506,12 @@ pub enum VolatileKind {
     /// Budget/turn/round limit advisory ("You have reached the token
     /// budget…", "Do NOT call any more tools…").
     BudgetAdvisory,
+    /// Runtime telemetry snapshot. It must never be treated as a user
+    /// utterance, because doing so pollutes latest-user-goal extraction.
+    SelfStatus,
+    /// Per-round anchor for the current user goal. It is rebuilt from
+    /// authoritative runtime state immediately before each LLM request.
+    ActiveTurnFrame,
     /// Tactical adaptation hint.
     TacticalAdaptation,
     /// "Context was just compacted — continue working, do not
@@ -1539,7 +1591,35 @@ impl VolatileKind {
                 | Self::TaskBoardCompletionGate
                 | Self::TaskBoardStartGate
                 | Self::PlanModeMarker
-                | Self::IntentDrift,
+                | Self::IntentDrift
+                | Self::SelfStatus
+                | Self::ActiveTurnFrame,
+        )
+    }
+
+    /// Whether this volatile kind may be rendered into the user-role
+    /// tail reminder used by cache-sensitive providers. Telemetry is
+    /// diagnostic state, not user intent, so it is intentionally excluded.
+    #[must_use]
+    pub fn render_in_user_tail(self) -> bool {
+        matches!(
+            self,
+            Self::ToolHealthWarning
+                | Self::StallNudge
+                | Self::ParallelBatchingForce
+                | Self::ExecutionEscalation
+                | Self::Corrective
+                | Self::CircuitBreaker
+                | Self::BudgetAdvisory
+                | Self::CompactResume
+                | Self::TaskBoardCompletionGate
+                | Self::TaskBoardStartGate
+                | Self::ExecutionRetry
+                | Self::ExplorationBudget
+                | Self::ContextPressure
+                | Self::DeferredUserInput
+                | Self::BudgetReview
+                | Self::IntentDrift
         )
     }
 
@@ -1570,7 +1650,9 @@ impl VolatileKind {
             // System-role: prevents injection via attacker-crafted file content.
             Self::HallucinationTripwire => "system",
             // System-role: in-band runtime snapshots or coaching.
-            Self::WorkingSet
+            Self::SelfStatus
+            | Self::ActiveTurnFrame
+            | Self::WorkingSet
             | Self::AlreadyFetched
             | Self::ToolBatchCoaching
             | Self::TacticalAdaptation
@@ -1887,7 +1969,8 @@ pub struct AgenticLoopState {
     // ── Server-side tool execution ──
     /// Optional server-side tool executor for web agent sessions (no CLI edge agent).
     /// When present, tools that have no edge match are executed directly by the server.
-    pub server_tool_executor: Option<Arc<crate::server::server_tool_executor::ServerToolExecutor>>,
+    pub runtime_tool_executor:
+        Option<Arc<crate::server::runtime_tool_executor::RuntimeToolExecutor>>,
 
     // ── Interruption tracking ──
     /// Structured interruption record populated by early-exit paths.
@@ -2008,6 +2091,16 @@ pub fn runtime_manifest_for_model(
 }
 
 impl AgenticLoopState {
+    /// Only the root access-surface loop owns the session-level composite
+    /// snapshot pointer. Delegated/sub-agent loops may share the same
+    /// `session_id` for evidence and replay, but their internal checkpoints are
+    /// implementation detail and must not become the parent conversation's
+    /// current resumable state.
+    #[must_use]
+    pub fn owns_session_composite_snapshot(&self) -> bool {
+        self.recursion_depth == 0 && self.delegation_chain.is_empty()
+    }
+
     /// Provider-reported total tokens consumed by this loop.
     ///
     /// The four run-level token buckets are disjoint. Any budget, governor, or
@@ -2152,6 +2245,9 @@ impl AgenticLoopState {
         }
         let mut rendered = String::new();
         for inj in &drained {
+            if !inj.kind.render_in_user_tail() {
+                continue;
+            }
             let text = inj.content.trim();
             if text.is_empty() {
                 continue;
@@ -2984,7 +3080,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         step_signal_collector: None,
         tool_budget_override: None,
         recent_tactical_actions: Vec::new(),
-        server_tool_executor: None,
+        runtime_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
         memory_extraction_service: None,
@@ -3022,6 +3118,17 @@ pub(crate) mod tests {
         )])
     }
 
+    fn control_plane_runtime_environment_fields() -> serde_json::Map<String, Value> {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::cloud_control_plane(&registry),
+        );
+        serde_json::Map::from_iter([(
+            "runtime_environment_advertisement".to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )])
+    }
+
     #[test]
     fn provider_total_tokens_sums_disjoint_cache_buckets() {
         let mut state = make_test_loop_state();
@@ -3032,6 +3139,19 @@ pub(crate) mod tests {
 
         assert_eq!(state.provider_input_tokens(), 127);
         assert_eq!(state.provider_total_tokens(), 140);
+    }
+
+    #[test]
+    fn only_root_loop_owns_session_composite_snapshot() {
+        let mut state = make_state();
+        assert!(state.owns_session_composite_snapshot());
+
+        state.recursion_depth = 1;
+        assert!(!state.owns_session_composite_snapshot());
+
+        state.recursion_depth = 0;
+        state.delegation_chain = vec!["orchestrator".to_string()];
+        assert!(!state.owns_session_composite_snapshot());
     }
 
     /// Unwind-safe cleanup guard for tests that write under
@@ -3356,7 +3476,7 @@ pub(crate) mod tests {
                 }
             })
             .to_string(),
-            tool_result_fields: Some(edge_runtime_environment_fields()),
+            tool_result_fields: Some(control_plane_runtime_environment_fields()),
             status: "ok".to_string(),
             duration_ms: 10,
         }
@@ -3476,7 +3596,7 @@ pub(crate) mod tests {
             step_signal_collector: None,
             tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
-            server_tool_executor: None,
+            runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
@@ -3592,6 +3712,7 @@ pub(crate) mod tests {
         );
         assert!(snapshot.has_unfinished_tasks());
         assert!(snapshot.has_completion_blocking_tasks());
+        assert!(snapshot.requires_settlement_intervention());
         assert!(!snapshot.all_tracked_tasks_completed());
         assert!(snapshot.short_summary().contains("task(s) remain"));
         assert_eq!(
@@ -3683,7 +3804,37 @@ pub(crate) mod tests {
             !snapshot.has_completion_blocking_tasks(),
             "pending-only task board is backlog, not an active completion blocker"
         );
+        assert!(!snapshot.requires_settlement_intervention());
         assert!(!snapshot.all_tracked_tasks_completed());
+    }
+
+    #[test]
+    fn task_board_snapshot_in_progress_reconciles_but_does_not_require_intervention() {
+        let snapshot = TaskBoardSnapshot::from_active_tasks(&[SessionTask {
+            archived_at: None,
+            id: "task-1".to_string(),
+            title: "running bookkeeping".to_string(),
+            description: None,
+            status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
+            subtasks: Vec::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        }]);
+
+        assert!(snapshot.has_unfinished_tasks());
+        assert!(
+            snapshot.has_completion_blocking_tasks(),
+            "in-progress work should still trigger one model reconciliation round"
+        );
+        assert!(
+            !snapshot.requires_settlement_intervention(),
+            "in-progress bookkeeping alone must not pause a run after a final answer exists"
+        );
     }
 
     #[test]
@@ -3708,6 +3859,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.completed_count, 1);
         assert!(!snapshot.has_unfinished_tasks());
         assert!(!snapshot.has_completion_blocking_tasks());
+        assert!(!snapshot.requires_settlement_intervention());
         assert!(snapshot.all_tracked_tasks_completed());
     }
 
@@ -3733,6 +3885,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.paused_count, 1);
         assert!(snapshot.has_unfinished_tasks());
         assert!(snapshot.has_completion_blocking_tasks());
+        assert!(snapshot.requires_settlement_intervention());
         assert!(!snapshot.all_tracked_tasks_completed());
         assert_eq!(snapshot.status_count_summary(), "1 paused task(s) remain");
     }
@@ -3913,6 +4066,43 @@ pub(crate) mod tests {
         assert!(state.total_tool_calls >= 1);
         // Messages accumulated: assistant + tool from turn 1, at minimum
         assert!(state.messages.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn off_target_final_after_successful_tool_retries_synthesis() {
+        let bad_answer = "Session context was unavailable or incomplete in this runtime \
+            (degraded resume — no prior prompt-facing history restored). Workspace is bound \
+            and ready at /Users/xupeng/github/astra with the executor online.\n\n\
+            Awaiting your next instruction.";
+        let good_answer = "当前目录下的子目录包括 rust、web、plans。";
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("list_dir", "rust/\nweb/\nplans/\n")],
+                20,
+                10,
+                Some(50),
+            ),
+            text_result(bad_answer, 15, 5, Some(30)),
+            text_result(good_answer, 15, 5, Some(30)),
+        ]);
+        let mut state = make_state();
+        state.message = "有哪些子目录".to_string();
+        state
+            .messages
+            .push(json!({"role": "user", "content": state.message.clone()}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
+        assert_eq!(host.current_turn, 3);
+        assert_eq!(state.final_text, good_answer);
+        assert!(
+            !state.messages.iter().any(|msg| msg
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("Session context was unavailable"))),
+            "{:?}",
+            state.messages
+        );
     }
 
     #[tokio::test]
@@ -8876,13 +9066,13 @@ mod parallel_execution_tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Session c47c2dca REGRESSION: bridge_inprocess path must drain the
+    // Session c47c2dca REGRESSION: the chat-turn adapter path must drain the
     // structured volatile lane so runtime nudges reach the LLM.
     //
     // 65606b95 migrated 27 runtime injection sites from
     // `state.messages.push(...)` to `state.push_volatile(Kind, content)`.
     // `server_loop_host` drains via `wire_assembly::assemble_llm_messages`,
-    // but the CLI `astra chat` path (bridge_inprocess) NEVER drained the
+    // but the CLI `astra chat` path NEVER drained the
     // lane — every Self-check, force-stop, budget-advisory, corrective,
     // stall-nudge, working-set snapshot, etc. was silently dropped.
     //
@@ -8955,6 +9145,27 @@ mod parallel_execution_tests {
         assert!(
             state.take_volatile_pending_as_message().is_none(),
             "second take must be None — lane was drained"
+        );
+    }
+
+    #[test]
+    fn take_volatile_pending_as_message_excludes_self_status_telemetry() {
+        let mut state = make_state();
+        state.push_volatile(
+            VolatileKind::SelfStatus,
+            "## ⚡ Self-Status\nTurn 9/299 | Cache: 86%",
+        );
+        state.push_volatile(VolatileKind::Corrective, "answer the latest question");
+
+        let msg = state
+            .take_volatile_pending_as_message()
+            .expect("corrective content should still render");
+        let content = msg["content"].as_str().unwrap();
+        assert_eq!(msg["role"], "user");
+        assert!(content.contains("answer the latest question"));
+        assert!(
+            !content.contains("Self-Status"),
+            "runtime telemetry must not be sent as a user message: {content}"
         );
     }
 

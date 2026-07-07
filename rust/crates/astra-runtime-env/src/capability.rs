@@ -37,6 +37,7 @@ pub struct WorkspaceCapabilities {
 pub struct ExecutorCapabilities {
     pub reachable: bool,
     pub control_plane: bool,
+    pub server_service: bool,
     pub runtime_executor: bool,
     pub mcp_executor: bool,
 }
@@ -149,7 +150,18 @@ impl EffectiveCapabilitySet {
                 reachable: executor_reachable,
                 control_plane: executor_reachable
                     && executor_transport_known
-                    && matches!(executor.kind, ExecutorBindingKind::ControlPlane),
+                    && matches!(
+                        executor.kind,
+                        ExecutorBindingKind::ControlPlane | ExecutorBindingKind::LocalCli
+                    ),
+                server_service: executor_reachable
+                    && executor_transport_known
+                    && matches!(
+                        executor.kind,
+                        ExecutorBindingKind::ControlPlane
+                            | ExecutorBindingKind::ServerRuntime
+                            | ExecutorBindingKind::LocalCli
+                    ),
                 runtime_executor: executor_reachable
                     && executor_transport_known
                     && matches!(
@@ -161,7 +173,7 @@ impl EffectiveCapabilitySet {
                     ),
                 mcp_executor: executor_reachable
                     && executor_transport_known
-                    && matches!(executor.kind, ExecutorBindingKind::RequestScopedMcp),
+                    && matches!(executor.kind, ExecutorBindingKind::Mcp),
             },
             runtime: RuntimeCapabilities {
                 runtime_has_process,

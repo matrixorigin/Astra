@@ -428,7 +428,7 @@ impl CliSpawnAgentExecutor {
 #[async_trait]
 impl SpawnAgentExecutor for CliSpawnAgentExecutor {
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
-        let all_schemas = edge_tools::all_tool_schemas();
+        let all_schemas = edge_tools::local_tool_schemas();
         let valid_tool_names = tool_names_from_schemas(&all_schemas);
 
         // Hold a clone for emitting the terminal `AgentTerminated`
@@ -474,6 +474,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         let mut executor = edge_tools::ToolExecutor::new(&effective_root)
             .with_cloud(self.api.api_origin(), &token);
+        executor.set_cli_local_provider_schemas(all_schemas.clone());
         if let Some(ref cmds) = self.bg_task_commands {
             executor = executor.with_bg_task_commands(cmds.clone());
         }
@@ -752,7 +753,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             step_signal_collector: None,
             tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
-            server_tool_executor: None,
+            runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,

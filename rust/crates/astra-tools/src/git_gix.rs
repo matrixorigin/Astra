@@ -2612,37 +2612,50 @@ pub fn push(project_root: &Path, args: &Value) -> String {
 /// appropriate git sub-operation. Replaces 11 separate git_* tools with
 /// a single `git { action: "...", ...params }` interface.
 ///
-/// For `action: "stash"`, the sub-action is read from `stash_action`
+/// For `action: "stash"`, the sub-action is read from `sub_action`
 /// (push, apply, pop, list, drop) to avoid collision with the top-level
 /// `action` field.
 pub fn git_dispatch(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
-    let action = match args.get("action").and_then(Value::as_str) {
-        Some(a) => a,
-        None => {
-            return ToolExecutionOutcome::error(
-                "Missing required parameter: action. \
-                 Use one of: status, diff, log, show, blame, \
-                 file_history, log_search, contributors, commit, \
-                 revert_commit, stash, push"
-                    .to_string(),
-            );
-        }
+    let action = match crate::git_tool_contract::git_action_from_args(args) {
+        Ok(action) => action,
+        Err(error) => return ToolExecutionOutcome::error(format!("Error: {error}")),
     };
     match action {
-        "status" => ToolExecutionOutcome::ok(status(project_root, args)),
-        "diff" => ToolExecutionOutcome::ok(diff(project_root, args, 0.0, 0)),
-        "log" => ToolExecutionOutcome::ok(log(project_root, args)),
-        "show" => ToolExecutionOutcome::ok(show(project_root, args, 0.0, 0)),
-        "blame" => ToolExecutionOutcome::ok(blame(project_root, args)),
-        "file_history" => ToolExecutionOutcome::ok(file_history(project_root, args)),
-        "log_search" => ToolExecutionOutcome::ok(log_search(project_root, args)),
-        "contributors" => ToolExecutionOutcome::ok(contributors(project_root, args)),
-        "commit" => commit_with_metadata(project_root, args),
-        "revert_commit" => revert_commit_with_metadata(project_root, args),
-        "stash" => {
-            // Remap: read `stash_action` and set it as `action` for the
+        crate::git_tool_contract::GitAction::Status => {
+            ToolExecutionOutcome::ok(status(project_root, args))
+        }
+        crate::git_tool_contract::GitAction::Diff => {
+            ToolExecutionOutcome::ok(diff(project_root, args, 0.0, 0))
+        }
+        crate::git_tool_contract::GitAction::Log => {
+            ToolExecutionOutcome::ok(log(project_root, args))
+        }
+        crate::git_tool_contract::GitAction::Show => {
+            ToolExecutionOutcome::ok(show(project_root, args, 0.0, 0))
+        }
+        crate::git_tool_contract::GitAction::Blame => {
+            ToolExecutionOutcome::ok(blame(project_root, args))
+        }
+        crate::git_tool_contract::GitAction::FileHistory => {
+            ToolExecutionOutcome::ok(file_history(project_root, args))
+        }
+        crate::git_tool_contract::GitAction::LogSearch => {
+            ToolExecutionOutcome::ok(log_search(project_root, args))
+        }
+        crate::git_tool_contract::GitAction::Contributors => {
+            ToolExecutionOutcome::ok(contributors(project_root, args))
+        }
+        crate::git_tool_contract::GitAction::Commit => commit_with_metadata(project_root, args),
+        crate::git_tool_contract::GitAction::RevertCommit => {
+            revert_commit_with_metadata(project_root, args)
+        }
+        crate::git_tool_contract::GitAction::Stash => {
+            // Remap: read `sub_action` and set it as `action` for the
             // inner stash function which expects action ∈ {push,apply,pop,list,drop}.
-            let stash_action = args.get("stash_action").and_then(Value::as_str);
+            let stash_action = args
+                .get("sub_action")
+                .or_else(|| args.get("stash_action"))
+                .and_then(Value::as_str);
             let remapped_args = if let Some(sa) = stash_action {
                 let mut map = args.as_object().cloned().unwrap_or_default();
                 map.insert("action".to_string(), Value::String(sa.to_string()));
@@ -2652,12 +2665,14 @@ pub fn git_dispatch(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
             };
             stash_with_metadata(project_root, &remapped_args)
         }
-        "push" => push_with_metadata(project_root, args),
-        other => ToolExecutionOutcome::error(format!(
-            "Unknown git action: '{other}'. Valid actions: status, diff, log, \
-             show, blame, file_history, log_search, contributors, commit, \
-             revert_commit, stash, push"
-        )),
+        crate::git_tool_contract::GitAction::CheckoutFile => ToolExecutionOutcome::error(
+            "Error: git.checkout_file requires a CLI/edge executor with checkout_file support."
+                .to_string(),
+        ),
+        crate::git_tool_contract::GitAction::Worktree => ToolExecutionOutcome::error(
+            "Error: git.worktree requires a CLI/edge executor with worktree support.".to_string(),
+        ),
+        crate::git_tool_contract::GitAction::Push => push_with_metadata(project_root, args),
     }
 }
 
@@ -4223,8 +4238,10 @@ mod tests {
         let root = repo_root();
         let result = super::git_dispatch(&root, &json!({"action": "diff"}));
         assert!(
-            !result.output.starts_with("Unknown git action")
-                && !result.output.starts_with("Missing required"),
+            !result.output.contains("unknown `git` action")
+                && !result
+                    .output
+                    .contains("missing required parameter `action` for `git`"),
             "diff must be recognized as valid action"
         );
     }
@@ -4235,7 +4252,7 @@ mod tests {
         let result = super::git_dispatch(&root, &json!({"action": "nonexistent"}));
         assert!(result.is_error);
         assert!(
-            result.output.contains("Unknown git action"),
+            result.output.contains("unknown `git` action 'nonexistent'"),
             "unknown action must produce error: {}",
             result.output
         );
@@ -4277,10 +4294,37 @@ mod tests {
         let result = super::git_dispatch(&root, &json!({"file": "foo.rs"}));
         assert!(result.is_error);
         assert!(
-            result.output.contains("Missing required parameter"),
+            result
+                .output
+                .contains("missing required parameter `action` for `git`"),
             "missing action must produce helpful error: {}",
             result.output
         );
+    }
+
+    #[test]
+    fn consolidated_git_stash_uses_schema_sub_action() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "stash", "sub_action": "list"}));
+        assert!(
+            !result.is_error,
+            "schema-public sub_action must drive stash dispatch: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn consolidated_git_edge_only_actions_return_executor_requirement() {
+        let root = repo_root();
+        for action in ["checkout_file", "worktree"] {
+            let result = super::git_dispatch(&root, &json!({"action": action}));
+            assert!(result.is_error);
+            assert!(
+                result.output.contains("requires a CLI/edge executor"),
+                "{action} must fail as unavailable in default executor, got: {}",
+                result.output
+            );
+        }
     }
 
     #[test]

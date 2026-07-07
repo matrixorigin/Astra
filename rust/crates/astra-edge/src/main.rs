@@ -6,9 +6,10 @@
 //!
 //! ## Usage
 //! ```bash
-//! astra-edge --server-url wss://astra.example.com --token <jwt> --workspace-dir ~/projects/my-app
+//! astra-edge --server-url https://astra.example.com --workspace-dir ~/projects/my-app
 //! ```
 
+use astra_credentials::{CredentialStore, CredentialsFile};
 use astra_runtime_env::{
     ExecutorBinding, PolicyIntent, RunBinding, RuntimeBinding, RuntimeEnvironmentAdvertisement,
     ToolRegistry, WorkspaceAuthority, WorkspaceBinding,
@@ -19,6 +20,7 @@ use astra_server_types::edge_ws_protocol::{
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -28,46 +30,204 @@ use tracing::Instrument;
 #[derive(Parser, Debug)]
 #[command(name = "astra-edge", version, about)]
 struct Args {
-    /// WebSocket URL of the Astra server (e.g., wss://astra.example.com/edge/ws)
-    #[arg(long, env = "ASTRA_SERVER_URL")]
-    server_url: String,
+    /// Astra API/WebSocket base URL. Accepts http(s)://host[:port] or ws(s)://host[:port]/edge/ws.
+    ///
+    /// Defaults to ASTRA_SERVER_URL, then ASTRA_API_URL, then http://127.0.0.1:17001.
+    #[arg(long)]
+    server_url: Option<String>,
 
-    /// Authentication token (JWT)
+    /// Authentication token (JWT). When omitted, astra-edge reads the selected Astra CLI profile.
     #[arg(long, env = "ASTRA_TOKEN")]
-    token: String,
+    token: Option<String>,
+
+    /// Astra CLI credentials profile to read when --token is omitted.
+    #[arg(long)]
+    profile: Option<String>,
 
     /// Local workspace directory for file operations
     #[arg(long, env = "ASTRA_WORKSPACE_DIR", default_value = ".")]
     workspace_dir: PathBuf,
 
-    /// Edge agent identifier
-    #[arg(long, env = "ASTRA_EDGE_ID", default_value_t = default_edge_id())]
-    edge_id: String,
+    /// Edge agent identifier. Defaults to a stable id derived from hostname + canonical workspace.
+    #[arg(long, env = "ASTRA_EDGE_ID")]
+    edge_id: Option<String>,
 
     /// Auto-reconnect on disconnect
     #[arg(long, default_value_t = true)]
     reconnect: bool,
 }
 
-fn default_edge_id() -> String {
+#[derive(Debug, Clone)]
+struct EdgeConfig {
+    server_url: String,
+    token: String,
+    workspace_dir: PathBuf,
+    edge_id: String,
+    reconnect: bool,
+}
+
+fn normalized_hostname() -> String {
     let hostname = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown".into());
-    format!("edge-{hostname}-{}", &uuid::Uuid::new_v4().to_string()[..8])
+    hostname
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
-fn canonical_workspace_dir(workspace_dir: &Path) -> PathBuf {
-    workspace_dir
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_dir.to_path_buf())
+fn default_edge_id(workspace_dir: &Path) -> String {
+    let workspace = canonical_workspace_dir(workspace_dir).unwrap_or_else(|_| {
+        // Fall back to the non-canonical path for edge ID stability
+        workspace_dir.to_path_buf()
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(workspace.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("edge-{}-{suffix}", normalized_hostname())
 }
 
+fn default_server_url() -> String {
+    std::env::var("ASTRA_SERVER_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("ASTRA_API_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:17001".to_string())
+}
+
+fn edge_ws_url(server_url: &str) -> Result<String, String> {
+    let trimmed = server_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("server URL must not be empty".to_string());
+    }
+    let with_ws_scheme = if let Some(rest) = trimmed.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        trimmed.to_string()
+    } else if trimmed.contains("://") {
+        return Err(format!(
+            "unsupported server URL scheme in '{trimmed}'; use http(s):// or ws(s)://"
+        ));
+    } else {
+        format!("ws://{trimmed}")
+    };
+
+    if let Ok(mut url) = reqwest::Url::parse(&with_ws_scheme) {
+        if !matches!(url.scheme(), "ws" | "wss") {
+            return Err(format!(
+                "unsupported edge WebSocket URL scheme '{}'; use ws:// or wss://",
+                url.scheme()
+            ));
+        }
+        url.set_path(&normalized_edge_ws_path(url.path()));
+        url.set_query(None);
+        url.set_fragment(None);
+        Ok(url.to_string())
+    } else {
+        Err(format!("invalid server URL '{server_url}'"))
+    }
+}
+
+fn normalized_edge_ws_path(path: &str) -> String {
+    let segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    if segments.is_empty() {
+        return "/edge/ws".to_string();
+    }
+
+    if let Some(index) = segments
+        .windows(2)
+        .position(|window| window == ["edge", "ws"])
+    {
+        return format!("/{}", segments[..index + 2].join("/"));
+    }
+
+    format!("/{}/edge/ws", segments.join("/"))
+}
+
+fn token_from_credentials(
+    creds: &CredentialsFile,
+    profile_override: Option<&str>,
+) -> Result<(String, String), String> {
+    let profile_name =
+        CredentialStore::resolve_profile_name(profile_override, creds.current_profile.as_deref());
+    let profile = creds
+        .profiles
+        .get(&profile_name)
+        .ok_or_else(|| format!("no profile '{profile_name}', run `astra login` first"))?;
+    let token = profile
+        .access_token
+        .clone()
+        .ok_or_else(|| format!("profile '{profile_name}' is not logged in; run `astra login`"))?;
+    Ok((profile_name, token))
+}
+
+fn resolve_token(args: &Args) -> Result<String, String> {
+    if let Some(token) = args.token.as_ref().filter(|token| !token.trim().is_empty()) {
+        return Ok(token.clone());
+    }
+    let creds = CredentialStore::new()
+        .load()
+        .map_err(|error| format!("failed to read Astra credentials: {error}"))?;
+    let (profile_name, token) = token_from_credentials(&creds, args.profile.as_deref())?;
+    tracing::info!(profile = %profile_name, "using Astra CLI profile token");
+    Ok(token)
+}
+
+fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
+    let raw_server_url = args.server_url.clone().unwrap_or_else(default_server_url);
+    let workspace_dir = canonical_workspace_dir(&args.workspace_dir)?;
+    let token = resolve_token(&args)?;
+    let edge_id = args
+        .edge_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default_edge_id(&workspace_dir));
+    Ok(EdgeConfig {
+        server_url: edge_ws_url(&raw_server_url)?,
+        token,
+        workspace_dir,
+        edge_id,
+        reconnect: args.reconnect,
+    })
+}
+
+fn canonical_workspace_dir(workspace_dir: &Path) -> Result<PathBuf, String> {
+    workspace_dir.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize workspace directory '{}': {error}",
+            workspace_dir.display()
+        )
+    })
+}
+
+/// Build the runtime-environment capability advertisement for this edge.
+///
+/// Callers must pass an already-canonical `workspace` path; `run_edge_agent`
+/// enforces this via [`canonical_workspace_dir`] before calling here.
 fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Value {
     let registry = ToolRegistry::builtins();
-    let workspace = canonical_workspace_dir(workspace)
-        .to_string_lossy()
-        .to_string();
+    let workspace = workspace.to_string_lossy().to_string();
     let binding = RunBinding::resolve(
         WorkspaceBinding::edge_workspace(workspace, WorkspaceAuthority::ReadWrite),
         ExecutorBinding::edge_agent(edge_id.to_string()),
@@ -82,19 +242,15 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
 
 // ─── Connection loop ─────────────────────────────────────────────────────────
 
-async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let url = if args.server_url.ends_with("/edge/ws") {
-        args.server_url.clone()
-    } else {
-        format!("{}/edge/ws", args.server_url.trim_end_matches('/'))
-    };
+async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let url = config.server_url.clone();
 
-    tracing::info!(url = %url, edge_id = %args.edge_id, "Connecting to server...");
+    tracing::info!(url = %url, edge_id = %config.edge_id, "Connecting to server...");
 
     let (ws_stream, _) = connect_async(&url).await.map_err(|e| {
         tracing::error!(
             target: "astra.edge",
-            edge_id = %args.edge_id,
+            edge_id = %config.edge_id,
             url = %url,
             error = %e,
             "WebSocket connect failed"
@@ -107,14 +263,16 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
 
     // Send auth
     let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
-    let workspace = canonical_workspace_dir(&args.workspace_dir);
+    let workspace = canonical_workspace_dir(&config.workspace_dir).map_err(|e| {
+        Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, e)) as Box<dyn std::error::Error>
+    })?;
     let auth_msg = EdgeClientMessage::Auth {
-        token: args.token.clone(),
-        edge_agent_id: args.edge_id.clone(),
+        token: config.token.clone(),
+        edge_agent_id: config.edge_id.clone(),
         hostname,
         workspace_dir: Some(workspace.to_string_lossy().to_string()),
         capabilities: Some(edge_runtime_environment_capabilities(
-            &args.edge_id,
+            &config.edge_id,
             &workspace,
         )),
     };
@@ -135,7 +293,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
             Ok(EdgeServerMessage::AuthError { message }) => {
                 tracing::error!(
                     target: "astra.edge",
-                    edge_id = %args.edge_id,
+                    edge_id = %config.edge_id,
                     detail = %message,
                     "server rejected edge authentication"
                 );
@@ -144,7 +302,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
             _ => {
                 tracing::error!(
                     target: "astra.edge",
-                    edge_id = %args.edge_id,
+                    edge_id = %config.edge_id,
                     "unexpected auth response payload"
                 );
                 return Err("Unexpected auth response".into());
@@ -153,7 +311,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
         _ => {
             tracing::error!(
                 target: "astra.edge",
-                edge_id = %args.edge_id,
+                edge_id = %config.edge_id,
                 "auth timeout or connection closed before auth_ok"
             );
             return Err("Auth timeout or connection closed".into());
@@ -163,7 +321,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
     let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let executor = astra_tools::executor::DefaultToolExecutor::for_workspace(
         &workspace,
-        args.edge_id.clone(),
+        config.edge_id.clone(),
         session_id,
         "astra-edge/0.1",
         Duration::from_secs(30),
@@ -174,7 +332,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     tracing::info!(
-        workspace = %args.workspace_dir.display(),
+        workspace = %config.workspace_dir.display(),
         "Edge agent ready — waiting for tool calls"
     );
 
@@ -192,7 +350,12 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                             }) => {
                                 tracing::info!(tool = %tool, request_id = %request_id, "Executing tool");
                                 let start = Instant::now();
-                                let result = astra_tools::ToolExecutor::execute(&executor, &tool, &tool_args).await;
+                                let result = astra_tools::ToolExecutor::execute(
+                                    &executor,
+                                    &tool,
+                                    &tool_args,
+                                )
+                                .await;
                                 let output = result.output;
                                 let is_error = result.is_error;
                                 let tool_result_fields = result.metadata;
@@ -220,7 +383,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                             Ok(EdgeServerMessage::ToolCancel { request_id }) => {
                                 tracing::warn!(
                                     request_id = %request_id,
-                                    "Server cancelled tool request; edge has no in-flight cancel hook yet — ignoring"
+                                    "Server cancelled tool request, but edge has no in-flight cancellation hook yet; ignoring"
                                 );
                             }
                             Ok(EdgeServerMessage::Closing { reason }) => {
@@ -267,14 +430,21 @@ async fn main() {
     );
 
     let args = Args::parse();
+    let config = match resolve_config(args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(2);
+        }
+    };
 
     eprintln!(
         "astra-edge v{} — remote tool execution agent",
         env!("CARGO_PKG_VERSION")
     );
-    eprintln!("  server:    {}", args.server_url);
-    eprintln!("  edge-id:   {}", args.edge_id);
-    eprintln!("  workspace: {}", args.workspace_dir.display());
+    eprintln!("  server:    {}", config.server_url);
+    eprintln!("  edge-id:   {}", config.edge_id);
+    eprintln!("  workspace: {}", config.workspace_dir.display());
     eprintln!();
 
     let mut exit_with_error = false;
@@ -283,13 +453,13 @@ async fn main() {
     loop {
         let edge_span = tracing::info_span!(
             "edge.agent",
-            edge_id = %args.edge_id,
-            server_url = %args.server_url,
+            edge_id = %config.edge_id,
+            server_url = %config.server_url,
         );
-        match run_edge_connection(&args).instrument(edge_span).await {
+        match run_edge_connection(&config).instrument(edge_span).await {
             Ok(()) => {
                 reconnect_delay_secs = 1; // reset on clean disconnect
-                if !args.reconnect {
+                if !config.reconnect {
                     break;
                 }
                 tracing::info!(
@@ -298,8 +468,22 @@ async fn main() {
                 );
             }
             Err(e) => {
+                let err_str = e.to_string();
+                // Permanent errors: authentication failures, invalid config
+                let is_permanent = err_str.contains("Authentication failed")
+                    || err_str.contains("401")
+                    || err_str.contains("403")
+                    || err_str.contains("invalid token");
+                if is_permanent {
+                    tracing::error!(
+                        error = %e,
+                        "Permanent authentication failure — not retrying"
+                    );
+                    exit_with_error = true;
+                    break;
+                }
                 tracing::error!(error = %e, "Connection error");
-                if !args.reconnect {
+                if !config.reconnect {
                     exit_with_error = true;
                     break;
                 }
@@ -325,7 +509,8 @@ mod tests {
 
     #[test]
     fn edge_runtime_environment_capabilities_describe_local_edge_runtime() {
-        let value = edge_runtime_environment_capabilities("edge-test", Path::new("/workspace/app"));
+        let workspace = canonical_workspace_dir(Path::new(".")).expect("canonical test workspace");
+        let value = edge_runtime_environment_capabilities("edge-test", &workspace);
 
         assert_eq!(
             value["schema_version"],
@@ -333,6 +518,10 @@ mod tests {
         );
         assert_eq!(value["binding"]["workspace"]["kind"], "edge_workspace");
         assert_eq!(value["binding"]["workspace"]["authority"], "read_write");
+        assert_eq!(
+            value["binding"]["workspace"]["cwd"],
+            workspace.to_string_lossy().as_ref()
+        );
         assert_eq!(value["binding"]["executor"]["kind"], "edge_agent");
         assert_eq!(value["binding"]["executor"]["executor_id"], "edge-test");
         assert_eq!(
@@ -353,6 +542,93 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|name| name.as_str() == Some("bash"))
+        );
+    }
+
+    #[test]
+    fn default_edge_id_is_stable_for_the_same_workspace() {
+        let workspace = Path::new("/workspace/app");
+        assert_eq!(default_edge_id(workspace), default_edge_id(workspace));
+    }
+
+    #[test]
+    fn default_edge_id_is_workspace_scoped() {
+        assert_ne!(
+            default_edge_id(Path::new("/workspace/app-a")),
+            default_edge_id(Path::new("/workspace/app-b"))
+        );
+    }
+
+    #[test]
+    fn edge_ws_url_accepts_api_or_ws_base_urls() {
+        assert_eq!(
+            edge_ws_url("http://127.0.0.1:17001").unwrap(),
+            "ws://127.0.0.1:17001/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com").unwrap(),
+            "wss://astra.example.com/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("wss://astra.example.com/edge/ws").unwrap(),
+            "wss://astra.example.com/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com/edge/ws/extra-path").unwrap(),
+            "wss://astra.example.com/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com/prefix").unwrap(),
+            "wss://astra.example.com/prefix/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com/prefix/edge/ws/extra-path").unwrap(),
+            "wss://astra.example.com/prefix/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com/not-edge/ws").unwrap(),
+            "wss://astra.example.com/not-edge/ws/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("https://astra.example.com/edge/ws?debug=1#fragment").unwrap(),
+            "wss://astra.example.com/edge/ws"
+        );
+        assert_eq!(
+            edge_ws_url("127.0.0.1:17001").unwrap(),
+            "ws://127.0.0.1:17001/edge/ws"
+        );
+        assert!(edge_ws_url("ftp://astra.example.com").is_err());
+        assert!(edge_ws_url("").is_err());
+    }
+
+    #[test]
+    fn token_from_credentials_uses_current_or_explicit_profile() {
+        let mut creds = CredentialsFile {
+            current_profile: Some("work".to_string()),
+            profiles: Default::default(),
+        };
+        creds.profiles.insert(
+            "work".to_string(),
+            astra_credentials::Profile {
+                access_token: Some("work-token".to_string()),
+                ..Default::default()
+            },
+        );
+        creds.profiles.insert(
+            "other".to_string(),
+            astra_credentials::Profile {
+                access_token: Some("other-token".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            token_from_credentials(&creds, None).unwrap(),
+            ("work".to_string(), "work-token".to_string())
+        );
+        assert_eq!(
+            token_from_credentials(&creds, Some("other")).unwrap(),
+            ("other".to_string(), "other-token".to_string())
         );
     }
 }

@@ -182,6 +182,11 @@ pub(crate) fn build_external_sources(
             tool_count: tool_names.len(),
             skill_count,
             max_turn_input_tokens: state.max_turn_input_tokens,
+            capacity_provider_coverage: state
+                .runtime_tool_executor
+                .as_deref()
+                .map(|executor| executor.capacity_provider_coverage())
+                .unwrap_or_default(),
         }));
     }
 
@@ -422,6 +427,7 @@ struct CapabilitiesProvider {
     tool_count: usize,
     skill_count: usize,
     max_turn_input_tokens: u64,
+    capacity_provider_coverage: Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry>,
 }
 
 impl astra_turn_core::context_sources::ContextChannelProvider for CapabilitiesProvider {
@@ -444,6 +450,15 @@ impl astra_turn_core::context_sources::ContextChannelProvider for CapabilitiesPr
                 " Context window: {} tokens per turn.",
                 self.max_turn_input_tokens
             ));
+        }
+        if !self.capacity_provider_coverage.is_empty() {
+            cap.push_str(" Provider coverage: ");
+            cap.push_str(
+                &astra_turn_core::introspect::capacity_provider_coverage_summary(
+                    &self.capacity_provider_coverage,
+                ),
+            );
+            cap.push('.');
         }
         Some(PromptSection::dynamic(cap, PromptTokenBucket::Environment))
     }
@@ -1673,6 +1688,7 @@ mod tests {
             tool_count: 5,
             skill_count: 2,
             max_turn_input_tokens: 100_000,
+            capacity_provider_coverage: Vec::new(),
         };
         let section = p.provide(0).expect("should always emit");
         assert!(section.text.contains("Capabilities"));
@@ -1687,6 +1703,7 @@ mod tests {
             tool_count: 1,
             skill_count: 0,
             max_turn_input_tokens: 0,
+            capacity_provider_coverage: Vec::new(),
         };
         let section = p.provide(0).expect("should emit");
         assert!(
@@ -1701,8 +1718,42 @@ mod tests {
             tool_count: 1,
             skill_count: 0,
             max_turn_input_tokens: 0,
+            capacity_provider_coverage: Vec::new(),
         };
         assert_eq!(p.cache_scope(), CacheScope::None);
+    }
+
+    #[test]
+    fn capabilities_provider_emits_capacity_provider_coverage() {
+        let p = super::CapabilitiesProvider {
+            tool_count: 4,
+            skill_count: 0,
+            max_turn_input_tokens: 0,
+            capacity_provider_coverage: vec![
+                astra_runtime_env::CapacityProviderCoverageEntry::ready(
+                    astra_runtime_env::CapacityProviderType::ServerService,
+                    "server-builtin",
+                    vec!["web_fetch".into()],
+                ),
+                astra_runtime_env::CapacityProviderCoverageEntry::unavailable(
+                    astra_runtime_env::CapacityProviderType::Sandbox,
+                    "workspace-executor",
+                    astra_runtime_env::CapacityProviderStatus::Unbound,
+                    "no_workspace_provider_bound",
+                ),
+            ],
+        };
+
+        let section = p.provide(0).expect("should emit");
+        assert!(section.text.contains("Provider coverage"));
+        assert!(section.text.contains("server_service:ready"));
+        assert!(
+            section
+                .text
+                .contains("sandbox:unbound (workspace executor not bound)")
+        );
+        assert!(!section.text.contains("no_workspace_provider_bound"));
+        assert!(!section.text.contains("chat-only"));
     }
 
     // ── SkillListingProvider ──

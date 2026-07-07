@@ -564,6 +564,88 @@ async fn maybe_judge_factual_retry_fallback<H: AgenticLoopHost>(
     .await
 }
 
+fn has_successful_real_tool_evidence(state: &AgenticLoopState) -> bool {
+    state.total_evidence_tool_calls > 0
+        || state.stall.tool_call_records.iter().any(|record| {
+            record.ok && !record.is_synthetic_placeholder() && !record.was_blocked_by_policy()
+        })
+}
+
+fn should_force_answer_relevance_retry(state: &AgenticLoopState) -> bool {
+    if state.stall.forced_answer_relevance_retry
+        || state.final_text.trim().is_empty()
+        || !has_successful_real_tool_evidence(state)
+        || state.budget_wrapup_injected
+        || state.stall.hard_intervention_active()
+    {
+        return false;
+    }
+
+    let latest_user_message = answer_relevance_latest_user_message(state);
+    astra_turn_core::evaluation::final_answer_relevance_signal(
+        latest_user_message.as_str(),
+        state.final_text.as_str(),
+    )
+    .is_some()
+}
+
+/// Check if the retry was attempted and the answer is STILL off-target.
+/// If so, produce an interruption instead of delivering a bad answer.
+fn is_answer_relevance_retry_exhausted(state: &AgenticLoopState) -> bool {
+    if !state.stall.forced_answer_relevance_retry || state.final_text.trim().is_empty() {
+        return false;
+    }
+    let latest_user_message = answer_relevance_latest_user_message(state);
+    astra_turn_core::evaluation::final_answer_relevance_signal(
+        latest_user_message.as_str(),
+        state.final_text.as_str(),
+    )
+    .is_some()
+}
+
+fn answer_relevance_latest_user_message(state: &AgenticLoopState) -> String {
+    state
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .filter(|message| !is_execution_corrective_message(message))
+        .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+        .map(astra_turn_core::chat_turn_heuristics::active_user_task_text)
+        .find(|content| !content.trim().is_empty())
+        .unwrap_or_else(|| {
+            astra_turn_core::chat_turn_heuristics::active_user_task_text(state.message.as_str())
+        })
+}
+
+fn remove_trailing_assistant_final_answer(messages: &mut Vec<serde_json::Value>, final_text: &str) {
+    let Some(last) = messages.last() else {
+        return;
+    };
+    let is_matching_final = last
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|role| role == "assistant")
+        && last
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|content| content.trim() == final_text.trim());
+    if is_matching_final {
+        messages.pop();
+    }
+}
+
+fn answer_relevance_retry_message(latest_user_message: &str) -> String {
+    format!(
+        "{FINAL_ANSWER_RELEVANCE_RETRY_MARKER}\n\
+         The previous final answer did not answer the latest user request.\n\
+         Latest user request: {latest_user_message}\n\
+         Use the already available tool results and answer that request directly now. \
+         Do not discuss resume state, degraded context, workspace readiness, or waiting for \
+         another instruction unless the user explicitly asked about those topics."
+    )
+}
+
 pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -660,10 +742,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 state.remaining_turns as u32,
             );
             if !status.is_empty() {
-                astra_turn_core::chat_history_openai::append_openai_user_content_messages(
-                    &mut state.messages,
-                    &[status],
-                );
+                state.push_volatile(super::host::VolatileKind::SelfStatus, status);
             }
         }
 
@@ -671,10 +750,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             let guidance =
                 crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
             if !guidance.is_empty() {
-                astra_turn_core::chat_history_openai::append_openai_user_content_messages(
-                    &mut state.messages,
-                    &[guidance],
-                );
+                state.push_volatile(super::host::VolatileKind::BudgetAdvisory, guidance);
             }
         }
     }
@@ -1773,6 +1849,66 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
 
+            if should_force_answer_relevance_retry(state) {
+                let rejected_final = state.final_text.clone();
+                let latest_user_message = answer_relevance_latest_user_message(state);
+                let retry_message = answer_relevance_retry_message(&latest_user_message);
+                state.stall.forced_answer_relevance_retry = true;
+                remove_trailing_assistant_final_answer(&mut state.messages, &rejected_final);
+                state.final_text.clear();
+                state.final_text_streamed = false;
+                state.push_volatile(super::host::VolatileKind::Corrective, retry_message);
+                tracing::warn!(
+                    target: "astra::loop_guard",
+                    tier = "final_answer_relevance_retry",
+                    round = state.llm_rounds_completed,
+                    "final answer did not answer latest user request; forcing one synthesis retry"
+                );
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        "↻ Final answer missed the latest request; retrying synthesis.".to_string(),
+                    );
+                }
+                record_early_exit_llm_round(
+                    state,
+                    &turn_result,
+                    prep.turn_start_time,
+                    Some("final_answer_relevance_retry"),
+                );
+                state.step_recorder.end_turn(false);
+                try_write_heavy_checkpoint(state);
+                return Ok(TurnExecutionControl::ContinueLoop);
+            }
+
+            // Post-retry exhaustion check: if retry was attempted and answer is STILL off-target
+            if is_answer_relevance_retry_exhausted(state) {
+                state.final_text.clear();
+                state.final_text_streamed = false;
+                let reason = "Answer relevance retry exhausted: model remained off-target after one forced retry.".to_string();
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::BudgetExhausted,
+                    ResumeAction::RequiresIntervention {
+                        description: reason.clone(),
+                    },
+                    interruption_state_summary(state, Some(reason)),
+                ));
+                tracing::warn!(
+                    target: "astra::loop_guard",
+                    tier = "answer_relevance_retry_exhausted",
+                    round = state.llm_rounds_completed,
+                    "answer relevance retry exhausted; terminating with interruption"
+                );
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Red,
+                        "✗ Answer relevance retry exhausted; producing final answer with interruption marker.".to_string(),
+                    );
+                }
+                finalize_and_render(host, state).await;
+                return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
+            }
+
             if state.hooks.stop_hook_runs == 0 && should_skip_auto_verify_stop_hooks(state) {
                 state.hooks.stop_hook_runs = 1;
                 if !prep.quiet {
@@ -1951,7 +2087,9 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
     if state.stall.any_intervention_active() {
         return None;
     }
-    if missing_browser_verification_evidence(state) {
+    let active_message =
+        astra_turn_core::chat_turn_heuristics::active_user_task_text(&state.message);
+    if missing_browser_verification_evidence(state, &active_message) {
         return Some(ExecutionRetryReason::MissingBrowserVerification);
     }
     if has_concrete_workspace_mutation(state) {
@@ -1974,16 +2112,16 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
         // completion is a high-risk silent no-op, so force exactly one retry.
         return Some(ExecutionRetryReason::MissingMutation);
     }
-    (user_confirmed_execution_from_recent_context(state)
+    (user_confirmed_execution_from_recent_context(state, &active_message)
         && (attempted_work_without_mutation || defers))
         .then_some(ExecutionRetryReason::MissingMutation)
 }
 
-fn missing_browser_verification_evidence(state: &AgenticLoopState) -> bool {
+fn missing_browser_verification_evidence(state: &AgenticLoopState, active_message: &str) -> bool {
     if state.final_text.trim().is_empty() {
         return false;
     }
-    if !message_requires_browser_verification(&state.message) {
+    if !message_requires_browser_verification(active_message) {
         return false;
     }
     if final_text_admits_browser_not_verified(&state.final_text) {
@@ -2297,8 +2435,11 @@ fn command_looks_like_verification(command: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn user_confirmed_execution_from_recent_context(state: &AgenticLoopState) -> bool {
-    if !looks_like_execution_confirmation(&state.message) {
+fn user_confirmed_execution_from_recent_context(
+    state: &AgenticLoopState,
+    active_message: &str,
+) -> bool {
+    if !looks_like_execution_confirmation(active_message) {
         return false;
     }
 
@@ -2434,6 +2575,7 @@ fn final_text_concludes_no_change_needed(text: &str) -> bool {
 /// conversation history clean across user turns without depending on the
 /// downstream compactor's heuristics.
 pub(crate) const EXECUTION_RETRY_MARKER: &str = "## ⤴ Execution Retry Correction";
+pub(crate) const FINAL_ANSWER_RELEVANCE_RETRY_MARKER: &str = "## ⤴ Final Answer Relevance Retry";
 
 pub(crate) fn is_execution_retry_correction(m: &serde_json::Value) -> bool {
     if m.get("role").and_then(|r| r.as_str()) != Some("user") {
@@ -2509,6 +2651,16 @@ pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
         || is_search_fanout_corrective(m)
         || is_exploration_family_corrective(m)
         || is_exploration_family_phase2(m)
+        || is_final_answer_relevance_retry(m)
+}
+
+fn is_final_answer_relevance_retry(m: &serde_json::Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    m.get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.starts_with(FINAL_ANSWER_RELEVANCE_RETRY_MARKER))
 }
 
 /// Third-tier guard for the parallel-batching layer. The prompt-side soft
@@ -4264,6 +4416,31 @@ mod tests {
     }
 
     #[test]
+    fn execution_retry_uses_active_user_text_not_runtime_scaffolding() {
+        let mut state = make_state();
+        state.message = concat!(
+            "review local changes",
+            "\n\n<system-reminder>\n",
+            "Previous runtime correction mentioned fix, apply, edit, and cleanup.\n",
+            "</system-reminder>"
+        )
+        .into();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
+        state.final_text = "I found one issue.".into();
+        state.total_tool_calls = 1;
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"git diff --stat"}"#.into()),
+            ..Default::default()
+        });
+
+        assert!(!state.task_profile.mutates_workspace);
+        assert!(!should_force_execution_retry(&state));
+    }
+
+    #[test]
     fn execution_retry_does_not_fire_after_concrete_edit() {
         let mut state = make_state();
         state.task_profile =
@@ -4800,8 +4977,8 @@ mod tests {
     /// per turn so a model that ignores the corrective doesn't churn the
     /// global round budget. After the gate fires once, the next text-only
     /// completion should fall through to terminal rendering, where
-    /// `ensure_terminal_text` records structured task-board state without
-    /// rewriting assistant text (covered by the finalization tests).
+    /// terminal settlement leaves the task-board state observable without
+    /// turning a valid assistant answer into a paused run.
     #[tokio::test]
     async fn unfinished_task_board_gate_is_one_shot_per_turn() {
         let mut host = StubbornTextOnlyHost::new(vec![
@@ -4841,8 +5018,8 @@ mod tests {
             "task-board control state must not be rewritten into assistant prose"
         );
         assert!(
-            state.interruption.is_some(),
-            "unfinished active task-board work should still record structured interruption state"
+            state.interruption.is_none(),
+            "in-progress task-board bookkeeping must not pause a run that produced an answer"
         );
         let unfinished_notices = host
             .emitted_lines
@@ -6417,6 +6594,39 @@ mod tests {
         assert!(is_execution_corrective_message(&msg));
         let unrelated = serde_json::json!({"role": "user", "content": "hello"});
         assert!(!is_exploration_family_corrective(&unrelated));
+    }
+
+    #[test]
+    fn answer_relevance_retry_message_is_classified_as_corrective() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": answer_relevance_retry_message("相关的测试够硬核吗？"),
+        });
+
+        assert!(is_final_answer_relevance_retry(&msg));
+        assert!(is_execution_corrective_message(&msg));
+    }
+
+    #[test]
+    fn answer_relevance_retry_exhausted_only_triggers_when_still_off_target() {
+        let mut state = make_state();
+        state.message = "相关的测试够硬核吗？".into();
+        state.final_text = "测试覆盖了 provider routing、edge offline、prompt cache 和 unhappy path，但还缺一次全量在线回归。".into();
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"ls"}"#.into()),
+            ..Default::default()
+        });
+
+        assert!(!state.stall.forced_answer_relevance_retry);
+        assert!(!is_answer_relevance_retry_exhausted(&state));
+
+        state.stall.forced_answer_relevance_retry = true;
+        assert!(!is_answer_relevance_retry_exhausted(&state));
+
+        state.final_text = "148 files changed, +9498 / -2335 lines, 11 commits.".into();
+        assert!(is_answer_relevance_retry_exhausted(&state));
     }
 
     #[test]

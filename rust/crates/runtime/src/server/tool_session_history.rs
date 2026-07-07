@@ -30,6 +30,15 @@ struct SessionHistoryRow {
     created_at: Option<String>,
 }
 
+const ROOT_CONVERSATION_TRANSCRIPT_JOIN: &str = " LEFT JOIN agent_runs ON agent_runs.user_id = session_transcript_items.user_id AND agent_runs.session_id = session_transcript_items.session_id AND agent_runs.run_id = session_transcript_items.run_id";
+
+const ROOT_CONVERSATION_TRANSCRIPT_FILTER: &str = " AND (session_transcript_items.run_id IS NULL OR (agent_runs.run_id IS NOT NULL AND agent_runs.parent_run_id IS NULL))";
+
+const ROOT_CONVERSATION_CHUNK_JOIN: &str = " LEFT JOIN agent_runs ON session_history_chunks.source_table = 'agent_runs' AND agent_runs.user_id = session_history_chunks.user_id AND agent_runs.session_id = session_history_chunks.session_id AND agent_runs.run_id = session_history_chunks.source_id";
+
+const ROOT_CONVERSATION_CHUNK_FILTER: &str =
+    " AND (agent_runs.run_id IS NULL OR agent_runs.parent_run_id IS NULL)";
+
 fn json_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
@@ -176,18 +185,23 @@ async fn query_session_history_rows(
     };
 
     let mut sql = String::from(
-        "SELECT item_seq, role, content, run_id, \
-                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-         FROM session_transcript_items \
-         WHERE user_id = ? AND session_id = ?",
+        "SELECT session_transcript_items.item_seq, session_transcript_items.role, \
+                session_transcript_items.content, session_transcript_items.run_id, \
+                DATE_FORMAT(session_transcript_items.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+         FROM session_transcript_items",
     );
+    sql.push_str(ROOT_CONVERSATION_TRANSCRIPT_JOIN);
+    sql.push_str(
+        " WHERE session_transcript_items.user_id = ? AND session_transcript_items.session_id = ?",
+    );
+    sql.push_str(ROOT_CONVERSATION_TRANSCRIPT_FILTER);
     if before_seq.is_some() {
-        sql.push_str(" AND item_seq < ?");
+        sql.push_str(" AND session_transcript_items.item_seq < ?");
     }
     if after_seq.is_some() {
-        sql.push_str(" AND item_seq > ?");
+        sql.push_str(" AND session_transcript_items.item_seq > ?");
     }
-    sql.push_str(" ORDER BY item_seq ");
+    sql.push_str(" ORDER BY session_transcript_items.item_seq ");
     sql.push_str(if order == "asc" { "ASC" } else { "DESC" });
     sql.push_str(&format!(" LIMIT {}", limit.max(1)));
 
@@ -258,12 +272,18 @@ async fn query_session_history_chunk_rows(
     patterns.dedup();
 
     let mut sql = String::from(
-        "SELECT chunk_type, source_id, content_text, \
-                COALESCE(item_seq_start, seq_start) AS item_seq, \
-                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-         FROM session_history_chunks \
-         WHERE user_id = ? AND session_id = ? AND (",
+        "SELECT session_history_chunks.chunk_type, session_history_chunks.source_id, \
+                session_history_chunks.content_text, \
+                COALESCE(session_history_chunks.item_seq_start, session_history_chunks.seq_start) AS item_seq, \
+                DATE_FORMAT(session_history_chunks.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+         FROM session_history_chunks",
     );
+    sql.push_str(ROOT_CONVERSATION_CHUNK_JOIN);
+    sql.push_str(
+        " WHERE session_history_chunks.user_id = ? AND session_history_chunks.session_id = ?",
+    );
+    sql.push_str(ROOT_CONVERSATION_CHUNK_FILTER);
+    sql.push_str(" AND (");
     for idx in 0..patterns.len() {
         if idx > 0 {
             sql.push_str(" OR ");
@@ -473,6 +493,7 @@ pub(crate) async fn history_around(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn context_preserves_identity_without_pool() {
@@ -481,5 +502,163 @@ mod tests {
         assert_eq!(context.user_id, "user-1");
         assert_eq!(context.session_id, "session-1");
         assert!(context.pool.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn session_history_tools_filter_child_agent_rows_on_matrixone() {
+        let _ = dotenvy::dotenv();
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored MatrixOne tests"
+        );
+        let settings = astra_core::MatrixOneSettings::from_env();
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        astra_services::storage::ensure_core_schema(&settings, &catalog)
+            .await
+            .expect("ensure schema");
+        let pool = astra_core::SharedPool::new(&settings)
+            .await
+            .expect("SharedPool::new");
+
+        let user_id = format!("hist-user-{}", uuid::Uuid::new_v4());
+        let session_id = format!("hist-session-{}", uuid::Uuid::new_v4());
+        let root_run = format!("root-{}", uuid::Uuid::new_v4());
+        let child_run = format!("child-{}", uuid::Uuid::new_v4());
+
+        sqlx::query("INSERT INTO agent_sessions (user_id, session_id, title) VALUES (?, ?, ?)")
+            .bind(&user_id)
+            .bind(&session_id)
+            .bind("history-root-boundary")
+            .execute(pool.get())
+            .await
+            .expect("insert session");
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (user_id, session_id, run_id, parent_run_id, root_run_id, ancestor_path, depth, status)
+             VALUES (?, ?, ?, NULL, ?, ?, 0, 'completed')",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&root_run)
+        .bind(&root_run)
+        .bind(&root_run)
+        .execute(pool.get())
+        .await
+        .expect("insert root run");
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (user_id, session_id, run_id, parent_run_id, root_run_id, ancestor_path, depth, status)
+             VALUES (?, ?, ?, ?, ?, ?, 1, 'completed')",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&child_run)
+        .bind(&root_run)
+        .bind(&root_run)
+        .bind(format!("{root_run}/{child_run}"))
+        .execute(pool.get())
+        .await
+        .expect("insert child run");
+
+        for (seq, run_id, role, content) in [
+            (1_i64, &root_run, "user", "root user request"),
+            (2_i64, &child_run, "assistant", "child agent private answer"),
+            (3_i64, &root_run, "assistant", "root assistant answer"),
+        ] {
+            sqlx::query(
+                "INSERT INTO session_transcript_items
+                 (user_id, session_id, item_seq, run_id, role, content, content_hash)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&user_id)
+            .bind(&session_id)
+            .bind(seq)
+            .bind(run_id)
+            .bind(role)
+            .bind(content)
+            .bind(format!("hash-{seq}"))
+            .execute(pool.get())
+            .await
+            .expect("insert transcript row");
+        }
+        for (chunk_id, source_table, source_id, content) in [
+            ("root-chunk", "agent_runs", &root_run, "root chunk keep"),
+            ("child-chunk", "agent_runs", &child_run, "child chunk leak"),
+            (
+                "non-run-chunk",
+                "runtime_messages",
+                &session_id,
+                "non run chunk keep",
+            ),
+            (
+                "non-run-collision",
+                "runtime_messages",
+                &child_run,
+                "non run collision chunk keep",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO session_history_chunks
+                 (chunk_id, user_id, session_id, seq_start, seq_end, chunk_type,
+                  source_table, source_id, content_text, content_hash, token_estimate)
+                 VALUES (?, ?, ?, 1, 3, 'summary', ?, ?, ?, ?, 1)",
+            )
+            .bind(format!("{chunk_id}-{}", uuid::Uuid::new_v4()))
+            .bind(&user_id)
+            .bind(&session_id)
+            .bind(source_table)
+            .bind(source_id)
+            .bind(content)
+            .bind(format!("hash-{chunk_id}"))
+            .execute(pool.get())
+            .await
+            .expect("insert history chunk");
+        }
+
+        let result = history_page(
+            context(&user_id, &session_id, Some(&pool)),
+            &json!({"order": "asc", "limit": 10}),
+        )
+        .await;
+        let rendered = result.output;
+        assert!(rendered.contains("root user request"), "{rendered}");
+        assert!(rendered.contains("root assistant answer"), "{rendered}");
+        assert!(
+            !rendered.contains("child agent private answer"),
+            "child transcript row leaked into root session history: {rendered}"
+        );
+
+        let search = history_search(
+            context(&user_id, &session_id, Some(&pool)),
+            &json!({"pattern": "chunk", "limit": 10, "scan_limit": 50}),
+        )
+        .await
+        .output;
+        assert!(search.contains("root chunk keep"), "{search}");
+        assert!(search.contains("non run chunk keep"), "{search}");
+        assert!(
+            search.contains("non run collision chunk keep"),
+            "non-run chunk source_id collisions must not be filtered as child runs: {search}"
+        );
+        assert!(
+            !search.contains("child chunk leak"),
+            "child run chunk leaked into session history search: {search}"
+        );
+
+        let around = history_around(
+            context(&user_id, &session_id, Some(&pool)),
+            &json!({"item_seq": 2, "radius": 1}),
+        )
+        .await
+        .output;
+        assert!(around.contains("root user request"), "{around}");
+        assert!(around.contains("root assistant answer"), "{around}");
+        assert!(
+            !around.contains("child agent private answer"),
+            "child transcript row leaked into session history around: {around}"
+        );
     }
 }

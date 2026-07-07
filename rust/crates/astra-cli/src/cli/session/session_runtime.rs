@@ -1038,10 +1038,10 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
         if event.event_type != session_journal::JournalEventType::Turn {
             continue;
         }
-        restored.history.push((
-            event.user_input.unwrap_or_default(),
-            event.assistant_output.unwrap_or_default(),
-        ));
+        let user_input = restored_turn_user_input(&event);
+        restored
+            .history
+            .push((user_input, event.assistant_output.unwrap_or_default()));
         restored.turn = restored
             .turn
             .max(event.turn.unwrap_or(restored.turn.saturating_add(1)));
@@ -1059,6 +1059,45 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
         session: restored,
         last_turn_event,
     })
+}
+
+fn restored_turn_user_input(event: &session_journal::JournalEvent) -> String {
+    let base = event.user_input.clone().unwrap_or_default();
+    let deferred = deferred_user_inputs_from_turn_metadata(event.metadata.as_ref());
+    if deferred.is_empty() {
+        return base;
+    }
+
+    let mut parts = Vec::new();
+    if !base.trim().is_empty() {
+        parts.push(base.clone());
+    }
+    let base_sections = base
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    for content in deferred {
+        let trimmed = content.trim();
+        if trimmed.is_empty() || base_sections.contains(trimmed) {
+            continue;
+        }
+        parts.push(trimmed.to_string());
+    }
+    parts.join("\n\n")
+}
+
+fn deferred_user_inputs_from_turn_metadata(metadata: Option<&serde_json::Value>) -> Vec<String> {
+    metadata
+        .and_then(|metadata| metadata.get("deferred_user_inputs"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("content").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|content| !content.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
@@ -1683,6 +1722,35 @@ mod tests {
         assert_eq!(history[0].0, "what is Rust?");
         assert_eq!(history[0].1, "Rust is a systems language.");
         assert_eq!(history[1].0, "show me an example");
+    }
+
+    #[test]
+    fn restore_history_includes_structured_deferred_user_inputs() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("test-restore-deferred-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+
+        writer
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(&sid),
+                    1,
+                    None,
+                    "1",
+                    "handled latest input",
+                    0,
+                    10,
+                    5,
+                    100,
+                )
+                .with_deferred_user_inputs([(2, "2")]),
+            )
+            .unwrap();
+
+        let history = restore_history_from_journal(&sid).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0, "1\n\n2");
+        assert_eq!(history[0].1, "handled latest input");
     }
 
     #[test]

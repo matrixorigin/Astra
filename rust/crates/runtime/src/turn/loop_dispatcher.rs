@@ -358,7 +358,7 @@ mod tests {
             tactical_adapter: None,
             step_signal_collector: None,
             recent_tactical_actions: Vec::new(),
-            server_tool_executor: None,
+            runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,

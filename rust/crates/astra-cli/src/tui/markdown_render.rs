@@ -1,7 +1,7 @@
 use super::render::highlight::highlight_code_to_lines;
 use super::render::line_utils::line_to_static;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::{Style, Stylize};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthStr;

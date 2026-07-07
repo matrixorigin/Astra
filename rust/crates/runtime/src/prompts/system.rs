@@ -1224,17 +1224,17 @@ fn search_strategy_section(tool_names: &[&str]) -> String {
     }
 }
 
-/// When to use `task` tool for complex, multi-outcome work.
+/// When to use `task_board` for complex, multi-outcome work.
 fn task_lifecycle_section(tool_names: &[&str]) -> String {
-    if !tool_visible(tool_names, "task") {
+    if !tool_visible(tool_names, "task_board") {
         return String::new();
     }
     "\n## Task Lifecycle\n\
-     - When facing 3+ distinct outcomes or work spanning multiple files, break it into subtasks with `task create`.\n\
-     - Claim before starting: `task update task_id=task-1 new_status=in_progress`.\n\
-     - Mark done after verifying: `task update task_id=task-1 new_status=completed`.\n\
-     - For a child item, include its parent: `task update task_id=task-1 subtask_id=s1 new_status=completed`.\n\
-     - Check remaining: `task list` to see what is unfinished.\n\
+     - When facing 3+ distinct outcomes or work spanning multiple files, break it into subtasks with `task_board(action=\"create\", title=\"...\")`.\n\
+     - Claim before starting: `task_board(action=\"update\", task_id=\"task-1\", new_status=\"in_progress\")`.\n\
+     - Mark done after verifying: `task_board(action=\"update\", task_id=\"task-1\", new_status=\"completed\")`.\n\
+     - For a child item, include its parent: `task_board(action=\"update\", task_id=\"task-1\", subtask_id=\"s1\", new_status=\"completed\")`.\n\
+     - Check remaining: `task_board(action=\"list\")` to see what is unfinished.\n\
      - Do not delete failed/cancelled/completed tasks to make the board look clean; terminal states are evidence. Use archive for old terminal work, and create follow-up tasks only for genuinely new work.\n\
      - Before saying all work is done or all checks are green, verify the artifact/build/test evidence and explicitly account for skipped or ignored checks.\n\
      - The task board is your working memory across turns — if the session resumes or you are interrupted, read it before acting.\n"
@@ -1903,7 +1903,7 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     };
     // Session 8d9e5903 regression: every outbound request ends with a
     // role=user `<system-reminder>` wrapper produced by the volatile
-    // lane (wire_assembly / bridge_inprocess / server_loop_host). This
+    // lane (wire_assembly / chat-turn adapter / server_loop_host). This
     // is runtime scaffolding, not a user query, and must not break
     // round-cadence detection — otherwise the single-tool-streak
     // counter always returns 0 on live sessions and the
@@ -2389,20 +2389,24 @@ mod tests {
             "without memory tools, no rules"
         );
 
-        // Task lifecycle: task tool present → lifecycle guidance
-        let p_task = build_main_system_prompt(&["task", "bash"], "", None);
+        // Task lifecycle: task_board tool present → lifecycle guidance
+        let p_task = build_main_system_prompt(&["task_board", "bash"], "", None);
         assert!(p_task.contains("Task Lifecycle"));
-        assert!(p_task.contains("task create"));
-        assert!(p_task.contains("task update task_id=task-1 new_status=in_progress"));
-        assert!(p_task.contains("task update task_id=task-1 subtask_id=s1 new_status=completed"));
+        assert!(p_task.contains("task_board(action=\"create\""));
+        assert!(p_task.contains(
+            "task_board(action=\"update\", task_id=\"task-1\", new_status=\"in_progress\")"
+        ));
+        assert!(p_task.contains(
+            "task_board(action=\"update\", task_id=\"task-1\", subtask_id=\"s1\", new_status=\"completed\")"
+        ));
         assert!(p_task.contains("terminal states are evidence"));
         assert!(p_task.contains("all checks are green"));
         assert!(
-            !p_task.contains("task update subtask_id=X"),
-            "task update examples must include the required parent task_id"
+            !p_task.contains("task_board(action=\"update\", subtask_id="),
+            "task_board update examples must include the required parent task_id"
         );
 
-        // Task lifecycle: no task tool → no lifecycle guidance
+        // Task lifecycle: no task_board tool → no lifecycle guidance
         let p_no_task = build_main_system_prompt(&["bash", "read_file"], "", None);
         assert!(!p_no_task.contains("Task Lifecycle"));
 
@@ -3116,7 +3120,7 @@ mod tests {
     /// despite 18 consecutive single-tool rounds in T11. The fix
     /// extends scaffolding detection to any user message whose content
     /// starts with `<system-reminder>`, which is a stable runtime
-    /// marker applied by every provider path (bridge_inprocess /
+    /// marker applied by every runtime path (chat-turn adapter /
     /// server_loop_host / wire_assembly).
     #[test]
     fn trailing_single_tool_streak_skips_system_reminder_wrapper() {

@@ -51,12 +51,6 @@ pub fn session_id_footer_abbrev(session_id: Option<&str>) -> &str {
     }
 }
 
-/// Default `StepRecorder` run label for ephemeral chat streams (`chat-{ms}`).
-#[must_use]
-pub fn step_recorder_chat_ephemeral_run_id(loop_start_elapsed_ms: u128) -> String {
-    format!("chat-{loop_start_elapsed_ms}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,14 +129,6 @@ mod tests {
         assert_eq!(
             session_id_footer_abbrev(Some("数据数据数据数据数据数据数据数据数据")),
             "数据数据数据数据"
-        );
-    }
-
-    #[test]
-    fn step_chat_run_id() {
-        assert_eq!(
-            step_recorder_chat_ephemeral_run_id(42),
-            "chat-42".to_string()
         );
     }
 }

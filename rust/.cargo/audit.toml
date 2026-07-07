@@ -7,9 +7,17 @@
 # REVIEW_BY: 2026-10-18 — calendar re-check: run `cargo audit`, confirm whether rsa/sqlx resolved;
 # remove this ignore if a fixed dependency graph is available.
 
-# RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml): pulled via plist → syntect → two-face.
-# quick-xml 0.39.3 is the version required by plist 1.9.0; there is no patched release in the
-# transitive dependency chain yet. Revisit when syntect/two-face upgrades plist.
-# REVIEW_BY: 2026-09-02
+# RUSTSEC-2026-0204 (crossbeam-epoch): crossbeam-epoch 0.9.18 has an invalid-pointer
+# dereference bug in fmt::Pointer for Atomic/Shared. There is currently no patched
+# crossbeam-epoch release listed by RustSec. Our remaining production path is
+# astra-cli → termimad → crossbeam; termimad 0.34.1 still depends on crossbeam, so
+# a termimad version bump does not remove the vulnerable crate. We do not format
+# crossbeam epoch pointers in the CLI markdown rendering path. Revisit by either
+# removing/replacing termimad or dropping this ignore when crossbeam publishes a
+# fixed release.
+# REVIEW_BY: 2026-10-07
 [advisories]
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0204",
+]

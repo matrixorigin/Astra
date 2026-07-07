@@ -27,10 +27,12 @@ import { IconButton } from "@/components/ui/icon-button";
 import { useToast } from "@/components/ui/toast";
 import { splitThinkingTags } from "@/lib/api/chats";
 import type { ChatArtifactRef, ChatMessage } from "@/lib/api/types";
+import { isChatScrolledToBottom } from "@/lib/chat-scroll-state";
 import { cn } from "@/lib/utils/cn";
 
 const markdownRemarkPlugins = [remarkGfm, remarkMath];
 const markdownRehypePlugins = [rehypeKatex, rehypeHighlight];
+const REASONING_SETTLE_GRACE_MS = 900;
 
 const markdownComponents: Components = {
   pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
@@ -516,11 +518,16 @@ function ReasoningPanel({
   const [open, setOpen] = useState(streaming);
   const userToggledRef = useRef(false);
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  const elapsed = useReasoningElapsed(startedAt, completedAt, streaming);
+  const bodyPinnedRef = useRef(true);
+  const displayStreaming = useDisplayedReasoningStreaming(
+    streaming,
+    completedAt,
+  );
+  const elapsed = useReasoningElapsed(startedAt, completedAt, displayStreaming);
   const body =
-    reasoning.trim() || (streaming ? "Preparing response..." : "Done");
+    reasoning.trim() || (displayStreaming ? "Preparing response..." : "Done");
   const blocks = splitReasoningBlocks(body);
-  const summary = streaming
+  const summary = displayStreaming
     ? elapsed
       ? `Thinking ${elapsed}`
       : "Thinking"
@@ -533,14 +540,14 @@ function ReasoningPanel({
     if (userToggledRef.current) {
       return;
     }
-    setOpen(streaming);
-  }, [streaming]);
+    setOpen(displayStreaming);
+  }, [displayStreaming]);
 
   useEffect(() => {
-    if (open && streaming) {
+    if (open && displayStreaming && bodyPinnedRef.current) {
       bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight });
     }
-  }, [open, reasoning, streaming]);
+  }, [body, displayStreaming, open]);
 
   return (
     <div className="astra-reasoning-panel mb-4 max-w-[min(100%,44rem)] text-text-muted">
@@ -553,7 +560,7 @@ function ReasoningPanel({
         aria-expanded={open}
         className="group -ml-1 inline-flex max-w-full items-center gap-2 rounded-control px-1 py-1 text-left text-[13px] font-medium leading-5 text-text-secondary transition-colors hover:text-text"
       >
-        {streaming ? (
+        {displayStreaming ? (
           <Loader className="size-3.5 shrink-0 animate-spin text-text-muted" />
         ) : (
           <CheckCircle2 className="size-3.5 shrink-0 text-text-muted" />
@@ -561,7 +568,7 @@ function ReasoningPanel({
         <span
           className={cn(
             "astra-reasoning-summary shrink-0",
-            streaming && "astra-reasoning-summary-streaming",
+            displayStreaming && "astra-reasoning-summary-streaming",
           )}
         >
           {summary}
@@ -577,7 +584,7 @@ function ReasoningPanel({
         />
       </button>
       <span className="sr-only" role="status" aria-live="polite">
-        {streaming ? "Astra is thinking" : "Astra finished thinking"}
+        {displayStreaming ? "Astra is thinking" : "Astra finished thinking"}
       </span>
       <div
         className={cn(
@@ -588,10 +595,37 @@ function ReasoningPanel({
         <div className="min-w-0 overflow-hidden">
           <div
             ref={bodyRef}
+            data-testid="reasoning-scroll-container"
+            onWheel={(event) => {
+              if (event.deltaY < 0) {
+                bodyPinnedRef.current = false;
+              }
+              if (displayStreaming) {
+                const chatScrollContainer =
+                  event.currentTarget.closest<HTMLElement>(
+                    '[data-chat-scroll-container="true"]',
+                  );
+                if (chatScrollContainer) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  chatScrollContainer.scrollBy({
+                    top: event.deltaY,
+                    left: 0,
+                    behavior: "auto",
+                  });
+                }
+              }
+            }}
+            onScroll={(event) => {
+              bodyPinnedRef.current = isChatScrolledToBottom(
+                event.currentTarget,
+                24,
+              );
+            }}
             className={cn(
               "ml-[6px] mt-1 border-l border-border/70 py-2 pl-4 pr-1",
               open &&
-                (streaming
+                (displayStreaming
                   ? "max-h-56 overflow-y-auto"
                   : "max-h-[320px] overflow-y-auto"),
             )}
@@ -609,6 +643,33 @@ function ReasoningPanel({
       </div>
     </div>
   );
+}
+
+function useDisplayedReasoningStreaming(
+  streaming: boolean,
+  completedAt: string | null | undefined,
+) {
+  const [displayStreaming, setDisplayStreaming] = useState(streaming);
+  const hasStreamedRef = useRef(streaming);
+
+  useEffect(() => {
+    if (streaming) {
+      hasStreamedRef.current = true;
+      setDisplayStreaming(true);
+      return;
+    }
+    if (!hasStreamedRef.current || completedAt) {
+      setDisplayStreaming(false);
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setDisplayStreaming(false);
+    }, REASONING_SETTLE_GRACE_MS);
+    return () => window.clearTimeout(timeout);
+  }, [completedAt, streaming]);
+
+  return displayStreaming;
 }
 
 function ReasoningStep({

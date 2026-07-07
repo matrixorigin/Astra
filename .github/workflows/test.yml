@@ -45,6 +45,14 @@ jobs:
   #   shard-b: astra-runtime (3151) + contracts (19)
   #   shard-c: astra-turn-core (2167) + astra-services (1186) + plan/prompts
   #   shard-d: remaining core crates + bridge-e2e-hooks (3176, mostly overlaps runtime)
+  #
+  # Runtime profile guardrails are intentionally covered across these shards
+  # instead of running `make test-runtime-profiles` as a separate CI job. That
+  # target is a focused local/PR triage gate; in CI, shard-b covers astra-runtime
+  # default-feature profile tests, shard-d covers runtime-env/edge plus bridge
+  # hook web-agent E2E, shard-a covers the CLI-local lib guardrail, and
+  # static-checks.yml covers the web Vitest files. This keeps the invariant
+  # protected without repeating the same Rust/Web tests in an extra job.
 
   shard-a:
     name: "Test: astra-cli (${{ matrix.segment }})"
@@ -86,6 +94,12 @@ jobs:
           timeout ${{ matrix.command_timeout }} cargo nextest run
           --manifest-path rust/Cargo.toml -p astra-cli
           --profile ci --bins -E "$NEXTEST_FILTER"
+      - name: Test astra-cli runtime profile guardrail
+        if: matrix.segment == 'non-edge'
+        run: >-
+          cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
+          --profile ci --lib
+          -E 'test(/local_cli_catalog_uses_runtime_env_surface_for_local_runtime/)'
       - name: Dump processes on failure
         if: failure()
         run: ps -ef | grep -E 'cargo|nextest|astra|bash|sleep' || true
@@ -150,11 +164,11 @@ jobs:
       - name: Test core crates
         run: >-
           cargo nextest run --manifest-path rust/Cargo.toml
-          -p astra-core -p astra-thin-client
+          -p astra-core -p astra-thin-client -p astra-runtime-env
           -p astra-tools -p astra-pipeline -p astra-turn-types
           -p astra-skills -p astra-sandbox -p astra-server-types
           -p astra-messaging -p astra-text-utils
-          -p astra-config
+          -p astra-config -p astra-edge
           --profile ci
       - name: Test bridge-e2e-hooks (selective)
         run: >-

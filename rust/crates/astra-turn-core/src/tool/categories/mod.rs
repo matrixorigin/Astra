@@ -229,6 +229,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("apply_patch", MU, A.union(FI)),
     tool("create_file", MU, A.union(FI)),
     tool("delete_file", MU, A.union(FI)),
+    tool("publish_artifact", MU, A.union(FI)),
     tool("notebook_edit", MU, OR),
     // ── Mutating — rollback ──────────────────────────────────────────
     tool("rollback_file_edits", MU, A.union(OR)),
@@ -248,7 +249,7 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("compress_context", MU, OR),
     tool("env", MU, OR),
     // ── Mutating — task management (immune to health avoidance) ───────
-    tool("task", MU, OR.union(ToolFlags::TASK_MGMT)),
+    tool("task_board", MU, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_output", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_list", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_stop", MU, OR.union(ToolFlags::TASK_MGMT)),
@@ -310,7 +311,7 @@ impl ToolRegistry {
     /// Returns the effective `ToolCategory` after inspecting `args` for
     /// consolidated tools.
     pub fn category_for(&self, name: &str, args: Option<&serde_json::Value>) -> ToolCategory {
-        if matches!(name, "memory" | "git" | "github" | "task") {
+        if matches!(name, "memory" | "git" | "github" | "task_board") {
             return classify(name, args).category;
         }
         self.category(name)
@@ -586,7 +587,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         }
     }
 
-    if name == "task" {
+    if name == "task_board" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
             Some("list" | "get" | "list_user") => {
                 meta_category = ToolCategory::ReadOnly;
@@ -611,6 +612,15 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
             Some("checkout_file" | "worktree") => {
                 meta_category = ToolCategory::Mutating;
                 meta_flags = NONE;
+            }
+            Some("stash")
+                if args
+                    .and_then(|a| a.get("stash_action").or_else(|| a.get("sub_action")))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|action| matches!(action, "list" | "show")) =>
+            {
+                meta_category = ToolCategory::ReadOnly;
+                meta_flags = GR;
             }
             Some("commit" | "revert_commit" | "stash" | "push") | None => {
                 meta_category = ToolCategory::Mutating;
@@ -676,7 +686,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
 
     let idempotency = if shell_read_only {
         ToolIdempotency::PureRead
-    } else if name == "task" {
+    } else if name == "task_board" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
             Some("list" | "get" | "list_user") => ToolIdempotency::PureRead,
             _ => ToolIdempotency::NonIdempotent,
@@ -689,6 +699,14 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
                 "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
                 | "contributors",
             ) => ToolIdempotency::PureRead,
+            Some("stash")
+                if args
+                    .and_then(|a| a.get("stash_action").or_else(|| a.get("sub_action")))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|action| matches!(action, "list" | "show")) =>
+            {
+                ToolIdempotency::PureRead
+            }
             _ => ToolIdempotency::NonIdempotent,
         }
     } else if name == "github" {
@@ -959,18 +977,18 @@ mod tests {
         use serde_json::json;
 
         for action in ["list", "get", "list_user"] {
-            let read = classify("task", Some(&json!({"action": action})));
+            let read = classify("task_board", Some(&json!({"action": action})));
             assert_eq!(read.category, ToolCategory::ReadOnly);
             assert!(!read.approval_required);
             assert!(read.parallelizable);
         }
 
-        let update = classify("task", Some(&json!({"action": "update"})));
+        let update = classify("task_board", Some(&json!({"action": "update"})));
         assert_eq!(update.category, ToolCategory::Mutating);
         assert!(!update.approval_required);
 
         let stale_background = classify(
-            "task",
+            "task_board",
             Some(&json!({"action": "background_shell", "command": "npm run dev"})),
         );
         assert_eq!(stale_background.category, ToolCategory::Mutating);
@@ -2387,7 +2405,7 @@ mod tests {
             "compress_context",
             "env",
             "notebook_edit",
-            "task",
+            "task_board",
             "context_analysis",
             "diagnose",
             "rollback_file_edits",
@@ -2548,5 +2566,19 @@ mod tests {
                  either the table or display_category() logic is wrong"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod artifact_effect_invariants {
+    use super::*;
+
+    #[test]
+    fn publish_artifact_is_a_mutating_external_effect() {
+        let classified = classify("publish_artifact", None);
+
+        assert!(classified.category.is_mutating());
+        assert!(!classified.category.is_read_only());
+        assert_eq!(classified.category, ToolCategory::Mutating);
     }
 }

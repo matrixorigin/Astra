@@ -37,6 +37,7 @@ use astra_services::session_journal::{
     SessionMemoryExtractionSource,
 };
 use astra_turn_core::cloud_session_memory_extract::SessionMemoryState;
+use astra_turn_types::{is_runtime_scaffolding_message, is_transient_runtime_status_text};
 
 use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::MemoriaClient;
@@ -544,6 +545,12 @@ impl MemoryExtractionService {
                     trigger: trig,
                     reason,
                     label: skip_reason_label(reason),
+                }
+            } else if request_has_low_incremental_information(&req) {
+                Admission::Skip {
+                    trigger: trig,
+                    reason: SessionMemoryExtractionSkipReason::LowInformation,
+                    label: skip_reason_label(SessionMemoryExtractionSkipReason::LowInformation),
                 }
             } else {
                 // Memoria circuit breaker: fail fast when the endpoint has
@@ -1215,10 +1222,58 @@ fn skip_reason_label(reason: SessionMemoryExtractionSkipReason) -> &'static str 
         SessionMemoryExtractionSkipReason::NoSessionId => "no_session_id",
         SessionMemoryExtractionSkipReason::BelowInitGate => "below_init_gate",
         SessionMemoryExtractionSkipReason::NoGrowth => "no_growth",
+        SessionMemoryExtractionSkipReason::LowInformation => "low_information",
         SessionMemoryExtractionSkipReason::InFlight => "in_flight",
         SessionMemoryExtractionSkipReason::SelectorCooldown => "selector_cooldown",
         SessionMemoryExtractionSkipReason::MemoriaUnhealthy => "memoria_unhealthy",
     }
+}
+
+const LOW_INFORMATION_RECENT_MESSAGE_LIMIT: usize = 6;
+const LOW_INFORMATION_CHAR_THRESHOLD: usize = 160;
+
+fn request_has_low_incremental_information(req: &ExtractionRequest) -> bool {
+    if req.session_id.is_empty()
+        || req.had_error
+        || req.had_user_correction
+        || req.messages.is_empty()
+    {
+        return false;
+    }
+
+    let mut chars = 0usize;
+    let mut prompt_facing_messages = 0usize;
+    for msg in req
+        .messages
+        .iter()
+        .rev()
+        .take(LOW_INFORMATION_RECENT_MESSAGE_LIMIT)
+    {
+        if is_runtime_scaffolding_message(msg) {
+            continue;
+        }
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "tool" || msg.get("tool_calls").is_some() {
+            return false;
+        }
+        if !matches!(role, "user" | "assistant") {
+            continue;
+        }
+        let Some(text) = msg.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() || is_transient_runtime_status_text(text) {
+            continue;
+        }
+        prompt_facing_messages += 1;
+        chars = chars.saturating_add(text.chars().count().min(2_000));
+        if prompt_facing_messages >= 2 {
+            break;
+        }
+    }
+
+    prompt_facing_messages > 0 && chars < LOW_INFORMATION_CHAR_THRESHOLD
 }
 
 fn summarize_persisted_content(content: &str) -> String {
@@ -1592,7 +1647,10 @@ mod tests {
         ExtractionRequest {
             user_id: "test-user".to_string(),
             session_id: session_id.to_string(),
-            messages: vec![json!({"role": "user", "content": "hello world"})],
+            messages: vec![
+                json!({"role": "user", "content": "Design a durable runtime history boundary that separates root conversation history from child agent artifacts and keeps prompt cache stable."}),
+                json!({"role": "assistant", "content": "I will inspect the restore path, session history tool, and event persistence boundary, then update the shared runtime code and regression tests."}),
+            ],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             current_tokens: tokens,
             current_tool_calls: 0,
@@ -1610,6 +1668,24 @@ mod tests {
             messages: vec![
                 json!({"role": "user", "content": "Need a cache-safe session memory design that still captures shutdown summaries for short sessions and resumed work."}),
                 json!({"role": "assistant", "content": "I removed the legacy extractor, fixed the model poisoning bug, and am wiring a final shutdown flush plus resume recap next."}),
+            ],
+            session_facts: astra_turn_types::session_facts::SessionFacts::default(),
+            current_tokens: tokens,
+            current_tool_calls: 0,
+            had_error: false,
+            had_user_correction: false,
+            turn_number: 1,
+            config: SessionMemoryExtractConfig::default(),
+        }
+    }
+
+    fn low_information_req(session_id: &str, tokens: usize) -> ExtractionRequest {
+        ExtractionRequest {
+            user_id: "test-user".to_string(),
+            session_id: session_id.to_string(),
+            messages: vec![
+                json!({"role": "user", "content": "1+1"}),
+                json!({"role": "assistant", "content": "2"}),
             ],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),
             current_tokens: tokens,
@@ -1639,6 +1715,49 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+
+    #[tokio::test]
+    async fn maybe_spawn_skips_low_information_turn_even_when_cached_context_is_large() {
+        let TestCtx {
+            svc,
+            mut rx,
+            memoria,
+        } = build_ctx(None);
+        let sid = format!("low-info-{}", nanos());
+
+        assert_eq!(
+            svc.maybe_spawn(low_information_req(&sid, 50_000)),
+            SpawnDecision::Skipped
+        );
+        assert!(
+            memoria.stored.lock().unwrap().is_empty(),
+            "low-information turns must not enqueue extraction work"
+        );
+
+        let events = collect_extraction_events(&mut rx);
+        assert!(
+            events.iter().any(|evt| {
+                evt.metadata.as_ref().is_some_and(|meta| {
+                    meta["outcome"] == "skipped" && meta["reason"] == "low_information"
+                })
+            }),
+            "expected a typed low_information skip event, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_spawn_does_not_treat_recent_tool_use_as_low_information() {
+        let TestCtx { svc, .. } = build_ctx(None);
+        let sid = format!("tool-info-{}", nanos());
+        let mut req = low_information_req(&sid, 50_000);
+        req.messages.push(json!({
+            "role": "assistant",
+            "content": serde_json::Value::Null,
+            "tool_calls": [{"function": {"name": "list_dir"}}],
+        }));
+
+        assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
     }
 
     #[test]

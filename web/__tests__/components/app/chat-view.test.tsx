@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
@@ -22,6 +23,7 @@ import {
   streamChatMessage,
   streamExistingChatRun,
   updateChatModel,
+  updateChatWorkspaceSelection,
 } from "@/lib/api/chats";
 
 const pushMock = vi.fn();
@@ -166,6 +168,7 @@ vi.mock("@/lib/api/chats", () => ({
   streamChatMessage: vi.fn(),
   streamExistingChatRun: vi.fn(),
   updateChatModel: vi.fn(),
+  updateChatWorkspaceSelection: vi.fn(),
 }));
 
 const mockGetEdgeStatus = vi.mocked(getEdgeStatus);
@@ -178,6 +181,7 @@ const mockStopChatRun = vi.mocked(stopChatRun);
 const mockStreamChatMessage = vi.mocked(streamChatMessage);
 const mockStreamExistingChatRun = vi.mocked(streamExistingChatRun);
 const mockUpdateChatModel = vi.mocked(updateChatModel);
+const mockUpdateChatWorkspaceSelection = vi.mocked(updateChatWorkspaceSelection);
 
 const defaultActiveRun: NonNullable<ChatDetail["activeRun"]> = {
   runId: "run-123",
@@ -274,6 +278,14 @@ describe("ChatView deferred-input unhappy paths", () => {
     mockStreamExistingChatRun.mockReset();
     mockStreamExistingChatRun.mockResolvedValue("");
     mockUpdateChatModel.mockReset();
+    mockUpdateChatWorkspaceSelection.mockReset();
+    mockUpdateChatWorkspaceSelection.mockImplementation(
+      async (_chatId, workspaceSelection) => ({
+        ...makeDetail(null),
+        workspaceSelection: workspaceSelection ?? undefined,
+        workspaceSelectionExplicit: Boolean(workspaceSelection),
+      }),
+    );
     window.localStorage.clear();
     window.alert = vi.fn();
     HTMLElement.prototype.scrollTo = vi.fn();
@@ -554,6 +566,42 @@ describe("ChatView deferred-input unhappy paths", () => {
     });
   });
 
+  it("does not auto-select the only connected edge workspace for new turns", async () => {
+    const user = userEvent.setup();
+    const edgeWorkspace = {
+      kind: "edge_workspace" as const,
+      edgeAgentId: "edge-1",
+      displayName: "MacBook Pro",
+      cwd: "/Users/test/astra",
+    };
+    mockGetEdgeStatus.mockResolvedValue({
+      edges: [
+        {
+          edge_agent_id: "edge-1",
+          hostname: "MacBook Pro",
+          workspace_dir: "/Users/test/astra",
+          connected_secs: 10,
+        },
+      ],
+    });
+    mockStreamChatMessage.mockResolvedValue("edge answer");
+
+    render(<ChatView initial={makeDetail(null)} />);
+
+    await waitFor(() => expect(mockGetEdgeStatus).toHaveBeenCalled());
+    expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Submit composer" }));
+
+    await waitFor(() => {
+      expect(mockStreamChatMessage).toHaveBeenCalledWith(
+        "chat-123",
+        expect.not.objectContaining({ workspace: edgeWorkspace }),
+        expect.any(Object),
+      );
+    });
+  });
+
   it("does not expose environment controls in the main composer", async () => {
     const user = userEvent.setup();
     mockGetEdgeStatus.mockRejectedValue(new WebApiError(404, "Not Found"));
@@ -821,6 +869,10 @@ describe("ChatView deferred-input unhappy paths", () => {
     expect(
       screen.getByRole("button", { name: /Open tools activity/i }),
     ).toBeInTheDocument();
+    expect(screen.getAllByText("bash").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("transport disconnected").length,
+    ).toBeGreaterThan(0);
 
     await user.click(
       screen.getByRole("button", { name: /Open tools activity/i }),
@@ -856,6 +908,78 @@ describe("ChatView deferred-input unhappy paths", () => {
         "child-run",
       );
     });
+  });
+
+  it("shows parent-paused subagent work as waiting in the chat timeline", async () => {
+    mockGetChatWorkSurface.mockResolvedValue({
+      sessionId: "chat-123",
+      runId: "run-123",
+      tasks: [],
+      events: [
+        {
+          type: "agent_spawned",
+          agent_id: "agent-1",
+          run_id: "child-run",
+          parent_run_id: "run-123",
+          agent_type: "code-review",
+          description: "Review the branch",
+          timestamp: 1_801_000_000_000,
+        },
+        {
+          type: "run_interrupted",
+          run_id: "run-123",
+          kind: "empty_completion",
+          resumable: true,
+          timestamp: 1_801_000_001_000,
+        },
+      ],
+      generatedAt: "2026-06-07T00:00:00.000Z",
+    });
+
+    render(<ChatView initial={makeDetail()} />);
+
+    const card = await screen.findByLabelText("Background work");
+    expect(within(card).getAllByText("Waiting").length).toBeGreaterThan(0);
+    expect(within(card).getByText("Review the branch")).toBeInTheDocument();
+    expect(within(card).queryByText("Needs attention")).toBeNull();
+    expect(within(card).queryByText("interrupted")).toBeNull();
+  });
+
+  it("shows empty-completion subagent work as final-answer work in the chat timeline", async () => {
+    mockGetChatWorkSurface.mockResolvedValue({
+      sessionId: "chat-123",
+      runId: "run-123",
+      tasks: [],
+      events: [
+        {
+          type: "agent_spawned",
+          agent_id: "agent-weather",
+          run_id: "child-weather",
+          parent_run_id: "run-123",
+          agent_type: "research",
+          description: "Fetch Shanghai weather",
+          timestamp: 1_801_000_000_000,
+        },
+        {
+          type: "agent_interrupted",
+          agent_id: "agent-weather",
+          run_id: "child-weather",
+          parent_run_id: "run-123",
+          reason: "empty_completion",
+          result_summary: "上海今日小雨，33°C / 25°C。",
+          timestamp: 1_801_000_001_000,
+        },
+      ],
+      generatedAt: "2026-06-07T00:00:00.000Z",
+    });
+
+    render(<ChatView initial={makeDetail()} />);
+
+    const card = await screen.findByLabelText("Background work");
+    expect(within(card).getByText("Needs final answer")).toBeInTheDocument();
+    expect(within(card).getByText("Fetch Shanghai weather")).toBeInTheDocument();
+    expect(within(card).queryByText("Needs attention")).toBeNull();
+    expect(within(card).queryByText("Interrupted")).toBeNull();
   });
 
   it("continues queueing follow-up input while the active run is input-queued", async () => {

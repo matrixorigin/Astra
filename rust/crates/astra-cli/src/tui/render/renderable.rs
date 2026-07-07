@@ -51,7 +51,7 @@ impl Renderable for Paragraph<'_> {
 
 impl Renderable for Line<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        ratatui::widgets::WidgetRef::render_ref(self, area, buf);
+        ratatui::widgets::WidgetRef::render_ref(&self, area, buf);
     }
     fn desired_height(&self, _: u16) -> u16 {
         1

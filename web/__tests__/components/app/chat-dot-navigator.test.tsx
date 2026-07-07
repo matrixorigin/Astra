@@ -44,41 +44,49 @@ function appendMessageAnchor(container: HTMLElement, index: number, top: number)
   return element;
 }
 
+function longConversation(): Pick<ChatMessage, 'role' | 'content'>[] {
+  return [
+    userMessage(1),
+    message('assistant', 'Assistant response 1'),
+    userMessage(2),
+    message('assistant', 'Assistant response 2'),
+    userMessage(3),
+    message('assistant', 'Assistant response 3'),
+    userMessage(4),
+  ];
+}
+
 describe('ChatDotNavigator', () => {
   it('stays hidden until the first message exists', () => {
     renderNavigator([]);
     expect(screen.queryByRole('navigation', { name: 'Message navigation' })).not.toBeInTheDocument();
   });
 
-  it('appears with the first message', () => {
+  it('stays hidden for short conversations', () => {
     renderNavigator([message('user', 'Build a dashboard')]);
-    expect(screen.getByRole('navigation', { name: 'Message navigation' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Jump to Msg 1: Build a dashboard' })).toBeInTheDocument();
-    expect(screen.getByText('Msg 1: Build a dashboard')).toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: 'Message navigation' })).not.toBeInTheDocument();
   });
 
-  it('anchors every message in short conversations', () => {
-    renderNavigator([
-      userMessage(1),
-      message('assistant', 'Assistant response 1'),
-      userMessage(2),
-      message('assistant', 'Assistant response 2'),
-      userMessage(3),
-    ]);
+  it('appears only once conversation navigation is useful', () => {
+    renderNavigator(longConversation());
 
-    expect(screen.getAllByRole('button')).toHaveLength(5);
-    for (let index = 1; index <= 5; index += 1) {
-      expect(screen.getByRole('button', { name: new RegExp(`^Jump to Msg ${index}:`) })).toBeInTheDocument();
-    }
+    expect(screen.getByRole('navigation', { name: 'Message navigation' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Jump to Msg 1: User input 1' })).toBeInTheDocument();
+    expect(screen.getAllByRole('button')).toHaveLength(4);
   });
 
   it('labels assistant anchors with the preceding user input', () => {
     renderNavigator([
       message('user', 'Explain retries'),
       message('assistant', 'Use backoff'),
+      message('assistant', 'Add jitter'),
+      userMessage(2),
+      userMessage(3),
+      message('assistant', 'Third response'),
+      userMessage(4),
     ]);
 
-    expect(screen.getByRole('button', { name: 'Jump to Msg 2: Explain retries' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Jump to Msg 3: Explain retries' })).toBeInTheDocument();
   });
 
   it('compacts long user inputs in labels', () => {
@@ -87,6 +95,12 @@ describe('ChatDotNavigator', () => {
         'user',
         'Summarize this long request with multiple\n\nspaces and enough extra words to require a compact preview in the navigator tooltip.',
       ),
+      message('assistant', 'First response'),
+      userMessage(2),
+      message('assistant', 'Second response'),
+      userMessage(3),
+      message('assistant', 'Third response'),
+      userMessage(4),
     ]);
 
     expect(screen.getByText('Msg 1: Summarize this long request with multiple spaces and enough extra words to...')).toBeInTheDocument();
@@ -97,12 +111,9 @@ describe('ChatDotNavigator', () => {
     const { container, scrollTo } = makeScrollableContainer();
     appendMessageAnchor(container, 0, 220);
 
-    renderNavigator([
-      message('user', 'First task'),
-      message('assistant', 'First response'),
-    ], container);
+    renderNavigator(longConversation(), container);
 
-    await user.click(screen.getByRole('button', { name: 'Jump to Msg 1: First task' }));
+    await user.click(screen.getByRole('button', { name: 'Jump to Msg 1: User input 1' }));
 
     expect(scrollTo).toHaveBeenCalledWith({ top: 300, behavior: 'smooth' });
   });
@@ -110,16 +121,11 @@ describe('ChatDotNavigator', () => {
   it('scrolls to the bottom for the last message anchor', async () => {
     const user = userEvent.setup();
     const { container, scrollTo } = makeScrollableContainer();
-    appendMessageAnchor(container, 3, 700);
+    appendMessageAnchor(container, 6, 700);
 
-    renderNavigator([
-      message('user', 'First task'),
-      message('assistant', 'First response'),
-      message('user', 'Second task'),
-      message('assistant', 'Second response'),
-    ], container);
+    renderNavigator(longConversation(), container);
 
-    await user.click(screen.getByRole('button', { name: 'Jump to Msg 4: Second task' }));
+    await user.click(screen.getByRole('button', { name: 'Jump to Msg 7: User input 4' }));
 
     expect(scrollTo).toHaveBeenCalledWith({ top: 800, behavior: 'smooth' });
   });

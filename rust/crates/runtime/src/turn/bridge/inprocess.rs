@@ -10,20 +10,21 @@
 /// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm::client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`call_llm_stream`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm::client::wait_until_cancelled_or_pending) in the bridge stream |
 /// | Tool permission queue + single resolve | CLI: `astra-cli` `permission_manager`; cloud: edge approval ledger / `POST /tools/result`. "resolve once" matches ledger single-shot semantics |
 ///
-/// # Legacy Status
+/// # Adapter Status
 ///
-/// This module implements the **old-style cloud tool loop** (its own `for round_ix..`
-/// loop inside `stream!`). It does NOT use [`run_agentic_loop_with_host`], so semantic
-/// dedup and full step recording are still absent here. Legacy `/chat/turn` and
-/// `/chat/stream` now thinly reuse the shared TurnGuard / post-tool-policy shell so
-/// they no longer bypass runtime stall and tool-restriction controls entirely.
+/// This module is the remaining HTTP `/chat/turn` single-turn transport adapter.
+/// It still has its own `for round_ix..` loop inside `stream!` and does NOT use
+/// [`run_agentic_loop_with_host`], so semantic dedup and full step recording are
+/// still absent here. It must not present itself as a separate agent runtime:
+/// public runtime metadata is expressed as CLI local capacity, while
+/// implementation-specific provenance such as `BRIDGE_CACHE_SOURCE` stays
+/// internal for prompt-cache continuity and journal diagnostics.
 ///
 /// **Preferred replacement**: Use [`super::loop_dispatcher::LoopDispatcher`] with
 /// [`ServerAgenticLoopHost`](crate::server::server_loop_host::ServerAgenticLoopHost)
 /// which runs the full unified cognitive loop including all runtime policies.
 ///
-/// This bridge remains wired for backward compatibility with existing `/chat/turn`
-/// and `/chat/stream` HTTP endpoints. New features should target the unified loop.
+/// New features should target the unified loop.
 ///
 /// # Architecture (legacy)
 ///
@@ -168,7 +169,7 @@ fn rewrite_bridge_runtime_manifest_model_resolution(
         "resolved": true,
         "fallback": fallback_trace,
     });
-    manifest["runtime_profile"] = json!("bridge_inprocess");
+    manifest["runtime_profile"] = json!(astra_runtime_env::CapacityProviderType::CliLocal.as_str());
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -4154,6 +4155,7 @@ impl InProcessChatTurnBridge {
                     event_id: user_query_event_id.clone(),
                     user_id: user_id.clone(),
                     session_id: session_id.clone(),
+                    run_id: Some(run_id.clone()),
                     agent_id: agent_id.clone(),
                     event_type: "user_query".to_string(),
                     content: content.clone(),
@@ -4172,6 +4174,7 @@ impl InProcessChatTurnBridge {
                 event_id: Uuid::now_v7().to_string(),
                 user_id: user_id.clone(),
                 session_id: session_id.clone(),
+                run_id: Some(run_id.clone()),
                 agent_id: agent_id.clone(),
                 event_type: "llm_response".to_string(),
                 content: llm_content.clone(),
@@ -4197,10 +4200,21 @@ impl InProcessChatTurnBridge {
                 for (index, tool_call) in all_round_tool_calls.iter().enumerate() {
                     if let Some(tc) = tool_call.as_object() {
                         let payload = build_tool_call_event_payload(tc, index, &reasoning);
+                        let tool_call_id = payload
+                            .metadata
+                            .get("tool_call_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string);
+                        let mut metadata = payload.metadata;
+                        metadata.insert("run_id".to_string(), Value::String(run_id.clone()));
                         events.push(TurnToolEventRecord {
                             event_id: Uuid::now_v7().to_string(),
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
+                            run_id: Some(run_id.clone()),
+                            tool_call_id,
                             agent_id: agent_id.clone(),
                             event_type: "tool_call".to_string(),
                             content: match payload.content {
@@ -4210,8 +4224,7 @@ impl InProcessChatTurnBridge {
                             parent_event_id: Some(user_query_event_id.clone()),
                             parent_event_ids: vec![user_query_event_id.clone()],
                             causal_chain_id: turn_chain_id.clone(),
-                            metadata: (!payload.metadata.is_empty())
-                                .then_some(Value::Object(payload.metadata)),
+                            metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
                             skill_name: (!payload.skill_name.is_empty())
                                 .then_some(payload.skill_name),
                             skill_version: None,
@@ -4223,10 +4236,21 @@ impl InProcessChatTurnBridge {
                     if let Some(tr) = tool_result.as_object() {
                         let payload =
                             build_tool_result_event_payload(tr, "edge", TOOL_RESULT_AUDIT_CHARS);
+                        let tool_call_id = payload
+                            .metadata
+                            .get("tool_call_id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToString::to_string);
+                        let mut metadata = payload.metadata;
+                        metadata.insert("run_id".to_string(), Value::String(run_id.clone()));
                         events.push(TurnToolEventRecord {
                             event_id: Uuid::now_v7().to_string(),
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
+                            run_id: Some(run_id.clone()),
+                            tool_call_id,
                             agent_id: agent_id.clone(),
                             event_type: "tool_result".to_string(),
                             content: match payload.content {
@@ -4236,8 +4260,7 @@ impl InProcessChatTurnBridge {
                             parent_event_id: Some(user_query_event_id.clone()),
                             parent_event_ids: vec![user_query_event_id.clone()],
                             causal_chain_id: turn_chain_id.clone(),
-                            metadata: (!payload.metadata.is_empty())
-                                .then_some(Value::Object(payload.metadata)),
+                            metadata: (!metadata.is_empty()).then_some(Value::Object(metadata)),
                             skill_name: (!payload.skill_name.is_empty())
                                 .then_some(payload.skill_name),
                             skill_version: None,
@@ -4437,7 +4460,7 @@ impl InProcessChatTurnBridge {
                 .unwrap_or("")
                 .to_string();
             let evaluation = (!tool_call_records.is_empty()).then(|| {
-                crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
+                let mut eval = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
                     &user_message_for_eval,
                     &recent_tools_for_quality,
                     &tool_call_records,
@@ -4445,7 +4468,13 @@ impl InProcessChatTurnBridge {
                     verdict_warning,
                     budget_pressure,
                     crate::pipeline::evaluation::current_evaluation_thresholds(),
-                )
+                );
+                crate::pipeline::evaluation::apply_final_answer_relevance(
+                    &mut eval,
+                    &user_message_for_eval,
+                    &full_text,
+                );
+                eval
             });
             let tool_execution_ms: u64 = merged_tool_results
                 .iter()
@@ -5013,6 +5042,11 @@ mod tests {
         assert_eq!(
             manifest["model_resolution"]["fallback"]["from_model"],
             "deepseek-v4-pro-official"
+        );
+        assert_eq!(
+            manifest["runtime_profile"],
+            astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
+            "public runtime metadata should identify the CLI local capacity provider, not the in-process bridge adapter"
         );
     }
 

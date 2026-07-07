@@ -99,6 +99,27 @@ fn status_icon_and_color(
     }
 }
 
+fn is_task_board_tombstone(status: SessionTaskStatusKind) -> bool {
+    matches!(
+        status,
+        SessionTaskStatusKind::Archived
+            | SessionTaskStatusKind::Deleted
+            | SessionTaskStatusKind::Migrated
+    )
+}
+
+fn task_is_renderable(task: &SessionTask) -> bool {
+    !is_task_board_tombstone(task.status)
+}
+
+fn renderable_tasks(tasks: &[SessionTask]) -> Vec<SessionTask> {
+    tasks
+        .iter()
+        .filter(|task| task_is_renderable(task))
+        .cloned()
+        .collect()
+}
+
 /// Compute how many task lines fit in the given terminal height. Mirrors
 /// the reference TUI's `maxDisplay = rows <= 10 ? 0 : min(10, max(3, rows - 14))`.
 fn max_display(rows: u16) -> usize {
@@ -197,6 +218,9 @@ impl TaskStatusCounts {
 fn counts(tasks: &[SessionTask]) -> TaskStatusCounts {
     let mut counts = TaskStatusCounts::default();
     for task in tasks {
+        if !task_is_renderable(task) {
+            continue;
+        }
         match task.status {
             SessionTaskStatusKind::Completed => counts.completed += 1,
             SessionTaskStatusKind::InProgress => counts.in_progress += 1,
@@ -204,10 +228,10 @@ fn counts(tasks: &[SessionTask]) -> TaskStatusCounts {
             SessionTaskStatusKind::Paused => counts.paused += 1,
             SessionTaskStatusKind::Failed => counts.failed += 1,
             SessionTaskStatusKind::Cancelled => counts.cancelled += 1,
+            SessionTaskStatusKind::Other => counts.other += 1,
             SessionTaskStatusKind::Archived
             | SessionTaskStatusKind::Deleted
-            | SessionTaskStatusKind::Migrated
-            | SessionTaskStatusKind::Other => counts.other += 1,
+            | SessionTaskStatusKind::Migrated => {}
         }
     }
     counts
@@ -247,7 +271,8 @@ fn sort_by_id_asc(mut tasks: Vec<&SessionTask>) -> Vec<&SessionTask> {
 
 /// Order `tasks` by the reference TUI's display priority:
 /// in_progress → pending (open blockers last) → paused → completed →
-/// terminal/archival history.
+/// failed/unknown diagnostics. Tombstones (archived/deleted/migrated)
+/// are audit rows and never belong on the live task board.
 fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec<&'a SessionTask> {
     let in_progress = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_in_progress()).collect());
     let mut pending: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_pending()).collect();
@@ -282,17 +307,10 @@ fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec
             .filter(|t| matches!(t.status, SessionTaskStatusKind::Failed))
             .collect(),
     );
-    let archival = sort_by_id_asc(
+    let diagnostics = sort_by_id_asc(
         tasks
             .iter()
-            .filter(|t| {
-                matches!(
-                    t.status,
-                    SessionTaskStatusKind::Archived
-                        | SessionTaskStatusKind::Deleted
-                        | SessionTaskStatusKind::Other
-                )
-            })
+            .filter(|t| matches!(t.status, SessionTaskStatusKind::Other))
             .collect(),
     );
     let mut out: Vec<&SessionTask> = Vec::with_capacity(tasks.len());
@@ -301,7 +319,7 @@ fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec
     out.extend(paused);
     out.extend(completed);
     out.extend(terminal);
-    out.extend(archival);
+    out.extend(diagnostics);
     out
 }
 
@@ -470,6 +488,9 @@ fn render_hidden_summary(hidden: &[&SessionTask]) -> Option<Line<'static>> {
     let counts = hidden
         .iter()
         .fold(TaskStatusCounts::default(), |mut counts, task| {
+            if !task_is_renderable(task) {
+                return counts;
+            }
             match task.status {
                 SessionTaskStatusKind::Completed => counts.completed += 1,
                 SessionTaskStatusKind::InProgress => counts.in_progress += 1,
@@ -477,10 +498,10 @@ fn render_hidden_summary(hidden: &[&SessionTask]) -> Option<Line<'static>> {
                 SessionTaskStatusKind::Paused => counts.paused += 1,
                 SessionTaskStatusKind::Failed => counts.failed += 1,
                 SessionTaskStatusKind::Cancelled => counts.cancelled += 1,
+                SessionTaskStatusKind::Other => counts.other += 1,
                 SessionTaskStatusKind::Archived
                 | SessionTaskStatusKind::Deleted
-                | SessionTaskStatusKind::Migrated
-                | SessionTaskStatusKind::Other => counts.other += 1,
+                | SessionTaskStatusKind::Migrated => {}
             }
             counts
         });
@@ -573,7 +594,7 @@ where
     // the bullet for a ↺ glyph tinted accent.
     let theme = crate::tui::theme::current();
     let flash_color = theme.accent;
-    for task in tasks {
+    for task in tasks.iter().filter(|task| task_is_renderable(task)) {
         if !is_fresh(&task.id) {
             continue;
         }
@@ -751,6 +772,13 @@ pub fn render_with_colors(
     standalone: bool,
     colors: TaskBoardColors,
 ) -> Vec<Line<'static>> {
+    let filtered_tasks;
+    let tasks = if tasks.iter().all(task_is_renderable) {
+        tasks
+    } else {
+        filtered_tasks = renderable_tasks(tasks);
+        filtered_tasks.as_slice()
+    };
     let cap = max_display(rows);
     if cap == 0 || tasks.is_empty() {
         return Vec::new();
@@ -945,6 +973,13 @@ pub fn render_with_colors(
 /// Returns `None` for empty task lists — caller renders nothing in
 /// that case.
 pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<Line<'static>> {
+    let filtered_tasks;
+    let tasks = if tasks.iter().all(task_is_renderable) {
+        tasks
+    } else {
+        filtered_tasks = renderable_tasks(tasks);
+        filtered_tasks.as_slice()
+    };
     if tasks.is_empty() {
         return None;
     }
@@ -1237,6 +1272,23 @@ mod tests {
     }
 
     #[test]
+    fn deleted_archived_and_migrated_tasks_do_not_render_as_other() {
+        let tasks = vec![
+            mk_task("task-1", "deleted", "deleted"),
+            mk_task("task-2", "archived", "archived"),
+            mk_task("task-3", "migrated", "migrated"),
+        ];
+        let lines = render(&tasks, 80, 40, true);
+        assert!(lines.is_empty(), "tombstones must not render: {lines:?}");
+
+        let summary = render_collapsed_summary(&tasks, 80);
+        assert!(
+            summary.is_none(),
+            "tombstones must not render collapsed summary"
+        );
+    }
+
+    #[test]
     fn blocked_tasks_sort_after_unblocked_within_pending() {
         let a = mk_task("task-1", "free", "pending");
         let mut b = mk_task("task-2", "blocked", "pending");
@@ -1409,7 +1461,7 @@ mod tests {
     }
 
     /// REGRESSION: model emits one parent task with 5 subtasks via
-    /// `task.create({subtasks: [...]})`, but the dashboard only ever
+    /// `task_board.create({subtasks: [...]})`, but the dashboard only ever
     /// rendered the parent line — subtasks were invisible. This test
     /// pins inline rendering: parent line first, then one indented
     /// row per subtask, with status icons reflecting each subtask's

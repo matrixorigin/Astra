@@ -1,4 +1,4 @@
-//! Server-side tool executor for web agent sessions.
+//! Provider-backed runtime tool executor for server-hosted agentic runs.
 //!
 //! By default the server exposes only server-service and control-plane tools.
 //! Workspace/process execution, such as bash, file mutation, git, or test
@@ -11,8 +11,8 @@
 //! # Integration
 //!
 //! The executor is injected into `HeadlessToolRoundCtx` via the
-//! `server_tool_executor` field. When present, the headless round
-//! calls it directly instead of waiting for edge POST callbacks.
+//! `runtime_tool_executor` field. It executes server-owned tools locally and
+//! delegates runtime-executor tools through the bound provider route.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -35,11 +35,14 @@ use astra_tools::tool_engine::ToolEngine;
 use astra_tools::{AskUserGate, ToolExecutor};
 use astra_turn_core::capability::Capability;
 use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
-use astra_turn_core::tool::schema::{retain_tool_schemas_by_names, tool_schema_name};
+use astra_turn_core::tool::schema::{
+    prompt_schema_conflicting_tool_names, retain_tool_schemas_by_names, tool_schema_name,
+};
 use async_trait::async_trait;
 
 use crate::orchestration::AgentToolContext;
 use crate::server::server_bash_execution::execute_server_bash;
+use crate::server::tool_admission::{ToolAdmissionContext, ToolHiddenReason};
 use crate::server::tool_ask_user::{AskUserExecutionContext, execute_ask_user};
 use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJournal};
 use crate::server::tool_exactly_once;
@@ -60,13 +63,13 @@ use crate::server::tool_session_state_rollback::{
 };
 
 use crate::server::tool_transport::{
-    ExecutionBindingState, ExecutorBinding, ServerLocalToolTransport,
-    TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT, TOOL_ERROR_KIND_CANCELLED,
-    TOOL_ERROR_KIND_CAPABILITY_DENIED, TOOL_ERROR_KIND_EXECUTOR_OFFLINE,
+    ExecutionBindingState, ExecutorBinding, ExecutorBindingKind, SelectedToolOfferSnapshot,
+    ServerLocalToolTransport, TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT,
+    TOOL_ERROR_KIND_CANCELLED, TOOL_ERROR_KIND_CAPABILITY_DENIED, TOOL_ERROR_KIND_EXECUTOR_OFFLINE,
     TOOL_ERROR_KIND_TOOL_TIMEOUT, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
     TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH, ToolExecutionRequest, ToolExecutionService,
     ToolPolicySnapshot, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
-    binding_event_fields, capability_filtered_server_tool_schemas,
+    binding_event_fields, capability_filtered_server_tool_schemas_with_context,
 };
 use crate::server::tool_work_surface_events::{
     WorkSurfaceEventEmitter, binding_snapshot_events, task_board_snapshot_event,
@@ -78,22 +81,32 @@ use astra_tools::plan_task_mirror;
 
 mod tool_handlers;
 
+#[cfg(test)]
 fn resolved_server_tool_names(
     capabilities: &astra_turn_core::capability::CapabilitySet,
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> HashSet<String> {
-    capability_filtered_server_tool_schemas(capabilities, workspace, executor, runtime)
-        .iter()
-        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
-        .collect()
+    capability_filtered_server_tool_schemas_with_context(
+        capabilities,
+        workspace,
+        executor,
+        runtime,
+        ToolAdmissionContext::default(),
+    )
+    .iter()
+    .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+    .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolAdmission {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecutorToolReadiness {
     Ready,
+    UnknownTool,
     MissingRuntimeBinding,
+    RuntimeBindingBusy(&'static str),
+    RuntimeEnvironmentDenied(astra_runtime_env::ToolUnavailableReason),
     MissingCapability(Capability),
     MissingService(Capability),
 }
@@ -120,11 +133,11 @@ impl SessionConfigState {
     }
 }
 
-/// Server-side tool executor for web agent sessions.
+/// Provider-backed runtime tool executor for server-hosted agentic runs.
 ///
-/// Wraps tool calls in a sandboxed environment without requiring a CLI process.
-/// Created per-session by `AgenticRunLifecycleService::create_run()`.
-pub struct ServerToolExecutor {
+/// Server-service and control-plane tools run locally. Workspace/process tools
+/// are only available when an explicit provider binding exists.
+pub struct RuntimeToolExecutor {
     // ── Identity ──────────────────────────────────────────────────────────────
     /// Workspace root for this session.
     pub(super) workspace_root: PathBuf,
@@ -155,7 +168,7 @@ pub struct ServerToolExecutor {
     /// Shared default executor for delegating common tool logic.
     pub(super) default_executor: DefaultToolExecutor,
     /// Canonical handler registry for server-local tools.
-    tool_engine: ToolEngine<ServerToolExecutor>,
+    tool_engine: ToolEngine<RuntimeToolExecutor>,
     /// Cooperative cancellation for server-owned runtime/control-plane tool awaits.
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Explicit workspace, executor, runtime, and provisioned workspace record
@@ -214,6 +227,10 @@ pub struct ServerToolExecutor {
     /// plan-mode state write through this so the next turn's system prompt
     /// reflects current state instead of the loop-start snapshot.
     plan_resume_hint_handle: Option<Arc<std::sync::RwLock<Option<String>>>>,
+    /// Shared handle to the loop host's authoritative plan authoring gate.
+    /// This is intentionally separate from the prompt hint: ordinary session
+    /// resume text must never activate plan-mode tool blocking.
+    plan_authoring_active_handle: Option<Arc<std::sync::RwLock<bool>>>,
 
     // ── MCP and external tool integration ─────────────────────────────────────
     /// MCP client manager for forwarding `mcp__*` tool calls to connected
@@ -223,17 +240,22 @@ pub struct ServerToolExecutor {
     /// shared HTTP transport pool. Unlike `mcp_manager`, this never holds a
     /// long-lived authorization-scoped MCP session.
     agent_binding_mcp: Option<Arc<super::runtime_mcp::AgentBindingMcpRuntime>>,
-    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
-    /// server-side allowlist when `tool_search(select:NAME)` runs so
-    /// deferred activation reaches plugin tools. Populated by the server
-    /// loop host once MCP servers have been refreshed.
-    plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
+    /// Request-scoped MCP tool schemas. Joined with the server-side allowlist
+    /// only when the matching MCP runtime binding is ready, so deferred
+    /// activation reaches MCP tools without treating arbitrary schemas as
+    /// server-owned capacity.
+    request_scoped_mcp_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
     /// Deferred tool names whose full schema has been fetched via
     /// `tool_search(query="select:NAME")` in this session.
     activated_deferred_tools: Arc<std::sync::RwLock<HashSet<String>>>,
     /// Tool names searchable/admissible in the current server-host turn.
     /// `None` keeps direct unit-test executor calls permissive.
     current_searchable_tool_names: Arc<std::sync::RwLock<Option<HashSet<String>>>>,
+    /// Selected provider offers for the current wire tool surface, keyed by
+    /// canonical tool name. This is execution metadata; it never enters
+    /// prompt-visible tool schemas.
+    current_selected_tool_offers:
+        Arc<std::sync::RwLock<HashMap<String, SelectedToolOfferSnapshot>>>,
     /// Tool names listed in the current turn's `<deferred_tools>` manifest.
     /// Mirrors the CLI executor's `current_activatable_tool_names`. Populated
     /// from `ToolSurface::deferred()` per turn so the validator can emit the
@@ -244,10 +266,14 @@ pub struct ServerToolExecutor {
     /// When enabled, server-local execution rejects names outside the current
     /// capability-filtered server tool surface.
     enforce_server_tool_capabilities: bool,
-    /// When false, Astra-owned built-in server tools are neither advertised nor
-    /// executable through this executor. Request-scoped MCP tools are not part of
-    /// this surface and keep their own transport path.
-    server_builtin_tools_enabled: bool,
+    /// When false, server-service tools are neither advertised nor executable
+    /// through this executor. Request-scoped MCP tools are not part of this
+    /// surface and keep their own transport path.
+    server_service_tools_enabled: bool,
+    /// Control-plane backbone tools remain separate from server-service
+    /// capacity so agent-binding/runtime modes can still plan, inspect, and
+    /// manage tasks without implying generic server execution capacity.
+    control_plane_tools_enabled: bool,
 
     // ── Gates and callbacks ───────────────────────────────────────────────────
     /// Optional approval gate for dangerous tool execution.
@@ -260,7 +286,7 @@ pub struct ServerToolExecutor {
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
 }
 
-impl ServerToolExecutor {
+impl RuntimeToolExecutor {
     /// Create a new server tool executor for a session.
     pub fn new(
         workspace_root: PathBuf,
@@ -287,7 +313,7 @@ impl ServerToolExecutor {
         let task_manager = Arc::new(TaskManager::new(session_id.clone(), task_store));
 
         let capabilities = crate::capabilities::full_server_capabilities_for_tests();
-        let tool_engine = tool_handlers::server_tool_engine();
+        let tool_engine = tool_handlers::runtime_tool_engine();
 
         Self {
             workspace_root: workspace_root.clone(),
@@ -321,9 +347,11 @@ impl ServerToolExecutor {
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
-            plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+            plan_authoring_active_handle: None,
+            request_scoped_mcp_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             current_searchable_tool_names: Arc::new(std::sync::RwLock::new(None)),
+            current_selected_tool_offers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             current_activatable_tool_names: Arc::new(std::sync::RwLock::new(None)),
             mcp_manager: None,
             agent_binding_mcp: None,
@@ -332,7 +360,8 @@ impl ServerToolExecutor {
             execution_binding: ExecutionBindingState::none(),
             capabilities,
             enforce_server_tool_capabilities: false,
-            server_builtin_tools_enabled: true,
+            server_service_tools_enabled: true,
+            control_plane_tools_enabled: true,
             exactly_once_executor: None,
         }
     }
@@ -344,13 +373,13 @@ impl ServerToolExecutor {
     /// Public accessor for transport-aware tool execution routing.
     /// Callers wire edge, gateway relay, and sandbox-resident
     /// agent transports through this handle instead of through
-    /// `ServerToolExecutor` thin-setters.
+    /// `RuntimeToolExecutor` thin-setters.
     pub fn tool_execution_service(&mut self) -> &mut ToolExecutionService {
         &mut self.tool_execution_service
     }
 
     /// Replace the internal ToolExecutionService with a shared instance,
-    /// so that multiple executors share the same disabled_tools set.
+    /// so that multiple executors share the same disabled tool-offer set.
     pub fn with_tool_execution_service(mut self, service: ToolExecutionService) -> Self {
         self.tool_execution_service = service;
         self
@@ -461,7 +490,13 @@ impl ServerToolExecutor {
     pub fn with_server_builtin_tools_disabled(mut self) -> Self {
         self.capabilities = astra_turn_core::capability::CapabilitySet::empty();
         self.enforce_server_tool_capabilities = true;
-        self.server_builtin_tools_enabled = false;
+        self.server_service_tools_enabled = false;
+        self.control_plane_tools_enabled = false;
+        self
+    }
+
+    pub fn with_server_service_tools_disabled(mut self) -> Self {
+        self.server_service_tools_enabled = false;
         self
     }
 
@@ -480,19 +515,27 @@ impl ServerToolExecutor {
         self.agent_binding_mcp = Some(agent_binding_mcp);
     }
 
-    /// Install plugin-registered schemas (MCP, etc.) so
+    /// Install request-scoped MCP schemas so
     /// `tool_search(select:NAME)` can resolve them for deferred activation.
-    /// Called by the server loop host after MCP manager refresh.
+    /// Called by the server loop host after request-scoped MCP discovery.
     ///
-    /// Poison handling: plugin schemas are a rebuildable cache. Reset cached
+    /// Poison handling: MCP schemas are a rebuildable cache. Reset cached
     /// state on poison instead of reusing possibly half-written inner data.
-    pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
-        let mut guard = rwlock_write_reset_on_poison(&self.plugin_schemas, "plugin_schemas");
+    pub fn set_request_scoped_mcp_schemas(&self, schemas: Vec<Value>) {
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.request_scoped_mcp_schemas,
+            "request_scoped_mcp_schemas",
+        );
         *guard = schemas;
     }
 
     pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {
-        let names = astra_turn_core::tool::schema::tool_names_from_schemas(schemas);
+        let allowed = self.provider_visible_runtime_tool_names();
+        let conflicts = prompt_schema_conflicting_tool_names(schemas);
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(schemas)
+            .into_iter()
+            .filter(|name| allowed.contains(name) && !conflicts.contains(name))
+            .collect();
         let mut guard = rwlock_write_reset_on_poison(
             &self.current_searchable_tool_names,
             "current_searchable_tool_names",
@@ -500,7 +543,19 @@ impl ServerToolExecutor {
         *guard = Some(names);
     }
 
+    pub fn set_current_selected_tool_offers(
+        &self,
+        offers: HashMap<String, SelectedToolOfferSnapshot>,
+    ) {
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.current_selected_tool_offers,
+            "current_selected_tool_offers",
+        );
+        *guard = offers;
+    }
+
     pub fn set_current_activatable_tool_names(&self, names: HashSet<String>) {
+        let names = self.runtime_bound_tool_names(names);
         let mut guard = rwlock_write_reset_on_poison(
             &self.current_activatable_tool_names,
             "current_activatable_tool_names",
@@ -523,19 +578,29 @@ impl ServerToolExecutor {
         )
     }
 
+    fn current_selected_tool_offer(&self, tool_name: &str) -> Option<SelectedToolOfferSnapshot> {
+        rwlock_read_clone_or_default(
+            &self.current_selected_tool_offers,
+            "current_selected_tool_offers",
+        )
+        .get(tool_name)
+        .cloned()
+    }
+
     pub(super) fn current_tool_search_pool_schemas(&self) -> Vec<Value> {
         let mut pool = self.capability_filtered_server_tool_schemas();
         let activatable = self.current_activatable_tool_names_snapshot();
         if !activatable.is_empty() {
-            let mut activatable_pool =
-                crate::capabilities::server_runtime_tool_schemas(&self.capabilities);
+            let mut activatable_pool = self.capability_filtered_server_tool_schemas();
             retain_tool_schemas_by_names(&mut activatable_pool, &activatable);
             activatable_pool.retain(|schema| {
                 tool_schema_name(schema).is_some_and(|name| self.tool_runtime_ready(name))
             });
-            extend_tool_schema_pool_unique(&mut pool, activatable_pool);
+            pool.extend(activatable_pool);
         }
-        pool.extend(self.external_schemas_snapshot("external_schemas_tool_search"));
+        pool.extend(self.ready_request_scoped_mcp_schemas());
+        remove_prompt_schema_conflicts(&mut pool);
+        dedupe_tool_schema_pool(&mut pool);
 
         let Some(mut searchable_names) = self.current_searchable_tool_names() else {
             return pool;
@@ -612,12 +677,38 @@ impl ServerToolExecutor {
         guard.extend(names);
     }
 
-    pub(crate) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
-        rwlock_read_clone_or_default(&self.plugin_schemas, label)
+    pub(crate) fn request_scoped_mcp_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+        rwlock_read_clone_or_default(&self.request_scoped_mcp_schemas, label)
     }
 
-    pub(crate) fn external_schemas_snapshot(&self, label: &str) -> Vec<Value> {
-        self.plugin_schemas_snapshot(label)
+    pub(crate) fn ready_request_scoped_mcp_schemas(&self) -> Vec<Value> {
+        let schemas = self.request_scoped_mcp_schemas_snapshot("request_scoped_mcp_schemas_ready");
+        let mut context = self.tool_admission_context();
+        context.request_scoped_mcp_provider_ready = !schemas.is_empty();
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut ready = schemas
+            .iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_some_and(|name| {
+                    if !self.mcp_tool_has_runtime_binding(name) {
+                        return false;
+                    }
+                    crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
+                        name,
+                        &schemas,
+                        &WorkspaceBinding::none(),
+                        &ExecutorBinding::request_scoped_mcp(),
+                        None,
+                        &registry,
+                        context.clone(),
+                    )
+                    .visible
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        astra_core::tool_schema::sort_tool_schemas_by_name(&mut ready);
+        ready
     }
 
     /// Record a direct deferred call as an activation intent. Called when the
@@ -672,10 +763,8 @@ impl ServerToolExecutor {
         }
     }
 
+    #[cfg(test)]
     fn supports_server_tool_name(&self, tool: &str) -> bool {
-        if !self.server_builtin_tools_enabled {
-            return false;
-        }
         let supported_names = resolved_server_tool_names(
             &self.capabilities,
             self.execution_binding.workspace(),
@@ -686,14 +775,15 @@ impl ServerToolExecutor {
     }
 
     fn capability_filtered_server_tool_schemas(&self) -> Vec<Value> {
-        if !self.server_builtin_tools_enabled {
+        if !self.server_service_tools_enabled && !self.control_plane_tools_enabled {
             return Vec::new();
         }
-        let mut schemas = capability_filtered_server_tool_schemas(
+        let mut schemas = capability_filtered_server_tool_schemas_with_context(
             &self.capabilities,
             self.execution_binding.workspace(),
             self.execution_binding.executor(),
             self.execution_binding.runtime(),
+            self.tool_admission_context(),
         );
         schemas.retain(|schema| {
             tool_schema_name(schema).is_some_and(|name| self.tool_runtime_ready(name))
@@ -706,117 +796,247 @@ impl ServerToolExecutor {
     }
 
     pub(crate) fn runtime_bound_tool_names(&self, names: HashSet<String>) -> HashSet<String> {
+        let allowed = self.provider_visible_runtime_tool_names();
         astra_turn_core::tool::deferred_activation::runtime_bound_tool_names(names, |name| {
-            self.tool_runtime_ready(name)
+            allowed.contains(name)
         })
     }
 
-    pub(crate) fn tool_runtime_ready(&self, name: &str) -> bool {
-        matches!(self.tool_admission(name), ToolAdmission::Ready)
+    fn provider_visible_runtime_tool_names(&self) -> HashSet<String> {
+        let mut names: HashSet<String> = self
+            .capability_filtered_server_tool_schemas()
+            .iter()
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+            .collect();
+        names.extend(
+            self.ready_request_scoped_mcp_schemas()
+                .iter()
+                .filter_map(|schema| tool_schema_name(schema).map(str::to_string)),
+        );
+        names
     }
 
-    fn tool_admission(&self, name: &str) -> ToolAdmission {
-        if name.starts_with("mcp__") {
-            return if self.mcp_tool_has_runtime_binding(name) {
-                ToolAdmission::Ready
-            } else {
-                ToolAdmission::MissingRuntimeBinding
-            };
+    pub(crate) fn tool_runtime_ready(&self, name: &str) -> bool {
+        matches!(
+            self.executor_tool_readiness(name),
+            ExecutorToolReadiness::Ready
+        )
+    }
+
+    fn executor_tool_readiness(&self, name: &str) -> ExecutorToolReadiness {
+        self.executor_tool_readiness_for_call(name, &Value::Null)
+    }
+
+    fn tool_admission_context(&self) -> ToolAdmissionContext {
+        let mut context = self
+            .tool_execution_service
+            .tool_admission_context_snapshot();
+        context.server_service_provider_ready = self.server_service_tools_enabled;
+        context.control_plane_provider_ready = self.control_plane_tools_enabled;
+        context.request_scoped_mcp_provider_ready = !self
+            .request_scoped_mcp_schemas_snapshot("request_scoped_mcp_admission")
+            .is_empty();
+        context
+    }
+
+    fn executor_tool_readiness_for_call(&self, name: &str, args: &Value) -> ExecutorToolReadiness {
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
+            if let Some(reason) = self.request_scoped_mcp_admission_policy_denial(name) {
+                return ExecutorToolReadiness::RuntimeEnvironmentDenied(reason);
+            }
+            return self.mcp_executor_tool_readiness(name);
         }
 
-        if !self.runtime_environment_allows_tool(name) {
-            return ToolAdmission::MissingRuntimeBinding;
+        let runtime_registry = astra_runtime_env::ToolRegistry::builtins();
+        let runtime_registry_knows_tool = runtime_registry.get(name).is_some();
+        if let Some(reason) = self.runtime_environment_tool_denial(name, args) {
+            return ExecutorToolReadiness::RuntimeEnvironmentDenied(reason);
         }
 
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
-            return if self.tool_engine.contains(name) || self.plugin_schema_has_name(name) {
-                ToolAdmission::Ready
+            return if runtime_registry_knows_tool {
+                ExecutorToolReadiness::Ready
             } else {
-                ToolAdmission::MissingRuntimeBinding
+                ExecutorToolReadiness::UnknownTool
             };
         };
+
+        if !runtime_registry_knows_tool {
+            return ExecutorToolReadiness::UnknownTool;
+        }
 
         for capability in meta.requires {
             if !self.capabilities.has(*capability) {
                 return if self.capability_is_service_dependency(*capability) {
-                    ToolAdmission::MissingService(*capability)
+                    ExecutorToolReadiness::MissingService(*capability)
                 } else {
-                    ToolAdmission::MissingCapability(*capability)
+                    ExecutorToolReadiness::MissingCapability(*capability)
                 };
             }
             if !self.capability_has_runtime_binding(*capability) {
-                return ToolAdmission::MissingRuntimeBinding;
+                return ExecutorToolReadiness::MissingRuntimeBinding;
             }
             if !self.capability_service_dependency_ready(*capability) {
-                return ToolAdmission::MissingService(*capability);
+                return ExecutorToolReadiness::MissingService(*capability);
             }
         }
 
-        ToolAdmission::Ready
+        ExecutorToolReadiness::Ready
     }
 
-    fn runtime_environment_allows_tool(&self, name: &str) -> bool {
+    fn runtime_environment_tool_denial(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<astra_runtime_env::ToolUnavailableReason> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
-        if registry.get(name).is_none() {
-            return true;
+        registry.get(name)?;
+        let admission_context = self.tool_admission_context();
+        let providers = crate::server::tool_admission::active_provider_declarations_for_binding(
+            &[],
+            self.execution_binding.workspace(),
+            self.execution_binding.executor(),
+            self.execution_binding.runtime(),
+            &registry,
+            &admission_context,
+        );
+        let admission =
+            crate::server::tool_admission::resolve_tool_admission_for_providers_with_context(
+                name,
+                self.execution_binding.workspace(),
+                self.execution_binding.executor(),
+                &providers,
+                &registry,
+                &admission_context,
+            );
+        if let Some(reason) = admission_hidden_reason_to_unavailable(admission.hidden_reason) {
+            return Some(reason);
         }
-        let binding = crate::server::tool_binding_projection::runtime_environment_binding_for_parts(
+        if matches!(
+            admission.selected_route(),
+            crate::server::tool_route_selection::ToolExecutionRouteKind::ServerRuntime
+        ) && registry.get(name).is_some_and(|spec| {
+            matches!(
+                spec.required.executor,
+                astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
+            )
+        }) {
+            return None;
+        }
+        let binding = crate::server::tool_binding_projection::runtime_environment_binding_for_parts_with_provider_declarations(
             name,
             self.execution_binding.workspace(),
             self.execution_binding.executor(),
             self.execution_binding.runtime().cloned(),
             &ToolPolicySnapshot::default(),
             &registry,
+            &providers,
         );
         astra_runtime_env::CapabilityResolver
-            .check_tool_call(&registry, name, &json!({}), &binding.capabilities)
-            .is_ok()
+            .check_tool_call_for_surface(
+                &registry,
+                name,
+                args,
+                &binding.capabilities,
+                &binding.tool_surface,
+            )
+            .err()
     }
 
     fn tool_has_runtime_binding(&self, name: &str) -> bool {
-        if name.starts_with("mcp__") {
-            return self.mcp_tool_has_runtime_binding(name);
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
+            return matches!(
+                self.mcp_executor_tool_readiness(name),
+                ExecutorToolReadiness::Ready | ExecutorToolReadiness::RuntimeBindingBusy(_)
+            );
         }
-        if !self.runtime_environment_allows_tool(name) {
+        if self
+            .runtime_environment_tool_denial(name, &Value::Null)
+            .is_some()
+        {
             return false;
         }
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
-            return self.tool_engine.contains(name) || self.plugin_schema_has_name(name);
+            return astra_runtime_env::ToolRegistry::builtins()
+                .get(name)
+                .is_some();
         };
         meta.requires
             .iter()
             .all(|capability| self.capability_has_runtime_binding(*capability))
     }
 
-    fn plugin_schema_has_name(&self, name: &str) -> bool {
-        self.external_schemas_snapshot("external_schemas_runtime_binding")
-            .iter()
-            .any(|schema| tool_schema_name(schema).is_some_and(|schema_name| schema_name == name))
+    fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
+        matches!(
+            self.mcp_executor_tool_readiness(name),
+            ExecutorToolReadiness::Ready | ExecutorToolReadiness::RuntimeBindingBusy(_)
+        )
     }
 
-    fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
+    fn request_scoped_mcp_admission_policy_denial(
+        &self,
+        name: &str,
+    ) -> Option<astra_runtime_env::ToolUnavailableReason> {
+        let schemas =
+            self.request_scoped_mcp_schemas_snapshot("request_scoped_mcp_policy_admission");
+        if schemas.is_empty() {
+            return None;
+        }
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let executor = ExecutorBinding::request_scoped_mcp();
+        let mut context = self.tool_admission_context();
+        context.request_scoped_mcp_provider_ready = true;
+        let decision =
+            crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
+                name,
+                &schemas,
+                &WorkspaceBinding::none(),
+                &executor,
+                None,
+                &registry,
+                context,
+            );
+        match decision.hidden_reason {
+            Some(
+                ToolHiddenReason::DisabledOffer
+                | ToolHiddenReason::ProviderToolNotAllowed
+                | ToolHiddenReason::SchemaConflict,
+            ) => admission_hidden_reason_to_unavailable(decision.hidden_reason),
+            _ => None,
+        }
+    }
+
+    fn mcp_executor_tool_readiness(&self, name: &str) -> ExecutorToolReadiness {
         if self
             .agent_binding_mcp
             .as_ref()
             .is_some_and(|runtime| runtime.owns_public_tool_name(name))
         {
-            return true;
+            return ExecutorToolReadiness::Ready;
         }
         let Some(manager) = &self.mcp_manager else {
-            return false;
+            return ExecutorToolReadiness::MissingRuntimeBinding;
         };
-        manager
-            .try_read()
-            .is_ok_and(|manager| manager.find_tool_by_mcp_name(name).is_some())
+        match manager.try_read() {
+            Ok(manager) if manager.find_tool_by_mcp_name(name).is_some() => {
+                ExecutorToolReadiness::Ready
+            }
+            Ok(_) => ExecutorToolReadiness::UnknownTool,
+            Err(_) => ExecutorToolReadiness::RuntimeBindingBusy("mcp_registry"),
+        }
     }
 
     fn capability_has_runtime_binding(&self, capability: Capability) -> bool {
-        if !capability.is_executor_gated() {
-            return true;
-        }
         match capability {
             Capability::AgentSpawner => self.agent_tool_context.is_some(),
-            _ => true,
+            Capability::MemoryService
+            | Capability::Database
+            | Capability::SkillsCatalog
+            | Capability::GitHubAuth
+            | Capability::LSPServer
+            | Capability::PlanLifecycle
+            | Capability::LocalBackgroundTasks
+            | Capability::ReflectService => !capability.is_executor_gated(),
         }
     }
 
@@ -827,7 +1047,14 @@ impl ServerToolExecutor {
     fn capability_service_dependency_ready(&self, capability: Capability) -> bool {
         match capability {
             Capability::ReflectService => self.reflect_service.is_configured(),
-            _ => true,
+            Capability::AgentSpawner
+            | Capability::MemoryService
+            | Capability::Database
+            | Capability::SkillsCatalog
+            | Capability::GitHubAuth
+            | Capability::LSPServer
+            | Capability::PlanLifecycle
+            | Capability::LocalBackgroundTasks => true,
         }
     }
 
@@ -855,6 +1082,59 @@ impl ServerToolExecutor {
                 "status": "failed",
                 "error": error,
                 "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                "retryable": false,
+            })
+            .to_string(),
+        )
+    }
+
+    fn runtime_environment_denial_error_result(
+        &self,
+        name: &str,
+        reason: &astra_runtime_env::ToolUnavailableReason,
+    ) -> astra_tools::ToolResult {
+        tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error": format!(
+                    "Tool `{name}` is not available for this run binding: {reason}. Select a workspace, executor, runtime, or policy that provides the required capability."
+                ),
+                "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                "runtime_env_reason": reason,
+                "retryable": false,
+            })
+            .to_string(),
+        )
+    }
+
+    fn runtime_binding_busy_error_result(
+        &self,
+        name: &str,
+        provider: &'static str,
+    ) -> astra_tools::ToolResult {
+        tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error": format!(
+                    "Tool `{name}` is temporarily unavailable because runtime binding provider `{provider}` is refreshing or reconnecting. Retry the same tool call after the provider is ready."
+                ),
+                "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                "runtime_binding_state": "busy",
+                "runtime_binding_provider": provider,
+                "retryable": true,
+            })
+            .to_string(),
+        )
+    }
+
+    fn unknown_tool_error_result(&self, name: &str) -> astra_tools::ToolResult {
+        tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error": format!(
+                    "Unknown tool `{name}`. Use only tools advertised in the current turn surface; do not retry this exact name unless it appears in the tool schema."
+                ),
+                "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
                 "retryable": false,
             })
             .to_string(),
@@ -901,25 +1181,32 @@ impl ServerToolExecutor {
         )
     }
 
-    fn tool_binding_preflight_result(
+    fn executor_readiness_preflight_result(
         &self,
         name: &str,
         args: &Value,
     ) -> Option<astra_tools::ToolResult> {
-        match self.tool_admission(name) {
-            ToolAdmission::Ready => None,
-            ToolAdmission::MissingRuntimeBinding
+        match self.executor_tool_readiness_for_call(name, args) {
+            ExecutorToolReadiness::Ready => None,
+            ExecutorToolReadiness::UnknownTool => Some(self.unknown_tool_error_result(name)),
+            ExecutorToolReadiness::MissingRuntimeBinding
                 if self.tool_can_validate_without_runtime_binding(name, args) =>
             {
                 None
             }
-            ToolAdmission::MissingRuntimeBinding => {
+            ExecutorToolReadiness::MissingRuntimeBinding => {
                 Some(self.runtime_binding_error_result(name, args))
             }
-            ToolAdmission::MissingCapability(capability) => {
+            ExecutorToolReadiness::RuntimeBindingBusy(provider) => {
+                Some(self.runtime_binding_busy_error_result(name, provider))
+            }
+            ExecutorToolReadiness::RuntimeEnvironmentDenied(reason) => {
+                Some(self.runtime_environment_denial_error_result(name, &reason))
+            }
+            ExecutorToolReadiness::MissingCapability(capability) => {
                 Some(self.capability_unavailable_error_result(name, capability))
             }
-            ToolAdmission::MissingService(capability) => {
+            ExecutorToolReadiness::MissingService(capability) => {
                 Some(self.service_dependency_error_result(name, capability))
             }
         }
@@ -937,6 +1224,12 @@ impl ServerToolExecutor {
     /// hint untouched — useful for test executors without a host.
     pub fn set_plan_resume_hint_handle(&mut self, handle: Arc<std::sync::RwLock<Option<String>>>) {
         self.plan_resume_hint_handle = Some(handle);
+    }
+
+    /// Inject the host's plan authoring gate handle so enter/exit_plan_mode
+    /// can update the same boolean used by the headless permission gate.
+    pub fn set_plan_authoring_active_handle(&mut self, handle: Arc<std::sync::RwLock<bool>>) {
+        self.plan_authoring_active_handle = Some(handle);
     }
 
     /// Set the approval gate for interactive tool execution.
@@ -1029,14 +1322,49 @@ impl ServerToolExecutor {
     }
 
     pub(super) fn binding_event_fields(&self) -> Map<String, Value> {
-        binding_event_fields(
+        let mut fields = binding_event_fields(
             self.execution_binding.workspace(),
             self.execution_binding.executor(),
-        )
+        );
+        fields.insert(
+            "capacity_provider_coverage".to_string(),
+            serde_json::to_value(self.capacity_provider_coverage()).unwrap_or(Value::Null),
+        );
+        fields
     }
 
     pub fn binding_metadata(&self) -> Value {
         Value::Object(self.binding_event_fields())
+    }
+
+    pub fn capacity_provider_coverage(
+        &self,
+    ) -> Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry> {
+        let mut coverage = crate::server::tool_transport_metadata::capacity_provider_coverage(
+            self.execution_binding.workspace(),
+            self.execution_binding.executor(),
+        );
+        coverage.push(self.request_scoped_mcp_provider_coverage());
+        coverage
+    }
+
+    fn request_scoped_mcp_provider_coverage(
+        &self,
+    ) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        let schemas = self.request_scoped_mcp_schemas_snapshot("request_scoped_mcp_coverage");
+        let mut ready_names = schemas
+            .iter()
+            .filter_map(tool_schema_name)
+            .filter(|name| self.mcp_tool_has_runtime_binding(name))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        ready_names.sort();
+        ready_names.dedup();
+        astra_runtime_env::request_scoped_mcp_coverage(
+            "request-scoped-mcp",
+            !schemas.is_empty(),
+            ready_names,
+        )
     }
 
     fn try_emit_work_surface_event(&self, event: Map<String, Value>, unavailable_label: &str) {
@@ -1066,9 +1394,76 @@ impl ServerToolExecutor {
         );
     }
 
-    fn tool_execution_request(&self, name: &str, args: &Value) -> ToolExecutionRequest {
-        self.execution_binding
-            .tool_execution_request(&self.user_id, &self.session_id, name, args)
+    pub(crate) fn tool_execution_request(&self, name: &str, args: &Value) -> ToolExecutionRequest {
+        let mut request = self.execution_binding.tool_execution_request(
+            &self.user_id,
+            &self.session_id,
+            name,
+            args,
+        );
+        if let Some(offer) = self.selected_offer_for_request(&request) {
+            request = Self::request_with_selected_offer_route(request, offer.route);
+            request = request.with_selected_offer(offer);
+        }
+        request
+    }
+
+    fn selected_offer_for_request(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Option<SelectedToolOfferSnapshot> {
+        // Primary path: use the pre-computed offer from surface assembly.
+        // This avoids TOCTOU between admission time and execution time.
+        if let Some(offer) = self.current_selected_tool_offer(&request.tool_name) {
+            return Some(offer);
+        }
+        // Fallback for request-scoped MCP tools: these are dynamically discovered
+        // and may not have been available during surface assembly.
+        if astra_runtime_env::is_mcp_namespaced_tool_name(&request.tool_name) {
+            let schemas =
+                self.request_scoped_mcp_schemas_snapshot("selected_offer_request_scoped_mcp");
+            if schemas
+                .iter()
+                .any(|schema| tool_schema_name(schema) == Some(request.tool_name.as_str()))
+            {
+                let mut context = self.tool_admission_context();
+                context.request_scoped_mcp_provider_ready = true;
+                let decision =
+                    crate::server::tool_admission::resolve_tool_admission_for_binding_with_context(
+                        &request.tool_name,
+                        &schemas,
+                        &request.workspace,
+                        &request.executor,
+                        request.runtime.as_ref(),
+                        &astra_runtime_env::ToolRegistry::builtins(),
+                        context,
+                    );
+                return decision.selected_offer.map(|offer| {
+                    SelectedToolOfferSnapshot::new_with_route(
+                        offer.tool_name,
+                        offer.provider_id,
+                        offer.route,
+                    )
+                });
+            }
+        }
+        None
+    }
+
+    fn request_with_selected_offer_route(
+        mut request: ToolExecutionRequest,
+        route: crate::server::tool_route_selection::ToolExecutionRouteKind,
+    ) -> ToolExecutionRequest {
+        if matches!(
+            route,
+            crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp
+        ) {
+            request.workspace = WorkspaceBinding::none();
+            request.workspace_record = None;
+            request.executor = ExecutorBinding::request_scoped_mcp();
+            request.runtime = None;
+        }
+        request
     }
 
     /// Swap the in-memory task store for a shared one (MatrixOne in
@@ -1145,12 +1540,13 @@ impl ServerToolExecutor {
     /// Routing order:
     /// 1. Route from the explicit workspace/executor binding.
     /// 2. Server-sandbox runs execute server-local tools.
-    /// 3. Edge-bound runs execute on edge only; server fallback is disabled.
+    /// 3. Edge-bound runs execute on edge only; no alternate execution
+    ///    provider is silently attempted.
     pub async fn execute(&self, name: &str, args: &Value) -> String {
         self.execute_with_metadata(name, args).await.output
     }
 
-    /// Execute a tool call and preserve structured metadata for server-side fallback paths.
+    /// Execute a tool call and preserve structured metadata for route-bound execution paths.
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         let request = self.tool_execution_request(name, args);
 
@@ -1234,7 +1630,7 @@ impl ServerToolExecutor {
     }
 
     async fn run_local_tool_preflight(&self, name: &str, args: &Value) -> LocalToolPreflight {
-        if let Some(result) = self.tool_binding_preflight_result(name, args) {
+        if let Some(result) = self.executor_readiness_preflight_result(name, args) {
             return LocalToolPreflight::ShortCircuit(result);
         }
 
@@ -1318,18 +1714,57 @@ impl ServerToolExecutor {
     }
 }
 
-fn extend_tool_schema_pool_unique(pool: &mut Vec<Value>, additions: Vec<Value>) {
-    let mut seen = pool
-        .iter()
-        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
-        .collect::<HashSet<_>>();
-    for schema in additions {
+fn dedupe_tool_schema_pool(pool: &mut Vec<Value>) {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(pool.len());
+    for schema in std::mem::take(pool) {
         let Some(name) = tool_schema_name(&schema) else {
             continue;
         };
         if seen.insert(name.to_string()) {
-            pool.push(schema);
+            deduped.push(schema);
         }
+    }
+    *pool = deduped;
+}
+
+fn remove_prompt_schema_conflicts(pool: &mut Vec<Value>) {
+    let conflicts = prompt_schema_conflicting_tool_names(pool);
+    if conflicts.is_empty() {
+        return;
+    }
+    pool.retain(|schema| tool_schema_name(schema).is_none_or(|name| !conflicts.contains(name)));
+}
+
+fn admission_hidden_reason_to_unavailable(
+    reason: Option<ToolHiddenReason>,
+) -> Option<astra_runtime_env::ToolUnavailableReason> {
+    use astra_runtime_env::ToolUnavailableReason;
+    match reason? {
+        ToolHiddenReason::UnknownTool => Some(ToolUnavailableReason::UnknownTool),
+        ToolHiddenReason::NoProvider => Some(ToolUnavailableReason::ExecutorUnavailable(
+            "no capacity provider declares this tool for the current binding".to_string(),
+        )),
+        ToolHiddenReason::ProviderUnavailable => Some(ToolUnavailableReason::ExecutorUnavailable(
+            "the selected capacity provider is not ready for this binding".to_string(),
+        )),
+        ToolHiddenReason::SchemaConflict => Some(ToolUnavailableReason::PolicyDenied(
+            "conflicting tool schemas for this name".to_string(),
+        )),
+        ToolHiddenReason::ProviderRouteMismatch => {
+            Some(ToolUnavailableReason::ExecutorUnavailable(
+                "no capacity provider matches the selected execution route".to_string(),
+            ))
+        }
+        ToolHiddenReason::UnsupportedRoute => Some(ToolUnavailableReason::ExecutorUnavailable(
+            "tool has no supported execution route for the current binding".to_string(),
+        )),
+        ToolHiddenReason::DisabledOffer => Some(ToolUnavailableReason::PolicyDenied(
+            "tool offer disabled by policy".to_string(),
+        )),
+        ToolHiddenReason::ProviderToolNotAllowed => Some(ToolUnavailableReason::PolicyDenied(
+            "tool not allowed for selected provider".to_string(),
+        )),
     }
 }
 
@@ -1352,30 +1787,27 @@ fn server_local_tool_arguments(request: &ToolExecutionRequest) -> Value {
 
 // ─── ToolExecutor trait implementation ────────────────────────────────────────
 //
-// This allows ServerToolExecutor to be used polymorphically wherever
+// This allows RuntimeToolExecutor to be used polymorphically wherever
 // `dyn ToolExecutor` (or `impl ToolExecutor`) is required, e.g. in
 // shared pipeline code that doesn't know whether it runs on the server
 // or on an edge/CLI client.
 
 #[async_trait]
-impl ServerLocalToolTransport for ServerToolExecutor {
+impl ServerLocalToolTransport for RuntimeToolExecutor {
     async fn execute_server_local_tool(
         &self,
         request: &ToolExecutionRequest,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
-        if request.tool_name.starts_with("mcp__") {
+        if astra_runtime_env::is_mcp_namespaced_tool_name(&request.tool_name) {
+            if let Some(result) =
+                self.executor_readiness_preflight_result(&request.tool_name, &request.args)
+            {
+                return result;
+            }
             return self
                 .execute_mcp_tool(&request.tool_name, &request.args)
                 .await;
-        }
-        if self.enforce_server_tool_capabilities
-            && !self.supports_server_tool_name(&request.tool_name)
-        {
-            return astra_tools::ToolResult::error(format!(
-                "Error: Tool '{}' is not available in this runtime capability surface.",
-                request.tool_name
-            ));
         }
         spawn_resource_tool_call_recording(&self.user_id, self.resource_governor.as_ref());
         let args = server_local_tool_arguments(request);
@@ -1385,10 +1817,10 @@ impl ServerLocalToolTransport for ServerToolExecutor {
 }
 
 #[async_trait]
-impl ToolExecutor for ServerToolExecutor {
+impl ToolExecutor for RuntimeToolExecutor {
     async fn execute(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         // Delegate to the concrete method that already returns ToolResult.
-        ServerToolExecutor::execute_with_metadata(self, name, args).await
+        RuntimeToolExecutor::execute_with_metadata(self, name, args).await
     }
 
     fn tool_schemas(&self) -> Vec<Value> {
@@ -1401,7 +1833,7 @@ impl ToolExecutor for ServerToolExecutor {
 
     async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         // Explicitly delegate to the inherent method (not the default trait impl).
-        ServerToolExecutor::execute_with_metadata(self, name, args).await
+        RuntimeToolExecutor::execute_with_metadata(self, name, args).await
     }
 }
 
@@ -1486,7 +1918,7 @@ mod tests {
     #[test]
     fn new_executor_defaults_to_control_plane_without_workspace_runtime() {
         let dir = TempDir::new().unwrap();
-        let exec = ServerToolExecutor::new(
+        let exec = RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             "test-session".into(),
@@ -1528,10 +1960,9 @@ mod tests {
         exec.set_execution_bindings(
             WorkspaceBinding {
                 kind: WorkspaceBindingKind::None,
-                display_name: "No workspace".to_string(),
+                display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding::server_local(),
         );
@@ -1557,6 +1988,143 @@ mod tests {
     }
 
     #[test]
+    fn edge_executor_denies_control_plane_tools_when_catalog_is_unbound() {
+        let (mut exec, dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "Edge workspace",
+                dir.path().display().to_string(),
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "Edge workspace",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+        exec.server_service_tools_enabled = false;
+        exec.control_plane_tools_enabled = false;
+
+        let names = schema_name_set(exec.tool_schemas());
+
+        assert!(exec.tool_runtime_ready("read_file"));
+        assert!(exec.tool_runtime_ready("bash"));
+        for hidden in [
+            "task_board",
+            "introspect",
+            "reflect",
+            "agent_fanout",
+            "memory",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must not be prompt-visible without a bound control-plane/server provider: {names:?}"
+            );
+            assert!(
+                !exec.tool_runtime_ready(hidden),
+                "{hidden} must not be runtime-ready without a bound control-plane/server provider"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_surface_state_drops_project_tools_without_workspace_runtime() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::None,
+                display_name: "No file environment".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::None,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        exec.set_current_searchable_tool_schemas(&astra_tools::schemas::all_tool_schemas());
+        exec.set_current_activatable_tool_names(HashSet::from([
+            "bash".to_string(),
+            "memory".to_string(),
+        ]));
+
+        let searchable = exec
+            .current_searchable_tool_names()
+            .expect("searchable names should be installed");
+        assert!(searchable.contains("tool_search"));
+        assert!(searchable.contains("memory"));
+        assert!(!searchable.contains("bash"));
+        assert!(!searchable.contains("read_file"));
+
+        let activatable = exec.current_activatable_tool_names_snapshot();
+        assert!(activatable.contains("memory"));
+        assert!(!activatable.contains("bash"));
+    }
+
+    #[tokio::test]
+    async fn direct_project_tool_call_without_workspace_is_rejected_by_runtime_env_admission() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::None,
+                display_name: "No file environment".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::None,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        let result = exec
+            .execute_with_metadata("read_file", &json!({"path": "README.md"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("runtime_executor_required")
+                || result.output.contains("runtime executor"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn action_sensitive_runtime_env_admission_blocks_read_only_write_actions() {
+        let (mut exec, dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::ServerSandbox,
+                display_name: "Read-only server sandbox".to_string(),
+                cwd: Some(dir.path().display().to_string()),
+                authority: WorkspaceAuthority::ReadOnly,
+            },
+            ExecutorBinding::server_local(),
+        );
+
+        assert!(
+            exec.tool_runtime_ready("git"),
+            "read-only git inspection should remain visible with a read-only workspace provider"
+        );
+        assert!(
+            exec.executor_readiness_preflight_result("git", &json!({"action": "status"}))
+                .is_none(),
+            "read-only git actions should pass runtime-env admission"
+        );
+
+        let blocked = exec
+            .executor_readiness_preflight_result(
+                "git",
+                &json!({"action": "commit", "message": "no"}),
+            )
+            .expect("git commit must be blocked before execution on read-only workspace");
+        assert!(blocked.is_error, "{blocked:?}");
+        let value: Value = serde_json::from_str(&blocked.output).unwrap();
+        assert_eq!(value["status"], "failed");
+        assert_eq!(
+            value["runtime_env_reason"],
+            json!({"PolicyDenied": "filesystem_write"})
+        );
+    }
+
+    #[test]
     fn supported_server_tool_names_follow_current_runtime_binding() {
         let (mut exec, _dir) = test_executor();
         assert!(
@@ -1567,10 +2135,9 @@ mod tests {
         exec.set_execution_bindings(
             WorkspaceBinding {
                 kind: WorkspaceBindingKind::None,
-                display_name: "No workspace".to_string(),
+                display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding::server_local(),
         );
@@ -1582,6 +2149,214 @@ mod tests {
         assert!(
             !exec.supports_server_tool_name("bash"),
             "project tools must not remain supported after binding changes to no-runtime"
+        );
+    }
+
+    fn provider_coverage_status<'a>(
+        coverage: &'a [astra_turn_core::introspect::CapacityProviderCoverageEntry],
+        provider_type: &str,
+    ) -> &'a astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        coverage
+            .iter()
+            .find(|provider| provider.provider_type == provider_type)
+            .unwrap_or_else(|| panic!("missing provider coverage: {provider_type}"))
+    }
+
+    #[test]
+    fn capacity_provider_coverage_reports_request_scoped_mcp_unbound_by_default() {
+        let (exec, _dir) = test_executor();
+        let coverage = exec.capacity_provider_coverage();
+        let mcp = provider_coverage_status(&coverage, "request_scoped_mcp");
+
+        assert_eq!(mcp.status, "unbound");
+        assert_eq!(
+            mcp.unavailable_reason.as_deref(),
+            Some("no_request_scoped_mcp_provider_bound")
+        );
+        assert!(mcp.capabilities.is_empty());
+    }
+
+    #[test]
+    fn capacity_provider_coverage_reports_request_scoped_mcp_schema_without_binding() {
+        let (exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })]);
+
+        let coverage = exec.capacity_provider_coverage();
+        let mcp = provider_coverage_status(&coverage, "request_scoped_mcp");
+
+        assert_eq!(mcp.status, "unbound");
+        assert_eq!(
+            mcp.unavailable_reason.as_deref(),
+            Some("no_request_scoped_mcp_runtime_binding")
+        );
+        assert!(mcp.capabilities.is_empty());
+    }
+
+    #[test]
+    fn capacity_provider_coverage_reports_request_scoped_mcp_ready_when_bound() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+
+        let coverage = exec.capacity_provider_coverage();
+        let mcp = provider_coverage_status(&coverage, "request_scoped_mcp");
+
+        assert_eq!(mcp.status, "ready");
+        assert!(mcp.unavailable_reason.is_none());
+        assert_eq!(mcp.capabilities, vec!["mcp__calculator".to_string()]);
+
+        let metadata = exec.binding_metadata();
+        let metadata_coverage = metadata["capacity_provider_coverage"]
+            .as_array()
+            .expect("binding metadata should include provider coverage");
+        let mcp_metadata = metadata_coverage
+            .iter()
+            .find(|provider| provider["provider_type"].as_str() == Some("request_scoped_mcp"))
+            .expect("binding metadata should include request-scoped MCP provider coverage");
+        assert_eq!(mcp_metadata["status"].as_str(), Some("ready"));
+        assert_eq!(
+            mcp_metadata["capabilities"][0].as_str(),
+            Some("mcp__calculator")
+        );
+    }
+
+    #[test]
+    fn capacity_provider_coverage_sorts_request_scoped_mcp_capabilities() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__zeta__query",
+                    "description": "Zeta query.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__alpha__query",
+                    "description": "Alpha query.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+        ]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "docs",
+                &["mcp__alpha__query", "mcp__zeta__query"],
+            ),
+        ));
+
+        let coverage = exec.capacity_provider_coverage();
+        let mcp = provider_coverage_status(&coverage, "request_scoped_mcp");
+
+        assert_eq!(
+            mcp.capabilities,
+            vec![
+                "mcp__alpha__query".to_string(),
+                "mcp__zeta__query".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn ready_request_scoped_mcp_schemas_are_sorted_for_cache_stability() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__zeta__query",
+                    "description": "Zeta query.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__alpha__query",
+                    "description": "Alpha query.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+        ]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "docs",
+                &["mcp__alpha__query", "mcp__zeta__query"],
+            ),
+        ));
+
+        let schemas = exec.ready_request_scoped_mcp_schemas();
+        let names: Vec<_> = schemas.iter().filter_map(tool_schema_name).collect();
+
+        assert_eq!(names, vec!["mcp__alpha__query", "mcp__zeta__query"]);
+    }
+
+    #[test]
+    fn tool_search_pool_is_byte_stable_for_permuted_request_scoped_mcp_schemas() {
+        let alpha = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__alpha__query",
+                "description": "Alpha query.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        let zeta = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__zeta__query",
+                "description": "Zeta query.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+
+        let (mut first, _first_dir) = test_executor();
+        first.set_request_scoped_mcp_schemas(vec![zeta.clone(), alpha.clone()]);
+        first.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "docs",
+                &["mcp__alpha__query", "mcp__zeta__query"],
+            ),
+        ));
+
+        let (mut second, _second_dir) = test_executor();
+        second.set_request_scoped_mcp_schemas(vec![alpha, zeta]);
+        second.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "docs",
+                &["mcp__alpha__query", "mcp__zeta__query"],
+            ),
+        ));
+
+        let first_pool = first.current_tool_search_pool_schemas();
+        let second_pool = second.current_tool_search_pool_schemas();
+
+        assert_eq!(
+            serde_json::to_vec(&first_pool).expect("serialize first tool_search pool"),
+            serde_json::to_vec(&second_pool).expect("serialize second tool_search pool"),
+            "tool_search must not depend on request-scoped MCP list_tools order"
         );
     }
 
@@ -1633,6 +2408,59 @@ mod tests {
             .await;
         assert!(!result.is_error, "{result:?}");
         assert!(result.output.contains("reflect ready"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn server_only_reflect_report_includes_runtime_provider_coverage() {
+        let dir = TempDir::new().unwrap();
+        let exec = RuntimeToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        )
+        .with_reflect_service(Arc::new(ReadyReflectService));
+
+        let names = schema_name_set(exec.tool_schemas());
+        assert!(names.contains("reflect"));
+        assert!(
+            !names.contains("bash"),
+            "server-only reflect must not imply workspace/process executor tools: {names:?}"
+        );
+
+        let result = exec
+            .execute_with_metadata("reflect", &json!({"topic": "execution"}))
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        let report: Value =
+            serde_json::from_str(&result.output).expect("reflect should return JSON report");
+        let providers = report["data_coverage"]["providers"]
+            .as_object()
+            .expect("reflect report should include data coverage providers");
+
+        for (provider, status) in [
+            ("runtime_provider:server_service", "ready"),
+            ("runtime_provider:control_plane", "ready"),
+            ("runtime_provider:sandbox", "unbound"),
+            ("runtime_provider:request_scoped_mcp", "unbound"),
+        ] {
+            assert_eq!(
+                providers
+                    .get(provider)
+                    .and_then(|coverage| coverage["status"].as_str()),
+                Some(status),
+                "reflect report must expose {provider}={status}: {}",
+                result.output
+            );
+        }
+        assert_eq!(
+            providers["runtime_provider:sandbox"]["reason"].as_str(),
+            Some("no_workspace_provider_bound"),
+            "reflect should make the missing workspace executor explicit: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -1861,7 +2689,9 @@ mod tests {
 
         assert!(result.is_error, "{result:?}");
         assert!(
-            result.output.contains("Missing required parameter: action"),
+            result
+                .output
+                .contains("missing required parameter `action` for `github`"),
             "{result:?}"
         );
         assert!(
@@ -1905,10 +2735,9 @@ mod tests {
         exec.set_execution_bindings(
             WorkspaceBinding {
                 kind: WorkspaceBindingKind::None,
-                display_name: "No workspace".to_string(),
+                display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::None,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding::server_local(),
         );
@@ -1956,6 +2785,79 @@ mod tests {
                 .as_ref()
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
             "ToolEngine introspect results should still receive execution metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_only_introspect_json_preserves_provider_coverage_graph() {
+        let dir = TempDir::new().unwrap();
+        let exec = RuntimeToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        let provider_coverage = exec.capacity_provider_coverage();
+        exec.update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
+            capacity_provider_coverage: provider_coverage,
+            turns_completed: 1,
+            turns_remaining: 0,
+            turn_budget_unlimited: true,
+            ..Default::default()
+        });
+
+        let result = exec
+            .execute_with_metadata("introspect", &json!({"format": "json"}))
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        let report: Value =
+            serde_json::from_str(&result.output).expect("introspect should return JSON report");
+        let observations = report["observations"]
+            .as_array()
+            .expect("json report should include observations");
+
+        for expected in [
+            "server_service:ready",
+            "control_plane:ready",
+            "sandbox:unbound (workspace executor not bound)",
+            "request_scoped_mcp:unbound",
+        ] {
+            assert!(
+                observations.iter().any(|observation| {
+                    observation["kind"] == "capacity_provider"
+                        && observation["summary"]
+                            .as_str()
+                            .is_some_and(|summary| summary.contains(expected))
+                }),
+                "server-only introspect observations must expose provider coverage `{expected}`: {}",
+                result.output
+            );
+        }
+
+        let graph_nodes = report["graph_slice"]["nodes"]
+            .as_array()
+            .expect("json report should include graph nodes");
+        assert!(
+            graph_nodes.iter().any(|node| {
+                node["label"] == "capacity_provider"
+                    && node["summary"]
+                        .as_str()
+                        .is_some_and(|summary| summary.contains("server_service:ready"))
+            }),
+            "provider coverage must be reachable in the introspect evidence graph: {}",
+            result.output
+        );
+        assert!(
+            graph_nodes.iter().any(|node| {
+                node["label"] == "observed_evidence"
+                    && node["summary"]
+                        .as_str()
+                        .is_some_and(|summary| summary.contains("turns=1/∞"))
+            }),
+            "runtime snapshot evidence should stay linked in the graph: {}",
+            result.output
         );
     }
 
@@ -2147,7 +3049,7 @@ mod tests {
         let unclassified: Vec<_> = handler_names
             .iter()
             .filter(|n| {
-                !schema_names.contains(*n) && !n.starts_with("mcp__") // dynamic prefix handler
+                !schema_names.contains(*n) && !astra_runtime_env::is_mcp_namespaced_tool_name(n)
             })
             .cloned()
             .collect();
@@ -2246,7 +3148,7 @@ mod tests {
 
         let names = schema_name_set(exec.tool_schemas());
 
-        for visible in ["agent", "tool_search", "web_search", "memory"] {
+        for visible in ["agent", "tool_search", "memory"] {
             assert!(
                 names.contains(visible),
                 "{visible} should remain visible because it runs on the server"
@@ -2259,6 +3161,8 @@ mod tests {
             "git",
             "symbols",
             "run_script",
+            "web_fetch",
+            "web_search",
         ] {
             assert!(
                 !names.contains(hidden),
@@ -2340,7 +3244,7 @@ mod tests {
     #[test]
     fn session_history_actions_are_advertised_on_session_tool() {
         let names: std::collections::HashSet<String> =
-            crate::capabilities::server_runtime_tool_schemas(
+            crate::capabilities::server_builtin_tool_schemas(
                 &crate::capabilities::full_server_capabilities_for_tests(),
             )
             .into_iter()
@@ -2359,10 +3263,10 @@ mod tests {
         let (exec, _dir) = test_executor();
         assert!(
             exec.supports_server_tool_name("session"),
-            "session must be accepted by ServerToolExecutor"
+            "session must be accepted by RuntimeToolExecutor"
         );
 
-        let session_schema = crate::capabilities::server_runtime_tool_schemas(
+        let session_schema = crate::capabilities::server_builtin_tool_schemas(
             &crate::capabilities::full_server_capabilities_for_tests(),
         )
         .into_iter()
@@ -2457,9 +3361,9 @@ esac
         std::fs::set_permissions(&script, perms).unwrap();
     }
 
-    fn test_executor() -> (ServerToolExecutor, TempDir) {
+    fn test_executor() -> (RuntimeToolExecutor, TempDir) {
         let dir = TempDir::new().unwrap();
-        let mut exec = ServerToolExecutor::new(
+        let mut exec = RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             "test-session".into(),
@@ -2473,18 +3377,79 @@ esac
         (exec, dir)
     }
 
-    fn test_executor_with_agent_context() -> (ServerToolExecutor, TempDir) {
+    fn test_executor_with_agent_context() -> (RuntimeToolExecutor, TempDir) {
         let (mut exec, dir) = test_executor();
         exec.set_agent_tool_context(test_agent_tool_context(dir.path()));
         (exec, dir)
     }
 
-    fn test_executor_with_agent_context_and_reflect_service() -> (ServerToolExecutor, TempDir) {
+    fn test_executor_with_agent_context_and_reflect_service() -> (RuntimeToolExecutor, TempDir) {
         let (exec, dir) = test_executor_with_agent_context();
         (
             exec.with_reflect_service(Arc::new(ReadyReflectService)),
             dir,
         )
+    }
+
+    fn all_capabilities_for_admission_tests() -> [Capability; 9] {
+        [
+            Capability::AgentSpawner,
+            Capability::MemoryService,
+            Capability::Database,
+            Capability::SkillsCatalog,
+            Capability::GitHubAuth,
+            Capability::LSPServer,
+            Capability::PlanLifecycle,
+            Capability::LocalBackgroundTasks,
+            Capability::ReflectService,
+        ]
+    }
+
+    #[test]
+    fn executor_gated_capabilities_fail_closed_without_runtime_binding() {
+        let (exec, _dir) = test_executor();
+        for capability in all_capabilities_for_admission_tests() {
+            if capability.is_executor_gated() {
+                assert!(
+                    !exec.capability_has_runtime_binding(capability),
+                    "{capability:?} is executor-gated and must not pass without an explicit runtime binding"
+                );
+            } else {
+                assert!(
+                    exec.capability_has_runtime_binding(capability),
+                    "{capability:?} is not executor-gated and should not require a runtime binding"
+                );
+            }
+        }
+
+        let (exec, _dir) = test_executor_with_agent_context();
+        assert!(
+            exec.capability_has_runtime_binding(Capability::AgentSpawner),
+            "agent spawning becomes runtime-bound only after an explicit agent context is installed"
+        );
+    }
+
+    #[test]
+    fn service_dependency_readiness_is_exhaustive_and_service_specific() {
+        let (exec, _dir) = test_executor();
+        for capability in all_capabilities_for_admission_tests() {
+            match capability {
+                Capability::ReflectService => assert!(
+                    !exec.capability_service_dependency_ready(capability),
+                    "reflect must fail closed until the service is configured"
+                ),
+                _ => assert!(
+                    exec.capability_service_dependency_ready(capability),
+                    "{capability:?} is not a service dependency and should not be blocked here"
+                ),
+            }
+        }
+
+        let (exec, _dir) = test_executor_with_agent_context_and_reflect_service();
+        assert!(
+            exec.capability_service_dependency_ready(Capability::ReflectService),
+            "reflect becomes ready only when the reflect service provider is configured"
+        );
     }
 
     fn test_agent_tool_context(work_dir: &Path) -> AgentToolContext {
@@ -2530,7 +3495,7 @@ esac
             "title": "live second",
             "_tool_call_id": "call-live"
         });
-        let first_key = IdempotencyKey::semantic("task", &public_first_args);
+        let first_key = IdempotencyKey::semantic("task_board", &public_first_args);
         {
             let executor = exec
                 .exactly_once_executor
@@ -2555,7 +3520,7 @@ esac
             executor.cache_mut().record(
                 &first_key,
                 CachedToolResult {
-                    tool_name: "task".to_string(),
+                    tool_name: "task_board".to_string(),
                     output: "cached-first".to_string(),
                     is_error: false,
                     cached_at: 1,
@@ -2565,20 +3530,22 @@ esac
         }
 
         let first = exec
-            .execute_local_with_metadata("task", &replay_first_args, None)
+            .execute_local_with_metadata("task_board", &replay_first_args, None)
             .await;
         assert_eq!(first.output, "cached-first");
 
         let second = exec
-            .execute_local_with_metadata("task", &second_args, None)
+            .execute_local_with_metadata("task_board", &second_args, None)
             .await;
         assert!(
             second.output.contains("\"success\":true"),
             "second tool should execute normally: {second:?}"
         );
 
-        let second_key =
-            IdempotencyKey::semantic("task", &json!({"action": "create", "title": "live second"}));
+        let second_key = IdempotencyKey::semantic(
+            "task_board",
+            &json!({"action": "create", "title": "live second"}),
+        );
         let executor = exec
             .exactly_once_executor
             .as_ref()
@@ -2634,7 +3601,7 @@ esac
 
         let created = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "create", "title": "server archive"}),
             )
             .await;
@@ -2644,7 +3611,7 @@ esac
         );
         let started = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "update", "task_id": "task-1", "new_status": "in_progress"}),
             )
             .await;
@@ -2654,7 +3621,7 @@ esac
         );
         let completed = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "update", "task_id": "task-1", "new_status": "completed"}),
             )
             .await;
@@ -2664,7 +3631,10 @@ esac
         );
 
         let archived = exec
-            .execute("task", &json!({"action": "archive", "task_id": "task-1"}))
+            .execute(
+                "task_board",
+                &json!({"action": "archive", "task_id": "task-1"}),
+            )
             .await;
         assert!(
             !archived.contains("Unknown task action"),
@@ -2677,7 +3647,7 @@ esac
 
         let list = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "list", "status_filter": "archived"}),
             )
             .await;
@@ -2691,11 +3661,11 @@ esac
     async fn task_executes_from_tool_engine_registry() {
         let (exec, _dir) = test_executor();
         assert!(
-            exec.tool_engine.contains("task"),
+            exec.tool_engine.contains("task_board"),
             "consolidated task should be registered in ToolEngine for server-local execution"
         );
 
-        let result = exec.execute_with_metadata("task", &json!({})).await;
+        let result = exec.execute_with_metadata("task_board", &json!({})).await;
         assert!(result.is_error, "{result:?}");
         assert!(
             result.output.contains("missing required parameter")
@@ -2724,11 +3694,14 @@ esac
         );
 
         let unified = exec
-            .execute("task", &json!({"action": "create", "title": "new surface"}))
+            .execute(
+                "task_board",
+                &json!({"action": "create", "title": "new surface"}),
+            )
             .await;
         assert!(
             unified.contains("\"success\":true") && unified.contains("task-1"),
-            "unified task(action=create) should remain the executable surface: {unified}"
+            "unified task_board(action=create) should remain the executable surface: {unified}"
         );
     }
 
@@ -2736,7 +3709,7 @@ esac
     async fn consolidated_task_tool_rejects_bad_action_shape_on_server_executor() {
         let (exec, _dir) = test_executor();
 
-        let missing = exec.execute("task", &json!({})).await;
+        let missing = exec.execute("task_board", &json!({})).await;
         assert!(
             missing.starts_with("Error:")
                 && missing.contains("missing required parameter")
@@ -2745,7 +3718,7 @@ esac
             "server task tool must not default missing action to list: {missing}"
         );
 
-        let wrong_type = exec.execute("task", &json!({"action": true})).await;
+        let wrong_type = exec.execute("task_board", &json!({"action": true})).await;
         assert!(
             wrong_type.starts_with("Error:")
                 && wrong_type.contains("field 'action'")
@@ -2753,12 +3726,27 @@ esac
             "server task tool should reject non-string action: {wrong_type}"
         );
 
-        let unknown = exec.execute("task", &json!({"action": "complete"})).await;
+        let unknown = exec
+            .execute("task_board", &json!({"action": "complete"}))
+            .await;
         assert!(
             unknown.starts_with("Error:")
-                && unknown.contains("unknown `task` action")
+                && unknown.contains("unknown `task_board` action")
                 && unknown.contains("update"),
             "server task tool should mark unknown actions as tool errors: {unknown}"
+        );
+
+        let hidden_alias = exec
+            .execute(
+                "task_board",
+                &json!({"action": "cancel", "task_id": "task-1"}),
+            )
+            .await;
+        assert!(
+            hidden_alias.starts_with("Error:")
+                && hidden_alias.contains("unknown `task_board` action")
+                && hidden_alias.contains("cancel"),
+            "server must not accept schema-hidden task action aliases: {hidden_alias}"
         );
     }
 
@@ -2768,7 +3756,7 @@ esac
 
         let list_user_typo = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "list_user", "user_status": "active", "limit": 10}),
             )
             .await;
@@ -2780,7 +3768,10 @@ esac
         );
 
         let create_blocker = exec
-            .execute("task", &json!({"action": "create", "title": "Blocker"}))
+            .execute(
+                "task_board",
+                &json!({"action": "create", "title": "Blocker"}),
+            )
             .await;
         assert!(
             !create_blocker.starts_with("Error:") && create_blocker.contains("task-1"),
@@ -2789,7 +3780,7 @@ esac
 
         let create_dependency_field = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({
                     "action": "create",
                     "title": "Blocked task",
@@ -2806,7 +3797,7 @@ esac
 
         let update_status_field = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "update", "task_id": "task-1", "status": "paused"}),
             )
             .await;
@@ -2815,23 +3806,23 @@ esac
                 && update_status_field.contains("unknown field")
                 && update_status_field.contains("status")
                 && !update_status_field.contains("new_status, status"),
-            "server task.update must not recognize the old status argument: {update_status_field}"
+            "server task_board.update must not recognize the old status argument: {update_status_field}"
         );
 
         let list_status_field = exec
-            .execute("task", &json!({"action": "list", "status": "active"}))
+            .execute("task_board", &json!({"action": "list", "status": "active"}))
             .await;
         assert!(
             list_status_field.starts_with("Error:")
                 && list_status_field.contains("unknown field")
                 && list_status_field.contains("status")
                 && !list_status_field.contains("status_filter, status"),
-            "server task.list must not recognize the old status argument: {list_status_field}"
+            "server task_board.list must not recognize the old status argument: {list_status_field}"
         );
 
         let adopt_typo = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({
                     "action": "adopt",
                     "source_session_id": "source",
@@ -2877,7 +3868,9 @@ esac
         let (exec, _dir) = test_executor();
         let exec = exec.with_task_store(store);
 
-        let active = exec.execute("task", &json!({"action": "list_user"})).await;
+        let active = exec
+            .execute("task_board", &json!({"action": "list_user"}))
+            .await;
         assert!(
             active.contains("\"total\":2")
                 && active.contains("active cross-session task")
@@ -2891,7 +3884,7 @@ esac
 
         let completed = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "list_user", "user_status": "completed"}),
             )
             .await;
@@ -2902,7 +3895,7 @@ esac
 
         let typo = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "list_user", "user_status": "cancelledd"}),
             )
             .await;
@@ -2912,7 +3905,10 @@ esac
         );
 
         let wrong_type = exec
-            .execute("task", &json!({"action": "list_user", "user_status": true}))
+            .execute(
+                "task_board",
+                &json!({"action": "list_user", "user_status": true}),
+            )
             .await;
         assert!(
             wrong_type.contains("user_status") && wrong_type.contains("string"),
@@ -2969,7 +3965,7 @@ esac
 
         let out = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({"action": "create", "title": "must not mutate"}),
             )
             .await;
@@ -2992,7 +3988,7 @@ esac
         let (exec, _dir) = test_executor();
         let out = exec
             .execute(
-                "task",
+                "task_board",
                 &json!({
                     "action": "adopt",
                     "source_session_id": "source",
@@ -3294,6 +4290,18 @@ esac
                 .edge_registry_service(Arc::new(PanicEdgeRegistry))
                 .build(),
         );
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__demo__search",
+                "description": "Search the demo MCP source.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }
+        })]);
         assert!(
             exec.tool_engine.contains("mcp__demo__search"),
             "mcp__* calls should be owned by the ToolEngine prefix handler"
@@ -3304,34 +4312,122 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolBinding.as_str()
+        );
+        assert_eq!(parsed["retryable"], false);
         assert!(
-            result.output.contains("no MCP manager configured"),
+            parsed["error"].as_str().unwrap().contains("MCP server"),
             "{}",
             result.output
         );
     }
 
     #[tokio::test]
-    async fn capability_enforcement_blocks_local_tools_but_allows_mcp_forwarding() {
+    async fn invalid_mcp_shaped_tool_names_do_not_reach_dynamic_handler() {
+        let (exec, _dir) = test_executor();
+
+        assert!(
+            !exec.tool_engine.contains("mcp__bad/name"),
+            "validated MCP prefix handler must not accept non-canonical MCP names"
+        );
+
+        let result = exec
+            .execute_with_metadata("mcp__bad/name", &json!({"query": "hello"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolNotFound.as_str()
+        );
+        assert!(
+            parsed["error"].as_str().unwrap().contains("Unknown tool"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_binding_busy_is_retryable_not_missing_binding() {
+        let (mut exec, _dir) = test_executor();
+        let manager = Arc::new(tokio::sync::RwLock::new(astra_mcp::McpClientManager::new()));
+        exec.set_mcp_manager(Arc::clone(&manager));
+
+        let _discovery_write_lock = manager.write().await;
+        assert_eq!(
+            exec.mcp_executor_tool_readiness("mcp__demo__search"),
+            ExecutorToolReadiness::RuntimeBindingBusy("mcp_registry"),
+            "MCP discovery/reconnect write-lock contention must be observable, not collapsed into missing binding"
+        );
+
+        let result = exec
+            .executor_readiness_preflight_result("mcp__demo__search", &json!({"query": "hello"}))
+            .expect("busy MCP registry should short-circuit with structured feedback");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["runtime_binding_state"], "busy");
+        assert_eq!(parsed["runtime_binding_provider"], "mcp_registry");
+        assert_eq!(parsed["retryable"], true);
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolBinding.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_server_builtin_catalog_keeps_explicit_sandbox_and_mcp_routes() {
         let (mut exec, _dir) = test_executor();
         exec = exec.with_server_builtin_tools_disabled();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__demo__search",
+                "description": "Search the demo MCP source.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }
+        })]);
 
-        let blocked = exec
+        let sandbox_tool = exec
             .execute_with_metadata("bash", &json!({"command": "echo should-not-run"}))
             .await;
-        assert!(blocked.is_error, "{blocked:?}");
-        assert!(
-            blocked.output.contains("not available"),
-            "{}",
-            blocked.output
+        assert!(!sandbox_tool.is_error, "{sandbox_tool:?}");
+        assert_eq!(sandbox_tool.output, "should-not-run\n");
+
+        let mcp_request =
+            exec.tool_execution_request("mcp__demo__search", &json!({"query": "hello"}));
+        let selected_offer = mcp_request
+            .selected_offer
+            .as_ref()
+            .expect("request-scoped MCP schema must produce a selected offer");
+        assert_eq!(
+            selected_offer.offer_id,
+            "mcp__demo__search@request-scoped-mcp"
+        );
+        assert_eq!(
+            selected_offer.route,
+            crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp
         );
 
         let mcp = exec
             .execute_with_metadata("mcp__demo__search", &json!({"query": "hello"}))
             .await;
         assert!(mcp.is_error, "{mcp:?}");
+        let parsed: Value = serde_json::from_str(&mcp.output).unwrap();
+        assert_eq!(parsed["status"], "failed");
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolBinding.as_str()
+        );
+        assert_eq!(parsed["retryable"], false);
         assert!(
-            mcp.output.contains("no MCP manager configured"),
+            parsed["error"].as_str().unwrap().contains("MCP server"),
             "{}",
             mcp.output
         );
@@ -3354,6 +4450,18 @@ esac
             "/Users/test/project",
             WorkspaceAuthority::ReadWrite,
         );
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__demo__search",
+                "description": "Search the demo MCP source.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }
+        })]);
 
         let result = exec
             .execute_with_metadata(
@@ -3367,15 +4475,24 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolBinding.as_str()
+        );
+        assert_eq!(parsed["retryable"], false);
         assert!(
-            result.output.contains("no MCP manager configured"),
+            parsed["error"].as_str().unwrap().contains("MCP server"),
             "{}",
             result.output
         );
         let metadata = result.metadata.as_ref().expect("mcp metadata");
-        assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+        assert_eq!(
+            metadata["workspace"]["kind"], "none",
+            "request-scoped MCP execution must not inherit an unrelated edge workspace binding"
+        );
         assert_eq!(metadata["executor"]["kind"], "mcp");
-        assert_eq!(metadata["executor"]["display_name"], "MCP server");
+        assert_eq!(metadata["executor"]["display_name"], "Request-scoped MCP");
         assert_eq!(metadata["transport"], "mcp_http");
 
         let mut events = Vec::new();
@@ -3389,7 +4506,10 @@ esac
             .expect("tool_routing_decision");
         assert_eq!(routing["route"], "request_scoped_mcp");
         assert_eq!(routing["run_id"], "run-mcp");
-        assert_eq!(routing["workspace"]["kind"], "edge_workspace");
+        assert_eq!(
+            routing["workspace"]["kind"], "none",
+            "routing events must report the selected request-scoped MCP offer, not the ambient edge workspace"
+        );
         assert_eq!(routing["executor"]["kind"], "mcp");
         assert_eq!(routing["transport"], "mcp_http");
 
@@ -3459,7 +4579,6 @@ esac
                 display_name: "Cloud workspace".to_string(),
                 cwd: Some("/checkout/repo".to_string()),
                 authority: WorkspaceAuthority::ReadOnly,
-                fallback_policy: crate::server::tool_transport::FallbackPolicy::Disabled,
             },
             ExecutorBinding {
                 kind: crate::server::tool_transport::ExecutorBindingKind::OrchestratorManaged,
@@ -3484,7 +4603,9 @@ esac
         assert!(result.is_error, "{result:?}");
         assert!(
             result.output.contains("policy denied: filesystem_write")
-                && result.output.contains("no fallback was attempted"),
+                && result
+                    .output
+                    .contains("no alternate execution provider was attempted"),
             "{}",
             result.output
         );
@@ -3531,9 +4652,9 @@ esac
         assert_eq!(blocked["call_id"], "call-unsupported-workspace");
         assert_eq!(blocked["reason"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
         assert!(
-            blocked["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("no fallback was attempted")),
+            blocked["message"].as_str().is_some_and(
+                |message| message.contains("no alternate execution provider was attempted")
+            ),
             "{blocked:?}"
         );
     }
@@ -3561,7 +4682,7 @@ esac
 
         assert!(result.is_error, "{result:?}");
         assert!(
-            result.output.contains("fallback is disabled"),
+            result.output.contains("No alternate execution provider"),
             "{}",
             result.output
         );
@@ -3573,11 +4694,10 @@ esac
         let metadata = result.metadata.expect("binding metadata");
         assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
         assert_eq!(metadata["executor"]["kind"], "edge_agent");
-        assert_eq!(metadata["fallback_policy"], "disabled");
     }
 
     #[tokio::test]
-    async fn edge_bound_web_search_runs_on_server_runtime_with_explicit_metadata() {
+    async fn shared_network_web_search_prefers_bound_edge_provider() {
         let (mut exec, _dir) = test_executor();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         exec.set_work_surface_event_tx(tx);
@@ -3599,13 +4719,13 @@ esac
             )
             .await;
 
-        assert!(!result.is_error, "{result:?}");
-        assert!(result.output.contains("search_url"), "{result:?}");
-        let metadata = result.metadata.as_ref().expect("server runtime metadata");
-        assert_eq!(metadata["workspace"]["kind"], "none");
-        assert_eq!(metadata["executor"]["kind"], "server_local");
-        assert_eq!(metadata["executor"]["display_name"], "Server runtime");
-        assert_eq!(metadata["transport"], "server_local");
+        assert!(result.is_error, "{result:?}");
+        let metadata = result.metadata.as_ref().expect("edge runtime metadata");
+        assert_eq!(metadata["error_kind"], "transport_disconnected");
+        assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+        assert_eq!(metadata["executor"]["kind"], "edge_agent");
+        assert_eq!(metadata["executor"]["display_name"], "MacBook Pro");
+        assert_eq!(metadata["transport"], "edge_ws");
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -3616,11 +4736,11 @@ esac
             .iter()
             .find(|event| event["type"] == "tool_routing_decision")
             .expect("tool_routing_decision");
-        assert_eq!(routing["route"], "server_runtime");
+        assert_eq!(routing["route"], "edge_bound");
         assert_eq!(routing["run_id"], "run-web-search");
-        assert_eq!(routing["workspace"]["kind"], "none");
-        assert_eq!(routing["executor"]["display_name"], "Server runtime");
-        assert_eq!(routing["transport"], "server_local");
+        assert_eq!(routing["workspace"]["kind"], "edge_workspace");
+        assert_eq!(routing["executor"]["display_name"], "MacBook Pro");
+        assert_eq!(routing["transport"], "edge_ws");
 
         let started = events
             .iter()
@@ -3628,19 +4748,16 @@ esac
             .expect("tool_transport_started");
         assert_eq!(started["call_id"], "call-web-search");
         assert_eq!(started["run_id"], "run-web-search");
-        assert_eq!(started["workspace"]["kind"], "none");
-        assert_eq!(started["executor"]["display_name"], "Server runtime");
-        assert_eq!(started["transport"], "server_local");
+        assert_eq!(started["workspace"]["kind"], "edge_workspace");
+        assert_eq!(started["executor"]["display_name"], "MacBook Pro");
+        assert_eq!(started["transport"], "edge_ws");
 
-        let completed = events
-            .iter()
-            .find(|event| event["type"] == "tool_transport_completed")
-            .expect("tool_transport_completed");
-        assert_eq!(completed["call_id"], "call-web-search");
-        assert_eq!(completed["run_id"], "run-web-search");
-        assert_eq!(completed["workspace"]["kind"], "none");
-        assert_eq!(completed["executor"]["display_name"], "Server runtime");
-        assert_eq!(completed["transport"], "server_local");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "tool_transport_completed"),
+            "transport-disconnected edge route must not be reported as completed: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -3693,7 +4810,6 @@ esac
         assert_eq!(routing["executor"]["executor_id"], "edge-macbook-1");
         assert_eq!(routing["executor"]["transport"], "edge_ws");
         assert_eq!(routing["transport"], "edge_ws");
-        assert_eq!(routing["fallback_policy"], "disabled");
 
         let started = events
             .iter()
@@ -3707,7 +4823,6 @@ esac
         assert_eq!(started["executor"]["kind"], "edge_agent");
         assert_eq!(started["executor"]["executor_id"], "edge-macbook-1");
         assert_eq!(started["transport"], "edge_ws");
-        assert_eq!(started["fallback_policy"], "disabled");
 
         let failed = events
             .iter()
@@ -3737,7 +4852,7 @@ esac
         assert!(
             blocked["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("Server fallback is disabled")),
+                .is_some_and(|message| message.contains("No alternate execution provider")),
             "{blocked:?}"
         );
     }
@@ -4012,7 +5127,7 @@ esac
 
         let result = exec
             .execute_with_metadata(
-                "task",
+                "task_board",
                 &json!({
                     "action": "create",
                     "title": "live task board",
@@ -4034,7 +5149,7 @@ esac
             .expect("task_board_snapshot");
         assert_eq!(snapshot["session_id"], "test-session");
         assert_eq!(snapshot["run_id"], "run-task");
-        assert_eq!(snapshot["reason"], "task.create");
+        assert_eq!(snapshot["reason"], "task_board.create");
         assert_eq!(snapshot["workspace"]["kind"], "server_sandbox");
         assert_eq!(snapshot["executor"]["kind"], "server_local");
         assert_eq!(snapshot["transport"], "server_local");
@@ -4059,7 +5174,7 @@ esac
     fn session_state_test_executor(
         turn_index: u32,
     ) -> (
-        ServerToolExecutor,
+        RuntimeToolExecutor,
         TempDir,
         String,
         std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>,
@@ -4071,7 +5186,7 @@ esac
         workspace.cwd = dir.path().display().to_string();
         astra_services::session_workspace::write_workspace(&workspace).unwrap();
 
-        let mut exec = ServerToolExecutor::new(
+        let mut exec = RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             session_id.clone(),
@@ -4089,15 +5204,15 @@ esac
 
     #[test]
     fn session_state_tools_publish_workspace_artifacts() {
-        let source = include_str!("server_tool_executor.rs");
+        let source = include_str!("runtime_tool_executor.rs");
         assert!(
             source.contains("publish_current_workspace(\"adjust_config\")"),
             "adjust_config should publish remote workspace artifacts"
         );
-        let handlers = include_str!("server_tool_executor/tool_handlers.rs");
+        let handlers = include_str!("runtime_tool_executor/tool_handlers.rs");
         assert!(
             handlers.contains(
-                "publish_current_workspace(\"server_tool_executor:rollback_session_state\")"
+                "publish_current_workspace(\"runtime_tool_executor:rollback_session_state\")"
             ),
             "rollback_session_state should publish remote workspace artifacts after local restore"
         );
@@ -4337,7 +5452,7 @@ esac
     #[tokio::test]
     async fn default_tool_search_does_not_resolve_workspace_runtime_tools() {
         let dir = TempDir::new().unwrap();
-        let exec = ServerToolExecutor::new(
+        let exec = RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             "test-session".into(),
@@ -4398,6 +5513,50 @@ esac
         );
     }
 
+    #[tokio::test]
+    async fn server_tool_search_does_not_resolve_conflicting_searchable_schema_name() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_searchable_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "github",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "github",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "q": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        ]);
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "conflicting searchable schema must fail closed instead of resolving through catalog search; got: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("github"));
+    }
+
     /// Deferred tools must still be discoverable via `tool_search(select:NAME)`
     /// even though they are *not* in the per-turn visible slice. Without this
     /// the activation flow deadlocks: prompt instructs the model to select a
@@ -4439,9 +5598,149 @@ esac
     }
 
     #[tokio::test]
-    async fn server_tool_search_resolves_plugin_after_install() {
+    async fn server_tool_search_uses_production_surface_not_tool_engine_inventory() {
+        let (exec, _dir) = test_executor_with_agent_context();
+        let exec = exec
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                true, true,
+            ))
+            .with_enforce_server_tool_capabilities(true);
+        let searchable = exec.capability_filtered_server_tool_schemas();
+        exec.set_current_searchable_tool_schemas(&searchable);
+
+        let task = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:task"}))
+            .await;
+        let parsed_task: Value = serde_json::from_str(&task.output).unwrap();
+        assert!(
+            parsed_task["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["name"].as_str() == Some("task_board")),
+            "durable task-board backbone must be searchable in production server surface; got: {}",
+            task.output
+        );
+
+        let mo_query = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mo_query"}))
+            .await;
+        let parsed_mo_query: Value = serde_json::from_str(&mo_query.output).unwrap();
+        assert!(
+            parsed_mo_query["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not surface DB debug tools merely because ToolEngine can execute them; got: {}",
+            mo_query.output
+        );
+        assert!(
+            parsed_mo_query["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("mo_query")),
+            "mo_query must be reported missing from the current production search pool; got: {}",
+            mo_query.output
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_runtime_tool_offer_prunes_executor_surface_and_tool_search() {
+        let (mut exec, _dir) = test_executor();
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_disabled_tool_offers(&["bash@server-sandbox".to_string()])
+                .build(),
+        );
+
+        let names = schema_name_set(exec.tool_schemas());
+        assert!(
+            !names.contains("bash"),
+            "disabled runtime tool offers must not be prompt-visible"
+        );
+        assert!(
+            !exec.tool_runtime_ready("bash"),
+            "disabled runtime tool offers must not be readiness-visible"
+        );
+
+        let searchable = exec.capability_filtered_server_tool_schemas();
+        exec.set_current_searchable_tool_schemas(&searchable);
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:bash"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not rediscover a policy-disabled runtime tool: {}",
+            result.output
+        );
+        assert!(
+            parsed["missing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("bash")),
+            "disabled runtime tool offer should be reported missing from searchable surface: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_allowlist_prunes_server_service_surface_and_tool_search_results() {
+        let dir = TempDir::new().unwrap();
+        let mut allowed = HashMap::new();
+        allowed.insert(
+            "server-builtin".to_string(),
+            HashSet::from(["memory".to_string()]),
+        );
+        allowed.insert(
+            "server-control-plane".to_string(),
+            HashSet::from(["tool_search".to_string()]),
+        );
+        let exec = RuntimeToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        )
+        .with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_provider_allowed_tools(allowed)
+                .build(),
+        );
+
+        let names = schema_name_set(exec.tool_schemas());
+        assert!(names.contains("memory"));
+        assert!(
+            !names.contains("web_search"),
+            "server service tools excluded by provider allowlist must not be visible"
+        );
+        assert!(
+            !exec.tool_runtime_ready("web_search"),
+            "provider-disallowed server service tool must not be ready"
+        );
+
+        let searchable = exec.capability_filtered_server_tool_schemas();
+        exec.set_current_searchable_tool_schemas(&searchable);
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:web_search"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap_or_else(|error| {
+            panic!(
+                "tool_search must return search JSON, parse error={error}, output={}",
+                result.output
+            )
+        });
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not rediscover a provider-disallowed server service tool: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_hides_request_scoped_mcp_without_runtime_binding() {
         let (exec, _dir) = test_executor();
-        let plugin = json!({
+        let schema = json!({
             "type": "function",
             "function": {
                 "name": "mcp__calculator",
@@ -4453,7 +5752,42 @@ esac
                 }
             }
         });
-        exec.set_plugin_schemas(vec![plugin]);
+        exec.set_request_scoped_mcp_schemas(vec![schema]);
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "MCP schema must not resolve before a request-scoped MCP provider owns it; got: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("mcp__calculator"));
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_resolves_request_scoped_mcp_with_runtime_binding() {
+        let (mut exec, _dir) = test_executor();
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_request_scoped_mcp_schemas(vec![schema]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
 
         let result = exec
             .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
@@ -4461,13 +5795,278 @@ esac
         let parsed: Value = serde_json::from_str(&result.output).unwrap();
         assert!(
             parsed["missing"].as_array().unwrap().is_empty(),
-            "plugin must resolve after set_plugin_schemas on server path; got: {}",
+            "MCP schema must resolve when a request-scoped MCP provider owns it; got: {}",
             result.output
         );
         assert_eq!(
             parsed["matches"][0]["name"].as_str(),
             Some("mcp__calculator")
         );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_hides_disabled_request_scoped_mcp_offer() {
+        let (mut exec, _dir) = test_executor();
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_request_scoped_mcp_schemas(vec![schema]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_disabled_tool_offers(&["mcp__calculator@request-scoped-mcp".to_string()])
+                .build(),
+        );
+
+        assert!(
+            !exec.tool_runtime_ready("mcp__calculator"),
+            "policy-disabled MCP offers must not be readiness-visible"
+        );
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not rediscover disabled request-scoped MCP offers: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("mcp__calculator"));
+    }
+
+    #[tokio::test]
+    async fn disabled_request_scoped_mcp_offer_without_schema_does_not_create_offer() {
+        let (mut exec, _dir) = test_executor();
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_disabled_tool_offers(&["mcp__ghost__query@request-scoped-mcp".to_string()])
+                .build(),
+        );
+
+        assert!(
+            !exec.tool_runtime_ready("mcp__ghost__query"),
+            "a disabled selector must not synthesize a request-scoped MCP offer"
+        );
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__ghost__query"}))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "disabled selector without a schema must not synthesize a request-scoped MCP offer: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("mcp__ghost__query"));
+    }
+
+    #[test]
+    fn request_scoped_mcp_request_binding_is_selected_offer_driven() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_edge_workspace_binding(
+            "edge-macbook-1",
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        })]);
+
+        let request = exec.tool_execution_request("mcp__calculator", &json!({"expr": "1+1"}));
+
+        assert_eq!(request.workspace.kind, WorkspaceBindingKind::None);
+        assert_eq!(request.executor.kind, ExecutorBindingKind::Mcp);
+        assert_eq!(request.executor.executor_id, "request-scoped-mcp");
+        let offer = request.selected_offer.expect("selected MCP offer");
+        assert_eq!(offer.offer_id, "mcp__calculator@request-scoped-mcp");
+        assert_eq!(offer.provider_id, "request-scoped-mcp");
+        assert_eq!(
+            offer.route,
+            crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp
+        );
+    }
+
+    #[test]
+    fn mcp_prefixed_name_without_discovered_offer_does_not_override_binding() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_edge_workspace_binding(
+            "edge-macbook-1",
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        );
+
+        let request = exec.tool_execution_request("mcp__ghost__query", &json!({"query": "hello"}));
+
+        assert_eq!(request.workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
+        assert_eq!(request.executor.kind, ExecutorBindingKind::EdgeAgent);
+        assert_eq!(request.executor.executor_id, "edge-macbook-1");
+        assert!(
+            request.selected_offer.is_none(),
+            "mcp__ prefix alone must not synthesize a selected offer"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_hides_provider_disallowed_request_scoped_mcp_tool() {
+        let (mut exec, _dir) = test_executor();
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_request_scoped_mcp_schemas(vec![schema]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_provider_allowed_tools(HashMap::from([(
+                    "request-scoped-mcp".to_string(),
+                    HashSet::from(["mcp__other__query".to_string()]),
+                )]))
+                .build(),
+        );
+
+        assert!(
+            !exec.tool_runtime_ready("mcp__calculator"),
+            "provider-disallowed MCP tools must not be readiness-visible"
+        );
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not rediscover provider-disallowed MCP tools: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("mcp__calculator"));
+    }
+
+    #[tokio::test]
+    async fn disabled_request_scoped_mcp_offer_blocks_execution() {
+        let (mut exec, _dir) = test_executor();
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_request_scoped_mcp_schemas(vec![schema]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_disabled_tool_offers(&["mcp__calculator@request-scoped-mcp".to_string()])
+                .build(),
+        );
+
+        let result = exec
+            .execute_with_metadata("mcp__calculator", &json!({"expr": "1+1"}))
+            .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result
+                .output
+                .contains("disabled by the server administrator")
+                || result.output.contains("policy denied"),
+            "disabled MCP direct execution should fail closed with a policy error: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_hides_conflicting_request_scoped_mcp_schemas() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__calculator",
+                    "description": "Evaluate arithmetic expression.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"expr": {"type": "string"}},
+                        "required": ["expr"]
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__calculator",
+                    "description": "Evaluate arithmetic expression.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"expression": {"type": "string"}},
+                        "required": ["expression"]
+                    }
+                }
+            }),
+        ]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests(
+                "calculator",
+                &["mcp__calculator"],
+            ),
+        ));
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "conflicting request-scoped MCP schemas must not first-win into tool_search; got: {}",
+            result.output
+        );
+        assert_eq!(parsed["missing"][0].as_str(), Some("mcp__calculator"));
     }
 
     #[tokio::test]
@@ -5030,7 +6629,41 @@ esac
     async fn unknown_tool_returns_error_message() {
         let (exec, _dir) = test_executor();
         let result = exec.execute("nonexistent_tool", &json!({})).await;
-        assert!(result.contains("not available"));
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["status"], "failed");
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolNotFound.as_str()
+        );
+        assert_eq!(parsed["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn server_local_transport_reuses_executor_readiness_preflight() {
+        let (mut exec, _dir) = test_executor();
+        let manager = Arc::new(tokio::sync::RwLock::new(astra_mcp::McpClientManager::new()));
+        exec.set_mcp_manager(Arc::clone(&manager));
+
+        let _discovery_write_lock = manager.write().await;
+        let args = json!({"query": "hello"});
+        let expected = exec
+            .executor_readiness_preflight_result("mcp__demo__search", &args)
+            .expect("busy MCP registry should be rejected by executor readiness preflight");
+        let request = exec.tool_execution_request("mcp__demo__search", &args);
+
+        let actual =
+            <RuntimeToolExecutor as crate::server::tool_local_transport::ServerLocalToolTransport>::execute_server_local_tool(
+                &exec,
+                &request,
+                None,
+            )
+            .await;
+
+        assert_eq!(actual.is_error, expected.is_error);
+        assert_eq!(
+            actual.output, expected.output,
+            "server-local transport must not maintain a second divergent executor readiness path"
+        );
     }
 
     struct AlwaysTimeoutGate;
@@ -5357,6 +6990,18 @@ esac
             )
             .is_some()
         );
+        let mismatch = server_sandbox_local_path_mismatch(
+            "cd ~/github/astra && git status",
+            workspace_root,
+            &workspace,
+        )
+        .expect("path mismatch");
+        assert!(
+            mismatch.contains("current workspace provider"),
+            "{mismatch}"
+        );
+        assert!(!mismatch.contains("connected edge workspace"), "{mismatch}");
+        assert!(!mismatch.contains("Server sandbox"), "{mismatch}");
     }
 
     #[test]
@@ -5488,8 +7133,12 @@ esac
             )
             .await;
         assert!(result.is_error, "{result:?}");
-        assert!(result.output.contains("Server sandbox"), "{result:?}");
-        assert!(result.output.contains("edge workspace"), "{result:?}");
+        assert!(
+            result.output.contains("current workspace provider"),
+            "{result:?}"
+        );
+        assert!(!result.output.contains("Server sandbox"), "{result:?}");
+        assert!(!result.output.contains("edge workspace"), "{result:?}");
         let metadata = result.metadata.as_ref().expect("path mismatch metadata");
         assert_eq!(
             metadata["error_kind"],
@@ -5542,8 +7191,12 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
-        assert!(result.output.contains("Server sandbox"), "{result:?}");
-        assert!(result.output.contains("edge workspace"), "{result:?}");
+        assert!(
+            result.output.contains("current workspace provider"),
+            "{result:?}"
+        );
+        assert!(!result.output.contains("Server sandbox"), "{result:?}");
+        assert!(!result.output.contains("edge workspace"), "{result:?}");
         let metadata = result.metadata.as_ref().expect("path mismatch metadata");
         assert_eq!(
             metadata["error_kind"],
@@ -5578,7 +7231,11 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
-        assert!(result.output.contains("Server sandbox"), "{result:?}");
+        assert!(
+            result.output.contains("current workspace provider"),
+            "{result:?}"
+        );
+        assert!(!result.output.contains("Server sandbox"), "{result:?}");
         assert!(result.output.contains("/tmp/user-local-repo"), "{result:?}");
         let metadata = result.metadata.as_ref().expect("path mismatch metadata");
         assert_eq!(
@@ -5863,18 +7520,15 @@ esac
         ] {
             let result = exec.execute_with_metadata(name, &json!({})).await;
             assert!(result.is_error, "{name}: {result:?}");
-            let metadata = result.metadata.as_ref().expect("metadata should exist");
+            let parsed = serde_json::from_str::<Value>(&result.output).expect("json error body");
             assert_eq!(
-                metadata.get("capability_denial").and_then(Value::as_str),
-                Some("UnknownTool"),
+                parsed.get("error_kind").and_then(Value::as_str),
+                Some(astra_core::ErrorKind::ToolNotFound.as_str()),
                 "{name}: {result:?}"
             );
-            assert!(
-                metadata
-                    .get("execution_started")
-                    .and_then(Value::as_bool)
-                    .is_some_and(|started| !started),
-                "{name}: {result:?}"
+            assert_eq!(
+                parsed.get("retryable").and_then(Value::as_bool),
+                Some(false)
             );
         }
     }
@@ -5887,18 +7541,15 @@ esac
             .await;
 
         assert!(result.is_error, "{result:?}");
-        let metadata = result.metadata.as_ref().expect("metadata should exist");
+        let parsed = serde_json::from_str::<Value>(&result.output).expect("json error body");
         assert_eq!(
-            metadata.get("capability_denial").and_then(Value::as_str),
-            Some("UnknownTool"),
+            parsed.get("error_kind").and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolNotFound.as_str()),
             "{result:?}"
         );
-        assert!(
-            metadata
-                .get("execution_started")
-                .and_then(Value::as_bool)
-                .is_some_and(|started| !started),
-            "{result:?}"
+        assert_eq!(
+            parsed.get("retryable").and_then(Value::as_bool),
+            Some(false)
         );
     }
 
@@ -6052,18 +7703,15 @@ esac
         ] {
             let result = exec.execute_with_metadata(name, &json!({})).await;
             assert!(result.is_error, "{name}: {result:?}");
-            let metadata = result.metadata.as_ref().expect("metadata should exist");
+            let parsed = serde_json::from_str::<Value>(&result.output).expect("json error body");
             assert_eq!(
-                metadata.get("capability_denial").and_then(Value::as_str),
-                Some("UnknownTool"),
+                parsed.get("error_kind").and_then(Value::as_str),
+                Some(astra_core::ErrorKind::ToolNotFound.as_str()),
                 "{name}: {result:?}"
             );
-            assert!(
-                metadata
-                    .get("execution_started")
-                    .and_then(Value::as_bool)
-                    .is_some_and(|started| !started),
-                "{name}: {result:?}"
+            assert_eq!(
+                parsed.get("retryable").and_then(Value::as_bool),
+                Some(false)
             );
         }
     }
@@ -6301,21 +7949,21 @@ esac
         ));
         assert!(!is_plan_mode_blocked_tool("task_list", &json!({})));
 
-        // Consolidated `task` tool: block only destructive actions
+        // Consolidated `task_board` tool: block only destructive actions
         assert!(is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "stop", "task_id": "bg-shell-1"})
         ));
         assert!(!is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "create", "title": "new task"})
         ));
         assert!(!is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "list"})
         ));
         assert!(!is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "update", "task_id": "bg-shell-1", "new_status": "in_progress"})
         ));
 
@@ -6647,10 +8295,11 @@ esac
         }
     }
 
-    /// Core plan-mode write guard contract: bash is blocked while a plan is
-    /// in authoring phase, and unblocked after exit_plan_mode(approved=true).
+    /// Core plan-mode write guard contract: mutating bash is blocked while a
+    /// plan is in authoring phase. Read-only bash remains available through
+    /// the args-aware plan-mode policy.
     #[tokio::test]
-    async fn plan_mode_write_guard_blocks_bash_during_authoring_unblocks_after_exit() {
+    async fn plan_mode_write_guard_blocks_mutating_bash_during_authoring() {
         let repo = Arc::new(InMemoryPlanRepo::new());
 
         // Seed a plan in authoring state (has subtasks, all pending, none done).
@@ -6676,13 +8325,19 @@ esac
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
 
-        // ── Phase 1: bash must be blocked ────────────────────────────────
+        // ── Phase 1: mutating bash must be blocked ───────────────────────
         let result = exec
-            .execute("bash", &json!({"command": "echo hello"}))
+            .execute("bash", &json!({"command": "touch plan.txt"}))
             .await;
         assert!(
             result.contains("blocked while plan mode is active"),
-            "bash must be blocked during authoring, got: {result}"
+            "mutating bash must be blocked during authoring, got: {result}"
+        );
+
+        let result = exec.execute("bash", &json!({"command": "ls"})).await;
+        assert!(
+            !result.contains("blocked while plan mode is active"),
+            "read-only bash must remain available during authoring, got: {result}"
         );
 
         // write_file also blocked.
@@ -6705,13 +8360,13 @@ esac
             "exit_plan_mode must submit, not self-approve, got: {exit_result}"
         );
 
-        // bash remains blocked until a trusted approval clears active_plan_id.
+        // Mutating bash remains blocked until a trusted approval clears active_plan_id.
         let result = exec
-            .execute("bash", &json!({"command": "echo hello"}))
+            .execute("bash", &json!({"command": "touch plan.txt"}))
             .await;
         assert!(
             result.contains("blocked while plan mode is active"),
-            "bash must remain blocked after model-supplied exit_plan_mode, got: {result}"
+            "mutating bash must remain blocked after model-supplied exit_plan_mode, got: {result}"
         );
     }
 
@@ -7638,6 +9293,12 @@ esac
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(repo as Arc<dyn astra_plan::PlanRepository>);
         exec.session_id = "no-active-plan".to_string();
+        let stale_hint = Arc::new(std::sync::RwLock::new(Some(
+            "[plan-resume] goal=\"stale\"".to_string(),
+        )));
+        let stale_authoring = Arc::new(std::sync::RwLock::new(true));
+        exec.set_plan_resume_hint_handle(Arc::clone(&stale_hint));
+        exec.set_plan_authoring_active_handle(Arc::clone(&stale_authoring));
 
         let result = exec
             .execute("exit_plan_mode", &json!({"approved": true}))
@@ -7645,6 +9306,14 @@ esac
         assert!(
             result.contains("nothing to exit"),
             "no-active-plan path should return a soft note, got: {result}"
+        );
+        assert!(
+            stale_hint.read().expect("hint lock").is_none(),
+            "exit_plan_mode without an active plan must clear stale prompt plan state"
+        );
+        assert!(
+            !*stale_authoring.read().expect("authoring lock"),
+            "exit_plan_mode without an active plan must clear stale plan-mode gate state"
         );
     }
 

@@ -5,6 +5,11 @@
 //! and the in-memory content is replaced with a compact preview + file
 //! reference.  This prevents oversized tool outputs from bloating the LLM
 //! context window while still preserving the full output for later retrieval.
+//!
+//! The model-facing reference is a logical session artifact handle, not a
+//! physical path. Paths contain runtime-specific user scopes and are easy for
+//! the model to copy incorrectly; callers that need the full body must resolve
+//! the handle through runtime-owned artifact APIs.
 
 use std::path::{Path, PathBuf};
 
@@ -58,6 +63,10 @@ const PERSISTED_TAG_CLOSE: &str = "</persisted-output>";
 /// Subdirectory under the session folder for tool result files.
 const TOOL_RESULTS_SUBDIR: &str = "tool-results";
 
+/// Logical URI prefix for a persisted tool result scoped to the current
+/// session.
+pub const SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX: &str = "artifact://session/tool-result/";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PersistedFormat {
     PlainText,
@@ -84,7 +93,7 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// If `content` exceeds the persistence threshold, write it to disk and return
-/// a compact replacement string with a preview and file path.
+/// a compact replacement string with a preview and stable session artifact id.
 ///
 /// Returns `None` if the content is small enough to keep inline, or if disk
 /// persistence fails (in which case the caller should use the original content).
@@ -125,7 +134,10 @@ pub fn maybe_persist_tool_result(
     }
 
     Some(build_replacement(
-        tool_name, content, &persisted, &file_path,
+        tool_call_id,
+        tool_name,
+        content,
+        &persisted,
     ))
 }
 
@@ -182,6 +194,12 @@ pub fn tool_results_dir(session_dir: &Path) -> PathBuf {
     session_dir.join(TOOL_RESULTS_SUBDIR)
 }
 
+/// Return the model-facing logical artifact URI for a persisted tool result.
+#[must_use]
+pub fn session_tool_result_artifact_uri(tool_call_id: &str) -> String {
+    format!("{SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX}{tool_call_id}")
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -203,10 +221,10 @@ fn persistable_content(content: &str) -> PersistedContent {
 }
 
 fn build_replacement(
+    tool_call_id: &str,
     tool_name: &str,
     original_content: &str,
     persisted: &PersistedContent,
-    file_path: &Path,
 ) -> String {
     let total_chars = original_content.chars().count();
     let stored_chars = persisted.text.chars().count();
@@ -231,16 +249,20 @@ fn build_replacement(
 
     format!(
         "{PERSISTED_TAG_OPEN}\n\
-         Tool `{tool_name}` produced {total_chars} chars of output (persisted to disk).\n\
-         File: {path}\n\
+         Tool `{tool_name}` produced {total_chars} chars of output.\n\
+         Tool result id: {tool_call_id}\n\
+         Artifact handle: {artifact_uri}\n\
+         Storage: session tool-result artifact.\n\
+         Resolve this handle through runtime artifact recovery; do not search, \
+         copy, or read physical local session paths with workspace filesystem tools.\n\
          {format_note}\
          \n\
          Preview (first ~{prev_len} chars):\n\
          {preview}\n\
-         ...[truncated — full output persisted at path above]\n\
+         ...[truncated — full output is available through the session tool-result artifact, not workspace filesystem tools]\n\
          {PERSISTED_TAG_CLOSE}",
-        path = file_path.display(),
         prev_len = preview.len(),
+        artifact_uri = session_tool_result_artifact_uri(tool_call_id),
     )
 }
 
@@ -274,7 +296,13 @@ mod tests {
         assert!(replacement.contains(PERSISTED_TAG_OPEN));
         assert!(replacement.contains(PERSISTED_TAG_CLOSE));
         assert!(replacement.contains("bash"));
-        assert!(replacement.contains("persisted to disk"));
+        assert!(replacement.contains("Tool result id: call-42"));
+        assert!(replacement.contains("Artifact handle: artifact://session/tool-result/call-42"));
+        assert!(replacement.contains("session tool-result artifact"));
+        assert!(!replacement.contains("read_file"));
+        assert!(!replacement.contains("File:"));
+        assert!(!replacement.contains("tool-results"));
+        assert!(!replacement.contains("~/.astra"));
 
         // File was written (name is `<safe_id>-<hash>.txt` to avoid collisions)
         let results_dir = dir.join(TOOL_RESULTS_SUBDIR);
@@ -362,6 +390,15 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         assert!(read_persisted_result(&dir, "nonexistent").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_artifact_uri_is_stable_and_path_free() {
+        let uri = session_tool_result_artifact_uri("call_abc123");
+
+        assert_eq!(uri, "artifact://session/tool-result/call_abc123");
+        assert!(!uri.contains(".astra"));
+        assert!(!uri.contains("tool-results/"));
     }
 
     #[test]

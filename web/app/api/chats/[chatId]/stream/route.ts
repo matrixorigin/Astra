@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   PATH_CHAT_STREAM,
-  PATH_EDGES_STATUS,
   buildQueryString,
   chatRunStreamPath,
 } from "@astra/sdk";
@@ -29,17 +28,15 @@ import {
   requireRuntimeClient,
 } from "@/lib/runtime-client";
 import type {
-  EdgeStatusResponse,
   SendMessageRequest,
-  WorkspaceSelection,
 } from "@/lib/api/types";
 import {
-  normalizeSlashPath,
   normalizeWorkspaceSelection,
   resolveWorkspaceBindings,
   sameWorkspaceSelection,
   validateWorkspaceAuthority,
 } from "@/lib/workspace-authority";
+import { verifyLiveWorkspaceSelection } from "@/lib/workspace-selection-server";
 
 const encoder = new TextEncoder();
 
@@ -74,54 +71,6 @@ function normalizedActiveSkills(skills?: string[]) {
   return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort(
     (left, right) => left.localeCompare(right),
   );
-}
-
-async function verifyLiveWorkspaceSelection(
-  selection: WorkspaceSelection | null | undefined,
-  runtime: WebRuntimeClient,
-): Promise<WorkspaceSelection | null | undefined> {
-  if (selection?.kind !== "edge_workspace") {
-    return selection;
-  }
-
-  const status = await runtime.get<EdgeStatusResponse>(PATH_EDGES_STATUS, {
-    auth: "required",
-    operation: "verify edge workspace binding",
-  });
-  const edge = status.edges.find(
-    (candidate) => candidate.edge_agent_id === selection.edgeAgentId,
-  );
-  if (!edge) {
-    throw new RuntimeClientError({
-      operation: "verify edge workspace binding",
-      path: PATH_EDGES_STATUS,
-      status: 409,
-      detail: `Edge executor ${selection.displayName ?? selection.edgeAgentId} is offline. Reconnect edge or choose a connected workspace. Server fallback is disabled for this workspace.`,
-    });
-  }
-
-  const liveCwd = edge.workspace_dir?.trim() ?? "";
-  if (
-    !liveCwd ||
-    normalizeSlashPath(liveCwd) !== normalizeSlashPath(selection.cwd)
-  ) {
-    const current = liveCwd
-      ? `currently reports ${liveCwd}`
-      : "does not report a workspace";
-    throw new RuntimeClientError({
-      operation: "verify edge workspace binding",
-      path: PATH_EDGES_STATUS,
-      status: 409,
-      detail: `Edge executor ${edge.hostname ?? selection.displayName ?? selection.edgeAgentId} ${current}, not ${selection.cwd}. Choose the current edge workspace, then retry. Server fallback is disabled for this workspace.`,
-    });
-  }
-
-  return {
-    ...selection,
-    displayName:
-      edge.hostname ?? selection.displayName ?? selection.edgeAgentId,
-    cwd: liveCwd,
-  };
 }
 
 async function readSendMessageRequest(
@@ -190,6 +139,27 @@ function normalizedLastIndex(value: string | null) {
     return null;
   }
   return Math.trunc(parsed);
+}
+
+function isMalformedStreamEventIndexError(error: unknown) {
+  return (
+    error instanceof Error && error.message === "Malformed stream event index."
+  );
+}
+
+function applyBackendStreamEvent(
+  event: import("@astra/sdk").StreamEvent,
+  ctx: StreamEventContext,
+  state: StreamEventState,
+) {
+  try {
+    applyStreamEvent(event, ctx, state);
+  } catch (error) {
+    if (isMalformedStreamEventIndexError(error)) {
+      return;
+    }
+    throw error;
+  }
 }
 
 function proxyRunStream(params: {
@@ -289,6 +259,10 @@ function proxyRunStream(params: {
           }
           const message =
             error instanceof Error ? error.message : "Astra stream failed.";
+          const status =
+            error instanceof RuntimeClientError ? error.status : undefined;
+          const code =
+            error instanceof RuntimeClientError ? error.code : undefined;
           updateStreamingAssistantMessage(
             ownerUserId,
             chatId,
@@ -299,7 +273,7 @@ function proxyRunStream(params: {
             },
           );
           setChatActiveRun(ownerUserId, chatId, undefined);
-          enqueueFrame({ type: "error", message });
+          enqueueFrame({ type: "error", message, status, code });
           closeController();
           return;
         }
@@ -375,13 +349,7 @@ function proxyRunStream(params: {
             for (const frame of frames) {
               const event = eventFromSseFrame(frame);
               if (event) {
-                try {
-                  applyStreamEvent(event, ctx, state);
-                } catch (error) {
-                  if (error instanceof Error) {
-                    enqueueFrame({ type: "error", message: error.message });
-                  }
-                }
+                applyBackendStreamEvent(event, ctx, state);
               }
             }
           }
@@ -393,13 +361,7 @@ function proxyRunStream(params: {
           if (buffer.trim()) {
             const event = eventFromSseFrame(buffer);
             if (event) {
-              try {
-                applyStreamEvent(event, ctx, state);
-              } catch (error) {
-                if (error instanceof Error) {
-                  enqueueFrame({ type: "error", message: error.message });
-                }
-              }
+              applyBackendStreamEvent(event, ctx, state);
             }
           }
 
@@ -469,6 +431,8 @@ function proxyRunStream(params: {
           if (clientCancelled) {
             return;
           }
+          backendAbortController.abort();
+          await Promise.resolve(reader.cancel()).catch(() => undefined);
           const message =
             error instanceof Error ? error.message : "Astra stream failed.";
           setChatActiveRun(ownerUserId, chatId, undefined);
@@ -561,7 +525,7 @@ export async function POST(
   if (hasRequestedWorkspace && !requestedWorkspaceSelection) {
     return NextResponse.json(
       {
-        error: "workspace must be a server sandbox or edge workspace selection",
+        error: "workspace must be a valid file environment selection",
         code: "invalid_workspace_selection",
       },
       { status: 400 },
@@ -569,39 +533,18 @@ export async function POST(
   }
   const workspaceSelection =
     requestedWorkspaceSelection ?? storedWorkspaceSelection;
-  const workspaceError = validateWorkspaceAuthority(
+  const workspaceAuthorityError = validateWorkspaceAuthority(
     body.content,
     workspaceSelection,
   );
-  if (workspaceError) {
+  if (workspaceAuthorityError) {
     return NextResponse.json(
-      { error: workspaceError.message, code: workspaceError.code },
-      { status: 409 },
+      {
+        error: workspaceAuthorityError.error,
+        code: workspaceAuthorityError.code,
+      },
+      { status: workspaceAuthorityError.status },
     );
-  }
-  if (
-    requestedWorkspaceSelection &&
-    !sameWorkspaceSelection(
-      requestedWorkspaceSelection,
-      storedWorkspaceSelection,
-    )
-  ) {
-    try {
-      const updated = await updateChatWorkspaceSelection(
-        ownerUserId,
-        chatId,
-        requestedWorkspaceSelection,
-      );
-      if (!updated) {
-        return NextResponse.json({ error: "chat not found" }, { status: 404 });
-      }
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : "failed to persist workspace selection";
-      return NextResponse.json({ error: message }, { status: 502 });
-    }
   }
 
   let runtimeSessionId = chatId;
@@ -626,13 +569,17 @@ export async function POST(
       );
       if (
         liveWorkspaceSelection &&
-        !sameWorkspaceSelection(liveWorkspaceSelection, workspaceSelection)
+        (hasRequestedWorkspace ||
+          !sameWorkspaceSelection(liveWorkspaceSelection, storedWorkspaceSelection))
       ) {
-        await updateChatWorkspaceSelection(
+        const updated = await updateChatWorkspaceSelection(
           ownerUserId,
           chatId,
           liveWorkspaceSelection,
         );
+        if (!updated) {
+          throw new Error("chat not found");
+        }
       }
       const effectiveWorkspaceSelection =
         liveWorkspaceSelection ?? null;

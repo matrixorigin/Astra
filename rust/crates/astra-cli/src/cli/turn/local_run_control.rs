@@ -12,14 +12,15 @@ const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
 struct LocalRunControlState {
     next_event_index: usize,
     inputs: Vec<QueuedRunInputEvent>,
+    status: Option<RunControlStatus>,
 }
 
-/// In-process deferred-input queue for the CLI/TUI agentic loop.
+/// In-process run-control provider for the CLI/TUI agentic loop.
 ///
-/// The local `/chat/turn` SSE loop is not backed by a durable run record,
-/// so `/chat/runs/{run_id}/input` cannot address it. This provider lets the
-/// runtime's existing deferred-input release logic operate against a
-/// turn-scoped in-memory queue instead.
+/// Server-backed runs use the durable run engine for this contract. CLI local
+/// runs use this turn-scoped provider so the same runtime polling paths can
+/// observe user cancellation and deferred input without requiring a server-side
+/// workspace executor.
 #[derive(Default)]
 pub(crate) struct LocalDeferredInputRunControl {
     // This lock is only held for short in-memory queue mutations and never
@@ -31,6 +32,25 @@ pub(crate) struct LocalDeferredInputRunControl {
 impl LocalDeferredInputRunControl {
     pub(crate) fn shared() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub(crate) fn request_cancel(&self) {
+        let mut guard = recover_mutex_lock(&self.state);
+        guard.status = Some(RunControlStatus::Cancelled);
+    }
+
+    pub(crate) fn request_pause(&self) {
+        let mut guard = recover_mutex_lock(&self.state);
+        if guard.status != Some(RunControlStatus::Cancelled) {
+            guard.status = Some(RunControlStatus::Paused);
+        }
+    }
+
+    pub(crate) fn resume(&self) {
+        let mut guard = recover_mutex_lock(&self.state);
+        if guard.status == Some(RunControlStatus::Paused) {
+            guard.status = None;
+        }
     }
 
     pub(crate) fn enqueue_text(&self, text: &str) -> Result<(), String> {
@@ -63,7 +83,7 @@ impl RunStatusProvider for LocalDeferredInputRunControl {
         _user_id: &str,
         _run_id: &str,
     ) -> Result<Option<RunControlStatus>, String> {
-        Ok(None)
+        Ok(recover_mutex_lock(&self.state).status)
     }
 }
 
@@ -134,6 +154,62 @@ mod tests {
         assert_eq!(second.next_cursor, 2);
         assert_eq!(second.inputs.len(), 1);
         assert_eq!(second.inputs[0].input["content"], "second");
+    }
+
+    #[tokio::test]
+    async fn local_run_control_reports_cancel_status_through_shared_contract() {
+        let provider = LocalDeferredInputRunControl::default();
+        assert_eq!(
+            provider
+                .control_status("local-user", "run-local")
+                .await
+                .expect("status poll should succeed"),
+            None
+        );
+
+        provider.request_cancel();
+
+        assert_eq!(
+            provider
+                .control_status("local-user", "run-local")
+                .await
+                .expect("status poll should succeed"),
+            Some(RunControlStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_run_control_pause_can_resume_but_not_override_cancel() {
+        let provider = LocalDeferredInputRunControl::default();
+        provider.request_pause();
+        assert_eq!(
+            provider
+                .control_status("local-user", "run-local")
+                .await
+                .expect("status poll should succeed"),
+            Some(RunControlStatus::Paused)
+        );
+
+        provider.resume();
+        assert_eq!(
+            provider
+                .control_status("local-user", "run-local")
+                .await
+                .expect("status poll should succeed"),
+            None
+        );
+
+        provider.request_cancel();
+        provider.request_pause();
+        provider.resume();
+        assert_eq!(
+            provider
+                .control_status("local-user", "run-local")
+                .await
+                .expect("status poll should succeed"),
+            Some(RunControlStatus::Cancelled),
+            "cancelled is terminal for the turn-scoped local provider"
+        );
     }
 
     #[test]

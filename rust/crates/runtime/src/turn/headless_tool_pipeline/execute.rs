@@ -17,20 +17,23 @@ use astra_turn_core::tool_result_semantics::{
 
 /// The sentinel error prefix emitted by `take_edge_output_for_tool_call_with_duration`
 /// when no edge agent matched the tool call.
-const EDGE_PROTOCOL_ERROR_PREFIX: &str = "Error: headless edge protocol";
+const EDGE_PROTOCOL_ERROR_PREFIX: &str = super::HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX;
 
 /// Pure execution: server-side tool execution + hydration.
 /// No &mut pipeline needed — only shared refs.
 pub(crate) async fn execute_tool_pure(
     execution: &mut super::HeadlessResolvedExecution,
-    server_tool_executor: Option<&crate::server::server_tool_executor::ServerToolExecutor>,
+    runtime_tool_executor: Option<&crate::server::runtime_tool_executor::RuntimeToolExecutor>,
     api: &ThinClient,
     token: &str,
     current_session_id: Option<&String>,
     session_turn: u32,
+    edge_round_present: bool,
 ) {
     if !execution.is_edge_tool && execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
-        if let Some(executor) = server_tool_executor {
+        if let Some(executor) = runtime_tool_executor
+            && !selected_runtime_provider_tool_missing_edge_result(execution, edge_round_present)
+        {
             executor.set_turn_index(session_turn.max(1));
             let mut server_args = execution.args.clone();
             if let Some(obj) = server_args.as_object_mut() {
@@ -70,21 +73,49 @@ pub(crate) async fn execute_tool_pure(
     .await;
 }
 
+fn selected_runtime_provider_tool_missing_edge_result(
+    execution: &super::HeadlessResolvedExecution,
+    edge_round_present: bool,
+) -> bool {
+    if !edge_round_present || execution.is_edge_tool {
+        return false;
+    }
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    registry.get(&execution.name).is_some_and(|spec| {
+        matches!(
+            spec.required.executor,
+            astra_runtime_env::RequiredExecutor::RuntimeExecutor
+                | astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
+        )
+    })
+}
+
 pub(super) fn execution_result_is_error(
     name: &str,
     result_str: &str,
     tool_result_fields: Option<&Map<String, Value>>,
 ) -> bool {
-    let metadata_failed = tool_result_fields
-        .and_then(|fields| fields.get("status"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(edge_tool_status_exit_code)
-        .is_some_and(|exit_code| exit_code != 0);
+    let metadata_failed = tool_result_fields.is_some_and(|fields| {
+        let status_exit_code = fields
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .and_then(edge_tool_status_exit_code);
+        let failed_status = status_exit_code.is_some_and(|exit_code| exit_code != 0);
+        let successful_status = status_exit_code == Some(0);
+        let runtime_error = fields.get("runtime_error").is_some();
+        let blocked = fields
+            .get("blocked")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let explicit_error_kind = fields.get("error_kind").is_some();
+
+        failed_status || runtime_error || blocked || (explicit_error_kind && !successful_status)
+    });
 
     match classify_tool_error(name, result_str) {
         ToolErrorSeverity::HardError => true,
         ToolErrorSeverity::InfrastructureError => true,
-        ToolErrorSeverity::SoftError => false,
+        ToolErrorSeverity::SoftError => metadata_failed,
         // Success arm — body-wins reconciliation contract:
         //
         // When edge metadata says the call failed (non-zero exit status) but
@@ -106,12 +137,93 @@ pub(super) fn execution_result_is_error(
 }
 
 fn execution_error_kind(
+    result_str: &str,
     tool_result_fields: Option<&Map<String, Value>>,
 ) -> Option<astra_core::ErrorKind> {
     tool_result_fields
         .and_then(|fields| fields.get("error_kind"))
         .and_then(serde_json::Value::as_str)
         .and_then(astra_core::ErrorKind::parse_tag)
+        .or_else(|| structured_output_error_kind(result_str))
+}
+
+fn structured_output_error_kind(result_str: &str) -> Option<astra_core::ErrorKind> {
+    serde_json::from_str::<Value>(result_str)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error_kind")
+                .and_then(Value::as_str)
+                .and_then(astra_core::ErrorKind::parse_tag)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Map, Value};
+
+    #[test]
+    fn transport_failure_metadata_marks_read_only_tool_as_error() {
+        let mut fields = Map::new();
+        fields.insert("status".to_string(), Value::String("failed".to_string()));
+        fields.insert(
+            "error_kind".to_string(),
+            Value::String("transport_disconnected".to_string()),
+        );
+        fields.insert("blocked".to_string(), Value::Bool(true));
+
+        assert!(execution_result_is_error(
+            "list_dir",
+            "Error: transport 'edge_ws' disconnected or timed out while executing tool 'list_dir'",
+            Some(&fields),
+        ));
+    }
+
+    #[test]
+    fn plain_read_only_timeout_without_runtime_metadata_stays_soft() {
+        assert!(!execution_result_is_error(
+            "grep",
+            "Error: command timed out after 30s",
+            None,
+        ));
+    }
+
+    #[test]
+    fn explicit_success_body_can_override_stale_failed_status() {
+        let mut fields = Map::new();
+        fields.insert("status".to_string(), Value::String("failed".to_string()));
+
+        assert!(!execution_result_is_error(
+            "str_replace",
+            "Replaced 1 occurrence\n<<<ASTRA_TOOL_OK>>>",
+            Some(&fields),
+        ));
+    }
+
+    #[test]
+    fn successful_status_ignores_stale_error_kind_without_runtime_error() {
+        let mut fields = Map::new();
+        fields.insert("status".to_string(), Value::String("completed".to_string()));
+        fields.insert(
+            "error_kind".to_string(),
+            Value::String("transport_disconnected".to_string()),
+        );
+
+        assert!(!execution_result_is_error("list_dir", "ok", Some(&fields)));
+    }
+
+    #[test]
+    fn runtime_error_still_fails_even_with_successful_status() {
+        let mut fields = Map::new();
+        fields.insert("status".to_string(), Value::String("completed".to_string()));
+        fields.insert(
+            "runtime_error".to_string(),
+            serde_json::json!({"kind": "transport_disconnected"}),
+        );
+
+        assert!(execution_result_is_error("list_dir", "ok", Some(&fields)));
+    }
 }
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
@@ -128,11 +240,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let tool_start = Instant::now();
         execute_tool_pure(
             &mut execution,
-            self.ctx.server_tool_executor,
+            self.ctx.runtime_tool_executor,
             self.ctx.api,
             self.ctx.token,
             self.ctx.current_session_id,
             self.ctx.session_turn,
+            !self.ctx.edge_tool_round.is_empty(),
         )
         .await;
 
@@ -149,7 +262,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &execution.result_str,
             execution.tool_result_fields.as_ref(),
         );
-        let source_error_kind = execution_error_kind(execution.tool_result_fields.as_ref());
+        let source_error_kind =
+            execution_error_kind(&execution.result_str, execution.tool_result_fields.as_ref());
         let tool_already_restricted = self.ctx.restricted_tools.contains(&execution.name);
         let quiet = self.ctx.quiet;
         let term = &mut self.ctx.term;
@@ -187,6 +301,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &execution.name,
             &mut execution.result_str,
             source_error_kind,
+            is_err,
             resource_limit_recorded,
             self.ctx.turn_guard,
         );

@@ -145,7 +145,7 @@ fn server_builtin_inventory_is_public_schema_backed() {
     let schema_names = schema_name_set();
     let registry = astra_runtime_env::ToolRegistry::builtins();
 
-    for &name in crate::provider::server_builtin::SERVER_BUILTIN_TOOL_NAMES {
+    for name in crate::provider::server_builtin::server_builtin_tool_names() {
         let spec = registry
             .get(name)
             .unwrap_or_else(|| panic!("server builtin inventory has no ToolSpec: {name}"));
@@ -158,6 +158,7 @@ fn server_builtin_inventory_is_public_schema_backed() {
                 spec.required.executor,
                 astra_runtime_env::RequiredExecutor::ControlPlane
                     | astra_runtime_env::RequiredExecutor::ServiceExecutor
+                    | astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
             ),
             "server builtin inventory must be server-owned, not runtime-executor: {name}"
         );
@@ -204,7 +205,7 @@ fn always_load_default_candidates_follow_tool_spec_load_policy() {
 }
 
 #[test]
-fn web_no_workspace_final_surface_filters_workspace_executor_candidates() {
+fn web_without_file_environment_provider_filters_workspace_executor_candidates() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
     let candidate_names: std::collections::BTreeSet<String> =
@@ -222,10 +223,9 @@ fn web_no_workspace_final_surface_filters_workspace_executor_candidates() {
             surface.always_load_schemas(),
             &crate::server::tool_execution_binding::WorkspaceBinding {
                 kind: astra_runtime_env::WorkspaceBindingKind::None,
-                display_name: "No workspace".to_string(),
+                display_name: "No file environment".to_string(),
                 cwd: None,
                 authority: astra_runtime_env::WorkspaceAuthority::None,
-                fallback_policy: crate::server::tool_execution_binding::FallbackPolicy::Disabled,
             },
             &crate::server::tool_execution_binding::ExecutorBinding::server_control_plane(),
             None,
@@ -235,7 +235,7 @@ fn web_no_workspace_final_surface_filters_workspace_executor_candidates() {
     for visible in ["ask_user", "tool_search", "introspect", "reflect"] {
         assert!(
             final_names.contains(visible),
-            "{visible} should remain visible in Web/no-workspace mode"
+            "{visible} should remain visible without a file-environment provider"
         );
     }
     for hidden in ["bash", "read_file", "write_file", "git"] {

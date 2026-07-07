@@ -26,6 +26,45 @@ make stack-up
 
 `make stack-up` fails before starting containers if any required value is empty.
 
+## Runtime Startup Profiles
+
+The compose stack is server-only by default: it starts MatrixOne, Memoria, and
+`astra-server`. Web agent, memory, planning, MCP, introspection, and other
+server-service capabilities can run in this mode, but local filesystem, shell,
+git, build/test, and private-network tools are not available unless an execution
+provider connects.
+
+Use the explicit server-only target when that is the intended test/deployment
+shape:
+
+```bash
+make stack-up-server-only
+```
+
+This target also stops any local `astra-edge` process started by the repo dev
+scripts before starting the compose stack, so the resulting process graph is
+actually server-only instead of "server plus a previously connected local edge".
+
+Use server+edge when a Web session should operate on a local workspace from the
+host machine:
+
+```bash
+astra login
+ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make stack-up-server-edge
+```
+
+`stack-up-server-edge` starts the same compose stack and then launches a local
+host `astra-edge` process connected to `/edge/ws`. The edge process reads the
+selected Astra CLI profile token by default; set `ASTRA_TOKEN` if you need to
+inject a token explicitly.
+
+Run the focused runtime profile guardrails before changing startup or tool
+visibility behavior:
+
+```bash
+make test-runtime-profiles
+```
+
 ## Admin Accounts
 
 Use `astra admin register` to create an administrator account. On a fresh MatrixOne

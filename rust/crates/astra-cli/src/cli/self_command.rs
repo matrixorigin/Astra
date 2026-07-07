@@ -7,6 +7,7 @@ use crate::cli::cli_config::cli_args::{
 };
 use crate::cli::cli_config::cli_utils::local_resumable_last_session_id;
 use crate::cli::session::session_continuation::extract_text_content;
+use crate::edge_tools;
 use astra_config::runtime_config::RuntimeConfig;
 use astra_core::observation::SourcePolicy;
 use astra_core::{
@@ -16,11 +17,11 @@ use astra_core::{
     ObservationRecord, ObservationView, Urn,
 };
 use astra_runtime::self_model::ConstraintSet;
-use astra_runtime::tool_registry::ToolRegistry;
 use astra_services::reflect::{ReflectReport, ReflectRequest};
 use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, WorkspaceMetadata};
+use astra_turn_core::tool::schema::tool_schema_name;
 
 use super::surface::self_surface;
 
@@ -1010,7 +1011,7 @@ pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<Chec
         ),
     });
 
-    let available_tools = ToolRegistry::all_tool_names().len();
+    let available_tools = cli_provider_visible_tool_names().len();
     let min_required = ConstraintSet::default().min_available_tool_count;
     checks.push(CheckResult {
         name: "available_tool_floor".to_string(),
@@ -1022,6 +1023,16 @@ pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<Chec
     });
 
     checks
+}
+
+pub(crate) fn cli_provider_visible_tool_names() -> Vec<String> {
+    let mut names = edge_tools::local_tool_schemas()
+        .iter()
+        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn replace_json_path(
@@ -1168,8 +1179,8 @@ fn event_preview_ref_namespace(event: &EventPreview) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_reflect_response, execute_self_command, replace_json_path, resolve_session_id,
-        verify_runtime_config,
+        build_reflect_response, cli_provider_visible_tool_names, execute_self_command,
+        replace_json_path, resolve_session_id, verify_runtime_config,
     };
     use crate::cli::cli_config::cli_args::{SelfCmd, SelfReflectArgs, SelfSessionArgs};
     use crate::cli::cli_config::cli_utils::{
@@ -1269,6 +1280,28 @@ mod tests {
             checks
                 .iter()
                 .any(|check| { check.name == "verification_bounds" && !check.ok })
+        );
+    }
+
+    #[test]
+    fn self_runtime_tool_names_use_provider_visible_cli_surface() {
+        let names = cli_provider_visible_tool_names();
+        assert!(names.contains(&"bash".to_string()));
+        assert!(!names.contains(&"delete_file".to_string()));
+        assert!(!names.contains(&"multi_edit".to_string()));
+
+        let checks = verify_runtime_config(None);
+        let available = checks
+            .iter()
+            .find(|check| check.name == "available_tool_floor")
+            .expect("available_tool_floor check");
+        assert!(available.ok);
+        assert!(
+            available
+                .detail
+                .contains(&format!("available_tools={}", names.len())),
+            "{}",
+            available.detail
         );
     }
 

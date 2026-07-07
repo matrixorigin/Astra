@@ -422,12 +422,12 @@ fn is_completion_signal(content: &str) -> bool {
 ///
 /// 1. `system_messages` (from the context pipeline).
 /// 2. `compacted_messages` (conversation history from Memoria).
-/// 3. `volatile_preamble` content is attached at the true tail:
-///    if the last message is already `role=user`, prepend there; if the tail is
-///    `role=tool`, append `assistant("Understood.")` + `user(reminder)` so the
-///    wire alternation stays protocol-valid; otherwise append one synthetic tail
-///    `role=user` reminder. This avoids rewriting a historical user message
-///    when `assistant/tool` messages trail it.
+/// 3. `volatile_preamble` content is attached as runtime context adjacent to
+///    the true tail. If the last message is already `role=user`, insert a
+///    synthetic `role=system` message immediately before it so the latest real
+///    user message remains byte-for-byte intact and authoritative. If the tail
+///    is `role=tool`, append `assistant("Understood.")` and then a synthetic
+///    runtime `role=system` message.
 /// 4. `strip_stale_reasoning` is applied in place.
 /// 5. Invoked-skill attachments (server path only).
 /// 6. Recent-file attachments (server path only).
@@ -469,12 +469,8 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
     } else {
         volatile_preamble
     };
-    let drained_text = render_drained_volatile(&drained_volatile);
-    if !suppress_volatile && !drained_text.is_empty() {
-        volatile_preamble.push(serde_json::json!({
-            "role": "user",
-            "content": drained_text,
-        }));
+    if !suppress_volatile {
+        volatile_preamble.extend(render_drained_volatile_messages(&drained_volatile));
     }
 
     // Belt-and-suspenders: legacy callers still push mid-history volatile
@@ -496,26 +492,55 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
     // bytes and can zero prefix-cache hits on multi-round tool loops.
     let mut synthetic_tail_start: Option<usize> = None;
     let mut synthetic_tail_end: Option<usize> = None;
+    let mut tail_user_cache_boundary_applied = false;
     if !volatile_preamble.is_empty() {
-        let volatile_text: String = volatile_preamble
-            .iter()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
+        let mut system_parts = Vec::new();
+        let mut user_parts = Vec::new();
+        for message in &volatile_preamble {
+            let Some(content) = message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::trim)
+            else {
+                continue;
+            };
+            if content.is_empty() {
+                continue;
+            }
+            match message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user")
+            {
+                "system" => system_parts.push(content.to_string()),
+                "user" => user_parts.push(content.to_string()),
+                // Historical volatile preamble was represented as a
+                // user reminder plus an assistant acknowledgement. The
+                // acknowledgement is a transport shim, not instruction
+                // content, so it must not be folded into the synthetic
+                // reminder user. If the protocol tail requires an assistant
+                // bridge, we synthesize that below from the real tail role.
+                _ => {}
+            }
+        }
+
+        let volatile_text = system_parts
+            .into_iter()
+            .chain(user_parts)
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n\n");
         if !volatile_text.is_empty() {
             let tail_role = llm_messages
                 .last()
                 .and_then(|m| m.get("role").and_then(Value::as_str));
             if tail_role == Some("user") {
-                let last_user = llm_messages
-                    .last_mut()
-                    .expect("tail_role=user implies a last message exists");
-                let existing = last_user
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                last_user["content"] = Value::String(format!("{volatile_text}\n\n{existing}"));
+                if let Some(tail) = llm_messages.last_mut() {
+                    tail_user_cache_boundary_applied = append_volatile_to_tail_user_message(
+                        tail,
+                        &volatile_text,
+                        cache_cfg.should_annotate(),
+                    );
+                }
             } else if tail_role == Some("tool") {
                 synthetic_tail_start = Some(llm_messages.len());
                 llm_messages.push(serde_json::json!({
@@ -528,10 +553,11 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
                 }));
                 synthetic_tail_end = Some(llm_messages.len());
             } else {
-                // No tail user available — append one synthetic tail reminder
-                // instead of rewriting a historical user message.
                 synthetic_tail_start = Some(llm_messages.len());
-                llm_messages.push(serde_json::json!({"role": "user", "content": volatile_text}));
+                llm_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": volatile_text,
+                }));
                 synthetic_tail_end = Some(llm_messages.len());
             }
         }
@@ -567,13 +593,19 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
         llm_messages.extend(file_messages);
     }
 
-    // When the synthetic tail is still the final suffix (no attachments landed
-    // after it), place the message-level cache marker on the last REAL message
-    // before the synthetic assistant/user reminder pair. Otherwise the
-    // synthesized reminder would consume the only message marker and we'd fall
-    // back to caching just system+tools on every tool-loop round.
+    // When synthetic runtime context was appended as the final suffix (no
+    // attachments landed after it), place the message-level cache marker on the
+    // last REAL message before the synthetic assistant/user reminder pair.
+    // Otherwise the synthesized reminder would consume the only message marker
+    // and we'd fall back to caching just system+tools on every tool-loop round.
+    //
+    // User-tail volatile context is appended inside the final user message as
+    // a post-marker content block. Inserting it before the latest user would
+    // put per-round runtime bytes inside the Anthropic cached prefix and churn
+    // historical message hashes on the next turn; appending it as a separate
+    // role=system message would violate Anthropic/Bedrock role alternation.
     let synthetic_tail_is_final = synthetic_tail_end.is_some_and(|end| end == llm_messages.len());
-    if cache_cfg.should_annotate() {
+    if cache_cfg.should_annotate() && !tail_user_cache_boundary_applied {
         if synthetic_tail_is_final {
             if let Some(prefix_end) = synthetic_tail_start {
                 apply_anthropic_cache_metadata(
@@ -587,6 +619,64 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
         }
     }
     llm_messages
+}
+
+fn append_volatile_to_tail_user_message(
+    message: &mut Value,
+    volatile_text: &str,
+    mark_cache_boundary_before_volatile: bool,
+) -> bool {
+    let Some(object) = message.as_object_mut() else {
+        return false;
+    };
+    let volatile_block = serde_json::json!({
+        "type": "text",
+        "text": volatile_text,
+    });
+
+    match object.get_mut("content") {
+        Some(Value::String(text)) => {
+            let real_user_text = std::mem::take(text);
+            if mark_cache_boundary_before_volatile {
+                object.insert(
+                    "content".to_string(),
+                    serde_json::json!([
+                        {
+                            "type": "text",
+                            "text": real_user_text,
+                            "cache_control": astra_turn_core::context_serializer::anthropic_ephemeral_cache_control(),
+                        },
+                        volatile_block,
+                    ]),
+                );
+                true
+            } else {
+                object.insert(
+                    "content".to_string(),
+                    Value::String(format!("{real_user_text}\n\n{volatile_text}")),
+                );
+                false
+            }
+        }
+        Some(Value::Array(blocks)) => {
+            let mut marked = false;
+            if mark_cache_boundary_before_volatile && let Some(last_real_block) = blocks.last_mut()
+            {
+                last_real_block["cache_control"] =
+                    astra_turn_core::context_serializer::anthropic_ephemeral_cache_control();
+                marked = true;
+            }
+            blocks.push(volatile_block);
+            marked
+        }
+        _ => {
+            object.insert(
+                "content".to_string(),
+                Value::String(volatile_text.to_string()),
+            );
+            false
+        }
+    }
 }
 
 /// Render the structured volatile lane drained from
@@ -606,6 +696,9 @@ pub(crate) fn render_drained_volatile(
 ) -> String {
     let mut out = String::new();
     for inj in drained {
+        if !inj.kind.render_in_user_tail() {
+            continue;
+        }
         let text = inj.content.trim();
         if text.is_empty() {
             continue;
@@ -614,6 +707,33 @@ pub(crate) fn render_drained_volatile(
             out.push_str("\n\n");
         }
         out.push_str(text);
+    }
+    out
+}
+
+fn render_drained_volatile_messages(
+    drained: &[crate::turn::agentic_loop::host::VolatileInjection],
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    let user_text = render_drained_volatile(drained);
+    if !user_text.is_empty() {
+        out.push(serde_json::json!({
+            "role": "user",
+            "content": user_text,
+        }));
+    }
+    for inj in drained {
+        if inj.kind.render_in_user_tail() {
+            continue;
+        }
+        let text = inj.content.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "role": inj.kind.default_role(),
+            "content": text,
+        }));
     }
     out
 }
@@ -638,10 +758,10 @@ pub(crate) fn render_drained_volatile(
 ///
 /// We keep only the FINAL occurrence of each known pattern (the most
 /// recent round's state is always the authoritative one) and return
-/// their concatenated text so [`assemble_llm_messages_with_cache_capability`] can prepend it
-/// to the last user message. Stripping them out of history removes the
-/// mid-history byte churn; the agent still sees the same up-to-date
-/// nudges in the tail.
+/// their concatenated text so [`assemble_llm_messages_with_cache_capability`]
+/// can render it as adjacent runtime context without mutating the latest real
+/// user message. Stripping them out of history removes the mid-history byte
+/// churn; the agent still sees the same up-to-date nudges in the tail.
 ///
 /// This is strictly a wire-layer pass. Session persistence (the
 /// `conversation_log` snapshot, event journal) is untouched.
@@ -747,6 +867,18 @@ mod tests {
 
     fn anthropic_cache_cfg() -> PromptCacheConfig {
         PromptCacheConfig::latch("anthropic", "claude-sonnet-4")
+    }
+
+    fn message_text(message: &Value) -> String {
+        match message.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
     }
 
     #[test]
@@ -1358,12 +1490,12 @@ mod tests {
         );
     }
 
-    /// Regression lock: for prefix-only providers, volatile content MUST NOT
-    /// appear in the system message OR as a separate early message pair.
-    /// When the tail is already a user message, it should be prepended there;
-    /// otherwise it must be appended as one synthetic tail user reminder.
+    /// Regression lock: volatile content must not be prepended before the
+    /// latest real user intent. Runtime context is appended after that intent
+    /// in the same tail user message so provider role ordering remains valid
+    /// and prompt-cache markers can sit before the volatile suffix.
     #[test]
-    fn prefix_provider_volatile_prepended_to_last_user_message() {
+    fn prefix_provider_volatile_appends_after_last_user_intent() {
         let stable_sys = vec![json!({"role": "system", "content": "stable core rules only"})];
         let volatile_preamble = vec![
             json!({"role": "user", "content": "<system-reminder>\nTurn: 5 | Tokens: 12000\n</system-reminder>"}),
@@ -1398,29 +1530,28 @@ mod tests {
         assert_eq!(msgs[2]["role"], "assistant");
         assert_eq!(msgs[2]["content"], "first answer");
 
-        // Last user message has volatile prepended to its content
         assert_eq!(msgs[3]["role"], "user");
-        let last_user = msgs[3]["content"].as_str().unwrap();
+        let tail_user = message_text(&msgs[3]);
         assert!(
-            last_user.contains("Turn: 5"),
-            "volatile must be prepended to last user message"
+            tail_user.starts_with("second question"),
+            "real user intent must remain first in the tail user message: {tail_user}"
         );
         assert!(
-            last_user.contains("second question"),
-            "original user content must be preserved"
+            tail_user.contains("Turn: 5"),
+            "volatile runtime context must remain visible after the real user intent: {tail_user}"
         );
         assert!(
-            last_user.starts_with("<system-reminder>"),
-            "volatile must come BEFORE user content"
+            msgs.iter()
+                .skip(1)
+                .all(|msg| msg.get("role").and_then(Value::as_str) != Some("system")),
+            "runtime context must not introduce provider-invalid system messages after history"
         );
 
-        // Total message count: system + 2 history + 1 combined last = 4
-        // (NOT 6 which would indicate a separate preamble pair)
-        assert_eq!(msgs.len(), 4, "no extra preamble pair should be inserted");
+        assert_eq!(msgs.len(), 4);
     }
 
     #[test]
-    fn volatile_preamble_prepended_to_last_user_not_inserted_as_pair() {
+    fn volatile_preamble_appends_to_tail_user_content() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![
             json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
@@ -1440,13 +1571,113 @@ mod tests {
             None,
             &cache_cfg(),
         );
-        // 2 messages: system + combined last user (volatile prepended to "hi")
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[1]["role"], "user");
-        let user_content = msgs[1]["content"].as_str().unwrap();
-        assert!(user_content.contains("volatile"), "volatile prepended");
-        assert!(user_content.contains("hi"), "original content preserved");
+        let tail_user = message_text(&msgs[1]);
+        assert!(
+            tail_user.starts_with("hi"),
+            "real user intent must stay first in the tail user message: {tail_user}"
+        );
+        assert!(
+            tail_user.contains("volatile"),
+            "volatile runtime context must be appended after real user intent: {tail_user}"
+        );
+    }
+
+    #[test]
+    fn self_status_volatile_appends_after_real_user_intent() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::SelfStatus,
+            content: "## ⚡ Self-Status\nTurn 9/299 | Cache: 86%".to_string(),
+            round_index: 9,
+        }];
+        let compacted = vec![json!({"role": "user", "content": "相关的测试够硬核吗？"})];
+        let msgs = assemble_llm_messages_with_cache_capability(
+            system,
+            Vec::new(),
+            drained,
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+            &cache_cfg(),
+        );
+
+        let user_text = msgs
+            .iter()
+            .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("user"))
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(user_text.contains("相关的测试够硬核吗"));
+        assert!(
+            user_text.contains("Self-Status"),
+            "runtime telemetry must remain visible after the real user intent: {user_text}"
+        );
+        let system_text = msgs
+            .iter()
+            .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !system_text.contains("Self-Status"),
+            "volatile runtime telemetry must not be smuggled into a post-history system lane"
+        );
+    }
+
+    #[test]
+    fn active_turn_frame_anchors_latest_user_goal_in_tail_user_content() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
+            content: "[active-turn-frame:v1]\n{\"latest_user_message\":\"相关的测试够硬核吗？\",\"active_goal\":\"相关的测试够硬核吗？\"}\n[/active-turn-frame]".to_string(),
+            round_index: 3,
+        }];
+        let compacted = vec![
+            json!({"role": "user", "content": "一共多少 changes？"}),
+            json!({"role": "assistant", "content": "148 files"}),
+            json!({"role": "user", "content": "相关的测试够硬核吗？"}),
+        ];
+        let msgs = assemble_llm_messages_with_cache_capability(
+            system,
+            Vec::new(),
+            drained,
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+            &cache_cfg(),
+        );
+
+        assert_eq!(msgs[1]["content"], "一共多少 changes？");
+        assert_eq!(msgs[2]["content"], "148 files");
+        assert_eq!(msgs[3]["role"], "user");
+        let tail_user = message_text(&msgs[3]);
+        assert!(
+            tail_user.starts_with("相关的测试够硬核吗？"),
+            "latest real user goal must remain first in the tail user message: {tail_user}"
+        );
+        assert!(tail_user.contains("[active-turn-frame:v1]"));
+        assert!(tail_user.contains("相关的测试够硬核吗"));
+        assert!(
+            tail_user.contains("active_goal"),
+            "active goal frame must stay explicit after tool rounds"
+        );
+        assert!(
+            msgs.iter()
+                .skip(1)
+                .all(|msg| msg.get("role").and_then(Value::as_str) != Some("system")),
+            "active-turn runtime context must not require a post-history system role"
+        );
     }
 
     #[test]
@@ -1483,10 +1714,10 @@ mod tests {
         assert_eq!(msgs[4]["role"], "assistant");
         assert_eq!(msgs[4]["content"], "Understood.");
         assert_eq!(msgs[5]["role"], "user");
-        let tail_user = msgs[5]["content"].as_str().unwrap();
+        let tail_user = message_text(&msgs[5]);
         assert!(
             tail_user.starts_with("<system-reminder>volatile</system-reminder>"),
-            "volatile reminder should be appended as the true tail user"
+            "volatile reminder should be appended as runtime context"
         );
     }
 
@@ -1520,8 +1751,9 @@ mod tests {
         assert_eq!(msgs[2]["content"], "tail assistant");
         assert_eq!(msgs[3]["role"], "user");
         assert_eq!(
-            msgs[3]["content"], "<system-reminder>volatile</system-reminder>",
-            "non-tool tails should append a single synthetic reminder user without an extra assistant ack"
+            message_text(&msgs[3]),
+            "<system-reminder>volatile</system-reminder>",
+            "non-tool tails should append a single synthetic runtime context message"
         );
     }
 
@@ -1556,9 +1788,55 @@ mod tests {
             astra_turn_core::context_serializer::message_has_cache_control(&msgs[3]),
             "last real tool result must carry the message-level cache marker",
         );
+        assert_eq!(msgs[5]["role"], "user");
         assert!(
             !astra_turn_core::context_serializer::message_has_cache_control(&msgs[5]),
-            "synthetic tail user must stay unannotated",
+            "synthetic runtime tail must stay unannotated",
+        );
+    }
+
+    #[test]
+    fn anthropic_user_tail_keeps_runtime_context_after_user_cache_marker() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let preamble = vec![json!({"role": "user", "content": "[active-turn-frame:v1]\nlatest"})];
+        let compacted = vec![json!({"role": "user", "content": "latest real user"})];
+        let msgs = assemble_llm_messages_with_cache_capability(
+            system,
+            preamble,
+            Vec::new(),
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "anthropic",
+            "claude-sonnet-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+            &anthropic_cache_cfg(),
+        );
+
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs.len(), 2);
+        assert!(
+            astra_turn_core::context_serializer::message_has_cache_control(&msgs[1]),
+            "final real user message must retain the Anthropic message cache marker",
+        );
+        let blocks = msgs[1]["content"]
+            .as_array()
+            .expect("tail user content should be block-shaped");
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].get("cache_control").is_some());
+        assert!(
+            blocks[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("latest real user")
+        );
+        assert!(blocks[1].get("cache_control").is_none());
+        assert!(
+            blocks[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("active-turn-frame")
         );
     }
 

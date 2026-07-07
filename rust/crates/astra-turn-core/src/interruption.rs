@@ -50,6 +50,10 @@ pub enum InterruptionKind {
     /// the turn so resumption surfaces the reason instead of an opaque final
     /// text string.
     GuardAbort,
+    /// Generic legacy interruption marker from pre-structured agent result paths.
+    Interrupted,
+    /// Executor task/channel disappeared before a terminal result was delivered.
+    ExecutorDropped,
 }
 
 impl InterruptionKind {
@@ -74,6 +78,8 @@ impl InterruptionKind {
             Self::HarnessBlocked => "harness_blocked",
             Self::HarnessPaused => "harness_paused",
             Self::GuardAbort => "guard_abort",
+            Self::Interrupted => "interrupted",
+            Self::ExecutorDropped => "executor_dropped",
         }
     }
 
@@ -97,6 +103,8 @@ impl InterruptionKind {
             "harness_blocked" => Some(Self::HarnessBlocked),
             "harness_paused" => Some(Self::HarnessPaused),
             "guard_abort" => Some(Self::GuardAbort),
+            "interrupted" => Some(Self::Interrupted),
+            "executor_dropped" => Some(Self::ExecutorDropped),
             _ => None,
         }
     }
@@ -115,7 +123,9 @@ impl InterruptionKind {
             | Self::CriticalVerdict
             | Self::ServerOverload
             | Self::StreamTransport
-            | Self::StreamIdle => true,
+            | Self::StreamIdle
+            | Self::Interrupted
+            | Self::ExecutorDropped => true,
             Self::ContextOverflow => true, // resumable with compaction
             Self::AuthFailure => false,    // needs external credential refresh
             Self::ApprovalRejected => true,
@@ -790,6 +800,11 @@ mod tests {
             InterruptionKind::ServerOverload,
             InterruptionKind::StreamTransport,
             InterruptionKind::StreamIdle,
+            InterruptionKind::HarnessBlocked,
+            InterruptionKind::HarnessPaused,
+            InterruptionKind::GuardAbort,
+            InterruptionKind::Interrupted,
+            InterruptionKind::ExecutorDropped,
         ];
         for kind in kinds {
             let label = kind.label();
@@ -818,8 +833,11 @@ mod tests {
         assert!(InterruptionKind::CumulativeBudgetExceeded.is_resumable());
         assert!(InterruptionKind::ServerOverload.is_resumable());
         assert!(InterruptionKind::CooldownRejected.is_resumable());
+        assert!(InterruptionKind::Interrupted.is_resumable());
+        assert!(InterruptionKind::ExecutorDropped.is_resumable());
         // non-resumable
         assert!(!InterruptionKind::AuthFailure.is_resumable());
+        assert!(!InterruptionKind::HarnessBlocked.is_resumable());
     }
 
     // ── error_kind → interruption mapping ──
@@ -919,6 +937,10 @@ mod tests {
         );
         assert_eq!(
             ResumeMode::from_json_value(None, "budget_exhausted"),
+            ResumeMode::Continue
+        );
+        assert_eq!(
+            ResumeMode::from_json_value(None, "executor_dropped"),
             ResumeMode::Continue
         );
         // explicit value wins over kind default

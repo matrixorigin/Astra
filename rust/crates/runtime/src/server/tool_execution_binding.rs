@@ -3,15 +3,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::tool_route_selection::ToolExecutionRouteKind;
+
 // Re-export canonical workspace/environment types from astra-runtime-env.
 pub use astra_runtime_env::{ExecutorStatus, WorkspaceAuthority, WorkspaceBindingKind};
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FallbackPolicy {
-    /// Never route a tool call away from the selected executor.
-    Disabled,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceBinding {
@@ -19,17 +14,15 @@ pub struct WorkspaceBinding {
     pub display_name: String,
     pub cwd: Option<String>,
     pub authority: WorkspaceAuthority,
-    pub fallback_policy: FallbackPolicy,
 }
 
 impl WorkspaceBinding {
     pub fn none() -> Self {
         Self {
             kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
+            display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
-            fallback_policy: FallbackPolicy::Disabled,
         }
     }
 
@@ -39,7 +32,6 @@ impl WorkspaceBinding {
             display_name: "Server sandbox".to_string(),
             cwd: Some(root.as_ref().display().to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         }
     }
 
@@ -53,7 +45,6 @@ impl WorkspaceBinding {
             display_name: display_name.into(),
             cwd: Some(cwd.into()),
             authority,
-            fallback_policy: FallbackPolicy::Disabled,
         }
     }
 
@@ -63,7 +54,6 @@ impl WorkspaceBinding {
             display_name: "Cloud workspace".to_string(),
             cwd: Some(root.into()),
             authority,
-            fallback_policy: FallbackPolicy::Disabled,
         }
     }
 }
@@ -136,6 +126,16 @@ impl ExecutorBinding {
         }
     }
 
+    pub fn request_scoped_mcp() -> Self {
+        Self {
+            kind: ExecutorBindingKind::Mcp,
+            executor_id: "request-scoped-mcp".to_string(),
+            display_name: "Request-scoped MCP".to_string(),
+            transport: ToolTransportKind::McpHttp,
+            status: ExecutorStatus::Online,
+        }
+    }
+
     pub fn orchestrator_managed(
         executor_id: impl Into<String>,
         display_name: impl Into<String>,
@@ -148,6 +148,43 @@ impl ExecutorBinding {
             transport: ToolTransportKind::SandboxResidentAgent,
             status,
         }
+    }
+}
+
+pub(crate) fn runtime_env_executor_kind_for_provider(
+    kind: ExecutorBindingKind,
+) -> astra_runtime_env::ExecutorBindingKind {
+    match kind {
+        ExecutorBindingKind::ServerLocal => astra_runtime_env::ExecutorBindingKind::ServerRuntime,
+        ExecutorBindingKind::EdgeAgent => astra_runtime_env::ExecutorBindingKind::EdgeAgent,
+        ExecutorBindingKind::OrchestratorManaged => {
+            astra_runtime_env::ExecutorBindingKind::OrchestratorManaged
+        }
+        ExecutorBindingKind::ThinClient
+        | ExecutorBindingKind::Mcp
+        | ExecutorBindingKind::Unknown => astra_runtime_env::ExecutorBindingKind::Unknown,
+    }
+}
+
+pub(crate) fn capacity_provider_type_for_workspace_executor(
+    workspace_kind: WorkspaceBindingKind,
+    executor_kind: ExecutorBindingKind,
+) -> astra_runtime_env::CapacityProviderType {
+    astra_runtime_env::runtime_execution_provider_type(
+        workspace_kind,
+        runtime_env_executor_kind_for_provider(executor_kind),
+    )
+}
+
+pub(crate) fn runtime_execution_provider_id_for_executor(executor: &ExecutorBinding) -> String {
+    match executor.kind {
+        ExecutorBindingKind::ServerLocal => "server-sandbox".to_string(),
+        ExecutorBindingKind::EdgeAgent | ExecutorBindingKind::OrchestratorManaged => {
+            executor.executor_id.clone()
+        }
+        ExecutorBindingKind::ThinClient
+        | ExecutorBindingKind::Mcp
+        | ExecutorBindingKind::Unknown => "workspace-executor".to_string(),
     }
 }
 
@@ -177,7 +214,45 @@ pub struct ToolExecutionRequest {
     pub executor: ExecutorBinding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<astra_runtime_env::RuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_offer: Option<SelectedToolOfferSnapshot>,
     pub policy: ToolPolicySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectedToolOfferSnapshot {
+    pub offer_id: String,
+    pub provider_id: String,
+    #[serde(default = "default_selected_offer_route")]
+    pub route: ToolExecutionRouteKind,
+}
+
+impl SelectedToolOfferSnapshot {
+    pub fn new(tool_name: impl AsRef<str>, provider_id: impl Into<String>) -> Self {
+        let provider_id = provider_id.into();
+        Self {
+            offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
+            provider_id,
+            route: default_selected_offer_route(),
+        }
+    }
+
+    pub fn new_with_route(
+        tool_name: impl AsRef<str>,
+        provider_id: impl Into<String>,
+        route: ToolExecutionRouteKind,
+    ) -> Self {
+        let provider_id = provider_id.into();
+        Self {
+            offer_id: astra_runtime_env::tool_offer_id(tool_name.as_ref(), &provider_id),
+            provider_id,
+            route,
+        }
+    }
+}
+
+fn default_selected_offer_route() -> ToolExecutionRouteKind {
+    ToolExecutionRouteKind::Unsupported
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -306,12 +381,18 @@ impl ExecutionBindingState {
             workspace_record: self.workspace_record.clone(),
             executor: self.executor.clone(),
             runtime: self.runtime.clone(),
+            selected_offer: None,
             policy: ToolPolicySnapshot::default(),
         }
     }
 }
 
 impl ToolExecutionRequest {
+    pub(crate) fn with_selected_offer(mut self, offer: SelectedToolOfferSnapshot) -> Self {
+        self.selected_offer = Some(offer);
+        self
+    }
+
     pub(crate) fn with_transport_arguments(&self) -> Self {
         let mut request = self.clone();
         request.args = transport_tool_arguments(&request.args);
@@ -399,7 +480,6 @@ mod tests {
                 display_name: "Cloud workspace".to_string(),
                 cwd: Some("/workspace".to_string()),
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: FallbackPolicy::Disabled,
             },
             ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,

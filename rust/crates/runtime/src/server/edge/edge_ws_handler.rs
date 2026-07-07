@@ -5,6 +5,7 @@
 //! Results are sent back over the same WebSocket.
 
 use super::*;
+use astra_runtime_env::CapacityProvider;
 use astra_server_types::edge_connection_pool::EdgeToolResult;
 use astra_server_types::edge_ws_protocol::*;
 
@@ -12,6 +13,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
 use futures_util::stream::SplitSink;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -23,35 +25,55 @@ const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 /// Global counter of active edge WebSocket connections.
 static EDGE_WS_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+struct EdgeWsConnectionPermit;
+
+impl Drop for EdgeWsConnectionPermit {
+    fn drop(&mut self) {
+        EDGE_WS_CONNECTION_COUNT.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn try_acquire_edge_ws_connection() -> Option<EdgeWsConnectionPermit> {
+    loop {
+        let current = EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire);
+        if current >= MAX_EDGE_WS_CONNECTIONS {
+            return None;
+        }
+        if EDGE_WS_CONNECTION_COUNT
+            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(EdgeWsConnectionPermit);
+        }
+    }
+}
+
 /// Axum handler for edge WebSocket upgrade.
 pub(crate) async fn edge_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let current = EDGE_WS_CONNECTION_COUNT.fetch_add(1, Ordering::Relaxed);
-    if current >= MAX_EDGE_WS_CONNECTIONS {
-        EDGE_WS_CONNECTION_COUNT.fetch_sub(1, Ordering::Relaxed);
+    let Some(permit) = try_acquire_edge_ws_connection() else {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "too many edge WebSocket connections",
         )
             .into_response();
-    }
+    };
     ws.max_message_size(256 * 1024)
-        .on_upgrade(move |socket| handle_edge_connection(socket, state))
+        .on_failed_upgrade(|error| {
+            tracing::warn!(target: "astra::edge_ws", %error, "edge WebSocket upgrade failed");
+        })
+        .on_upgrade(move |socket| handle_edge_connection(socket, state, permit))
         .into_response()
 }
 
 /// Main edge WebSocket connection loop.
-async fn handle_edge_connection(socket: WebSocket, state: AppState) {
-    // RAII guard: decrement on exit.
-    struct ConnGuard;
-    impl Drop for ConnGuard {
-        fn drop(&mut self) {
-            EDGE_WS_CONNECTION_COUNT.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-    let _guard = ConnGuard;
+async fn handle_edge_connection(
+    socket: WebSocket,
+    state: AppState,
+    _permit: EdgeWsConnectionPermit,
+) {
     let (ws_sink, mut ws_stream) = socket.split();
     let ws_sink = Arc::new(tokio::sync::Mutex::new(ws_sink));
 
@@ -104,6 +126,22 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
             return;
         }
     };
+
+    if !astra_runtime_env::is_valid_provider_id(&edge_agent_id) {
+        tracing::warn!(
+            target: "astra_runtime::edge_ws",
+            edge_agent_id = %edge_agent_id,
+            "edge WebSocket auth failed: invalid edge_agent_id"
+        );
+        let _ = send_edge_msg(
+            &ws_sink,
+            EdgeServerMessage::AuthError {
+                message: "invalid edge_agent_id".into(),
+            },
+        )
+        .await;
+        return;
+    }
 
     // Validate token
     let mut headers = HeaderMap::new();
@@ -182,13 +220,15 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
         .await;
 
     // ── Phase 2b: Spawn cross-pod dispatch relay polling task ─────────
+    let inflight_dispatches = InflightEdgeDispatchTracker::default();
     let dispatch_user_id = user_id.clone();
     let dispatch_agent_id = edge_agent_id.clone();
     let dispatch_svc = state.execution.edge_dispatch_service.clone();
     let dispatch_sink = ws_sink.clone();
+    let dispatch_inflight = inflight_dispatches.clone();
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
 
-    let dispatch_task = tokio::spawn(async move {
+    let mut dispatch_task = tokio::spawn(async move {
         // 2000ms interval keeps per-connection DB QPS at 0.5
         // (vs 5 at 200ms). Cross-pod dispatch targets ~2s end-to-end.
         let mut interval = tokio::time::interval(Duration::from_millis(2000));
@@ -220,7 +260,30 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                         continue;
                                     }
                                 };
+                                let inflight = InflightEdgeDispatch {
+                                    user_id: row.user_id.clone(),
+                                    edge_agent_id: row.edge_agent_id.clone(),
+                                    request_id: row.request_id.clone(),
+                                };
+                                if let Err(inflight) = dispatch_inflight.track(inflight).await {
+                                    tracing::warn!(
+                                        target: "astra_runtime::edge_ws",
+                                        user_id = %inflight.user_id,
+                                        edge_agent_id = %inflight.edge_agent_id,
+                                        request_id = %inflight.request_id,
+                                        "Edge dispatch relay rejected claimed dispatch because websocket cleanup is closing"
+                                    );
+                                    fail_inflight_edge_dispatches(
+                                        dispatch_svc.as_ref(),
+                                        std::slice::from_ref(&inflight),
+                                        "edge_ws_disconnected",
+                                    )
+                                    .await;
+                                    stop_dispatch = true;
+                                    break;
+                                }
                                 if send_edge_msg(&dispatch_sink, msg).await.is_err() {
+                                    dispatch_inflight.remove(&row.request_id).await;
                                     tracing::warn!(
                                         target: "astra_runtime::edge_ws",
                                         user_id = %row.user_id,
@@ -257,6 +320,7 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     let pool_for_cleanup = state.edge_connection_pool.clone();
     let user_id_cleanup = user_id.clone();
     let edge_agent_id_cleanup = edge_agent_id.clone();
+    let read_inflight = inflight_dispatches.clone();
 
     // Task: forward server → edge messages from the pool channel
     let ws_sink_fwd = ws_sink.clone();
@@ -349,6 +413,8 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
                                             error = %e,
                                             "Edge WS: failed to deliver tool result for cross-pod"
                                         );
+                                    } else {
+                                        read_inflight.remove(&request_id).await;
                                     }
                                 }
                                 Ok(EdgeClientMessage::Ping) => {
@@ -390,9 +456,23 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
 
     // ── Cleanup ──────────────────────────────────────────────────────
     forward_task.abort();
-    dispatch_task.abort();
     // Drop cancel sender so the dispatch task can break its loop cleanly.
     drop(dispatch_cancel_tx);
+    inflight_dispatches.close_to_new_dispatches().await;
+    if tokio::time::timeout(Duration::from_millis(250), &mut dispatch_task)
+        .await
+        .is_err()
+    {
+        dispatch_task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut dispatch_task).await;
+    }
+    let disconnected_dispatches = inflight_dispatches.drain().await;
+    fail_inflight_edge_dispatches(
+        state.execution.edge_dispatch_service.as_ref(),
+        &disconnected_dispatches,
+        "edge_ws_disconnected",
+    )
+    .await;
     pool_for_cleanup.unregister(&user_id_cleanup, &edge_agent_id_cleanup);
 
     // Unregister from DB edge registry so other pods stop routing to this edge.
@@ -409,6 +489,63 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     );
 }
 
+#[derive(Debug)]
+struct InflightEdgeDispatch {
+    user_id: String,
+    edge_agent_id: String,
+    request_id: String,
+}
+
+#[derive(Clone)]
+struct InflightEdgeDispatchTracker {
+    inner: Arc<tokio::sync::Mutex<InflightEdgeDispatchState>>,
+}
+
+#[derive(Default)]
+struct InflightEdgeDispatchState {
+    closing: bool,
+    dispatches: HashMap<String, InflightEdgeDispatch>,
+}
+
+impl Default for InflightEdgeDispatchTracker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(InflightEdgeDispatchState::default())),
+        }
+    }
+}
+
+impl InflightEdgeDispatchTracker {
+    async fn track(&self, dispatch: InflightEdgeDispatch) -> Result<(), InflightEdgeDispatch> {
+        let mut state = self.inner.lock().await;
+        if state.closing {
+            return Err(dispatch);
+        }
+        state
+            .dispatches
+            .insert(dispatch.request_id.clone(), dispatch);
+        Ok(())
+    }
+
+    async fn remove(&self, request_id: &str) -> Option<InflightEdgeDispatch> {
+        self.inner.lock().await.dispatches.remove(request_id)
+    }
+
+    async fn close_to_new_dispatches(&self) {
+        self.inner.lock().await.closing = true;
+    }
+
+    async fn drain(&self) -> Vec<InflightEdgeDispatch> {
+        self.inner
+            .lock()
+            .await
+            .dispatches
+            .drain()
+            .map(|(_, dispatch)| dispatch)
+            .collect()
+    }
+}
+
 /// Helper: serialize and send an EdgeServerMessage over the WebSocket.
 async fn send_edge_msg(
     sink: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
@@ -421,6 +558,91 @@ async fn send_edge_msg(
         .send(Message::Text(text.into()))
         .await
         .map_err(|_| ())
+}
+
+async fn fail_inflight_edge_dispatches(
+    dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
+    rows: &[InflightEdgeDispatch],
+    reason: &'static str,
+) -> usize {
+    let mut failed = 0;
+    for row in rows {
+        match dispatch
+            .fail_dispatch(&row.user_id, &row.request_id, reason)
+            .await
+        {
+            Ok(true) => failed += 1,
+            Ok(false) => {
+                tracing::debug!(
+                    target: "astra_runtime::edge_ws",
+                    user_id = %row.user_id,
+                    edge_agent_id = %row.edge_agent_id,
+                    request_id = %row.request_id,
+                    reason,
+                    "Edge dispatch was already terminal before disconnect cleanup"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::edge_ws",
+                    user_id = %row.user_id,
+                    edge_agent_id = %row.edge_agent_id,
+                    request_id = %row.request_id,
+                    reason,
+                    error = %error,
+                    "Edge dispatch disconnect cleanup failed"
+                );
+            }
+        }
+    }
+    failed
+}
+
+#[cfg(test)]
+mod inflight_dispatch_tracker_tests {
+    use super::*;
+
+    fn dispatch(request_id: &str) -> InflightEdgeDispatch {
+        InflightEdgeDispatch {
+            user_id: "user-a".to_string(),
+            edge_agent_id: "edge-a".to_string(),
+            request_id: request_id.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_close_drains_existing_and_rejects_late_dispatches() {
+        let tracker = InflightEdgeDispatchTracker::default();
+        assert!(tracker.track(dispatch("req-1")).await.is_ok());
+
+        tracker.close_to_new_dispatches().await;
+
+        let rejected = tracker.track(dispatch("req-2")).await.unwrap_err();
+        assert_eq!(rejected.request_id, "req-2");
+
+        let drained = tracker.drain().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].request_id, "req-1");
+        assert!(tracker.drain().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracker_remove_is_idempotent_before_and_after_close() {
+        let tracker = InflightEdgeDispatchTracker::default();
+        assert!(tracker.track(dispatch("req-1")).await.is_ok());
+
+        assert_eq!(
+            tracker
+                .remove("req-1")
+                .await
+                .map(|dispatch| dispatch.request_id),
+            Some("req-1".to_string())
+        );
+        assert!(tracker.remove("req-1").await.is_none());
+
+        tracker.close_to_new_dispatches().await;
+        assert!(tracker.remove("req-2").await.is_none());
+    }
 }
 
 async fn fail_claimed_edge_dispatch(
@@ -527,16 +749,39 @@ fn validate_edge_capabilities(
         return None;
     }
 
-    // Cross-reference tool names against the server-side built-in registry.
-    // Strip any tool name that doesn't exist — a malicious edge cannot
-    // fabricate tools it doesn't really have.
+    if advert.binding.executor.executor_id != edge_agent_id {
+        tracing::warn!(
+            target: "astra_runtime::edge_ws",
+            edge_agent_id = %edge_agent_id,
+            advertised_executor_id = %advert.binding.executor.executor_id,
+            "edge sent executor id that does not match authenticated edge id; accepting with empty capabilities"
+        );
+        return None;
+    }
+
+    // Cross-reference tool names against the edge provider contract. Strip
+    // registry-only, server-owned, or currently unavailable tools — edge is a
+    // runtime executor provider, not a source of server/control-plane capacity.
     let registry = astra_runtime_env::ToolRegistry::builtins();
+    let edge_provider = astra_runtime_env::runtime_workspace_provider(
+        astra_runtime_env::CapacityProviderType::EdgeCapacity,
+        advert.binding.executor.executor_id.clone(),
+        &registry,
+        advert.binding.runtime.platform,
+    );
     let original_count = advert.binding.tool_surface.tool_names.len();
+    advert.binding.tool_surface.tool_names.retain(|name| {
+        registry.get(name).is_some()
+            && edge_provider.declares_tool(name)
+            && astra_runtime_env::CapabilityResolver
+                .check_tool(&registry, name, &advert.binding.capabilities)
+                .is_ok()
+    });
     advert
         .binding
         .tool_surface
-        .tool_names
-        .retain(|name| registry.get(name).is_some());
+        .denials
+        .retain(|denial| edge_provider.declares_tool(&denial.tool_name));
     let stripped = original_count - advert.binding.tool_surface.tool_names.len();
     if stripped > 0 {
         tracing::warn!(
@@ -544,7 +789,7 @@ fn validate_edge_capabilities(
             edge_agent_id = %edge_agent_id,
             stripped,
             remaining = advert.binding.tool_surface.tool_names.len(),
-            "edge advertised non-existent tools — stripped"
+            "edge advertised tools outside edge provider ownership — stripped"
         );
     }
 
@@ -554,6 +799,7 @@ fn validate_edge_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_runtime_env::{RuntimeEnvironmentAdvertisement, ToolUnavailableReason};
     use astra_services::multi_agent::{EdgeDispatchRow, EdgeDispatchService};
     use std::sync::Mutex;
 
@@ -632,6 +878,93 @@ mod tests {
         }
     }
 
+    fn edge_advertisement_with_tools(tool_names: &[&str]) -> serde_json::Value {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut binding = astra_runtime_env::RunBinding::edge_developer("/workspace", &registry);
+        binding.tool_surface.tool_names =
+            tool_names.iter().map(|name| (*name).to_string()).collect();
+        binding.tool_surface.denials = vec![
+            astra_runtime_env::ToolDenial {
+                tool_name: "ask_user".to_string(),
+                reason: ToolUnavailableReason::ExecutorUnavailable(
+                    "control_plane_required".to_string(),
+                ),
+            },
+            astra_runtime_env::ToolDenial {
+                tool_name: "write_file".to_string(),
+                reason: ToolUnavailableReason::PolicyDenied("filesystem_write".to_string()),
+            },
+        ];
+        serde_json::to_value(RuntimeEnvironmentAdvertisement::new(binding))
+            .expect("edge advertisement serializes")
+    }
+
+    fn edge_advertisement_with_executor_id(
+        executor_id: &str,
+        tool_names: &[&str],
+    ) -> serde_json::Value {
+        let mut advert: RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(edge_advertisement_with_tools(tool_names))
+                .expect("edge advertisement parses");
+        advert.binding.executor.executor_id = executor_id.to_string();
+        serde_json::to_value(advert).expect("edge advertisement serializes")
+    }
+
+    #[test]
+    fn validate_edge_capabilities_strips_non_edge_provider_tools() {
+        let capabilities = edge_advertisement_with_tools(&[
+            "read_file",
+            "bash",
+            "ask_user",
+            "tool_search",
+            "memory",
+            "mcp__weather",
+            "not_registered",
+        ]);
+
+        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
+            .expect("valid edge advertisement");
+        let advert: RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(sanitized).expect("sanitized advertisement");
+
+        assert!(advert.binding.tool_surface.contains("read_file"));
+        assert!(advert.binding.tool_surface.contains("bash"));
+        for hidden in [
+            "ask_user",
+            "tool_search",
+            "memory",
+            "mcp__weather",
+            "not_registered",
+        ] {
+            assert!(
+                !advert.binding.tool_surface.contains(hidden),
+                "{hidden} must not be accepted as edge-owned capacity"
+            );
+        }
+        assert!(
+            advert
+                .binding
+                .tool_surface
+                .denials
+                .iter()
+                .all(|denial| denial.tool_name == "write_file"),
+            "edge capability denials should only describe edge-owned runtime tools"
+        );
+    }
+
+    #[test]
+    fn validate_edge_capabilities_rejects_executor_id_mismatch() {
+        let capabilities =
+            edge_advertisement_with_executor_id("edge@forged", &["read_file", "bash"]);
+
+        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1");
+
+        assert!(
+            sanitized.is_none(),
+            "edge advertisement executor id must match authenticated edge id before tools become offers"
+        );
+    }
+
     #[tokio::test]
     async fn fail_claimed_edge_dispatches_marks_each_row_terminal() {
         let dispatch = RecordingEdgeDispatch::default();
@@ -656,5 +989,104 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    fn inflight_dispatch(request_id: &str) -> InflightEdgeDispatch {
+        InflightEdgeDispatch {
+            user_id: "user-1".to_string(),
+            edge_agent_id: "edge-1".to_string(),
+            request_id: request_id.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn inflight_tracker_lifecycle_covers_send_fail_deliver_and_disconnect_drain() {
+        let tracker = InflightEdgeDispatchTracker::default();
+
+        assert!(
+            tracker
+                .track(inflight_dispatch("send-failed"))
+                .await
+                .is_ok()
+        );
+        let removed = tracker.remove("send-failed").await;
+        assert!(
+            removed.is_some(),
+            "send failure must remove the pre-registered dispatch before claimed-row failure handling"
+        );
+        assert!(
+            tracker.drain().await.is_empty(),
+            "send-failed dispatch must not be failed again during disconnect cleanup"
+        );
+
+        assert!(tracker.track(inflight_dispatch("delivered")).await.is_ok());
+        let delivered = tracker.remove("delivered").await;
+        assert!(
+            delivered.is_some(),
+            "successful edge result delivery must remove the inflight dispatch"
+        );
+        assert!(
+            tracker.drain().await.is_empty(),
+            "delivered dispatch must not be treated as orphaned on disconnect"
+        );
+
+        assert!(tracker.track(inflight_dispatch("orphaned")).await.is_ok());
+        let drained = tracker.drain().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].request_id, "orphaned");
+        assert!(
+            tracker.drain().await.is_empty(),
+            "disconnect cleanup must consume orphaned dispatches exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_tracker_concurrent_remove_and_disconnect_drain_consume_once() {
+        let tracker = InflightEdgeDispatchTracker::default();
+        assert!(tracker.track(inflight_dispatch("race")).await.is_ok());
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let remove_tracker = tracker.clone();
+        let remove_barrier = std::sync::Arc::clone(&barrier);
+        let remove_task = tokio::spawn(async move {
+            remove_barrier.wait().await;
+            remove_tracker.remove("race").await
+        });
+
+        let drain_tracker = tracker.clone();
+        let drain_barrier = std::sync::Arc::clone(&barrier);
+        let drain_task = tokio::spawn(async move {
+            drain_barrier.wait().await;
+            drain_tracker.drain().await
+        });
+
+        barrier.wait().await;
+        let removed = remove_task.await.expect("remove task should not panic");
+        let drained = drain_task.await.expect("drain task should not panic");
+        let consumed_count = usize::from(removed.is_some())
+            + drained
+                .iter()
+                .filter(|dispatch| dispatch.request_id == "race")
+                .count();
+
+        assert_eq!(
+            consumed_count, 1,
+            "delivery and disconnect cleanup racing for the same dispatch must have exactly one winner"
+        );
+        assert!(
+            tracker.drain().await.is_empty(),
+            "no inflight dispatch should remain after the race resolves"
+        );
+    }
+
+    #[test]
+    fn edge_ws_connection_permit_has_single_owner_and_releases_on_drop() {
+        let previous = EDGE_WS_CONNECTION_COUNT.swap(0, Ordering::AcqRel);
+        let permit = try_acquire_edge_ws_connection().expect("permit should be available");
+        assert_eq!(EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire), 1);
+
+        drop(permit);
+        assert_eq!(EDGE_WS_CONNECTION_COUNT.load(Ordering::Acquire), 0);
+        EDGE_WS_CONNECTION_COUNT.store(previous, Ordering::Release);
     }
 }

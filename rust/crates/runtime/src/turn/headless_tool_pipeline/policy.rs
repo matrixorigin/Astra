@@ -13,8 +13,9 @@ use astra_turn_core::headless_tool_assembly::{
 use astra_turn_core::headless_tool_body_preview::emit_headless_tool_body_preview;
 use astra_turn_core::headless_tool_journal::{
     journal_record_blocked_tool, journal_record_cross_turn_cache_hit,
-    journal_record_duplicate_within_turn, journal_record_suppressed_tool_retry,
-    journal_record_tool_not_admitted, journal_record_unknown_tool,
+    journal_record_deferred_activation_hint, journal_record_duplicate_within_turn,
+    journal_record_suppressed_tool_retry, journal_record_tool_not_admitted,
+    journal_record_unknown_tool,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_unknown_tool_detail,
@@ -220,7 +221,7 @@ fn validator_denial_body(
 
 fn runtime_binding_denial_for_unmatched_execution(
     execution: &HeadlessResolvedExecution,
-    server_tool_executor: Option<&crate::server::server_tool_executor::ServerToolExecutor>,
+    runtime_tool_executor: Option<&crate::server::runtime_tool_executor::RuntimeToolExecutor>,
 ) -> Option<String> {
     if execution.is_edge_tool {
         return None;
@@ -240,7 +241,7 @@ fn runtime_binding_denial_for_unmatched_execution(
         return None;
     }
     let has_runtime_binding =
-        server_tool_executor.is_some_and(|executor| executor.has_runtime_binding(&execution.name));
+        runtime_tool_executor.is_some_and(|executor| executor.has_runtime_binding(&execution.name));
     if has_runtime_binding {
         return None;
     }
@@ -681,13 +682,13 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         if !self.ctx.valid_tool_names.contains(&execution.name) {
             let is_prompt_deferred = self.ctx.deferred_tool_names.contains(&execution.name);
-            let is_activatable_deferred = self.ctx.server_tool_executor.is_some_and(|exec| {
+            let is_activatable_deferred = self.ctx.runtime_tool_executor.is_some_and(|exec| {
                 exec.current_activatable_tool_names_snapshot()
                     .contains(&execution.name)
             });
             let tool_runtime_ready = |name: &str| {
                 self.ctx
-                    .server_tool_executor
+                    .runtime_tool_executor
                     .is_some_and(|exec| exec.tool_runtime_ready(name))
             };
             let action = execution.args.get("action").and_then(Value::as_str);
@@ -697,7 +698,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 tool_runtime_ready,
             ) {
                 DirectDeferredCallAdmission::Activate { name } => {
-                    if let Some(exec) = self.ctx.server_tool_executor {
+                    if let Some(exec) = self.ctx.runtime_tool_executor {
                         exec.record_direct_deferred_call_activation(&name);
                     }
                     (
@@ -783,14 +784,22 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.messages.push(tool_msg);
             self.ctx.tool_results.push(err_tr);
             if is_prompt_deferred {
-                self.ctx
-                    .tool_call_records
-                    .push(journal_record_tool_not_admitted(
+                let record = if skip_reason == "direct_deferred_call_activated" {
+                    journal_record_deferred_activation_hint(
                         execution.name.clone(),
-                        args_preview,
+                        args_preview.clone(),
                         &err_msg,
                         execution.early_exit_ms,
-                    ));
+                    )
+                } else {
+                    journal_record_tool_not_admitted(
+                        execution.name.clone(),
+                        args_preview.clone(),
+                        &err_msg,
+                        execution.early_exit_ms,
+                    )
+                };
+                self.ctx.tool_call_records.push(record);
             } else {
                 self.ctx.tool_call_records.push(journal_record_unknown_tool(
                     execution.name.clone(),
@@ -806,7 +815,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         if let Some(err_msg) = runtime_binding_denial_for_unmatched_execution(
             &execution,
-            self.ctx.server_tool_executor,
+            self.ctx.runtime_tool_executor,
         ) {
             if !self.ctx.quiet {
                 self.ctx.term.emit_line(
@@ -897,6 +906,41 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             mut execution,
             idem_key,
         } = validated;
+        if server_owned_edge_result_should_be_rejected(
+            &execution,
+            self.ctx.runtime_tool_executor.is_some(),
+        ) {
+            let err_msg = server_owned_edge_result_error(&execution);
+            tracing::warn!(
+                target: "astra_runtime::headless_tool_pipeline",
+                tool_name = %execution.name,
+                tool_call_id = %execution.id,
+                "rejected client/edge result for server-owned tool"
+            );
+            emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &execution.id,
+                    name: &execution.name,
+                    args: &execution.args,
+                    reason_code: "wrong_executor_result",
+                    journal_kind: HeadlessShortCircuitJournalKind::HardBlocked,
+                    journal_reason: err_msg.clone(),
+                    err_msg,
+                    early_exit_ms: execution.early_exit_ms,
+                    status_line: Some(format!(
+                        "  ⚠ Wrong executor result rejected: {}",
+                        execution.name
+                    )),
+                },
+                self.ctx.step_recorder,
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
         if let Some(err_msg) = edge_result_runtime_environment_denial(&execution) {
             emit_blocked_tool_result(
                 HeadlessBlockedTool {

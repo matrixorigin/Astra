@@ -15,12 +15,13 @@ pub(crate) fn analyze_chat_turn_learning(
     result: &StreamResult,
 ) -> TurnLearningSnapshot {
     use astra_runtime::pipeline::evaluation::{
-        TurnEvaluationTelemetry, current_evaluation_thresholds,
+        TurnEvaluationTelemetry, apply_final_answer_relevance, current_evaluation_thresholds,
         evaluate_tool_call_records_with_thresholds_and_telemetry,
     };
     use astra_turn_core::routing_engine::RoutingEngine;
 
-    let routing = RoutingEngine::analyze(line, turn, recent_tools, &[], vec![]);
+    let latest_user_input = result.latest_user_input(line);
+    let routing = RoutingEngine::analyze(&latest_user_input, turn, recent_tools, &[], vec![]);
 
     let has_verdict_warning = result.verdict_events.iter().any(|verdict| {
         verdict.severity.eq_ignore_ascii_case("warning")
@@ -52,8 +53,8 @@ pub(crate) fn analyze_chat_turn_learning(
         );
     }
 
-    let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
-        line,
+    let mut eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
+        &latest_user_input,
         recent_tools,
         &result.tool_call_records,
         result.stall_events.len(),
@@ -67,6 +68,7 @@ pub(crate) fn analyze_chat_turn_learning(
             max_round_prompt_tokens,
         },
     );
+    apply_final_answer_relevance(&mut eval, &latest_user_input, &result.full_text);
 
     TurnLearningSnapshot { routing, eval }
 }
@@ -106,6 +108,12 @@ pub(crate) fn turn_quality_feedback_from_eval(
                 saw_stall_issue = true;
                 findings.push(format!(
                     "Unresolved tool outcome failure: {class} x{count}; do not report completion until a matching validation command succeeds."
+                ));
+            }
+            EvalSignal::BlockedToolCall { count } => {
+                saw_stall_issue = true;
+                findings.push(format!(
+                    "{count} tool call(s) were blocked before execution; do not retry the same unavailable tool surface without changing provider or approach."
                 ));
             }
             EvalSignal::ExplorationFamilyChurn { streak, .. } => {
@@ -217,6 +225,37 @@ mod tests {
                 delta_tokens: 11_553,
             }
         )));
+    }
+
+    #[test]
+    fn analyze_chat_turn_learning_applies_final_answer_relevance() {
+        let mut result =
+            crate::tests::stub_stream_result("148 files changed, +9498 / -2335 lines, 11 commits.");
+        result.tools_used = vec!["git".into()];
+        result.tool_calls_count = 1;
+        result.tool_call_records = vec![session_journal::ToolCallRecord {
+            name: "git".into(),
+            ok: true,
+            ms: 12,
+            output_bytes: Some(240),
+            result_preview: Some("diff".into()),
+            ..Default::default()
+        }];
+
+        let learning = analyze_chat_turn_learning("相关的测试够硬核吗？", 3, &[], &result);
+
+        assert!(!learning.eval.success);
+        assert!(learning.eval.signals.iter().any(|signal| matches!(
+            signal,
+            astra_runtime::pipeline::evaluation::EvalSignal::FinalAnswerOffTarget { .. }
+        )));
+        assert!(
+            !learning.eval.signals.iter().any(|signal| matches!(
+                signal,
+                astra_runtime::pipeline::evaluation::EvalSignal::AllToolsHealthy
+            )),
+            "tool health must not mask an off-target answer"
+        );
     }
 
     #[test]

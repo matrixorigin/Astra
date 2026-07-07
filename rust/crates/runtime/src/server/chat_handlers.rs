@@ -139,72 +139,6 @@ pub(super) fn is_session_service_unconfigured_error(
     error.0 == StatusCode::NOT_IMPLEMENTED && error.1.0.detail == "Session service not configured"
 }
 
-#[cfg(any(test, feature = "bridge-e2e-hooks"))]
-fn chat_stream_bridge_fallback_payload(
-    chat_data: &astra_services::runs::ChatRequestData,
-) -> serde_json::Value {
-    let allow_skills = normalize_bridge_allowlist(chat_data.allow_skills.as_deref());
-    let allow_skill_sources = normalize_bridge_allowlist(chat_data.allow_skill_sources.as_deref());
-    let allow_tools = normalize_bridge_allowlist(chat_data.allow_tools.as_deref());
-    let edge_profile = chat_data
-        .context
-        .as_ref()
-        .and_then(|c| c.get("edge_profile"))
-        .cloned();
-    // Hoist test_llm_stream_blocks from context to top-level so bridge can find it.
-    let test_llm_stream_blocks = chat_data
-        .context
-        .as_ref()
-        .and_then(|c| c.get("test_llm_stream_blocks"))
-        .cloned();
-    let mut payload = serde_json::json!({
-        "session_id": chat_data.session_id.as_deref(),
-        "agent_id": chat_data.agent_id.as_deref(),
-        "selected_model": chat_data.selected_model.as_ref(),
-        "llm_token_service": chat_data
-            .llm_token_service
-            .as_ref()
-            .map(|config| serde_json::json!(config)),
-        "skill_search": chat_data.skill_search.as_ref(),
-        "allow_skills": allow_skills,
-        "allow_skill_sources": allow_skill_sources,
-        "allow_tools": allow_tools,
-        "context": chat_data.context.as_ref(),
-        "parts": &chat_data.parts,
-        "attachments": &chat_data.attachments,
-        "runtime_system_prompt": chat_data.runtime_system_prompt.as_deref(),
-        "edge_executor_id": chat_data.edge_executor_id.as_deref(),
-        "capabilities": &chat_data.capabilities,
-        "execution_budget": chat_data.execution_budget.as_ref(),
-        "explain": chat_data.explain,
-        "interaction_mode": chat_data.interaction_mode,
-        "messages": [
-            {
-                "role": "user",
-                "content": chat_data.message.as_str(),
-            }
-        ],
-    });
-    if let Some(edge_profile) = edge_profile {
-        payload["edge_profile"] = edge_profile;
-    }
-    if let Some(test_llm_stream_blocks) = test_llm_stream_blocks {
-        payload["test_llm_stream_blocks"] = test_llm_stream_blocks;
-    }
-    payload
-}
-
-#[cfg(any(test, feature = "bridge-e2e-hooks"))]
-fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>> {
-    entries.map(|entries| {
-        let mut normalized = std::collections::BTreeSet::new();
-        for entry in entries {
-            normalized.insert(entry.trim().to_ascii_lowercase());
-        }
-        normalized.into_iter().collect()
-    })
-}
-
 pub(super) async fn chat_handler(
     State(state): State<AppState>,
     method: Method,
@@ -289,27 +223,6 @@ pub(super) async fn chat_stream_handler(
         inject_effective_runtime_context(&state, &principal, &mut chat_data).await
     {
         return sse_error_response_from_error(status, error.0);
-    }
-
-    // Bridge E2E hooks: when test secret is present and NO test_llm_rounds in
-    // context, route through bridge. When test_llm_rounds IS present, fall
-    // through to stream_chat() which wires mock rounds into the host.
-    #[cfg(feature = "bridge-e2e-hooks")]
-    {
-        let has_test_rounds = chat_data
-            .context
-            .as_ref()
-            .map_or(false, |c| c.contains_key("test_llm_rounds"));
-        if astra_turn_core::bridge_e2e_hooks::authorized(&headers) && !has_test_rounds {
-            let payload = chat_stream_bridge_fallback_payload(&chat_data);
-            let body = match serde_json::to_vec(&payload).map(Bytes::from) {
-                Ok(body) => body,
-                Err(e) => {
-                    return sse_error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-                }
-            };
-            return dispatch_chat_turn_bridge(&state, &user, &headers, body).await;
-        }
     }
 
     match state
@@ -552,9 +465,6 @@ pub(super) async fn chat_route_handler(
 
 #[cfg(test)]
 mod tests {
-    use astra_core::SkillSearchSettings;
-    use astra_services::runs::ChatRequestData;
-
     use super::*;
 
     #[test]
@@ -613,152 +523,6 @@ mod tests {
         // Ensure they are valid header values
         assert!(HeaderValue::from_static("1").to_str().is_ok());
         assert!(HeaderValue::from_static("0").to_str().is_ok());
-    }
-
-    #[test]
-    fn chat_stream_fallback_payload_shape() {
-        let mut context = serde_json::Map::new();
-        context.insert(
-            "edge_profile".to_string(),
-            serde_json::json!({"system_prompt_override": "override text"}),
-        );
-        let payload = chat_stream_bridge_fallback_payload(&ChatRequestData {
-            message: "hello".to_string(),
-            parts: Vec::new(),
-            attachments: Vec::new(),
-            runtime_system_prompt: Some("Runtime SQL scope db_name: retail.".to_string()),
-            session_id: Some("s1".to_string()),
-            full_llm_capture: false,
-            agent_id: Some("a1".to_string()),
-            model: Some("gpt-4".to_string()),
-            selected_model: None,
-            capability_descriptors: None,
-            provider_runtime_authorized: false,
-            agent_binding: None,
-            runtime_auth: None,
-            runtime_skill_binding: None,
-            runtime_profile: None,
-            llm_token_service: Some(astra_services::LlmTokenServiceConfig {
-                url: "http://catalog:8081/api/v1/llm-token".to_string(),
-                timeout_ms: Some(2500),
-            }),
-            skill_search: Some(SkillSearchSettings {
-                dynamic_surface: false,
-                min_catalog_size: 12,
-                surface_cap: 20,
-            }),
-            allow_skills: Some(vec!["plan".to_string()]),
-            allow_skill_sources: None,
-            allow_tools: Some(vec!["bash".to_string()]),
-            workspace_binding: None,
-            executor_binding: None,
-            runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: Some(vec!["mcp_bind_301".to_string()]),
-            context: Some(context),
-            edge_executor_id: None,
-            capabilities: Vec::new(),
-            forward_headers: std::collections::HashMap::new(),
-            execution_budget: Some(astra_services::runs::ExecutionBudget {
-                initial_turns: Some(3),
-                hard_turn_limit: Some(7),
-            }),
-            explain: true,
-            interaction_mode: Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
-            interactive_client: false,
-        });
-        let obj = payload.as_object().unwrap();
-        assert!(obj.contains_key("messages"));
-        assert!(obj.contains_key("session_id"));
-        assert!(!obj.contains_key("model"));
-        assert_eq!(obj["execution_budget"]["initial_turns"], 3);
-        assert_eq!(obj["execution_budget"]["hard_turn_limit"], 7);
-        assert_eq!(
-            obj["runtime_system_prompt"],
-            "Runtime SQL scope db_name: retail."
-        );
-        assert_eq!(obj["explain"], true);
-        assert_eq!(obj["interaction_mode"], "auto");
-        assert_eq!(obj["skill_search"]["dynamic_surface"], false);
-        assert_eq!(obj["skill_search"]["min_catalog_size"], 12);
-        assert_eq!(obj["skill_search"]["surface_cap"], 20);
-        assert_eq!(
-            obj["llm_token_service"]["url"],
-            "http://catalog:8081/api/v1/llm-token"
-        );
-        assert_eq!(obj["llm_token_service"]["timeout_ms"], 2500);
-        assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
-        assert_eq!(obj["allow_skill_sources"], serde_json::Value::Null);
-        assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
-        assert!(!obj.contains_key("mcp_binding_ids"));
-        assert_eq!(
-            obj["edge_profile"]["system_prompt_override"],
-            "override text"
-        );
-        let messages = obj["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["role"], "user");
-    }
-
-    #[test]
-    fn chat_stream_fallback_payload_normalizes_allowlists() {
-        let payload = chat_stream_bridge_fallback_payload(&ChatRequestData {
-            message: "hello".to_string(),
-            parts: Vec::new(),
-            attachments: Vec::new(),
-            runtime_system_prompt: None,
-            session_id: Some("s1".to_string()),
-            full_llm_capture: false,
-            agent_id: Some("a1".to_string()),
-            model: Some("gpt-4".to_string()),
-            selected_model: None,
-            capability_descriptors: None,
-            provider_runtime_authorized: false,
-            agent_binding: None,
-            runtime_auth: None,
-            runtime_skill_binding: None,
-            runtime_profile: None,
-            llm_token_service: None,
-            skill_search: None,
-            allow_skills: Some(vec![
-                " plan ".to_string(),
-                "PLAN".to_string(),
-                "analyze".to_string(),
-            ]),
-            allow_skill_sources: Some(vec![
-                " local ".to_string(),
-                "DATABASE".to_string(),
-                "local".to_string(),
-            ]),
-            allow_tools: Some(vec![
-                " bash ".to_string(),
-                "BASH".to_string(),
-                "read_file".to_string(),
-            ]),
-            workspace_binding: None,
-            executor_binding: None,
-            runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
-            context: None,
-            edge_executor_id: None,
-            capabilities: Vec::new(),
-            forward_headers: std::collections::HashMap::new(),
-            execution_budget: Some(astra_services::runs::ExecutionBudget {
-                initial_turns: Some(3),
-                hard_turn_limit: Some(7),
-            }),
-            explain: true,
-            interaction_mode: None,
-            interactive_client: false,
-        });
-        let obj = payload.as_object().unwrap();
-        assert_eq!(obj["allow_skills"], serde_json::json!(["analyze", "plan"]));
-        assert_eq!(
-            obj["allow_skill_sources"],
-            serde_json::json!(["database", "local"])
-        );
-        assert_eq!(obj["allow_tools"], serde_json::json!(["bash", "read_file"]));
-        assert!(!obj.contains_key("edge_profile"));
-        assert!(!obj.contains_key("test_llm_stream_blocks"));
     }
 
     #[test]
@@ -1032,9 +796,9 @@ mod session_resolution_tests {
     }
 }
 
-/// `/chat/stream` fallback when run-lifecycle is unconfigured (was `chat_stream_bridge_fallback_contract.rs`).
+/// `/chat/stream` lifecycle HTTP behavior.
 #[cfg(test)]
-mod chat_stream_bridge_fallback_tests {
+mod chat_stream_lifecycle_tests {
     use std::sync::Arc;
 
     use astra_core::error_response_coded;

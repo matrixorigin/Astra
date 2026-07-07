@@ -30,9 +30,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit@0.22.1
+      - name: Fetch RustSec advisory DB
+        run: |
+          rm -rf "$HOME/.cargo/advisory-db"
+          git clone --depth 1 https://github.com/RustSec/advisory-db "$HOME/.cargo/advisory-db"
       - name: cargo audit (RustSec advisory DB)
-        working-directory: rust
-        run: cargo audit
+        run: make audit
 
   sdk:
     name: "@astra/sdk (typecheck, test+coverage, build)"

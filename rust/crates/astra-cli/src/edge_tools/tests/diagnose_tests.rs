@@ -70,11 +70,23 @@ async fn diagnose_tools_verbose() {
         .await;
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
-    // Verbose mode should list all tools from all_tool_schemas()
     assert!(parsed["tools"]["available"].is_array());
     let tools = parsed["tools"]["available"].as_array().unwrap();
     assert!(tools.contains(&json!("bash")));
     assert!(tools.contains(&json!("introspect")));
+    for internal in [
+        "delete_file",
+        "multi_edit",
+        "background_shell",
+        "git_clone",
+        "find_definition",
+        "find_references",
+    ] {
+        assert!(
+            !tools.contains(&json!(internal)),
+            "diagnose tools must report provider-visible public schemas, not internal helpers: {internal}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -19,9 +19,141 @@ pub const SERVER_RUN_SCRIPT_RPC_TOOL_NAMES: &[&str] = &[
     "bash",
 ];
 
+fn task_board_schema() -> Value {
+    let mut subtask_props = serde_json::Map::new();
+    subtask_props.insert("id".to_string(), json!({"type": "string"}));
+    subtask_props.insert("title".to_string(), json!({"type": "string"}));
+    subtask_props.insert("description".to_string(), json!({"type": "string"}));
+    subtask_props.insert(
+        "depends_on".to_string(),
+        json!({"type": "array", "items": {"type": "string"}, "description": "Sibling ids that must complete first."}),
+    );
+    subtask_props.insert("owner".to_string(), json!({"type": "string"}));
+
+    let mut props = serde_json::Map::new();
+    props.insert(
+        "action".to_string(),
+        json!({"type": "string", "enum": crate::task_tool_contract::TASK_ACTIONS, "description": "Task-board operation; use only fields allowed for this action."}),
+    );
+    props.insert(
+        "source_session_id".to_string(),
+        json!({"type": "string", "description": "(adopt) Source session id."}),
+    );
+    props.insert(
+        "older_than_days".to_string(),
+        json!({"type": "integer", "description": "(archive bulk) Completed items older than N days."}),
+    );
+    props.insert(
+        "user_status".to_string(),
+        json!({"type": "string", "enum": ["active","pending","in_progress","paused","completed","failed","cancelled","archived","all"], "description": "(list_user) Default active = pending + in_progress + paused."}),
+    );
+    props.insert(
+        "title".to_string(),
+        json!({"type": "string", "description": "(create/update) Task title."}),
+    );
+    props.insert(
+        "description".to_string(),
+        json!({"type": "string", "description": "(create/update) Definition of done."}),
+    );
+    props.insert(
+        "task_id".to_string(),
+        json!({"type": "string", "description": "(update/get/stop/adopt/archive) Task id."}),
+    );
+    props.insert(
+        "new_status".to_string(),
+        json!({"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only; never with create) Parent/subtask status. deleted keeps an audit tombstone."}),
+    );
+    props.insert(
+        "status_filter".to_string(),
+        json!({"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","deleted","all","active"], "description": "(list) Default active = pending + in_progress + paused. all includes tombstones."}),
+    );
+    props.insert(
+        "subtask_id".to_string(),
+        json!({"type": "string", "description": "(update) Subtask id."}),
+    );
+    props.insert(
+        "active_form".to_string(),
+        json!({"type": "string", "description": "(create/update) Spinner text while in_progress."}),
+    );
+    props.insert(
+        "owner".to_string(),
+        json!({"type": "string", "description": "(create/update) Owner."}),
+    );
+    props.insert(
+        "metadata".to_string(),
+        json!({"type": "object", "description": "(create/update) Key-value metadata; null deletes a key on update."}),
+    );
+    props.insert(
+        "add_blocks".to_string(),
+        json!({"type": "array", "items": {"type": "string"}, "description": "(create/update) Task ids this task blocks."}),
+    );
+    props.insert(
+        "add_blocked_by".to_string(),
+        json!({"type": "array", "items": {"type": "string"}, "description": "(create/update) Task ids blocking this task."}),
+    );
+    props.insert(
+        "remove_blocks".to_string(),
+        json!({"type": "array", "items": {"type": "string"}, "description": "(update) Remove blocks edges."}),
+    );
+    props.insert(
+        "remove_blocked_by".to_string(),
+        json!({"type": "array", "items": {"type": "string"}, "description": "(update) Remove blocked_by edges."}),
+    );
+    props.insert(
+        "subtasks".to_string(),
+        json!({
+            "type": "array",
+            "maxItems": crate::task_mgmt::MAX_CREATE_SUBTASKS,
+            "description": "(create only) Optional subtasks; update existing subtasks with subtask_id + new_status.",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": Value::Object(subtask_props),
+                "required": ["id", "title"]
+            }
+        }),
+    );
+    props.insert(
+        "reason".to_string(),
+        json!({"type": "string", "description": "(update/stop/archive) Reason or subtask note."}),
+    );
+    props.insert(
+        "error_message".to_string(),
+        json!({"type": "string", "description": "(update) Failure/cancel reason."}),
+    );
+
+    let mut params = serde_json::Map::new();
+    params.insert("type".to_string(), json!("object"));
+    params.insert("additionalProperties".to_string(), json!(false));
+    params.insert("properties".to_string(), Value::Object(props));
+    params.insert("required".to_string(), json!(["action"]));
+    params.insert(
+        "x-astra-per-action-required".to_string(),
+        json!({
+            "create": ["title"],
+            "update": ["task_id"],
+            "get": ["task_id"],
+            "stop": ["task_id"],
+            "adopt": ["source_session_id", "task_id"]
+        }),
+    );
+    params.insert(
+        "x-astra-per-action-allowed".to_string(),
+        crate::task_tool_contract::task_action_allowed_fields_json(),
+    );
+
+    json!({
+        "type": "function",
+        "function": {
+            "name": crate::task_tool_contract::TASK_BOARD_TOOL_NAME,
+            "description": "Durable task board. Pick one action; use only that action's allowed fields. create makes tasks; update changes status.",
+            "parameters": Value::Object(params)
+        }
+    })
+}
+
 pub fn all_tool_schemas() -> Vec<Value> {
     let mut schemas = all_tool_schemas_core();
-    enforce_task_schema_unknown_field_contract(&mut schemas);
     // run_script is Unix-only (UDS RPC transport). Always exposed on Unix;
     // there is no environment gate for production tools.
     #[cfg(unix)]
@@ -71,33 +203,6 @@ pub fn narrow_run_script_for_server(schemas: &mut [Value]) {
             == Some("run_script")
     }) {
         *slot = run_script_schema_for(SERVER_RUN_SCRIPT_RPC_TOOL_NAMES);
-    }
-}
-
-fn enforce_task_schema_unknown_field_contract(schemas: &mut [Value]) {
-    if let Some(task) = schemas.iter_mut().find(|schema| {
-        schema
-            .get("function")
-            .and_then(|function| function.get("name"))
-            .and_then(Value::as_str)
-            == Some("task")
-    }) && let Some(parameters) = task
-        .get_mut("function")
-        .and_then(|function| function.get_mut("parameters"))
-        .and_then(Value::as_object_mut)
-    {
-        parameters.insert("additionalProperties".to_string(), Value::Bool(false));
-        if let Some(subtasks) = parameters
-            .get_mut("properties")
-            .and_then(Value::as_object_mut)
-            .and_then(|properties| properties.get_mut("subtasks"))
-            .and_then(Value::as_object_mut)
-        {
-            subtasks.insert(
-                "maxItems".to_string(),
-                Value::from(crate::task_mgmt::MAX_CREATE_SUBTASKS as u64),
-            );
-        }
     }
 }
 
@@ -439,7 +544,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree","push"],
+                            "enum": crate::git_tool_contract::GIT_ACTIONS,
                             "description": "Git operation to perform"
                         },
                         "path": {
@@ -769,7 +874,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `agent(spawn)` + `agent(get_result)`: one synchronous or background sub-agent you plan to collect results from.
          - `agent_fanout`: fixed-size parallel sub-agent groups with target-count accounting.
          - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
-         - `task`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
+         - `task_board`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1036,63 +1141,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 }
             }
         }),
-        // ── Task management (unified tool) ───────────────────────────────
-        //
-        json!({
-            "type": "function",
-            "function": {
-                "name": "task",
-                "description": "Checklist for multi-step work. Use subtasks for 3+ outcomes, files, or phases. Update progress with new_status; list with status_filter.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["create","update","list","get","stop","list_user","adopt","archive"], "description": "Operation."},
-                        "source_session_id": {"type": "string", "description": "(adopt) Source session id"},
-                        "older_than_days": {"type": "integer", "description": "(archive bulk; omit task_id) Archive completed older than N days. Default 30."},
-                        "user_status": {"type": "string", "enum": ["active","pending","in_progress","paused","completed","failed","cancelled","archived","all"], "description": "(list_user) Cross-session. Default active = open work: pending + in_progress + paused."},
-                        "title": {"type": "string", "description": "(create/update) Title."},
-                        "description": {"type": "string", "description": "(create/update) Done."},
-                        "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task id. Single-task archive stays in current session."},
-                        "new_status": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only) New task/subtask status. Do not send `status`. Only one parent task may be in_progress; `paused` frees that slot; `deleted` hides the task from active views while keeping an audit tombstone."},
-                        "status_filter": {"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","deleted","all","active"], "description": "(list only) Use `status_filter: \"all\"` to list all tasks, including audit tombstones; use `deleted` to inspect deleted tombstones; do not send an `all` boolean. `active` = pending + in_progress + paused."},
-                        "subtask_id": {"type": "string", "description": "(update) Subtask id; use with task_id + new_status, optional reason."},
-                        "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
-                        "owner": {"type": "string", "description": "(create/update) Owner."},
-                        "metadata": {"type": "object", "description": "(create/update) Key-value pairs; null deletes a key on update."},
-                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(create/update) Task ids this task blocks; edge is symmetric. Blocked tasks wait for completed blockers."},
-                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(create/update) Task ids blocking this task. It cannot start until every blocker is completed or removed."},
-                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update only; never with create) Remove symmetric blocks edges."},
-                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update only; never with create) Remove symmetric blocked_by edges."},
-                        "subtasks": {
-                            "type": "array",
-                            "description": "(create only) Optional subtasks. Do not send on update; use subtask_id + new_status to update existing subtask progress.",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "id": {"type": "string"},
-                                    "title": {"type": "string"},
-                                    "description": {"type": "string"},
-                                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Sibling ids completed before this subtask starts or completes."},
-                                    "owner": {"type": "string"}
-                                },
-                                "required": ["id", "title"]
-                            }
-                        },
-                        "reason": {"type": "string", "description": "(update/stop/archive) Reason. With subtask_id, stores a subtask status note; failed parent fills error_message if omitted."},
-                        "error_message": {"type": "string", "description": "(update) Failure/cancel reason to include when setting new_status='failed' or new_status='cancelled'."}
-                    },
-                    "required": ["action"],
-                    "x-astra-per-action-required": {
-                        "create": ["title"],
-                        "update": ["task_id"],
-                        "get": ["task_id"],
-                        "stop": ["task_id"],
-                        "adopt": ["source_session_id", "task_id"]
-                    }
-                }
-            }
-        }),
+        // ── Durable task board ───────────────────────────────────────────
+        task_board_schema(),
         // ── background task control ─────────────────────────────────
         // Typed control surface for background tasks. Starting shell work stays
         // on Bash / Ctrl+B and local agents stay on agent(); control actions
@@ -1280,6 +1330,20 @@ mod tests {
             .div_ceil(4)
     }
 
+    fn required_fields(schema: &Value) -> Vec<String> {
+        schema
+            .pointer("/function/parameters/required")
+            .and_then(Value::as_array)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     // execute_code has been deleted. The only hallucination-prevention
     // concern now is ensuring run_script is advertised on Unix, and that
     // `execute_code` is NOT in the schema list (so the model doesn't
@@ -1382,7 +1446,7 @@ mod tests {
                 .iter()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>(),
-            vec!["start", "get_results", "stop_slot"]
+            crate::agent_tool_contract::AGENT_FANOUT_ACTIONS
         );
         assert_eq!(
             params["x-astra-per-action-required"]["start"],
@@ -1439,6 +1503,15 @@ mod tests {
                 .contains("Never prefill this on spawn"),
             "agent_id field must explicitly forbid spawn-time prefill"
         );
+        assert_eq!(
+            params["properties"]["action"]["enum"]
+                .as_array()
+                .expect("agent action enum")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            crate::agent_tool_contract::AGENT_ACTIONS
+        );
     }
 
     #[test]
@@ -1481,40 +1554,42 @@ mod tests {
     }
 
     #[test]
-    fn task_schema_keeps_compact_multi_step_contract() {
+    fn task_board_public_surface_is_single_action_resource_tool() {
         let schemas = all_tool_schemas();
-        let task = find_schema(&schemas, "task").expect("task schema must exist");
-        let desc = task
-            .get("function")
-            .and_then(|f| f.get("description"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
         assert!(
-            desc.len() <= 140,
-            "task description should stay compact in the always-load prefix: {desc}"
+            find_schema(&schemas, "task").is_none(),
+            "model-facing task-board surface must not expose the old ambiguous task tool"
         );
-        assert!(
-            desc.contains("3+ outcomes") && desc.contains("subtasks"),
-            "task description must name the explicit '3+ outcomes/steps' threshold so the model has \
-             a hard trigger, not a fuzzy heuristic"
+        let task_board = find_schema(&schemas, "task_board").expect("task_board schema must exist");
+        let params = &task_board["function"]["parameters"];
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(required_fields(task_board), vec!["action".to_string()]);
+        assert_eq!(
+            params["properties"]["action"]["enum"]
+                .as_array()
+                .expect("task_board action enum")
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            crate::task_tool_contract::TASK_ACTIONS
         );
     }
 
     #[test]
-    fn memory_and_task_schemas_stay_compact() {
+    fn memory_and_task_board_schemas_stay_compact() {
         let schemas = all_tool_schemas();
         let memory = find_schema(&schemas, "memory").expect("memory schema must exist");
-        let task = find_schema(&schemas, "task").expect("task schema must exist");
         let memory_tokens = schema_token_cost(memory);
-        let task_tokens = schema_token_cost(task);
+        let task_board = find_schema(&schemas, "task_board").expect("task_board schema must exist");
+        let task_board_tokens = schema_token_cost(task_board);
 
         assert!(
             memory_tokens <= 700,
             "memory schema regressed to {memory_tokens} tokens; keep it compact"
         );
         assert!(
-            task_tokens <= 1100,
-            "task schema regressed to {task_tokens} tokens; keep it compact"
+            task_board_tokens <= 1100,
+            "task_board schema regressed to {task_board_tokens} tokens; keep the resource tool compact"
         );
     }
 
@@ -1528,7 +1603,7 @@ mod tests {
             ("memory", 120),
             ("ask_user", 180),
             ("notify", 180),
-            ("task", 140),
+            ("task_board", 140),
             ("tool_search", 240),
         ] {
             let schema = find_schema(&schemas, name).expect("schema must exist");
@@ -1559,245 +1634,143 @@ mod tests {
     }
 
     #[test]
-    fn task_schema_discourages_single_umbrella_task() {
+    fn task_board_schema_exposes_lifecycle_progress_and_dependencies() {
         let schemas = all_tool_schemas();
-        let task = find_schema(&schemas, "task").expect("task schema must exist");
-        let desc = task["function"]["description"].as_str().unwrap();
+        let task_board = find_schema(&schemas, "task_board").expect("task_board schema");
+        let properties = &task_board["function"]["parameters"]["properties"];
 
-        assert!(desc.contains("multi-step work"));
-        assert!(desc.contains("3+ outcomes"));
-    }
-
-    #[test]
-    fn task_schema_exposes_lifecycle_progress_and_dependencies() {
-        let schemas = all_tool_schemas();
-        let task = find_schema(&schemas, "task").expect("task schema must exist");
-        let properties = &task["function"]["parameters"]["properties"];
-        assert_eq!(
-            task["function"]["parameters"]["additionalProperties"], false,
-            "task schema should reject unknown top-level fields"
-        );
-
+        for field in ["active_form", "add_blocks", "add_blocked_by", "subtasks"] {
+            assert!(
+                properties.get(field).is_some(),
+                "task_board.create must expose {field}"
+            );
+        }
         for field in [
+            "new_status",
+            "subtask_id",
             "active_form",
             "add_blocks",
             "add_blocked_by",
+            "remove_blocks",
+            "remove_blocked_by",
             "error_message",
         ] {
             assert!(
                 properties.get(field).is_some(),
-                "task schema must expose {field} to the model"
+                "task_board.update must expose {field}"
             );
         }
-        let error_message_desc = properties["error_message"]["description"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            error_message_desc.contains("new_status='failed'"),
-            "error_message should be explicitly tied to failed task updates: {error_message_desc}"
-        );
-        assert!(
-            error_message_desc.contains("new_status='cancelled'"),
-            "error_message should also support cancelled task updates: {error_message_desc}"
-        );
-        assert!(
-            properties["active_form"]["description"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Spinner text"),
-            "active_form should stay product-facing spinner guidance"
-        );
-        let action_enum = properties["action"]["enum"]
-            .as_array()
-            .expect("task action enum");
-        assert!(
-            action_enum.iter().any(|v| v.as_str() == Some("archive")),
-            "task schema should expose archive as a structured action"
-        );
-        assert!(
-            properties["older_than_days"]["description"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Archive completed"),
-            "archive bulk criteria should live on older_than_days, not in the always-load description"
-        );
-        let subtask_id_desc = properties["subtask_id"]["description"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            subtask_id_desc.contains("optional reason"),
-            "subtask_id should explain the narrow subtask-update shape: {subtask_id_desc}"
-        );
-        let reason_desc = properties["reason"]["description"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            reason_desc.contains("With subtask_id") && reason_desc.contains("subtask status note"),
-            "reason should be advertised for explained subtask updates: {reason_desc}"
-        );
-        assert!(
-            properties["status_filter"]
-                .as_object()
-                .and_then(|_| properties["status_filter"]["enum"].as_array())
-                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("archived"))),
-            "task schema should let the model query archived tasks explicitly"
-        );
-        assert!(
-            properties["status_filter"]
-                .as_object()
-                .and_then(|_| properties["status_filter"]["enum"].as_array())
-                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("cancelled"))),
-            "task schema should let the model query cancelled tasks explicitly"
-        );
-        assert!(
-            properties["status_filter"]
-                .as_object()
-                .and_then(|_| properties["status_filter"]["enum"].as_array())
-                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("deleted"))),
-            "task schema should let the model query deleted audit tombstones explicitly"
-        );
-        assert!(
-            properties["status_filter"]
-                .as_object()
-                .and_then(|_| properties["status_filter"]["enum"].as_array())
-                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
-            "task schema should let the model query auto-paused tasks explicitly"
-        );
-        let status_filter_desc = properties["status_filter"]["description"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            status_filter_desc.contains("active")
-                && status_filter_desc.contains("pending + in_progress + paused"),
-            "task schema should explain task.list active includes paused open work: {status_filter_desc}"
-        );
-        assert!(
-            status_filter_desc.contains("status_filter")
-                && status_filter_desc.contains("\"all\"")
-                && status_filter_desc.contains("audit tombstones")
-                && status_filter_desc.contains("do not send an `all` boolean"),
-            "task schema should steer list-all away from an unsupported all field: {status_filter_desc}"
-        );
-        assert!(
-            properties.get("status").is_none(),
-            "task schema must not expose the old status field; use new_status/status_filter"
-        );
-        assert!(
-            properties.get("all").is_none(),
-            "task schema must not expose an all boolean; use status_filter='all'"
-        );
-        assert!(
-            properties["new_status"]
-                .as_object()
-                .and_then(|_| properties["new_status"]["enum"].as_array())
-                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
-            "task schema should let the model intentionally pause/resume stale work"
-        );
-        let new_status_desc = properties["new_status"]["description"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            new_status_desc.contains("Only one parent task may be in_progress"),
-            "new_status should teach the single in_progress task invariant: {new_status_desc}"
-        );
-        assert!(
-            new_status_desc.contains("Do not send `status`"),
-            "new_status should explicitly reject the old status alias: {new_status_desc}"
-        );
-        assert!(
-            new_status_desc.contains("audit tombstone"),
-            "new_status should explain deleted keeps an audit tombstone: {new_status_desc}"
-        );
-        let add_blocked_by_desc = properties["add_blocked_by"]["description"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            add_blocked_by_desc.contains("completed or removed"),
-            "blocked_by should explain blockers must resolve before start: {add_blocked_by_desc}"
-        );
-        assert!(
-            add_blocked_by_desc.contains("create/update"),
-            "blocked_by should expose create-time dependencies: {add_blocked_by_desc}"
-        );
-        let add_blocks_desc = properties["add_blocks"]["description"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            add_blocks_desc.contains("edge is symmetric"),
-            "blocks should explain task dependency edges are symmetric: {add_blocks_desc}"
-        );
-        assert!(
-            add_blocks_desc.contains("create/update"),
-            "blocks should expose create-time dependencies: {add_blocks_desc}"
-        );
-        let depends_on_desc =
-            properties["subtasks"]["items"]["properties"]["depends_on"]["description"]
-                .as_str()
-                .unwrap_or_default();
-        assert!(
-            depends_on_desc.contains("before this subtask starts or completes"),
-            "subtask depends_on should explain execution order constraints: {depends_on_desc}"
-        );
-        let subtask_item = &properties["subtasks"]["items"];
-        let subtasks_desc = properties["subtasks"]["description"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            subtasks_desc.contains("create only")
-                && subtasks_desc.contains("subtask_id + new_status"),
-            "subtasks property should prevent task.update(subtasks) misuse: {subtasks_desc}"
-        );
+
         assert_eq!(
             properties["subtasks"]["maxItems"].as_u64(),
             Some(crate::task_mgmt::MAX_CREATE_SUBTASKS as u64),
-            "task schema should expose the same subtask fan-out limit as TaskManager"
+            "create schema should expose the same subtask fan-out limit as TaskManager"
         );
         assert_eq!(
-            subtask_item["additionalProperties"], false,
+            properties["subtasks"]["items"]["additionalProperties"], false,
             "subtask schema should reject unknown fields"
         );
         assert!(
-            subtask_item["properties"].get("owner").is_some(),
+            properties["subtasks"]["items"]["properties"]
+                .get("owner")
+                .is_some(),
             "subtask schema should expose the supported owner field"
         );
         assert!(
-            properties["user_status"]
-                .as_object()
-                .and_then(|_| properties["user_status"]["enum"].as_array())
-                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("cancelled"))),
-            "task schema should let the model query cancelled cross-session tasks explicitly"
-        );
-        assert!(
-            properties["user_status"]
-                .as_object()
-                .and_then(|_| properties["user_status"]["enum"].as_array())
+            properties["new_status"]["enum"]
+                .as_array()
                 .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
-            "task schema should let the model query paused cross-session tasks explicitly"
+            "update schema should let the model intentionally pause/resume stale work"
         );
-        let user_status_desc = properties["user_status"]["description"]
-            .as_str()
-            .unwrap_or_default();
         assert!(
-            user_status_desc.contains("Default active")
-                && user_status_desc.contains("pending + in_progress + paused"),
-            "task schema should explain list_user active includes paused open work: {user_status_desc}"
+            properties["status_filter"]["enum"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("deleted"))),
+            "list schema should let the model inspect deleted audit tombstones"
         );
-        let per_action_required = task["function"]["parameters"]["x-astra-per-action-required"]
+        assert!(
+            properties["user_status"]["enum"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("cancelled"))),
+            "cross-session list schema should expose cancelled tasks"
+        );
+        let per_action_required =
+            task_board["function"]["parameters"]["x-astra-per-action-required"]
+                .as_object()
+                .expect("task_board per-action required fields");
+        assert_eq!(
+            per_action_required["create"],
+            json!(["title"]),
+            "task_board.create required fields must stay explicit"
+        );
+        assert_eq!(
+            per_action_required["adopt"],
+            json!(["source_session_id", "task_id"]),
+            "task_board.adopt required fields must stay explicit"
+        );
+        let per_action_allowed = task_board["function"]["parameters"]["x-astra-per-action-allowed"]
             .as_object()
-            .expect("task schema must expose per-action required fields");
-        let adopt_required = per_action_required
-            .get("adopt")
-            .and_then(|value| value.as_array())
-            .expect("adopt should list required fields");
-        assert!(
-            adopt_required
-                .iter()
-                .any(|value| value.as_str() == Some("source_session_id"))
-                && adopt_required
-                    .iter()
-                    .any(|value| value.as_str() == Some("task_id")),
-            "adopt requires both source_session_id and task_id: {adopt_required:?}"
+            .expect("task_board per-action allowed fields");
+        assert_eq!(
+            per_action_allowed["create"],
+            json!(crate::task_tool_contract::task_action_allowed_fields("create").unwrap()),
+            "task_board.create allowed fields must be generated from task_tool_contract"
         );
+        assert!(
+            !per_action_allowed["create"]
+                .as_array()
+                .expect("create allowed fields")
+                .iter()
+                .any(|field| field.as_str() == Some("new_status")),
+            "task_board.create must not advertise update-only status fields"
+        );
+        assert_eq!(
+            per_action_allowed["update"],
+            json!(crate::task_tool_contract::task_action_allowed_fields("update").unwrap()),
+            "task_board.update allowed fields must be generated from task_tool_contract"
+        );
+    }
+
+    #[test]
+    fn github_schema_action_enum_matches_executor_contract() {
+        let schemas = all_tool_schemas();
+        let github = find_schema(&schemas, "github").expect("github schema");
+        let actions = github["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("github action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actions, crate::github_tool_contract::GITHUB_ACTIONS);
+    }
+
+    #[test]
+    fn git_schema_action_enum_matches_executor_contract() {
+        let schemas = all_tool_schemas();
+        let git = find_schema(&schemas, "git").expect("git schema");
+        let actions = git["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("git action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actions, crate::git_tool_contract::GIT_ACTIONS);
+    }
+
+    #[test]
+    fn memory_schema_action_enum_matches_executor_contract() {
+        let schemas = all_tool_schemas();
+        let memory = find_schema(&schemas, "memory").expect("memory schema");
+        let actions = memory["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("memory action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actions, crate::memory_tool_contract::MEMORY_ACTIONS);
     }
 
     #[test]
@@ -2107,37 +2080,14 @@ mod tests {
     fn session_schema_exposes_only_lifecycle_and_history_actions() {
         let schemas = all_tool_schemas();
         let session = find_schema(&schemas, "session").expect("session schema");
-        let mut actions = session["function"]["parameters"]["properties"]["action"]["enum"]
+        let actions = session["function"]["parameters"]["properties"]["action"]["enum"]
             .as_array()
             .expect("session action enum")
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
 
-        actions.sort_unstable();
-        assert_eq!(
-            actions,
-            [
-                "config",
-                "history_around",
-                "history_page",
-                "history_search",
-                "sleep",
-            ],
-            "session action surface must stay narrow and current"
-        );
-        for current in [
-            "config",
-            "sleep",
-            "history_page",
-            "history_search",
-            "history_around",
-        ] {
-            assert!(
-                actions.contains(&current),
-                "session must expose current action {current}"
-            );
-        }
+        assert_eq!(actions, crate::session_tool_contract::SESSION_ACTIONS);
         let props = session["function"]["parameters"]["properties"]
             .as_object()
             .expect("session properties");

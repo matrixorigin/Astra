@@ -1,5 +1,5 @@
 use super::{fanout_test_context, test_executor, test_spawner};
-use crate::edge_tools::{ToolExecutor, all_tool_schemas, truncate_output};
+use crate::edge_tools::{ToolExecutor, local_tool_schemas, truncate_output};
 use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
 use chrono::Utc;
@@ -12,15 +12,19 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[test]
 fn executor_tool_count_matches_schemas() {
     let executor = test_executor();
-    assert_eq!(executor.tool_count(), all_tool_schemas().len());
+    let expected = executor.runtime_bound_tool_schemas(local_tool_schemas());
+    assert_eq!(executor.tool_count(), expected.len());
 }
 
 #[test]
 fn executor_tool_names_match_schemas() {
     let executor = test_executor();
     let names = executor.tool_names();
-    assert_eq!(names.len(), all_tool_schemas().len());
+    let expected = executor.runtime_bound_tool_schemas(local_tool_schemas());
+    assert_eq!(names.len(), expected.len());
     assert!(names.contains(&"bash".to_string()));
+    assert!(!names.contains(&"delete_file".to_string()));
+    assert!(!names.contains(&"multi_edit".to_string()));
 }
 
 #[tokio::test]
@@ -106,7 +110,8 @@ async fn unsupported_session_state_actions_are_rejected_on_cli_edge_executor() {
         assert!(
             result.contains("unknown `session` action")
                 && result.contains("history_page")
-                && result.contains("rollback_session_state"),
+                && result.contains("top-level tool")
+                && !result.contains("ask_user"),
             "{action}: {result}"
         );
     }
@@ -184,6 +189,28 @@ async fn execute_with_metadata_marks_structured_str_replace_failure_as_error() {
     assert_eq!(
         astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(&outcome.output),
         "failed"
+    );
+}
+
+#[tokio::test]
+async fn execute_with_metadata_git_missing_action_fails_closed() {
+    let executor = test_executor();
+    let outcome = executor
+        .execute_with_metadata("git", &json!({"path": "."}))
+        .await;
+
+    assert!(outcome.is_error, "{outcome:?}");
+    assert!(
+        outcome
+            .output
+            .contains("missing required parameter `action` for `git`"),
+        "{}",
+        outcome.output
+    );
+    assert!(
+        !outcome.output.contains("On branch") && !outcome.output.contains("##"),
+        "missing action must not be silently treated as git status: {}",
+        outcome.output
     );
 }
 
@@ -339,10 +366,17 @@ async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
             }),
         )
         .await;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&result).expect("agent action errors must stay structured JSON");
+    assert_eq!(parsed["status"].as_str(), Some("failed"), "got: {result}");
+    assert_eq!(
+        parsed["error_kind"].as_str(),
+        Some(astra_core::ErrorKind::ToolInvalidArgs.as_str()),
+        "got: {result}"
+    );
     assert!(
-        result.starts_with("Error"),
-        "blocked delegate action must return an Error: prefix so the TUI renders \
-         it as a failure (red banner), not as a normal tool result. Got: {result}"
+        parsed["error"].as_str().unwrap_or("").contains("delegate"),
+        "blocked delegate action error must name the bad action. Got: {result}"
     );
     assert!(
         result.contains("spawn"),
@@ -393,7 +427,14 @@ async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
             }),
         )
         .await;
-    assert!(result.starts_with("Error:"), "got: {result}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&result).expect("agent wrapper errors must stay structured JSON");
+    assert_eq!(parsed["status"].as_str(), Some("failed"), "got: {result}");
+    assert_eq!(
+        parsed["error_kind"].as_str(),
+        Some(astra_core::ErrorKind::ToolInvalidArgs.as_str()),
+        "got: {result}"
+    );
     assert!(
         result.contains("action='spawn'") || result.contains("\"action\":\"spawn\""),
         "error must show the correct top-level action shape so the model can recover. Got: {result}"
@@ -414,7 +455,7 @@ async fn task_background_actions_are_plain_unknown_task_actions() {
     for action in ["background_shell", "background_agent", "output", "kill"] {
         let result = executor
             .execute(
-                "task",
+                "task_board",
                 &json!({
                     "action": action,
                     "command": "echo hi",
@@ -429,7 +470,7 @@ async fn task_background_actions_are_plain_unknown_task_actions() {
              a red banner — got: {result}"
         );
         assert!(
-            result.contains("unknown `task` action") && result.contains(action),
+            result.contains("unknown `task_board` action") && result.contains(action),
             "task.{action} must be rejected by the ordinary unknown-action path. Got: {result}"
         );
         assert!(
@@ -935,7 +976,7 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
 // files via `write_file` while the active plan was still in `planning`
 // phase (rejected v2/v3, never approved). The server tool executor
 // already short-circuits mutation tools while a plan is being authored
-// (`server_tool_executor::is_plan_mode_blocked_tool` +
+// (`runtime_tool_executor::is_plan_mode_blocked_tool` +
 // `plan_mode_authoring_active`), but the CLI's local `ToolExecutor`
 // did NOT. These tests pin the parity contract.
 
@@ -1063,6 +1104,17 @@ async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
     assert!(
         result.contains("hello"),
         "read_file must return the file contents. Got: {result}"
+    );
+
+    let result = executor.execute("bash", &json!({"command": "ls"})).await;
+
+    assert!(
+        !result.contains("blocked while plan mode is active"),
+        "read-only bash must remain available during plan authoring. Got: {result}"
+    );
+    assert!(
+        result.contains("probe.txt"),
+        "read-only bash should execute in the workspace and observe files. Got: {result}"
     );
 }
 

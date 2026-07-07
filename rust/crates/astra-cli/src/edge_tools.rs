@@ -99,7 +99,6 @@ use astra_tools::passive_tsc_check;
 mod shell;
 use astra_tools::env_tools;
 use astra_tools::schemas::all_tool_schemas as full_tool_schemas;
-use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind_with_args};
 pub use env_tools::apply_overlay as apply_env_overlay;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
@@ -147,7 +146,7 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "session",
     "share_context",
     "symbol_search",
-    "task",
+    "task_board",
     "task_list",
     "task_output",
     "task_stop",
@@ -155,13 +154,19 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_search",
 ];
 
+fn runtime_env_builtin_registry() -> &'static astra_runtime_env::ToolRegistry {
+    static REGISTRY: std::sync::OnceLock<astra_runtime_env::ToolRegistry> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(astra_runtime_env::ToolRegistry::builtins)
+}
+
 fn local_runtime_tool_schemas(raw_schemas: Vec<Value>) -> Vec<Value> {
-    let registry = astra_runtime_env::ToolRegistry::builtins();
-    let binding = astra_runtime_env::RunBinding::local_developer(".", &registry);
-    astra_runtime_env::CapabilityResolver.filter_tool_schemas(
-        &registry,
+    let registry = runtime_env_builtin_registry();
+    let binding = astra_runtime_env::RunBinding::local_developer(".", registry);
+    astra_runtime_env::CapabilityResolver.filter_tool_schemas_for_binding(
+        registry,
         raw_schemas,
-        &binding.capabilities,
+        &binding,
     )
 }
 
@@ -189,6 +194,7 @@ struct CliCapabilityView {
     dropped_by_capability: Vec<Value>,
     dropped_by_surface: Vec<String>,
     mcp_pass_through: Vec<String>,
+    capacity_provider_coverage: Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry>,
 }
 
 pub fn local_tool_schemas() -> Vec<Value> {
@@ -196,7 +202,7 @@ pub fn local_tool_schemas() -> Vec<Value> {
 }
 
 /// Plan-mode write guard tool list (CLI parity with
-/// `server_tool_executor::is_plan_mode_blocked_tool`). While a plan is
+/// `runtime_tool_executor::is_plan_mode_blocked_tool`). While a plan is
 /// in `phase=planning` these tools must be short-circuited: they all
 /// mutate the world (filesystem, DB, git, GitHub), so allowing them
 /// would let the model execute a plan it has not yet had approved.
@@ -204,28 +210,7 @@ pub fn local_tool_schemas() -> Vec<Value> {
 /// session-scoped authoring tools (`task`, memory_*) stay available so the
 /// agent can keep authoring without mutating the external world.
 pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
-    // Legacy standalone tools are always blocked
-    if tool == "task_stop" {
-        return true;
-    }
-
-    // Consolidated `task` tool: block only destructive actions (stop)
-    if tool == "task" {
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        return action == "stop";
-    }
-
-    if matches!(
-        cloud_gated_tool_kind_with_args(tool, Some(args)),
-        Some(CloudGatedToolKind::Write | CloudGatedToolKind::Execute)
-    ) {
-        return true;
-    }
-
-    matches!(
-        tool,
-        "bash" | "write_file" | "str_replace" | "rollback_database_snapshots"
-    )
+    astra_turn_core::plan_mode_policy::is_plan_mode_blocked_tool(tool, args)
 }
 
 fn git_stash_action_args(args: &Value) -> Value {
@@ -388,8 +373,8 @@ const AGGREGATE_SOFT_LIMIT: usize = 120_000;
 
 /// Per-tool persistence threshold (chars). When a single tool result exceeds
 /// this AND aggregate output is above the soft limit, the result is persisted
-/// to disk and replaced with a preview + file path. The model can use
-/// `read_file` with `start_line/end_line` to access specific parts.
+/// as an internal artifact and replaced with a preview. The artifact path is
+/// not part of the workspace filesystem contract.
 /// Global default for large-output persistence threshold (50K).
 const PERSIST_THRESHOLD: usize = 50_000;
 
@@ -467,6 +452,15 @@ fn tool_execution_outcome_from_output(output: String) -> ToolExecutionOutcome {
         ToolExecutionOutcome::error(output)
     } else {
         ToolExecutionOutcome::ok(output)
+    }
+}
+
+fn tool_result_from_cli_outcome(outcome: ToolExecutionOutcome) -> astra_tools::ToolResult {
+    astra_tools::ToolResult {
+        output: outcome.output,
+        metadata: outcome.tool_result_fields,
+        is_error: outcome.is_error,
+        exit_semantics: None,
     }
 }
 
@@ -1064,11 +1058,12 @@ pub struct ToolExecutor {
     /// Per-turn mutation accounting for adjust_config governor.
     /// (turn_number, mutations_applied_on_turn)
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
-    /// Shared tool executor for delegating unknown tools to astra-tools.
+    /// Shared implementation host for explicitly delegated tools.
     default_executor: astra_tools::executor::DefaultToolExecutor,
-    /// Plugin-registered non-MCP tool schemas. MCP schemas live in
-    /// `mcp_runtime` so routing ownership and discovery data stay atomic.
-    plugin_schemas: std::sync::RwLock<Vec<Value>>,
+    /// Schemas declared by CLI-side providers except CLI MCP
+    /// (server service, control plane, and CLI local executor). MCP schemas live
+    /// in `mcp_runtime` so routing ownership and discovery data stay atomic.
+    cli_local_provider_schemas: std::sync::RwLock<Vec<Value>>,
     /// Atomic snapshot of the current visible/deferred execution surface.
     ///
     /// Visible and activatable names are read together by admission and
@@ -1136,7 +1131,7 @@ impl ToolExecutor {
             )
             .build()
             .unwrap_or_else(|_| Client::new()),
-            plugin_schemas: std::sync::RwLock::new(Vec::new()),
+            cli_local_provider_schemas: std::sync::RwLock::new(Vec::new()),
             current_tool_surface: std::sync::RwLock::new(ToolSurfaceNames::default()),
             activated_deferred_tools: std::sync::RwLock::new(HashSet::new()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
@@ -1231,8 +1226,10 @@ impl ToolExecutor {
                 }
             })
         }));
-        let schemas = self.runtime_bound_tool_schemas(schemas);
-        self.set_current_visible_tool_schemas(&schemas);
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&schemas);
+        let mut guard =
+            rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
+        *guard = ToolSurfaceNames::installed(names, HashSet::new());
     }
 
     /// Install the per-turn `ask_user` channel so tools can surface a
@@ -1361,13 +1358,40 @@ impl ToolExecutor {
         self
     }
 
-    /// Install plugin-registered non-MCP schemas so `tool_search(select:NAME)`
-    /// can resolve skill-backed tools. Called after plugin manifests load.
+    /// Install schemas declared by CLI-side providers so
+    /// `tool_search(select:NAME)` can resolve provider-owned dynamic tools. MCP
+    /// schemas are rejected here: they require an MCP runtime binding and must
+    /// be installed through `install_mcp_bundle`.
     ///
-    /// Poison handling: plugin schemas are a rebuildable cache. Reset cached
+    /// Poison handling: provider schemas are a rebuildable cache. Reset cached
     /// state on poison instead of reusing possibly half-written inner data.
-    pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
-        let mut guard = rwlock_write_reset_on_poison(&self.plugin_schemas, "plugin_schemas");
+    pub fn set_cli_local_provider_schemas(&self, schemas: Vec<Value>) {
+        let mut dropped_mcp_schema_names = Vec::new();
+        let schemas = schemas
+            .into_iter()
+            .filter(|schema| {
+                let Some(name) = astra_turn_core::tool::schema::tool_schema_name(schema) else {
+                    return true;
+                };
+                if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
+                    dropped_mcp_schema_names.push(name.to_string());
+                    return false;
+                }
+                true
+            })
+            .collect();
+        if !dropped_mcp_schema_names.is_empty() {
+            tracing::warn!(
+                target: "astra.cli.capacity_provider",
+                dropped = ?dropped_mcp_schema_names,
+                "dropped MCP schemas from CLI local provider; install them through the MCP runtime provider"
+            );
+        }
+
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.cli_local_provider_schemas,
+            "cli_local_provider_schemas",
+        );
         *guard = schemas;
     }
 
@@ -1386,7 +1410,8 @@ impl ToolExecutor {
 
     /// Install the visible `tools[]` names for the current LLM request.
     pub fn set_current_visible_tool_schemas(&self, schemas: &[Value]) {
-        let names = astra_turn_core::tool::schema::tool_names_from_schemas(schemas);
+        let visible_schemas = self.runtime_bound_tool_schemas(schemas.to_vec());
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible_schemas);
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
         let activatable = guard.activatable().cloned().unwrap_or_default();
@@ -1413,7 +1438,8 @@ impl ToolExecutor {
         visible_schemas: &[Value],
         activatable_names: HashSet<String>,
     ) {
-        let visible = astra_turn_core::tool::schema::tool_names_from_schemas(visible_schemas);
+        let visible_schemas = self.runtime_bound_tool_schemas(visible_schemas.to_vec());
+        let visible = astra_turn_core::tool::schema::tool_names_from_schemas(&visible_schemas);
         let activatable = self.runtime_bound_tool_names(activatable_names);
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
@@ -1472,7 +1498,7 @@ impl ToolExecutor {
 
         astra_turn_core::tool::deferred_activation::searchable_runtime_bound_tool_names(
             &surface,
-            |name| self.tool_has_runtime_binding(name),
+            |name| self.tool_has_public_schema_runtime_binding(name),
         )
     }
 
@@ -1482,7 +1508,7 @@ impl ToolExecutor {
 
     fn runtime_bound_tool_names(&self, names: HashSet<String>) -> HashSet<String> {
         astra_turn_core::tool::deferred_activation::runtime_bound_tool_names(names, |name| {
-            self.tool_has_runtime_binding(name)
+            self.tool_has_public_schema_runtime_binding(name)
         })
     }
 
@@ -1491,22 +1517,114 @@ impl ToolExecutor {
             .into_iter()
             .filter(|schema| {
                 astra_turn_core::tool::schema::tool_schema_name(schema)
-                    .is_some_and(|name| self.tool_has_runtime_binding(name))
+                    .is_some_and(|name| self.tool_has_public_schema_runtime_binding(name))
             })
             .collect()
     }
 
-    fn tool_has_runtime_binding(&self, name: &str) -> bool {
-        if name.starts_with("mcp__") {
+    fn runtime_available_tool_schemas(&self) -> Vec<Value> {
+        let mut schemas = local_tool_schemas();
+        schemas.extend(self.provider_owned_schemas_snapshot("shared_tool_executor_surface"));
+        let mut seen = HashSet::new();
+        let mut schemas: Vec<Value> = self
+            .runtime_bound_tool_schemas(schemas)
+            .into_iter()
+            .filter(|schema| {
+                astra_turn_core::tool::schema::tool_schema_name(schema)
+                    .is_some_and(|name| seen.insert(name.to_string()))
+            })
+            .collect();
+        astra_core::tool_schema::sort_tool_schemas_by_name(&mut schemas);
+        schemas
+    }
+
+    fn tool_has_public_schema_runtime_binding(&self, name: &str) -> bool {
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name) {
             return self.mcp_tool_has_runtime_binding(name);
         }
+
+        let registry = runtime_env_builtin_registry();
+        if let Some(spec) = registry.get(name) {
+            if !spec.load_policy.is_public_schema_policy() {
+                return false;
+            }
+            return self.tool_has_runtime_binding(name);
+        }
+
+        self.cli_local_provider_schema_has_name(name) && self.tool_has_runtime_binding(name)
+    }
+
+    fn tool_has_runtime_binding(&self, name: &str) -> bool {
+        self.tool_has_runtime_binding_for_call(name, &Value::Null)
+    }
+
+    fn tool_has_runtime_binding_for_call(&self, name: &str, args: &Value) -> bool {
+        if self.runtime_environment_tool_denial(name, args).is_some() {
+            return false;
+        }
+
         let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
             return self.cli_declared_local_tool_has_name(name)
-                || self.plugin_schema_has_name(name);
+                || self.cli_local_provider_schema_has_name(name);
         };
         meta.requires
             .iter()
             .all(|capability| self.capability_has_runtime_binding(*capability))
+    }
+
+    fn runtime_environment_tool_denial(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<astra_runtime_env::ToolUnavailableReason> {
+        let registry = runtime_env_builtin_registry();
+        if registry.get(name).is_none() && !astra_runtime_env::is_mcp_namespaced_tool_name(name) {
+            return None;
+        }
+        let binding = self.runtime_environment_binding_for_tool(name, registry);
+        astra_runtime_env::CapabilityResolver
+            .check_tool_call_for_surface(
+                registry,
+                name,
+                args,
+                &binding.capabilities,
+                &binding.tool_surface,
+            )
+            .err()
+    }
+
+    fn runtime_environment_binding_for_tool(
+        &self,
+        name: &str,
+        registry: &astra_runtime_env::ToolRegistry,
+    ) -> astra_runtime_env::RunBinding {
+        if astra_runtime_env::is_mcp_namespaced_tool_name(name)
+            && self.mcp_tool_has_runtime_binding(name)
+        {
+            let providers = vec![astra_runtime_env::mcp_provider(
+                "cli-mcp",
+                [name.to_string()],
+            )];
+            return astra_runtime_env::RunBinding::resolve_with_provider_declarations(
+                astra_runtime_env::WorkspaceBinding::none(),
+                astra_runtime_env::ExecutorBinding {
+                    kind: astra_runtime_env::ExecutorBindingKind::Mcp,
+                    executor_id: "cli-mcp".to_string(),
+                    display_name: "CLI MCP server".to_string(),
+                    transport: astra_runtime_env::ToolTransportKind::McpHttp,
+                    status: astra_runtime_env::ExecutorStatus::Online,
+                },
+                astra_runtime_env::RuntimeBinding::none(),
+                astra_runtime_env::PolicyIntent::cloud_control_plane(),
+                registry,
+                &providers,
+            );
+        }
+
+        astra_runtime_env::RunBinding::local_developer(
+            self.project_root.display().to_string(),
+            registry,
+        )
     }
 
     fn cli_declared_local_tool_has_name(&self, name: &str) -> bool {
@@ -1524,8 +1642,8 @@ impl ToolExecutor {
                 .contains(name)
     }
 
-    fn plugin_schema_has_name(&self, name: &str) -> bool {
-        self.external_schemas_snapshot("external_schemas_runtime_binding")
+    fn cli_local_provider_schema_has_name(&self, name: &str) -> bool {
+        self.cli_local_provider_schemas_snapshot("cli_local_provider_schemas_runtime_binding")
             .iter()
             .any(|schema| {
                 astra_turn_core::tool::schema::tool_schema_name(schema)
@@ -1535,12 +1653,27 @@ impl ToolExecutor {
 
     fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
         let runtime = self.mcp_runtime_snapshot("mcp_runtime_binding");
+        let schema_declared = runtime.schemas.iter().any(|schema| {
+            astra_turn_core::tool::schema::tool_schema_name(schema)
+                .is_some_and(|schema_name| schema_name == name)
+        });
+        if !schema_declared {
+            return false;
+        }
         let Some(manager) = &runtime.manager else {
             return false;
         };
-        manager
-            .try_read()
-            .is_ok_and(|manager| manager.find_tool_by_mcp_name(name).is_some())
+        match manager.try_read() {
+            Ok(manager) => manager.find_tool_by_mcp_name(name).is_some(),
+            Err(_) => {
+                tracing::debug!(
+                    target: "astra_cli::tool_binding",
+                    tool = %name,
+                    "MCP registry busy while checking runtime binding; preserving schema-declared availability"
+                );
+                true
+            }
+        }
     }
 
     fn capability_has_runtime_binding(
@@ -1579,7 +1712,7 @@ impl ToolExecutor {
     }
 
     fn tool_binding_admission_denial(&self, name: &str, args: &Value) -> Option<EdgeToolRun> {
-        if self.tool_has_runtime_binding(name) {
+        if self.tool_has_runtime_binding_for_call(name, args) {
             return None;
         }
         if self.tool_can_validate_without_runtime_binding(name, args) {
@@ -1707,28 +1840,32 @@ impl ToolExecutor {
         }
     }
 
-    pub(crate) fn runtime_bound_external_schemas_excluding(
+    pub(crate) fn runtime_bound_provider_owned_schemas_excluding(
         &self,
         restricted_tools: &HashSet<String>,
     ) -> Vec<Value> {
-        let external_schemas: Vec<Value> = self
-            .external_schemas_snapshot("external_schemas_deferred_manifest")
+        let provider_schemas: Vec<Value> = self
+            .provider_owned_schemas_snapshot("provider_owned_schemas_deferred_manifest")
             .into_iter()
             .filter(|schema| {
                 astra_turn_core::tool::schema::tool_schema_name(schema)
                     .is_none_or(|name| !restricted_tools.contains(name))
             })
             .collect();
-        self.runtime_bound_tool_schemas(external_schemas)
+        self.runtime_bound_tool_schemas(provider_schemas)
     }
 
-    pub(super) fn external_schemas_snapshot(&self, label: &str) -> Vec<Value> {
-        let mut schemas = rwlock_read_clone_or_default(&self.plugin_schemas, label);
+    pub(super) fn provider_owned_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+        let mut schemas = self.cli_local_provider_schemas_snapshot(label);
         schemas.extend(
             self.mcp_runtime_snapshot("mcp_runtime_schema_snapshot")
                 .schemas,
         );
         schemas
+    }
+
+    fn cli_local_provider_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+        rwlock_read_clone_or_default(&self.cli_local_provider_schemas, label)
     }
 
     pub(super) fn mcp_runtime_snapshot(&self, label: &str) -> EdgeMcpRuntimeSnapshot {
@@ -2185,7 +2322,7 @@ impl ToolExecutor {
         astra_core::sync_poison::recover_rwlock_read(&self.cloud_token).clone()
     }
 
-    // ─── Plan-mode write guard (parity with server_tool_executor) ───────────
+    // ─── Plan-mode write guard (parity with runtime_tool_executor) ───────────
     //
     // While a plan is in authoring (`phase=planning` or `phase=refining`),
     // world-mutating tools must be
@@ -2277,103 +2414,8 @@ impl ToolExecutor {
 
     // ─── Task management methods (delegated to task_mgmt module) ────────────
 
-    fn task_action_allowed_fields(action: &str) -> Option<&'static [&'static str]> {
-        match action {
-            "create" => Some(&[
-                "action",
-                "title",
-                "description",
-                "subtasks",
-                "active_form",
-                "owner",
-                "metadata",
-                "add_blocks",
-                "add_blocked_by",
-            ]),
-            "list" => Some(&["action", "status_filter"]),
-            "get" => Some(&["action", "task_id"]),
-            "update" => Some(&[
-                "action",
-                "task_id",
-                "new_status",
-                "status",
-                "title",
-                "description",
-                "subtask_id",
-                "active_form",
-                "owner",
-                "metadata",
-                "add_blocks",
-                "add_blocked_by",
-                "remove_blocks",
-                "remove_blocked_by",
-                "reason",
-                "error_message",
-            ]),
-            "stop" => Some(&["action", "task_id", "reason"]),
-            "list_user" => Some(&["action", "user_status"]),
-            "adopt" => Some(&["action", "source_session_id", "task_id"]),
-            "archive" => Some(&["action", "task_id", "older_than_days", "reason"]),
-            _ => None,
-        }
-    }
-
-    fn task_actions_allowing_field(field: &str, current_action: &str) -> Vec<&'static str> {
-        const TASK_ACTIONS: &[&str] = &[
-            "create",
-            "list",
-            "get",
-            "update",
-            "stop",
-            "list_user",
-            "adopt",
-            "archive",
-        ];
-        TASK_ACTIONS
-            .iter()
-            .copied()
-            .filter(|action| *action != current_action)
-            .filter(|action| {
-                Self::task_action_allowed_fields(action)
-                    .is_some_and(|allowed| allowed.contains(&field))
-            })
-            .collect()
-    }
-
-    fn task_unknown_field_message(action: &str, key: &str, allowed: &[&str]) -> String {
-        let other_actions = Self::task_actions_allowing_field(key, action);
-        let action_hint = if other_actions.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "; field is valid for: {}",
-                other_actions
-                    .iter()
-                    .map(|action| format!("task.{action}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        format!(
-            "unknown field '{key}' for task.{action} (valid: {}{})",
-            allowed.join(", "),
-            action_hint
-        )
-    }
-
     fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
-        let Some(allowed) = Self::task_action_allowed_fields(action) else {
-            return Ok(());
-        };
-        let Some(obj) = args.as_object() else {
-            return Err(format!("task.{action} arguments must be an object"));
-        };
-        for key in obj.keys() {
-            if !allowed.contains(&key.as_str()) {
-                return Err(Self::task_unknown_field_message(action, key, allowed));
-            }
-        }
-        Ok(())
+        astra_tools::task_tool_contract::validate_runtime_task_tool_args_for_action(action, args)
     }
 
     fn task_output_json(output: &str) -> Option<Value> {
@@ -2948,7 +2990,8 @@ impl ToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.create(args).await;
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        let output = self.task_manager.create(&public_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -2960,25 +3003,79 @@ impl ToolExecutor {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task:create:{}",
-                    args.get("title").and_then(Value::as_str).unwrap_or("task")
+                    "task_board:create:{}",
+                    public_args
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("task")
                 ),
             );
-            self.record_task_lifecycle_event("create", args, &output);
+            self.record_task_lifecycle_event("create", &public_args, &output);
         }
         output
     }
+
+    async fn execute_task_tool_args(&self, args: &Value) -> String {
+        let action = match astra_tools::task_tool_contract::task_action_from_args(args) {
+            Ok(action) => action,
+            Err(error) => return format!("Error: {error}"),
+        };
+        match action {
+            "create" => match Self::validate_task_tool_args_for_action("create", args) {
+                Ok(()) => self.task_action_create(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "list" => match Self::validate_task_tool_args_for_action("list", args) {
+                Ok(()) => self.task_list(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "get" => match Self::validate_task_tool_args_for_action("get", args) {
+                Ok(()) => self.task_get(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "update" => match Self::validate_task_tool_args_for_action("update", args) {
+                Ok(()) => self.task_action_update(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "stop" => match Self::validate_task_tool_args_for_action("stop", args) {
+                Ok(()) => self.task_action_stop(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "list_user" => match Self::validate_task_tool_args_for_action("list_user", args) {
+                Ok(()) => self.task_list_user(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "adopt" => match Self::validate_task_tool_args_for_action("adopt", args) {
+                Ok(()) => self.task_adopt(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            "archive" => match Self::validate_task_tool_args_for_action("archive", args) {
+                Ok(()) => self.task_action_archive(args).await,
+                Err(error) => format!("Error: {error}"),
+            },
+            other => match Self::validate_task_tool_args_for_action(other, args) {
+                Ok(()) => format!(
+                    "Error: {}",
+                    astra_tools::task_tool_contract::task_unknown_action_message(other)
+                ),
+                Err(error) => format!("Error: {error}"),
+            },
+        }
+    }
+
     async fn task_list(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("list", args).await {
             return output;
         }
-        self.task_manager.list(args).await
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        self.task_manager.list(&public_args).await
     }
     async fn task_get(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("get", args).await {
             return output;
         }
-        self.task_manager.get(args).await
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        self.task_manager.get(&public_args).await
     }
     async fn task_action_update(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("update", args).await {
@@ -2991,7 +3088,8 @@ impl ToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.update(args).await;
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        let output = self.task_manager.update(&public_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3003,13 +3101,14 @@ impl ToolExecutor {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task:update:{}",
-                    args.get("task_id")
+                    "task_board:update:{}",
+                    public_args
+                        .get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("task")
                 ),
             );
-            self.record_task_lifecycle_event("update", args, &output);
+            self.record_task_lifecycle_event("update", &public_args, &output);
         }
         output
     }
@@ -3024,7 +3123,8 @@ impl ToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.stop(args).await;
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        let output = self.task_manager.stop(&public_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3036,18 +3136,19 @@ impl ToolExecutor {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task:stop:{}",
-                    args.get("task_id")
+                    "task_board:stop:{}",
+                    public_args
+                        .get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("task")
                 ),
             );
-            self.record_task_lifecycle_event("stop", args, &output);
+            self.record_task_lifecycle_event("stop", &public_args, &output);
         }
         output
     }
 
-    /// `task(action='list_user')` — cross-session active list. Cloud
+    /// `task_board(action='list_user')` — cross-session active list. Cloud
     /// only: in-memory mode by definition has only one session, so
     /// the cross-session question is meaningless without a backing
     /// store that aggregates across users.
@@ -3057,7 +3158,7 @@ impl ToolExecutor {
             Err(err) => return err,
         };
         let Some(cloud_base) = self.cloud_base.clone() else {
-            return "Error: task(action='list_user') requires a cloud connection. \
+            return "Error: task_board(action='list_user') requires a cloud connection. \
                     The cross-session view is server-side only — set ASTRA_API_URL \
                     or sign in with `astra login` to enable it."
                 .to_string();
@@ -3093,14 +3194,14 @@ impl ToolExecutor {
         }
     }
 
-    /// `task(action='adopt', source_session_id, task_id)` — bring a
+    /// `task_board(action='adopt', source_session_id, task_id)` — bring a
     /// task from another of the user's sessions into the current
     /// session. Server-side it copies the row's title/description/
     /// metadata into a fresh todo here and marks the source migrated
     /// so the user doesn't see it twice. Cloud-only.
     async fn task_adopt(&self, args: &Value) -> String {
         if self.cloud_base.is_none() {
-            return "Error: task(action='adopt') requires a cloud connection.".to_string();
+            return "Error: task_board(action='adopt') requires a cloud connection.".to_string();
         }
         // Adopt is a write — route through the same execute endpoint.
         // Server-side dispatch will reject if source isn't owned by
@@ -3111,7 +3212,7 @@ impl ToolExecutor {
         }
     }
 
-    /// `task(action='archive', task_id?)` — either archive one
+    /// `task_board(action='archive', task_id?)` — either archive one
     /// current-session task immediately, or bulk-archive stale
     /// completed history in the current session.
     async fn task_action_archive(&self, args: &Value) -> String {
@@ -3125,7 +3226,8 @@ impl ToolExecutor {
                 return format!("Error: failed to capture task rollback snapshot: {error}");
             }
         };
-        let output = self.task_manager.archive(args).await;
+        let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
+        let output = self.task_manager.archive(&public_args).await;
         if Self::task_output_success(&output) {
             if let Err(error) = self
                 .task_manager
@@ -3137,13 +3239,14 @@ impl ToolExecutor {
             self.record_task_state_rollback(
                 snapshot,
                 format!(
-                    "task:archive:{}",
-                    args.get("task_id")
+                    "task_board:archive:{}",
+                    public_args
+                        .get("task_id")
                         .and_then(Value::as_str)
                         .unwrap_or("bulk")
                 ),
             );
-            self.record_task_lifecycle_event("archive", args, &output);
+            self.record_task_lifecycle_event("archive", &public_args, &output);
         }
         output
     }
@@ -4413,37 +4516,48 @@ impl ToolExecutor {
             return outcome;
         }
         if name == "git" {
-            let action = args
-                .get("action")
-                .and_then(Value::as_str)
-                .unwrap_or("status");
+            let action = match astra_tools::git_tool_contract::git_action_from_args(args) {
+                Ok(action) => action,
+                Err(error) => return ToolExecutionOutcome::error(format!("Error: {error}")),
+            };
             match action {
-                "commit" => {
+                astra_tools::git_tool_contract::GitAction::Commit => {
                     let mut outcome = self.commit_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
-                "revert_commit" => {
+                astra_tools::git_tool_contract::GitAction::RevertCommit => {
                     let mut outcome = self.revert_commit_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
-                "stash" => {
+                astra_tools::git_tool_contract::GitAction::Stash => {
                     let stash_args = git_stash_action_args(args);
                     let mut outcome = self.stash_with_metadata(&stash_args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
-                "worktree" => {
+                astra_tools::git_tool_contract::GitAction::Worktree => {
                     let mut outcome = self.worktree_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
-                _ => {} // Other git actions handled in execute() below
+                astra_tools::git_tool_contract::GitAction::Status
+                | astra_tools::git_tool_contract::GitAction::Diff
+                | astra_tools::git_tool_contract::GitAction::Log
+                | astra_tools::git_tool_contract::GitAction::Show
+                | astra_tools::git_tool_contract::GitAction::Blame
+                | astra_tools::git_tool_contract::GitAction::FileHistory
+                | astra_tools::git_tool_contract::GitAction::LogSearch
+                | astra_tools::git_tool_contract::GitAction::Contributors
+                | astra_tools::git_tool_contract::GitAction::CheckoutFile
+                | astra_tools::git_tool_contract::GitAction::Push => {
+                    // Other git actions are handled by execute_run below.
+                }
             }
         }
         self.execute_run(name, args).await.into_outcome()
@@ -4488,10 +4602,9 @@ impl ToolExecutor {
         } else if is_plan_mode_blocked_tool(name, args) && self.plan_mode_authoring_active().await {
             format!(
                 "Error: Tool '{name}' is blocked while plan mode is active. \
-                 The agent must call `exit_plan_mode` with an approved plan \
-                 before any write operation. This mirrors the reference agent's plan \
-                 mode: the plan is authored with read-only tools, approved by \
-                 the user, then execution proceeds with writes unlocked."
+                 Use read-only tools to finish the plan, then call \
+                 `exit_plan_mode(plan='...')` to submit it through the trusted \
+                 plan-review overlay before write tools can run."
             )
         } else {
             match name {
@@ -4541,43 +4654,58 @@ impl ToolExecutor {
                 "grep" => self.grep(args),
                 "glob" => self.glob(args),
                 "git" => {
-                    let action = args
-                        .get("action")
-                        .and_then(Value::as_str)
-                        .unwrap_or("status");
+                    let action = match astra_tools::git_tool_contract::git_action_from_args(args) {
+                        Ok(action) => action,
+                        Err(error) => return format!("Error: {error}"),
+                    };
                     match action {
-                        "status" => git_gix::status(&self.project_root, args),
-                        "diff" => git_gix::diff(
+                        astra_tools::git_tool_contract::GitAction::Status => {
+                            git_gix::status(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Diff => git_gix::diff(
                             &self.project_root,
                             args,
                             self.get_budget_pressure(),
                             self.aggregate_output_bytes
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        "log" => git_gix::log(&self.project_root, args),
-                        "show" => git_gix::show(
+                        astra_tools::git_tool_contract::GitAction::Log => {
+                            git_gix::log(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Show => git_gix::show(
                             &self.project_root,
                             args,
                             self.get_budget_pressure(),
                             self.aggregate_output_bytes
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        "blame" => git_gix::blame(&self.project_root, args),
-                        "file_history" => git_gix::file_history(&self.project_root, args),
-                        "log_search" => git_gix::log_search(&self.project_root, args),
-                        "contributors" => git_gix::contributors(&self.project_root, args),
-                        "commit" => self.commit(args),
-                        "revert_commit" => self.revert_commit(args),
-                        "stash" => {
+                        astra_tools::git_tool_contract::GitAction::Blame => {
+                            git_gix::blame(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::FileHistory => {
+                            git_gix::file_history(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::LogSearch => {
+                            git_gix::log_search(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Contributors => {
+                            git_gix::contributors(&self.project_root, args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Commit => self.commit(args),
+                        astra_tools::git_tool_contract::GitAction::RevertCommit => {
+                            self.revert_commit(args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Stash => {
                             let stash_args = git_stash_action_args(args);
                             self.stash(&stash_args)
                         }
-                        "checkout_file" => self.checkout_file(args),
-                        "worktree" => self.worktree(args),
-                        "push" => git_gix::push(&self.project_root, args),
-                        _ => format!(
-                            "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree, push"
-                        ),
+                        astra_tools::git_tool_contract::GitAction::CheckoutFile => {
+                            self.checkout_file(args)
+                        }
+                        astra_tools::git_tool_contract::GitAction::Worktree => self.worktree(args),
+                        astra_tools::git_tool_contract::GitAction::Push => {
+                            git_gix::push(&self.project_root, args)
+                        }
                     }
                 }
                 "find_definition" => self.find_definition(args),
@@ -4593,19 +4721,33 @@ impl ToolExecutor {
                 "symbols" => self.symbols(args),
                 "mo_query" => self.mo_query(args),
                 "github" => {
-                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    let action =
+                        match astra_tools::github_tool_contract::github_action_from_args(args) {
+                            Ok(action) => action,
+                            Err(error) => return format!("Error: {error}"),
+                        };
                     match action {
-                        "list_prs" => self.list_prs(args).await,
-                        "get_pr" => self.get_pr(args).await,
-                        "ci_status" => self.ci_status(args).await,
-                        "list_issues" => self.list_issues(args).await,
-                        "get_issue" => self.get_issue(args).await,
-                        "repo_stats" => self.repo_stats(args).await,
-                        "create_issue" => self.github_create_issue(args).await,
-                        "" => "Error: missing required parameter 'action'. Use one of: list_prs, get_pr, ci_status, list_issues, get_issue, repo_stats, create_issue".to_string(),
-                        other => format!(
-                            "Error: unknown github action '{other}'. Use one of: list_prs, get_pr, ci_status, list_issues, get_issue, repo_stats, create_issue"
-                        ),
+                        astra_tools::github_tool_contract::GithubAction::ListPrs => {
+                            self.list_prs(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::GetPr => {
+                            self.get_pr(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::CiStatus => {
+                            self.ci_status(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::RepoStats => {
+                            self.repo_stats(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::ListIssues => {
+                            self.list_issues(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::GetIssue => {
+                            self.get_issue(args).await
+                        }
+                        astra_tools::github_tool_contract::GithubAction::CreateIssue => {
+                            self.github_create_issue(args).await
+                        }
                     }
                 }
                 "web_fetch" => {
@@ -4617,14 +4759,33 @@ impl ToolExecutor {
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
                     astra_tools::web_fetch::fetch_with_cache_scope(None, args, &cache_scope).await
                 }
+                "display_sixel" => {
+                    astra_tools::ToolExecutor::execute(&self.default_executor, name, args)
+                        .await
+                        .output
+                }
+                "run_script" => {
+                    #[cfg(unix)]
+                    {
+                        let config = astra_tools::run_script::RunScriptConfig::default();
+                        astra_tools::run_script::handle_run_script(args, self, config)
+                            .await
+                            .output
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        "Error: run_script is not available on this platform (requires Unix domain sockets)"
+                            .to_string()
+                    }
+                }
                 "memory" => {
-                    let op = match args.get("action").and_then(|v| v.as_str()) {
-                        Some(a) => a,
-                        None => return "Error: missing required parameter `action`. \
-                             Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string(),
-                    };
+                    let action =
+                        match astra_tools::memory_tool_contract::memory_action_from_args(args) {
+                            Ok(action) => action,
+                            Err(error) => return format!("Error: {error}"),
+                        };
                     let clean_args = self.memory_args_with_context(args);
-                    self.memoria_call(op, &clean_args).await
+                    self.memoria_call(action.as_str(), &clean_args).await
                 }
                 "enter_plan_mode" => self.enter_plan_mode_remote(args).await,
                 "exit_plan_mode" => self.exit_plan_mode_remote(args).await,
@@ -4720,9 +4881,20 @@ impl ToolExecutor {
                 }
                 // ── Consolidated agent tool ──────────────────────────────────
                 "agent" => {
-                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    let action = match astra_tools::agent_tool_contract::agent_action_from_args(
+                        args,
+                    ) {
+                        Ok(action) => action,
+                        Err(error) => {
+                            return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_error_with_kind(
+                                    None,
+                                    &error,
+                                    Some(astra_core::ErrorKind::ToolInvalidArgs),
+                                );
+                        }
+                    };
                     match action {
-                        "run_chain" => {
+                        astra_tools::agent_tool_contract::AgentAction::RunChain => {
                             match serde_json::from_value::<
                                 astra_turn_core::tool_registry_chain::ToolChain,
                             >(args.clone())
@@ -4748,21 +4920,21 @@ impl ToolExecutor {
                                 Err(e) => format!("Error: Invalid chain format: {e}"),
                             }
                         }
-                        "spawn" => {
+                        astra_tools::agent_tool_contract::AgentAction::Spawn => {
                             agent_spawning::handle_agent_spawn_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )
                             .await
                         }
-                        "get_result" => {
+                        astra_tools::agent_tool_contract::AgentAction::GetResult => {
                             agent_spawning::handle_agent_get_result_action(
                                 args,
                                 self.spawn_context.as_ref(),
                             )
                             .await
                         }
-                        "send_message" => {
+                        astra_tools::agent_tool_contract::AgentAction::SendMessage => {
                             let ctx = self
                                 .send_message_context
                                 .lock()
@@ -4770,25 +4942,6 @@ impl ToolExecutor {
                                 .and_then(|g| g.clone());
                             agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
                         }
-                        _ if action.is_empty() && args.get("spawn").is_some() => {
-                            "Error: invalid agent call shape. Use the top-level \
-                             `action='spawn'` field, not a `spawn` wrapper key. \
-                             Example: agent(action='spawn', description='...', \
-                             prompt='...'). For parallel \
-                             fan-out, use agent_fanout(action='start', target_count=N, \
-                             slots=[...]); do not pass `agents:[...]`."
-                                .to_string()
-                        }
-                        _ if action.is_empty() && args.get("agents").is_some() => {
-                            "Error: unsupported `agents` batch payload for `agent`. \
-                             Each `agent(action='spawn', ...)` call launches exactly \
-                             one child. Use `agent_fanout(action='start', target_count=N, \
-                             slots=[...])` for atomic parallel fan-out."
-                                .to_string()
-                        }
-                        _ => format!(
-                            "Error: unknown agent action '{action}'. Use one of: spawn, get_result, run_chain, send_message"
-                        ),
                     }
                 }
                 "agent_fanout" => {
@@ -4797,74 +4950,28 @@ impl ToolExecutor {
                 }
                 // ── Consolidated session tool ──────────────────────────────
                 "session" => {
-                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    let action =
+                        match astra_tools::session_tool_contract::session_action_from_args(args) {
+                            Ok(action) => action,
+                            Err(error) => return format!("Error: {error}"),
+                        };
                     match action {
-                        "config" => self.adjust_config(args),
-                        "sleep" => self.sleep_tool(args).await,
-                        "history_page" | "history_search" => self.render_session_history(args),
-                        "history_around" => self.render_session_history_around(args),
-                        "" => "Missing required parameter: action. Use: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, compress_context, ask_user, enter_plan_mode, exit_plan_mode.".to_string(),
-                        other => format!("Error: unknown `session` action '{other}'. Valid: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, compress_context, ask_user, enter_plan_mode, exit_plan_mode."),
+                        astra_tools::session_tool_contract::SessionAction::Config => {
+                            self.adjust_config(args)
+                        }
+                        astra_tools::session_tool_contract::SessionAction::Sleep => {
+                            self.sleep_tool(args).await
+                        }
+                        astra_tools::session_tool_contract::SessionAction::HistoryPage
+                        | astra_tools::session_tool_contract::SessionAction::HistorySearch => {
+                            self.render_session_history(args)
+                        }
+                        astra_tools::session_tool_contract::SessionAction::HistoryAround => {
+                            self.render_session_history_around(args)
+                        }
                     }
                 }
-                // Task management (unified tool with action param)
-                "task" => {
-                    let action_value = args.get("action");
-                    let action = match action_value {
-                        Some(Value::String(action)) => action.as_str(),
-                        Some(_) => return "Error: field 'action' must be a string".to_string(),
-                        None => "",
-                    };
-                    match action {
-                        "create" => match Self::validate_task_tool_args_for_action("create", args)
-                        {
-                            Ok(()) => self.task_action_create(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
-                        "list" => match Self::validate_task_tool_args_for_action("list", args) {
-                            Ok(()) => self.task_list(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
-                        "get" => match Self::validate_task_tool_args_for_action("get", args) {
-                            Ok(()) => self.task_get(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
-                        "update" => match Self::validate_task_tool_args_for_action("update", args)
-                        {
-                            Ok(()) => self.task_action_update(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
-                        "stop" => match Self::validate_task_tool_args_for_action("stop", args) {
-                            Ok(()) => self.task_action_stop(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
-                        // Cross-session views (Phase 7): user_id-indexed
-                        // queries served by the server. Cloud-only;
-                        // offline mode returns an error since there's
-                        // nothing to aggregate across sessions.
-                        "list_user" => {
-                            match Self::validate_task_tool_args_for_action("list_user", args) {
-                                Ok(()) => self.task_list_user(args).await,
-                                Err(error) => format!("Error: {error}"),
-                            }
-                        }
-                        "adopt" => match Self::validate_task_tool_args_for_action("adopt", args) {
-                            Ok(()) => self.task_adopt(args).await,
-                            Err(error) => format!("Error: {error}"),
-                        },
-                        "archive" => {
-                            match Self::validate_task_tool_args_for_action("archive", args) {
-                                Ok(()) => self.task_action_archive(args).await,
-                                Err(error) => format!("Error: {error}"),
-                            }
-                        }
-                        "" => "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop, list_user, adopt, archive. For typed background tasks use `task_output`, `task_list`, or `task_stop`.".to_string(),
-                        other => match Self::validate_task_tool_args_for_action(other, args) {
-                            Ok(()) => format!("Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop, list_user, adopt, archive. For typed background tasks use `task_output`, `task_list`, or `task_stop`. For parallel sub-agents use `agent_fanout(action='start', target_count=N, slots=[...])`; it returns results by default. Backgrounding is user-controlled with Ctrl+B while the live tool is running."),
-                            Err(error) => format!("Error: {error}"),
-                        },
-                    }
-                }
+                "task_board" => self.execute_task_tool_args(args).await,
                 "task_output" => self.task_output(args).await,
                 "task_stop" => self.task_kill_bg(args).await,
                 "task_list" => self.task_list_bg().await,
@@ -4915,12 +5022,10 @@ impl ToolExecutor {
                 "config" => self.config_tool(args),
                 "brief" => self.brief(args).await,
                 "context_analysis" => self.context_analysis(args),
-                _ if name.starts_with("mcp__") => self.execute_mcp_tool(name, args).await,
-                _ => {
-                    // Delegate unknown tools to the shared DefaultToolExecutor.
-                    use astra_tools::ToolExecutor as _;
-                    self.default_executor.execute(name, args).await.output
+                _ if astra_runtime_env::is_mcp_namespaced_tool_name(name) => {
+                    self.execute_mcp_tool(name, args).await
                 }
+                _ => format!("Error: Tool '{name}' is not implemented by the CLI executor"),
             }
         };
         // Normalize empty output, then apply global safety net
@@ -4958,12 +5063,9 @@ impl ToolExecutor {
     ///
     /// When a single tool result exceeds `PERSIST_THRESHOLD` AND cumulative
     /// output this turn is above `AGGREGATE_SOFT_LIMIT`, the full output is
-    /// written to `~/.astra/tool-results/<hash>.txt` and replaced with a
-    /// ~2KB preview + file path. The model can use `read_file` with
-    /// `start_line/end_line` to access specific parts of the persisted file.
-    ///
-    /// Large results are persisted to a temp file and replaced with a
-    /// ~2KB preview + file path.
+    /// written to an internal artifact and replaced with a ~2KB preview. The
+    /// artifact path is intentionally not exposed to the model because it is
+    /// outside the workspace filesystem contract.
     fn maybe_persist_large_output(&self, output: String, _tool_name: &str) -> String {
         // Skip small outputs
         if output.len() < PERSIST_THRESHOLD {
@@ -5018,14 +5120,12 @@ impl ToolExecutor {
         format!(
             "<persisted-output>\n\
              Output too large ({} bytes, ~{} lines) for context window. \
-             Full output saved to: {}\n\n\
+             Full output was persisted as an internal tool-result artifact outside the workspace.\n\n\
              Preview (first ~{} bytes):\n\
              {}\n...\n\
-             </persisted-output>\n\
-             Use read_file with start_line/end_line to read specific sections of the persisted file.",
+             </persisted-output>",
             output.len(),
             total_lines,
-            filepath.display(),
             PERSIST_PREVIEW_BYTES,
             preview,
         )
@@ -5199,8 +5299,17 @@ impl ToolExecutor {
         })
     }
 
+    fn provider_visible_tool_schemas(&self) -> Vec<Value> {
+        let mut tools = self.runtime_bound_provider_owned_schemas_excluding(&HashSet::new());
+        if tools.is_empty() {
+            tools = self.runtime_bound_tool_schemas(local_tool_schemas());
+        }
+        tools
+    }
+
     fn tool_names(&self) -> Vec<String> {
-        all_tool_schemas()
+        let mut names: Vec<String> = self
+            .provider_visible_tool_schemas()
             .iter()
             .filter_map(|s| {
                 s.get("function")
@@ -5208,11 +5317,13 @@ impl ToolExecutor {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             })
-            .collect()
+            .collect();
+        names.sort();
+        names
     }
 
     fn tool_count(&self) -> usize {
-        all_tool_schemas().len()
+        self.tool_names().len()
     }
 
     async fn get_agent_info(&self, args: &Value) -> String {
@@ -5311,6 +5422,7 @@ impl ToolExecutor {
                 "tools_dropped_by_capability": caps.dropped_by_capability,
                 "tools_dropped_by_surface": caps.dropped_by_surface,
                 "tools_pass_through_mcp": caps.mcp_pass_through,
+                "capacity_provider_coverage": caps.capacity_provider_coverage,
                 "tool_count": model.capabilities.total_tools,
                 "retry_cautioned_tools": model.capabilities.retry_cautioned_tools,
                 "skills": model.capabilities.skills,
@@ -5334,6 +5446,7 @@ impl ToolExecutor {
                 "tools_dropped_by_capability": caps.dropped_by_capability,
                 "tools_dropped_by_surface": caps.dropped_by_surface,
                 "tools_pass_through_mcp": caps.mcp_pass_through,
+                "capacity_provider_coverage": caps.capacity_provider_coverage,
                 "tool_count": tool_count,
             })
         }
@@ -5366,7 +5479,7 @@ impl ToolExecutor {
         }
 
         let mut pool = full_tool_schemas();
-        pool.extend(self.external_schemas_snapshot("external_schemas_capability_view"));
+        pool.extend(self.provider_owned_schemas_snapshot("provider_owned_schemas_capability_view"));
 
         let outcome = astra_turn_core::tool_surface::resolve_with_diagnostics(
             astra_turn_core::tool_surface::Surface::CliLocal,
@@ -5423,7 +5536,7 @@ impl ToolExecutor {
                     .iter()
                     .any(|meta| meta.name == name.as_str())
             })
-            .filter(|name| name.starts_with("mcp__"))
+            .filter(|name| astra_runtime_env::is_mcp_namespaced_tool_name(name))
             .collect();
         let dropped_by_surface = outcome
             .dropped_by_surface
@@ -5438,7 +5551,81 @@ impl ToolExecutor {
             dropped_by_capability,
             dropped_by_surface,
             mcp_pass_through,
+            capacity_provider_coverage: self.cli_capacity_provider_coverage(),
         }
+    }
+
+    fn cli_capacity_provider_coverage(
+        &self,
+    ) -> Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry> {
+        vec![
+            self.cli_local_provider_coverage(),
+            self.cli_control_plane_provider_coverage(),
+            self.cli_mcp_provider_coverage(),
+        ]
+    }
+
+    fn cli_local_provider_coverage(
+        &self,
+    ) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        astra_runtime_env::CapacityProviderCoverageEntry::ready(
+            astra_runtime_env::CapacityProviderType::CliLocal,
+            "local-cli",
+            astra_runtime_env::read_write_workspace_capabilities(),
+        )
+    }
+
+    fn cli_control_plane_provider_coverage(
+        &self,
+    ) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        let mut extra = vec![
+            astra_runtime_env::CAP_INTROSPECT,
+            astra_runtime_env::CAP_REFLECT,
+        ];
+        if self.spawn_context.is_some() {
+            extra.push(astra_runtime_env::CAP_MULTI_AGENT);
+        }
+        if self.bg_task_commands.is_some() {
+            extra.push(astra_runtime_env::CAP_LOCAL_BACKGROUND_TASKS);
+        }
+        astra_runtime_env::CapacityProviderCoverageEntry::ready(
+            astra_runtime_env::CapacityProviderType::ControlPlane,
+            "cli-control-plane",
+            astra_runtime_env::control_plane_capabilities(extra),
+        )
+    }
+
+    fn cli_mcp_provider_coverage(
+        &self,
+    ) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        let schemas = self.mcp_runtime_snapshot("cli_mcp_coverage").schemas;
+        let mut ready_names = schemas
+            .iter()
+            .filter_map(astra_turn_core::tool::schema::tool_schema_name)
+            .filter(|name| self.mcp_tool_has_runtime_binding(name))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        ready_names.sort();
+        ready_names.dedup();
+        if !ready_names.is_empty() {
+            return astra_runtime_env::CapacityProviderCoverageEntry::ready(
+                astra_runtime_env::CapacityProviderType::McpProvider,
+                "cli-mcp",
+                ready_names,
+            );
+        }
+
+        let reason = if schemas.is_empty() {
+            "no_cli_mcp_provider_bound"
+        } else {
+            "no_cli_mcp_runtime_binding"
+        };
+        astra_runtime_env::CapacityProviderCoverageEntry::unavailable(
+            astra_runtime_env::CapacityProviderType::McpProvider,
+            "cli-mcp",
+            astra_runtime_env::CapacityProviderStatus::Unbound,
+            reason,
+        )
     }
 
     /// Build a SelfModel snapshot from available observability session data.
@@ -5570,12 +5757,31 @@ impl ToolExecutor {
     }
 }
 
+#[async_trait::async_trait]
+impl astra_tools::ToolExecutor for ToolExecutor {
+    async fn execute(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+        tool_result_from_cli_outcome(ToolExecutor::execute_with_metadata(self, name, args).await)
+    }
+
+    fn tool_schemas(&self) -> Vec<Value> {
+        self.runtime_available_tool_schemas()
+    }
+
+    fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+        tool_result_from_cli_outcome(ToolExecutor::execute_with_metadata(self, name, args).await)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BgTaskCommand, BgTaskOutputSnapshot, ToolExecutor, all_tool_schemas,
-        detect_git_remote_repos, extract_github_owner_repo, file_checkpoint_dir_for,
-        format_background_task_error, format_background_task_output,
+        AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputSnapshot, PERSIST_THRESHOLD, ToolExecutor,
+        all_tool_schemas, detect_git_remote_repos, extract_github_owner_repo,
+        file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
         format_background_task_output_timeout, format_background_task_stop_error, memoria,
         parse_memory_search_contents, utf16_col_to_char_idx,
     };
@@ -5673,6 +5879,120 @@ mod tests {
         (dir, executor)
     }
 
+    fn function_schema(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": format!("{name} test schema"),
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn cli_executor_implements_shared_tool_executor_contract() {
+        let (_dir, executor) = temp_executor();
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "list_dir",
+            &serde_json::json!({"path": "."}),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "shared trait execution failed: {result:?}"
+        );
+        assert!(
+            result.output.contains("Directory")
+                || result.output.contains("No entries")
+                || result.output.contains("empty"),
+            "shared trait must return the CLI tool output, got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn cli_shared_tool_schemas_are_runtime_bound_stable_and_deduped() {
+        let executor = test_executor();
+        let duplicate_schema = function_schema("read_file");
+        executor.set_cli_local_provider_schemas(vec![duplicate_schema]);
+
+        let first = astra_tools::ToolExecutor::tool_schemas(&executor);
+        let second = astra_tools::ToolExecutor::tool_schemas(&executor);
+        assert_eq!(first, second, "shared schema surface must be byte-stable");
+
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&first);
+        assert!(
+            names.contains("read_file"),
+            "runtime-bound CLI surface must include core local tools"
+        );
+        assert!(
+            names.contains("task_board"),
+            "runtime-bound CLI surface must include control-plane local tools"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "read_file")
+                .count(),
+            1,
+            "duplicate provider schemas must not create duplicate prompt tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_executor_rejects_provider_tool_without_explicit_handler() {
+        let executor = test_executor();
+        let schema = function_schema("custom_provider_probe");
+        executor.set_cli_local_provider_schemas(vec![schema.clone()]);
+        executor.set_current_visible_tool_schemas(&[schema]);
+
+        let output = executor
+            .execute("custom_provider_probe", &serde_json::json!({}))
+            .await;
+
+        assert!(
+            output.contains("not implemented by the CLI executor"),
+            "provider-owned tools without a CLI handler must fail closed: {output}"
+        );
+        assert!(
+            !output.contains("DefaultToolExecutor"),
+            "unknown CLI tools must not leak through the shared default executor: {output}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cli_run_script_is_explicit_shared_tool_delegate() {
+        let executor = test_executor();
+        let output = executor.execute("run_script", &serde_json::json!({})).await;
+
+        assert!(
+            output.contains("run_script requires a non-empty top-level `script` string"),
+            "run_script must be handled by its shared contract, got: {output}"
+        );
+    }
+
+    #[test]
+    fn edge_large_output_reference_does_not_expose_unreadable_filesystem_path() {
+        let executor = test_executor();
+        executor.aggregate_output_bytes.store(
+            AGGREGATE_SOFT_LIMIT + 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let output = "x".repeat(PERSIST_THRESHOLD + 100);
+
+        let rendered = executor.maybe_persist_large_output(output, "bash");
+
+        assert!(rendered.contains("<persisted-output>"));
+        assert!(rendered.contains("internal tool-result artifact"));
+        assert!(!rendered.contains("Full output saved to:"));
+        assert!(!rendered.contains("Use read_file"));
+        assert!(!rendered.contains(".astra/tool-results"));
+    }
+
     #[test]
     fn cloud_plan_summary_requires_canonical_status_field() {
         let executor = test_executor();
@@ -5721,7 +6041,7 @@ mod tests {
             HashSet::from(["tool_search".to_string(), "ask_user".to_string()])
         );
 
-        executor.set_plugin_schemas(vec![plugin_schema.clone()]);
+        executor.set_cli_local_provider_schemas(vec![plugin_schema.clone()]);
         let filtered = executor.runtime_bound_tool_schemas(candidate_schemas());
         let names = astra_turn_core::tool::schema::tool_names_from_schemas(&filtered);
         assert_eq!(
@@ -5731,6 +6051,106 @@ mod tests {
                 "ask_user".to_string(),
                 "plugin_registered".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn runtime_bound_tool_schemas_hide_internal_builtin_helpers() {
+        let executor = test_executor();
+        let filtered = executor.runtime_bound_tool_schemas(vec![
+            function_schema("read_file"),
+            function_schema("delete_file"),
+            function_schema("multi_edit"),
+            function_schema("background_shell"),
+            function_schema("git_clone"),
+            function_schema("find_definition"),
+            function_schema("find_references"),
+        ]);
+
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(&filtered),
+            HashSet::from(["read_file".to_string()]),
+            "internal helper schemas must not be prompt-visible even when the local runtime can execute their underlying capability"
+        );
+    }
+
+    #[test]
+    fn current_tool_surface_filters_internal_helpers_before_admission() {
+        let executor = test_executor();
+
+        executor.set_current_activatable_tool_names(HashSet::from([
+            "read_file".to_string(),
+            "delete_file".to_string(),
+            "multi_edit".to_string(),
+        ]));
+        assert_eq!(
+            executor.current_activatable_tool_names_snapshot(),
+            HashSet::from(["read_file".to_string()]),
+            "deferred activation must mirror public provider-owned schemas, not internal helper executability"
+        );
+
+        executor.set_current_tool_surface(
+            &[
+                function_schema("read_file"),
+                function_schema("delete_file"),
+                function_schema("multi_edit"),
+            ],
+            HashSet::from(["background_shell".to_string()]),
+        );
+        let surface = executor.current_tool_surface_snapshot("test_visible_surface");
+        assert_eq!(
+            surface.visible().cloned().unwrap_or_default(),
+            HashSet::from(["read_file".to_string()]),
+            "manual visible-surface installation must not admit internal helper schemas"
+        );
+        assert!(
+            surface
+                .activatable()
+                .cloned()
+                .unwrap_or_default()
+                .is_empty(),
+            "manual activatable surface must not retain internal helper names"
+        );
+    }
+
+    #[test]
+    fn cli_runtime_env_admission_allows_local_workspace_tools() {
+        let (_dir, executor) = temp_executor();
+
+        for (tool, args) in [
+            ("read_file", serde_json::json!({"path": "README.md"})),
+            ("bash", serde_json::json!({"command": "pwd"})),
+            (
+                "git",
+                serde_json::json!({"action": "commit", "message": "local change"}),
+            ),
+        ] {
+            assert!(
+                executor
+                    .runtime_environment_tool_denial(tool, &args)
+                    .is_none(),
+                "{tool} should be allowed by the CLI local provider runtime-env binding"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_runtime_env_admission_requires_mcp_executor() {
+        let executor = test_executor();
+
+        let denial = executor
+            .runtime_environment_tool_denial("mcp__weather", &serde_json::json!({"city": "NYC"}))
+            .expect("MCP tool without runtime binding must be denied");
+
+        assert_eq!(
+            denial,
+            astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(
+                "mcp_executor_required".to_string()
+            )
+        );
+        assert!(
+            !executor.tool_has_runtime_binding("mcp__weather"),
+            "MCP schema must stay invisible without MCP provider ownership"
         );
     }
 
@@ -6126,22 +6546,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_task_action_points_parallel_agents_to_agent_fanout() {
+    async fn unknown_task_action_stays_inside_task_contract() {
         let executor = test_executor();
         let output = executor
-            .execute("task", &serde_json::json!({"action": "spawn_agents"}))
+            .execute("task_board", &serde_json::json!({"action": "spawn_agents"}))
             .await;
 
-        assert!(output.contains("agent_fanout(action='start'"), "{output}");
-        assert!(output.contains("returns results by default"), "{output}");
-        assert!(output.contains("Ctrl+B"), "{output}");
         assert!(
-            !output.contains("agent_fanout(action='get_results'"),
+            output.contains("unknown `task_board` action 'spawn_agents'"),
             "{output}"
+        );
+        assert!(output.contains("create, update, list"), "{output}");
+        assert!(
+            !output.contains("agent_fanout"),
+            "task must not route unknown actions to agent orchestration: {output}"
         );
         assert!(!output.contains("run_in_background: true"), "{output}");
         assert!(!output.contains("run_in_background=true"), "{output}");
-        assert!(!output.contains("agent(action='get_result'"), "{output}");
+        assert!(!output.contains("agent(action="), "{output}");
     }
 
     fn bg_snapshot(
@@ -6487,7 +6909,7 @@ mod tests {
         executor.set_current_activatable_tool_names(HashSet::new());
         let injected = executor.execute("session", &serde_json::json!({})).await;
         assert!(
-            injected.contains("Missing required parameter: action"),
+            injected.contains("missing required parameter `action` for `session`"),
             "visible schema must allow the real executor path; got: {injected}"
         );
         assert_eq!(
@@ -6731,10 +7153,13 @@ mod tests {
                 "subtasks": []
             }),
         )
-        .expect_err("task.update must reject create-only subtasks");
+        .expect_err("task_board.update must reject create-only subtasks");
 
-        assert!(err.contains("unknown field 'subtasks' for task.update"));
-        assert!(err.contains("field is valid for: task.create"), "{err}");
+        assert!(err.contains("unknown field 'subtasks' for task_board.update"));
+        assert!(
+            err.contains("field is valid for: task_board.create"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -6790,6 +7215,32 @@ mod tests {
             .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
             .unwrap_or_default();
         assert!(missing.contains(&"LocalBackgroundTasks"));
+
+        let providers = parsed["capacity_provider_coverage"]
+            .as_array()
+            .expect("capacity_provider_coverage");
+        let cli_local = providers
+            .iter()
+            .find(|provider| provider["provider_type"] == "cli_local")
+            .expect("CLI introspect must expose cli_local provider coverage");
+        assert_eq!(cli_local["status"].as_str(), Some("ready"));
+        assert!(
+            cli_local["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some("shell"))),
+            "cli_local provider should report shell capacity; got {out}"
+        );
+        let mcp = providers
+            .iter()
+            .find(|provider| provider["provider_type"] == "mcp_provider")
+            .expect("CLI introspect must expose MCP provider coverage");
+        assert_eq!(mcp["status"].as_str(), Some("unbound"));
+        assert_eq!(
+            mcp["unavailable_reason"].as_str(),
+            Some("no_cli_mcp_provider_bound")
+        );
     }
 
     #[tokio::test]
@@ -6821,15 +7272,72 @@ mod tests {
             !dropped.iter().any(|entry| entry["name"] == "task_output"),
             "task_output must be visible when LocalBackgroundTasks is active; got {out}"
         );
+
+        let providers = parsed["capacity_provider_coverage"]
+            .as_array()
+            .expect("capacity_provider_coverage");
+        let control_plane = providers
+            .iter()
+            .find(|provider| provider["provider_type"] == "control_plane")
+            .expect("CLI introspect must expose control-plane provider coverage");
+        assert!(
+            control_plane["capabilities"]
+                .as_array()
+                .is_some_and(|capabilities| capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some("local_background_tasks"))),
+            "control-plane provider should report local background task capacity when wired; got {out}"
+        );
     }
 
     #[tokio::test]
-    async fn tool_search_rejects_mcp_plugin_schema_without_runtime_binding() {
-        // MCP schemas are only callable when the MCP manager currently owns
-        // the public tool name. A cached schema alone must not make
-        // `tool_search(select:mcp__X)` more optimistic than execution.
+    async fn introspect_capability_reports_stale_mcp_provider_unbound() {
+        let mut executor = test_executor();
+        executor.install_mcp_bundle(
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::mcp_client::McpClientManager::new(),
+            )),
+            vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__weather",
+                    "description": "Get weather for a city.",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+        );
+
+        let out = executor
+            .execute(
+                "introspect",
+                &serde_json::json!({"dimension": "capability"}),
+            )
+            .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("introspect must return JSON");
+        let providers = parsed["capacity_provider_coverage"]
+            .as_array()
+            .expect("capacity_provider_coverage");
+        let mcp = providers
+            .iter()
+            .find(|provider| provider["provider_type"] == "mcp_provider")
+            .expect("CLI MCP provider coverage");
+
+        assert_eq!(mcp["status"].as_str(), Some("unbound"));
+        assert_eq!(
+            mcp["unavailable_reason"].as_str(),
+            Some("no_cli_mcp_runtime_binding")
+        );
+        assert!(mcp["capabilities"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_search_rejects_mcp_schema_installed_on_cli_local_provider() {
+        // MCP schemas are only callable when the MCP provider currently owns
+        // the public tool name. Installing an MCP-shaped schema on the CLI
+        // local provider must not make it visible or activatable.
         let executor = test_executor();
-        let plugin = serde_json::json!({
+        let schema = serde_json::json!({
             "type": "function",
             "function": {
                 "name": "mcp__weather",
@@ -6841,7 +7349,7 @@ mod tests {
                 }
             }
         });
-        executor.set_plugin_schemas(vec![plugin]);
+        executor.set_cli_local_provider_schemas(vec![schema]);
         executor.set_current_activatable_tool_names(HashSet::from(["mcp__weather".to_string()]));
         assert!(
             executor
@@ -6865,7 +7373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_search_rejects_stale_mcp_plugin_schema_not_owned_by_manager() {
+    async fn tool_search_rejects_stale_mcp_schema_not_owned_by_manager() {
         let mut executor = test_executor();
         executor.install_mcp_bundle(
             std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -6906,9 +7414,9 @@ mod tests {
     }
 
     #[test]
-    fn runtime_bound_external_schemas_excluding_filters_restricted_plugins() {
+    fn runtime_bound_provider_owned_schemas_excluding_filters_restricted_cli_provider_tools() {
         let executor = test_executor();
-        executor.set_plugin_schemas(vec![serde_json::json!({
+        executor.set_cli_local_provider_schemas(vec![serde_json::json!({
             "type": "function",
             "function": {
                 "name": "custom_weather",
@@ -6921,18 +7429,18 @@ mod tests {
             }
         })]);
 
-        let unrestricted = executor.runtime_bound_external_schemas_excluding(&HashSet::new());
+        let unrestricted = executor.runtime_bound_provider_owned_schemas_excluding(&HashSet::new());
         assert_eq!(
             astra_turn_core::tool::schema::tool_names_from_schemas(&unrestricted),
             HashSet::from(["custom_weather".to_string()])
         );
 
-        let restricted = executor.runtime_bound_external_schemas_excluding(&HashSet::from([
+        let restricted = executor.runtime_bound_provider_owned_schemas_excluding(&HashSet::from([
             "custom_weather".to_string(),
         ]));
         assert!(
             restricted.is_empty(),
-            "restricted dynamic plugin schemas must not be advertised as deferred"
+            "restricted dynamic CLI provider schemas must not be advertised as deferred"
         );
     }
 
@@ -7026,31 +7534,32 @@ mod tests {
         );
     }
 
-    /// Poison recovery: plugin schemas are a cache. If a prior panic poisoned
+    /// Poison recovery: CLI provider schemas are a cache. If a prior panic poisoned
     /// the RwLock, reset to a known empty state rather than reading possibly
-    /// half-written inner data; a later `set_plugin_schemas` repopulates it.
+    /// half-written inner data; a later `set_cli_local_provider_schemas` repopulates it.
     #[tokio::test]
-    async fn tool_search_resets_poisoned_plugin_schemas_lock() {
+    async fn tool_search_resets_poisoned_cli_local_provider_schemas_lock() {
         let executor = test_executor();
-        let plugin = serde_json::json!({
+        let schema = serde_json::json!({
             "type": "function",
             "function": {
-                "name": "mcp__calc",
+                "name": "custom_calc",
                 "description": "Evaluate expressions.",
                 "parameters": {"type": "object", "properties": {}}
             }
         });
-        executor.set_plugin_schemas(vec![plugin.clone()]);
-        executor.set_current_activatable_tool_names(HashSet::from(["mcp__calc".to_string()]));
+        executor.set_cli_local_provider_schemas(vec![schema.clone()]);
+        executor.set_current_activatable_tool_names(HashSet::from(["custom_calc".to_string()]));
 
         // Simulate a prior panic-poisoned write lock.
-        let arc = std::sync::Arc::new(&executor.plugin_schemas);
+        let arc = std::sync::Arc::new(&executor.cli_local_provider_schemas);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = arc.write().unwrap();
             panic!("simulated panic under write lock");
         }));
         assert!(
-            executor.plugin_schemas.read().is_err() || executor.plugin_schemas.write().is_err(),
+            executor.cli_local_provider_schemas.read().is_err()
+                || executor.cli_local_provider_schemas.write().is_err(),
             "lock should be poisoned for the test to be meaningful"
         );
 
@@ -7059,32 +7568,28 @@ mod tests {
         let out = executor
             .execute(
                 "tool_search",
-                &serde_json::json!({"query": "select:mcp__calc"}),
+                &serde_json::json!({"query": "select:custom_calc"}),
             )
             .await;
         let parsed = parse_tool_search_output(&out);
         assert_eq!(tool_search_match_names(&parsed), Vec::<String>::new());
         assert_eq!(
             tool_search_string_array(&parsed, "missing"),
-            vec!["mcp__calc".to_string()]
+            vec!["custom_calc".to_string()]
         );
 
-        executor.set_plugin_schemas(vec![plugin]);
+        executor.set_cli_local_provider_schemas(vec![schema]);
         let out = executor
             .execute(
                 "tool_search",
-                &serde_json::json!({"query": "select:mcp__calc"}),
+                &serde_json::json!({"query": "select:custom_calc"}),
             )
             .await;
         let parsed = parse_tool_search_output(&out);
         assert_eq!(
             tool_search_match_names(&parsed),
-            Vec::<String>::new(),
-            "repopulating the cache should not bypass the missing MCP runtime binding"
-        );
-        assert_eq!(
-            tool_search_string_array(&parsed, "missing"),
-            vec!["mcp__calc".to_string()]
+            vec!["custom_calc".to_string()],
+            "repopulating the CLI provider cache should restore provider-owned tools"
         );
     }
 

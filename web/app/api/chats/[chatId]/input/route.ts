@@ -65,7 +65,7 @@ export async function POST(
   if (hasRequestedWorkspace && !requestedWorkspaceSelection) {
     return NextResponse.json(
       {
-        error: "workspace must be a server sandbox or edge workspace selection",
+        error: "workspace must be a valid file environment selection",
         code: "invalid_workspace_selection",
       },
       { status: 400 },
@@ -84,17 +84,19 @@ export async function POST(
       { status: 409 },
     );
   }
-  const workspaceError = validateWorkspaceAuthority(
+  const workspaceAuthorityError = validateWorkspaceAuthority(
     body.content,
-    storedWorkspaceSelection,
+    requestedWorkspaceSelection ?? storedWorkspaceSelection,
   );
-  if (workspaceError) {
+  if (workspaceAuthorityError) {
     return NextResponse.json(
-      { error: workspaceError.message, code: workspaceError.code },
-      { status: 409 },
+      {
+        error: workspaceAuthorityError.error,
+        code: workspaceAuthorityError.code,
+      },
+      { status: workspaceAuthorityError.status },
     );
   }
-
   try {
     const result = await queueDeferredRunInput(auth.user.user_id, chatId, body);
     if (!result) {
@@ -107,7 +109,7 @@ export async function POST(
     }
     if (error instanceof RuntimeClientError && error.status) {
       return NextResponse.json(
-        { error: error.detail },
+        { error: error.detail, code: error.code },
         { status: error.status },
       );
     }

@@ -93,18 +93,19 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "time",
 ] }
 unicode-normalization = "0.1"
-# Must match `tracing-opentelemetry` (0.27.x pulls opentelemetry 0.26 — keep a single OTel line).
-opentelemetry = { version = "0.26.0", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.26.0", default-features = false, features = [
+# Keep the OpenTelemetry crates on one version line; tracing-opentelemetry 0.33
+# integrates with opentelemetry 0.32.
+opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32.0", default-features = false, features = [
     "rt-tokio",
     "trace",
 ] }
-opentelemetry-otlp = { version = "0.26.0", default-features = false, features = [
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
     "grpc-tonic",
     "tls-roots",
     "trace",
 ] }
-tracing-opentelemetry = { version = "0.27.0" }
+tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-appender = { version = "0.2", default-features = false }
 http-body-util = "0.1"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }

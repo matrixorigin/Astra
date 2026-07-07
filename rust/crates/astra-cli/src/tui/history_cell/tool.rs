@@ -32,7 +32,7 @@ use crate::tui::render::line_utils::sanitize_terminal_text;
 use crate::tui::turn_event::{ToolStatus as PersistStatus, TurnEvent};
 use crate::tui::wrapping::{RtOptions, word_wrap_lines};
 use astra_tools::exit_semantics::{ExitSemantics, classify_exit};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
@@ -920,7 +920,7 @@ fn friendly_tool_display_name(name: &str) -> String {
         "str_replace" => "Replace text".into(),
         "grep" | "glob" => "Search".into(),
         "list_dir" => "List directory".into(),
-        "task" => "Task".into(),
+        "task_board" => "Task".into(),
         "memory" => "Memory".into(),
         "tool_search" => "Tool search".into(),
         _ => humanize_tool_name(name),

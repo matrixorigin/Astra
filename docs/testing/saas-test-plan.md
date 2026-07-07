@@ -311,7 +311,7 @@ AstraClient.login → createSession → createRun → SSE/WS 收流
 ### 6.3 平台 Admin 冷启动
 
 ```
-docker compose --profile app up -d
+make stack-up-server-only
 astra admin init
 astra admin model load ...
 curl /health → ok
@@ -363,13 +363,12 @@ Token 消耗 → GET /resources/usage 准确
 | 滚动升级 | 零 downtime；进行中 Run 可恢复或失败可感知 |
 
 ```bash
-cd deployment/all-in-one
-docker compose --profile app up -d --build
+make stack-up-server-only
 
 # K8s 最小 SaaS
 helm install astra deployment/kubernetes/chart \
   --set matrixone.enabled=false \
-  --set redis.enabled=false
+  --set memoria.enabled=false
 ```
 
 ### 7.2 性能与容量（SaaS SLA 基线）

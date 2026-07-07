@@ -1,14 +1,13 @@
 //! OTLP trace export (feature `otel`). Enabled when `ASTRA_OTEL_ENABLED=1` or OTLP endpoint env is set.
 
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
 
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::{
     Resource,
     resource::{EnvResourceDetector, SdkProvidedResourceDetector},
-    runtime,
-    trace::Config as TraceConfig,
+    trace::{SdkTracer, SdkTracerProvider},
 };
 use tracing_subscriber::{
     EnvFilter, fmt::time::UtcTime, layer::Layer, prelude::*, registry::Registry,
@@ -16,6 +15,12 @@ use tracing_subscriber::{
 };
 
 use crate::{InitError, LogFormat, LogInitConfig, resolve_format};
+
+static TRACER_PROVIDER: OnceLock<Mutex<Option<SdkTracerProvider>>> = OnceLock::new();
+
+fn tracer_provider_slot() -> &'static Mutex<Option<SdkTracerProvider>> {
+    TRACER_PROVIDER.get_or_init(|| Mutex::new(None))
+}
 
 /// Whether OTLP export should be activated (OTel feature compiled in).
 pub(crate) fn wants_otel_export() -> bool {
@@ -32,43 +37,37 @@ pub(crate) fn wants_otel_export() -> bool {
 }
 
 fn build_resource(config: &LogInitConfig<'_>) -> Resource {
-    use opentelemetry::KeyValue;
-
-    let mut resource = Resource::from_detectors(
-        Duration::from_secs(0),
-        vec![
-            Box::new(SdkProvidedResourceDetector),
-            Box::new(EnvResourceDetector::new()),
-        ],
-    );
+    let mut builder = Resource::builder_empty()
+        .with_detector(Box::new(SdkProvidedResourceDetector))
+        .with_detector(Box::new(EnvResourceDetector::new()));
     if let Some(name) = config.service_name.filter(|s| !s.is_empty()) {
-        let merged = Resource::new(vec![KeyValue::new("service.name", name.to_string())]);
-        resource = resource.merge(&merged);
+        builder = builder.with_service_name(name.to_string());
     } else if let Ok(name) = std::env::var("ASTRA_SERVICE_NAME")
         && !name.trim().is_empty()
     {
-        let merged = Resource::new(vec![KeyValue::new("service.name", name)]);
-        resource = resource.merge(&merged);
+        builder = builder.with_service_name(name);
     }
-    resource
+    builder.build()
 }
 
 /// Install OTLP batch exporter, register the global tracer provider, and return an SDK tracer for `tracing-opentelemetry`.
-fn install_otlp_tracer(
-    config: &LogInitConfig<'_>,
-) -> Result<opentelemetry_sdk::trace::Tracer, InitError> {
+fn install_otlp_tracer(config: &LogInitConfig<'_>) -> Result<SdkTracer, InitError> {
     let resource = build_resource(config);
-    let exporter = opentelemetry_otlp::new_exporter().tonic();
-
-    let provider = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(exporter)
-        .with_trace_config(TraceConfig::default().with_resource(resource))
-        .install_batch(runtime::Tokio)
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
         .map_err(|e| -> InitError { Box::new(e) })?;
 
+    let provider = SdkTracerProvider::builder()
+        .with_resource(resource)
+        .with_batch_exporter(exporter)
+        .build();
+    let tracer = provider.tracer("astra");
     global::set_tracer_provider(provider.clone());
-    Ok(provider.tracer("astra"))
+    if let Ok(mut slot) = tracer_provider_slot().lock() {
+        *slot = Some(provider);
+    }
+    Ok(tracer)
 }
 
 fn make_filter(config: &LogInitConfig<'_>) -> EnvFilter {
@@ -165,5 +164,14 @@ pub(crate) fn init_with_otel(config: &LogInitConfig<'_>) -> Result<(), InitError
 
 /// Flush and shutdown the global OpenTelemetry tracer provider.
 pub(crate) fn shutdown_tracer_provider() {
-    global::shutdown_tracer_provider();
+    let Some(provider) = tracer_provider_slot()
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+    else {
+        return;
+    };
+    if let Err(err) = provider.shutdown() {
+        eprintln!("[astra-logging] OTLP shutdown failed: {err}");
+    }
 }

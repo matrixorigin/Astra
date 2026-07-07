@@ -5,13 +5,10 @@ import {
   edgeExecutorBinding,
   normalizeWorkspaceSelection,
   sameWorkspaceSelection,
-  localCodeIntent,
-  extractLocalPathMentions,
   normalizeSlashPath,
-  edgeWorkspaceOwnsPath,
-  validateWorkspaceAuthority,
   resolveWorkspaceBindings,
-  type WorkspaceAuthorityError,
+  extractLocalPathMentions,
+  validateWorkspaceAuthority,
 } from "@/lib/workspace-authority";
 import type { WorkspaceSelection } from "@/lib/api/types";
 
@@ -30,10 +27,10 @@ type EdgeSelection = Extract<WorkspaceSelection, { kind: "edge_workspace" }>;
 // ─── binding factories ──────────────────────────────────────────────
 
 describe("defaultWorkspaceBinding", () => {
-  it("returns default Astra binding without exposing an absent workspace", () => {
+  it("returns default Web binding without exposing an absent workspace", () => {
     expect(defaultWorkspaceBinding()).toEqual({
       kind: "none",
-      display_name: "Astra",
+      display_name: "Web",
       authority: "none",
       fallback_policy: "disabled",
     });
@@ -41,11 +38,11 @@ describe("defaultWorkspaceBinding", () => {
 });
 
 describe("defaultExecutorBinding", () => {
-  it("returns default Astra control-plane executor binding", () => {
+  it("returns default server control-plane executor binding", () => {
     expect(defaultExecutorBinding()).toEqual({
       kind: "server_local",
       executor_id: "server-control-plane",
-      display_name: "Astra",
+      display_name: "Server control plane",
       transport: "server_local",
       status: "online",
     });
@@ -67,6 +64,12 @@ describe("edgeWorkspaceBinding", () => {
     expect(
       edgeWorkspaceBinding(edgeSelection({ displayName: null })),
     ).toHaveProperty("display_name", "agent-1");
+  });
+
+  it("passes explicit read-only authority through an edge workspace binding", () => {
+    expect(
+      edgeWorkspaceBinding(edgeSelection({ authority: "read_only" })),
+    ).toHaveProperty("authority", "read_only");
   });
 });
 
@@ -96,6 +99,23 @@ describe("normalizeWorkspaceSelection", () => {
   it("returns server_sandbox selection", () => {
     expect(normalizeWorkspaceSelection({ kind: "server_sandbox" })).toEqual({
       kind: "server_sandbox",
+    });
+  });
+
+  it("preserves explicit workspace authority", () => {
+    expect(
+      normalizeWorkspaceSelection({
+        kind: "edge_workspace",
+        edgeAgentId: "agent-1",
+        cwd: "/Users/test/project",
+        authority: "read_only",
+      }),
+    ).toEqual({
+      kind: "edge_workspace",
+      edgeAgentId: "agent-1",
+      displayName: null,
+      cwd: "/Users/test/project",
+      authority: "read_only",
     });
   });
 
@@ -239,142 +259,14 @@ describe("sameWorkspaceSelection", () => {
     // Both null and undefined displayName normalize to null via ?? null
     expect(sameWorkspaceSelection(a, b)).toBe(true);
   });
-});
 
-// ─── localCodeIntent ────────────────────────────────────────────────
-
-describe("localCodeIntent", () => {
-  it("detects git status as local intent", () => {
-    expect(localCodeIntent("run git status")).toBe(true);
-  });
-
-  it("detects npm test as local intent", () => {
-    expect(localCodeIntent("please npm test")).toBe(true);
-  });
-
-  it("detects cargo build as local intent", () => {
-    expect(localCodeIntent("cargo build --release")).toBe(true);
-  });
-
-  it("detects pytest as local intent", () => {
-    expect(localCodeIntent("run pytest")).toBe(true);
-  });
-
-  it("detects go test as local intent", () => {
-    expect(localCodeIntent("go test ./...")).toBe(true);
-  });
-
-  it("detects make targets as local intent", () => {
-    expect(localCodeIntent("make build")).toBe(true);
-  });
-
-  it("detects local path mentions", () => {
-    expect(localCodeIntent("fix /Users/test/project/src/main.ts")).toBe(true);
-  });
-
-  it('detects "this repo" context as local intent', () => {
-    expect(localCodeIntent("review this repo")).toBe(true);
-  });
-
-  it('detects "current workspace" context as local intent', () => {
-    expect(localCodeIntent("inspect current workspace")).toBe(true);
-  });
-
-  it("detects code review phrases as local intent", () => {
-    expect(localCodeIntent("code review")).toBe(true);
-    expect(localCodeIntent("review my code")).toBe(true);
-    expect(localCodeIntent("review the pull request")).toBe(true);
-  });
-
-  it("detects mixed Chinese and English review phrases as local intent", () => {
-    expect(localCodeIntent("多角度 review 这个分支的 changes")).toBe(true);
-    expect(localCodeIntent("review 这个分支")).toBe(true);
-    expect(localCodeIntent("review 这些代码改动")).toBe(true);
-  });
-
-  it("returns false for generic questions", () => {
-    expect(localCodeIntent("what is rust")).toBe(false);
-  });
-
-  it("returns false for generic review requests without code context", () => {
-    expect(localCodeIntent("review the quarterly plan")).toBe(false);
-  });
-
-  it("returns false for server-only operations", () => {
-    expect(localCodeIntent("deploy to production")).toBe(false);
-  });
-
-  it("handles empty string", () => {
-    expect(localCodeIntent("")).toBe(false);
-  });
-
-  it("handles whitespace-only string", () => {
-    expect(localCodeIntent("   ")).toBe(false);
-  });
-});
-
-// ─── extractLocalPathMentions ───────────────────────────────────────
-
-describe("extractLocalPathMentions", () => {
-  it("extracts absolute macOS paths", () => {
+  it("treats authority as part of the workspace binding identity", () => {
     expect(
-      extractLocalPathMentions("fix /Users/test/project/src/main.ts"),
-    ).toEqual(["/Users/test/project/src/main.ts"]);
-  });
-
-  it("extracts home-relative paths", () => {
-    expect(extractLocalPathMentions("edit ~/project/readme.md")).toEqual([
-      "~/project/readme.md",
-    ]);
-  });
-
-  it("extracts $HOME paths", () => {
-    expect(extractLocalPathMentions("fix $HOME/project/src/lib.rs")).toEqual([
-      "$HOME/project/src/lib.rs",
-    ]);
-  });
-
-  it("extracts ${HOME} paths", () => {
-    expect(extractLocalPathMentions("read ${HOME}/docs/guide.txt")).toEqual([
-      "${HOME}/docs/guide.txt",
-    ]);
-  });
-
-  it("extracts /home/ paths", () => {
-    expect(extractLocalPathMentions("check /home/user/project")).toEqual([
-      "/home/user/project",
-    ]);
-  });
-
-  it("extracts Windows paths", () => {
-    expect(extractLocalPathMentions("run C:\\Users\\test\\script.ps1")).toEqual(
-      ["C:\\Users\\test\\script.ps1"],
-    );
-  });
-
-  it("strips trailing punctuation", () => {
-    expect(extractLocalPathMentions("see /Users/test/file.txt.")).toEqual([
-      "/Users/test/file.txt",
-    ]);
-  });
-
-  it("preserves spaces and parentheses inside path mentions", () => {
-    expect(
-      extractLocalPathMentions("fix /Users/test/project (v2)/src/main.ts"),
-    ).toEqual(["/Users/test/project (v2)/src/main.ts"]);
-    expect(
-      extractLocalPathMentions("inspect /Users/test/My Project/src/lib.rs"),
-    ).toEqual(["/Users/test/My Project/src/lib.rs"]);
-  });
-
-  it("returns multiple matches", () => {
-    expect(
-      extractLocalPathMentions("compare ~/project/a.ts with /home/user/b.rs"),
-    ).toEqual(["~/project/a.ts", "/home/user/b.rs"]);
-  });
-
-  it("returns empty array when no paths found", () => {
-    expect(extractLocalPathMentions("hello world")).toEqual([]);
+      sameWorkspaceSelection(
+        edgeSelection({ authority: "read_only" }),
+        edgeSelection({ authority: "read_write" }),
+      ),
+    ).toBe(false);
   });
 });
 
@@ -419,122 +311,104 @@ describe("normalizeSlashPath", () => {
   });
 });
 
-// ─── edgeWorkspaceOwnsPath ──────────────────────────────────────────
-
-describe("edgeWorkspaceOwnsPath", () => {
-  const sel = edgeSelection({ cwd: "/Users/test/project" });
-
-  it("returns false for non-edge workspace", () => {
-    expect(
-      edgeWorkspaceOwnsPath({ kind: "server_sandbox" }, "/Users/test/project"),
-    ).toBe(false);
-  });
-
-  it("returns true for an exact cwd match", () => {
-    expect(edgeWorkspaceOwnsPath(sel, "/Users/test/project")).toBe(true);
-  });
-
-  it("returns true for a file inside cwd", () => {
-    expect(edgeWorkspaceOwnsPath(sel, "/Users/test/project/src/main.ts")).toBe(
-      true,
-    );
-  });
-
-  it("returns false for a path outside cwd", () => {
-    expect(edgeWorkspaceOwnsPath(sel, "/Users/other/file.ts")).toBe(false);
-  });
-
-  it("resolves ~/ paths against the cwd-derived home", () => {
-    expect(edgeWorkspaceOwnsPath(sel, "~/project/src/lib.rs")).toBe(true);
-  });
-
-  it("resolves $HOME/ paths", () => {
-    expect(edgeWorkspaceOwnsPath(sel, "$HOME/project/src/lib.rs")).toBe(true);
-  });
-
-  it("returns false when home can't be derived from cwd", () => {
-    const selNoHome = edgeSelection({ cwd: "/opt/app" });
-    expect(edgeWorkspaceOwnsPath(selNoHome, "~/file.txt")).toBe(false);
-  });
-
-  it("normalizes both cwd and path before comparison", () => {
-    const selMessy = edgeSelection({
-      cwd: "/Users//test/./project/other/..",
-    });
-    expect(
-      edgeWorkspaceOwnsPath(selMessy, "/Users/test/project/src//./lib.rs"),
-    ).toBe(true);
-  });
-});
-
-// ─── validateWorkspaceAuthority ─────────────────────────────────────
+// ─── validateWorkspaceAuthority ────────────────────────────────────
 
 describe("validateWorkspaceAuthority", () => {
-  it("returns null when there is no local code intent", () => {
-    expect(validateWorkspaceAuthority("hello world", null)).toBeNull();
-  });
-
-  it("does not reject local intent without workspace selection", () => {
-    expect(validateWorkspaceAuthority("run git status", null)).toBeNull();
-  });
-
-  it("does not reject local intent with undefined selection", () => {
-    expect(validateWorkspaceAuthority("cargo build", undefined)).toBeNull();
-  });
-
-  it("does not reject local intent on explicit server sandbox", () => {
-    expect(validateWorkspaceAuthority("npm test", {
-      kind: "server_sandbox",
-    })).toBeNull();
-  });
-
-  it("returns null for valid edge workspace with local intent and no foreign paths", () => {
+  it("extracts deterministic local filesystem paths without treating routes as files", () => {
     expect(
-      validateWorkspaceAuthority("review this repo", edgeSelection()),
-    ).toBeNull();
+      extractLocalPathMentions(
+        "review /Users/test/project/src/lib.rs then call /api/chats",
+      ),
+    ).toEqual(["/Users/test/project/src/lib.rs"]);
   });
 
-  it("returns workspace_path_mismatch when a mentioned path is outside cwd", () => {
-    const err = validateWorkspaceAuthority(
-      "fix /Users/other/project/src/bug.ts",
-      edgeSelection({ cwd: "/Users/test/project" }),
-    ) as WorkspaceAuthorityError;
-    expect(err.code).toBe("workspace_path_mismatch");
-    expect(err.message).toContain("/Users/other/project/src/bug.ts");
+  it("detects local roots case-insensitively so host paths cannot be smuggled by casing", () => {
+    expect(
+      extractLocalPathMentions("review /USERS/test/project/src/lib.rs"),
+    ).toEqual(["/USERS/test/project/src/lib.rs"]);
   });
 
-  it("allows paths owned by the workspace", () => {
+  it("allows explicit paths inside the selected edge workspace", () => {
     expect(
       validateWorkspaceAuthority(
-        "fix /Users/test/project/src/bug.ts",
-        edgeSelection({ cwd: "/Users/test/project" }),
+        "review /Users/test/project/src/lib.rs",
+        edgeSelection(),
       ),
     ).toBeNull();
   });
 
-  it("allows owned workspace paths that contain spaces and parentheses", () => {
+  it("allows case variants for case-insensitive edge workspace roots", () => {
     expect(
       validateWorkspaceAuthority(
-        "fix /Users/test/project (v2)/src/bug.ts",
-        edgeSelection({ cwd: "/Users/test/project (v2)" }),
+        "review /USERS/test/project/src/lib.rs",
+        edgeSelection(),
       ),
     ).toBeNull();
   });
 
-  it("validates ~/ paths as owned when home matches", () => {
+  it("expands home paths against the selected edge workspace owner", () => {
+    expect(
+      validateWorkspaceAuthority("review ~/project/src/lib.rs", edgeSelection()),
+    ).toBeNull();
+  });
+
+  it("rejects explicit paths outside the selected edge workspace before a run starts", () => {
     expect(
       validateWorkspaceAuthority(
-        "edit ~/project/readme.md",
-        edgeSelection({ cwd: "/Users/test/project" }),
+        "review /Users/test/other/src/lib.rs",
+        edgeSelection(),
       ),
-    ).toBeNull();
+    ).toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The referenced path is outside the selected file environment: /Users/test/other/src/lib.rs. Choose the environment that contains it or use a path inside the current one.",
+      status: 409,
+    });
+  });
+
+  it("rejects case-varied traversal that resolves outside the selected edge workspace", () => {
+    expect(
+      validateWorkspaceAuthority(
+        "review /USERS/test/project/../../../etc/passwd",
+        edgeSelection(),
+      ),
+    ).toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The referenced path is outside the selected file environment: /USERS/test/project/../../../etc/passwd. Choose the environment that contains it or use a path inside the current one.",
+      status: 409,
+    });
+  });
+
+  it("rejects explicit host paths for server sandbox before a run starts", () => {
+    expect(
+      validateWorkspaceAuthority("read /etc/passwd", {
+        kind: "server_sandbox",
+      }),
+    ).toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The selected Server sandbox is an isolated workspace and cannot access host path: /etc/passwd. Use a relative path inside the sandbox, or select an Edge workspace rooted at that host path.",
+      status: 409,
+    });
+  });
+
+  it("rejects explicit local paths when no file environment is selected", () => {
+    expect(
+      validateWorkspaceAuthority("read /Users/test/project/README.md", null),
+    ).toEqual({
+      code: "workspace_required",
+      error:
+        "The referenced path requires a file environment: /Users/test/project/README.md. Select the environment that contains it, then retry.",
+      status: 409,
+    });
   });
 });
 
 // ─── resolveWorkspaceBindings ───────────────────────────────────────
 
 describe("resolveWorkspaceBindings", () => {
-  it("returns no-workspace bindings for null selection", () => {
+  it("returns no-file-environment bindings for null selection", () => {
     const result = resolveWorkspaceBindings(null);
     expect(result.workspaceBinding.kind).toBe("none");
     expect(result.executorBinding.kind).toBe("server_local");

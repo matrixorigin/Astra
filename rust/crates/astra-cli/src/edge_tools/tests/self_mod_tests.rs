@@ -184,12 +184,17 @@ async fn shared_task_manager_and_session_state_journal_survive_across_executors(
         .store(11, std::sync::atomic::Ordering::Relaxed);
 
     let create_out = exe_a
-        .execute("task", &json!({"action": "create", "title": "shared task"}))
+        .execute(
+            "task_board",
+            &json!({"action": "create", "title": "shared task"}),
+        )
         .await;
     let create_json = parse_task_json(&create_out);
     assert_eq!(create_json["success"], true);
 
-    let listed_via_b = exe_b.execute("task", &json!({"action": "list"})).await;
+    let listed_via_b = exe_b
+        .execute("task_board", &json!({"action": "list"}))
+        .await;
     let listed_via_b_json: Value = serde_json::from_str(&listed_via_b).unwrap();
     assert_eq!(listed_via_b_json["count"], 1);
 
@@ -207,8 +212,11 @@ async fn shared_task_manager_and_session_state_journal_survive_across_executors(
         Some(1)
     );
 
-    let listed_after = exe_a.execute("task", &json!({"action": "list"})).await;
-    assert_eq!(listed_after, "No tasks found with status 'all'");
+    let listed_after = exe_a
+        .execute("task_board", &json!({"action": "list"}))
+        .await;
+    let listed_after_json: Value = serde_json::from_str(&listed_after).unwrap();
+    assert_eq!(listed_after_json["count"], 0);
 }
 
 // ─── P4: P3 seams wired into SelfModel snapshot ─────────────────────────────

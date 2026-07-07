@@ -1,21 +1,21 @@
 use serde_json::{Map, Value, json};
 
 use super::tool_execution_binding::{
-    ExecutorBinding, ExecutorStatus, ToolExecutionRequest, ToolTransportKind, WorkspaceBinding,
+    ExecutorBinding, ExecutorStatus, ToolExecutionRequest, ToolTransportKind, WorkspaceAuthority,
+    WorkspaceBinding, WorkspaceBindingKind, capacity_provider_type_for_workspace_executor,
+    runtime_execution_provider_id_for_executor,
 };
 
 pub const TOOL_ERROR_KIND_APPROVAL_TIMEOUT: &str = "approval_timeout";
 pub const TOOL_ERROR_KIND_TOOL_TIMEOUT: &str = "tool_timeout";
 pub const TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH: &str = "workspace_path_mismatch";
 pub const TOOL_ERROR_KIND_AGENT_WAITING: &str = "agent_waiting";
-pub const TOOL_ERROR_KIND_FALLBACK_DISABLED: &str = "fallback_disabled";
 pub const TOOL_ERROR_KIND_EXECUTOR_OFFLINE: &str = "executor_offline";
 pub const RUN_BLOCKED_REASON_EXECUTOR_OFFLINE: &str = TOOL_ERROR_KIND_EXECUTOR_OFFLINE;
 pub const TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED: &str = "transport_disconnected";
 pub const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
 pub const TOOL_ERROR_KIND_CAPABILITY_DENIED: &str = "capability_denied";
 pub const RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED: &str = TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED;
-pub const RUN_BLOCKED_REASON_FALLBACK_DISABLED: &str = TOOL_ERROR_KIND_FALLBACK_DISABLED;
 pub const TOOL_ERROR_KIND_ROUTE_MISMATCH: &str = "route_mismatch";
 pub const RUN_BLOCKED_REASON_ROUTE_MISMATCH: &str = TOOL_ERROR_KIND_ROUTE_MISMATCH;
 
@@ -149,6 +149,7 @@ pub(crate) fn attach_runtime_error_metadata(
     error: &astra_runtime_env::RuntimeError,
     reason: &str,
 ) {
+    metadata.insert("status".to_string(), Value::String("failed".to_string()));
     metadata.insert(
         "error_kind".to_string(),
         Value::String(error.kind.to_string()),
@@ -171,6 +172,10 @@ pub(crate) fn attach_runtime_error_metadata(
     metadata.insert(
         "runtime_error".to_string(),
         serde_json::to_value(error).unwrap_or(Value::Null),
+    );
+    metadata.insert(
+        "result_class".to_string(),
+        Value::String("execution_error".to_string()),
     );
 }
 
@@ -245,8 +250,257 @@ pub fn binding_event_fields(
         serde_json::to_value(executor.transport).unwrap_or(Value::Null),
     );
     fields.insert(
-        "fallback_policy".to_string(),
-        serde_json::to_value(workspace.fallback_policy).unwrap_or(Value::Null),
+        "capacity_provider_coverage".to_string(),
+        serde_json::to_value(capacity_provider_coverage(workspace, executor))
+            .unwrap_or(Value::Null),
     );
     fields
+}
+
+pub fn capacity_provider_coverage(
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+) -> Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry> {
+    let mut providers = vec![
+        astra_runtime_env::CapacityProviderCoverageEntry::ready(
+            astra_runtime_env::CapacityProviderType::ServerService,
+            "server-builtin",
+            astra_runtime_env::server_service_capabilities(),
+        ),
+        astra_runtime_env::CapacityProviderCoverageEntry::ready(
+            astra_runtime_env::CapacityProviderType::ControlPlane,
+            "server-control-plane",
+            astra_runtime_env::control_plane_capabilities([astra_runtime_env::CAP_MULTI_AGENT]),
+        ),
+    ];
+
+    providers.push(runtime_executor_coverage(workspace, executor));
+    providers
+}
+
+fn runtime_executor_coverage(
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+) -> astra_turn_core::introspect::CapacityProviderCoverageEntry {
+    let authority_bound = !matches!(
+        workspace.authority,
+        WorkspaceAuthority::None | WorkspaceAuthority::Unknown
+    );
+    let workspace_bound = authority_bound
+        && match workspace.kind {
+            WorkspaceBindingKind::EdgeWorkspace => true,
+            WorkspaceBindingKind::ServerSandbox | WorkspaceBindingKind::CloudWorkspace => {
+                workspace.cwd.is_some()
+            }
+            WorkspaceBindingKind::LocalFilesystem
+            | WorkspaceBindingKind::None
+            | WorkspaceBindingKind::Unknown => false,
+        };
+    if !workspace_bound {
+        return astra_runtime_env::CapacityProviderCoverageEntry::unavailable(
+            astra_runtime_env::CapacityProviderType::Sandbox,
+            "workspace-executor",
+            astra_runtime_env::CapacityProviderStatus::Unbound,
+            "no_workspace_provider_bound",
+        );
+    }
+
+    let provider_id = runtime_execution_provider_id_for_executor(executor);
+    let provider_type =
+        capacity_provider_type_for_workspace_executor(workspace.kind, executor.kind);
+
+    if matches!(
+        provider_type,
+        astra_runtime_env::CapacityProviderType::Unknown
+    ) {
+        return astra_turn_core::introspect::CapacityProviderCoverageEntry {
+            provider_type,
+            provider_id,
+            status: astra_runtime_env::CapacityProviderStatus::Unbound,
+            capabilities: Vec::new(),
+            unavailable_reason: Some("workspace_executor_binding_mismatch".to_string()),
+        };
+    }
+
+    let status = match executor.status {
+        ExecutorStatus::Online => astra_runtime_env::CapacityProviderStatus::Ready,
+        ExecutorStatus::Degraded => astra_runtime_env::CapacityProviderStatus::Degraded,
+        ExecutorStatus::Offline | ExecutorStatus::Unknown => {
+            astra_runtime_env::CapacityProviderStatus::Offline
+        }
+    };
+    let unavailable_reason = match executor.status {
+        ExecutorStatus::Online | ExecutorStatus::Degraded => None,
+        ExecutorStatus::Offline => Some("executor_offline".to_string()),
+        ExecutorStatus::Unknown => Some("executor_status_unknown_offline".to_string()),
+    };
+    let capabilities = if unavailable_reason.is_some() {
+        Vec::new()
+    } else {
+        astra_runtime_env::workspace_runtime_capabilities(workspace.authority)
+    };
+
+    astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        provider_type,
+        provider_id,
+        status,
+        capabilities,
+        unavailable_reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(
+        providers: &[astra_turn_core::introspect::CapacityProviderCoverageEntry],
+        provider_type: astra_runtime_env::CapacityProviderType,
+    ) -> &astra_turn_core::introspect::CapacityProviderCoverageEntry {
+        providers
+            .iter()
+            .find(|provider| provider.provider_type == provider_type)
+            .unwrap_or_else(|| panic!("{provider_type} provider coverage"))
+    }
+
+    #[test]
+    fn no_workspace_reports_sandbox_unbound() {
+        let providers = capacity_provider_coverage(
+            &WorkspaceBinding::none(),
+            &ExecutorBinding::server_control_plane(),
+        );
+
+        assert!(providers.iter().any(
+            |provider| provider.provider_type == "server_service" && provider.status == "ready"
+        ));
+        let runtime = provider(&providers, astra_runtime_env::CapacityProviderType::Sandbox);
+        assert_eq!(runtime.provider_id, "workspace-executor");
+        assert_eq!(runtime.status, "unbound");
+        assert_eq!(
+            runtime.unavailable_reason.as_deref(),
+            Some("no_workspace_provider_bound")
+        );
+        assert!(runtime.capabilities.is_empty());
+    }
+
+    #[test]
+    fn server_sandbox_reports_sandbox_ready() {
+        let providers = capacity_provider_coverage(
+            &WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
+            &ExecutorBinding::server_local(),
+        );
+
+        let runtime = provider(&providers, astra_runtime_env::CapacityProviderType::Sandbox);
+        assert_eq!(runtime.status, "ready");
+        assert!(runtime.unavailable_reason.is_none());
+        assert!(
+            runtime
+                .capabilities
+                .iter()
+                .any(|cap| cap == "workspace_read")
+        );
+        assert!(runtime.capabilities.iter().any(|cap| cap == "shell"));
+        assert!(runtime.capabilities.iter().any(|cap| cap == "git"));
+    }
+
+    #[test]
+    fn edge_workspace_without_server_cwd_reports_edge_capacity_ready() {
+        let providers = capacity_provider_coverage(
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "MacBook Pro".to_string(),
+                cwd: None,
+                authority: WorkspaceAuthority::ReadWrite,
+            },
+            &ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+
+        let runtime = provider(
+            &providers,
+            astra_runtime_env::CapacityProviderType::EdgeCapacity,
+        );
+        assert_eq!(runtime.provider_id, "edge-1");
+        assert_eq!(runtime.status, "ready");
+        assert!(runtime.unavailable_reason.is_none());
+        assert!(
+            runtime
+                .capabilities
+                .iter()
+                .any(|cap| cap == "workspace_read")
+        );
+        assert!(runtime.capabilities.iter().any(|cap| cap == "shell"));
+        assert!(runtime.capabilities.iter().any(|cap| cap == "git"));
+    }
+
+    #[test]
+    fn edge_offline_reports_edge_capacity_offline() {
+        let providers = capacity_provider_coverage(
+            &WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            &ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Offline,
+            ),
+        );
+
+        let runtime = provider(
+            &providers,
+            astra_runtime_env::CapacityProviderType::EdgeCapacity,
+        );
+        assert_eq!(runtime.status, "offline");
+        assert_eq!(
+            runtime.unavailable_reason.as_deref(),
+            Some("executor_offline")
+        );
+        assert!(runtime.capabilities.is_empty());
+    }
+
+    #[test]
+    fn mismatched_workspace_executor_reports_unbound_provider() {
+        let providers = capacity_provider_coverage(
+            &WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
+            &ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+
+        let runtime = provider(&providers, astra_runtime_env::CapacityProviderType::Unknown);
+        assert_eq!(runtime.provider_id, "edge-1");
+        assert_eq!(runtime.status, "unbound");
+        assert_eq!(
+            runtime.unavailable_reason.as_deref(),
+            Some("workspace_executor_binding_mismatch")
+        );
+        assert!(runtime.capabilities.is_empty());
+    }
+
+    #[test]
+    fn binding_event_fields_include_capacity_provider_coverage() {
+        let fields =
+            binding_event_fields(&WorkspaceBinding::none(), &ExecutorBinding::server_local());
+        let coverage = fields
+            .get("capacity_provider_coverage")
+            .and_then(Value::as_array)
+            .expect("capacity coverage array");
+        assert!(
+            coverage.iter().any(|entry| {
+                entry.get("provider_type").and_then(Value::as_str) == Some("sandbox")
+                    && entry.get("status").and_then(Value::as_str) == Some("unbound")
+            }),
+            "{coverage:?}"
+        );
+    }
 }

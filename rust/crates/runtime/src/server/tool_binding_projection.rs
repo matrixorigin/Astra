@@ -1,7 +1,14 @@
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
+use astra_runtime_env::CapacityProvider;
 use astra_turn_core::tool::schema::tool_schema_name;
 use serde_json::Value;
+
+use crate::server::tool_admission::{
+    ToolAdmissionContext, active_provider_declarations_for_binding,
+    has_explicit_runtime_executor_provider,
+};
 
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolPolicySnapshot,
@@ -16,27 +23,93 @@ pub fn capability_filter_tool_schemas_for_binding(
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> Vec<Value> {
+    capability_filter_tool_schemas_for_binding_with_context(
+        schemas,
+        workspace,
+        executor,
+        runtime,
+        ToolAdmissionContext::default(),
+    )
+}
+
+pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
+    schemas: Vec<Value>,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    admission_context: ToolAdmissionContext,
+) -> Vec<Value> {
     let registry = astra_runtime_env::ToolRegistry::builtins();
+    let providers = active_provider_declarations_for_binding(
+        &schemas,
+        workspace,
+        executor,
+        runtime,
+        &registry,
+        &admission_context,
+    );
+    let prompt_schema_conflicts =
+        astra_core::tool_schema::prompt_schema_conflicting_tool_names(&schemas);
+    let mut seen_mcp_tool_names = HashSet::new();
     schemas
         .into_iter()
         .filter(|schema| {
             let Some(tool_name) = tool_schema_name(schema) else {
                 return false;
             };
-            let binding = runtime_environment_binding_for_parts(
+            if astra_runtime_env::is_mcp_namespaced_tool_name(tool_name) {
+                if prompt_schema_conflicts.contains(tool_name) {
+                    return false;
+                }
+                if !seen_mcp_tool_names.insert(tool_name.to_string()) {
+                    return false;
+                }
+            }
+            if !providers
+                .iter()
+                .any(|provider| provider.declares_tool(tool_name))
+            {
+                return false;
+            }
+            let admission =
+                crate::server::tool_admission::resolve_tool_admission_for_providers_with_context(
+                    tool_name,
+                    workspace,
+                    executor,
+                    &providers,
+                    &registry,
+                    &admission_context,
+                );
+            if !admission.visible {
+                return false;
+            }
+            if admission.selected_route()
+                == super::tool_route_selection::ToolExecutionRouteKind::ServerRuntime
+                && registry.get(tool_name).is_some_and(|spec| {
+                    matches!(
+                        spec.required.executor,
+                        astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
+                    )
+                })
+            {
+                return true;
+            }
+            let binding = runtime_environment_binding_for_parts_with_provider_declarations(
                 tool_name,
                 workspace,
                 executor,
                 runtime.cloned(),
                 &ToolPolicySnapshot::default(),
                 &registry,
+                &providers,
             );
             astra_runtime_env::CapabilityResolver
-                .check_tool_call(
+                .check_tool_call_for_surface(
                     &registry,
                     tool_name,
                     &serde_json::json!({}),
                     &binding.capabilities,
+                    &binding.tool_surface,
                 )
                 .is_ok()
         })
@@ -52,18 +125,79 @@ pub fn capability_filter_edge_provided_tool_schemas_for_binding(
     capability_filter_tool_schemas_for_binding(schemas, workspace, executor, runtime)
 }
 
+pub(crate) fn capability_filter_edge_provided_tool_schemas_for_binding_with_context(
+    schemas: Vec<Value>,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    admission_context: ToolAdmissionContext,
+) -> Vec<Value> {
+    capability_filter_tool_schemas_for_binding_with_context(
+        schemas,
+        workspace,
+        executor,
+        runtime,
+        admission_context,
+    )
+}
+
 pub fn capability_filtered_server_tool_schemas(
     capabilities: &astra_turn_core::capability::CapabilitySet,
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
 ) -> Vec<Value> {
-    capability_filter_tool_schemas_for_binding(
-        crate::capabilities::server_runtime_tool_schemas(capabilities),
+    capability_filtered_server_tool_schemas_with_context(
+        capabilities,
         workspace,
         executor,
         runtime,
+        ToolAdmissionContext::default(),
     )
+}
+
+pub(crate) fn capability_filtered_server_tool_schemas_with_context(
+    capabilities: &astra_turn_core::capability::CapabilitySet,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    admission_context: ToolAdmissionContext,
+) -> Vec<Value> {
+    let mut pool = crate::capabilities::server_builtin_tool_schemas(capabilities);
+    if has_explicit_runtime_executor_provider(workspace, executor, runtime) {
+        extend_tool_schema_pool_prefer_extra_for_duplicates(
+            &mut pool,
+            crate::capabilities::runtime_executor_tool_schemas(capabilities),
+        );
+    }
+    capability_filter_tool_schemas_for_binding_with_context(
+        pool,
+        workspace,
+        executor,
+        runtime,
+        admission_context,
+    )
+}
+
+fn extend_tool_schema_pool_prefer_extra_for_duplicates(pool: &mut Vec<Value>, extra: Vec<Value>) {
+    let mut index_by_name = pool
+        .iter()
+        .enumerate()
+        .filter_map(|(index, schema)| {
+            tool_schema_name(schema).map(|name| (name.to_string(), index))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    for schema in extra {
+        let Some(name) = tool_schema_name(&schema).map(str::to_string) else {
+            continue;
+        };
+        if let Some(index) = index_by_name.get(&name).copied() {
+            pool[index] = schema;
+        } else {
+            index_by_name.insert(name, pool.len());
+            pool.push(schema);
+        }
+    }
 }
 
 impl ToolExecutionRequest {
@@ -91,13 +225,55 @@ pub(crate) fn runtime_environment_binding_for_parts(
     registry: &astra_runtime_env::ToolRegistry,
 ) -> astra_runtime_env::RunBinding {
     let runtime = runtime.unwrap_or_else(|| runtime_env_runtime_binding(workspace, executor));
+    let workspace_binding = runtime_env_workspace_binding(workspace);
+    let executor_binding = runtime_env_executor_binding(tool_name, workspace, executor);
+    let policy_intent = runtime_env_policy_intent(workspace, policy);
+    if is_explicit_request_scoped_mcp_binding(tool_name, executor) {
+        let providers = vec![astra_runtime_env::request_scoped_mcp_provider(
+            "request-scoped-mcp",
+            [tool_name.to_string()],
+        )];
+        return astra_runtime_env::RunBinding::resolve_with_provider_declarations(
+            workspace_binding,
+            executor_binding,
+            runtime,
+            policy_intent,
+            registry,
+            &providers,
+        );
+    }
     astra_runtime_env::RunBinding::resolve(
+        workspace_binding,
+        executor_binding,
+        runtime,
+        policy_intent,
+        registry,
+    )
+}
+
+pub(crate) fn runtime_environment_binding_for_parts_with_provider_declarations(
+    tool_name: &str,
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: Option<astra_runtime_env::RuntimeBinding>,
+    policy: &ToolPolicySnapshot,
+    registry: &astra_runtime_env::ToolRegistry,
+    providers: &[astra_runtime_env::CapacityProviderDeclaration],
+) -> astra_runtime_env::RunBinding {
+    let runtime = runtime.unwrap_or_else(|| runtime_env_runtime_binding(workspace, executor));
+    astra_runtime_env::RunBinding::resolve_with_provider_declarations(
         runtime_env_workspace_binding(workspace),
         runtime_env_executor_binding(tool_name, workspace, executor),
         runtime,
         runtime_env_policy_intent(workspace, policy),
         registry,
+        providers,
     )
+}
+
+fn is_explicit_request_scoped_mcp_binding(tool_name: &str, executor: &ExecutorBinding) -> bool {
+    astra_runtime_env::is_mcp_namespaced_tool_name(tool_name)
+        && matches!(executor.kind, ExecutorBindingKind::Mcp)
 }
 
 fn runtime_env_workspace_binding(
@@ -137,17 +313,18 @@ fn runtime_env_executor_binding(
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
 ) -> astra_runtime_env::ExecutorBinding {
-    let request_scoped_mcp =
-        tool_name.starts_with("mcp__") || matches!(executor.kind, ExecutorBindingKind::Mcp);
+    let request_scoped_mcp = is_explicit_request_scoped_mcp_binding(tool_name, executor);
     let server_owned_tool =
         is_server_control_plane_tool(tool_name) || is_server_runtime_tool(tool_name);
     let no_workspace_control_plane = matches!(workspace.kind, WorkspaceBindingKind::None)
         && matches!(
             executor.kind,
-            ExecutorBindingKind::ServerLocal | ExecutorBindingKind::Unknown
+            ExecutorBindingKind::ServerLocal
+                | ExecutorBindingKind::Mcp
+                | ExecutorBindingKind::Unknown
         );
     let kind = if request_scoped_mcp {
-        astra_runtime_env::ExecutorBindingKind::RequestScopedMcp
+        astra_runtime_env::ExecutorBindingKind::Mcp
     } else if server_owned_tool || no_workspace_control_plane {
         astra_runtime_env::ExecutorBindingKind::ControlPlane
     } else {
@@ -160,7 +337,7 @@ fn runtime_env_executor_binding(
                 astra_runtime_env::ExecutorBindingKind::OrchestratorManaged
             }
             ExecutorBindingKind::ThinClient => astra_runtime_env::ExecutorBindingKind::ControlPlane,
-            ExecutorBindingKind::Mcp => astra_runtime_env::ExecutorBindingKind::RequestScopedMcp,
+            ExecutorBindingKind::Mcp => astra_runtime_env::ExecutorBindingKind::ControlPlane,
             ExecutorBindingKind::Unknown => astra_runtime_env::ExecutorBindingKind::Unknown,
         }
     };
@@ -191,7 +368,7 @@ fn runtime_env_executor_binding(
             executor.executor_id.clone()
         },
         display_name: if request_scoped_mcp {
-            "MCP server".to_string()
+            "Request-scoped MCP".to_string()
         } else if server_owned_tool {
             "Server runtime".to_string()
         } else {
@@ -270,6 +447,7 @@ fn runtime_env_runtime_binding(
         status: astra_runtime_env::RuntimeStatus::Ready,
         ephemeral: !matches!(executor.kind, ExecutorBindingKind::EdgeAgent),
         supports_long_sessions: true,
+        platform: astra_runtime_env::RuntimePlatform::Unknown,
         interaction_channels: vec![
             astra_runtime_env::RuntimeInteractionChannel::Exec,
             astra_runtime_env::RuntimeInteractionChannel::StdinPipe,
@@ -351,7 +529,7 @@ fn builtin_tool_registry() -> &'static astra_runtime_env::ToolRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use serde_json::{Value, json};
 
@@ -371,6 +549,12 @@ mod tests {
         })
     }
 
+    fn schema_with_description(tool_name: &str, description: &str) -> Value {
+        let mut schema = schema(tool_name);
+        schema["function"]["description"] = Value::String(description.to_string());
+        schema
+    }
+
     fn schema_names(schemas: Vec<Value>) -> HashSet<String> {
         schemas
             .into_iter()
@@ -381,11 +565,64 @@ mod tests {
     fn no_workspace() -> WorkspaceBinding {
         WorkspaceBinding {
             kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
+            display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
-            fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
         }
+    }
+
+    fn mcp_executor() -> ExecutorBinding {
+        ExecutorBinding {
+            kind: ExecutorBindingKind::Mcp,
+            executor_id: "mcp".to_string(),
+            display_name: "MCP".to_string(),
+            transport: ToolTransportKind::McpHttp,
+            status: ExecutorStatus::Online,
+        }
+    }
+
+    fn edge_workspace() -> WorkspaceBinding {
+        WorkspaceBinding {
+            kind: WorkspaceBindingKind::EdgeWorkspace,
+            display_name: "Edge workspace".to_string(),
+            cwd: Some("/Users/test/repo".to_string()),
+            authority: WorkspaceAuthority::ReadWrite,
+        }
+    }
+
+    fn edge_executor(executor_id: &str) -> ExecutorBinding {
+        ExecutorBinding {
+            kind: ExecutorBindingKind::EdgeAgent,
+            executor_id: executor_id.to_string(),
+            display_name: "Edge workspace".to_string(),
+            transport: ToolTransportKind::EdgeWs,
+            status: ExecutorStatus::Online,
+        }
+    }
+
+    #[test]
+    fn runtime_schema_replaces_duplicate_server_schema_without_reordering() {
+        let mut pool = vec![
+            schema_with_description("ask_user", "server ask"),
+            schema_with_description("web_fetch", "server fetch"),
+            schema_with_description("memory", "server memory"),
+        ];
+
+        extend_tool_schema_pool_prefer_extra_for_duplicates(
+            &mut pool,
+            vec![
+                schema_with_description("web_fetch", "runtime fetch"),
+                schema_with_description("bash", "runtime bash"),
+            ],
+        );
+
+        let names = pool
+            .iter()
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["ask_user", "web_fetch", "memory", "bash"]);
+        assert_eq!(pool[1]["function"]["description"], "runtime fetch");
+        assert_eq!(pool[3]["function"]["description"], "runtime bash");
     }
 
     #[test]
@@ -432,6 +669,124 @@ mod tests {
     }
 
     #[test]
+    fn mcp_schema_is_hidden_without_request_scoped_mcp_provider() {
+        let names = schema_names(capability_filter_tool_schemas_for_binding(
+            vec![schema("ask_user"), schema("mcp__weather")],
+            &no_workspace(),
+            &ExecutorBinding::server_local(),
+            None,
+        ));
+
+        assert!(names.contains("ask_user"));
+        assert!(!names.contains("mcp__weather"));
+    }
+
+    #[test]
+    fn mcp_executor_provider_declares_request_scoped_mcp_schemas() {
+        let names = schema_names(capability_filter_tool_schemas_for_binding(
+            vec![schema("mcp__weather")],
+            &no_workspace(),
+            &mcp_executor(),
+            None,
+        ));
+
+        assert_eq!(names, HashSet::from(["mcp__weather".to_string()]));
+    }
+
+    #[test]
+    fn mcp_executor_fails_closed_for_conflicting_mcp_schemas() {
+        let names = schema_names(capability_filter_tool_schemas_for_binding(
+            vec![
+                schema("ask_user"),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"}
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"}
+                            }
+                        }
+                    }
+                }),
+            ],
+            &no_workspace(),
+            &mcp_executor(),
+            None,
+        ));
+
+        assert!(names.contains("ask_user"));
+        assert!(
+            !names.contains("mcp__weather"),
+            "conflicting MCP schemas for one canonical tool must fail closed"
+        );
+    }
+
+    #[test]
+    fn request_scoped_mcp_provider_does_not_hide_server_control_plane_tools() {
+        let names = schema_names(capability_filter_tool_schemas_for_binding(
+            vec![
+                schema("ask_user"),
+                schema("tool_search"),
+                schema("enter_plan_mode"),
+                schema("mcp__weather"),
+            ],
+            &no_workspace(),
+            &mcp_executor(),
+            None,
+        ));
+
+        for expected in ["ask_user", "tool_search", "enter_plan_mode", "mcp__weather"] {
+            assert!(
+                names.contains(expected),
+                "{expected} should remain visible when request-scoped MCP is also bound: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_mcp_tools_keep_server_executor_binding_when_mcp_provider_is_bound() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let binding = runtime_environment_binding_for_parts(
+            "ask_user",
+            &no_workspace(),
+            &mcp_executor(),
+            None,
+            &ToolPolicySnapshot::default(),
+            &registry,
+        );
+
+        assert_eq!(
+            binding.executor.kind,
+            astra_runtime_env::ExecutorBindingKind::ControlPlane
+        );
+        assert!(
+            astra_runtime_env::CapabilityResolver
+                .check_tool_call(
+                    &registry,
+                    "ask_user",
+                    &serde_json::json!({}),
+                    &binding.capabilities,
+                )
+                .is_ok(),
+            "server/control-plane tools must not be denied only because a request-scoped MCP provider is present"
+        );
+    }
+
+    #[test]
     fn server_sandbox_binding_exposes_project_runtime_tools() {
         let names = schema_names(capability_filter_tool_schemas_for_binding(
             vec![
@@ -455,6 +810,545 @@ mod tests {
     }
 
     #[test]
+    fn server_provider_surface_does_not_start_from_workspace_tools() {
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &no_workspace(),
+            &ExecutorBinding::server_local(),
+            None,
+        ));
+
+        for expected in ["ask_user", "agent", "tool_search", "web_fetch", "memory"] {
+            assert!(
+                names.contains(expected),
+                "{expected} should be visible from server builtin provider capacity"
+            );
+        }
+        for hidden in [
+            "bash",
+            "read_file",
+            "write_file",
+            "str_replace",
+            "git",
+            "run_script",
+            "symbols",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must be absent until an explicit runtime provider is bound"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_server_sandbox_provider_adds_workspace_tools() {
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &WorkspaceBinding::server_sandbox("/workspace"),
+            &ExecutorBinding::server_local(),
+            None,
+        ));
+
+        for expected in [
+            "ask_user",
+            "tool_search",
+            "web_fetch",
+            "read_file",
+            "write_file",
+            "bash",
+            "git",
+        ] {
+            assert!(
+                names.contains(expected),
+                "{expected} should be visible for explicit server sandbox capacity"
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_workspace_executor_does_not_expose_runtime_tools() {
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &WorkspaceBinding::server_sandbox("/workspace"),
+            &ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            None,
+        ));
+
+        for expected in ["ask_user", "tool_search"] {
+            assert!(
+                names.contains(expected),
+                "{expected} should remain visible from server/control-plane providers"
+            );
+        }
+        for hidden in ["web_fetch", "read_file", "write_file", "bash", "git"] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must be invisible when workspace and executor provider ownership disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_offline_runtime_binding_does_not_expose_runtime_tools() {
+        let mut runtime = astra_runtime_env::RuntimeBinding::host_process("server-host");
+        runtime.status = astra_runtime_env::RuntimeStatus::Offline;
+
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &WorkspaceBinding::server_sandbox("/workspace"),
+            &ExecutorBinding::server_local(),
+            Some(&runtime),
+        ));
+
+        for expected in ["ask_user", "tool_search"] {
+            assert!(
+                names.contains(expected),
+                "{expected} should remain visible from server/control-plane providers"
+            );
+        }
+        for hidden in ["web_fetch", "read_file", "write_file", "bash", "git"] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must be invisible when the explicit runtime binding is offline"
+            );
+        }
+    }
+
+    #[test]
+    fn server_sandbox_hides_runtime_tools_without_server_local_adapter() {
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &WorkspaceBinding::server_sandbox("/workspace"),
+            &ExecutorBinding::server_local(),
+            None,
+        ));
+
+        assert!(names.contains("symbols"));
+        for hidden in ["lsp", "powershell"] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must not be visible for server-local sandbox without an adapter"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_provider_exposes_runtime_tools_without_server_local_adapter() {
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+        ));
+
+        for expected in ["bash", "read_file", "lsp"] {
+            assert!(
+                names.contains(expected),
+                "{expected} should be visible when the edge provider owns runtime execution"
+            );
+        }
+        for hidden in ["powershell", "display_sixel"] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} requires an explicit terminal/platform-local provider, not a generic edge workspace"
+            );
+        }
+    }
+
+    #[test]
+    fn server_edge_composition_exposes_server_services_and_edge_runtime_tools() {
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+        ));
+
+        for expected in [
+            "ask_user",
+            "task_board",
+            "session",
+            "tool_search",
+            "memory",
+            "web_fetch",
+            "bash",
+            "read_file",
+            "write_file",
+            "git",
+        ] {
+            assert!(
+                names.contains(expected),
+                "{expected} must be visible in the composed server+edge runtime surface: {names:?}"
+            );
+        }
+        for hidden in ["mcp__weather", "not_registered"] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must still require an explicit request-scoped provider"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_projection_hides_control_plane_tools_when_provider_is_unbound() {
+        let names = schema_names(capability_filter_tool_schemas_for_binding_with_context(
+            vec![
+                schema("task_board"),
+                schema("introspect"),
+                schema("reflect"),
+                schema("agent_fanout"),
+                schema("memory"),
+                schema("read_file"),
+                schema("bash"),
+            ],
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+            ToolAdmissionContext {
+                server_service_provider_ready: false,
+                control_plane_provider_ready: false,
+                ..ToolAdmissionContext::default()
+            },
+        ));
+
+        assert!(names.contains("read_file"), "{names:?}");
+        assert!(names.contains("bash"), "{names:?}");
+        for hidden in [
+            "task_board",
+            "introspect",
+            "reflect",
+            "agent_fanout",
+            "memory",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must not be prompt-visible without a bound provider: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_allowlist_filters_prompt_visible_schema_without_server_reroute() {
+        let names = schema_names(capability_filter_tool_schemas_for_binding_with_context(
+            vec![
+                schema("ask_user"),
+                schema("memory"),
+                schema("web_fetch"),
+                schema("bash"),
+            ],
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+            ToolAdmissionContext {
+                provider_allowed_tools: HashMap::from([
+                    (
+                        "server-builtin".to_string(),
+                        HashSet::from(["memory".to_string()]),
+                    ),
+                    ("edge-1".to_string(), HashSet::from(["bash".to_string()])),
+                ]),
+                ..ToolAdmissionContext::default()
+            },
+        ));
+
+        assert!(names.contains("ask_user"));
+        assert!(names.contains("memory"));
+        assert!(names.contains("bash"));
+        assert!(
+            !names.contains("web_fetch"),
+            "web_fetch is disallowed on the selected edge offer and must not reroute to server: {names:?}"
+        );
+    }
+
+    #[test]
+    fn shared_network_tool_runtime_binding_follows_selected_executor() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+
+        let server_only = runtime_environment_binding_for_parts(
+            "web_fetch",
+            &no_workspace(),
+            &ExecutorBinding::server_local(),
+            None,
+            &ToolPolicySnapshot::default(),
+            &registry,
+        );
+        assert_eq!(
+            server_only.executor.kind,
+            astra_runtime_env::ExecutorBindingKind::ControlPlane
+        );
+        assert!(server_only.capabilities.executor.server_service);
+        assert!(!server_only.capabilities.executor.runtime_executor);
+
+        let server_sandbox = runtime_environment_binding_for_parts(
+            "web_fetch",
+            &WorkspaceBinding::server_sandbox("/workspace"),
+            &ExecutorBinding::server_local(),
+            None,
+            &ToolPolicySnapshot::default(),
+            &registry,
+        );
+        assert_eq!(
+            server_sandbox.executor.kind,
+            astra_runtime_env::ExecutorBindingKind::ServerRuntime
+        );
+        assert!(server_sandbox.capabilities.executor.server_service);
+        assert!(server_sandbox.capabilities.executor.runtime_executor);
+
+        let edge = runtime_environment_binding_for_parts(
+            "web_fetch",
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+            &ToolPolicySnapshot::default(),
+            &registry,
+        );
+        assert_eq!(
+            edge.executor.kind,
+            astra_runtime_env::ExecutorBindingKind::EdgeAgent
+        );
+        assert!(!edge.capabilities.executor.server_service);
+        assert!(edge.capabilities.executor.runtime_executor);
+        assert!(
+            astra_runtime_env::CapabilityResolver
+                .check_tool_call(
+                    &registry,
+                    "web_fetch",
+                    &serde_json::json!({}),
+                    &edge.capabilities,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn shared_network_tool_schema_is_stable_across_selected_offers() {
+        let canonical_schema = schema("web_fetch");
+        let server_visible = capability_filter_tool_schemas_for_binding(
+            vec![canonical_schema.clone()],
+            &no_workspace(),
+            &ExecutorBinding::server_local(),
+            None,
+        );
+        let edge_visible = capability_filter_tool_schemas_for_binding(
+            vec![canonical_schema.clone()],
+            &edge_workspace(),
+            &edge_executor("edge-1"),
+            None,
+        );
+
+        assert_eq!(server_visible, vec![canonical_schema.clone()]);
+        assert_eq!(edge_visible, vec![canonical_schema]);
+        assert_eq!(
+            server_visible, edge_visible,
+            "provider/route selection must not mutate prompt-visible canonical schema"
+        );
+    }
+
+    #[test]
+    fn same_tool_schema_stays_stable_while_offer_selection_is_provider_scoped() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let canonical_schema = schema("web_fetch");
+        let workspace = edge_workspace();
+        let alice = edge_executor("edge-alice");
+        let bob = edge_executor("edge-bob");
+
+        let alice_visible = capability_filter_tool_schemas_for_binding(
+            vec![canonical_schema.clone()],
+            &workspace,
+            &alice,
+            None,
+        );
+        let bob_visible = capability_filter_tool_schemas_for_binding(
+            vec![canonical_schema.clone()],
+            &workspace,
+            &bob,
+            None,
+        );
+
+        assert_eq!(alice_visible, vec![canonical_schema.clone()]);
+        assert_eq!(
+            alice_visible, bob_visible,
+            "provider identity must not mutate prompt-visible canonical schema"
+        );
+
+        let alice_admission = crate::server::tool_admission::resolve_tool_admission_for_binding(
+            "web_fetch",
+            std::slice::from_ref(&canonical_schema),
+            &workspace,
+            &alice,
+            None,
+            &registry,
+        );
+        let bob_admission = crate::server::tool_admission::resolve_tool_admission_for_binding(
+            "web_fetch",
+            &[canonical_schema],
+            &workspace,
+            &bob,
+            None,
+            &registry,
+        );
+
+        assert_eq!(
+            alice_admission.selected_offer_id(),
+            Some("web_fetch@edge-alice")
+        );
+        assert_eq!(
+            bob_admission.selected_offer_id(),
+            Some("web_fetch@edge-bob")
+        );
+    }
+
+    #[test]
+    fn provider_allowlist_is_provider_scoped_not_global_tool_scoped() {
+        let canonical_schema = schema("web_fetch");
+        let workspace = edge_workspace();
+        let alice = edge_executor("edge-alice");
+        let bob = edge_executor("edge-bob");
+        let context = ToolAdmissionContext {
+            provider_allowed_tools: HashMap::from([(
+                "edge-alice".to_string(),
+                HashSet::from(["bash".to_string()]),
+            )]),
+            ..ToolAdmissionContext::default()
+        };
+
+        let alice_visible = capability_filter_tool_schemas_for_binding_with_context(
+            vec![canonical_schema.clone()],
+            &workspace,
+            &alice,
+            None,
+            context.clone(),
+        );
+        let bob_visible = capability_filter_tool_schemas_for_binding_with_context(
+            vec![canonical_schema.clone()],
+            &workspace,
+            &bob,
+            None,
+            context,
+        );
+
+        assert!(
+            alice_visible.is_empty(),
+            "edge-alice allowlist excludes web_fetch and must hide only that provider's offer"
+        );
+        assert_eq!(
+            bob_visible,
+            vec![canonical_schema],
+            "edge-bob has no provider allowlist entry and must not inherit edge-alice policy"
+        );
+    }
+
+    #[test]
+    fn production_server_edge_surface_hides_admin_and_platform_local_tools() {
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::lifecycle_server_capabilities(true, true),
+            &WorkspaceBinding {
+                kind: WorkspaceBindingKind::EdgeWorkspace,
+                display_name: "Edge workspace".to_string(),
+                cwd: Some("/Users/test/repo".to_string()),
+                authority: WorkspaceAuthority::ReadWrite,
+            },
+            &ExecutorBinding {
+                kind: ExecutorBindingKind::EdgeAgent,
+                executor_id: "edge-1".to_string(),
+                display_name: "Edge workspace".to_string(),
+                transport: ToolTransportKind::EdgeWs,
+                status: ExecutorStatus::Online,
+            },
+            None,
+        ));
+
+        for expected in [
+            "task_board",
+            "session",
+            "introspect",
+            "reflect",
+            "tool_search",
+            "bash",
+            "read_file",
+        ] {
+            assert!(
+                names.contains(expected),
+                "{expected} must be visible in production server+edge surface: {names:?}"
+            );
+        }
+        for hidden in [
+            "mo_query",
+            "rollback_database_snapshots",
+            "powershell",
+            "display_sixel",
+            "task_output",
+            "task_stop",
+            "task_list",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must not be visible in ordinary production server+edge surface: {names:?}"
+            );
+        }
+    }
+
+    #[test]
     fn edge_provided_tools_allow_registered_project_tools_without_server_cwd() {
         let names = schema_names(capability_filter_edge_provided_tool_schemas_for_binding(
             vec![
@@ -467,7 +1361,6 @@ mod tests {
                 display_name: "Edge workspace".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
             },
             &ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,
@@ -494,7 +1387,6 @@ mod tests {
                 display_name: "Edge workspace".to_string(),
                 cwd: None,
                 authority: WorkspaceAuthority::ReadWrite,
-                fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
             },
             &ExecutorBinding {
                 kind: ExecutorBindingKind::EdgeAgent,
@@ -527,6 +1419,26 @@ mod tests {
     }
 
     #[test]
+    fn runtime_without_long_session_support_does_not_hide_ready_runtime_provider() {
+        let mut runtime = astra_runtime_env::RuntimeBinding::host_process("runtime-short-session");
+        runtime.supports_long_sessions = false;
+
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &WorkspaceBinding::server_sandbox("/workspace"),
+            &ExecutorBinding::server_local(),
+            Some(&runtime),
+        ));
+
+        for expected in ["bash", "read_file", "write_file", "git"] {
+            assert!(
+                names.contains(expected),
+                "{expected} must remain visible when the runtime is ready and isolated even if it does not support long sessions"
+            );
+        }
+    }
+
+    #[test]
     fn local_filesystem_maps_to_unknown_in_conversion() {
         // When the server receives a client-only LocalFilesystem workspace
         // kind, it should map to Unknown rather than propagating the variant.
@@ -535,7 +1447,6 @@ mod tests {
             display_name: "local".into(),
             cwd: Some("/tmp/test".into()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: super::super::tool_transport::FallbackPolicy::Disabled,
         };
         let runtime_ws = runtime_env_workspace_binding(&workspace);
         assert_eq!(

@@ -260,13 +260,15 @@ fn apply_turn_success_sync(
     );
     state.total_session_cost += turn_cost;
     state.last_response = Some(result.full_text.clone());
-    state.continuation_anchor = build_continuation_anchor(state, line, &result);
+    let effective_user_input = result.effective_user_input(line);
+    let latest_user_input = result.latest_user_input(line);
+    state.continuation_anchor = build_continuation_anchor(state, &latest_user_input, &result);
     state.pending_followup_suggestion =
-        crate::cli::followup_suggestion::suggest_followup(line, state, &result);
+        crate::cli::followup_suggestion::suggest_followup(&latest_user_input, state, &result);
 
     state.redo_stack.clear();
     state.history.push((
-        line.to_string(),
+        effective_user_input.clone(),
         build_history_text(&result.full_text, &result.tool_call_records),
     ));
     state.recent_tools = recent_tools_after_successful_turn(&state.recent_tools, &result);
@@ -281,7 +283,8 @@ fn apply_turn_success_sync(
         state.tool_health_entries = result.tool_health_export.clone();
     }
 
-    let learning_snap = analyze_chat_turn_learning(line, state.turn, &state.recent_tools, &result);
+    let learning_snap =
+        analyze_chat_turn_learning(&latest_user_input, state.turn, &state.recent_tools, &result);
     state.latest_turn_quality_feedback =
         turn_quality_feedback_from_eval(state.turn, &learning_snap.eval);
     let mut result = result;

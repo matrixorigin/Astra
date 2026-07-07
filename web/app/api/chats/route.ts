@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireRuntimeUser } from '@/lib/api/auth-guard';
 import { createChatWithMessage, deleteArchivedChats, listChats } from '@/lib/api/web-store';
 import type { CreateChatRequest } from '@/lib/api/types';
+import { RuntimeClientError, requireRuntimeClient } from '@/lib/runtime-client';
+import { verifyLiveWorkspaceSelection } from '@/lib/workspace-selection-server';
+import { normalizeWorkspaceSelection } from '@/lib/workspace-authority';
 
 export async function GET(request: NextRequest) {
   const auth = await requireRuntimeUser();
@@ -32,14 +35,47 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'message is required' }, { status: 400 });
   }
   try {
+    const normalizedWorkspaceSelection =
+      body.workspaceSelection === null
+        ? null
+        : body.workspaceSelection === undefined
+          ? undefined
+          : normalizeWorkspaceSelection(body.workspaceSelection);
+    if (
+      body.workspaceSelection !== undefined &&
+      body.workspaceSelection !== null &&
+      !normalizedWorkspaceSelection
+    ) {
+      return NextResponse.json(
+        { error: 'workspaceSelection must be a valid environment selection' },
+        { status: 400 },
+      );
+    }
+    const workspaceSelection =
+      normalizedWorkspaceSelection?.kind === 'edge_workspace'
+        ? await verifyLiveWorkspaceSelection(
+            normalizedWorkspaceSelection,
+            await requireRuntimeClient({
+              auth: 'required',
+              operation: 'verify initial chat environment selection',
+            }),
+          )
+        : normalizedWorkspaceSelection;
     const result = await createChatWithMessage(auth.user.user_id, {
       message: body.message,
       model: body.model,
       options: body.options,
       projectId: body.projectId,
+      workspaceSelection: workspaceSelection ?? undefined,
     });
     return NextResponse.json(result, { status: 201 });
   } catch (error) {
+    if (error instanceof RuntimeClientError && error.status) {
+      return NextResponse.json(
+        { error: error.detail, code: error.code },
+        { status: error.status },
+      );
+    }
     const message = error instanceof Error ? error.message : 'failed to create chat';
     const status = message.includes('authentication is missing') ? 401 : 502;
     return NextResponse.json({ error: message }, { status });

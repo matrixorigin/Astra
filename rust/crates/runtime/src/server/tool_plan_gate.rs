@@ -16,8 +16,8 @@ pub(crate) struct PlanModeSnapshot {
 
 /// Tools that mutate the world outside the session. Blocked while plan mode
 /// is active (`PlanPhase` = Planning|Refining) to mirror the reference agent's
-/// `prepareContextForPlanMode` behaviour: the model must call ExitPlanMode
-/// before writing anything.
+/// permission-overlay behaviour: the model must call ExitPlanMode before
+/// writing anything.
 ///
 /// Read-only tools (grep, glob, read_file, git action=status/diff/log,
 /// web_search) and session-scoped authoring tools (`task`, memory_retrieve,
@@ -30,10 +30,9 @@ pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
 pub(crate) fn plan_mode_blocked_tool_result(tool: &str) -> astra_tools::ToolResult {
     astra_tools::ToolResult::error(format!(
         "Tool '{tool}' is blocked while plan mode is active. \
-         The agent must call `exit_plan_mode` with an approved plan \
-         before any write operation. This mirrors the reference agent's plan \
-         mode: the plan is authored with read-only tools, approved by \
-         the user, then execution proceeds with writes unlocked."
+         Use read-only tools to finish the plan, then call \
+         `exit_plan_mode(plan='...')` to submit it for trusted user \
+         approval before write tools can run."
     ))
 }
 
@@ -87,19 +86,50 @@ pub(crate) async fn invalidate_plan_mode_cache(
     session_id: &str,
     cache: &tokio::sync::RwLock<PlanModeSnapshot>,
     resume_hint_handle: Option<&Arc<std::sync::RwLock<Option<String>>>>,
+    authoring_active_handle: Option<&Arc<std::sync::RwLock<bool>>>,
 ) {
     {
         let mut writer = cache.write().await;
         *writer = PlanModeSnapshot::default();
     }
-    if let Some(handle) = resume_hint_handle {
+    let should_refresh_shared = resume_hint_handle.is_some() || authoring_active_handle.is_some();
+    if should_refresh_shared {
         let (authoring, hint) = recompute_plan_mode_snapshot(repo, user_id, session_id).await;
-        if let Ok(mut slot) = handle.write() {
+        if let Some(handle) = resume_hint_handle
+            && let Ok(mut slot) = handle.write()
+        {
             *slot = hint.clone();
+        }
+        if let Some(handle) = authoring_active_handle
+            && let Ok(mut slot) = handle.write()
+        {
+            *slot = authoring;
         }
         let mut writer = cache.write().await;
         writer.authoring_active = Some(authoring);
         writer.resume_hint = hint;
+    }
+}
+
+async fn clear_shared_plan_mode_state(
+    cache: &tokio::sync::RwLock<PlanModeSnapshot>,
+    resume_hint_handle: Option<&Arc<std::sync::RwLock<Option<String>>>>,
+    authoring_active_handle: Option<&Arc<std::sync::RwLock<bool>>>,
+) {
+    {
+        let mut writer = cache.write().await;
+        writer.authoring_active = Some(false);
+        writer.resume_hint = None;
+    }
+    if let Some(handle) = resume_hint_handle
+        && let Ok(mut slot) = handle.write()
+    {
+        *slot = None;
+    }
+    if let Some(handle) = authoring_active_handle
+        && let Ok(mut slot) = handle.write()
+    {
+        *slot = false;
     }
 }
 
@@ -109,6 +139,7 @@ pub(crate) async fn execute_enter_plan_mode(
     user_id: &str,
     cache: &tokio::sync::RwLock<PlanModeSnapshot>,
     resume_hint_handle: Option<&Arc<std::sync::RwLock<Option<String>>>>,
+    authoring_active_handle: Option<&Arc<std::sync::RwLock<bool>>>,
     args: &Value,
 ) -> String {
     let Some(repo) = repo.cloned() else {
@@ -178,7 +209,15 @@ pub(crate) async fn execute_enter_plan_mode(
         return format!("Error: link plan to session: {error}");
     }
 
-    invalidate_plan_mode_cache(Some(&repo), user_id, session_id, cache, resume_hint_handle).await;
+    invalidate_plan_mode_cache(
+        Some(&repo),
+        user_id,
+        session_id,
+        cache,
+        resume_hint_handle,
+        authoring_active_handle,
+    )
+    .await;
 
     if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
         let _ = writer.append(
@@ -195,7 +234,7 @@ pub(crate) async fn execute_enter_plan_mode(
 
     format!(
         "Entered plan mode. plan_id={} goal=\"{}\". Write tools are now blocked — \
-         author the plan, then call `exit_plan_mode` with `approved=true` when ready.",
+         author the plan, then call `exit_plan_mode(plan='...')` when ready for trusted review.",
         plan_id, goal
     )
 }
@@ -206,6 +245,7 @@ pub(crate) async fn execute_exit_plan_mode(
     session_id: &str,
     cache: &tokio::sync::RwLock<PlanModeSnapshot>,
     resume_hint_handle: Option<&Arc<std::sync::RwLock<Option<String>>>>,
+    authoring_active_handle: Option<&Arc<std::sync::RwLock<bool>>>,
     args: &Value,
 ) -> String {
     let Some(repo) = repo.cloned() else {
@@ -215,6 +255,7 @@ pub(crate) async fn execute_exit_plan_mode(
     let active = match repo.active_plan_for_session(user_id, session_id).await {
         Ok(Some(id)) => id,
         Ok(None) => {
+            clear_shared_plan_mode_state(cache, resume_hint_handle, authoring_active_handle).await;
             return "Note: session has no active plan; nothing to exit.".to_string();
         }
         Err(error) => return format!("Error: lookup active plan: {error}"),
@@ -255,7 +296,15 @@ pub(crate) async fn execute_exit_plan_mode(
         }
     }
 
-    invalidate_plan_mode_cache(Some(&repo), user_id, session_id, cache, resume_hint_handle).await;
+    invalidate_plan_mode_cache(
+        Some(&repo),
+        user_id,
+        session_id,
+        cache,
+        resume_hint_handle,
+        authoring_active_handle,
+    )
+    .await;
 
     if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
         let _ = writer.append(
@@ -281,8 +330,6 @@ mod tests {
     fn plan_mode_blocks_all_write_and_execute_class_tools() {
         for (tool, args) in [
             ("bash", json!({"command": "touch plan.txt"})),
-            ("bash", json!({"command": "git status --short"})),
-            ("bash", json!({"command": "ls src"})),
             ("background_shell", json!({"command": "ls src"})),
             ("powershell", json!({"command": "Get-ChildItem"})),
             ("write_file", json!({"path": "plan.txt", "content": "x"})),
@@ -311,15 +358,17 @@ mod tests {
     fn plan_mode_allows_read_only_exploration_by_args() {
         for (tool, args) in [
             ("read_file", json!({"path": "src/lib.rs"})),
+            ("bash", json!({"command": "git status --short"})),
+            ("bash", json!({"command": "ls src"})),
             ("grep", json!({"pattern": "needle", "path": "src"})),
             ("glob", json!({"pattern": "**/*.rs"})),
             ("list_dir", json!({"path": "src"})),
             ("git", json!({"action": "status"})),
             ("git", json!({"action": "diff"})),
             ("github", json!({"action": "list_prs"})),
-            ("task", json!({"action": "list"})),
+            ("task_board", json!({"action": "list"})),
             (
-                "task",
+                "task_board",
                 json!({"action": "create", "title": "draft plan item"}),
             ),
             (
@@ -341,7 +390,7 @@ mod tests {
             &json!({"task_id": "bg-shell-1"})
         ));
         assert!(is_plan_mode_blocked_tool(
-            "task",
+            "task_board",
             &json!({"action": "stop", "task_id": "bg-shell-1"})
         ));
         assert!(is_plan_mode_blocked_tool(

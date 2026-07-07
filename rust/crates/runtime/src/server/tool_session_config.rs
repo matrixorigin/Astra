@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::{Value, json};
 
-use crate::server::server_tool_executor::SessionConfigInner;
+use crate::server::runtime_tool_executor::SessionConfigInner;
 use crate::server::tool_session_state_rollback::{
     self, SessionStateRollbackAction, SessionStateRollbackJournal,
 };
@@ -321,7 +321,7 @@ pub(crate) fn execute_adjust_config<PublishWorkspace>(
 where
     PublishWorkspace: FnOnce() -> Result<(), String>,
 {
-    use crate::server::server_tool_executor::SessionConfigInner;
+    use crate::server::runtime_tool_executor::SessionConfigInner;
 
     let path = match args.get("path").and_then(Value::as_str) {
         Some(path) if !path.trim().is_empty() => path.trim(),
@@ -387,7 +387,7 @@ where
         session_id,
         path,
         update.new_value.clone(),
-        "server_tool_executor:adjust_config",
+        "runtime_tool_executor:adjust_config",
     ) {
         // Rollback observability state.
         if let Ok(mut session) = observability_session.write() {
@@ -528,7 +528,7 @@ pub(crate) fn execute_compress_context(
         session_id,
         turn,
         reason,
-        "server_tool_executor:compress_context",
+        "runtime_tool_executor:compress_context",
     ) {
         return compress_context_output(json!({
             "error": "failed_to_persist_manual_compression",

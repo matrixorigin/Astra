@@ -53,8 +53,6 @@ pub(crate) enum TurnToolPhaseControl {
     Return(AgenticLoopOutcome),
 }
 
-const TOOL_ERROR_KIND_FALLBACK_DISABLED: &str = "fallback_disabled";
-
 fn execution_boundary_blocked_wait_reason(tool_results: &[Value]) -> Option<String> {
     tool_results.iter().find_map(|result| {
         let result = result.as_object()?;
@@ -74,7 +72,6 @@ fn execution_boundary_blocked_wait_reason(tool_results: &[Value]) -> Option<Stri
             Some(
                 TOOL_ERROR_KIND_EXECUTOR_OFFLINE
                 | TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
-                | TOOL_ERROR_KIND_FALLBACK_DISABLED
                 | TOOL_ERROR_KIND_ROUTE_MISMATCH,
             ) => Some(reason.to_string()),
             _ => None,
@@ -510,7 +507,7 @@ pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
             // session state
             | "adjust_config"
             | "compress_context"
-            | "task"
+            | "task_board"
     )
 }
 
@@ -538,7 +535,7 @@ fn tool_record_is_server_mutator(record: &ToolCallRecord) -> bool {
 }
 
 fn task_tool_call_is_session_state_mutator(tool_call: &Value) -> bool {
-    if tool_call_name(tool_call) != Some("task") {
+    if tool_call_name(tool_call) != Some("task_board") {
         return false;
     }
     matches!(
@@ -851,7 +848,7 @@ fn server_git_mutation_targets(tool_results: &[Value]) -> Vec<String> {
 }
 
 async fn rollback_server_git_mutations(
-    executor: &crate::server::server_tool_executor::ServerToolExecutor,
+    executor: &crate::server::runtime_tool_executor::RuntimeToolExecutor,
     targets: &[String],
 ) -> Option<Value> {
     if targets.is_empty() {
@@ -910,7 +907,7 @@ async fn rollback_server_git_mutations(
 
 fn open_server_rollback_boundary(
     session_id: Option<&str>,
-    executor: &crate::server::server_tool_executor::ServerToolExecutor,
+    executor: &crate::server::runtime_tool_executor::RuntimeToolExecutor,
     turn_index: u32,
     tool_calls: &[Value],
 ) -> Option<ServerRollbackBoundary> {
@@ -952,7 +949,7 @@ fn open_server_rollback_boundary(
 
 async fn finalize_server_rollback_boundary(
     session_id: Option<&str>,
-    executor: &crate::server::server_tool_executor::ServerToolExecutor,
+    executor: &crate::server::runtime_tool_executor::RuntimeToolExecutor,
     active: &ServerRollbackBoundary,
     new_records: &[ToolCallRecord],
     new_tool_results: &[Value],
@@ -1294,7 +1291,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     let all_tool_calls = tool_calls.as_slice();
     let edge_round_for_headless = edge_tool_round.as_slice();
     let active_server_rollback_boundary =
-        state.server_tool_executor.as_deref().and_then(|executor| {
+        state.runtime_tool_executor.as_deref().and_then(|executor| {
             open_server_rollback_boundary(
                 state.current_session_id.as_deref(),
                 executor,
@@ -1367,7 +1364,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             permission_context: state.permission_context.as_ref(),
             progress_emitter: state.messaging.progress_emitter.as_ref(),
             pre_resolved_results: &pre_resolved_results,
-            server_tool_executor: state.server_tool_executor.as_deref(),
+            runtime_tool_executor: state.runtime_tool_executor.as_deref(),
             turn_start: Some(tool_record_turn_start),
             llm_round: obs_llm_round,
             plan_mode_active,
@@ -1628,7 +1625,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     if let (Some(active), Some(executor)) = (
         active_server_rollback_boundary.as_ref(),
-        state.server_tool_executor.as_deref(),
+        state.runtime_tool_executor.as_deref(),
     ) {
         let new_records = &state.stall.tool_call_records[evo_records_before..];
         finalize_server_rollback_boundary(
@@ -1641,33 +1638,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .await;
     }
 
-    if let Some(reason) = execution_boundary_blocked_wait_reason(&new_tool_results) {
-        state.step_recorder.end_turn(false);
-        finalize_turn_trace(state).await;
-        refresh_runtime_promotion_signals_from_db(state).await;
-        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
-            reason,
-        )));
-    }
-
-    if let Some(reason) = detached_background_task_wait_reason(&edge_tool_round, &new_tool_results)
-    {
-        state.step_recorder.end_turn(false);
-        finalize_turn_trace(state).await;
-        refresh_runtime_promotion_signals_from_db(state).await;
-        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
-            reason,
-        )));
-    }
-
-    if let Some(reason) = agent_fanout_wait_reason(&edge_tool_round, &new_tool_results) {
-        state.step_recorder.end_turn(false);
-        finalize_turn_trace(state).await;
-        refresh_runtime_promotion_signals_from_db(state).await;
-        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
-            reason,
-        )));
-    }
+    let waiting_reason = execution_boundary_blocked_wait_reason(&new_tool_results)
+        .or_else(|| detached_background_task_wait_reason(&edge_tool_round, &new_tool_results))
+        .or_else(|| agent_fanout_wait_reason(&edge_tool_round, &new_tool_results));
 
     let _ = evo_records_before;
 
@@ -1747,6 +1720,15 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         state
             .turn_guard
             .record_tool_result(&edge_result.tool, &edge_result.output);
+    }
+
+    if let Some(reason) = waiting_reason {
+        state.step_recorder.end_turn(false);
+        finalize_turn_trace(state).await;
+        refresh_runtime_promotion_signals_from_db(state).await;
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Waiting(
+            reason,
+        )));
     }
 
     if let Some(ref registry) = state.skills.registry_for_activation {
@@ -2069,6 +2051,41 @@ mod tests {
         assert_eq!(
             snapshot.step_latency[0].terminal_event_kind.as_deref(),
             Some("StepIncomplete")
+        );
+    }
+
+    #[test]
+    fn introspect_snapshot_includes_server_capacity_provider_coverage() {
+        let mut state = make_state();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        state.runtime_tool_executor = Some(Arc::new(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+                dir.path().to_path_buf(),
+                "test-user".into(),
+                "test-session".into(),
+                None,
+                None,
+            ),
+        ));
+
+        let snapshot = build_introspect_snapshot(&state, String::new(), None);
+        let runtime = snapshot
+            .capacity_provider_coverage
+            .iter()
+            .find(|provider| provider.provider_type == "sandbox")
+            .expect("sandbox provider coverage");
+
+        assert_eq!(runtime.status, "unbound");
+        assert_eq!(
+            runtime.unavailable_reason.as_deref(),
+            Some("no_workspace_provider_bound")
+        );
+        assert!(
+            snapshot
+                .capacity_provider_coverage
+                .iter()
+                .any(|provider| provider.provider_type == "server_service"
+                    && provider.status == "ready")
         );
     }
 
@@ -2581,7 +2598,7 @@ esac
         dir: &tempfile::TempDir,
         turn_index: u32,
     ) -> (
-        crate::server::server_tool_executor::ServerToolExecutor,
+        crate::server::runtime_tool_executor::RuntimeToolExecutor,
         std::sync::Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>,
     ) {
         let mut workspace =
@@ -2589,7 +2606,7 @@ esac
         workspace.cwd = dir.path().display().to_string();
         astra_services::session_workspace::write_workspace(&workspace).unwrap();
 
-        let mut executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
             dir.path().to_path_buf(),
             "test-user".into(),
             session_id.to_string(),
@@ -2612,8 +2629,8 @@ esac
     fn server_executor_for_test_workspace(
         workspace: &std::path::Path,
         session_id: &str,
-    ) -> crate::server::server_tool_executor::ServerToolExecutor {
-        let mut executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+    ) -> crate::server::runtime_tool_executor::RuntimeToolExecutor {
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
             workspace.to_path_buf(),
             "test-user".into(),
             session_id.to_string(),
@@ -2970,7 +2987,7 @@ esac
         // Session-state mutators
         assert!(is_server_mutator_tool_name("adjust_config"));
         assert!(is_server_mutator_tool_name("compress_context"));
-        assert!(is_server_mutator_tool_name("task"));
+        assert!(is_server_mutator_tool_name("task_board"));
 
         // Common read-only tools must NOT be classified as mutators.
         for name in [
@@ -3030,19 +3047,19 @@ esac
     fn task_round_mutator_detection_uses_task_action_only() {
         assert!(server_session_state_mutator_in_round(&[json!({
             "function": {
-                "name": "task",
+                "name": "task_board",
                 "arguments": "{\"action\":\"create\",\"title\":\"ship\"}"
             }
         })]));
         assert!(server_session_state_mutator_in_round(&[json!({
             "function": {
-                "name": "task",
+                "name": "task_board",
                 "arguments": "{\"action\":\"archive\",\"task_id\":\"task-1\"}"
             }
         })]));
         assert!(!server_session_state_mutator_in_round(&[json!({
             "function": {
-                "name": "task",
+                "name": "task_board",
                 "arguments": "{\"action\":\"list\"}"
             }
         })]));

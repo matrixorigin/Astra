@@ -199,8 +199,6 @@ pub(crate) struct RunProjectionResponse {
     pub executor: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fallback_policy: Option<String>,
     pub run_event_high_watermark: i64,
     pub projection_event_idx: i64,
     pub projection_updated_at: String,
@@ -255,7 +253,6 @@ impl RunProjectionResponse {
             workspace: value.workspace,
             executor: value.executor,
             transport: value.transport,
-            fallback_policy: value.fallback_policy,
             run_event_high_watermark: value.run_event_high_watermark,
             projection_event_idx: value.projection_event_idx,
             projection_updated_at: value.projection_updated_at,
@@ -872,9 +869,9 @@ mod tests {
                         "waiting_for": "task_board_intervention",
                         "user_message": "Task-board work remains open.",
                         "task_board": {
-                            "summary": "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
-                            "in_progress_count": 1,
-                            "active_tasks": ["task-2 Investigate [in_progress]"]
+                            "summary": "1 paused task(s) remain: task-2 Investigate [paused]",
+                            "paused_count": 1,
+                            "active_tasks": ["task-2 Investigate [paused]"]
                         }
                     },
                     "index": 10
@@ -900,9 +897,9 @@ mod tests {
                 "user_message": "Task-board work remains open.",
                 "message": "Task-board work remains open.",
                 "task_board": {
-                    "summary": "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
-                    "in_progress_count": 1,
-                    "active_tasks": ["task-2 Investigate [in_progress]"]
+                    "summary": "1 paused task(s) remain: task-2 Investigate [paused]",
+                    "paused_count": 1,
+                    "active_tasks": ["task-2 Investigate [paused]"]
                 },
                 "index": 10
             })
@@ -1006,10 +1003,10 @@ mod tests {
             "run-123",
             vec![
                 json!({
-                    "event_type": "run_blocked", "reason": "fallback_disabled",
+                    "event_type": "run_blocked", "reason": "executor_offline",
                     "data": {
-                        "message": "Server fallback is disabled.",
-                        "reason": "fallback_disabled"
+                        "message": "Execution provider is offline.",
+                        "reason": "executor_offline"
                     },
                     "index": 4
                 }),
@@ -1033,10 +1030,10 @@ mod tests {
         assert_eq!(
             transformed[0],
             json!({
-                "type": "run_blocked", "reason": "fallback_disabled",
+                "type": "run_blocked", "reason": "executor_offline",
                 "run_id": "run-123",
-                "message": "Server fallback is disabled.",
-                "reason": "fallback_disabled",
+                "message": "Execution provider is offline.",
+                "reason": "executor_offline",
                 "index": 4
             })
         );
@@ -1357,8 +1354,7 @@ mod tests {
                             "kind": "edge_workspace",
                             "display_name": "MacBook Pro",
                             "cwd": "/Users/xupeng/github/astra",
-                            "authority": "read_write",
-                            "fallback_policy": "disabled"
+                            "authority": "read_write"
                         },
                         "executor": {
                             "kind": "edge_agent",
@@ -1367,8 +1363,7 @@ mod tests {
                             "transport": "edge_ws",
                             "status": "online"
                         },
-                        "transport": "edge_ws",
-                        "fallback_policy": "disabled"
+                        "transport": "edge_ws"
                     }
                 }),
             )
@@ -1480,7 +1475,6 @@ mod tests {
             Some(&json!("edge-macbook-1"))
         );
         assert_eq!(json.get("transport"), Some(&json!("edge_ws")));
-        assert_eq!(json.get("fallback_policy"), Some(&json!("disabled")));
         assert_eq!(
             json.pointer("/latest_checkpoint/checkpoint_version"),
             Some(&json!("checkpoint_v3"))

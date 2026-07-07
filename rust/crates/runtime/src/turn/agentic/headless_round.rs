@@ -11,11 +11,13 @@ use serde_json::Value;
 use super::super::headless_tool_pipeline::{
     HeadlessToolExecutionCtx, HeadlessToolExecutionPipeline,
 };
-use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
+use astra_pipeline::step_protocol::{ExecutionSlotSpec, InMemoryIdempotencyCache};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
+use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
     EdgeToolRoundRow, begin_headless_tool_round_opening_ext, openai_tool_roundtrip_values,
+    resolve_headless_tool_slot,
 };
 use astra_turn_core::headless_tool_postprocess::HeadlessStepDeadline;
 use astra_turn_core::tool_result_sanitize::tool_result_content_for_model;
@@ -76,7 +78,8 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     /// to maintain correct ordering: assistant(tool_calls) → tool(pre_resolved) → tool(executed).
     pub pre_resolved_results: &'a [(String, String)],
     /// Optional server-side tool executor for web agent sessions.
-    pub server_tool_executor: Option<&'a crate::server::server_tool_executor::ServerToolExecutor>,
+    pub runtime_tool_executor:
+        Option<&'a crate::server::runtime_tool_executor::RuntimeToolExecutor>,
     // ── Observability (Phase 1) ──
     /// Turn start instant for computing start_offset_ms on tool records.
     pub turn_start: Option<std::time::Instant>,
@@ -156,7 +159,31 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
         tool_results.push(tr);
     }
 
-    step_recorder.begin_act(opening.tool_count);
+    let slot_specs = opening
+        .indices
+        .iter()
+        .map(|idx| {
+            let slot = resolve_headless_tool_slot(*idx, tool_calls.as_ref(), |edge_idx| {
+                let edge = &edge_tool_round[edge_idx];
+                (
+                    edge.assistant_tool_call_id(edge_idx),
+                    edge.tool_name().to_string(),
+                    edge.tool_args().clone(),
+                )
+            });
+            ExecutionSlotSpec {
+                args_preview: make_args_preview(&slot.name, &slot.args),
+                tool_name: slot.name,
+                call_id: slot.id,
+                idempotency_key: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    if slot_specs.is_empty() {
+        step_recorder.begin_act(opening.tool_count);
+    } else {
+        step_recorder.begin_act_with_slots(slot_specs);
+    }
     let step_deadline =
         HeadlessStepDeadline::from_scheduling_timeout_ms(step_recorder.scheduling().timeout_ms);
 
@@ -209,7 +236,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         permission_context,
         progress_emitter,
         pre_resolved_results,
-        server_tool_executor,
+        runtime_tool_executor,
         turn_start,
         llm_round,
         plan_mode_active,
@@ -269,7 +296,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             permission_context,
             progress_emitter,
             effective_permission_timeout,
-            server_tool_executor,
+            runtime_tool_executor,
             turn_start,
             llm_round,
             plan_mode_active,

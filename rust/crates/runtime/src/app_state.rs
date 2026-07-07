@@ -199,7 +199,7 @@ pub struct AppState {
     pub resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
     /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
     pub edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
-    /// Shared ToolExecutionService for admin-controllable disabled_tools.
+    /// Shared ToolExecutionService for admin-controllable disabled_tool_offers.
     /// All executors share a clone of this service so admin API changes
     /// take effect immediately on in-flight sessions.
     pub tool_execution_service: ToolExecutionService,
@@ -234,6 +234,11 @@ impl AppState {
         let chat_turn_bridge_cache =
             Arc::new(tokio::sync::Mutex::new(SessionCache::new(1000, 86400.0)));
         let default_memoria = astra_core::MemoriaSettings::from_env();
+        let edge_connection_pool =
+            astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+        let tool_execution_service = ToolExecutionService::builder()
+            .edge_connection_pool(edge_connection_pool.clone())
+            .build();
         Self {
             service_info,
             health_checker,
@@ -297,9 +302,8 @@ impl AppState {
             resource_governor: std::sync::Arc::new(
                 astra_services::resource_governor::InMemoryResourceGovernor::new(),
             ),
-            edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool::new(
-            ),
-            tool_execution_service: ToolExecutionService::builder().build(),
+            edge_connection_pool,
+            tool_execution_service,
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .connect_timeout(std::time::Duration::from_secs(30))
@@ -629,6 +633,14 @@ impl AppState {
         self
     }
 
+    pub fn with_tool_execution_service(
+        mut self,
+        tool_execution_service: ToolExecutionService,
+    ) -> Self {
+        self.tool_execution_service = tool_execution_service;
+        self
+    }
+
     pub fn with_task_lease_service(
         mut self,
         task_lease_service: Arc<dyn TaskLeaseService>,
@@ -946,7 +958,13 @@ impl HealthChecker for MatrixOneHealthChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::tool_local_transport::ServerLocalToolTransport;
+    use crate::server::tool_transport::{
+        ExecutorBinding, ExecutorStatus, ToolExecutionRequest, ToolTransportKind,
+        WorkspaceAuthority, WorkspaceBinding,
+    };
     use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
 
     struct AlwaysHealthy;
 
@@ -1103,6 +1121,104 @@ mod tests {
             snapshot.lock().await.get("req-1"),
             Some(&serde_json::json!({ "status": "queued" }))
         );
+    }
+
+    struct NoopLocalTransport;
+
+    #[async_trait]
+    impl ServerLocalToolTransport for NoopLocalTransport {
+        async fn execute_server_local_tool(
+            &self,
+            request: &ToolExecutionRequest,
+            _cancel_token: Option<&CancellationToken>,
+        ) -> astra_tools::ToolResult {
+            astra_tools::ToolResult::text(format!("local:{}", request.tool_name))
+        }
+    }
+
+    fn edge_runtime_environment_advertisement(edge_agent_id: &str) -> serde_json::Value {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let binding = astra_runtime_env::RunBinding::resolve(
+            astra_runtime_env::WorkspaceBinding::edge_workspace(
+                "/Users/test/project",
+                astra_runtime_env::WorkspaceAuthority::ReadWrite,
+            ),
+            astra_runtime_env::ExecutorBinding::edge_agent(edge_agent_id.to_string()),
+            astra_runtime_env::RuntimeBinding::host_process(format!("edge-host:{edge_agent_id}")),
+            astra_runtime_env::PolicyIntent::local_developer(),
+            &registry,
+        );
+        serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            binding,
+        ))
+        .expect("edge advertisement serializes")
+    }
+
+    #[tokio::test]
+    async fn default_tool_execution_service_shares_app_edge_connection_pool() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(AlwaysHealthy));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+        state.edge_connection_pool.register_with_capabilities(
+            "user-1",
+            "edge-selected",
+            Some("MacBook Pro".to_string()),
+            Some("/Users/test/project".to_string()),
+            Some(edge_runtime_environment_advertisement("edge-selected")),
+            tx,
+        );
+
+        let service = state.tool_execution_service.clone();
+        let request = ToolExecutionRequest {
+            user_id: "user-1".to_string(),
+            run_id: "run-1".to_string(),
+            session_id: "session-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            args: serde_json::json!({"cmd": "pwd"}),
+            workspace: WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            executor: ExecutorBinding::edge_agent(
+                "edge-selected",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            workspace_record: None,
+            runtime: None,
+            selected_offer: None,
+            policy: crate::server::tool_transport::ToolPolicySnapshot::default(),
+        };
+        let handle =
+            tokio::spawn(async move { service.execute(request, &NoopLocalTransport).await });
+
+        let message = rx.recv().await.expect("edge tool request is delivered");
+        let request_id = match message {
+            astra_server_types::EdgeServerMessage::ToolRequest {
+                request_id, tool, ..
+            } => {
+                assert_eq!(tool, "bash");
+                request_id
+            }
+            other => panic!("expected edge tool request, got {other:?}"),
+        };
+        assert!(state.edge_connection_pool.deliver_tool_result(
+            "user-1",
+            "edge-selected",
+            &request_id,
+            astra_server_types::edge_connection_pool::EdgeToolResult {
+                output: "ok".to_string(),
+                is_error: false,
+                duration_ms: Some(1),
+                tool_result_fields: None,
+            },
+        ));
+
+        let result = handle.await.expect("edge execution task joins");
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.output, "ok");
     }
 
     #[test]

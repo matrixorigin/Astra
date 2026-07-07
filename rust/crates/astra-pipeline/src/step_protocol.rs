@@ -500,6 +500,18 @@ pub struct ExecutionSlot {
     pub retry_count: u32,
 }
 
+/// Known tool-call identity before dispatch starts.
+///
+/// ACT checkpoints must reflect real pending work. Persisting anonymous pending
+/// slots makes resume/projection indistinguishable from corrupted state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionSlotSpec {
+    pub tool_name: String,
+    pub call_id: String,
+    pub idempotency_key: Option<String>,
+    pub args_preview: Option<String>,
+}
+
 /// Slot state machine: Pending → Running → Completed|Failed|Skipped
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlotState {
@@ -563,6 +575,30 @@ impl ExecutionCursor {
                     state: SlotState::Pending,
                     idempotency_key: None,
                     args_preview: None,
+                    cached_result: None,
+                    retry_count: 0,
+                })
+                .collect(),
+            parallel: false,
+            wait_trigger: None,
+            sub_step: None,
+        }
+    }
+
+    /// Create an ACT cursor with all pending slots pre-bound to concrete tool calls.
+    pub fn for_act_slots(slots: Vec<ExecutionSlotSpec>) -> Self {
+        Self {
+            phase: StepAction::Act,
+            slots: slots
+                .into_iter()
+                .enumerate()
+                .map(|(i, slot)| ExecutionSlot {
+                    index: i as u32,
+                    tool_name: slot.tool_name,
+                    call_id: slot.call_id,
+                    state: SlotState::Pending,
+                    idempotency_key: slot.idempotency_key,
+                    args_preview: slot.args_preview,
                     cached_result: None,
                     retry_count: 0,
                 })

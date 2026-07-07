@@ -13,12 +13,13 @@
 //! Keeping those rules here prevents the Web picker, runtime prompt assembly,
 //! and CLI tool-surface assembly from growing separate capability policies.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
+use astra_runtime_env::CapacityProvider;
 use astra_services::skills::{SkillListCursor, SkillListRecord, SkillRecord, SkillService};
 use astra_skills::manifest::{
     ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind, TrustTier,
@@ -33,15 +34,6 @@ const REMOTE_SKILL_MAX_ROWS: u32 = 5_000;
 
 pub use astra_turn_core::tool_surface::Surface as CapabilitySurface;
 
-/// Source bucket used for deterministic tool visibility and tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ToolCapabilitySource {
-    ServerBuiltin,
-    ServerMcp,
-    ClientBuiltin,
-    ClientMcp,
-}
-
 /// Skill source buckets used by the capability policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SkillCapabilitySource {
@@ -55,78 +47,6 @@ pub enum SkillCapabilitySource {
     CliBundled,
 }
 
-#[derive(Clone, Debug)]
-pub struct ToolSchemaSource {
-    pub source: ToolCapabilitySource,
-    pub schemas: Vec<Value>,
-}
-
-impl ToolSchemaSource {
-    pub fn new(source: ToolCapabilitySource, schemas: Vec<Value>) -> Self {
-        Self { source, schemas }
-    }
-}
-
-/// Input for resolving tool schemas for one turn.
-#[derive(Clone, Debug)]
-pub struct ToolCatalogRequest {
-    pub surface: CapabilitySurface,
-    pub sources: Vec<ToolSchemaSource>,
-}
-
-impl ToolCatalogRequest {
-    pub fn new(surface: CapabilitySurface) -> Self {
-        Self {
-            surface,
-            sources: Vec::new(),
-        }
-    }
-
-    pub fn with_source(mut self, source: ToolCapabilitySource, schemas: Vec<Value>) -> Self {
-        self.sources.push(ToolSchemaSource::new(source, schemas));
-        self
-    }
-}
-
-/// Resolve visible tool schemas for an execution surface.
-///
-/// Dedupe is by function name with first source winning, which makes source
-/// precedence explicit and stable. This is not a permissive fallback: a source
-/// must be supplied by the caller to participate in resolution.
-pub fn resolve_tool_schemas(request: ToolCatalogRequest) -> Vec<Value> {
-    let allowed_sources: HashSet<ToolCapabilitySource> = match request.surface {
-        CapabilitySurface::Web | CapabilitySurface::CliRemote => [
-            ToolCapabilitySource::ServerBuiltin,
-            ToolCapabilitySource::ServerMcp,
-        ]
-        .into_iter()
-        .collect(),
-        CapabilitySurface::CliLocal => [
-            ToolCapabilitySource::ClientBuiltin,
-            ToolCapabilitySource::ClientMcp,
-        ]
-        .into_iter()
-        .collect(),
-    };
-
-    let mut seen = HashSet::new();
-    let mut resolved = Vec::new();
-    for source in request.sources {
-        if !allowed_sources.contains(&source.source) {
-            continue;
-        }
-        for schema in source.schemas {
-            let Some(name) = tool_schema_name(&schema) else {
-                continue;
-            };
-            if seen.insert(name.to_string()) {
-                resolved.push(schema);
-            }
-        }
-    }
-    resolved
-}
-
 /// Full capability set for tests that need the complete catalog. Production
 /// callers must derive capabilities from actual service wiring instead.
 pub fn full_server_capabilities_for_tests() -> astra_turn_core::capability::CapabilitySet {
@@ -135,14 +55,13 @@ pub fn full_server_capabilities_for_tests() -> astra_turn_core::capability::Capa
 
 /// Production-truth `CapabilitySet` for an agentic-run lifecycle.
 pub fn lifecycle_server_capabilities(
-    database_pool_present: bool,
+    _database_pool_present: bool,
     reflect_service_configured: bool,
 ) -> astra_turn_core::capability::CapabilitySet {
     use astra_turn_core::capability::{Capability, CapabilitySet};
     CapabilitySet::empty()
         .with(Capability::AgentSpawner)
         .with(Capability::MemoryService)
-        .with_if(database_pool_present, Capability::Database)
         .with(Capability::SkillsCatalog)
         .with(Capability::GitHubAuth)
         .with(Capability::PlanLifecycle)
@@ -159,23 +78,49 @@ pub fn server_capabilities_from(
     )
 }
 
-/// Tool schemas for Web agent / server-executed turns.
+/// Server-service/control-plane schemas declared by the server builtin provider.
 ///
-/// Capability-driven (see `astra_turn_core::tool_surface`). The catalog,
-/// the `requires` metadata, and the active server `CapabilitySet` together
-/// decide what the model sees.
-pub fn server_runtime_tool_schemas(
+/// This is the provider-owned source pool for Web / remote server execution.
+/// Workspace and process schemas are intentionally absent here; they are added
+/// only by an explicit runtime/workspace provider binding in
+/// `tool_binding_projection`.
+pub fn server_builtin_tool_schemas(
     capabilities: &astra_turn_core::capability::CapabilitySet,
 ) -> Vec<Value> {
-    let mut schemas = astra_turn_core::tool_surface::resolve(
-        CapabilitySurface::Web,
-        capabilities,
-        &astra_tools::schemas::all_tool_schemas(),
-    );
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let providers = vec![
+        astra_runtime_env::server_service_provider("server-builtin", &registry),
+        astra_runtime_env::control_plane_provider("server-control-plane", &registry),
+    ];
+    let pool = schema_pool_declared_by_providers(&providers);
+    let mut schemas =
+        astra_turn_core::tool_surface::resolve(CapabilitySurface::Web, capabilities, &pool);
     if !capabilities.has(astra_turn_core::capability::Capability::ReflectService) {
         schemas.retain(|s| tool_schema_name(s) != Some("reflect"));
     }
     retain_server_executable_schemas(&mut schemas);
+    #[cfg(unix)]
+    {
+        astra_tools::schemas::narrow_run_script_for_server(&mut schemas);
+    }
+    schemas
+}
+
+/// Runtime/workspace executor schemas that require an explicit execution
+/// provider such as edge, server sandbox, or orchestrator-managed runtime.
+pub fn runtime_executor_tool_schemas(
+    capabilities: &astra_turn_core::capability::CapabilitySet,
+) -> Vec<Value> {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let provider = astra_runtime_env::runtime_workspace_provider(
+        astra_runtime_env::CapacityProviderType::Sandbox,
+        "runtime-workspace",
+        &registry,
+        astra_runtime_env::RuntimePlatform::Unknown,
+    );
+    let pool = schema_pool_declared_by_providers(&[provider]);
+    let mut schemas =
+        astra_turn_core::tool_surface::resolve(CapabilitySurface::Web, capabilities, &pool);
     #[cfg(unix)]
     {
         astra_tools::schemas::narrow_run_script_for_server(&mut schemas);
@@ -189,18 +134,23 @@ pub fn cli_local_tool_schemas(
     client_mcp: Vec<Value>,
     capabilities: &astra_turn_core::capability::CapabilitySet,
 ) -> Vec<Value> {
-    let mut pool = client_builtin;
-    let mut seen: HashSet<String> = pool
-        .iter()
-        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
-        .collect();
-    for schema in client_mcp {
-        if let Some(name) = tool_schema_name(&schema)
-            && seen.insert(name.to_string())
-        {
-            pool.push(schema);
-        }
-    }
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let providers = vec![
+        astra_runtime_env::server_service_provider("cli-server-service", &registry),
+        astra_runtime_env::control_plane_provider("cli-control-plane", &registry),
+        astra_runtime_env::cli_local_provider("cli-local", &registry),
+    ];
+    let mut pool = client_builtin
+        .into_iter()
+        .filter(|schema| {
+            tool_schema_name(schema).is_some_and(|name| {
+                providers
+                    .iter()
+                    .any(|provider| provider.declares_tool(name))
+            })
+        })
+        .collect::<Vec<_>>();
+    pool.extend(mcp_provider_tool_schemas("cli-mcp", client_mcp));
     astra_turn_core::tool_surface::resolve(CapabilitySurface::CliLocal, capabilities, &pool)
 }
 
@@ -210,18 +160,8 @@ pub fn cli_remote_tool_schemas(
     server_mcp: Vec<Value>,
     capabilities: &astra_turn_core::capability::CapabilitySet,
 ) -> Vec<Value> {
-    let mut pool = astra_tools::schemas::all_tool_schemas();
-    let mut seen: HashSet<String> = pool
-        .iter()
-        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
-        .collect();
-    for schema in server_mcp {
-        if let Some(name) = tool_schema_name(&schema)
-            && seen.insert(name.to_string())
-        {
-            pool.push(schema);
-        }
-    }
+    let mut pool = server_builtin_tool_schemas(capabilities);
+    pool.extend(mcp_provider_tool_schemas("server-mcp", server_mcp));
     let mut schemas =
         astra_turn_core::tool_surface::resolve(CapabilitySurface::CliRemote, capabilities, &pool);
     if !capabilities.has(astra_turn_core::capability::Capability::ReflectService) {
@@ -235,8 +175,72 @@ pub fn cli_remote_tool_schemas(
     schemas
 }
 
+fn mcp_provider_tool_schemas(provider_id: &str, schemas: Vec<Value>) -> Vec<Value> {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let provider = astra_runtime_env::mcp_provider_from_schemas(provider_id, schemas.as_slice());
+    astra_runtime_env::CapabilityResolver.filter_tool_schemas_for_providers(
+        &registry,
+        schemas,
+        &mcp_provider_capabilities(),
+        &[provider],
+    )
+}
+
+fn mcp_provider_capabilities() -> astra_runtime_env::EffectiveCapabilitySet {
+    astra_runtime_env::EffectiveCapabilitySet {
+        workspace: astra_runtime_env::WorkspaceCapabilities {
+            present: false,
+            readable: false,
+            writable: false,
+            persistent: false,
+        },
+        executor: astra_runtime_env::ExecutorCapabilities {
+            reachable: true,
+            control_plane: false,
+            server_service: false,
+            runtime_executor: false,
+            mcp_executor: true,
+        },
+        runtime: astra_runtime_env::RuntimeCapabilities {
+            runtime_has_process: false,
+            runtime_has_shell: false,
+            runtime_has_git: false,
+            runtime_has_lsp: false,
+            runtime_has_network: false,
+            runtime_has_credentials: false,
+        },
+        policy: astra_runtime_env::PolicyCapabilities {
+            filesystem_read: false,
+            filesystem_write: false,
+            network: astra_runtime_env::NetworkCapability::AllowList,
+            credentials: false,
+            approvals_required: false,
+            audit_required: true,
+        },
+    }
+}
+
 fn retain_server_executable_schemas(schemas: &mut Vec<Value>) {
     schemas.retain(|schema| !matches!(tool_schema_name(schema), Some("lsp" | "powershell")));
+}
+
+fn schema_pool_declared_by_providers(
+    providers: &[astra_runtime_env::CapacityProviderDeclaration],
+) -> Vec<Value> {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    astra_tools::schemas::all_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            tool_schema_name(schema).is_some_and(|name| {
+                registry
+                    .get(name)
+                    .is_some_and(|spec| spec.load_policy.is_public_schema_policy())
+                    && providers
+                        .iter()
+                        .any(|provider| provider.declares_tool(name))
+            })
+        })
+        .collect()
 }
 
 /// Return the skill source policy for a surface.
@@ -523,74 +527,110 @@ mod tests {
             .collect()
     }
 
-    // ── tool surface routing ──
+    fn contains_object_key(value: &Value, needle: &str) -> bool {
+        match value {
+            Value::Object(map) => {
+                map.contains_key(needle)
+                    || map.values().any(|child| contains_object_key(child, needle))
+            }
+            Value::Array(items) => items.iter().any(|child| contains_object_key(child, needle)),
+            _ => false,
+        }
+    }
+
+    // ── remote/server tool schema assembly ──
 
     #[test]
-    fn tool_surface_routing() {
-        let sources = vec![
-            ToolSchemaSource::new(ToolCapabilitySource::ServerBuiltin, vec![schema("server")]),
-            ToolSchemaSource::new(ToolCapabilitySource::ServerMcp, vec![schema("server_mcp")]),
-            ToolSchemaSource::new(ToolCapabilitySource::ClientBuiltin, vec![schema("client")]),
-            ToolSchemaSource::new(ToolCapabilitySource::ClientMcp, vec![schema("client_mcp")]),
-        ];
-
-        // Web / remote CLI: server-only tools
-        let web = names(resolve_tool_schemas(ToolCatalogRequest {
-            surface: CapabilitySurface::Web,
-            sources: sources.clone(),
-        }));
-        let remote_names = names(resolve_tool_schemas(ToolCatalogRequest {
-            surface: CapabilitySurface::CliRemote,
-            sources,
-        }));
-        assert_eq!(
-            web,
-            vec!["server", "server_mcp"],
-            "web must expose only server tools"
-        );
-        assert_eq!(remote_names, web, "remote CLI must match web");
-
-        // Local CLI: client-only tools
-        let local = names(resolve_tool_schemas(
-            ToolCatalogRequest::new(CapabilitySurface::CliLocal)
-                .with_source(ToolCapabilitySource::ServerBuiltin, vec![schema("server")])
-                .with_source(ToolCapabilitySource::ClientBuiltin, vec![schema("client")])
-                .with_source(ToolCapabilitySource::ClientMcp, vec![schema("client_mcp")]),
+    fn cli_remote_catalog_uses_server_builtin_and_namespaced_server_mcp_only() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names = names(cli_remote_tool_schemas(
+            vec![
+                schema("mcp__server_docs__query"),
+                schema("mcp__"),
+                schema("mcp__bad/name"),
+                schema("read_file"),
+                schema("powershell"),
+                json!({"type": "custom", "function": {"name": "mcp__custom__bad"}}),
+            ],
+            &caps,
         ));
-        assert_eq!(
-            local,
-            vec!["client", "client_mcp"],
-            "local CLI must use client tools only"
+
+        assert!(tool_names.contains(&"tool_search".to_string()));
+        assert!(tool_names.contains(&"memory".to_string()));
+        assert!(tool_names.contains(&"mcp__server_docs__query".to_string()));
+        for hidden in [
+            "read_file",
+            "powershell",
+            "mcp__custom__bad",
+            "mcp__",
+            "mcp__bad/name",
+        ] {
+            assert!(
+                !tool_names.contains(&hidden.to_string()),
+                "{hidden} must not enter remote CLI server-executed schema surface: {tool_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_remote_catalog_fails_closed_for_conflicting_server_mcp_schema() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names = names(cli_remote_tool_schemas(
+            vec![
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__docs__query",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string" }
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__docs__query",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "q": { "type": "string" }
+                            }
+                        }
+                    }
+                }),
+            ],
+            &caps,
+        ));
+
+        assert!(
+            !tool_names.contains(&"mcp__docs__query".to_string()),
+            "conflicting remote MCP schemas must be hidden instead of first-wins"
         );
     }
 
     #[test]
-    fn tool_dedupe_keeps_first_source() {
-        let resolved = resolve_tool_schemas(
-            ToolCatalogRequest::new(CapabilitySurface::CliLocal)
-                .with_source(ToolCapabilitySource::ClientBuiltin, vec![schema("shared")])
-                .with_source(ToolCapabilitySource::ClientMcp, vec![schema("shared")]),
-        );
-
-        assert_eq!(names(resolved), vec!["shared".to_string()]);
-    }
-
-    #[test]
-    fn tool_surface_rejects_custom_type_but_accepts_missing_type_function_shorthand() {
-        let resolved =
-            resolve_tool_schemas(ToolCatalogRequest::new(CapabilitySurface::Web).with_source(
-                ToolCapabilitySource::ServerBuiltin,
-                vec![
-                    schema("server"),
-                    json!({"type": "custom", "function": {"name": "custom_shape"}}),
-                    json!({"function": {"name": "missing_type"}}),
-                ],
-            ));
+    fn mcp_schema_pool_requires_provider_admitted_function_schema() {
+        let tool_names = names(mcp_provider_tool_schemas(
+            "cli-mcp",
+            vec![
+                schema("mcp__zeta__query"),
+                schema("custom_plugin_tool"),
+                schema("mcp__bad/name"),
+                json!({"type": "custom", "function": {"name": "mcp__custom__bad"}}),
+                schema("mcp__alpha__query"),
+            ],
+        ));
 
         assert_eq!(
-            names(resolved),
-            vec!["server".to_string(), "missing_type".to_string()],
-            "surface resolution must reject explicit non-function schemas while accepting function shorthand without a redundant top-level type"
+            tool_names,
+            vec![
+                "mcp__alpha__query".to_string(),
+                "mcp__zeta__query".to_string()
+            ],
+            "MCP schemas must be admitted as provider offers, fail closed for invalid/non-MCP schemas, and keep stable prompt order"
         );
     }
 
@@ -621,16 +661,16 @@ mod tests {
         );
     }
 
-    // ── surface-routed lifecycle tools ──
+    // ── surface-routed backbone and local process tools ──
 
     #[test]
-    fn surface_routed_lifecycle_tools() {
+    fn surface_routed_backbone_and_local_process_tools() {
         use astra_turn_core::capability::{Capability, CapabilitySet};
         use astra_turn_core::tool_surface::{Surface, resolve};
 
         let pool = astra_tools::schemas::all_tool_schemas();
 
-        // ── Plan lifecycle: server-only ──
+        // ── Plan lifecycle: server-owned in web/remote execution ──
         let base_caps = CapabilitySet::empty()
             .with(Capability::AgentSpawner)
             .with(Capability::MemoryService)
@@ -646,7 +686,7 @@ mod tests {
 
         assert!(
             !local_plan.contains(&"enter_plan_mode".to_string()),
-            "plan lifecycle tools are server-only"
+            "this capability pass models server-owned plan lifecycle; CLI local plan mode is injected by the CLI adapter"
         );
         assert!(
             web_plan.contains(&"enter_plan_mode".to_string()),
@@ -657,7 +697,6 @@ mod tests {
             "remote CLI plan visibility must match web"
         );
 
-        // ── Background task tools: local-only ──
         let server_caps = lifecycle_server_capabilities(true, true);
         let local_caps = CapabilitySet::empty()
             .with(Capability::MemoryService)
@@ -665,6 +704,25 @@ mod tests {
             .with(Capability::PlanLifecycle)
             .with(Capability::LocalBackgroundTasks);
 
+        // ── Durable task board: runtime backbone, not CLI-local ──
+        for (surface, names) in [
+            ("web", names(resolve(Surface::Web, &server_caps, &pool))),
+            (
+                "remote CLI",
+                names(resolve(Surface::CliRemote, &server_caps, &pool)),
+            ),
+            (
+                "local CLI",
+                names(resolve(Surface::CliLocal, &local_caps, &pool)),
+            ),
+        ] {
+            assert!(
+                names.contains(&"task_board".to_string()),
+                "{surface} must expose the durable task-board backbone: {names:?}"
+            );
+        }
+
+        // ── Typed background process tools: local executor only ──
         let web_bg = names(resolve(Surface::Web, &server_caps, &pool));
         let remote_bg = names(resolve(Surface::CliRemote, &server_caps, &pool));
         let local_bg = names(resolve(Surface::CliLocal, &local_caps, &pool));
@@ -692,7 +750,7 @@ mod tests {
     #[test]
     fn server_executed_tool_descriptions_do_not_reference_unavailable_job_tool() {
         let caps = lifecycle_server_capabilities(true, true);
-        let server_tools = server_runtime_tool_schemas(&caps);
+        let server_tools = server_builtin_tool_schemas(&caps);
         let remote_tools = cli_remote_tool_schemas(Vec::new(), &caps);
 
         for (surface, schemas) in [("web", server_tools), ("remote", remote_tools)] {
@@ -717,9 +775,306 @@ mod tests {
     }
 
     #[test]
+    fn server_builtin_schema_pool_is_provider_declared_only() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names: std::collections::BTreeSet<String> =
+            names(server_builtin_tool_schemas(&caps))
+                .into_iter()
+                .collect();
+
+        for visible in [
+            "ask_user",
+            "agent",
+            "task_board",
+            "session",
+            "tool_search",
+            "web_fetch",
+            "memory",
+        ] {
+            assert!(
+                tool_names.contains(visible),
+                "{visible} should be declared by the server builtin provider"
+            );
+        }
+        for hidden in [
+            "bash",
+            "read_file",
+            "write_file",
+            "str_replace",
+            "git",
+            "run_script",
+            "symbols",
+            "delete_file",
+            "multi_edit",
+            "background_shell",
+            "git_clone",
+            "find_definition",
+            "find_references",
+            "task_output",
+            "task_stop",
+            "task_list",
+        ] {
+            assert!(
+                !tool_names.contains(hidden),
+                "{hidden} must require an explicit runtime/workspace provider"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_executor_schema_pool_is_not_server_builtin_capacity() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names: std::collections::BTreeSet<String> =
+            names(runtime_executor_tool_schemas(&caps))
+                .into_iter()
+                .collect();
+
+        for visible in [
+            "bash",
+            "web_fetch",
+            "web_search",
+            "read_file",
+            "write_file",
+            "git",
+            "run_script",
+            "lsp",
+        ] {
+            assert!(
+                tool_names.contains(visible),
+                "{visible} should be available to explicit runtime/workspace providers"
+            );
+        }
+        for hidden in ["powershell", "display_sixel"] {
+            assert!(
+                !tool_names.contains(hidden),
+                "{hidden} requires an explicit terminal/platform-local provider, not the generic server runtime provider pool"
+            );
+        }
+        for server_owned in ["ask_user", "agent", "tool_search", "memory"] {
+            assert!(
+                !tool_names.contains(server_owned),
+                "{server_owned} must stay in the server builtin provider pool"
+            );
+        }
+        for internal in [
+            "delete_file",
+            "multi_edit",
+            "background_shell",
+            "git_clone",
+            "find_definition",
+            "find_references",
+        ] {
+            assert!(
+                !tool_names.contains(internal),
+                "{internal} is an internal execution helper and must not enter model schema pools"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_local_catalog_filters_builtin_source_by_provider_ownership() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names = names(cli_local_tool_schemas(
+            vec![
+                schema("read_file"),
+                schema("bash"),
+                schema("memory"),
+                schema("ask_user"),
+                schema("custom_local_builtin"),
+            ],
+            vec![
+                schema("mcp__local__query"),
+                schema("mcp__"),
+                schema("mcp__bad/name"),
+            ],
+            &caps,
+        ));
+
+        for expected in [
+            "read_file",
+            "bash",
+            "memory",
+            "ask_user",
+            "mcp__local__query",
+        ] {
+            assert!(
+                tool_names.contains(&expected.to_string()),
+                "{expected} should remain visible in local CLI catalog: {tool_names:?}"
+            );
+        }
+        assert!(
+            !tool_names.contains(&"custom_local_builtin".to_string()),
+            "client builtin schemas must still be declared by a CLI/server provider"
+        );
+        for invalid in ["mcp__", "mcp__bad/name"] {
+            assert!(
+                !tool_names.contains(&invalid.to_string()),
+                "invalid MCP schema name {invalid:?} must not enter local CLI catalog: {tool_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_local_catalog_fails_closed_for_conflicting_mcp_schemas() {
+        let caps = full_server_capabilities_for_tests();
+        let tool_names = names(cli_local_tool_schemas(
+            vec![schema("read_file")],
+            vec![
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__docs__query",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string" }
+                            }
+                        }
+                    }
+                }),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__docs__query",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "q": { "type": "string" }
+                            }
+                        }
+                    }
+                }),
+            ],
+            &caps,
+        ));
+
+        assert!(tool_names.contains(&"read_file".to_string()));
+        assert!(
+            !tool_names.contains(&"mcp__docs__query".to_string()),
+            "conflicting MCP offers must be hidden instead of first-wins"
+        );
+    }
+
+    #[test]
+    fn cli_local_catalog_is_byte_stable_for_identical_inputs() {
+        let caps = full_server_capabilities_for_tests();
+        let client_mcp = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__docs__query",
+                    "description": "Query local docs.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__tickets__search",
+                    "description": "Search local tickets.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "q": { "type": "string" }
+                        },
+                        "required": ["q"]
+                    }
+                }
+            }),
+        ];
+
+        let first = cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            client_mcp.clone(),
+            &caps,
+        );
+        let second =
+            cli_local_tool_schemas(astra_tools::schemas::all_tool_schemas(), client_mcp, &caps);
+
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first tool schema list"),
+            serde_json::to_vec(&second).expect("serialize second tool schema list"),
+            "CLI local tool schema list must be byte-stable for identical provider inputs"
+        );
+    }
+
+    #[test]
+    fn cli_local_catalog_is_byte_stable_for_permuted_mcp_inputs() {
+        let caps = full_server_capabilities_for_tests();
+        let alpha = schema("mcp__alpha__query");
+        let zeta = schema("mcp__zeta__query");
+
+        let first = cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            vec![zeta.clone(), alpha.clone()],
+            &caps,
+        );
+        let second = cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            vec![alpha, zeta],
+            &caps,
+        );
+
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first tool schema list"),
+            serde_json::to_vec(&second).expect("serialize second tool schema list"),
+            "CLI local prompt schemas must not depend on MCP list_tools order"
+        );
+    }
+
+    #[test]
+    fn cli_remote_catalog_is_byte_stable_for_permuted_mcp_inputs() {
+        let caps = full_server_capabilities_for_tests();
+        let alpha = schema("mcp__server_alpha__query");
+        let zeta = schema("mcp__server_zeta__query");
+
+        let first = cli_remote_tool_schemas(vec![zeta.clone(), alpha.clone()], &caps);
+        let second = cli_remote_tool_schemas(vec![alpha, zeta], &caps);
+
+        assert_eq!(
+            serde_json::to_vec(&first).expect("serialize first tool schema list"),
+            serde_json::to_vec(&second).expect("serialize second tool schema list"),
+            "CLI remote prompt schemas must not depend on MCP list_tools order"
+        );
+    }
+
+    #[test]
+    fn cli_local_prompt_schemas_do_not_embed_provider_or_route_metadata() {
+        let caps = full_server_capabilities_for_tests();
+        let schemas = cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            vec![schema("mcp__docs__query")],
+            &caps,
+        );
+
+        for forbidden_key in [
+            "provider_id",
+            "provider_type",
+            "capacity_provider",
+            "offer_id",
+            "selected_offer",
+            "selected_route",
+            "executor_id",
+        ] {
+            assert!(
+                !schemas
+                    .iter()
+                    .any(|schema| contains_object_key(schema, forbidden_key)),
+                "provider/executor routing metadata key `{forbidden_key}` must not enter prompt-visible tool schemas"
+            );
+        }
+    }
+
+    #[test]
     fn server_executed_surfaces_hide_client_only_runtime_tools() {
         let caps = full_server_capabilities_for_tests();
-        let web = names(server_runtime_tool_schemas(&caps));
+        let web = names(server_builtin_tool_schemas(&caps));
         let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
         let local = names(cli_local_tool_schemas(
             astra_tools::schemas::all_tool_schemas(),
@@ -736,17 +1091,21 @@ mod tests {
                 !remote.contains(&tool.to_string()),
                 "remote CLI executes on the server and must not advertise client-only tool {tool}: {remote:?}"
             );
-            assert!(
-                local.contains(&tool.to_string()),
-                "local CLI should retain client-owned tool {tool}"
-            );
         }
+        assert!(
+            local.contains(&"lsp".to_string()),
+            "local CLI should retain client-owned LSP tools"
+        );
+        assert!(
+            !local.contains(&"powershell".to_string()),
+            "powershell requires an explicit Windows provider/platform fact, not the default local catalog: {local:?}"
+        );
     }
 
     #[test]
     fn server_executed_surfaces_advertise_server_reflect_tool() {
         let caps = full_server_capabilities_for_tests();
-        let web = names(server_runtime_tool_schemas(&caps));
+        let web = names(server_builtin_tool_schemas(&caps));
         let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
         let local = names(cli_local_tool_schemas(
             astra_tools::schemas::all_tool_schemas(),
@@ -769,7 +1128,7 @@ mod tests {
     #[test]
     fn server_executed_surfaces_hide_reflect_without_reflect_service_capability() {
         let caps = lifecycle_server_capabilities(true, false);
-        let web = names(server_runtime_tool_schemas(&caps));
+        let web = names(server_builtin_tool_schemas(&caps));
         let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
 
         for (surface, names) in [("web", web), ("remote", remote)] {
@@ -791,14 +1150,17 @@ mod tests {
             "server lifecycle must include AgentSpawner"
         );
 
-        // Database is gated on pool availability
+        // A database pool is an internal runtime dependency, not a default
+        // model-facing SQL capability. SQL/debug tools need an explicit
+        // admin/debug provider or policy gate instead of appearing in ordinary
+        // web/server agent surfaces.
         assert!(!lifecycle_server_capabilities(false, true).has(Capability::Database));
-        assert!(caps.has(Capability::Database));
+        assert!(!caps.has(Capability::Database));
         assert!(!lifecycle_server_capabilities(true, false).has(Capability::ReflectService));
         assert!(caps.has(Capability::ReflectService));
 
         // Web resolve with lifecycle caps advertises agent tool
-        let tool_names = names(server_runtime_tool_schemas(&caps));
+        let tool_names = names(server_builtin_tool_schemas(&caps));
         assert!(
             tool_names.contains(&"agent".to_string()),
             "production lifecycle must advertise agent tool"

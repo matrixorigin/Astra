@@ -1947,7 +1947,7 @@ async fn execute_cli_command_impl(
                 astra_harness::SessionTrace::new(None),
             ));
             // Wire the MO-backed task store for `astra chat -m` single-shot
-            // runs so unified `task(action=...)` calls in this path write
+            // runs so unified `task_board(action=...)` calls in this path write
             // through to `session_todos`. Without this the tool runs against
             // a throwaway in-memory manager and the Tier 1 board is invisible
             // across edge/cloud boundaries.
@@ -2656,7 +2656,7 @@ pub(crate) async fn run_print_mode(
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
     // Print mode wires an MO-backed TaskManager when available so that the
-    // `task` tool's writes land in `session_todos` the same way the REPL
+    // `task_board` tool's writes land in `session_todos` the same way the REPL
     // path handles them. Without this, single-shot runs silently drop to
     // in-memory scratchpad and the Tier 1 board is invisible across turns
     // that reuse the same `session_id`.
@@ -3582,6 +3582,7 @@ mod one_shot_persistence_tests {
             final_state: "completed".into(),
             interruption_kind: None,
             final_messages: Vec::new(),
+            deferred_user_inputs: Vec::new(),
             background_agent_results: Vec::new(),
         };
 
@@ -3695,6 +3696,7 @@ mod one_shot_persistence_tests {
             final_state: "completed".into(),
             interruption_kind: None,
             final_messages: Vec::new(),
+            deferred_user_inputs: Vec::new(),
             background_agent_results: Vec::new(),
         };
 

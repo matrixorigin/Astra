@@ -16,7 +16,7 @@
 //! runtime tool surface without silently dropping otherwise valid function
 //! schemas from provider or edge surfaces that omit the redundant type field.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -55,6 +55,76 @@ pub fn tool_names_from_schemas(schemas: &[Value]) -> HashSet<String> {
 pub fn retain_tool_schemas_by_names(schemas: &mut Vec<Value>, allowed_names: &HashSet<String>) {
     schemas
         .retain(|schema| tool_schema_name(schema).is_some_and(|name| allowed_names.contains(name)));
+}
+
+/// Sort prompt-visible function schemas by canonical tool name.
+///
+/// This is stable for equal names: if equivalent duplicate schemas share a
+/// name, the caller's first schema stays first so dedupe keeps the same bytes.
+/// Provider/executor metadata must not be part of this sort key because that
+/// would churn prompt-cache bytes.
+pub fn sort_tool_schemas_by_name(schemas: &mut [Value]) {
+    schemas.sort_by(
+        |left, right| match (tool_schema_name(left), tool_schema_name(right)) {
+            (Some(left), Some(right)) => left.cmp(right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        },
+    );
+}
+
+/// Return tool names whose prompt-visible schemas contain conflicting
+/// contracts.
+///
+/// Missing top-level `type` is normalized to `"function"` when the schema has
+/// a `function` object, matching [`tool_schema_name`]. Equivalent shorthand and
+/// explicit function schemas therefore dedupe without prompt churn, while
+/// materially different argument schemas fail closed in callers.
+#[must_use]
+pub fn prompt_schema_conflicting_tool_names(schemas: &[Value]) -> HashSet<String> {
+    let mut schemas_by_tool: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
+    for schema in schemas {
+        let Some(tool_name) = tool_schema_name(schema) else {
+            continue;
+        };
+        schemas_by_tool
+            .entry(tool_name.to_string())
+            .or_default()
+            .insert(prompt_tool_schema_canonical_bytes(schema));
+    }
+    schemas_by_tool
+        .into_iter()
+        .filter_map(|(tool_name, schemas)| (schemas.len() > 1).then_some(tool_name))
+        .collect()
+}
+
+fn prompt_tool_schema_canonical_bytes(schema: &Value) -> Vec<u8> {
+    let mut normalized = schema.clone();
+    if let Value::Object(map) = &mut normalized
+        && !map.contains_key("type")
+        && map.contains_key("function")
+    {
+        map.insert("type".to_string(), Value::String("function".to_string()));
+    }
+    let canonical = canonical_json_value(&normalized);
+    serde_json::to_vec(&canonical).expect("canonical tool schema JSON must serialize")
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json_value).collect()),
+        Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json_value(&map[key]));
+            }
+            Value::Object(sorted)
+        }
+        other => other.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -164,5 +234,59 @@ mod tests {
             schemas.is_empty(),
             "empty search surface must not leak global schemas"
         );
+    }
+
+    #[test]
+    fn sort_tool_schemas_by_name_is_stable_for_equal_names() {
+        let shorthand = json!({"function": {"name": "mcp__docs__query"}});
+        let explicit = json!({"type": "function", "function": {"name": "mcp__docs__query"}});
+        let weather = json!({"type": "function", "function": {"name": "mcp__weather__query"}});
+        let mut schemas = vec![weather.clone(), shorthand.clone(), explicit.clone()];
+
+        sort_tool_schemas_by_name(&mut schemas);
+
+        assert_eq!(schemas, vec![shorthand, explicit, weather]);
+    }
+
+    #[test]
+    fn prompt_schema_conflicts_ignore_equivalent_function_shorthand() {
+        let conflicts = prompt_schema_conflicting_tool_names(&[
+            json!({"function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "bash"}}),
+        ]);
+
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn prompt_schema_conflicts_detect_same_name_different_contract() {
+        let conflicts = prompt_schema_conflicting_tool_names(&[
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "script": { "type": "string" }
+                        }
+                    }
+                }
+            }),
+        ]);
+
+        assert_eq!(conflicts, HashSet::from(["bash".to_string()]));
     }
 }

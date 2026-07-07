@@ -44,6 +44,8 @@
     "@floating-ui/core": "1.7.5",
     "@floating-ui/dom": "1.7.5",
     "@floating-ui/react-dom": "2.1.7",
+    "js-yaml": "4.3.0",
+    "undici": "7.28.0",
     "postcss": "^8.5.15"
   },
   "devDependencies": {

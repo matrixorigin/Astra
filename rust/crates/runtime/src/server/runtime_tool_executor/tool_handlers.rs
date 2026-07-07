@@ -6,11 +6,12 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use astra_tools::ToolExecutor;
+use astra_tools::executor::SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES;
 use astra_tools::tool_engine::{
     DynamicToolHandler, NotifyToolHandler, ToolEngine, ToolHandler, WebSearchToolHandler,
 };
 
-use super::ServerToolExecutor;
+use super::RuntimeToolExecutor;
 use crate::server::tool_agent_info::{AgentInfoIdentity, render_agent_info};
 use crate::server::tool_agent_runtime::{execute_agent_fanout_tool, execute_agent_tool};
 use crate::server::tool_database_snapshots::{execute_mo_query, rollback_database_snapshots};
@@ -30,7 +31,7 @@ use crate::server::tool_session_state_rollback::{
 /// Register a tool handler and log an error on failure (duplicate name).
 ///
 /// Eliminates ~200 lines of repetitive `if let Err(error)` + `tracing::error!`
-/// boilerplate in [`server_tool_engine`].
+/// boilerplate in [`runtime_tool_engine`].
 macro_rules! register_handler_or_log {
     ($engine:expr, $name:expr, $handler:expr) => {
         if let Err(error) = $engine.register_handler($name, $handler) {
@@ -44,38 +45,25 @@ macro_rules! register_handler_or_log {
     };
 }
 
-pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
+pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     let mut engine = ToolEngine::new();
 
     register_handler_or_log!(engine, "notify", NotifyToolHandler);
     register_handler_or_log!(engine, "web_search", WebSearchToolHandler);
 
-    for name in [
-        "web_fetch",
-        "read_file",
-        "list_dir",
-        "grep",
-        "glob",
-        "symbols",
-    ] {
-        register_handler_or_log!(engine, name, DefaultExecutorToolHandler { name });
+    for name in SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES {
+        register_handler_or_log!(engine, *name, DefaultExecutorToolHandler { name });
     }
 
     register_handler_or_log!(engine, "write_file", WriteFileToolHandler);
     register_handler_or_log!(engine, "str_replace", StrReplaceToolHandler);
     register_handler_or_log!(engine, "rollback_file_edits", RollbackFileEditsToolHandler);
     register_handler_or_log!(engine, "bash", BashToolHandler);
-    register_handler_or_log!(engine, "git", DefaultExecutorToolHandler { name: "git" });
-    register_handler_or_log!(
-        engine,
-        "github",
-        DefaultExecutorToolHandler { name: "github" }
-    );
     register_handler_or_log!(engine, "get_agent_info", GetAgentInfoToolHandler);
     register_handler_or_log!(engine, "tool_search", ToolSearchToolHandler);
     register_handler_or_log!(engine, "memory", MemoryToolHandler);
     register_handler_or_log!(engine, "session", SessionToolHandler);
-    register_handler_or_log!(engine, "task", TaskToolHandler);
+    register_handler_or_log!(engine, "task_board", TaskBoardToolHandler);
     register_handler_or_log!(engine, "agent", AgentToolHandler);
     register_handler_or_log!(engine, "agent_fanout", AgentFanoutToolHandler);
     register_handler_or_log!(engine, "ask_user", AskUserToolHandler);
@@ -98,7 +86,11 @@ pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
     register_handler_or_log!(engine, "publish_artifact", PublishArtifactToolHandler);
     register_handler_or_log!(engine, "run_script", RunScriptToolHandler);
 
-    if let Err(error) = engine.register_prefix_handler("mcp__", McpToolHandler) {
+    if let Err(error) = engine.register_prefix_handler_with_validator(
+        "mcp__",
+        astra_core::tool_offer::is_mcp_namespaced_tool_name,
+        McpToolHandler,
+    ) {
         tracing::error!(
             target: "astra_runtime::tool_engine",
             error = %error,
@@ -113,10 +105,10 @@ pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
 struct GetAgentInfoToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for GetAgentInfoToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for GetAgentInfoToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -141,10 +133,10 @@ impl ToolHandler<ServerToolExecutor> for GetAgentInfoToolHandler {
 struct ToolSearchToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for ToolSearchToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for ToolSearchToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -157,10 +149,10 @@ impl ToolHandler<ServerToolExecutor> for ToolSearchToolHandler {
 struct MemoryToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for MemoryToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -170,10 +162,11 @@ impl ToolHandler<ServerToolExecutor> for MemoryToolHandler {
                 "Memory tool not executed: run was cancelled".to_string(),
             );
         }
-        let Some(op) = args.get("action").and_then(Value::as_str) else {
-            return astra_tools::ToolResult::error(
-                "Error: missing required parameter `action`. Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string(),
-            );
+        let action = match astra_tools::memory_tool_contract::memory_action_from_args(args) {
+            Ok(action) => action,
+            Err(error) => {
+                return astra_tools::ToolResult::error(format!("Error: {error}"));
+            }
         };
         let isolated_args = memory_args_with_context(
             args,
@@ -181,7 +174,10 @@ impl ToolHandler<ServerToolExecutor> for MemoryToolHandler {
             &context.user_id,
             context.journal_turn_index.load(Ordering::Relaxed),
         );
-        let output = context.memoria_client.call(op, &isolated_args).await;
+        let output = context
+            .memoria_client
+            .call(action.as_str(), &isolated_args)
+            .await;
         if output.starts_with("Error") {
             astra_tools::ToolResult::error(output)
         } else {
@@ -194,10 +190,10 @@ impl ToolHandler<ServerToolExecutor> for MemoryToolHandler {
 struct SessionToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for SessionToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for SessionToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -212,13 +208,13 @@ impl ToolHandler<ServerToolExecutor> for SessionToolHandler {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct TaskToolHandler;
+struct TaskBoardToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for TaskToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for TaskBoardToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -236,10 +232,10 @@ impl ToolHandler<ServerToolExecutor> for TaskToolHandler {
 struct AgentToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for AgentToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for AgentToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -262,10 +258,10 @@ impl ToolHandler<ServerToolExecutor> for AgentToolHandler {
 struct AgentFanoutToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for AgentFanoutToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for AgentFanoutToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -283,10 +279,10 @@ impl ToolHandler<ServerToolExecutor> for AgentFanoutToolHandler {
 struct AskUserToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for AskUserToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for AskUserToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -304,10 +300,10 @@ impl ToolHandler<ServerToolExecutor> for AskUserToolHandler {
 struct EnterPlanModeToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for EnterPlanModeToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for EnterPlanModeToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -324,6 +320,7 @@ impl ToolHandler<ServerToolExecutor> for EnterPlanModeToolHandler {
                 &context.user_id,
                 context.plan_mode_cache.as_ref(),
                 context.plan_resume_hint_handle.as_ref(),
+                context.plan_authoring_active_handle.as_ref(),
                 args,
             )
             .await,
@@ -335,10 +332,10 @@ impl ToolHandler<ServerToolExecutor> for EnterPlanModeToolHandler {
 struct ExitPlanModeToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for ExitPlanModeToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for ExitPlanModeToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -355,6 +352,7 @@ impl ToolHandler<ServerToolExecutor> for ExitPlanModeToolHandler {
                 &context.session_id,
                 context.plan_mode_cache.as_ref(),
                 context.plan_resume_hint_handle.as_ref(),
+                context.plan_authoring_active_handle.as_ref(),
                 args,
             )
             .await,
@@ -366,10 +364,10 @@ impl ToolHandler<ServerToolExecutor> for ExitPlanModeToolHandler {
 struct IntrospectToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for IntrospectToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -386,10 +384,10 @@ impl ToolHandler<ServerToolExecutor> for IntrospectToolHandler {
 struct ReflectToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for ReflectToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for ReflectToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -433,12 +431,15 @@ impl ToolHandler<ServerToolExecutor> for ReflectToolHandler {
             .build_evidence(&context.user_id, &context.session_id, request.clone())
             .await
         {
-            Ok(report) => match serde_json::to_string(&report) {
-                Ok(output) => astra_tools::ToolResult::text(output),
-                Err(error) => astra_tools::ToolResult::error(format!(
-                    "Error: failed to encode reflect report: {error}"
-                )),
-            },
+            Ok(mut report) => {
+                inject_runtime_provider_coverage(&mut report, context.capacity_provider_coverage());
+                match serde_json::to_string(&report) {
+                    Ok(output) => astra_tools::ToolResult::text(output),
+                    Err(error) => astra_tools::ToolResult::error(format!(
+                        "Error: failed to encode reflect report: {error}"
+                    )),
+                }
+            }
             Err((_status, axum::Json(body))) => {
                 // Fall back to local snapshot-based reflect when the cloud
                 // service is unavailable and the source policy allows local data.
@@ -484,6 +485,25 @@ impl ToolHandler<ServerToolExecutor> for ReflectToolHandler {
     }
 }
 
+fn inject_runtime_provider_coverage(
+    report: &mut astra_services::ReflectReport,
+    coverage: Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry>,
+) {
+    for provider in coverage {
+        report.data_coverage.providers.insert(
+            format!("runtime_provider:{}", provider.provider_type.as_str()),
+            astra_core::ObservationProviderCoverage {
+                status: provider.status.as_str().to_string(),
+                freshness_ms: None,
+                reason: provider.unavailable_reason.clone(),
+            },
+        );
+    }
+    if let Some(view) = report.view.as_mut() {
+        view.data_coverage = report.data_coverage.clone();
+    }
+}
+
 fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
@@ -497,10 +517,10 @@ struct DefaultExecutorToolHandler {
 }
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for DefaultExecutorToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for DefaultExecutorToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -519,10 +539,10 @@ impl ToolHandler<ServerToolExecutor> for DefaultExecutorToolHandler {
 struct WriteFileToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for WriteFileToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for WriteFileToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -559,10 +579,10 @@ impl ToolHandler<ServerToolExecutor> for WriteFileToolHandler {
 struct StrReplaceToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for StrReplaceToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for StrReplaceToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -603,10 +623,10 @@ impl ToolHandler<ServerToolExecutor> for StrReplaceToolHandler {
 struct RollbackFileEditsToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for RollbackFileEditsToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for RollbackFileEditsToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -628,10 +648,10 @@ impl ToolHandler<ServerToolExecutor> for RollbackFileEditsToolHandler {
 struct BashToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for BashToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for BashToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -649,10 +669,10 @@ impl ToolHandler<ServerToolExecutor> for BashToolHandler {
 struct CompressContextToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for CompressContextToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for CompressContextToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -664,10 +684,10 @@ impl ToolHandler<ServerToolExecutor> for CompressContextToolHandler {
 struct RollbackSessionStateToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for RollbackSessionStateToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for RollbackSessionStateToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -689,7 +709,10 @@ impl ToolHandler<ServerToolExecutor> for RollbackSessionStateToolHandler {
                     },
                 },
                 args,
-                || context.publish_current_workspace("server_tool_executor:rollback_session_state"),
+                || {
+                    context
+                        .publish_current_workspace("runtime_tool_executor:rollback_session_state")
+                },
             )
             .await,
         )
@@ -700,10 +723,10 @@ impl ToolHandler<ServerToolExecutor> for RollbackSessionStateToolHandler {
 struct MoQueryToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for MoQueryToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for MoQueryToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -725,10 +748,10 @@ impl ToolHandler<ServerToolExecutor> for MoQueryToolHandler {
 struct RollbackDatabaseSnapshotsToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for RollbackDatabaseSnapshotsToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for RollbackDatabaseSnapshotsToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -744,10 +767,10 @@ impl ToolHandler<ServerToolExecutor> for RollbackDatabaseSnapshotsToolHandler {
 struct PublishArtifactToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for PublishArtifactToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for PublishArtifactToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -773,10 +796,10 @@ impl ToolHandler<ServerToolExecutor> for PublishArtifactToolHandler {
 struct RunScriptToolHandler;
 
 #[async_trait]
-impl ToolHandler<ServerToolExecutor> for RunScriptToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for RunScriptToolHandler {
     async fn execute(
         &self,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -794,11 +817,11 @@ impl ToolHandler<ServerToolExecutor> for RunScriptToolHandler {
 struct McpToolHandler;
 
 #[async_trait]
-impl DynamicToolHandler<ServerToolExecutor> for McpToolHandler {
+impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
     async fn execute(
         &self,
         name: &str,
-        context: &ServerToolExecutor,
+        context: &RuntimeToolExecutor,
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
@@ -810,5 +833,44 @@ impl DynamicToolHandler<ServerToolExecutor> for McpToolHandler {
             ));
         }
         context.execute_mcp_tool(name, args).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_direct_default_executor_handlers_follow_shared_contract() {
+        let engine = runtime_tool_engine();
+        let handlers = engine
+            .handler_names()
+            .collect::<std::collections::HashSet<_>>();
+
+        for name in SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES {
+            assert!(
+                handlers.contains(name),
+                "server runtime must register direct DefaultToolExecutor handler for {name}"
+            );
+        }
+        for wrapped in [
+            "write_file",
+            "str_replace",
+            "bash",
+            "run_script",
+            "task_board",
+            "session",
+            "memory",
+            "rollback_file_edits",
+        ] {
+            assert!(
+                !astra_tools::executor::is_server_direct_default_executor_tool(wrapped),
+                "server-specific wrapper `{wrapped}` must not be classified as direct default executor"
+            );
+            assert!(
+                handlers.contains(wrapped),
+                "server-specific wrapper `{wrapped}` must still have a runtime handler"
+            );
+        }
     }
 }

@@ -6,7 +6,7 @@
 //! source of truth for ownership, concurrency, and audit.
 //!
 //! Clients in this module are thin wrappers that mirror the model-
-//! facing `task` tool action shape (one HTTP call per action).
+//! facing `task_board` tool action shape (one HTTP call per action).
 //! Returns a `Result<String, String>`: on success the rendered output
 //! the LLM/UI consumes; on error a stringified failure suitable to
 //! return as an `Error: ...` ToolResult.
@@ -65,7 +65,7 @@ fn build_request(
 /// runs the action against MO and returns the same string output the
 /// in-memory manager would produce. Action is one of
 /// `create | update | list | get | stop | adopt | archive`; `args` mirrors the
-/// model-emitted `task` tool args.
+/// model-emitted `task_board` tool args.
 ///
 /// U-15: transient cloud failures (5xx response, connection drop)
 /// retry once with 200ms backoff. Client errors (4xx) propagate
@@ -156,7 +156,7 @@ pub async fn copy_todos_for_fork(
 
 /// `GET /users/me/todos?status=...` — cross-session active list for
 /// the authenticated user. Returns a JSON-stringified payload
-/// formatted as the model-facing `task` tool's output convention so
+/// formatted as the model-facing `task_board` tool's output convention so
 /// the CLI dispatcher can pass it straight through.
 pub async fn list_user_todos(
     cloud_base: &str,
@@ -292,7 +292,7 @@ impl TaskStore for HttpTaskStore {
 //  2. TaskBoardObserver constructed with empty session_id silently
 //     filtered every broadcast for a brand-new session (the server
 //     allocates the SID mid-turn).
-//  3. `task` tool stuck in T2 deferred so the model never invoked it
+//  3. `task_board` tool stuck in T2 deferred so the model never invoked it
 //     even when the user asked for multi-step work.
 //
 // Each test wires a fresh wiremock server playing the role of
@@ -414,7 +414,7 @@ mod wiring_e2e {
         if cond() { Ok(start.elapsed()) } else { Err(()) }
     }
 
-    /// REGRESSION: `route_task_action` POSTs to the cloud on a `task.create`,
+    /// REGRESSION: `route_task_action` POSTs to the cloud on a `task_board.create`,
     /// fires the broadcast, and the observer picks the row up within the
     /// dirty/FAST_POLL window (≤ 200ms even on slow CI). This is the
     /// "dashboard appears mid-turn" SLA.

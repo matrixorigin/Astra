@@ -1,50 +1,44 @@
 //! ServerBuiltinProvider — routes server-in-process tool calls.
 //!
 //! In L1, this was a stub that returned NotCapable for every `execute()` call.
-//! In L2, this is wired to the actual `ServerToolExecutor` via the
+//! In L2, this is wired to the actual `RuntimeToolExecutor` via the
 //! `ServerToolRuntime` trait, so server-local tools execute directly.
 
 use astra_runtime_env::IsolationIntent;
 use async_trait::async_trait;
 use serde_json;
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, OnceLock};
 
 use super::traits::{
     CapabilityProvider, ProviderError, ServerToolRuntime, ToolRequest, ToolResult,
 };
 use super::types::{ProviderKind, ToolCapability};
+use astra_turn_core::tool::schema::tool_schema_name;
 
-/// Exact server-service/control-plane tools provided by the server builtin
-/// provider by default.
+/// Server-service/control-plane tools provided by the server builtin provider
+/// by default.
 ///
-/// This is intentionally a named-tool inventory rather than category
-/// capabilities: category matching is broad enough to include tools such as
-/// `bash`, `read_file`, `lsp`, and `find_definition` that are valid runtime
-/// tools but require an explicit workspace/runtime execution provider.
-pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
-    // Server services
-    "memory",
-    "mo_query",
-    "rollback_database_snapshots",
-    "tool_search",
-    "web_search",
-    "web_fetch",
-    "github",
-    // Control plane
-    "ask_user",
-    "notify",
-    "agent",
-    "agent_fanout",
-    "compress_context",
-    "enter_plan_mode",
-    "exit_plan_mode",
-    "get_agent_info",
-    "introspect",
-    "reflect",
-    "rollback_session_state",
-    "session",
-    "task",
-];
+/// The inventory is derived from the provider-declared schema surface instead
+/// of a separate hand-maintained list, so routing capacity cannot drift from
+/// model-visible server capacity.
+pub fn server_builtin_tool_names() -> &'static [String] {
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        crate::capabilities::server_builtin_tool_schemas(
+            &astra_turn_core::capability::CapabilitySet::all(),
+        )
+        .into_iter()
+        .filter_map(|schema| tool_schema_name(&schema).map(str::to_string))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+    })
+}
+
+fn server_builtin_declares_tool(tool: &str) -> bool {
+    server_builtin_tool_names().iter().any(|name| name == tool)
+}
 
 // ---------------------------------------------------------------------------
 // ServerBuiltinProvider
@@ -53,7 +47,7 @@ pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
 /// Provider for server-builtin tools.
 ///
 /// Declares only server-service/control-plane capabilities and delegates
-/// execution to a `ServerToolRuntime` (backed by `ServerToolExecutor`).
+/// execution to a `ServerToolRuntime` (backed by `RuntimeToolExecutor`).
 ///
 /// Workspace and process tools such as `bash`, `read_file`, `write_file`, and
 /// `git` are intentionally excluded. They require an explicit runtime/workspace
@@ -62,7 +56,7 @@ pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
 /// ## Tool filtering
 ///
 /// When `tools` is `Some(list)`, `capabilities()` returns only names that are
-/// also in [`SERVER_BUILTIN_TOOL_NAMES`]. This lets deployment profiles narrow
+/// also in [`server_builtin_tool_names`]. This lets deployment profiles narrow
 /// the server service surface without reclassifying workspace/runtime tools as
 /// server builtin tools.
 pub struct ServerBuiltinProvider {
@@ -94,7 +88,7 @@ impl ServerBuiltinProvider {
     ) -> Self {
         if let Some(configured_tools) = tools.as_ref() {
             for tool in configured_tools {
-                if !SERVER_BUILTIN_TOOL_NAMES.contains(&tool.as_str()) {
+                if !server_builtin_declares_tool(tool) {
                     tracing::warn!(
                         tool = %tool,
                         "ignoring non-server-builtin tool in ServerBuiltinProvider whitelist; declare an explicit runtime/workspace provider for executor tools"
@@ -121,12 +115,12 @@ impl CapabilityProvider for ServerBuiltinProvider {
         match self.tools.as_deref() {
             Some(tools) => tools
                 .iter()
-                .filter(|tool| SERVER_BUILTIN_TOOL_NAMES.contains(&tool.as_str()))
+                .filter(|tool| server_builtin_declares_tool(tool))
                 .map(|tool| ToolCapability::Named(tool.clone()))
                 .collect(),
-            None => SERVER_BUILTIN_TOOL_NAMES
+            None => server_builtin_tool_names()
                 .iter()
-                .map(|tool| ToolCapability::Named((*tool).to_string()))
+                .map(|tool| ToolCapability::Named(tool.clone()))
                 .collect(),
         }
     }
@@ -211,7 +205,7 @@ mod tests {
         let provider = ServerBuiltinProvider::new(10, Arc::new(TestRuntime), None);
         let caps = provider.capabilities().await;
         assert!(!caps.is_empty());
-        assert_eq!(caps.len(), SERVER_BUILTIN_TOOL_NAMES.len());
+        assert_eq!(caps.len(), server_builtin_tool_names().len());
         assert!(caps.contains(&ToolCapability::Named("reflect".into())));
         assert!(caps.contains(&ToolCapability::Named("web_search".into())));
         assert!(!caps.contains(&ToolCapability::Named("bash".into())));
@@ -271,9 +265,9 @@ mod tests {
         let caps = provider.capabilities().await;
         assert!(caps.iter().all(|c| matches!(c, ToolCapability::Named(_))));
         assert!(
-            SERVER_BUILTIN_TOOL_NAMES
+            server_builtin_tool_names()
                 .iter()
-                .all(|tool| caps.contains(&ToolCapability::Named((*tool).to_string())))
+                .all(|tool| caps.contains(&ToolCapability::Named(tool.clone())))
         );
     }
 }

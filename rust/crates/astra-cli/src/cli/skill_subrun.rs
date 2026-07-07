@@ -513,7 +513,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             .tool_policy
             .resolve_for_model(effective_model.as_deref());
 
-        let all_schemas = edge_tools::all_tool_schemas();
+        let all_schemas = edge_tools::local_tool_schemas();
         let valid_tool_names = tool_names_from_schemas(&all_schemas);
 
         // Issue #326 P5b: skill subruns are headless — never read
@@ -527,6 +527,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
 
         let executor = edge_tools::ToolExecutor::new(&self.project_root)
             .with_cloud(self.api.api_origin(), &self.token);
+        executor.set_cli_local_provider_schemas(all_schemas.clone());
         if let Some(session_id) = self.active_session_id.as_deref() {
             executor.set_active_session_id(session_id.to_string());
         }
@@ -733,7 +734,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             step_signal_collector: None,
             tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
-            server_tool_executor: None,
+            runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,
@@ -869,12 +870,12 @@ fn attach_subrun_tool_surface(
         .cloned()
         .collect();
     let eligible_surface_schemas = executor.runtime_bound_tool_schemas(eligible_surface_schemas);
-    let eligible_external_schemas =
-        executor.runtime_bound_external_schemas_excluding(restricted_tools);
+    let eligible_provider_schemas =
+        executor.runtime_bound_provider_owned_schemas_excluding(restricted_tools);
     let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::build_excluding_visible(
         eligible_surface_schemas,
         &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
-        &eligible_external_schemas,
+        &eligible_provider_schemas,
         &final_visible_tool_names,
     );
     let mut activatable_tool_names = HashSet::new();

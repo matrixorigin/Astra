@@ -514,7 +514,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             step_signal_collector: None,
             tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
-            server_tool_executor: None,
+            runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
@@ -547,7 +547,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             },
         };
 
-        // ── Wire ServerToolExecutor for skill sub-run tool execution ────
+        // ── Wire RuntimeToolExecutor for skill sub-run tool execution ────
         {
             let workspace = self.provision_skill_workspace(skill_name, &subrun_session_id)?;
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
@@ -557,7 +557,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 builder = builder.edge_connection_pool(pool.clone());
             }
 
-            let mut executor = super::server_tool_executor::ServerToolExecutor::new(
+            let mut executor = super::runtime_tool_executor::RuntimeToolExecutor::new(
                 workspace,
                 String::new(), // skill sub-runs don't track user_id
                 subrun_session_id.clone(),
@@ -574,7 +574,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             if let Some(pool) = &self.shared_pool {
                 executor.set_context_manifest_pool(pool.clone());
             }
-            state.server_tool_executor = Some(std::sync::Arc::new(executor));
+            state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
         if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {

@@ -1,3 +1,4 @@
+use super::super::tool_results_dir;
 use super::test_executor;
 use crate::edge_tools::{
     AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, PERSIST_THRESHOLD, ToolExecutor,
@@ -10,7 +11,7 @@ use std::path::PathBuf;
 //
 // These tests simulate realistic multi-tool-call turns to verify that:
 // 1. Progressive scaling reduces limits smoothly (not step-function)
-// 2. Persist-to-disk triggers when aggregate is high + output is large
+// 2. Internal artifact persistence triggers when aggregate is high + output is large
 // 3. read_file auto-downgrades to outline under aggregate pressure
 // 4. Ranged reads always work regardless of aggregate pressure
 // 5. git(action=show/diff) respects aggregate-aware limits
@@ -106,22 +107,37 @@ fn persist_to_disk_triggers_when_aggregate_high_and_output_large() {
     let result = executor.maybe_persist_large_output(small.clone(), "bash");
     assert_eq!(result, small, "small output should pass through");
 
-    // Large output → persisted
-    let large = "x\n".repeat(30_000); // ~60KB
+    // Large output → persisted internally while keeping the model-facing text
+    // inside the workspace/provider contract.
+    let marker = format!(
+        "persist-contract-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let large = format!("{marker}\n{}", "x\n".repeat(30_000)); // ~60KB
     let result = executor.maybe_persist_large_output(large.clone(), "bash");
     assert!(
         result.contains("<persisted-output>"),
         "large output should be persisted, got first 200 chars: {}",
         &result[..result.len().min(200)]
     );
-    assert!(result.contains("tool-results/"), "should contain file path");
+    assert!(
+        result.contains("internal tool-result artifact"),
+        "should describe the internal artifact contract"
+    );
+    assert!(
+        !result.contains("tool-results/"),
+        "model-facing result must not expose internal file path"
+    );
     assert!(
         result.contains("</persisted-output>"),
         "should have closing tag"
     );
     assert!(
-        result.contains("read_file"),
-        "should suggest read_file for access"
+        !result.contains("read_file"),
+        "must not suggest workspace read_file for internal artifacts"
     );
     assert!(
         result.len() < large.len() / 5,
@@ -130,21 +146,25 @@ fn persist_to_disk_triggers_when_aggregate_high_and_output_large() {
         large.len()
     );
 
-    // Verify file was actually written
-    let file_path = result
-        .lines()
-        .find_map(|line| {
-            line.split_once("Full output saved to: ")
-                .map(|(_, path)| path.trim())
+    // Verify file was actually written without parsing a model-visible path.
+    let persisted_file = std::fs::read_dir(tool_results_dir())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            std::fs::read_to_string(path)
+                .map(|content| content.contains(&marker))
+                .unwrap_or(false)
         })
-        .unwrap();
+        .expect("persisted file containing unique marker should exist");
     assert!(
-        std::path::Path::new(file_path).exists(),
-        "persisted file should exist: {file_path}"
+        persisted_file.exists(),
+        "persisted file should exist: {}",
+        persisted_file.display()
     );
 
     // Cleanup
-    let _ = std::fs::remove_file(file_path);
+    let _ = std::fs::remove_file(persisted_file);
 }
 
 #[test]

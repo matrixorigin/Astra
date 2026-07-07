@@ -170,6 +170,9 @@ async fn e2e_matrix_chat_stream_session_info() {
     journey_extended::run_chat_stream_session_info_smoke().await;
 }
 
+// This journey asserts local journal isolation while the stream handler and
+// turn flush run across worker threads; the journey installs a process-scoped
+// journal root for that single nextest process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
 async fn e2e_matrix_stream_session_metadata_enables_full_llm_exchange_journaling() {

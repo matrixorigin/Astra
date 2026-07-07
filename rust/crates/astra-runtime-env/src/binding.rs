@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AvailableToolSurface, CapabilityResolver, EffectiveCapabilitySet, PolicyIntent, ToolDenial,
-    ToolRegistry, ToolUnavailableReason,
+    AvailableToolSurface, CapabilityResolver, CapacityProviderDeclaration, CapacityProviderType,
+    EffectiveCapabilitySet, PolicyIntent, ToolDenial, ToolRegistry, ToolUnavailableReason,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,7 +39,7 @@ impl WorkspaceBinding {
     pub fn none() -> Self {
         Self {
             kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
+            display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
             persistent: false,
@@ -97,7 +97,7 @@ pub enum ExecutorBindingKind {
     LocalCli,
     EdgeAgent,
     OrchestratorManaged,
-    RequestScopedMcp,
+    Mcp,
     Unknown,
 }
 
@@ -190,6 +190,27 @@ impl ExecutorBinding {
     }
 }
 
+pub fn runtime_execution_provider_type(
+    workspace_kind: WorkspaceBindingKind,
+    executor_kind: ExecutorBindingKind,
+) -> CapacityProviderType {
+    match (workspace_kind, executor_kind) {
+        (WorkspaceBindingKind::LocalFilesystem, ExecutorBindingKind::LocalCli) => {
+            CapacityProviderType::CliLocal
+        }
+        (WorkspaceBindingKind::EdgeWorkspace, ExecutorBindingKind::EdgeAgent) => {
+            CapacityProviderType::EdgeCapacity
+        }
+        (WorkspaceBindingKind::ServerSandbox, ExecutorBindingKind::ServerRuntime) => {
+            CapacityProviderType::Sandbox
+        }
+        (WorkspaceBindingKind::CloudWorkspace, ExecutorBindingKind::OrchestratorManaged) => {
+            CapacityProviderType::OrchestratorManagedRuntime
+        }
+        _ => CapacityProviderType::Unknown,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSessionManager {
@@ -243,6 +264,41 @@ pub enum RuntimeInteractionChannel {
     FileTransfer,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePlatform {
+    Linux,
+    Macos,
+    Windows,
+    #[default]
+    Unknown,
+}
+
+impl RuntimePlatform {
+    pub const fn current() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Self::Windows
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self::Macos
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            Self::Linux
+        }
+        #[cfg(not(any(unix, target_os = "windows")))]
+        {
+            Self::Unknown
+        }
+    }
+
+    pub const fn supports_powershell(self) -> bool {
+        matches!(self, Self::Windows)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeStatus {
@@ -263,6 +319,8 @@ pub struct RuntimeBinding {
     pub ephemeral: bool,
     pub supports_long_sessions: bool,
     #[serde(default)]
+    pub platform: RuntimePlatform,
+    #[serde(default)]
     pub interaction_channels: Vec<RuntimeInteractionChannel>,
 }
 
@@ -277,6 +335,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Offline,
             ephemeral: true,
             supports_long_sessions: false,
+            platform: RuntimePlatform::Unknown,
             interaction_channels: Vec::new(),
         }
     }
@@ -291,6 +350,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Ready,
             ephemeral: false,
             supports_long_sessions: true,
+            platform: RuntimePlatform::current(),
             interaction_channels: vec![
                 RuntimeInteractionChannel::Exec,
                 RuntimeInteractionChannel::StdinPipe,
@@ -309,6 +369,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Ready,
             ephemeral: true,
             supports_long_sessions: true,
+            platform: RuntimePlatform::Linux,
             interaction_channels: vec![
                 RuntimeInteractionChannel::Exec,
                 RuntimeInteractionChannel::StdinPipe,
@@ -326,6 +387,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Ready,
             ephemeral: true,
             supports_long_sessions: false,
+            platform: RuntimePlatform::Unknown,
             interaction_channels: vec![
                 RuntimeInteractionChannel::Exec,
                 RuntimeInteractionChannel::StdinPipe,
@@ -348,6 +410,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Ready,
             ephemeral: true,
             supports_long_sessions: true,
+            platform: RuntimePlatform::Unknown,
             interaction_channels: vec![
                 RuntimeInteractionChannel::Exec,
                 RuntimeInteractionChannel::StdinPipe,
@@ -367,6 +430,7 @@ impl RuntimeBinding {
             status: RuntimeStatus::Ready,
             ephemeral: true,
             supports_long_sessions: true,
+            platform: RuntimePlatform::Linux,
             interaction_channels: vec![
                 RuntimeInteractionChannel::Exec,
                 RuntimeInteractionChannel::StdinPipe,
@@ -376,6 +440,11 @@ impl RuntimeBinding {
 
     pub fn with_launch_driver(mut self, launch_driver: RuntimeLaunchDriver) -> Self {
         self.launch_driver = launch_driver;
+        self
+    }
+
+    pub fn with_platform(mut self, platform: RuntimePlatform) -> Self {
+        self.platform = platform;
         self
     }
 }
@@ -398,9 +467,28 @@ impl RunBinding {
         policy: PolicyIntent,
         registry: &ToolRegistry,
     ) -> Self {
+        let providers =
+            default_capacity_provider_declarations(&workspace, &executor, &runtime, registry);
+        Self::resolve_with_provider_declarations(
+            workspace, executor, runtime, policy, registry, &providers,
+        )
+    }
+
+    pub fn resolve_with_provider_declarations(
+        workspace: WorkspaceBinding,
+        executor: ExecutorBinding,
+        runtime: RuntimeBinding,
+        policy: PolicyIntent,
+        registry: &ToolRegistry,
+        providers: &[CapacityProviderDeclaration],
+    ) -> Self {
         let capabilities =
             EffectiveCapabilitySet::from_bindings(&workspace, &executor, &runtime, &policy);
-        let mut tool_surface = CapabilityResolver.available_tool_surface(registry, &capabilities);
+        let mut tool_surface = CapabilityResolver.available_tool_surface_for_providers(
+            registry,
+            &capabilities,
+            providers,
+        );
         apply_policy_tool_allowlist(&policy, &mut tool_surface);
         Self {
             workspace,
@@ -453,6 +541,83 @@ impl RunBinding {
     }
 }
 
+fn default_capacity_provider_declarations(
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    runtime: &RuntimeBinding,
+    registry: &ToolRegistry,
+) -> Vec<CapacityProviderDeclaration> {
+    let mut providers = Vec::new();
+
+    if matches!(
+        executor.kind,
+        ExecutorBindingKind::ControlPlane | ExecutorBindingKind::LocalCli
+    ) {
+        providers.push(crate::control_plane_provider("control-plane", registry));
+    }
+
+    if matches!(
+        executor.kind,
+        ExecutorBindingKind::ControlPlane
+            | ExecutorBindingKind::ServerRuntime
+            | ExecutorBindingKind::LocalCli
+    ) {
+        providers.push(crate::server_service_provider("server-service", registry));
+    }
+
+    if let Some(provider_type) = default_runtime_provider_type(workspace, executor, runtime) {
+        providers.push(crate::runtime_workspace_provider(
+            provider_type,
+            default_runtime_provider_id(provider_type, executor),
+            registry,
+            runtime.platform,
+        ));
+    }
+
+    providers
+}
+
+fn default_runtime_provider_type(
+    workspace: &WorkspaceBinding,
+    executor: &ExecutorBinding,
+    _runtime: &RuntimeBinding,
+) -> Option<CapacityProviderType> {
+    if matches!(
+        workspace.authority,
+        WorkspaceAuthority::None | WorkspaceAuthority::Unknown
+    ) {
+        return None;
+    }
+
+    match runtime_execution_provider_type(workspace.kind, executor.kind) {
+        CapacityProviderType::Unknown => None,
+        provider_type => Some(provider_type),
+    }
+}
+
+fn default_runtime_provider_id(
+    provider_type: CapacityProviderType,
+    executor: &ExecutorBinding,
+) -> String {
+    match provider_type {
+        CapacityProviderType::CliLocal => executor.executor_id.clone(),
+        CapacityProviderType::EdgeCapacity => executor.executor_id.clone(),
+        CapacityProviderType::OrchestratorManagedRuntime => executor.executor_id.clone(),
+        CapacityProviderType::Sandbox => {
+            if executor.executor_id.is_empty() {
+                "server-sandbox".to_string()
+            } else {
+                executor.executor_id.clone()
+            }
+        }
+        CapacityProviderType::ServerService
+        | CapacityProviderType::ControlPlane
+        | CapacityProviderType::RequestScopedMcp
+        | CapacityProviderType::McpProvider
+        | CapacityProviderType::Unknown => executor.executor_id.clone(),
+    }
+}
+
 fn apply_policy_tool_allowlist(policy: &PolicyIntent, tool_surface: &mut AvailableToolSurface) {
     if !policy.has_restricted_tool_allowlist() {
         return;
@@ -463,11 +628,19 @@ fn apply_policy_tool_allowlist(policy: &PolicyIntent, tool_surface: &mut Availab
         if policy.allows_tool(tool_name) {
             return true;
         }
+        let reason =
+            ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(tool_name));
+        if let Some(admission) = tool_surface
+            .admissions
+            .iter_mut()
+            .find(|admission| admission.tool_name == *tool_name)
+        {
+            admission.visible = false;
+            admission.hidden_reason = Some(reason.clone());
+        }
         policy_denials.push(ToolDenial {
             tool_name: tool_name.clone(),
-            reason: ToolUnavailableReason::PolicyDenied(PolicyIntent::disallowed_tool_reason(
-                tool_name,
-            )),
+            reason,
         });
         false
     });
@@ -479,7 +652,33 @@ fn apply_policy_tool_allowlist(policy: &PolicyIntent, tool_surface: &mut Availab
             );
         }
     }
-    tool_surface.denials.extend(policy_denials);
+    for admission in &mut tool_surface.admissions {
+        if !policy.allows_tool(&admission.tool_name) {
+            admission.visible = false;
+            admission.hidden_reason = Some(ToolUnavailableReason::PolicyDenied(
+                PolicyIntent::disallowed_tool_reason(&admission.tool_name),
+            ));
+        }
+    }
+    let mut merged_denials = std::collections::BTreeMap::new();
+    for denial in tool_surface.denials.drain(..) {
+        merged_denials.insert(denial.tool_name, denial.reason);
+    }
+    for denial in policy_denials {
+        merged_denials.insert(denial.tool_name, denial.reason);
+    }
+    tool_surface.denials = merged_denials
+        .into_iter()
+        .map(|(tool_name, reason)| ToolDenial { tool_name, reason })
+        .collect();
+    tool_surface.tool_names.sort();
+    tool_surface.tool_names.dedup();
+    tool_surface
+        .admissions
+        .sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
+    tool_surface
+        .admissions
+        .dedup_by(|a, b| a.tool_name == b.tool_name);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -523,6 +722,49 @@ mod tests {
             true
         );
         assert!(value["binding"]["tool_surface"]["tool_names"].is_array());
+        assert!(
+            value["binding"]["tool_surface"].get("admissions").is_none(),
+            "selected provider offers are runtime evidence and must not churn prompt/runtime advertisement bytes"
+        );
+    }
+
+    #[test]
+    fn policy_allowlist_canonicalizes_tool_surface_denials() {
+        let policy = PolicyIntent::local_developer().with_allowed_tools(["read_file"]);
+        let mut surface = AvailableToolSurface {
+            tool_names: vec![
+                "write_file".to_string(),
+                "read_file".to_string(),
+                "bash".to_string(),
+            ],
+            denials: vec![
+                ToolDenial {
+                    tool_name: "z_hidden".to_string(),
+                    reason: ToolUnavailableReason::UnknownTool,
+                },
+                ToolDenial {
+                    tool_name: "bash".to_string(),
+                    reason: ToolUnavailableReason::UnknownTool,
+                },
+            ],
+            admissions: vec![],
+        };
+
+        apply_policy_tool_allowlist(&policy, &mut surface);
+
+        assert_eq!(surface.tool_names, vec!["read_file"]);
+        let denied_names: Vec<_> = surface
+            .denials
+            .iter()
+            .map(|denial| denial.tool_name.as_str())
+            .collect();
+        assert_eq!(denied_names, vec!["bash", "write_file", "z_hidden"]);
+        assert_eq!(
+            surface.denial_for("bash"),
+            Some(&ToolUnavailableReason::PolicyDenied(
+                PolicyIntent::disallowed_tool_reason("bash")
+            ))
+        );
     }
 
     #[test]
@@ -601,5 +843,73 @@ mod tests {
         let kind = WorkspaceBindingKind::LocalFilesystem;
         let json = serde_json::to_string(&kind).unwrap();
         assert_eq!(json, "\"local_filesystem\"");
+    }
+
+    #[test]
+    fn mcp_executor_kind_uses_generic_label() {
+        let kind = ExecutorBindingKind::Mcp;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"mcp\"");
+    }
+
+    #[test]
+    fn runtime_execution_provider_type_requires_matching_workspace_executor_pair() {
+        assert_eq!(
+            runtime_execution_provider_type(
+                WorkspaceBindingKind::LocalFilesystem,
+                ExecutorBindingKind::LocalCli
+            ),
+            CapacityProviderType::CliLocal
+        );
+        assert_eq!(
+            runtime_execution_provider_type(
+                WorkspaceBindingKind::EdgeWorkspace,
+                ExecutorBindingKind::EdgeAgent
+            ),
+            CapacityProviderType::EdgeCapacity
+        );
+        assert_eq!(
+            runtime_execution_provider_type(
+                WorkspaceBindingKind::ServerSandbox,
+                ExecutorBindingKind::ServerRuntime
+            ),
+            CapacityProviderType::Sandbox
+        );
+        assert_eq!(
+            runtime_execution_provider_type(
+                WorkspaceBindingKind::CloudWorkspace,
+                ExecutorBindingKind::OrchestratorManaged
+            ),
+            CapacityProviderType::OrchestratorManagedRuntime
+        );
+
+        for (workspace_kind, executor_kind) in [
+            (
+                WorkspaceBindingKind::EdgeWorkspace,
+                ExecutorBindingKind::ServerRuntime,
+            ),
+            (
+                WorkspaceBindingKind::ServerSandbox,
+                ExecutorBindingKind::EdgeAgent,
+            ),
+            (
+                WorkspaceBindingKind::CloudWorkspace,
+                ExecutorBindingKind::LocalCli,
+            ),
+            (
+                WorkspaceBindingKind::LocalFilesystem,
+                ExecutorBindingKind::OrchestratorManaged,
+            ),
+            (
+                WorkspaceBindingKind::None,
+                ExecutorBindingKind::ServerRuntime,
+            ),
+        ] {
+            assert_eq!(
+                runtime_execution_provider_type(workspace_kind, executor_kind),
+                CapacityProviderType::Unknown,
+                "{workspace_kind:?} + {executor_kind:?} must not infer runtime provider ownership"
+            );
+        }
     }
 }

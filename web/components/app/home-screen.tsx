@@ -2,10 +2,11 @@
 
 import { BookOpen, Code2, Coffee, Lightbulb, PenLine } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Composer } from '@/components/app/composer';
-import { createChat } from '@/lib/api/chats';
+import { createChat, getEdgeStatus } from '@/lib/api/chats';
 import { isAuthRequiredError } from '@/lib/api/errors';
+import type { EdgeStatusResponse, WorkspaceSelection } from '@/lib/api/types';
 import { greetingFor } from '@/lib/utils/time';
 
 const suggestions = [
@@ -20,6 +21,34 @@ export function HomeScreen() {
   const router = useRouter();
   const [initialValue, setInitialValue] = useState('');
   const [busy, setBusy] = useState(false);
+  const [workspaceSelection, setWorkspaceSelection] =
+    useState<WorkspaceSelection | null>(null);
+  const [edgeWorkspaces, setEdgeWorkspaces] =
+    useState<EdgeStatusResponse['edges']>([]);
+  const [edgeWorkspacesLoading, setEdgeWorkspacesLoading] = useState(false);
+  const [edgeWorkspacesError, setEdgeWorkspacesError] = useState<string | null>(
+    null,
+  );
+
+  const refreshEdgeWorkspaces = useCallback(async () => {
+    setEdgeWorkspacesLoading(true);
+    setEdgeWorkspacesError(null);
+    try {
+      const status = await getEdgeStatus();
+      setEdgeWorkspaces(status.edges);
+    } catch (error) {
+      setEdgeWorkspaces([]);
+      setEdgeWorkspacesError(
+        error instanceof Error ? error.message : 'Failed to load environments.',
+      );
+    } finally {
+      setEdgeWorkspacesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshEdgeWorkspaces();
+  }, [refreshEdgeWorkspaces]);
 
   return (
     <div className="flex h-full overflow-y-auto overscroll-contain flex-col items-center justify-center px-6 py-12">
@@ -32,6 +61,12 @@ export function HomeScreen() {
         initialValue={initialValue}
         disabled={busy}
         className="mt-10 w-full max-w-composer"
+        workspaceSelection={workspaceSelection}
+        edgeWorkspaces={edgeWorkspaces}
+        edgeWorkspacesLoading={edgeWorkspacesLoading}
+        edgeWorkspacesError={edgeWorkspacesError}
+        onWorkspaceSelectionChange={setWorkspaceSelection}
+        onRefreshEdgeWorkspaces={refreshEdgeWorkspaces}
         onSubmit={async ({ text, options }) => {
           setBusy(true);
           try {
@@ -44,6 +79,7 @@ export function HomeScreen() {
                 activeSkills: options.activeSkills,
               },
               projectId: null,
+              workspaceSelection,
             });
             router.replace(`/chats/${result.chatId}`);
           } catch (error) {

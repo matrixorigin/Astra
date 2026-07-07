@@ -36,7 +36,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tower::util::ServiceExt;
 
 use crate::test_support::{
@@ -531,14 +531,93 @@ fn normalize_chat_stream_payload(mut payload: Value) -> Value {
         return payload;
     };
     let legacy_model = object.remove("model");
-    if object.contains_key("selected_model") {
-        return payload;
+    if !object.contains_key("selected_model") {
+        let model = legacy_model
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| DEFAULT_SELECTED_MODEL.to_string());
+        object.insert("selected_model".to_string(), json!({ "model": model }));
     }
-    let model = legacy_model
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| DEFAULT_SELECTED_MODEL.to_string());
-    object.insert("selected_model".to_string(), json!({ "model": model }));
+    ensure_test_edge_profile_for_edge_tools(object);
     payload
+}
+
+fn ensure_test_edge_profile_for_edge_tools(payload: &mut Map<String, Value>) {
+    let Some(context) = payload.get_mut("context").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let has_edge_runtime_tools = context
+        .get("edge_tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(test_tool_requires_edge_runtime));
+    if !has_edge_runtime_tools {
+        return;
+    }
+    context
+        .entry("edge_profile".to_string())
+        .or_insert_with(|| {
+            json!({
+                "cwd": "/tmp/astra-web-agent-e2e-edge",
+                "edge_agent_id": "web-agent-e2e-edge",
+                "hostname": "web-agent-e2e",
+            })
+        });
+    let workspace_binding = payload
+        .entry("workspace_binding".to_string())
+        .or_insert_with(|| {
+            json!({
+                "kind": "edge_workspace",
+                "display_name": "web-agent-e2e",
+                "cwd": "/tmp/astra-web-agent-e2e-edge",
+                "authority": "read_write",
+            })
+        });
+    assert_eq!(
+        workspace_binding["kind"].as_str(),
+        Some("edge_workspace"),
+        "test payload with edge runtime tools must use an edge workspace binding"
+    );
+    let executor_binding = payload
+        .entry("executor_binding".to_string())
+        .or_insert_with(|| {
+            json!({
+                "kind": "edge_agent",
+                "executor_id": "web-agent-e2e-edge",
+                "display_name": "web-agent-e2e",
+                "transport": "edge_ledger",
+                "status": "online"
+            })
+        });
+    assert_eq!(
+        executor_binding["kind"].as_str(),
+        Some("edge_agent"),
+        "test payload with edge runtime tools must use an edge executor binding"
+    );
+    assert_eq!(
+        executor_binding["transport"].as_str(),
+        Some("edge_ledger"),
+        "web_agent_e2e edge runtime tools are executed through the client ledger"
+    );
+    assert_eq!(
+        executor_binding["status"].as_str(),
+        Some("online"),
+        "web_agent_e2e edge runtime tool fixtures require an online executor"
+    );
+}
+
+fn test_tool_requires_edge_runtime(tool: &Value) -> bool {
+    astra_runtime_env::tool_schema_name(tool).is_some_and(test_tool_uses_client_ledger)
+}
+
+fn test_tool_uses_client_ledger(tool_name: &str) -> bool {
+    astra_runtime_env::ToolRegistry::builtins()
+        .get(tool_name)
+        .is_some_and(|spec| {
+            matches!(
+                spec.required.executor,
+                astra_runtime_env::RequiredExecutor::RuntimeExecutor
+                    | astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
+            )
+        })
 }
 
 /// Send a POST /chat/stream request and collect all SSE events from the stream.
@@ -755,7 +834,7 @@ async fn web_agent_executes_sync_dynamic_spawn_with_server_executor() {
             && live_output["executor"]["kind"].as_str() == Some("server_local")
             && live_output["executor"]["executor_id"].as_str() == Some("server-control-plane")
             && live_output["transport"].as_str() == Some("server_local"),
-        "server dynamic spawn should stream child output into agent_live_event: {serialized}"
+        "server-only dynamic spawn should stream child output without inventing a workspace executor provider: {serialized}"
     );
     assert!(
         live_events.iter().any(|event| {
@@ -815,7 +894,6 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/xupeng/github/astra",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor_binding": {
                 "kind": "edge_agent",
@@ -869,7 +947,6 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     assert_eq!(workspace["workspace"]["cwd"], "/Users/xupeng/github/astra");
     assert_eq!(workspace["executor"]["kind"], "edge_agent");
     assert_eq!(workspace["transport"], "edge_ws");
-    assert_eq!(workspace["fallback_policy"], "disabled");
 
     let routing = find_events(&events, "tool_routing_decision")
         .into_iter()
@@ -901,7 +978,6 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     assert_eq!(live_output["executor"]["kind"], "edge_agent");
     assert_eq!(live_output["executor"]["executor_id"], "edge-macbook-1");
     assert_eq!(live_output["transport"], "edge_ws");
-    assert_eq!(live_output["fallback_policy"], "disabled");
 
     let spawned = find_event_type(&events, "agent_spawned");
     assert!(
@@ -913,7 +989,6 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     assert_eq!(spawned[0]["executor"]["kind"], "edge_agent");
     assert_eq!(spawned[0]["executor"]["executor_id"], "edge-macbook-1");
     assert_eq!(spawned[0]["transport"], "edge_ws");
-    assert_eq!(spawned[0]["fallback_policy"], "disabled");
 
     let completed = find_event_type(&events, "agent_completed");
     assert!(
@@ -965,15 +1040,21 @@ async fn wait_for_sse(
     timeout_secs: u64,
 ) -> Value {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut seen = Vec::new();
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(event)) => {
                 if event.get("type").and_then(Value::as_str) == Some(event_type) {
                     return event;
                 }
+                seen.push(event);
             }
-            Ok(None) => panic!("stream ended without '{event_type}' event"),
-            Err(_) => panic!("timed out ({timeout_secs}s) waiting for '{event_type}' event"),
+            Ok(None) => panic!("stream ended without '{event_type}' event; seen={seen:#?}"),
+            Err(_) => {
+                panic!(
+                    "timed out ({timeout_secs}s) waiting for '{event_type}' event; seen={seen:#?}"
+                )
+            }
         }
     }
 }
@@ -1009,6 +1090,9 @@ async fn execute_mock_tool_turn(
     let approval_identity = wait_for_approval_identity(&mut rx).await;
 
     for step in steps {
+        if !test_tool_uses_client_ledger(step.tool_name) {
+            continue;
+        }
         if step.requires_approval {
             let approval = wait_for_sse(&mut rx, "approval_required", 5).await;
             assert_eq!(
@@ -1294,7 +1378,6 @@ async fn web_agent_stream_emits_workspace_and_executor_binding_snapshots() {
                 "kind": "server_sandbox",
                 "display_name": "Server sandbox",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor_binding": {
                 "kind": "server_local",
@@ -1321,7 +1404,6 @@ async fn web_agent_stream_emits_workspace_and_executor_binding_snapshots() {
     assert_eq!(workspace["workspace"]["kind"], "server_sandbox");
     assert_eq!(workspace["executor"]["kind"], "server_local");
     assert_eq!(workspace["transport"], "server_local");
-    assert_eq!(workspace["fallback_policy"], "disabled");
     assert!(
         workspace["workspace"]["cwd"].as_str().is_some_and(|cwd| {
             cwd.contains("astra-workspaces") && !cwd.contains("client/claimed")
@@ -1348,7 +1430,6 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
                 "kind": "server_sandbox",
                 "display_name": "Server sandbox",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor_binding": {
                 "kind": "server_local",
@@ -1377,7 +1458,6 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
     assert_eq!(tool_call["workspace"]["kind"], "server_sandbox");
     assert_eq!(tool_call["executor"]["kind"], "server_local");
     assert_eq!(tool_call["transport"], "server_local");
-    assert_eq!(tool_call["fallback_policy"], "disabled");
     assert!(
         tool_call["workspace"]["cwd"].as_str().is_some_and(|cwd| {
             cwd.contains("astra-workspaces") && !cwd.contains("client/claimed")
@@ -1400,7 +1480,6 @@ async fn edge_executor_offline_blocks_run_before_next_llm_round() {
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/xupeng/github/astra",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor_binding": {
                 "kind": "edge_agent",
@@ -1466,7 +1545,6 @@ async fn edge_executor_offline_child_spawn_blocks_parent_before_next_llm_round()
                 "display_name": "MacBook Pro",
                 "cwd": "/Users/xupeng/github/astra",
                 "authority": "read_write",
-                "fallback_policy": "disabled"
             },
             "executor_binding": {
                 "kind": "edge_agent",
@@ -1864,7 +1942,7 @@ async fn server_side_tools_no_edge_tools_auto_populated() {
     let (app, _) = build_test_app();
 
     // No edge_tools in context → server_side_tools = true.
-    // The mock LLM returns tool calls, but server_tool_executor would handle them.
+    // The mock LLM returns tool calls, but runtime_tool_executor would handle them.
     // With mock LLM, tool calls with no edge tools won't go through the ledger.
     let payload = json!({
         "message": "Hello server mode",
@@ -3679,7 +3757,6 @@ async fn a1_run_status_all_fields_text_only() {
         Some("server-control-plane")
     );
     assert_eq!(body["transport"].as_str(), Some("server_local"));
-    assert_eq!(body["fallback_policy"].as_str(), Some("disabled"));
 }
 
 #[tokio::test]

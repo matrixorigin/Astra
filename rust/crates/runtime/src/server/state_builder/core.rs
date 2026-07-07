@@ -1,4 +1,8 @@
 use super::*;
+use crate::server::deployment_tool_policy::{
+    DeploymentToolPolicy, apply_deployment_tool_policy, load_deployment_tool_policy,
+};
+use crate::server::tool_transport::ToolExecutionService;
 
 pub(super) fn build_auth_service(
     settings: &AppSettings,
@@ -201,16 +205,164 @@ pub(super) fn install_execution_services(
     lease_hold_cache: &Arc<TaskLeaseHoldCache>,
 ) -> AppState {
     let metrics = state.multi_agent_metrics.clone();
+    let edge_registry_service: Arc<dyn EdgeRegistryService> = Arc::new(
+        DatabaseEdgeRegistryService::from_shared(shared_pool).with_metrics(metrics.clone()),
+    );
+    let edge_dispatch_service: Arc<dyn EdgeDispatchService> = Arc::new(
+        DatabaseEdgeDispatchService::from_shared(shared_pool).with_metrics(metrics.clone()),
+    );
+    let tool_execution_service = build_shared_tool_execution_service(
+        state.edge_connection_pool.clone(),
+        Arc::clone(&edge_dispatch_service),
+        Arc::clone(&edge_registry_service),
+        &load_deployment_tool_policy(),
+    );
     state
         .with_task_service(Arc::new(MatrixOneTaskService::from_shared(shared_pool)))
-        .with_edge_registry_service(Arc::new(
-            DatabaseEdgeRegistryService::from_shared(shared_pool).with_metrics(metrics.clone()),
-        ))
-        .with_edge_dispatch_service(Arc::new(
-            DatabaseEdgeDispatchService::from_shared(shared_pool).with_metrics(metrics.clone()),
-        ))
+        .with_edge_registry_service(edge_registry_service)
+        .with_edge_dispatch_service(edge_dispatch_service)
+        .with_tool_execution_service(tool_execution_service)
         .with_task_lease_service(Arc::new(
             DatabaseTaskLeaseService::from_shared(shared_pool, Arc::clone(lease_hold_cache))
                 .with_metrics(metrics),
         ))
+}
+
+fn build_shared_tool_execution_service(
+    edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
+    edge_dispatch_service: Arc<dyn EdgeDispatchService>,
+    edge_registry_service: Arc<dyn EdgeRegistryService>,
+    policy: &DeploymentToolPolicy,
+) -> ToolExecutionService {
+    let mut builder = ToolExecutionService::builder()
+        .edge_connection_pool(edge_connection_pool)
+        .edge_dispatch_service(edge_dispatch_service)
+        .edge_registry_service(edge_registry_service);
+    if !policy.disabled_tool_offers.is_empty() {
+        builder = builder.initial_disabled_tool_offers(&policy.disabled_tool_offers);
+    }
+    if !policy.provider_allowed_tools.is_empty() {
+        builder = builder.initial_provider_allowed_tools(policy.provider_allowed_tools.clone());
+    }
+    builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::server::tool_local_transport::ServerLocalToolTransport;
+    use crate::server::tool_transport::{
+        ExecutorBinding, ExecutorStatus, ToolExecutionRequest, ToolTransportKind,
+        WorkspaceAuthority, WorkspaceBinding,
+    };
+
+    struct NoopLocalTransport;
+
+    #[async_trait]
+    impl ServerLocalToolTransport for NoopLocalTransport {
+        async fn execute_server_local_tool(
+            &self,
+            request: &ToolExecutionRequest,
+            _cancel_token: Option<&CancellationToken>,
+        ) -> astra_tools::ToolResult {
+            astra_tools::ToolResult::text(format!("local:{}", request.tool_name))
+        }
+    }
+
+    fn edge_runtime_environment_advertisement(edge_agent_id: &str) -> serde_json::Value {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let binding = astra_runtime_env::RunBinding::resolve(
+            astra_runtime_env::WorkspaceBinding::edge_workspace(
+                "/Users/test/project",
+                astra_runtime_env::WorkspaceAuthority::ReadWrite,
+            ),
+            astra_runtime_env::ExecutorBinding::edge_agent(edge_agent_id.to_string()),
+            astra_runtime_env::RuntimeBinding::host_process(format!("edge-host:{edge_agent_id}")),
+            astra_runtime_env::PolicyIntent::local_developer(),
+            &registry,
+        );
+        serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            binding,
+        ))
+        .expect("edge advertisement serializes")
+    }
+
+    fn edge_request() -> ToolExecutionRequest {
+        ToolExecutionRequest {
+            user_id: "user-1".to_string(),
+            run_id: "run-1".to_string(),
+            session_id: "session-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "bash".to_string(),
+            args: serde_json::json!({"cmd": "pwd"}),
+            workspace: WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            executor: ExecutorBinding::edge_agent(
+                "edge-selected",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            workspace_record: None,
+            runtime: None,
+            selected_offer: None,
+            policy: crate::server::tool_transport::ToolPolicySnapshot::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_tool_execution_service_wires_edge_websocket_transport() {
+        let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+        pool.register_with_capabilities(
+            "user-1",
+            "edge-selected",
+            Some("MacBook Pro".to_string()),
+            Some("/Users/test/project".to_string()),
+            Some(edge_runtime_environment_advertisement("edge-selected")),
+            tx,
+        );
+
+        let service = build_shared_tool_execution_service(
+            pool.clone(),
+            Arc::new(astra_services::multi_agent::UnconfiguredEdgeDispatchService),
+            Arc::new(astra_services::multi_agent::UnconfiguredEdgeRegistryService),
+            &DeploymentToolPolicy::default(),
+        );
+        let request = edge_request();
+        let handle =
+            tokio::spawn(async move { service.execute(request, &NoopLocalTransport).await });
+
+        let message = rx.recv().await.expect("edge tool request is delivered");
+        let request_id = match message {
+            astra_server_types::EdgeServerMessage::ToolRequest {
+                request_id, tool, ..
+            } => {
+                assert_eq!(tool, "bash");
+                request_id
+            }
+            other => panic!("expected edge tool request, got {other:?}"),
+        };
+        assert!(pool.deliver_tool_result(
+            "user-1",
+            "edge-selected",
+            &request_id,
+            astra_server_types::edge_connection_pool::EdgeToolResult {
+                output: "ok".to_string(),
+                is_error: false,
+                duration_ms: Some(1),
+                tool_result_fields: None,
+            },
+        ));
+
+        let result = handle.await.expect("edge execution task joins");
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.output, "ok");
+    }
 }

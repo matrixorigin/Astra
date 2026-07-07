@@ -233,7 +233,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             .tool_policy
             .resolve_for_model(effective_model.as_deref());
 
-        let all_schemas = edge_tools::all_tool_schemas();
+        let all_schemas = edge_tools::local_tool_schemas();
         let valid_tool_names = tool_names_from_schemas(&all_schemas);
 
         // Issue #326 P5b: delegate sub-run is headless — strip project
@@ -257,6 +257,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
 
         let executor = edge_tools::ToolExecutor::new(&effective_root)
             .with_cloud(self.api.api_origin(), &self.token);
+        executor.set_cli_local_provider_schemas(all_schemas.clone());
         if !config.session_id.trim().is_empty() {
             executor.set_active_session_id(config.session_id.clone());
         }
@@ -502,7 +503,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             step_signal_collector: None,
             tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
-            server_tool_executor: None,
+            runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
             memory_extraction_service: None,

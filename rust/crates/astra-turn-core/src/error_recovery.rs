@@ -135,6 +135,11 @@ pub fn build_recovery_message(
         && category == ErrorCategory::ToolInvalidArgs
         && (error_lower.contains("missing 'path' parameter")
             || error_lower.contains("missing 'content' parameter"));
+    let task_board_invalid_args = tool_name == "task_board"
+        && matches!(
+            category,
+            ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest
+        );
 
     let mut msg = match category {
         ErrorCategory::Network
@@ -161,6 +166,8 @@ pub fn build_recovery_message(
                 "⚠ ask_user failed: invalid questionnaire arguments. You chose ask_user because user clarification is required. Retry the SAME ask_user tool immediately with corrected questionnaire args. Do NOT continue implementation, guess defaults, or act as if the user already answered. Use a top-level `questions` array, for example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}.".to_string()
             } else if write_file_missing_args {
                 "⚠ write_file failed: invalid arguments. Retry the same tool with both `path` and `content` for writes, or `path` + `delete=true` for deletes. Do NOT switch to bash or python just to write or delete this file.".to_string()
+            } else if task_board_invalid_args {
+                astra_tools::task_tool_contract::task_invalid_args_recovery_message()
             } else {
                 format!(
                     "⚠ {} failed: invalid arguments. \
@@ -701,6 +708,30 @@ mod tests {
         assert!(
             !alts_section.to_lowercase().contains("bash"),
             "bash must not be an alternative"
+        );
+
+        // task missing/invalid action → retry the same structured tool with
+        // the shared action contract instead of switching tools or answering
+        // as if task management succeeded.
+        let err = "Error: missing required parameter `action` for `task_board`.";
+        let cat = classify_error(err);
+        assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
+        let msg = build_recovery_message("task_board", err, cat, &[]);
+        assert!(msg.contains("Retry the same `task_board` tool"));
+        assert!(msg.contains(astra_tools::task_tool_contract::TASK_ACTIONS_DISPLAY));
+        assert!(msg.contains("use only fields allowed for that action"));
+
+        let err = astra_tools::task_tool_contract::unknown_task_field_message(
+            "create",
+            "new_status",
+            astra_tools::task_tool_contract::task_action_allowed_fields("create").unwrap(),
+        );
+        let cat = classify_error(&err);
+        assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
+        let msg = build_recovery_message("task_board", &err, cat, &[]);
+        assert!(
+            msg.contains("action=update with task_id + new_status"),
+            "wrong-action field errors must recover through the task contract: {msg}"
         );
 
         // write_file missing content → editing alternatives

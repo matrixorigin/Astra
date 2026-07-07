@@ -691,13 +691,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &mut surface_report,
     );
 
-    // Plan-mode tool restrictions are owned by the host
-    // (`CliAgenticLoopHost::execute_turn`) using the same
-    // turn-scoped add-then-remove pattern as
-    // `interaction_scoped_tool_restrictions`. Doing it here as a
-    // raw `extend` on the shared `state.restricted_tools` set
-    // leaked names into later turns — see the regression note on
-    // session 19298aea in `cli_loop_host::plan_mode_restriction_names`.
+    // Plan mode is enforced at permission/tool preflight time, not by
+    // mutating `restricted_tools` here. Keeping schema filtering out of
+    // payload assembly avoids plan/default prompt-cache churn and prevents
+    // stale hard restrictions from leaking into later turns.
 
     ctx.executor.set_budget_pressure(budget_pressure);
 
@@ -722,13 +719,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let eligible_surface_schemas = ctx
         .executor
         .runtime_bound_tool_schemas(eligible_surface_schemas);
-    let eligible_external_schemas = ctx
+    let eligible_provider_schemas = ctx
         .executor
-        .runtime_bound_external_schemas_excluding(ctx.restricted_tools);
+        .runtime_bound_provider_owned_schemas_excluding(ctx.restricted_tools);
     let tool_surface = tool_registry::surface::ToolSurface::build_excluding_visible(
         eligible_surface_schemas,
         &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
-        &eligible_external_schemas,
+        &eligible_provider_schemas,
         &final_visible_tool_names,
     );
     let mut activatable_tool_names = HashSet::new();
@@ -2222,7 +2219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_excludes_plan_tools_when_plan_mode_inactive() {
+    async fn prepare_chat_turn_payload_keeps_plan_tools_when_plan_mode_inactive() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -2239,10 +2236,9 @@ mod tests {
             schema("enter_plan_mode"),
             schema("exit_plan_mode"),
         ];
-        // Budget of 2 forces the surface builder to expose only the 2 most relevant tools,
-        // leaving plan-mode escape hatches absent naturally. This makes the test
-        // meaningful: if the `plan_mode_active` guard is accidentally removed, the
-        // injection would add them and the assertion below would fail.
+        // Budget of 2 would normally expose only the 2 most relevant tools.
+        // Plan-control tools are injected regardless of active mode so the
+        // schema surface stays stable across plan/default transitions.
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(2);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let messages = vec![json!({"role": "user", "content": "inspect the repo state"})];

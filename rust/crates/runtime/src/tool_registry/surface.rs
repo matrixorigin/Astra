@@ -16,9 +16,9 @@
 //!
 //! The default T1 candidate set is derived from
 //! `astra_runtime_env::ToolSpec::load_policy`. It intentionally is not the
-//! final visible surface for every access mode: Web/no-workspace runs must hide
-//! workspace/process executor tools, while CLI/edge/sandbox/managed runtimes may
-//! expose them when their provider binding is ready.
+//! final visible surface for every access mode: runs without a file-environment
+//! provider must hide workspace/process executor tools, while CLI/edge/sandbox/
+//! managed runtimes may expose them when their provider binding is ready.
 //! Users can add extra T1 tools via `runtime.tool_surface.pinned_tools` in TOML.
 //!
 //! Implementation is complete and wired into production.

@@ -45,6 +45,42 @@ const CLOUD_CHECKPOINT_COUNT_SQL: &str = "\
     SELECT COUNT(*) AS checkpoint_count \
     FROM session_checkpoints \
     WHERE user_id = ? AND session_id = ? AND state_json IS NULL";
+pub const MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS: i64 = 80;
+pub const PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL: &str = "\
+    SELECT role, content \
+    FROM ( \
+        SELECT sti.item_seq, sti.role, sti.content \
+        FROM session_transcript_items sti \
+        LEFT JOIN agent_runs r \
+          ON r.user_id = sti.user_id \
+         AND r.session_id = sti.session_id \
+         AND r.run_id = sti.run_id \
+        WHERE sti.session_id = ? \
+          AND sti.user_id = ? \
+          AND sti.role IN ('user', 'assistant', 'system') \
+          AND ( \
+              sti.run_id IS NULL \
+              OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
+          ) \
+        ORDER BY sti.item_seq DESC \
+        LIMIT ? \
+    ) recent_prompt_history \
+    ORDER BY item_seq";
+pub const PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL: &str = "\
+    SELECT 1 AS present \
+    FROM session_transcript_items sti \
+    LEFT JOIN agent_runs r \
+      ON r.user_id = sti.user_id \
+     AND r.session_id = sti.session_id \
+     AND r.run_id = sti.run_id \
+    WHERE sti.session_id = ? \
+      AND sti.user_id = ? \
+      AND sti.role IN ('user', 'assistant', 'system') \
+      AND ( \
+          sti.run_id IS NULL \
+          OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
+      ) \
+    LIMIT 1";
 const PUSH_SESSION_STATE_UPSERT_SQL: &str = "INSERT INTO agent_sessions \
              (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
              VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6)) \
@@ -1194,15 +1230,13 @@ impl HybridRestoreService {
             None => return Ok(Vec::new()),
         };
 
-        let rows = sqlx::query(
-            "SELECT role, content FROM session_transcript_items \
-             WHERE session_id = ? AND user_id = ? ORDER BY item_seq",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("restore_cloud_transcript_messages: {e}"))?;
+        let rows = sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("restore_cloud_transcript_messages: {e}"))?;
 
         let mut messages = Vec::new();
         for row in &rows {
@@ -3777,6 +3811,245 @@ mod tests {
                 .to_ascii_uppercase()
                 .contains("COUNT(*)"),
             "checkpoint count must stay a lightweight aggregate"
+        );
+    }
+
+    #[test]
+    fn prompt_history_transcript_query_restores_only_root_conversation_rows() {
+        for sql in [
+            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL,
+            PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL,
+        ] {
+            let upper = sql.to_ascii_uppercase();
+
+            assert!(
+                upper.contains("LEFT JOIN AGENT_RUNS"),
+                "prompt-history transcript restore must classify transcript rows by durable run lineage: {sql}"
+            );
+            assert!(
+                upper.contains("R.SESSION_ID = STI.SESSION_ID"),
+                "run lineage lookup must stay scoped to the same session: {sql}"
+            );
+            assert!(
+                upper.contains("STI.RUN_ID IS NULL"),
+                "system/session transcript rows without a run owner remain restorable: {sql}"
+            );
+            assert!(
+                upper.contains("R.RUN_ID IS NOT NULL") && upper.contains("R.PARENT_RUN_ID IS NULL"),
+                "child/subrun transcript rows must not be restored as main prompt history: {sql}"
+            );
+        }
+        assert!(
+            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL
+                .to_ascii_uppercase()
+                .contains("ORDER BY STI.ITEM_SEQ DESC"),
+            "inner prompt-history transcript query must choose the newest bounded rows first: {PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL}"
+        );
+        assert!(
+            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL
+                .to_ascii_uppercase()
+                .contains("LIMIT ?"),
+            "prompt-history transcript restore must be bounded: {PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL}"
+        );
+        assert!(
+            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL
+                .to_ascii_uppercase()
+                .ends_with("ORDER BY ITEM_SEQ"),
+            "prompt-history transcript restore must preserve transcript order: {PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL}"
+        );
+        assert_eq!(
+            MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS, 80,
+            "transcript fallback is not the canonical log; keep it bounded"
+        );
+    }
+
+    static SESSION_RESTORE_DB: tokio::sync::OnceCell<astra_core::MatrixOneSettings> =
+        tokio::sync::OnceCell::const_new();
+
+    async fn setup_session_restore_db_it() -> astra_core::SharedPool {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored MatrixOne restore tests"
+        );
+        let settings = SESSION_RESTORE_DB
+            .get_or_init(|| async {
+                let settings = astra_core::MatrixOneSettings::from_env();
+                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                    .unwrap_or_else(|_| "mysql".to_string());
+                crate::storage::ensure_core_schema(&settings, &catalog)
+                    .await
+                    .expect("ensure_core_schema");
+                settings
+            })
+            .await
+            .clone();
+        astra_core::SharedPool::new(&settings)
+            .await
+            .expect("SharedPool::new")
+    }
+
+    async fn cleanup_prompt_history_restore_fixture(
+        pool: &astra_core::SharedPool,
+        user_id: &str,
+        session_id: &str,
+    ) {
+        for sql in [
+            "DELETE FROM session_transcript_items WHERE user_id = ? AND session_id = ?",
+            "DELETE FROM agent_runs WHERE user_id = ? AND session_id = ?",
+            "DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+        ] {
+            let _ = sqlx::query(sql)
+                .bind(user_id)
+                .bind(session_id)
+                .execute(pool.get())
+                .await;
+        }
+    }
+
+    async fn insert_prompt_history_restore_session(
+        pool: &astra_core::SharedPool,
+        user_id: &str,
+        session_id: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, status, created_at, updated_at, last_active_at)
+             VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool.get())
+        .await
+        .expect("insert restore fixture session");
+    }
+
+    async fn insert_prompt_history_restore_run(
+        pool: &astra_core::SharedPool,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        depth: i32,
+    ) {
+        let root_run_id = parent_run_id.unwrap_or(run_id);
+        let ancestor_path = match parent_run_id {
+            Some(parent) => format!("{parent}/{run_id}"),
+            None => run_id.to_string(),
+        };
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'completed')",
+        )
+        .bind(run_id)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(parent_run_id)
+        .bind(root_run_id)
+        .bind(ancestor_path)
+        .bind(depth)
+        .execute(pool.get())
+        .await
+        .expect("insert restore fixture run");
+    }
+
+    async fn insert_prompt_history_restore_transcript(
+        pool: &astra_core::SharedPool,
+        user_id: &str,
+        session_id: &str,
+        item_seq: i64,
+        run_id: Option<&str>,
+        role: &str,
+        content: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO session_transcript_items
+             (session_id, item_seq, user_id, run_id, role, content, content_hash, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(session_id)
+        .bind(item_seq)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(role)
+        .bind(content)
+        .bind(format!("fixture:{item_seq}"))
+        .execute(pool.get())
+        .await
+        .expect("insert restore fixture transcript");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn prompt_history_transcript_restore_matches_real_run_lineage_and_limit_on_matrixone() {
+        let pool = setup_session_restore_db_it().await;
+        let user_id = format!("user-{}", uuid::Uuid::new_v4());
+        let session_id = format!("sess-{}", uuid::Uuid::new_v4());
+        let root_run_id = format!("root-{}", uuid::Uuid::new_v4());
+        let child_run_id = format!("child-{}", uuid::Uuid::new_v4());
+        cleanup_prompt_history_restore_fixture(&pool, &user_id, &session_id).await;
+
+        insert_prompt_history_restore_session(&pool, &user_id, &session_id).await;
+        insert_prompt_history_restore_run(&pool, &user_id, &session_id, &root_run_id, None, 0)
+            .await;
+        insert_prompt_history_restore_run(
+            &pool,
+            &user_id,
+            &session_id,
+            &child_run_id,
+            Some(&root_run_id),
+            1,
+        )
+        .await;
+        for seq in 1..=90 {
+            insert_prompt_history_restore_transcript(
+                &pool,
+                &user_id,
+                &session_id,
+                seq,
+                Some(&root_run_id),
+                "user",
+                &format!("root-{seq:02}"),
+            )
+            .await;
+        }
+        insert_prompt_history_restore_transcript(
+            &pool,
+            &user_id,
+            &session_id,
+            905,
+            Some(&child_run_id),
+            "assistant",
+            "child-output-must-not-be-prompt-history",
+        )
+        .await;
+        insert_prompt_history_restore_transcript(
+            &pool,
+            &user_id,
+            &session_id,
+            91,
+            None,
+            "system",
+            "session-note",
+        )
+        .await;
+
+        let service = HybridRestoreService::new(pool.get().clone());
+        let messages = service
+            .restore_cloud_transcript_messages(&user_id, &session_id)
+            .await
+            .expect("restore transcript prompt history");
+
+        cleanup_prompt_history_restore_fixture(&pool, &user_id, &session_id).await;
+
+        assert_eq!(messages.len(), MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize);
+        assert_eq!(messages.first().unwrap()["content"], "root-12");
+        assert_eq!(messages.last().unwrap()["content"], "session-note");
+        assert!(
+            messages.iter().all(|message| {
+                message["content"].as_str() != Some("child-output-must-not-be-prompt-history")
+            }),
+            "child run transcript rows are work-unit output, not main prompt history"
         );
     }
 

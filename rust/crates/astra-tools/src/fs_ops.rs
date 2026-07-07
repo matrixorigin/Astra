@@ -389,6 +389,11 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
             );
         }
     };
+    if let Some(error) =
+        crate::internal_artifacts::internal_tool_result_artifact_access_error("read_file", path_str)
+    {
+        return ToolResult::error(error);
+    }
     let path = match resolve_path(workspace_root, path_str) {
         Ok(p) => p,
         Err(e) => return ToolResult::error(e),
@@ -2554,6 +2559,31 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.output.contains("1\tline1"));
         assert!(result.output.contains("3\tline3"));
+    }
+
+    #[test]
+    fn read_file_rejects_internal_tool_result_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let artifact = tmp
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, "child output").unwrap();
+
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": ".astra/sessions/session-1/tool-results/call_abc.txt"}),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("runtime-owned tool-result artifacts"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("agent_fanout(action='get_results'"));
     }
 
     #[test]

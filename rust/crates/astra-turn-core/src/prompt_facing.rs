@@ -6,13 +6,9 @@
 //! session restore and CSL prompt-materialization boundaries.
 
 use crate::conversation_log::SessionStateCompact;
-use crate::tool::args::shape::tool_call_name;
 use serde_json::{Value, json};
 
 const MAX_PROMPT_FACING_MESSAGES: usize = 40;
-const MAX_TOOL_RECAP_MESSAGES: usize = 8;
-const MAX_TOOL_RESULT_CHARS: usize = 600;
-const TOOL_RECAP_PREFIX: &str = "[Runtime tool result]";
 const RUNTIME_RECAP_PREFIX: &str = "[Session runtime recap]";
 
 pub fn extract_text_content(msg: &Value) -> Option<String> {
@@ -44,16 +40,9 @@ pub fn sanitize_prompt_facing_messages(messages: Vec<Value>) -> Vec<Value> {
     let mut out = Vec::new();
     let start = latest_compaction_boundary_start(&messages).unwrap_or(0);
     let mut has_user_context = false;
-    let mut pending_tool_calls: Vec<ToolCallRef> = Vec::new();
 
     for msg in messages.into_iter().skip(start) {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let recaps = tool_result_recap_messages(&mut pending_tool_calls, &msg);
-        if has_user_context {
-            for recap in recaps {
-                out.push(recap);
-            }
-        }
         if role == "tool" {
             continue;
         }
@@ -62,23 +51,21 @@ pub fn sanitize_prompt_facing_messages(messages: Vec<Value>) -> Vec<Value> {
         }
 
         if role == "assistant" {
-            let calls = extract_tool_calls(&msg);
-            if !calls.is_empty() {
-                pending_tool_calls.extend(calls);
+            if contains_tool_call_frame(&msg) {
                 continue;
             }
         }
 
-        let Some(content) = extract_text_content(&msg) else {
+        let Some(raw_content) = extract_text_content(&msg) else {
+            continue;
+        };
+        let Some(content) = prompt_facing_content_for_role(role, &raw_content) else {
             continue;
         };
         if content.trim().is_empty() {
             continue;
         }
         if role == "system" && content.trim_start().starts_with(RUNTIME_RECAP_PREFIX) {
-            continue;
-        }
-        if crate::runtime_scaffolding::is_continuation_scaffolding_for_role(role, &content) {
             continue;
         }
 
@@ -94,7 +81,6 @@ pub fn sanitize_prompt_facing_messages(messages: Vec<Value>) -> Vec<Value> {
         }
     }
 
-    let out = trim_tool_recaps(out);
     trim_to_recent_messages(out)
 }
 
@@ -107,6 +93,33 @@ pub fn sanitize_prompt_facing_messages_with_state(
         out.push(recap);
     }
     trim_to_recent_messages(out)
+}
+
+pub fn sanitize_user_visible_messages(messages: Vec<Value>) -> Vec<Value> {
+    messages
+        .into_iter()
+        .filter_map(|msg| user_visible_message(&msg))
+        .collect()
+}
+
+pub fn user_visible_message(msg: &Value) -> Option<Value> {
+    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(role, "user" | "assistant" | "system") {
+        return None;
+    }
+    let raw_content = extract_text_content(msg)?;
+    let content = prompt_facing_content_for_role(role, &raw_content)?;
+    if role == "system" && is_prompt_internal_system_text(&content) {
+        return None;
+    }
+    let content = sanitize_user_visible_text(&content);
+    if content.trim().is_empty() {
+        return None;
+    }
+    Some(json!({
+        "role": role,
+        "content": content,
+    }))
 }
 
 pub fn runtime_recap_message(state: &SessionStateCompact) -> Option<Value> {
@@ -165,119 +178,84 @@ fn is_compaction_boundary_text(content: &str) -> bool {
         || trimmed.starts_with("前文上下文已压缩")
 }
 
-#[derive(Debug, Clone)]
-struct ToolCallRef {
-    id: String,
-    name: String,
+fn is_prompt_internal_system_text(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("[Runtime tool result]") || trimmed.starts_with(RUNTIME_RECAP_PREFIX)
 }
 
-fn extract_tool_calls(msg: &Value) -> Vec<ToolCallRef> {
-    let mut calls = Vec::new();
-    if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-        for call in tool_calls {
-            let Some(id) = call.get("id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let name = tool_call_name(call).unwrap_or("unknown_tool");
-            calls.push(ToolCallRef {
-                id: id.to_string(),
-                name: name.to_string(),
-            });
-        }
-    }
-    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-        for block in content {
-            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-                continue;
-            }
-            let Some(id) = block.get("id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let name = tool_call_name(block).unwrap_or("unknown_tool");
-            calls.push(ToolCallRef {
-                id: id.to_string(),
-                name: name.to_string(),
-            });
-        }
-    }
-    calls
-}
-
-fn tool_result_recap_messages(pending: &mut Vec<ToolCallRef>, msg: &Value) -> Vec<Value> {
-    let mut out = Vec::new();
-    if let Some(tool_call_id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
-        if let Some(recap) = tool_result_recap_message(
-            pending,
-            tool_call_id,
-            extract_text_content(msg)
-                .unwrap_or_else(|| msg.get("content").map(Value::to_string).unwrap_or_default()),
-        ) {
-            out.push(recap);
-        }
-    }
-    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-        for block in content {
-            if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
-                continue;
-            }
-            let Some(tool_call_id) = block
-                .get("tool_use_id")
-                .or_else(|| block.get("tool_call_id"))
-                .and_then(|v| v.as_str())
-            else {
-                continue;
-            };
-            let content = extract_tool_result_block_text(block);
-            if let Some(recap) = tool_result_recap_message(pending, tool_call_id, content) {
-                out.push(recap);
-            }
-        }
-    }
-    out
-}
-
-fn tool_result_recap_message(
-    pending: &mut Vec<ToolCallRef>,
-    tool_call_id: &str,
-    content: String,
-) -> Option<Value> {
-    let idx = pending.iter().position(|call| call.id == tool_call_id)?;
-    let call = pending.remove(idx);
-    let snippet = compact_tool_result(&content);
-    if snippet.is_empty() {
+fn prompt_facing_content_for_role(role: &str, content: &str) -> Option<String> {
+    let content = if role == "user" {
+        crate::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(content)
+    } else {
+        content.trim().to_string()
+    };
+    if content.trim().is_empty() {
         return None;
     }
-    Some(json!({
-        "role": "system",
-        "content": format!("{TOOL_RECAP_PREFIX}\n{}: {}", call.name, snippet),
-    }))
+    if crate::runtime_scaffolding::is_continuation_scaffolding_for_role(role, &content) {
+        return None;
+    }
+    Some(content)
 }
 
-fn extract_tool_result_block_text(block: &Value) -> String {
-    match block.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(items)) => items
+fn contains_tool_call_frame(msg: &Value) -> bool {
+    if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+        return !tool_calls.is_empty();
+    }
+    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+        return content
             .iter()
-            .filter_map(|item| {
-                item.get("text")
-                    .or_else(|| item.get("content"))
-                    .and_then(Value::as_str)
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Some(other) => other.to_string(),
-        None => String::new(),
+            .any(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
     }
+    false
 }
 
-fn compact_tool_result(content: &str) -> String {
-    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= MAX_TOOL_RESULT_CHARS {
-        return normalized;
+fn sanitize_user_visible_text(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            strip_escape_sequence(&mut chars);
+            continue;
+        }
+        if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+            continue;
+        }
+        out.push(ch);
     }
-    let mut out: String = normalized.chars().take(MAX_TOOL_RESULT_CHARS).collect();
-    out.push_str("...");
-    out
+    out.trim().to_string()
+}
+
+fn strip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    match chars.peek().copied() {
+        Some('[') => {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ('@'..='~').contains(&ch) {
+                    break;
+                }
+            }
+        }
+        Some(']') => {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '\u{7}' {
+                    break;
+                }
+                if ch == '\u{1b}' && chars.peek().copied() == Some('\\') {
+                    chars.next();
+                    break;
+                }
+            }
+        }
+        Some(_) => {
+            chars.next();
+        }
+        None => {}
+    }
 }
 
 fn trim_to_recent_messages(mut messages: Vec<Value>) -> Vec<Value> {
@@ -288,39 +266,11 @@ fn trim_to_recent_messages(mut messages: Vec<Value>) -> Vec<Value> {
     messages
 }
 
-fn trim_tool_recaps(messages: Vec<Value>) -> Vec<Value> {
-    let total = messages
-        .iter()
-        .filter(|msg| is_prefixed_system_message(msg, TOOL_RECAP_PREFIX))
-        .count();
-    if total <= MAX_TOOL_RECAP_MESSAGES {
-        return messages;
-    }
-    let mut remaining_to_drop = total - MAX_TOOL_RECAP_MESSAGES;
-    messages
-        .into_iter()
-        .filter(|msg| {
-            if remaining_to_drop > 0 && is_prefixed_system_message(msg, TOOL_RECAP_PREFIX) {
-                remaining_to_drop -= 1;
-                return false;
-            }
-            true
-        })
-        .collect()
-}
-
-fn is_prefixed_system_message(msg: &Value, prefix: &str) -> bool {
-    msg.get("role").and_then(|v| v.as_str()) == Some("system")
-        && extract_text_content(msg)
-            .map(|content| content.trim_start().starts_with(prefix))
-            .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         runtime_recap_message, sanitize_prompt_facing_messages,
-        sanitize_prompt_facing_messages_with_state,
+        sanitize_prompt_facing_messages_with_state, sanitize_user_visible_messages,
     };
     use crate::conversation_log::{DelegationCompact, SessionStateCompact};
     use serde_json::json;
@@ -341,14 +291,13 @@ mod tests {
             got,
             vec![
                 json!({"role": "user", "content": "fix it"}),
-                json!({"role": "system", "content": "[Runtime tool result]\nread_file: file"}),
                 json!({"role": "assistant", "content": "done"}),
             ]
         );
     }
 
     #[test]
-    fn tool_recap_canonicalizes_tool_call_names() {
+    fn tool_results_do_not_become_prompt_facing_system_messages() {
         let messages = vec![
             json!({"role": "user", "content": "inspect"}),
             json!({"role": "assistant", "tool_calls": [
@@ -361,14 +310,7 @@ mod tests {
 
         let got = sanitize_prompt_facing_messages(messages);
 
-        assert_eq!(
-            got,
-            vec![
-                json!({"role": "user", "content": "inspect"}),
-                json!({"role": "system", "content": "[Runtime tool result]\nread_file: file"}),
-                json!({"role": "system", "content": "[Runtime tool result]\nunknown_tool: blank-name result"}),
-            ]
-        );
+        assert_eq!(got, vec![json!({"role": "user", "content": "inspect"})]);
     }
 
     #[test]
@@ -476,6 +418,60 @@ mod tests {
     }
 
     #[test]
+    fn preserves_real_user_text_after_leading_system_reminder() {
+        let messages = vec![
+            json!({"role": "user", "content": "<system-reminder>\n## Session Memory Advisory\nstale memory\n</system-reminder>\n\n你知道我们之前做什么？"}),
+            json!({"role": "assistant", "content": "We reviewed the branch."}),
+        ];
+
+        let got = sanitize_prompt_facing_messages(messages);
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "你知道我们之前做什么？"}),
+                json!({"role": "assistant", "content": "We reviewed the branch."}),
+            ]
+        );
+    }
+
+    #[test]
+    fn strips_trailing_system_reminder_without_mutating_user_text() {
+        let messages = vec![
+            json!({"role": "user", "content": "继续修复\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            json!({"role": "assistant", "content": "Continuing."}),
+        ];
+
+        let got = sanitize_prompt_facing_messages(messages);
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "继续修复"}),
+                json!({"role": "assistant", "content": "Continuing."}),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_user_suffix_after_legacy_leading_resume_hint() {
+        let messages = vec![
+            json!({"role": "user", "content": "[session-resume:v1]\nResume context hydration was requested but no prior prompt-facing history could be restored.\nReason: degraded\nTreat this as a degraded resume.\n\n之前我说的话？"}),
+            json!({"role": "assistant", "content": "I should recover the journal."}),
+        ];
+
+        let got = sanitize_prompt_facing_messages(messages);
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "之前我说的话？"}),
+                json!({"role": "assistant", "content": "I should recover the journal."}),
+            ]
+        );
+    }
+
+    #[test]
     fn anthropic_style_tool_blocks_are_compacted_without_provider_frames() {
         let messages = vec![
             json!({"role": "user", "content": "inspect"}),
@@ -501,14 +497,13 @@ mod tests {
             got,
             vec![
                 json!({"role": "user", "content": "inspect"}),
-                json!({"role": "system", "content": "[Runtime tool result]\nread_file: line 1"}),
                 json!({"role": "assistant", "content": "done"}),
             ]
         );
     }
 
     #[test]
-    fn tool_result_recaps_are_bounded_and_compacted() {
+    fn tool_result_rounds_are_dropped_instead_of_recap_injected() {
         let mut messages = vec![json!({"role": "user", "content": "inspect"})];
         for i in 0..12 {
             messages.push(json!({
@@ -523,15 +518,8 @@ mod tests {
         }
 
         let got = sanitize_prompt_facing_messages(messages);
-        let recaps: Vec<_> = got
-            .iter()
-            .filter_map(|msg| msg["content"].as_str())
-            .filter(|content| content.starts_with("[Runtime tool result]"))
-            .collect();
 
-        assert_eq!(recaps.len(), 8);
-        assert!(recaps[0].contains("match 4"));
-        assert!(recaps.iter().all(|content| content.len() < 700));
+        assert_eq!(got, vec![json!({"role": "user", "content": "inspect"})]);
     }
 
     #[test]
@@ -581,5 +569,29 @@ mod tests {
         let recap = got[1]["content"].as_str().unwrap();
         assert!(recap.contains("Recent tools: bash"));
         assert!(!recap.contains("stale"));
+    }
+
+    #[test]
+    fn user_visible_messages_drop_prompt_internal_recaps_and_control_bytes() {
+        let messages = vec![
+            json!({"role": "user", "content": "hello\u{0}"}),
+            json!({"role": "system", "content": "[Runtime tool result]\nread_file: secret trace"}),
+            json!({"role": "system", "content": "[Session runtime recap]\nRecent tools: bash"}),
+            json!({"role": "tool", "content": "raw tool output"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "assistant", "content": "\u{1b}[31mdone\u{1b}[0m"}),
+            json!({"role": "system", "content": "visible status"}),
+        ];
+
+        let got = sanitize_user_visible_messages(messages);
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "hello"}),
+                json!({"role": "assistant", "content": "done"}),
+                json!({"role": "system", "content": "visible status"}),
+            ]
+        );
     }
 }

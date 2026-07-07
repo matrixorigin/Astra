@@ -22,11 +22,21 @@ vi.mock("@/lib/runtime-client", () => ({
   RuntimeClientError: class RuntimeClientError extends Error {
     status?: number;
     detail: string;
+    code?: string;
 
-    constructor({ status, detail }: { status?: number; detail: string }) {
+    constructor({
+      status,
+      detail,
+      code,
+    }: {
+      status?: number;
+      detail: string;
+      code?: string;
+    }) {
       super(detail);
       this.status = status;
       this.detail = detail;
+      this.code = code;
     }
   },
   WebRuntimeClient: class WebRuntimeClient {},
@@ -120,13 +130,14 @@ function waitForStreamWork(ms = 0) {
 }
 
 async function waitUntil(predicate: () => boolean) {
-  for (let index = 0; index < 20; index += 1) {
-    if (predicate()) {
-      return;
-    }
-    await waitForStreamWork(0);
-  }
-  throw new Error("condition was not met");
+  await vi.waitFor(
+    () => {
+      if (!predicate()) {
+        throw new Error("condition was not met");
+      }
+    },
+    { interval: 5, timeout: 1000 },
+  );
 }
 
 const connectedEdge = {
@@ -308,7 +319,7 @@ describe("chat stream route proxy cancellation", () => {
       "chat-1",
       undefined,
     );
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
       "user-a",
       "chat-1",
       "assistant-1",
@@ -376,13 +387,138 @@ describe("chat stream route proxy cancellation", () => {
         waitingFor: "executor_offline",
       }),
     );
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
       "user-a",
       "chat-1",
       "assistant-1",
       expect.objectContaining({
         content: "Edge executor MacBook Pro is offline.",
         status: "streaming",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ status: "failed" }),
+    );
+  });
+
+  it("rejects explicit paths outside the selected edge workspace before opening a backend run", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "review /Users/test/other/src/lib.rs",
+          workspace: {
+            kind: "edge_workspace",
+            edgeAgentId: "edge-1",
+            displayName: "MacBook Pro",
+            cwd: "/Users/test/astra",
+          },
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    await expect(response.json()).resolves.toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The referenced path is outside the selected file environment: /Users/test/other/src/lib.rs. Choose the environment that contains it or use a path inside the current one.",
+    });
+    expect(response.status).toBe(409);
+    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
+    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
+  });
+
+  it("rejects explicit host paths on server sandbox before opening a backend run", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "read /etc/passwd",
+          workspace: { kind: "server_sandbox" },
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    await expect(response.json()).resolves.toEqual({
+      code: "workspace_path_mismatch",
+      error:
+        "The selected Server sandbox is an isolated workspace and cannot access host path: /etc/passwd. Use a relative path inside the sandbox, or select an Edge workspace rooted at that host path.",
+    });
+    expect(response.status).toBe(409);
+    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
+    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
+  });
+
+  it("ignores malformed event indexes without aborting an otherwise valid backend stream", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendFrameStream([
+      'data: {"type":"run_started","run_id":"run-soft","index":"bad"}\n\n',
+      'data: {"type":"text_done","full_text":"done"}\n\n',
+    ]);
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: vi.fn().mockResolvedValue({
+        ok: true,
+        body: backend.body,
+      }),
+    } as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "hello",
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    for (;;) {
+      const { done } = await reader!.read();
+      if (done) {
+        break;
+      }
+    }
+
+    expect(backend.cancel).not.toHaveBeenCalled();
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "done",
+        status: "complete",
       }),
     );
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
@@ -616,7 +752,7 @@ describe("chat stream route proxy cancellation", () => {
       new Request("http://web.test/api/chats/chat-1/stream", {
         method: "POST",
         body: JSON.stringify({
-          content: "review ~/project",
+          content: "summarize the current plan",
           options: {
             model: "sonnet-4.6-adaptive",
             webSearch: false,
@@ -643,14 +779,14 @@ describe("chat stream route proxy cancellation", () => {
       expect.objectContaining({
         workspace_binding: {
           kind: "none",
-          display_name: "Astra",
+          display_name: "Web",
           authority: "none",
           fallback_policy: "disabled",
         },
         executor_binding: {
           kind: "server_local",
           executor_id: "server-control-plane",
-          display_name: "Astra",
+          display_name: "Server control plane",
           transport: "server_local",
           status: "online",
         },
@@ -659,6 +795,35 @@ describe("chat stream route proxy cancellation", () => {
     expect(runtime.get).not.toHaveBeenCalled();
 
     await reader?.cancel();
+  });
+
+  it("rejects invalid file environment selections before starting a run", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "review the current branch",
+          workspace: { kind: "unknown_environment" },
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({
+      error: "workspace must be a valid file environment selection",
+      code: "invalid_workspace_selection",
+    });
+    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
+    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
   });
 
   it("streams local-code prompts when server sandbox is explicitly selected", async () => {
@@ -825,14 +990,15 @@ describe("chat stream route proxy cancellation", () => {
     const second = await reader!.read();
     const secondText = new TextDecoder().decode(second.value);
     expect(secondText).toContain('"type":"error"');
-    expect(secondText).toContain("Server fallback is disabled");
+    expect(secondText).toContain('"code":"workspace_edge_unavailable"');
+    expect(secondText).toContain("No alternate execution provider");
     expect(runtime.fetchResponse).not.toHaveBeenCalled();
     expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
       "user-a",
       "chat-1",
       "assistant-1",
       expect.objectContaining({
-        content: expect.stringContaining("Server fallback is disabled"),
+        content: expect.stringContaining("No alternate execution provider"),
         status: "failed",
       }),
     );
@@ -1059,6 +1225,97 @@ describe("chat stream route proxy cancellation", () => {
           kind: "edge_agent",
           executor_id: "edge-1",
         }),
+      }),
+    );
+    await reader?.cancel();
+  });
+
+  it("rejects a recovered pending turn when its edge provider id is stale", async () => {
+    const storedWorkspace = {
+      kind: "edge_workspace" as const,
+      edgeAgentId: "edge-old-random",
+      displayName: "MacBook Pro",
+      cwd: "/Users/test/astra",
+    };
+    mockGetChat.mockReturnValue({
+      chat: {
+        id: "chat-1",
+        title: "Chat",
+        projectId: null,
+        createdAt: "2026-06-07T00:00:00.000Z",
+        updatedAt: "2026-06-07T00:00:00.000Z",
+        archivedAt: null,
+        model: "sonnet-4.6-adaptive",
+      },
+      messages: [
+        {
+          id: "pending-user-1",
+          role: "user" as const,
+          content: "review this repo",
+          createdAt: "2026-06-07T00:00:00.000Z",
+          status: "complete" as const,
+        },
+      ],
+      pendingTurn: {
+        messageId: "pending-user-1",
+        content: "review this repo",
+        options: {
+          model: "sonnet-4.6-adaptive",
+          webSearch: false,
+          thinking: true,
+          activeSkills: [],
+        },
+      },
+      workspaceSelection: storedWorkspace,
+    });
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendStream();
+    const runtime = makeRuntimeWithEdgeStatus(backend, [
+      {
+        edge_agent_id: "edge-new-stable",
+        hostname: "MacBook Pro",
+        workspace_dir: "/Users/test/astra",
+        connected_secs: 1,
+      },
+    ]);
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(mockBeginStreamingMessage).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        workspaceSelection: storedWorkspace,
+      }),
+    );
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const first = await reader!.read();
+    expect(new TextDecoder().decode(first.value)).toContain(
+      '"type":"local_messages"',
+    );
+    const second = await reader!.read();
+    const secondText = new TextDecoder().decode(second.value);
+    expect(secondText).toContain('"type":"error"');
+    expect(secondText).toContain('"code":"workspace_edge_stale_selection"');
+    expect(secondText).toContain("No alternate execution provider");
+    expect(runtime.fetchResponse).not.toHaveBeenCalled();
+    expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: expect.stringContaining("No alternate execution provider"),
+        status: "failed",
       }),
     );
     await reader?.cancel();
@@ -1528,6 +1785,73 @@ describe("chat existing run stream route", () => {
       "assistant-1",
       expect.objectContaining({
         content: expect.stringContaining("wrong-session"),
+        status: "failed",
+      }),
+    );
+  });
+
+  it("fails the local run state when a backend stream event has a malformed cursor", async () => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendFrameStream([
+      'data: {"type":"session_info","session_id":"runtime-session-1","run_id":"run-1"}\n\n',
+      'data: {"type":"run_input_queued","run_id":"run-1","index":"4"}\n\n',
+      'data: {"type":"text_done","full_text":"should not win"}\n\n',
+    ]);
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: vi.fn().mockResolvedValue({
+        ok: true,
+        body: backend.body,
+      }),
+    } as never);
+    const request = new Request(
+      "http://web.test/api/chats/web-chat-1/stream?runId=run-1",
+      { method: "GET" },
+    );
+    Object.defineProperty(request, "nextUrl", {
+      value: new URL("http://web.test/api/chats/web-chat-1/stream?runId=run-1"),
+    });
+
+    const response = await GET(request as never, {
+      params: Promise.resolve({ chatId: "web-chat-1" }),
+    });
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    let body = "";
+    for (;;) {
+      const { done, value } = await reader!.read();
+      if (done) {
+        break;
+      }
+      body += new TextDecoder().decode(value);
+    }
+
+    expect(body).not.toContain("Malformed stream event index.");
+    expect(body).toContain("should not win");
+    expect(backend.cancel).not.toHaveBeenCalled();
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "web-chat-1",
+      undefined,
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "web-chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "should not win",
+        status: "complete",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
+      "user-a",
+      "web-chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "Malformed stream event index.",
         status: "failed",
       }),
     );

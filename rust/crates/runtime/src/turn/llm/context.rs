@@ -747,7 +747,7 @@ pub(crate) fn assemble_bridge_context(
                     "provider": input.session.provider,
                     "resolved": true,
                 },
-                "runtime_profile": "bridge_inprocess",
+                "runtime_profile": astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
             })),
         },
     }
@@ -1069,6 +1069,7 @@ fn classify_pipeline_abort(
 /// paths can share the same message ordering and cache-sensitive volatile
 /// placement instead of each host rebuilding this logic.
 pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Value> {
+    queue_active_turn_frame(input.state);
     let drained = input.state.take_volatile_pending();
 
     let mut skills: Vec<_> = input.state.skills.invoked.values().collect();
@@ -1101,17 +1102,97 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
     )
 }
 
+fn queue_active_turn_frame(state: &mut AgenticLoopState) {
+    let latest_user_message = state.message.trim();
+    if latest_user_message.is_empty() {
+        return;
+    }
+    let frame = json!({
+        "latest_user_message": latest_user_message,
+        "active_goal": latest_user_message,
+        "turn_id": state.session_turn,
+        "round_id": state.llm_rounds_completed,
+        "instruction": "Answer the latest user message first. History, memory, and tool results are evidence for this goal; do not finish with an answer to an older question."
+    });
+    state.push_volatile(
+        crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
+        format!("[active-turn-frame:v1]\n{frame}\n[/active-turn-frame]"),
+    );
+}
+
 /// Apply provider-specific cache annotations to the final visible tool schemas.
 pub(crate) fn annotate_tool_schemas_for_cache(
     tool_schemas: &mut [Value],
     cache_cfg: &PromptCacheConfig,
     always_load_names: &std::collections::HashSet<String>,
 ) {
+    canonicalize_tool_schemas_for_wire(tool_schemas);
+    stabilize_tool_schema_wire_order(tool_schemas, always_load_names);
     crate::turn::prompt_cache::annotate_tool_schemas_for_caching_with_always_load(
         tool_schemas,
         cache_cfg,
         always_load_names,
     );
+    canonicalize_tool_schemas_for_wire(tool_schemas);
+}
+
+fn stabilize_tool_schema_wire_order(
+    tool_schemas: &mut [Value],
+    always_load_names: &std::collections::HashSet<String>,
+) {
+    tool_schemas.sort_by(|left, right| {
+        let left_name = tool_name(left);
+        let right_name = tool_name(right);
+        let left_bucket = tool_schema_wire_bucket(left_name, always_load_names);
+        let right_bucket = tool_schema_wire_bucket(right_name, always_load_names);
+        left_bucket
+            .cmp(&right_bucket)
+            .then_with(|| left_name.unwrap_or("").cmp(right_name.unwrap_or("")))
+            .then_with(|| {
+                serde_json::to_string(left)
+                    .unwrap_or_default()
+                    .cmp(&serde_json::to_string(right).unwrap_or_default())
+            })
+    });
+}
+
+fn tool_schema_wire_bucket(
+    name: Option<&str>,
+    always_load_names: &std::collections::HashSet<String>,
+) -> u8 {
+    match name {
+        Some(name) if always_load_names.contains(name) => 0,
+        Some(_) => 1,
+        None => 2,
+    }
+}
+
+fn canonicalize_tool_schemas_for_wire(tool_schemas: &mut [Value]) {
+    for schema in tool_schemas {
+        canonicalize_json_for_wire(schema);
+    }
+}
+
+fn canonicalize_json_for_wire(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                canonicalize_json_for_wire(item);
+            }
+        }
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
+            entries.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+
+            let mut canonical = Map::new();
+            for (key, mut value) in entries {
+                canonicalize_json_for_wire(&mut value);
+                canonical.insert(key, value);
+            }
+            *map = canonical;
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 pub(crate) fn stabilize_tool_schemas_for_cache(
@@ -1132,6 +1213,7 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
     }
 
     let visible_names: HashSet<&str> = visible_tool_schemas.iter().filter_map(tool_name).collect();
+    let current_names: HashSet<&str> = current_tool_schemas.iter().filter_map(tool_name).collect();
     let mut stabilized = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1139,7 +1221,7 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
         let Some(name) = tool_name(schema) else {
             continue;
         };
-        if visible_names.contains(name) {
+        if visible_names.contains(name) && current_names.contains(name) {
             push_unique_tool(&mut stabilized, &mut seen, schema);
         }
     }
@@ -1286,6 +1368,140 @@ mod context_cache_contract_tests {
             .collect()
     }
 
+    fn message_text(message: &Value) -> String {
+        match message.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
+    }
+
+    fn tool_with_parameter_insert_order(name: &str, parameter_names: &[&str]) -> Value {
+        let mut properties = Map::new();
+        for parameter_name in parameter_names {
+            properties.insert(
+                (*parameter_name).to_string(),
+                json!({"type": "string", "description": format!("{name} {parameter_name}")}),
+            );
+        }
+
+        let mut parameters = Map::new();
+        parameters.insert("properties".to_string(), Value::Object(properties));
+        parameters.insert("type".to_string(), Value::String("object".to_string()));
+
+        let mut function = Map::new();
+        function.insert("parameters".to_string(), Value::Object(parameters));
+        function.insert(
+            "description".to_string(),
+            Value::String(format!("tool {name}")),
+        );
+        function.insert("name".to_string(), Value::String(name.to_string()));
+
+        let mut schema = Map::new();
+        schema.insert("function".to_string(), Value::Object(function));
+        schema.insert("type".to_string(), Value::String("function".to_string()));
+        Value::Object(schema)
+    }
+
+    fn strict_history_cache_capability() -> astra_turn_core::cache_placement::CacheCapability {
+        astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        }
+    }
+
+    #[test]
+    fn final_tool_wire_list_is_byte_stable_across_input_order() {
+        let mut left = vec![tool("aaa_dynamic"), tool("read_file"), tool("bash")];
+        let mut right = vec![tool("bash"), tool("aaa_dynamic"), tool("read_file")];
+        let always_load_names = HashSet::from(["bash".to_string(), "read_file".to_string()]);
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+
+        annotate_tool_schemas_for_cache(&mut left, &cache_cfg, &always_load_names);
+        annotate_tool_schemas_for_cache(&mut right, &cache_cfg, &always_load_names);
+
+        assert_eq!(tool_names(&left), vec!["bash", "read_file", "aaa_dynamic"]);
+        assert_eq!(tool_names(&right), tool_names(&left));
+        assert_eq!(
+            serde_json::to_vec(&left).expect("tool list serializes"),
+            serde_json::to_vec(&right).expect("tool list serializes"),
+            "final tool list must be byte-stable for the same CLI/provider surface"
+        );
+        assert!(left[0].get("cache_control").is_none());
+        assert_eq!(
+            left[1]["cache_control"]["type"].as_str(),
+            Some("ephemeral"),
+            "cache marker stays on the last always-load tool in the stable prefix"
+        );
+        assert!(left[2].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn final_tool_wire_list_is_byte_stable_across_multi_round_cli_surface() {
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let always_load_names = HashSet::from(["bash".to_string(), "read_file".to_string()]);
+        let round_zero_current = vec![
+            tool_with_parameter_insert_order("read_file", &["path", "offset"]),
+            tool_with_parameter_insert_order("aaa_dynamic", &["query", "limit"]),
+            tool_with_parameter_insert_order("bash", &["cmd", "timeout"]),
+        ];
+        let round_zero_visible = round_zero_current.clone();
+        let round_zero_sticky = stabilize_tool_schemas_for_cache(
+            &round_zero_current,
+            &[],
+            &round_zero_visible,
+            strict_history_cache_capability(),
+            0,
+        );
+        let mut round_zero_wire = round_zero_sticky.clone();
+        annotate_tool_schemas_for_cache(&mut round_zero_wire, &cache_cfg, &always_load_names);
+
+        let round_one_current = vec![
+            tool_with_parameter_insert_order("bash", &["timeout", "cmd"]),
+            tool_with_parameter_insert_order("read_file", &["offset", "path"]),
+            tool_with_parameter_insert_order("aaa_dynamic", &["limit", "query"]),
+        ];
+        let round_one_visible = round_one_current.clone();
+        let mut round_one_wire = stabilize_tool_schemas_for_cache(
+            &round_one_current,
+            &round_zero_sticky,
+            &round_one_visible,
+            strict_history_cache_capability(),
+            1,
+        );
+        annotate_tool_schemas_for_cache(&mut round_one_wire, &cache_cfg, &always_load_names);
+
+        assert_eq!(
+            tool_names(&round_zero_wire),
+            vec!["bash", "read_file", "aaa_dynamic"]
+        );
+        assert_eq!(tool_names(&round_one_wire), tool_names(&round_zero_wire));
+        assert_eq!(
+            serde_json::to_vec(&round_zero_wire).expect("round zero tools serialize"),
+            serde_json::to_vec(&round_one_wire).expect("round one tools serialize"),
+            "a stable CLI/provider surface must produce byte-identical final tool lists across rounds"
+        );
+        assert!(round_one_wire[0].get("cache_control").is_none());
+        assert_eq!(
+            round_one_wire[1]["cache_control"]["type"].as_str(),
+            Some("ephemeral"),
+            "the cache marker remains on the deterministic always-load prefix boundary"
+        );
+        assert!(round_one_wire[2].get("cache_control").is_none());
+    }
+
     #[test]
     fn effective_tool_schemas_merges_priority_dedupes_and_filters_restricted() {
         let visible = vec![tool("visible_a"), tool("always_load_a"), tool("dynamic_a")];
@@ -1377,6 +1593,64 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn assemble_wire_messages_auto_injects_active_turn_frame() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.message = "相关的测试够硬核吗？".to_string();
+        state.session_turn = 7;
+        state.llm_rounds_completed = 3;
+        state.messages = vec![
+            json!({"role": "user", "content": "一共多少 changes？"}),
+            json!({"role": "assistant", "content": "148 files"}),
+            json!({"role": "user", "content": "相关的测试够硬核吗？"}),
+        ];
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let edge_profile = Map::new();
+        let cache_cfg = PromptCacheConfig::latch("openai", "gpt-4");
+
+        let messages = assemble_wire_messages(LlmWireAssemblyInput {
+            system_messages: vec![json!({"role": "system", "content": "sys"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state: &mut state,
+            thinking: &thinking,
+            edge_profile: &edge_profile,
+            session_id: "sid",
+            provider: "openai",
+            model_name: "gpt-4",
+            cache_capability: None,
+            cache_cfg: &cache_cfg,
+        });
+
+        let user_text = messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(user_text.contains("相关的测试够硬核吗"));
+        assert!(
+            user_text.contains("[active-turn-frame:v1]"),
+            "runtime goal frame must be appended after the real tail user intent"
+        );
+        assert!(user_text.contains("\"turn_id\":7"));
+        assert!(user_text.contains("\"round_id\":3"));
+        let system_text = messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !system_text.contains("[active-turn-frame:v1]"),
+            "active-turn runtime context must not require a provider-invalid post-history system role"
+        );
+        assert!(
+            state.volatile_pending.is_empty(),
+            "active frame must be one-shot per LLM request"
+        );
+    }
+
+    #[test]
     fn assemble_bridge_context_reports_configured_context_window() {
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1407,10 +1681,15 @@ mod context_cache_contract_tests {
             json!(1_000_000),
             "bridge context assembly must preserve the resolved model context_window"
         );
+        assert_eq!(
+            output.manifest_trace.to_json()["runtime_manifest"]["runtime_profile"],
+            astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
+            "the /chat/turn adapter must surface CLI local capacity, not an implementation class name"
+        );
     }
 
     #[test]
-    fn stabilize_tool_schemas_keeps_prior_tools_visible_mid_turn() {
+    fn stabilize_tool_schemas_does_not_restore_currently_pruned_tools_mid_turn() {
         let visible = vec![tool("bash"), tool("read_file"), tool("git")];
         let previous = vec![tool("bash"), tool("read_file"), tool("git")];
         let current = vec![tool("bash"), tool("read_file")];
@@ -1430,7 +1709,7 @@ mod context_cache_contract_tests {
             1,
         );
 
-        assert_eq!(tool_names(&stabilized), vec!["bash", "read_file", "git"]);
+        assert_eq!(tool_names(&stabilized), vec!["bash", "read_file"]);
     }
 
     #[test]

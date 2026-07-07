@@ -60,6 +60,16 @@ pub struct IntrospectSnapshot {
     /// began.
     #[serde(default)]
     pub lifecycle_summary: String,
+    /// Capacity-provider coverage for this runtime surface. This is separate
+    /// from data coverage: it describes which execution/provider classes are
+    /// ready, unbound, degraded, or unavailable for tool visibility.
+    #[serde(default)]
+    pub capacity_provider_coverage: Vec<CapacityProviderCoverageEntry>,
+    /// Per-tool admission decisions for the current runtime surface. This is
+    /// runtime metadata for introspect/UI/audit only; prompt-visible tool
+    /// schemas remain canonical and do not include provider placement.
+    #[serde(default)]
+    pub tool_admission: Vec<ToolAdmissionSnapshotEntry>,
     /// Provider-reported input token total for this snapshot. This includes
     /// fresh input tokens, cached-read input tokens, and cache-creation tokens.
     pub total_input_tokens: u64,
@@ -238,6 +248,42 @@ pub struct CircuitBreakerSnapshot {
     pub consecutive_failures: u64,
 }
 
+pub use astra_runtime_env::CapacityProviderCoverageEntry;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolAdmissionSnapshotEntry {
+    pub tool_name: String,
+    pub visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_offer_id: Option<String>,
+    pub selected_route: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_reason: Option<String>,
+    #[serde(default)]
+    pub candidates: Vec<ToolAdmissionCandidateSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolAdmissionCandidateSnapshotEntry {
+    pub offer_id: String,
+    pub provider_type: String,
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub executor_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub placement: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authority: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schema_digest: String,
+    pub route: String,
+    pub readiness: String,
+    pub selected: bool,
+    pub reason: String,
+}
+
 /// Text output depth chosen from the normalized observation-plane request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntrospectTextDepth {
@@ -330,6 +376,14 @@ fn render_hint(s: &IntrospectSnapshot) -> String {
         out.push_str(" model=");
         out.push_str(model);
     }
+    if !s.capacity_provider_coverage.is_empty() {
+        out.push_str(" providers=");
+        out.push_str(&capacity_provider_inline_summary(s));
+    }
+    if !s.tool_admission.is_empty() {
+        out.push_str(" tool_admission=");
+        out.push_str(&tool_admission_inline_summary(s));
+    }
     out
 }
 
@@ -379,6 +433,11 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
             ));
         }
     }
+    if !s.capacity_provider_coverage.is_empty() {
+        out.push_str("Capacity providers: ");
+        out.push_str(&capacity_provider_inline_summary(s));
+        out.push('\n');
+    }
     if !s.alerts.is_empty() {
         out.push_str("Alerts:\n");
         for alert in s.alerts.iter().take(3) {
@@ -398,7 +457,60 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
         out.push_str(&s.lifecycle_summary);
         out.push('\n');
     }
+    if !s.tool_admission.is_empty() {
+        out.push_str(&format!(
+            "Tool admission: {}\n",
+            tool_admission_inline_summary(s)
+        ));
+    }
     out.trim_end().to_string()
+}
+
+fn capacity_provider_inline_summary(s: &IntrospectSnapshot) -> String {
+    capacity_provider_coverage_summary(&s.capacity_provider_coverage)
+}
+
+fn tool_admission_inline_summary(s: &IntrospectSnapshot) -> String {
+    let total = s.tool_admission.len();
+    let visible = s
+        .tool_admission
+        .iter()
+        .filter(|entry| entry.visible)
+        .count();
+    let hidden = total.saturating_sub(visible);
+    format!("visible={visible}/{total} hidden={hidden}")
+}
+
+pub fn capacity_provider_coverage_summary(coverage: &[CapacityProviderCoverageEntry]) -> String {
+    coverage
+        .iter()
+        .map(capacity_provider_coverage_entry_summary)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn capacity_provider_coverage_entry_summary(
+    provider: &CapacityProviderCoverageEntry,
+) -> String {
+    let mut label = format!("{}:{}", provider.provider_type, provider.status);
+    if let Some(reason) = provider.unavailable_reason.as_deref() {
+        label.push_str(" (");
+        label.push_str(capacity_provider_unavailable_text(reason));
+        label.push(')');
+    }
+    label
+}
+
+fn capacity_provider_unavailable_text(reason: &str) -> &str {
+    match reason {
+        "no_workspace_provider_bound" => "workspace executor not bound",
+        "no_executor_provider_bound" => "executor provider not bound",
+        "executor_offline" => "executor offline",
+        "executor_status_unknown" => "executor status unknown",
+        "no_request_scoped_mcp_provider_bound" => "request-scoped MCP provider not bound",
+        "no_request_scoped_mcp_runtime_binding" => "request-scoped MCP runtime not bound",
+        _ => "provider unavailable",
+    }
 }
 
 pub fn turn_budget_label(s: &IntrospectSnapshot) -> String {
@@ -873,6 +985,8 @@ mod tests {
             lifecycle_summary:
                 "### Turn-start session execution state\nresume pending: [plan-resume] goal=\"Fix auth\""
                     .into(),
+            capacity_provider_coverage: Vec::new(),
+            tool_admission: Vec::new(),
             total_input_tokens: 145_000,
             total_output_tokens: 12_000,
             cache_read_tokens: 95_000,
@@ -936,6 +1050,61 @@ mod tests {
         assert!(output.contains("## Tool Health"));
         assert!(output.contains("| bash |"));
         assert!(output.contains("| read_file |"));
+    }
+
+    #[test]
+    fn summary_and_json_include_tool_admission_metadata() {
+        let snap = IntrospectSnapshot {
+            tool_admission: vec![ToolAdmissionSnapshotEntry {
+                tool_name: "web_fetch".to_string(),
+                visible: true,
+                selected_offer_id: Some("web_fetch@edge-1".to_string()),
+                selected_route: "EdgeBound".to_string(),
+                hidden_reason: None,
+                candidates: vec![
+                    ToolAdmissionCandidateSnapshotEntry {
+                        offer_id: "web_fetch@edge-1".to_string(),
+                        provider_type: "edge_capacity".to_string(),
+                        provider_id: "edge-1".to_string(),
+                        executor_id: "edge-1".to_string(),
+                        placement: "edge:edge-1".to_string(),
+                        scope: "workspace".to_string(),
+                        authority: "read_write".to_string(),
+                        schema_digest: "sha256:edge".to_string(),
+                        route: "EdgeBound".to_string(),
+                        readiness: "ready".to_string(),
+                        selected: true,
+                        reason: "Selected".to_string(),
+                    },
+                    ToolAdmissionCandidateSnapshotEntry {
+                        offer_id: "web_fetch@server-builtin".to_string(),
+                        provider_type: "server_service".to_string(),
+                        provider_id: "server-builtin".to_string(),
+                        executor_id: "server-service".to_string(),
+                        placement: "server".to_string(),
+                        scope: "session".to_string(),
+                        authority: "none".to_string(),
+                        schema_digest: "sha256:server".to_string(),
+                        route: "ServerRuntime".to_string(),
+                        readiness: "ready".to_string(),
+                        selected: false,
+                        reason: "CurrentProviderPreferred".to_string(),
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+
+        let summary = render_introspect(&snap, IntrospectTextDepth::Summary);
+        assert!(summary.contains("Tool admission: visible=1/1 hidden=0"));
+
+        let req = IntrospectRequest {
+            format: IntrospectFormat::Json,
+            ..Default::default()
+        };
+        let json = render_introspect_request(&snap, &req);
+        assert!(json.contains("\"kind\":\"tool_admission\""), "{json}");
+        assert!(json.contains("web_fetch@edge-1"), "{json}");
     }
 
     #[test]
@@ -1240,6 +1409,36 @@ mod tests {
             summary.contains("Snapshot age: 2 turn(s)"),
             "summary should surface staleness: {summary}"
         );
+    }
+
+    #[test]
+    fn runtime_snapshot_renders_capacity_provider_coverage() {
+        let snap = IntrospectSnapshot {
+            capacity_provider_coverage: vec![
+                CapacityProviderCoverageEntry::ready(
+                    astra_runtime_env::CapacityProviderType::ServerService,
+                    "server-builtin",
+                    vec!["web_fetch".into()],
+                ),
+                CapacityProviderCoverageEntry::unavailable(
+                    astra_runtime_env::CapacityProviderType::Sandbox,
+                    "workspace-executor",
+                    astra_runtime_env::CapacityProviderStatus::Unbound,
+                    "no_workspace_provider_bound",
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let hint = render_introspect(&snap, IntrospectTextDepth::Hint);
+        assert!(hint.contains("providers=server_service:ready"));
+        assert!(hint.contains("sandbox:unbound (workspace executor not bound)"));
+        assert!(!hint.contains("no_workspace_provider_bound"));
+
+        let summary = render_introspect(&snap, IntrospectTextDepth::Summary);
+        assert!(summary.contains("Capacity providers: server_service:ready"));
+        assert!(summary.contains("sandbox:unbound (workspace executor not bound)"));
+        assert!(!summary.contains("no_workspace_provider_bound"));
     }
 
     #[test]

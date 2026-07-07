@@ -481,6 +481,27 @@ fn build_introspect_observations(
                     evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
                 });
             }
+
+            for provider in &snapshot.capacity_provider_coverage {
+                observations.push(ObservationRecord {
+                    ref_id: Urn::new("observation", "local", "introspect")
+                        .seg("capacity")
+                        .seg(provider.provider_type.as_str())
+                        .build(),
+                    topic: "execution".to_string(),
+                    facet: request.facet.as_str().to_string(),
+                    kind: "capacity_provider".to_string(),
+                    severity: if provider.status == "ready" {
+                        "info"
+                    } else {
+                        "warning"
+                    }
+                    .to_string(),
+                    summary: capacity_provider_observation_summary(provider),
+                    confidence: ObservationConfidence::evidence(0.85),
+                    evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+                });
+            }
         }
 
         ObservationFacet::Errors => {
@@ -564,6 +585,27 @@ fn build_introspect_observations(
     if matches!(
         request.facet,
         ObservationFacet::Session | ObservationFacet::Overview | ObservationFacet::Trace
+    ) {
+        for admission in &snapshot.tool_admission {
+            observations.push(ObservationRecord {
+                ref_id: Urn::new("observation", "local", "introspect")
+                    .seg("tool_admission")
+                    .seg(&admission.tool_name)
+                    .build(),
+                topic: "execution".to_string(),
+                facet: request.facet.as_str().to_string(),
+                kind: "tool_admission".to_string(),
+                severity: if admission.visible { "info" } else { "warning" }.to_string(),
+                summary: tool_admission_observation_summary(admission),
+                confidence: ObservationConfidence::evidence(0.85),
+                evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
+            });
+        }
+    }
+
+    if matches!(
+        request.facet,
+        ObservationFacet::Session | ObservationFacet::Overview | ObservationFacet::Trace
     ) && let Some(summary) = latest_step_latency_summary(snapshot)
     {
         observations.push(ObservationRecord {
@@ -579,6 +621,47 @@ fn build_introspect_observations(
     }
 
     observations
+}
+
+fn capacity_provider_observation_summary(
+    provider: &super::CapacityProviderCoverageEntry,
+) -> String {
+    let capabilities = if provider.capabilities.is_empty() {
+        "none".to_string()
+    } else {
+        provider.capabilities.join(",")
+    };
+    format!(
+        "{} provider_id={} capabilities={}",
+        super::capacity_provider_coverage_entry_summary(provider),
+        provider.provider_id,
+        capabilities
+    )
+}
+
+fn tool_admission_observation_summary(admission: &super::ToolAdmissionSnapshotEntry) -> String {
+    let selected = admission.selected_offer_id.as_deref().unwrap_or("-");
+    let hidden = admission.hidden_reason.as_deref().unwrap_or("-");
+    let candidates = admission
+        .candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{}:{}:{}",
+                candidate.offer_id, candidate.reason, candidate.readiness
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{} visible={} selected={} route={} hidden={} candidates=[{}]",
+        admission.tool_name,
+        admission.visible,
+        selected,
+        admission.selected_route,
+        hidden,
+        candidates
+    )
 }
 
 fn latest_step_latency_summary(snapshot: &IntrospectSnapshot) -> Option<String> {
@@ -1038,6 +1121,44 @@ mod tests {
                 .any(|node| node.label == "step_latency"),
             "step latency observation should also be reachable from graph_slice"
         );
+    }
+
+    #[test]
+    fn json_report_includes_capacity_provider_observations() {
+        let snapshot = IntrospectSnapshot {
+            capacity_provider_coverage: vec![
+                crate::introspect::CapacityProviderCoverageEntry::ready(
+                    astra_runtime_env::CapacityProviderType::ServerService,
+                    "server-builtin",
+                    vec!["web_fetch".into(), "memory".into()],
+                ),
+                crate::introspect::CapacityProviderCoverageEntry::unavailable(
+                    astra_runtime_env::CapacityProviderType::Sandbox,
+                    "workspace-executor",
+                    astra_runtime_env::CapacityProviderStatus::Unbound,
+                    "no_workspace_provider_bound",
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let report = build_introspect_report(&snapshot, &IntrospectRequest::default());
+        let provider_observations: Vec<_> = report
+            .observations
+            .iter()
+            .filter(|observation| observation.kind == "capacity_provider")
+            .collect();
+
+        assert_eq!(provider_observations.len(), 2);
+        assert!(provider_observations.iter().any(|observation| {
+            observation.summary.contains("server_service:ready")
+                && observation.summary.contains("provider_id=server-builtin")
+        }));
+        assert!(provider_observations.iter().any(|observation| {
+            observation.summary.contains("sandbox:unbound")
+                && observation.summary.contains("workspace executor not bound")
+                && !observation.summary.contains("no_workspace_provider_bound")
+        }));
     }
 
     #[test]

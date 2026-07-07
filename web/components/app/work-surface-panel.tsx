@@ -28,6 +28,7 @@ import type {
 } from "@/lib/work-surface";
 import type { WorkSurfaceRunResponse } from "@/lib/api/types";
 import { useKeyboardShortcut } from "@/hooks/use-keyboard-shortcut";
+import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from "@/lib/run-status-messages";
 import { cn } from "@/lib/utils/cn";
 
 export type WorkSurfaceTab = "tasks" | "agents" | "tools";
@@ -167,10 +168,10 @@ export function WorkSurfacePanel({
     ) {
       return;
     }
-    const latest = [...visibleAgents].sort(
-      (left, right) => right.updatedAt - left.updatedAt,
-    )[0];
-    setSelectedAgentId(latest?.agentId ?? null);
+    const firstActive =
+      visibleAgents.find((agent) => isAgentActive(agent.status)) ??
+      visibleAgents[0];
+    setSelectedAgentId(firstActive?.agentId ?? null);
   }, [selectedAgentId, visibleAgents, tab]);
 
   useEffect(() => {
@@ -694,10 +695,9 @@ function AgentCard({
   onSelect: () => void;
 }) {
   const active = isAgentActive(agent.status);
-  const failed =
-    agent.status === "failed" ||
-    agent.status === "cancelled" ||
-    agent.status === "interrupted";
+  const display = agentDisplayState(agent);
+  const waiting = display.tone === "warning";
+  const failed = display.tone === "danger";
   const progress =
     agent.turn && agent.maxTurns
       ? Math.min(100, Math.round((agent.turn / agent.maxTurns) * 100))
@@ -713,6 +713,8 @@ function AgentCard({
         selected ? "ring-1 ring-accent/25" : "",
         active
           ? "border-accent/30"
+          : waiting
+            ? "border-warning/25"
           : failed
             ? "border-danger/25"
             : "border-border/70",
@@ -729,6 +731,8 @@ function AgentCard({
             "mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full border",
             active
               ? "border-accent/25 bg-accent/10 text-accent"
+              : waiting
+                ? "border-warning/25 bg-warning/10 text-warning"
               : failed
                 ? "border-danger/20 bg-danger/10 text-danger"
                 : "border-border bg-surface-muted text-text-muted",
@@ -736,6 +740,8 @@ function AgentCard({
         >
           {active ? (
             <Activity className="size-4 animate-pulse" />
+          ) : waiting ? (
+            <Pause className="size-4" />
           ) : (
             <Bot className="size-4" />
           )}
@@ -758,7 +764,12 @@ function AgentCard({
               </div>
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
-              <StatusPill status={agent.status} active={active} />
+              <StatusPill
+                status={agent.status}
+                active={active}
+                label={display.label}
+                tone={active ? "running" : display.tone}
+              />
               <ChevronRight
                 className={cn(
                   "size-4 text-text-muted transition-transform",
@@ -775,6 +786,8 @@ function AgentCard({
                   "shrink-0 text-[11px] font-medium",
                   failed
                     ? "text-danger"
+                    : waiting
+                      ? "text-warning"
                     : active
                       ? "text-accent"
                       : "text-text-muted",
@@ -803,9 +816,11 @@ function AgentCard({
                   "h-full rounded-full transition-all duration-500",
                   failed
                     ? "bg-danger"
-                    : agent.status === "completed"
-                      ? "bg-success"
-                      : "bg-accent",
+                    : waiting
+                      ? "bg-warning"
+                      : agent.status === "completed"
+                        ? "bg-success"
+                        : "bg-accent",
                 )}
                 style={{ width: `${Math.max(active ? 8 : 0, progress)}%` }}
               />
@@ -815,7 +830,11 @@ function AgentCard({
             <p
               className={cn(
                 "mt-2 line-clamp-2 text-xs leading-5",
-                failed ? "text-danger" : "text-text-muted",
+                failed
+                  ? "text-danger"
+                  : waiting
+                    ? "text-warning"
+                    : "text-text-muted",
               )}
             >
               {summary}
@@ -824,10 +843,55 @@ function AgentCard({
         </div>
       </button>
       {selected ? (
-        <AgentDetails agent={agent} failed={failed} runDetails={runDetails} />
+        <AgentDetails
+          agent={agent}
+          failed={failed}
+          runDetails={runDetails}
+          display={display}
+        />
       ) : null}
     </section>
   );
+}
+
+type AgentDisplayTone = "neutral" | "running" | "success" | "warning" | "danger";
+
+function agentDisplayState(agent: AgentSurfaceItem): {
+  label: string;
+  tone: AgentDisplayTone;
+} {
+  const status = agent.status.trim().toLowerCase();
+  if (ACTIVE_AGENT_SURFACE_STATUSES.has(status)) {
+    return { label: "Working", tone: "running" };
+  }
+  if (status === "completed") {
+    return { label: "Completed", tone: "success" };
+  }
+  if (status === "waiting") {
+    return { label: "Waiting", tone: "warning" };
+  }
+  if (status === "failed") {
+    return { label: "Failed", tone: "danger" };
+  }
+  if (status === "cancelled") {
+    return { label: "Cancelled", tone: "danger" };
+  }
+  if (status === "interrupted") {
+    const reason = (agent.reason ?? "").trim().toLowerCase();
+    if (!reason || reason === "interrupted" || reason === "empty_completion") {
+      return { label: "Needs final answer", tone: "warning" };
+    }
+    if (
+      reason === "budget_exhausted" ||
+      reason === "turn_budget_exhausted" ||
+      reason === "max_turns_exceeded" ||
+      reason === "max_turns"
+    ) {
+      return { label: "Needs continuation", tone: "warning" };
+    }
+    return { label: "Interrupted", tone: "danger" };
+  }
+  return { label: statusLabel(agent.status), tone: "neutral" };
 }
 
 function agentCompactMeta(agent: AgentSurfaceItem) {
@@ -862,10 +926,12 @@ function AgentDetails({
   agent,
   failed,
   runDetails,
+  display,
 }: {
   agent: AgentSurfaceItem;
   failed: boolean;
   runDetails?: AgentRunProjectionState;
+  display: ReturnType<typeof agentDisplayState>;
 }) {
   const updated = new Date(agent.updatedAt);
   const active = isAgentActive(agent.status);
@@ -903,7 +969,7 @@ function AgentDetails({
             ? "now"
             : updated.toLocaleTimeString()}
         </span>
-        {agent.reason ? <span>Reason {statusLabel(agent.reason)}</span> : null}
+        {agent.reason ? <span>{agentReasonText(agent, display)}</span> : null}
         {agent.toolName ? <span>Tool {agent.toolName}</span> : null}
       </div>
       {agent.resultSummary || agent.error ? (
@@ -920,6 +986,28 @@ function AgentDetails({
       ) : null}
     </div>
   );
+}
+
+function agentReasonText(
+  agent: AgentSurfaceItem,
+  display: ReturnType<typeof agentDisplayState>,
+) {
+  const reason = (agent.reason ?? "").trim().toLowerCase();
+  if (!reason || reason === "interrupted" || reason === "empty_completion") {
+    return "No final answer";
+  }
+  if (
+    reason === "budget_exhausted" ||
+    reason === "turn_budget_exhausted" ||
+    reason === "max_turns_exceeded" ||
+    reason === "max_turns"
+  ) {
+    return "Turn budget reached";
+  }
+  if (display.tone === "warning") {
+    return display.label;
+  }
+  return `Reason ${statusLabel(agent.reason ?? "")}`;
 }
 
 function AgentExecutionMeta({ agent }: { agent: AgentSurfaceItem }) {
@@ -1239,6 +1327,8 @@ function AgentEventRow({
             ? "bg-success"
             : event.tone === "danger"
               ? "bg-danger"
+              : event.tone === "warning"
+                ? "bg-warning"
               : event.tone === "running"
                 ? "animate-pulse bg-accent"
                 : "bg-border-strong",
@@ -1580,10 +1670,13 @@ function toolFailureMessage(tool: ToolSurfaceItem) {
     return "Tool timed out. Retry or narrow the command.";
   }
   if (tool.errorKind === "fallback_disabled") {
-    return "This request needs a file or command environment. Connect one or choose a sandbox, then retry.";
+    return WORKSPACE_EXECUTION_BLOCKED_MESSAGE;
   }
   if (tool.errorKind === "workspace_executor_unavailable") {
-    return "This request needs a file or command environment. Connect one or choose a sandbox, then retry.";
+    return WORKSPACE_EXECUTION_BLOCKED_MESSAGE;
+  }
+  if (tool.errorKind === "workspace_path_mismatch") {
+    return "Path is outside the selected file environment. Server sandbox cannot access host paths; use a relative sandbox path or select the matching Edge workspace.";
   }
   if (tool.blocked) {
     return "Tool blocked. Resolve the execution environment before retrying.";
@@ -1727,24 +1820,42 @@ function EmptySurface({ loading, label }: { loading: boolean; label: string }) {
 function StatusPill({
   status,
   active = false,
+  label,
+  tone,
 }: {
   status: string;
   active?: boolean;
+  label?: string;
+  tone?: AgentDisplayTone;
 }) {
   const done = isDone(status) || status === "done";
+  const waiting = status === "waiting";
   const cancelled = status === "cancelled";
   const failed = status === "failed" || status === "interrupted";
+  const effectiveTone =
+    tone ??
+    (cancelled
+      ? "neutral"
+      : waiting
+        ? "warning"
+        : failed
+          ? "danger"
+          : done
+            ? "success"
+            : active
+              ? "running"
+              : "neutral");
   return (
     <span
       className={cn(
         "inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium",
-        cancelled
-          ? "bg-surface-muted text-text-muted"
-          : failed
-            ? "bg-danger/10 text-danger"
-            : done
+        effectiveTone === "danger"
+          ? "bg-danger/10 text-danger"
+          : effectiveTone === "warning"
+            ? "bg-warning/10 text-warning"
+            : effectiveTone === "success"
               ? "bg-success/10 text-success"
-              : active
+              : effectiveTone === "running"
                 ? "bg-accent/10 text-accent"
                 : "bg-surface-muted text-text-muted",
       )}
@@ -1752,7 +1863,7 @@ function StatusPill({
       {active ? (
         <span className="size-1.5 animate-pulse rounded-full bg-current" />
       ) : null}
-      {statusLabel(status)}
+      {label ?? (waiting ? "Waiting" : statusLabel(status))}
     </span>
   );
 }
@@ -1767,6 +1878,7 @@ function StatusIcon({
   const done = isDone(status);
   const running =
     status === "in_progress" || status === "running" || status === "started";
+  const waiting = status === "waiting";
   const cancelled = status === "cancelled";
   const failed = status === "failed" || status === "interrupted";
   const className = cn(
@@ -1776,6 +1888,8 @@ function StatusIcon({
       ? "text-success"
       : running
         ? "text-accent"
+        : waiting
+          ? "text-warning"
         : cancelled
           ? "text-text-muted"
           : failed
@@ -1783,6 +1897,7 @@ function StatusIcon({
             : "text-text-muted",
   );
   if (done) return <CheckCircle2 className={className} />;
+  if (waiting) return <Pause className={className} />;
   if (cancelled) return <Pause className={className} />;
   if (failed) return <AlertTriangle className={className} />;
   if (running) return <Loader2 className={cn(className, "animate-spin")} />;
@@ -1817,12 +1932,19 @@ function taskNeedsAttention(task: SessionTask) {
 }
 
 function agentNeedsAttention(agent: AgentSurfaceItem) {
-  return (
-    agent.status === "failed" ||
-    agent.status === "waiting" ||
-    agent.status === "interrupted" ||
-    Boolean(agent.error)
-  );
+  if (agent.error) return true;
+  const display = agentDisplayState(agent);
+  if (display.tone === "danger") return true;
+  if (agent.status === "waiting") {
+    const reason = (agent.reason ?? "").trim().toLowerCase();
+    return (
+      reason === "executor_offline" ||
+      reason === "fallback_disabled" ||
+      reason === "workspace_executor_unavailable" ||
+      reason === "transport_disconnected"
+    );
+  }
+  return false;
 }
 
 function toolNeedsAttention(tool: ToolSurfaceItem) {

@@ -19,15 +19,24 @@ fn metadata_duration_ms(metadata: Option<&serde_json::Value>) -> Option<i32> {
         .and_then(|v| i32::try_from(v).ok())
 }
 
+fn metadata_string(metadata: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    metadata
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 fn mysql_datetime(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 
 const INSERT_CORE_TURN_EVENT_SQL: &str = "INSERT IGNORE INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-          parent_event_id, causal_chain_id, turn_seq, token_usage, llm_model_used, llm_params, reasoning_content, \
+          parent_event_id, causal_chain_id, run_id, turn_seq, token_usage, llm_model_used, llm_params, reasoning_content, \
           token_input, token_output, token_total, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())";
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())";
 
 #[derive(Debug, PartialEq)]
 struct CoreTurnEventInsertValues {
@@ -252,6 +261,7 @@ pub(crate) async fn insert_core_turn_event(
         .bind(&event.content)
         .bind(&event.parent_event_id)
         .bind(&event.causal_chain_id)
+        .bind(&event.run_id)
         .bind(values.turn_seq)
         .bind(values.token_usage_json)
         .bind(&event.llm_model_used)
@@ -285,9 +295,9 @@ pub(crate) async fn insert_tool_turn_event(
     let result = query(
         "INSERT IGNORE INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-          parent_event_id, causal_chain_id, metadata, skill_name, skill_version, reasoning_content, \
+          parent_event_id, causal_chain_id, run_id, tool_call_id, metadata, skill_name, skill_version, reasoning_content, \
           meta_tool_name, meta_duration_ms, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
     )
     .bind(&event.event_id)
     .bind(&event.session_id)
@@ -298,6 +308,18 @@ pub(crate) async fn insert_tool_turn_event(
     .bind(&event.content)
     .bind(&event.parent_event_id)
     .bind(&event.causal_chain_id)
+    .bind(
+        event
+            .run_id
+            .clone()
+            .or_else(|| metadata_string(event.metadata.as_ref(), "run_id")),
+    )
+    .bind(
+        event
+            .tool_call_id
+            .clone()
+            .or_else(|| metadata_string(event.metadata.as_ref(), "tool_call_id")),
+    )
     .bind(event.metadata.as_ref().map(serde_json::Value::to_string))
     .bind(&event.skill_name)
     .bind(skill_version.cloned().or_else(|| event.skill_version.clone()))
@@ -346,8 +368,8 @@ pub(crate) async fn insert_turn_decision_audit(
 #[cfg(test)]
 mod tests {
     use super::{
-        INSERT_CORE_TURN_EVENT_SQL, core_turn_event_insert_values, metadata_tool_name,
-        trace_event_insert_values,
+        INSERT_CORE_TURN_EVENT_SQL, core_turn_event_insert_values, metadata_string,
+        metadata_tool_name, trace_event_insert_values,
     };
     use astra_turn_core::contracts::TurnCoreEventRecord;
     use astra_turn_core::trace_event::TraceEvent;
@@ -356,14 +378,36 @@ mod tests {
     fn core_turn_event_insert_persists_turn_seq() {
         assert!(
             INSERT_CORE_TURN_EVENT_SQL.contains(
-                "parent_event_id, causal_chain_id, turn_seq, token_usage, llm_model_used"
+                "parent_event_id, causal_chain_id, run_id, turn_seq, token_usage, llm_model_used"
             ),
-            "core turn events must persist turn_seq so session_turn inference has a fact source"
+            "core turn events must persist run_id and turn_seq so session traces have durable anchors"
         );
         assert_eq!(
             INSERT_CORE_TURN_EVENT_SQL.matches('?').count(),
-            17,
+            18,
             "core turn event insert SQL placeholder count must match its bound values"
+        );
+    }
+
+    #[test]
+    fn metadata_string_trims_empty_values() {
+        assert_eq!(
+            metadata_string(Some(&serde_json::json!({"run_id": " run-1 "})), "run_id").as_deref(),
+            Some("run-1")
+        );
+        assert_eq!(
+            metadata_string(
+                Some(&serde_json::json!({"tool_call_id": "  "})),
+                "tool_call_id"
+            ),
+            None
+        );
+        assert_eq!(
+            metadata_string(
+                Some(&serde_json::json!({"tool_call_id": 7})),
+                "tool_call_id"
+            ),
+            None
         );
     }
 
@@ -372,6 +416,7 @@ mod tests {
             event_id: "evt-1".to_string(),
             user_id: "user-1".to_string(),
             session_id: "session-1".to_string(),
+            run_id: Some("run-1".to_string()),
             agent_id: None,
             event_type: "llm_response".to_string(),
             content: "done".to_string(),

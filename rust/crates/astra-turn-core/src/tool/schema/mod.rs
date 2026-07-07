@@ -15,5 +15,6 @@ pub mod surface_subset;
 /// The implementation lives in `astra-core` so that every crate admits
 /// OpenAI function-tool schemas by exactly the same admission rule.
 pub use astra_core::tool_schema::{
-    retain_tool_schemas_by_names, tool_names_from_schemas, tool_schema_name,
+    prompt_schema_conflicting_tool_names, retain_tool_schemas_by_names, sort_tool_schemas_by_name,
+    tool_names_from_schemas, tool_schema_name,
 };

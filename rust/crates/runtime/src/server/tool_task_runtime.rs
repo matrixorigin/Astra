@@ -1,11 +1,12 @@
 use astra_tools::task_mgmt::{
     SessionTaskStatusKind, TaskManager, TaskManagerSnapshot, VALID_LIST_STATUS_FILTERS,
 };
+use astra_tools::task_tool_contract;
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 
 use super::tool_execution_result::tool_result_from_output;
-use crate::server::server_tool_executor::ServerToolExecutor;
+use crate::server::runtime_tool_executor::RuntimeToolExecutor;
 use crate::server::tool_session_state_rollback::{self, SessionStateRollbackAction};
 
 fn find_json_body_start(output: &str) -> Option<usize> {
@@ -29,102 +30,8 @@ pub(crate) fn task_output_success(output: &str) -> bool {
     true
 }
 
-const TASK_ACTIONS: &[&str] = &[
-    "create",
-    "list",
-    "get",
-    "update",
-    "stop",
-    "cancel",
-    "list_user",
-    "adopt",
-    "archive",
-];
-
-fn task_action_allowed_fields(action: &str) -> Option<&'static [&'static str]> {
-    match action {
-        "create" => Some(&[
-            "action",
-            "title",
-            "description",
-            "subtasks",
-            "active_form",
-            "owner",
-            "metadata",
-            "add_blocks",
-            "add_blocked_by",
-        ]),
-        "list" => Some(&["action", "status_filter"]),
-        "get" => Some(&["action", "task_id"]),
-        "update" => Some(&[
-            "action",
-            "task_id",
-            "new_status",
-            "title",
-            "description",
-            "subtask_id",
-            "active_form",
-            "owner",
-            "metadata",
-            "add_blocks",
-            "add_blocked_by",
-            "remove_blocks",
-            "remove_blocked_by",
-            "reason",
-            "error_message",
-        ]),
-        "stop" | "cancel" => Some(&["action", "task_id", "reason"]),
-        "list_user" => Some(&["action", "user_status"]),
-        "adopt" => Some(&["action", "source_session_id", "task_id"]),
-        "archive" => Some(&["action", "task_id", "older_than_days", "reason"]),
-        _ => None,
-    }
-}
-
-fn task_actions_allowing_field(field: &str, current_action: &str) -> Vec<&'static str> {
-    TASK_ACTIONS
-        .iter()
-        .copied()
-        .filter(|action| *action != current_action)
-        .filter(|action| {
-            task_action_allowed_fields(action).is_some_and(|allowed| allowed.contains(&field))
-        })
-        .collect()
-}
-
 pub(crate) fn validate_task_tool_args_for_action(action: &str, args: &Value) -> Result<(), String> {
-    let Some(allowed) = task_action_allowed_fields(action) else {
-        return Ok(());
-    };
-    let Some(obj) = args.as_object() else {
-        return Err(format!("task.{action} arguments must be an object"));
-    };
-    for key in obj.keys() {
-        if key.starts_with('_') {
-            continue;
-        }
-        if !allowed.contains(&key.as_str()) {
-            let other_actions = task_actions_allowing_field(key, action);
-            let action_hint = if other_actions.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "; field is valid for: {}",
-                    other_actions
-                        .iter()
-                        .map(|action| format!("task.{action}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
-            return Err(format!(
-                "unknown field '{key}' for task.{action} (valid: {}{})",
-                allowed.join(", "),
-                action_hint
-            ));
-        }
-    }
-    Ok(())
+    task_tool_contract::validate_runtime_task_tool_args_for_action(action, args)
 }
 
 pub(crate) fn normalize_task_user_status(args: &Value) -> Result<&str, String> {
@@ -164,10 +71,10 @@ pub(crate) enum TaskMutationKind {
 impl TaskMutationKind {
     pub(crate) fn event_reason(self) -> &'static str {
         match self {
-            Self::Create => "task.create",
-            Self::Update => "task.update",
-            Self::Stop => "task.stop",
-            Self::Archive => "task.archive",
+            Self::Create => "task_board.create",
+            Self::Update => "task_board.update",
+            Self::Stop => "task_board.stop",
+            Self::Archive => "task_board.archive",
         }
     }
 
@@ -262,7 +169,7 @@ pub(crate) async fn task_list_user(task_manager: &TaskManager, args: &Value) -> 
 }
 
 pub(crate) fn task_adopt_requires_http_endpoint_result() -> String {
-    "Error: task(action='adopt') requires the HTTP /sessions/{session_id}/todos:execute endpoint so the source migrate and target clone use the transactional MatrixOne CAS path"
+    "Error: task_board(action='adopt') requires the HTTP /sessions/{session_id}/todos:execute endpoint so the source migrate and target clone use the transactional MatrixOne CAS path"
         .to_string()
 }
 
@@ -319,18 +226,9 @@ pub(crate) async fn execute_task_mutation(
 }
 
 pub(crate) async fn execute_task_tool(task_manager: &TaskManager, args: &Value) -> TaskToolOutcome {
-    let action_value = args.get("action");
-    let action = match action_value {
-        Some(Value::String(action)) => action.as_str(),
-        Some(_) => {
-            return task_tool_result("Error: field 'action' must be a string".to_string(), None);
-        }
-        None => {
-            return task_tool_result(
-                "Error: missing required parameter `action` for `task`. Use one of: create, update, list, get, stop (or cancel), list_user, adopt, archive.".to_string(),
-                None,
-            );
-        }
+    let action = match task_tool_contract::task_action_from_args(args) {
+        Ok(action) => action,
+        Err(error) => return task_tool_result(format!("Error: {error}"), None),
     };
 
     match action {
@@ -342,9 +240,7 @@ pub(crate) async fn execute_task_tool(task_manager: &TaskManager, args: &Value) 
         "update" => {
             execute_validated_task_mutation(task_manager, args, TaskMutationKind::Update).await
         }
-        "stop" | "cancel" => {
-            execute_validated_task_mutation(task_manager, args, TaskMutationKind::Stop).await
-        }
+        "stop" => execute_validated_task_mutation(task_manager, args, TaskMutationKind::Stop).await,
         "list_user" => execute_validated_task_read(task_manager, args, "list_user").await,
         "adopt" => match validate_task_tool_args_for_action("adopt", args) {
             Ok(()) => task_tool_result(task_adopt_requires_http_endpoint_result(), None),
@@ -355,7 +251,8 @@ pub(crate) async fn execute_task_tool(task_manager: &TaskManager, args: &Value) 
         }
         other => task_tool_result(
             format!(
-                "Error: unknown `task` action '{other}'. Valid: create, update, list, get, stop (or cancel), list_user, adopt, archive."
+                "Error: {}",
+                task_tool_contract::task_unknown_action_message(other)
             ),
             None,
         ),
@@ -408,11 +305,11 @@ fn task_tool_result(output: String, rollback: Option<TaskMutationRollback>) -> T
     }
 }
 
-/// Server-side entry point for the `task` tool. Delegates to
+/// Server-side entry point for the `task_board` tool. Delegates to
 /// [`execute_task_tool`] and records rollback handles plus task-board
 /// work-surface snapshots on the executor.
 pub(super) async fn execute_with_executor(
-    executor: &ServerToolExecutor,
+    executor: &RuntimeToolExecutor,
     args: &Value,
 ) -> astra_tools::ToolResult {
     let outcome = execute_task_tool(&executor.task_manager(), args).await;
@@ -493,8 +390,11 @@ mod tests {
         )
         .expect_err("subtasks are create-only");
 
-        assert!(err.contains("unknown field 'subtasks' for task.update"));
-        assert!(err.contains("field is valid for: task.create"), "{err}");
+        assert!(err.contains("unknown field 'subtasks' for task_board.update"));
+        assert!(
+            err.contains("field is valid for: task_board.create"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -503,13 +403,13 @@ mod tests {
             "update",
             &json!({"action": "update", "task_id": "task-1", "new_status": "failed", "reason": "blocked"}),
         )
-        .expect("task.update supports reason");
+        .expect("task_board.update supports reason");
 
         validate_task_tool_args_for_action(
             "archive",
             &json!({"action": "archive", "task_id": "task-1", "reason": "old history"}),
         )
-        .expect("task.archive supports reason");
+        .expect("task_board.archive supports reason");
     }
 
     #[test]
@@ -560,8 +460,8 @@ mod tests {
 
     #[test]
     fn mutation_kind_produces_stable_event_reasons_and_rollback_labels() {
-        assert_eq!(TaskMutationKind::Create.event_reason(), "task.create");
-        assert_eq!(TaskMutationKind::Update.event_reason(), "task.update");
+        assert_eq!(TaskMutationKind::Create.event_reason(), "task_board.create");
+        assert_eq!(TaskMutationKind::Update.event_reason(), "task_board.update");
         assert_eq!(
             TaskMutationKind::Create.rollback_label(&json!({"title": "ship"})),
             "task:create:ship"
@@ -589,7 +489,7 @@ mod tests {
             .rollback
             .expect("successful mutation should produce rollback");
         assert_eq!(rollback.label, "task:create:ship");
-        assert_eq!(rollback.event_reason, "task.create");
+        assert_eq!(rollback.event_reason, "task_board.create");
     }
 
     #[tokio::test]
@@ -623,6 +523,18 @@ mod tests {
         assert!(invalid.result.is_error, "{invalid:?}");
         assert!(invalid.result.output.contains("must be a string"));
         assert!(invalid.rollback.is_none());
+
+        let hidden_alias =
+            execute_task_tool(&manager, &json!({"action": "cancel", "task_id": "task-1"})).await;
+        assert!(hidden_alias.result.is_error, "{hidden_alias:?}");
+        assert!(
+            hidden_alias
+                .result
+                .output
+                .contains("unknown `task_board` action")
+                && hidden_alias.result.output.contains("cancel"),
+            "schema-hidden action aliases must fail closed: {hidden_alias:?}"
+        );
     }
 
     #[tokio::test]
@@ -656,6 +568,6 @@ mod tests {
         assert!(outcome.result.output.contains("\"success\":true"));
         let rollback = outcome.rollback.expect("successful create rollback");
         assert_eq!(rollback.label, "task:create:ship");
-        assert_eq!(rollback.event_reason, "task.create");
+        assert_eq!(rollback.event_reason, "task_board.create");
     }
 }

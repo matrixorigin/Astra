@@ -78,7 +78,7 @@ export function updateChatModel(chatId: string, model: string) {
 
 export function updateChatWorkspaceSelection(
   chatId: string,
-  workspaceSelection: WorkspaceSelection,
+  workspaceSelection: WorkspaceSelection | null,
 ) {
   return requestJson<ChatDetail>(`/api/chats/${encodeURIComponent(chatId)}`, {
     method: "PATCH",
@@ -177,10 +177,15 @@ type ChatStreamState = {
   cancelled?: boolean;
   paused?: boolean;
   error?: string;
+  errorCode?: string;
+  errorStatus?: number;
   nextEventIndex?: number;
 };
 
 function normalizeEventIndex(value: unknown): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     return null;
   }
@@ -504,6 +509,13 @@ function applyStreamEvent(
       typeof event.message === "string"
         ? event.message
         : "Astra stream failed.";
+    state.errorCode = typeof event.code === "string" ? event.code : undefined;
+    state.errorStatus =
+      typeof event.status === "number" &&
+      Number.isFinite(event.status) &&
+      event.status >= 400
+        ? Math.trunc(event.status)
+        : undefined;
     return;
   }
 
@@ -628,7 +640,7 @@ async function consumeChatStream(
   }
 
   if (state.error) {
-    throw new Error(state.error);
+    throw new WebApiError(state.errorStatus ?? 500, state.error, state.errorCode);
   }
   if (state.cancelled) {
     handlers.onCancelled?.(state.text);

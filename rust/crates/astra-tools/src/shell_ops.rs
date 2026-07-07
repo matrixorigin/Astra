@@ -102,6 +102,11 @@ pub fn validate_bash_background_task_contract(command: &str) -> Result<(), Strin
     if let Some(err) = background_task_output_dir_read_error(command) {
         return Err(err);
     }
+    if let Some(err) =
+        crate::internal_artifacts::internal_tool_result_artifact_access_error("bash", command)
+    {
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -4848,6 +4853,35 @@ printf 'probe.txt:1:needle\n'
         assert!(
             validate_execute_bash_command("ls /tmp/astra/").is_ok(),
             "directories above bg_tasks/ remain freely listable"
+        );
+    }
+
+    /// Runtime-owned tool-result artifacts are not workspace files. Blocking
+    /// physical artifact reads here keeps models from recovering truncated
+    /// agent/task results by spelunking ~/.astra implementation paths.
+    #[test]
+    fn validate_execute_bash_rejects_internal_tool_result_artifact_reads() {
+        for command in [
+            "cat /home/me/.astra/sessions/session-1/tool-results/call_abc.txt",
+            "find ~/.astra/sessions/session-1/tool-results -type f",
+            "grep -R result /home/me/.astra/tool-results/call_abc.txt",
+            "cat artifact://session/tool-result/call_abc",
+        ] {
+            let error = validate_execute_bash_command(command).expect_err(command);
+            assert!(
+                error.contains("runtime-owned tool-result artifacts"),
+                "{command}: {error}"
+            );
+            assert!(
+                error.contains("agent_fanout(action='get_results'"),
+                "{error}"
+            );
+            assert!(error.contains("agent(action='get_result'"), "{error}");
+            assert!(error.contains("task_output(task_id="), "{error}");
+        }
+        assert!(
+            validate_execute_bash_command("echo .astra/sessions without tool-results").is_ok(),
+            "plain mentions of the sessions directory are not artifact reads"
         );
     }
 

@@ -1,23 +1,28 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Map;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use super::tool_admission::{
+    ToolAdmissionContext, ToolHiddenReason, resolve_tool_admission_for_binding_with_context,
+};
 use super::tool_edge_transport::execute_edge_bound;
 use super::tool_execution_binding::{
-    ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy, ToolExecutionRequest,
-    ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
+    ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolTransportKind,
+    WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
 };
 use super::tool_external_transport::{
     ExternalTransport, execute_gateway_relay, execute_sandbox_resident_agent,
 };
 use super::tool_local_transport::{ServerLocalToolTransport, execute_local_transport};
 use super::tool_route_boundary::{ToolRouteBoundary, route_binding_event_fields};
-use super::tool_route_selection::{ToolExecutionRouteKind, routing_decision};
+use super::tool_route_selection::ToolExecutionRouteKind;
+use super::tool_route_selection::routing_decision_for_binding;
 use super::tool_transport_errors::{
-    capability_denied_result, unsupported_workspace_executor_result,
+    capability_denied_result, selected_offer_route_mismatch_result,
+    unsupported_workspace_executor_result,
 };
 use super::tool_transport_metadata::{
     cancelled_runtime_tool_result, cancelled_runtime_tool_result_for_binding,
@@ -35,7 +40,8 @@ pub struct ToolExecutionServiceBuilder {
     gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
     sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
-    disabled_tools: Arc<RwLock<HashSet<String>>>,
+    disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
+    provider_allowed_tools: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
 impl ToolExecutionServiceBuilder {
@@ -85,12 +91,26 @@ impl ToolExecutionServiceBuilder {
         self
     }
 
-    pub fn initial_disabled_tools(mut self, tools: &[String]) -> Self {
+    pub fn initial_disabled_tool_offers(mut self, tools: &[String]) -> Self {
         let mut set = HashSet::new();
         for t in tools {
+            validate_tool_offer_id(t).unwrap_or_else(|message| {
+                panic!("invalid deployment disabled_tool_offers: {message}")
+            });
             set.insert(t.clone());
         }
-        self.disabled_tools = Arc::new(RwLock::new(set));
+        self.disabled_tool_offers = Arc::new(RwLock::new(set));
+        self
+    }
+
+    pub fn initial_provider_allowed_tools(
+        mut self,
+        tools: HashMap<String, HashSet<String>>,
+    ) -> Self {
+        validate_provider_allowed_tools(&tools).unwrap_or_else(|message| {
+            panic!("invalid deployment provider_allowed_tools: {message}")
+        });
+        self.provider_allowed_tools = Arc::new(RwLock::new(tools));
         self
     }
 
@@ -103,7 +123,8 @@ impl ToolExecutionServiceBuilder {
             gateway_relay_transport: self.gateway_relay_transport,
             sandbox_resident_agent_transport: self.sandbox_resident_agent_transport,
             tool_registry: self.tool_registry,
-            disabled_tools: self.disabled_tools,
+            disabled_tool_offers: self.disabled_tool_offers,
+            provider_allowed_tools: self.provider_allowed_tools,
         }
     }
 }
@@ -116,8 +137,11 @@ pub struct ToolExecutionService {
     gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
     sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
-    /// Runtime-disabled tools (admin API). Checked before dispatch.
-    disabled_tools: Arc<RwLock<HashSet<String>>>,
+    /// Runtime-disabled tool offers (admin API/config). Checked before dispatch.
+    disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
+    /// Optional exact allowlist per provider id. Missing provider id means
+    /// unrestricted; present provider id means only listed canonical tools.
+    provider_allowed_tools: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
 impl ToolExecutionService {
@@ -145,28 +169,62 @@ impl Default for ToolExecutionService {
 }
 
 impl ToolExecutionService {
-    pub async fn disable_tool(&self, name: &str) -> bool {
-        self.disabled_tools.write().await.insert(name.to_string())
+    pub async fn disable_tool_offer(&self, offer_id: &str) -> Result<bool, String> {
+        validate_tool_offer_id(offer_id)?;
+        Ok(self
+            .disabled_tool_offers
+            .write()
+            .await
+            .insert(offer_id.to_string()))
     }
 
-    /// Enable a previously disabled tool at runtime (returns true if it was disabled).
-    pub async fn enable_tool(&self, name: &str) -> bool {
-        self.disabled_tools.write().await.remove(name)
+    /// Enable a previously disabled tool offer at runtime (returns true if it was disabled).
+    pub async fn enable_tool_offer(&self, offer_id: &str) -> Result<bool, String> {
+        validate_tool_offer_id(offer_id)?;
+        Ok(self.disabled_tool_offers.write().await.remove(offer_id))
     }
 
-    /// List currently disabled tools.
-    pub async fn disabled_tools(&self) -> Vec<String> {
-        self.disabled_tools.read().await.iter().cloned().collect()
+    /// List currently disabled tool offers.
+    pub async fn disabled_tool_offers(&self) -> Vec<String> {
+        let mut offers = self
+            .disabled_tool_offers
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        offers.sort();
+        offers
     }
 
-    pub fn disabled_tools_handle(&self) -> Arc<RwLock<HashSet<String>>> {
-        Arc::clone(&self.disabled_tools)
+    pub fn disabled_tool_offers_handle(&self) -> Arc<RwLock<HashSet<String>>> {
+        Arc::clone(&self.disabled_tool_offers)
+    }
+
+    pub fn provider_allowed_tools_handle(&self) -> Arc<RwLock<HashMap<String, HashSet<String>>>> {
+        Arc::clone(&self.provider_allowed_tools)
+    }
+
+    pub(crate) fn tool_admission_context_snapshot(&self) -> ToolAdmissionContext {
+        ToolAdmissionContext {
+            disabled_tool_offers: self
+                .disabled_tool_offers
+                .try_read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
+            provider_allowed_tools: self
+                .provider_allowed_tools
+                .try_read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default(),
+            ..ToolAdmissionContext::default()
+        }
     }
 
     /// Check whether a tool is currently disabled.
     #[allow(dead_code)]
-    pub(crate) async fn is_tool_disabled(&self, name: &str) -> bool {
-        self.disabled_tools.read().await.contains(name)
+    pub(crate) async fn is_tool_offer_disabled(&self, name: &str) -> bool {
+        self.disabled_tool_offers.read().await.contains(name)
     }
 
     pub fn tool_registry(&self) -> &astra_runtime_env::ToolRegistry {
@@ -183,7 +241,17 @@ impl ToolExecutionService {
     /// Primary resolution goes through the runtime tool registry: tool class
     /// declares the owner, then the current binding selects the transport.
     pub fn routing_decision(&self, request: &ToolExecutionRequest) -> ToolExecutionRouteKind {
-        routing_decision(request, &self.tool_registry)
+        if let Some(offer) = request.selected_offer.as_ref()
+            && !matches!(offer.route, ToolExecutionRouteKind::Unsupported)
+        {
+            return offer.route;
+        }
+        routing_decision_for_binding(
+            &request.tool_name,
+            request.workspace.kind,
+            request.executor.transport,
+            &self.tool_registry,
+        )
     }
 
     pub(crate) fn cancelled_before_route_result(
@@ -281,19 +349,54 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport + ?Sized,
     {
         let transport_request = request.with_transport_arguments();
+        if matches!(route, ToolExecutionRouteKind::Unsupported)
+            && !matches!(
+                transport_request.workspace.kind,
+                WorkspaceBindingKind::None | WorkspaceBindingKind::Unknown
+            )
+        {
+            let binding = transport_request.runtime_environment_binding(&self.tool_registry);
+            return unsupported_workspace_executor_result(&transport_request, &binding);
+        }
         let binding = match self.authorize_tool_request(&transport_request) {
             Ok(binding) => binding,
             Err(ref err) => {
                 return capability_denied_result(&transport_request, &err.0, err.1.clone());
             }
         };
+        if selected_offer_route_mismatch(&transport_request, route) {
+            return selected_offer_route_mismatch_result(&transport_request, &binding, route);
+        }
+        if matches!(route, ToolExecutionRouteKind::RequestScopedMcp)
+            && transport_request.selected_offer.is_none()
+        {
+            return capability_denied_result(
+                &transport_request,
+                &binding,
+                astra_runtime_env::ToolUnavailableReason::PolicyDenied(
+                    "selected tool offer is required for request-scoped MCP execution".to_string(),
+                ),
+            );
+        }
 
-        // ── Runtime disabled-tools check (admin API / config) ──
-        if self
-            .disabled_tools
-            .read()
-            .await
-            .contains(&transport_request.tool_name)
+        // ── Runtime offer policy check (admin API / config) ──
+        let disabled_offer_ids = self.disabled_tool_offers.read().await.clone();
+        let provider_allowed_tools = self.provider_allowed_tools.read().await.clone();
+        let admission = resolve_tool_admission_for_binding_with_context(
+            &transport_request.tool_name,
+            &[],
+            &transport_request.workspace,
+            &transport_request.executor,
+            transport_request.runtime.as_ref(),
+            &self.tool_registry,
+            ToolAdmissionContext {
+                disabled_tool_offers: disabled_offer_ids.clone(),
+                provider_allowed_tools: provider_allowed_tools.clone(),
+                ..ToolAdmissionContext::default()
+            },
+        );
+        if let Some(offer_id) =
+            disabled_offer_id_for_request(&transport_request, &admission, &disabled_offer_ids)
         {
             let mut meta = serde_json::Map::new();
             meta.insert("tool_disabled".to_string(), serde_json::Value::Bool(true));
@@ -301,10 +404,44 @@ impl ToolExecutionService {
                 "tool_name".to_string(),
                 serde_json::Value::String(transport_request.tool_name.clone()),
             );
+            meta.insert(
+                "tool_offer_id".to_string(),
+                serde_json::Value::String(offer_id.clone()),
+            );
             return astra_tools::ToolResult {
                 output: format!(
-                    "Tool `{}` is currently disabled by the server administrator.",
-                    transport_request.tool_name
+                    "Tool offer `{}` is currently disabled by the server administrator.",
+                    offer_id
+                ),
+                metadata: Some(meta),
+                is_error: true,
+                exit_semantics: None,
+            };
+        }
+        if let Some((offer_id, provider_id)) =
+            disallowed_offer_id_for_request(&transport_request, &admission, &provider_allowed_tools)
+        {
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "tool_provider_disallowed".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            meta.insert(
+                "tool_name".to_string(),
+                serde_json::Value::String(transport_request.tool_name.clone()),
+            );
+            meta.insert(
+                "tool_offer_id".to_string(),
+                serde_json::Value::String(offer_id.clone()),
+            );
+            meta.insert(
+                "provider_id".to_string(),
+                serde_json::Value::String(provider_id.clone()),
+            );
+            return astra_tools::ToolResult {
+                output: format!(
+                    "Tool offer `{}` is not enabled for provider `{}`.",
+                    offer_id, provider_id
                 ),
                 metadata: Some(meta),
                 is_error: true,
@@ -390,16 +527,26 @@ impl ToolExecutionService {
                 ),
             )));
         }
-        match astra_runtime_env::CapabilityResolver.check_tool_call(
+        match astra_runtime_env::CapabilityResolver.check_tool_call_for_surface(
             &self.tool_registry,
             &request.tool_name,
             &request.args,
             &binding.capabilities,
+            &binding.tool_surface,
         ) {
             Ok(()) => Ok(binding),
             Err(reason) => Err(Box::new((binding, reason))),
         }
     }
+}
+
+fn selected_offer_route_mismatch(
+    request: &ToolExecutionRequest,
+    route: ToolExecutionRouteKind,
+) -> bool {
+    request.selected_offer.as_ref().is_some_and(|offer| {
+        !matches!(offer.route, ToolExecutionRouteKind::Unsupported) && offer.route != route
+    })
 }
 
 fn local_result_binding(
@@ -429,13 +576,7 @@ fn local_result_binding(
         ),
         ToolExecutionRouteKind::RequestScopedMcp => (
             request.workspace.clone(),
-            ExecutorBinding {
-                kind: ExecutorBindingKind::Mcp,
-                executor_id: "request-scoped-mcp".to_string(),
-                display_name: "MCP server".to_string(),
-                transport: ToolTransportKind::McpHttp,
-                status: ExecutorStatus::Unknown,
-            },
+            ExecutorBinding::request_scoped_mcp(),
             ToolTransportKind::McpHttp,
         ),
         _ => (
@@ -485,13 +626,73 @@ fn append_route_binding_metadata(
     }
 }
 
+fn disabled_offer_id_for_request(
+    request: &ToolExecutionRequest,
+    admission: &super::tool_admission::ToolAdmissionDecision,
+    disabled_offer_ids: &HashSet<String>,
+) -> Option<String> {
+    if admission.hidden_reason == Some(ToolHiddenReason::DisabledOffer) {
+        return admission.selected_offer_id().map(str::to_string);
+    }
+    request
+        .selected_offer
+        .as_ref()
+        .filter(|offer| disabled_offer_ids.contains(&offer.offer_id))
+        .map(|offer| offer.offer_id.clone())
+}
+
+fn disallowed_offer_id_for_request(
+    request: &ToolExecutionRequest,
+    admission: &super::tool_admission::ToolAdmissionDecision,
+    provider_allowed_tools: &HashMap<String, HashSet<String>>,
+) -> Option<(String, String)> {
+    if admission.hidden_reason == Some(ToolHiddenReason::ProviderToolNotAllowed) {
+        let offer = admission.selected_offer.as_ref()?;
+        return Some((offer.offer_id.clone(), offer.provider_id.clone()));
+    }
+    let offer = request.selected_offer.as_ref()?;
+    provider_allowed_tools
+        .get(&offer.provider_id)
+        .is_some_and(|allowed| !allowed.contains(&request.tool_name))
+        .then(|| (offer.offer_id.clone(), offer.provider_id.clone()))
+}
+
+fn validate_tool_offer_id(offer_id: &str) -> Result<(), String> {
+    if astra_runtime_env::is_valid_tool_offer_id(offer_id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "tool offer id must be a concrete '<tool>@<provider>' id (got '{offer_id}')"
+        ))
+    }
+}
+
+fn validate_provider_allowed_tools(
+    provider_allowed_tools: &HashMap<String, HashSet<String>>,
+) -> Result<(), String> {
+    for (provider_id, tool_names) in provider_allowed_tools {
+        if !astra_runtime_env::is_valid_provider_id(provider_id) {
+            return Err(format!(
+                "provider_allowed_tools keys must be concrete provider ids (got '{provider_id}')"
+            ));
+        }
+        for tool_name in tool_names {
+            if !astra_runtime_env::is_valid_tool_offer_tool_name(tool_name) {
+                return Err(format!(
+                    "provider_allowed_tools values must be canonical tool names (got '{tool_name}' for provider '{provider_id}')"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn no_workspace() -> WorkspaceBinding {
     WorkspaceBinding {
         kind: WorkspaceBindingKind::None,
-        display_name: "No workspace".to_string(),
+        display_name: "No file environment".to_string(),
         cwd: None,
         authority: WorkspaceAuthority::None,
-        fallback_policy: FallbackPolicy::Disabled,
     }
 }
 
@@ -503,71 +704,94 @@ fn no_workspace() -> WorkspaceBinding {
 mod tests {
     use super::*;
 
-    // ── Runtime disabled_tools unit tests ───────────────────────────────
-
     #[tokio::test]
-    async fn disable_tool_adds_to_set() {
+    async fn disabled_tool_offers_are_offer_ids_with_idempotent_updates() {
         let svc = ToolExecutionService::new_for_test();
-        assert!(svc.disable_tool("web_search").await);
-        // Disabling again should return false (already disabled).
-        assert!(!svc.disable_tool("web_search").await);
+        assert!(svc.disabled_tool_offers().await.is_empty());
+        assert!(!svc.is_tool_offer_disabled("web_fetch@server-builtin").await);
+
+        svc.disable_tool_offer("web_fetch@server-builtin")
+            .await
+            .unwrap();
+        svc.disable_tool_offer("web_search@server-builtin")
+            .await
+            .unwrap();
+        assert!(svc.is_tool_offer_disabled("web_fetch@server-builtin").await);
+        assert!(
+            !svc.disable_tool_offer("web_fetch@server-builtin")
+                .await
+                .unwrap()
+        );
+
+        let list = svc.disabled_tool_offers().await;
+        assert_eq!(
+            list,
+            vec![
+                "web_fetch@server-builtin".to_string(),
+                "web_search@server-builtin".to_string()
+            ]
+        );
+
+        assert!(
+            svc.enable_tool_offer("web_fetch@server-builtin")
+                .await
+                .unwrap()
+        );
+        assert!(!svc.is_tool_offer_disabled("web_fetch@server-builtin").await);
+        assert!(
+            !svc.enable_tool_offer("web_fetch@server-builtin")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !svc.enable_tool_offer("nonexistent@server-builtin")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
-    async fn enable_tool_removes_from_set() {
+    async fn disabled_tool_offers_reject_global_or_ambiguous_ids() {
         let svc = ToolExecutionService::new_for_test();
-        svc.disable_tool("web_search").await;
-        assert!(svc.enable_tool("web_search").await);
-        // Enabling again should return false (not disabled).
-        assert!(!svc.enable_tool("web_search").await);
+
+        for offer_id in ["web_fetch", "web_fetch@edge@macpro", "web_fetch@../edge"] {
+            let error = svc.disable_tool_offer(offer_id).await.unwrap_err();
+            assert!(
+                error.contains("tool offer id must be a concrete"),
+                "invalid offer id {offer_id:?} should fail fast: {error}"
+            );
+        }
+
+        assert!(svc.disabled_tool_offers().await.is_empty());
     }
 
-    #[tokio::test]
-    async fn disabled_tools_list_matches_state() {
-        let svc = ToolExecutionService::new_for_test();
-        svc.disable_tool("web_fetch").await;
-        svc.disable_tool("web_search").await;
-        let list = svc.disabled_tools().await;
-        assert_eq!(list.len(), 2);
-        assert!(list.contains(&"web_fetch".to_string()));
-        assert!(list.contains(&"web_search".to_string()));
+    #[test]
+    #[should_panic(expected = "invalid deployment disabled_tool_offers")]
+    fn builder_rejects_invalid_initial_disabled_tool_offers() {
+        let _ = ToolExecutionService::builder()
+            .initial_disabled_tool_offers(&["web_fetch".to_string()])
+            .build();
     }
 
-    #[tokio::test]
-    async fn disabled_tools_empty_by_default() {
-        let svc = ToolExecutionService::new_for_test();
-        assert!(svc.disabled_tools().await.is_empty());
+    #[test]
+    #[should_panic(expected = "provider_allowed_tools keys must be concrete provider ids")]
+    fn builder_rejects_invalid_provider_allowed_tools_provider_id() {
+        let _ = ToolExecutionService::builder()
+            .initial_provider_allowed_tools(HashMap::from([(
+                "edge@macpro".to_string(),
+                HashSet::from(["web_fetch".to_string()]),
+            )]))
+            .build();
     }
 
-    #[tokio::test]
-    async fn is_tool_disabled_reflects_state() {
-        let svc = ToolExecutionService::new_for_test();
-        assert!(!svc.is_tool_disabled("web_search").await);
-        svc.disable_tool("web_search").await;
-        assert!(svc.is_tool_disabled("web_search").await);
-        svc.enable_tool("web_search").await;
-        assert!(!svc.is_tool_disabled("web_search").await);
-    }
-
-    #[tokio::test]
-    async fn enable_nonexistent_is_noop() {
-        let svc = ToolExecutionService::new_for_test();
-        assert!(!svc.enable_tool("nonexistent").await);
-    }
-
-    /// Verifies that `disable_tool` / `disabled_tools` work correctly
-    /// in an async context without deadlocks.
-    #[tokio::test]
-    async fn set_initial_disabled_tools_from_async_context() {
-        let svc = ToolExecutionService::new_for_test();
-        assert!(svc.disabled_tools().await.is_empty());
-
-        svc.disable_tool("web_fetch").await;
-        svc.disable_tool("web_search").await;
-
-        let list = svc.disabled_tools().await;
-        assert_eq!(list.len(), 2);
-        assert!(list.contains(&"web_fetch".to_string()));
-        assert!(list.contains(&"web_search".to_string()));
+    #[test]
+    #[should_panic(expected = "provider_allowed_tools values must be canonical tool names")]
+    fn builder_rejects_invalid_provider_allowed_tools_tool_name() {
+        let _ = ToolExecutionService::builder()
+            .initial_provider_allowed_tools(HashMap::from([(
+                "edge-macpro".to_string(),
+                HashSet::from(["web.fetch".to_string()]),
+            )]))
+            .build();
     }
 }

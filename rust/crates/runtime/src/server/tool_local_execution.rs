@@ -6,7 +6,7 @@ use std::sync::{
 
 use astra_core::SharedPool;
 use astra_services::resource_governor::ResourceGovernor;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -67,43 +67,18 @@ pub(crate) async fn run_local_tool_preflight(
     LocalToolPreflight::Continue
 }
 
-const SERVER_LOCAL_AVAILABLE_TOOLS: &[&str] = &[
-    "bash",
-    "read_file",
-    "write_file",
-    "str_replace",
-    "delete_file",
-    "rollback_file_edits",
-    "multi_edit",
-    "list_dir",
-    "adjust_config",
-    "compress_context",
-    "rollback_session_state",
-    "task",
-    "sleep",
-    "tool_search",
-    "mo_query",
-    "rollback_database_snapshots",
-    "grep",
-    "glob",
-    "git",
-    "github",
-    "symbols",
-    "memory",
-    "web_fetch",
-    "web_search",
-    "publish_artifact",
-    "run_script",
-    "notify",
-    "ask_user",
-    "get_agent_info",
-];
-
 pub(crate) fn unknown_local_tool_result(name: &str) -> astra_tools::ToolResult {
-    astra_tools::ToolResult::error(format!(
-        "Error: Tool '{name}' is not available in server-side execution mode. Available: {}",
-        SERVER_LOCAL_AVAILABLE_TOOLS.join(", ")
-    ))
+    astra_tools::ToolResult::error(
+        json!({
+            "status": "failed",
+            "error": format!(
+                "Tool `{name}` is not available in the current runtime tool surface. The runtime did not advertise this tool for this turn; use a visible tool, select an advertised deferred tool with tool_search, or bind the required capacity provider."
+            ),
+            "error_kind": astra_core::ErrorKind::ToolNotFound.as_str(),
+            "retryable": false,
+        })
+        .to_string(),
+    )
 }
 
 pub(crate) fn spawn_resource_tool_call_recording(
@@ -291,9 +266,19 @@ mod tests {
         let result = unknown_local_tool_result("delegate");
 
         assert!(result.is_error);
-        assert!(result.output.contains("Tool 'delegate' is not available"));
-        assert!(result.output.contains("Available: bash"));
-        assert!(result.output.contains("github"));
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["status"], "failed");
+        assert_eq!(
+            parsed["error_kind"],
+            astra_core::ErrorKind::ToolNotFound.as_str()
+        );
+        assert_eq!(parsed["retryable"], false);
+        let error = parsed["error"].as_str().unwrap();
+        assert!(error.contains("Tool `delegate` is not available"));
+        assert!(!result.output.contains("Available:"));
+        assert!(!result.output.contains("mo_query"));
+        assert!(!result.output.contains("powershell"));
+        assert!(error.contains("current runtime tool surface"));
     }
 
     #[test]

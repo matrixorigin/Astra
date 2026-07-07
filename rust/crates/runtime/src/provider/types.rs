@@ -3,6 +3,7 @@
 //! These types describe *what* a provider can do and *what kind* of provider
 //! it is. They form the vocabulary used by the capability registry at L1.
 
+use astra_core::tool_offer::is_mcp_namespaced_tool_name;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,9 @@ pub enum ToolCategory {
     ExternalApi,
     /// Session-level state management (`memory`, `session`, `task`).
     StateManagement,
+    /// Local typed background process/task projection (`task_output`,
+    /// `task_stop`, `task_list`), distinct from the durable task board.
+    BackgroundTaskProcess,
     /// Agent fan-out / delegation (`agent`, `agent_fanout`).
     AgentDelegation,
     /// MCP protocol tools.
@@ -85,16 +89,14 @@ impl ToolCategory {
             | "compress_context"
             | "memory"
             | "session"
-            | "task"
-            | "task_output"
-            | "task_stop"
-            | "task_list"
+            | "task_board"
             | "mo_query"
             | "rollback_database_snapshots"
             | "rollback_session_state" => Some(Self::StateManagement),
+            "task_output" | "task_stop" | "task_list" => Some(Self::BackgroundTaskProcess),
             "agent" | "agent_fanout" => Some(Self::AgentDelegation),
             "symbols" | "lsp" | "find_definition" | "find_references" => Some(Self::Symbols),
-            _ if name.starts_with("mcp__") => Some(Self::McpProtocol),
+            _ if is_mcp_namespaced_tool_name(name) => Some(Self::McpProtocol),
             _ => None,
         }
     }
@@ -136,9 +138,22 @@ mod tests {
             Some(ToolCategory::StateManagement)
         );
         assert_eq!(
+            ToolCategory::for_tool_name("task_board"),
+            Some(ToolCategory::StateManagement)
+        );
+        for local_background_tool in ["task_output", "task_stop", "task_list"] {
+            assert_eq!(
+                ToolCategory::for_tool_name(local_background_tool),
+                Some(ToolCategory::BackgroundTaskProcess),
+                "{local_background_tool} must not be confused with the durable task board"
+            );
+        }
+        assert_eq!(
             ToolCategory::for_tool_name("mcp__node_repl__js"),
             Some(ToolCategory::McpProtocol)
         );
+        assert_eq!(ToolCategory::for_tool_name("mcp__"), None);
+        assert_eq!(ToolCategory::for_tool_name("mcp__bad/name"), None);
         assert_eq!(ToolCategory::for_tool_name("unknown_tool"), None);
     }
 }

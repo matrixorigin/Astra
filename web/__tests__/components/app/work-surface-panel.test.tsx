@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { WorkSurfacePanel } from "@/components/app/work-surface-panel";
+import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from "@/lib/run-status-messages";
 import { createEmptyWorkSurface } from "@/lib/work-surface";
 
 vi.mock("lucide-react", () => {
@@ -188,7 +189,7 @@ describe("WorkSurfacePanel", () => {
     expect(screen.getAllByText("read_file").length).toBeGreaterThan(0);
   });
 
-  it("keeps subagent card order stable while opening latest details", async () => {
+  it("keeps subagent card order stable while opening active details", async () => {
     const loadAgentRun = vi.fn().mockResolvedValue({
       runId: "run-new",
       sessionId: "session-1",
@@ -285,6 +286,61 @@ describe("WorkSurfacePanel", () => {
     });
   });
 
+  it("opens the first active subagent instead of chasing latest timestamps", async () => {
+    const loadAgentRun = vi.fn().mockResolvedValue({
+      runId: "run-first",
+      sessionId: "session-1",
+      status: "running",
+      events: [
+        {
+          type: "agent_live_event",
+          event_kind: "output_delta",
+          content: "first active details",
+        },
+      ],
+      generatedAt: "2026-06-11T00:00:00.000Z",
+    });
+
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          agents: [
+            {
+              agentId: "agent-first",
+              runId: "run-first",
+              agentType: "research",
+              description: "First active agent",
+              status: "running",
+              updatedAt: 1_000,
+            },
+            {
+              agentId: "agent-latest",
+              runId: "run-latest",
+              agentType: "research",
+              description: "Latest active agent",
+              status: "running",
+              updatedAt: 9_000,
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "running" }}
+        tab="agents"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={loadAgentRun}
+      />,
+    );
+
+    expect(await screen.findByText("First active agent")).toBeInTheDocument();
+    expect(screen.getByText("Latest active agent")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(loadAgentRun).toHaveBeenCalledWith("run-first");
+    });
+    expect(loadAgentRun).not.toHaveBeenCalledWith("run-latest");
+  });
+
   it("renders cancelled tool cards without a failure notice", () => {
     render(
       <WorkSurfacePanel
@@ -364,14 +420,94 @@ describe("WorkSurfacePanel", () => {
 
     expect(screen.getByText("Needs file environment")).toBeInTheDocument();
     expect(
-      screen.getByText(
-        "This request needs a file or command environment. Connect one or choose a sandbox, then retry.",
-      ),
+      screen.getByText(WORKSPACE_EXECUTION_BLOCKED_MESSAGE),
     ).toBeInTheDocument();
     expect(
       screen.getByText("Orchestrator-managed executor"),
     ).toBeInTheDocument();
     expect(screen.getByText("/checkout/repo")).toBeInTheDocument();
+  });
+
+  it("renders parent-paused subagents as waiting instead of interrupted", () => {
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          agents: [
+            {
+              agentId: "agent-paused-child",
+              agentType: "code-review",
+              description: "Review current branch",
+              status: "waiting",
+              reason: "parent_run_paused",
+              resultSummary:
+                "Parent run paused before a terminal subagent event was observed.",
+              updatedAt: 1_801_000_000_000,
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "paused" }}
+        tab="agents"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByText("Waiting").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText(
+        "Parent run paused before a terminal subagent event was observed.",
+      ).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText("Needs attention")).toBeNull();
+    expect(screen.queryByText("Interrupted")).toBeNull();
+  });
+
+  it("renders empty-completion subagents as needing a final answer instead of failed", async () => {
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          agents: [
+            {
+              agentId: "agent-weather",
+              agentType: "research",
+              description: "Fetch Shanghai weather",
+              status: "interrupted",
+              reason: "empty_completion",
+              resultSummary: "上海今日小雨，33°C / 25°C。",
+              updatedAt: 1_801_000_000_000,
+              events: [
+                {
+                  id: "event-weather",
+                  type: "agent_interrupted",
+                  label: "Needs final answer",
+                  detail: "上海今日小雨，33°C / 25°C。",
+                  tone: "warning",
+                  timestamp: 1_801_000_000_000,
+                },
+              ],
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "paused" }}
+        tab="agents"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByText("Needs final answer").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Interrupted")).toBeNull();
+    expect(screen.queryByText("Needs attention")).toBeNull();
+    expect(await screen.findByText("No final answer")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("上海今日小雨，33°C / 25°C。").length,
+    ).toBeGreaterThan(0);
   });
 
   it("shows selected subagent live output as a readable transcript", async () => {

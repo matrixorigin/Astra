@@ -10,8 +10,8 @@ type ChatDotNavigatorProps = {
   scrollContainerRef: RefObject<HTMLDivElement | null>;
 };
 
-const FIRST_NAVIGABLE_MESSAGE_COUNT = 1;
 const FULL_ANCHOR_MESSAGE_LIMIT = 6;
+const FIRST_NAVIGABLE_MESSAGE_COUNT = FULL_ANCHOR_MESSAGE_LIMIT + 1;
 const USER_INPUT_PREVIEW_LIMIT = 80;
 
 function computeStep(total: number) {

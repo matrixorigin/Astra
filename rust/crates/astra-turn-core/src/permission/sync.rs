@@ -339,9 +339,10 @@ impl PermissionRequestHandler {
                 PermissionResponse::deny("permission mode is deny")
             }
             ManualApprovalPolicy::Plan => {
-                if crate::tool::schema::prune::PLAN_MODE_REQUIRED_TOOLS
-                    .contains(&request.tool_name.as_str())
-                {
+                if !crate::plan_mode_policy::is_plan_mode_blocked_tool(
+                    &request.tool_name,
+                    &request.args,
+                ) {
                     PermissionResponse::approve()
                 } else {
                     PermissionResponse::deny(crate::permission::engine::plan_mode_denial_reason(
@@ -489,10 +490,29 @@ mod handler_tests {
 
         assert!(!response.approved);
         let reason = response.reason.as_deref().expect("denial reason");
-        assert!(reason.contains("already-visible read-only tools"));
+        assert!(reason.contains("read-only invocations"));
         assert!(reason.contains("exit_plan_mode(plan=...)"));
         assert!(!reason.contains("Use `exit_plan_mode` directly"));
         assert!(!reason.contains("no longer routes through"));
+    }
+
+    #[tokio::test]
+    async fn handler_plan_mode_uses_args_aware_policy_for_shell() {
+        let handler =
+            PermissionRequestHandler::new(PermissionSyncContext::shared_root(PermissionMode::Plan));
+
+        let read_only =
+            PermissionRequest::new("bash", serde_json::json!({"command": "git status --short"}));
+        let response = handler.handle_request(&read_only).await;
+        assert!(
+            response.approved,
+            "plan mode should approve args-aware read-only bash"
+        );
+
+        let mutating =
+            PermissionRequest::new("bash", serde_json::json!({"command": "touch plan.txt"}));
+        let response = handler.handle_request(&mutating).await;
+        assert!(!response.approved, "plan mode should deny mutating bash");
     }
 
     #[tokio::test]

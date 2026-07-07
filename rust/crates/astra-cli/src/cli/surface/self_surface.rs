@@ -1,7 +1,8 @@
-use crate::cli::self_command::{IdentityView, identity_view, to_json, verify_runtime_config};
+use crate::cli::self_command::{
+    IdentityView, cli_provider_visible_tool_names, identity_view, to_json, verify_runtime_config,
+};
 use astra_config::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::ConstraintSet;
-use astra_runtime::tool_registry::ToolRegistry;
 use astra_services::self_surface::{
     BudgetConfig, LoadedSelfSurfaceArtifacts, LocalSelfSurfaceService, PersistentSelfSnapshot,
     SelfSurfaceArtifactLoader, SelfSurfaceCheck, SelfSurfaceDimension, SelfSurfaceResponse,
@@ -31,10 +32,7 @@ struct CliSelfSurfaceRuntimeSupport;
 
 impl SelfSurfaceRuntimeSupport for CliSelfSurfaceRuntimeSupport {
     fn tool_names(&self) -> Vec<String> {
-        ToolRegistry::all_tool_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        cli_provider_visible_tool_names()
     }
 
     fn constraints(&self) -> SurfaceConstraints {

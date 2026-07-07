@@ -112,20 +112,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_tool_has_triggers() {
-        for tool in TOOL_CATALOG {
-            assert!(!tool.triggers.is_empty(), "{} has no triggers", tool.name);
-        }
-    }
-
-    #[test]
-    fn every_tool_has_intents() {
-        for tool in TOOL_CATALOG {
-            assert!(!tool.intents.is_empty(), "{} has no intents", tool.name);
-        }
-    }
-
     // ── Tool surface contract ──
 
     #[test]
@@ -148,41 +134,6 @@ mod tests {
         assert!(
             !names.contains(&"lsp".to_string()),
             "lsp is deferred until explicit activation, got: {:?}",
-            names
-        );
-    }
-
-    /// Regression: recall queries should surface recall-oriented memory tools.
-    #[test]
-    fn memory_is_visible_for_recall_queries() {
-        let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("我有哪些记忆？");
-        let names = ToolRegistry::visible_names(&selected);
-        assert!(names.contains(&"memory".to_string()));
-    }
-
-    /// Regression: implicit Chinese preferences still have memory available
-    /// because memory is always_load.
-    #[test]
-    fn memory_is_visible_for_preference_statements() {
-        let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("苹果比较好吃");
-        let names = ToolRegistry::visible_names(&selected);
-        assert!(
-            names.contains(&"memory".to_string()),
-            "memory must be selected for implicit preference intent, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn memory_is_visible_for_tracking_statements() {
-        let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("我关注 matrixorigin");
-        let names = ToolRegistry::visible_names(&selected);
-        assert!(
-            names.contains(&"memory".to_string()),
-            "memory must be selected for tracking intent, got: {:?}",
             names
         );
     }
@@ -210,6 +161,31 @@ mod tests {
         let (result, _report) = registry.build_initial_surface_with_report("最新的pr?", 50);
         let names = ToolRegistry::visible_names(&result);
         assert_eq!(names, registry.always_load_tool_names_sorted());
+    }
+
+    #[test]
+    fn non_conversational_text_does_not_change_prompt_visible_surface() {
+        let registry = ToolRegistry::new(mock_schemas());
+        let baseline = registry.build_initial_surface("inspect the repository files");
+        let baseline_bytes =
+            serde_json::to_vec(&baseline).expect("baseline surface must serialize");
+
+        for query in [
+            "please use mo_query and powershell to inspect the database",
+            "fetch https://example.com with web_fetch and summarize it",
+            "open the latest GitHub PR and inspect the CI failure",
+            "find references for this symbol with lsp",
+            "git status and then read the changed files",
+            "我关注 matrixorigin, 请分析相关仓库状态",
+        ] {
+            let selected = registry.build_initial_surface(query);
+            let selected_bytes =
+                serde_json::to_vec(&selected).expect("selected surface must serialize");
+            assert_eq!(
+                selected_bytes, baseline_bytes,
+                "non-conversational query text must not change the prompt-visible tool surface: {query}"
+            );
+        }
     }
 
     // ── ToolRegistry integration ──
@@ -263,75 +239,6 @@ mod tests {
             names.len(),
             0,
             "pure conversational query should not spend schema tokens, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn complex_query_uses_always_load_surface() {
-        let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("analyze why the CI failed on the latest PR");
-        let names = ToolRegistry::visible_names(&selected);
-        assert!(names.contains(&"git".to_string()));
-        assert!(!names.contains(&"github".to_string()));
-    }
-
-    #[test]
-    fn repo_stats_query_leaves_github_deferred() {
-        let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("matrixorigin memoria 多少star了？");
-        let names = ToolRegistry::visible_names(&selected);
-        assert!(
-            !names.contains(&"github".to_string()),
-            "repo stats query should activate github through tool_search first, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn memory_query_uses_always_load_memory() {
-        let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("我之前记住的偏好是什么?");
-        let names = ToolRegistry::visible_names(&selected);
-        assert!(
-            names.contains(&"memory".to_string()),
-            "memory query should include memory, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn create_issue_query_leaves_github_deferred() {
-        let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("create a new issue for this bug");
-        let names = ToolRegistry::visible_names(&selected);
-        assert!(
-            !names.contains(&"github".to_string()),
-            "create issue query should activate github through tool_search first, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn git_status_query_uses_always_load_git() {
-        let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("git status 看看改了什么");
-        let names = ToolRegistry::visible_names(&selected);
-        assert!(
-            names.contains(&"git".to_string()),
-            "git status query should include git, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn observation_tools_are_visible_without_deferred_activation() {
-        let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("为什么上次选错了工具?");
-        let names = ToolRegistry::visible_names(&selected);
-        assert!(
-            names.contains(&"introspect".to_string()) && names.contains(&"reflect".to_string()),
-            "observation tools should be always visible for recovery/debug use, got: {:?}",
             names
         );
     }

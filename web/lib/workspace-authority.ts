@@ -1,15 +1,45 @@
 import type { WorkspaceBinding, ExecutorBinding } from "@astra/sdk";
-import type { WorkspaceSelection } from "@/lib/api/types";
+import type { WorkspaceAuthority, WorkspaceSelection } from "@/lib/api/types";
 
-export type WorkspaceAuthorityError = {
-  code: "workspace_path_mismatch";
-  message: string;
+type WorkspaceAuthorityError = {
+  code: string;
+  error: string;
+  status: number;
 };
+
+const DEFAULT_SELECTED_WORKSPACE_AUTHORITY: WorkspaceAuthority = "read_write";
+const LOCAL_PATH_ROOTS = [
+  "/Users/",
+  "/home/",
+  "/workspace/",
+  "/workspaces/",
+  "/tmp/",
+  "/private/tmp/",
+  "/var/",
+  "/etc/",
+  "/opt/",
+  "/mnt/",
+  "/Volumes/",
+];
+const CASE_INSENSITIVE_LOCAL_ROOTS = [
+  "/Users/",
+  "/Volumes/",
+  "/private/tmp/",
+  "/private/var/",
+];
+
+function workspaceAuthority(value: unknown): WorkspaceAuthority | undefined {
+  return value === "read_only" || value === "read_write" ? value : undefined;
+}
+
+function selectedWorkspaceAuthority(selection: WorkspaceSelection) {
+  return selection.authority ?? DEFAULT_SELECTED_WORKSPACE_AUTHORITY;
+}
 
 export function defaultWorkspaceBinding(): WorkspaceBinding {
   return {
     kind: "none",
-    display_name: "Astra",
+    display_name: "Web",
     authority: "none",
     fallback_policy: "disabled",
   };
@@ -19,7 +49,7 @@ export function defaultExecutorBinding(): ExecutorBinding {
   return {
     kind: "server_local",
     executor_id: "server-control-plane",
-    display_name: "Astra",
+    display_name: "Server control plane",
     transport: "server_local",
     status: "online",
   };
@@ -32,7 +62,7 @@ export function edgeWorkspaceBinding(
     kind: "edge_workspace",
     display_name: selection.displayName ?? selection.edgeAgentId,
     cwd: selection.cwd,
-    authority: "read_write",
+    authority: selectedWorkspaceAuthority(selection),
     fallback_policy: "disabled",
   };
 }
@@ -49,11 +79,13 @@ export function edgeExecutorBinding(
   };
 }
 
-export function serverSandboxWorkspaceBinding(): WorkspaceBinding {
+export function serverSandboxWorkspaceBinding(
+  selection?: Extract<WorkspaceSelection, { kind: "server_sandbox" }>,
+): WorkspaceBinding {
   return {
     kind: "server_sandbox",
     display_name: "Server sandbox",
-    authority: "read_write",
+    authority: selection ? selectedWorkspaceAuthority(selection) : "read_write",
     fallback_policy: "disabled",
   };
 }
@@ -75,8 +107,12 @@ export function normalizeWorkspaceSelection(
     return undefined;
   }
   const raw = value as Record<string, unknown>;
+  const authority = workspaceAuthority(raw.authority);
   if (raw.kind === "server_sandbox") {
-    return { kind: "server_sandbox" };
+    return {
+      kind: "server_sandbox",
+      ...(authority ? { authority } : {}),
+    };
   }
   if (raw.kind !== "edge_workspace") {
     return undefined;
@@ -102,6 +138,7 @@ export function normalizeWorkspaceSelection(
     edgeAgentId,
     displayName: displayName || null,
     cwd,
+    ...(authority ? { authority } : {}),
   };
 }
 
@@ -116,160 +153,15 @@ export function sameWorkspaceSelection(
     return false;
   }
   if (left.kind === "server_sandbox") {
-    return true;
+    return selectedWorkspaceAuthority(left) === selectedWorkspaceAuthority(right);
   }
   return (
     right.kind === "edge_workspace" &&
     left.edgeAgentId === right.edgeAgentId &&
     left.cwd === right.cwd &&
-    (left.displayName ?? null) === (right.displayName ?? null)
+    (left.displayName ?? null) === (right.displayName ?? null) &&
+    selectedWorkspaceAuthority(left) === selectedWorkspaceAuthority(right)
   );
-}
-
-export function localCodeIntent(message: string) {
-  const text = message.trim();
-
-  // Explicit local tool commands that inherently operate on CWD
-  if (
-    /\b(?:git\s+(?:status|diff|show|log|branch|checkout|merge|rebase|commit)|(?:npm|pnpm|yarn)\s+(?:test|run|install|build|lint)|cargo\s+(?:test|build|check|clippy|fmt)|pytest|go\s+test|make(?:\s+\w[\w:-]*)?)\b/i.test(
-      text,
-    )
-  ) {
-    return true;
-  }
-
-  // Explicit local path mentions
-  if (extractLocalPathMentions(text).length > 0) {
-    return true;
-  }
-
-  // "review" alongside code-related terms (branch, changes, diff, PR, commit, code)
-  if (
-    /\breview\b/i.test(text) &&
-    (/\b(?:branch(?:es)?|changes?|diffs?|prs?|pull\s+requests?|commits?|code|repos?|repositories)\b/i.test(
-      text,
-    ) ||
-      /(?:分支|代码|仓库|改动|变更)/u.test(text))
-  ) {
-    return true;
-  }
-
-  // "this/current" workspace context — unambiguously local
-  if (
-    /\b(?:this|current)\s+(?:repo|repository|project|workspace|directory|folder)\b/i.test(
-      text,
-    ) ||
-    /\b(?:review|inspect|fix|modify|edit|run|test|build|open|switch(?:\s+to)?|cd)\s+(?:this|current)\b/i.test(
-      text,
-    )
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-export function extractLocalPathMentions(message: string) {
-  const mentions: string[] = [];
-  for (let index = 0; index < message.length; index += 1) {
-    if (!pathStartBoundary(message[index - 1])) {
-      continue;
-    }
-    if (!localPathPrefixAt(message, index)) {
-      continue;
-    }
-    const token = collectPathToken(message, index);
-    if (token && !mentions.includes(token)) {
-      mentions.push(token);
-    }
-  }
-  return mentions;
-}
-
-function pathStartBoundary(previous: string | undefined) {
-  if (previous === undefined) return true;
-  if (/\s/u.test(previous)) return true;
-  // Non-Latin code points (CJK, symbols, emoji, etc.) are natural boundaries
-  const cp = previous.codePointAt(0);
-  if (cp !== undefined && cp > 127) return true;
-  return ["'", '"', "`", "=", ":", "(", "{", "[", ",", "<", ">"].includes(
-    previous,
-  );
-}
-
-function localPathPrefixAt(message: string, index: number) {
-  const rest = message.slice(index);
-  return (
-    rest.startsWith("~/") ||
-    rest.startsWith("$HOME/") ||
-    rest.startsWith("${HOME}/") ||
-    rest.startsWith("/Users/") ||
-    rest.startsWith("/home/") ||
-    rest.startsWith("/Volumes/") ||
-    /^[A-Za-z]:[\\/]/u.test(rest)
-  );
-}
-
-function collectPathToken(message: string, start: number): string {
-  const bracedHome = "${HOME}/";
-  if (message.slice(start).startsWith(bracedHome)) {
-    return `${bracedHome}${collectPathToken(message, start + bracedHome.length)}`;
-  }
-
-  let end = message.length;
-  for (let index = start; index < message.length; index += 1) {
-    const ch = message[index];
-    if (pathHardDelimiter(ch)) {
-      end = index;
-      break;
-    }
-    if (/\s/u.test(ch) && !whitespaceContinuesPath(message, index + 1)) {
-      end = index;
-      break;
-    }
-  }
-  return trimPathTokenEnd(message.slice(start, end));
-}
-
-function pathHardDelimiter(ch: string) {
-  return ["'", '"', "`", ";", "|", "&", "<", ">", "{", "[", "]"].includes(ch);
-}
-
-function whitespaceContinuesPath(message: string, index: number) {
-  while (index < message.length && /\s/u.test(message[index])) {
-    index += 1;
-  }
-  for (let cursor = index; cursor < message.length; cursor += 1) {
-    const ch = message[cursor];
-    if (/\s/u.test(ch) || pathHardDelimiter(ch)) {
-      return false;
-    }
-    if (ch === "/" || ch === "\\") {
-      return true;
-    }
-  }
-  return false;
-}
-
-function trimPathTokenEnd(token: string) {
-  let trimmed = token.replace(/[.,;:!?，。；：！？、]+$/u, "");
-  while (
-    trimmed.endsWith(")") &&
-    countChar(trimmed, ")") > countChar(trimmed, "(")
-  ) {
-    trimmed = trimmed.slice(0, -1);
-  }
-  return trimmed;
-}
-
-function countChar(value: string, needle: string) {
-  let count = 0;
-  for (const ch of value) {
-    if (ch === needle) {
-      count += 1;
-    }
-  }
-  return count;
 }
 
 export function normalizeSlashPath(path: string) {
@@ -288,56 +180,122 @@ export function normalizeSlashPath(path: string) {
   return absolute.startsWith("/") ? `/${parts.join("/")}` : parts.join("/");
 }
 
-export function edgeWorkspaceOwnsPath(
-  selection: WorkspaceSelection,
-  rawPath: string,
+function isLocalAbsolutePath(path: string) {
+  const normalized = path.replace(/\\/g, "/");
+  const lowered = normalized.toLowerCase();
+  return (
+    lowered.startsWith("~/") ||
+    /^[a-z]:\//.test(lowered) ||
+    LOCAL_PATH_ROOTS.some((root) => lowered.startsWith(root.toLowerCase()))
+  );
+}
+
+function stripPathPunctuation(path: string) {
+  return path.replace(/[.,;:!?)}\]]+$/g, "");
+}
+
+export function extractLocalPathMentions(content: string): string[] {
+  const mentions = new Set<string>();
+  const pathPattern =
+    /(^|[\s"'`([{])((?:~\/|[A-Za-z]:[\\/]|\/)[^\s"'`<>]*)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pathPattern.exec(content)) !== null) {
+    const candidate = stripPathPunctuation(match[2] ?? "");
+    if (candidate && isLocalAbsolutePath(candidate)) {
+      mentions.add(candidate);
+    }
+  }
+  return [...mentions];
+}
+
+function homePrefixFromWorkspace(cwd: string) {
+  const normalized = normalizeSlashPath(cwd);
+  const unixHome = normalized.match(/^\/(?:Users|home)\/[^/]+/);
+  if (unixHome) {
+    return unixHome[0];
+  }
+  const windowsHome = normalized.match(/^[A-Za-z]:\/Users\/[^/]+/);
+  return windowsHome?.[0] ?? null;
+}
+
+function expandWorkspaceRelativeHome(path: string, cwd: string) {
+  if (!path.startsWith("~/")) {
+    return path;
+  }
+  const home = homePrefixFromWorkspace(cwd);
+  return home ? `${home}/${path.slice(2)}` : path;
+}
+
+function pathUsesCaseInsensitiveRoot(path: string) {
+  const normalized = normalizeSlashPath(path).toLowerCase();
+  return (
+    /^[a-z]:\//.test(normalized) ||
+    CASE_INSENSITIVE_LOCAL_ROOTS.some((root) =>
+      normalized.startsWith(root.toLowerCase()),
+    )
+  );
+}
+
+function ownedPathKey(path: string, caseInsensitive: boolean) {
+  const normalized = normalizeSlashPath(path);
+  return caseInsensitive ? normalized.toLowerCase() : normalized;
+}
+
+function edgeWorkspaceOwnsPath(
+  selection: Extract<WorkspaceSelection, { kind: "edge_workspace" }>,
+  path: string,
 ) {
-  if (selection.kind !== "edge_workspace") {
+  const workspaceRoot = normalizeSlashPath(selection.cwd);
+  const expanded = expandWorkspaceRelativeHome(path, workspaceRoot);
+  const normalizedPath = normalizeSlashPath(expanded);
+  if (!workspaceRoot || !normalizedPath) {
     return false;
   }
-  const cwd = normalizeSlashPath(selection.cwd);
-  let path = rawPath;
-  if (
-    rawPath.startsWith("~/") ||
-    rawPath.startsWith("$HOME/") ||
-    rawPath.startsWith("${HOME}/")
-  ) {
-    const home = cwd.match(/^\/Users\/[^/]+|^\/home\/[^/]+/)?.[0];
-    if (!home) {
-      return false;
-    }
-    const suffix = rawPath.startsWith("~/")
-      ? rawPath.slice(2)
-      : rawPath.startsWith("$HOME/")
-        ? rawPath.slice(6)
-        : rawPath.slice(8);
-    path = `${home}/${suffix}`;
-  }
-  const normalizedPath = normalizeSlashPath(path);
-  return normalizedPath === cwd || normalizedPath.startsWith(`${cwd}/`);
+  const caseInsensitive =
+    pathUsesCaseInsensitiveRoot(workspaceRoot) ||
+    pathUsesCaseInsensitiveRoot(normalizedPath);
+  const workspaceKey = ownedPathKey(workspaceRoot, caseInsensitive);
+  const pathKey = ownedPathKey(normalizedPath, caseInsensitive);
+  return (
+    pathKey === workspaceKey ||
+    pathKey.startsWith(`${workspaceKey}/`)
+  );
 }
 
 export function validateWorkspaceAuthority(
-  message: string,
+  content: string,
   selection: WorkspaceSelection | null | undefined,
 ): WorkspaceAuthorityError | null {
-  if (!localCodeIntent(message)) {
+  const paths = extractLocalPathMentions(content);
+  if (paths.length === 0) {
     return null;
   }
-  if (!selection || selection.kind === "server_sandbox") {
-    return null;
-  }
-  const pathMentions = extractLocalPathMentions(message);
-  const foreignPath = pathMentions.find(
-    (path) => !edgeWorkspaceOwnsPath(selection, path),
-  );
-  if (foreignPath) {
+
+  if (!selection) {
     return {
-      code: "workspace_path_mismatch",
-      message: `The referenced path is outside the selected file environment: ${foreignPath}. Choose the environment that contains it or use a path inside the current one.`,
+      code: "workspace_required",
+      error: `The referenced path requires a file environment: ${paths[0]}. Select the environment that contains it, then retry.`,
+      status: 409,
     };
   }
-  return null;
+
+  if (selection.kind === "server_sandbox") {
+    return {
+      code: "workspace_path_mismatch",
+      error: `The selected Server sandbox is an isolated workspace and cannot access host path: ${paths[0]}. Use a relative path inside the sandbox, or select an Edge workspace rooted at that host path.`,
+      status: 409,
+    };
+  }
+
+  const outsidePath = paths.find((path) => !edgeWorkspaceOwnsPath(selection, path));
+  if (!outsidePath) {
+    return null;
+  }
+  return {
+    code: "workspace_path_mismatch",
+    error: `The referenced path is outside the selected file environment: ${outsidePath}. Choose the environment that contains it or use a path inside the current one.`,
+    status: 409,
+  };
 }
 
 export function resolveWorkspaceBindings(selection: WorkspaceSelection | null) {
@@ -353,7 +311,7 @@ export function resolveWorkspaceBindings(selection: WorkspaceSelection | null) {
   }
   if (selection?.kind === "server_sandbox") {
     return {
-      workspaceBinding: serverSandboxWorkspaceBinding(),
+      workspaceBinding: serverSandboxWorkspaceBinding(selection),
       executorBinding: serverSandboxExecutorBinding(),
       edgeProfile: undefined,
     };

@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::server::run::engine::RunStartContext;
 use crate::server::tool_transport::{
-    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
+    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus,
     ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
     binding_event_fields,
 };
@@ -20,13 +20,12 @@ pub(crate) fn resolve_request_execution_bindings(
     request: &astra_services::runs::ChatRequestData,
     server_workspace: &Path,
 ) -> (WorkspaceBinding, ExecutorBinding) {
-    resolve_request_execution_bindings_from_request(request, Some(server_workspace), None, false)
+    resolve_request_execution_bindings_from_request(request, Some(server_workspace), None)
         .expect("server workspace binding resolution should always succeed")
 }
 
 pub(crate) fn request_uses_server_workspace(
     request: &astra_services::runs::ChatRequestData,
-    _has_edge_tools: bool,
 ) -> bool {
     match request
         .workspace_binding
@@ -41,31 +40,19 @@ pub(crate) fn request_uses_server_workspace(
 pub(crate) fn resolve_request_execution_bindings_without_server_workspace(
     request: &astra_services::runs::ChatRequestData,
     edge_profile: &Map<String, Value>,
-    has_edge_tools: bool,
 ) -> Option<(WorkspaceBinding, ExecutorBinding)> {
-    resolve_request_execution_bindings_from_request(
-        request,
-        None,
-        Some(edge_profile),
-        has_edge_tools,
-    )
+    resolve_request_execution_bindings_from_request(request, None, Some(edge_profile))
 }
 
 fn resolve_request_execution_bindings_from_request(
     request: &astra_services::runs::ChatRequestData,
     server_workspace: Option<&Path>,
     edge_profile: Option<&Map<String, Value>>,
-    has_edge_tools: bool,
 ) -> Option<(WorkspaceBinding, ExecutorBinding)> {
     let workspace = match request.workspace_binding.as_ref() {
         Some(binding) => workspace_binding_from_request(binding, server_workspace)?,
         None => match server_workspace {
             Some(_) => WorkspaceBinding::none(),
-            None if has_edge_tools => {
-                return Some(execution_bindings_for_legacy_edge_tools(
-                    edge_profile.unwrap_or(&Map::new()),
-                ));
-            }
             None => return edge_profile.map(execution_bindings_from_edge_profile),
         },
     };
@@ -88,7 +75,7 @@ pub(crate) fn execution_bindings_from_edge_profile(
         if cwd.is_some() {
             "Edge workspace".to_string()
         } else {
-            "No workspace".to_string()
+            "No file environment".to_string()
         }
     });
 
@@ -97,16 +84,15 @@ pub(crate) fn execution_bindings_from_edge_profile(
             kind: WorkspaceBindingKind::EdgeWorkspace,
             display_name: display_name.clone(),
             cwd: Some(cwd),
-            authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
+            authority: edge_profile_workspace_authority(edge_profile)
+                .unwrap_or(WorkspaceAuthority::ReadWrite),
         }
     } else {
         WorkspaceBinding {
             kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
+            display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
-            fallback_policy: FallbackPolicy::Disabled,
         }
     };
     let executor = match workspace.kind {
@@ -131,35 +117,6 @@ pub(crate) fn execution_bindings_from_edge_profile(
     (workspace, executor)
 }
 
-fn execution_bindings_for_legacy_edge_tools(
-    edge_profile: &Map<String, Value>,
-) -> (WorkspaceBinding, ExecutorBinding) {
-    let cwd = first_non_empty_profile_string(edge_profile, &["cwd", "git_root"]);
-    let executor_id =
-        first_non_empty_profile_string(edge_profile, &["edge_agent_id", "agent_id", "edge_id"])
-            .unwrap_or_else(|| "edge-ledger".to_string());
-    let display_name = first_non_empty_profile_string(
-        edge_profile,
-        &["display_name", "hostname", "edge_agent_id", "agent_id"],
-    )
-    .unwrap_or_else(|| "Edge workspace".to_string());
-
-    let workspace = WorkspaceBinding {
-        kind: WorkspaceBindingKind::EdgeWorkspace,
-        display_name: display_name.clone(),
-        cwd,
-        authority: WorkspaceAuthority::ReadWrite,
-        fallback_policy: FallbackPolicy::Disabled,
-    };
-    let executor = ExecutorBinding::edge_agent(
-        executor_id,
-        display_name,
-        ToolTransportKind::EdgeLedger,
-        ExecutorStatus::Online,
-    );
-    (workspace, executor)
-}
-
 pub(crate) fn execution_bindings_from_metadata(
     metadata: Option<&Value>,
     server_workspace: &Path,
@@ -180,7 +137,6 @@ pub(crate) struct RunExecutionBindingSnapshot {
     pub workspace: Option<Value>,
     pub executor: Option<Value>,
     pub transport: Option<String>,
-    pub fallback_policy: Option<String>,
 }
 
 pub(crate) fn agent_working_dir_for_bindings(
@@ -336,9 +292,6 @@ fn workspace_binding_from_request(
             if let Some(authority) = binding.authority {
                 workspace.authority = workspace_authority_from_request(authority);
             }
-            if let Some(fallback_policy) = binding.fallback_policy {
-                workspace.fallback_policy = fallback_policy_from_request(fallback_policy);
-            }
             Some(workspace)
         }
         astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace => {
@@ -351,10 +304,6 @@ fn workspace_binding_from_request(
                     .authority
                     .map(workspace_authority_from_request)
                     .unwrap_or(WorkspaceAuthority::ReadWrite),
-                fallback_policy: binding
-                    .fallback_policy
-                    .map(fallback_policy_from_request)
-                    .unwrap_or(FallbackPolicy::Disabled),
             })
         }
         astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace => {
@@ -367,19 +316,12 @@ fn workspace_binding_from_request(
                     .authority
                     .map(workspace_authority_from_request)
                     .unwrap_or_else(|| cloud_workspace_default_authority(binding)),
-                fallback_policy: binding
-                    .fallback_policy
-                    .map(fallback_policy_from_request)
-                    .unwrap_or(FallbackPolicy::Disabled),
             })
         }
         astra_services::runs::WorkspaceBindingRequestKind::None => {
             let mut workspace = WorkspaceBinding::none();
             if let Some(display_name) = non_empty_string(binding.display_name.as_deref()) {
                 workspace.display_name = display_name;
-            }
-            if let Some(fallback_policy) = binding.fallback_policy {
-                workspace.fallback_policy = fallback_policy_from_request(fallback_policy);
             }
             Some(workspace)
         }
@@ -506,6 +448,18 @@ fn cloud_tool_transport_from_request(
     }
 }
 
+fn edge_profile_workspace_authority(
+    edge_profile: &Map<String, Value>,
+) -> Option<WorkspaceAuthority> {
+    let raw = first_non_empty_profile_string(edge_profile, &["authority", "workspace_authority"])?;
+    match raw.as_str() {
+        "read_only" | "readonly" | "ro" => Some(WorkspaceAuthority::ReadOnly),
+        "read_write" | "readwrite" | "rw" => Some(WorkspaceAuthority::ReadWrite),
+        "none" => Some(WorkspaceAuthority::None),
+        _ => None,
+    }
+}
+
 fn first_non_empty_profile_string(
     edge_profile: &Map<String, Value>,
     keys: &[&str],
@@ -527,14 +481,6 @@ fn workspace_authority_from_request(
         astra_services::runs::WorkspaceAuthorityRequest::ReadOnly => WorkspaceAuthority::ReadOnly,
         astra_services::runs::WorkspaceAuthorityRequest::ReadWrite => WorkspaceAuthority::ReadWrite,
         astra_services::runs::WorkspaceAuthorityRequest::None => WorkspaceAuthority::None,
-    }
-}
-
-fn fallback_policy_from_request(
-    fallback_policy: astra_services::runs::FallbackPolicyRequest,
-) -> FallbackPolicy {
-    match fallback_policy {
-        astra_services::runs::FallbackPolicyRequest::Disabled => FallbackPolicy::Disabled,
     }
 }
 
@@ -655,33 +601,23 @@ mod tests {
     }
 
     #[test]
-    fn fallback_policy_request_maps_all_runtime_variants() {
-        assert_eq!(
-            fallback_policy_from_request(astra_services::runs::FallbackPolicyRequest::Disabled),
-            FallbackPolicy::Disabled
-        );
-    }
-
-    #[test]
     fn request_uses_server_workspace_only_for_explicit_server_sandbox() {
         let request = test_request("hello");
 
-        assert!(!request_uses_server_workspace(&request, false));
-        assert!(!request_uses_server_workspace(&request, true));
+        assert!(!request_uses_server_workspace(&request));
     }
 
     #[test]
-    fn default_request_uses_no_workspace_even_when_server_workspace_exists() {
+    fn default_request_uses_no_file_environment_even_when_server_workspace_exists() {
         let request = test_request("web-only control plane");
 
         let (workspace, executor) =
             resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
 
         assert_eq!(workspace.kind, WorkspaceBindingKind::None);
-        assert_eq!(workspace.display_name, "No workspace");
+        assert_eq!(workspace.display_name, "No file environment");
         assert_eq!(workspace.cwd, None);
         assert_eq!(workspace.authority, WorkspaceAuthority::None);
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
         assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
         assert_eq!(executor.executor_id, "server-control-plane");
         assert_eq!(executor.display_name, "Server control plane");
@@ -698,7 +634,6 @@ mod tests {
             root: Some("/client/claimed/path".to_string()),
             source: None,
             authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
         });
         request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
             kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
@@ -734,7 +669,6 @@ mod tests {
                 reference: None,
             }),
             authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
         });
         request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
             kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
@@ -768,7 +702,6 @@ mod tests {
                 },
             ),
             authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
         });
         request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
             kind: astra_services::runs::ExecutorBindingRequestKind::OrchestratorManaged,
@@ -797,12 +730,9 @@ mod tests {
         edge_profile.insert("hostname".to_string(), Value::String("devbox".to_string()));
         let request = test_request("hello");
 
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &request,
-            &edge_profile,
-            false,
-        )
-        .expect("edge profile should resolve");
+        let (workspace, executor) =
+            resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
+                .expect("edge profile should resolve");
 
         assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
         assert_eq!(workspace.cwd.as_deref(), Some("/repo"));
@@ -810,6 +740,22 @@ mod tests {
         assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
         assert_eq!(executor.executor_id, "edge-1");
         assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
+    }
+
+    #[test]
+    fn edge_profile_can_declare_read_only_workspace_authority() {
+        let edge_profile = serde_json::json!({
+            "cwd": "/Users/test/project",
+            "edge_agent_id": "edge-1",
+            "authority": "read_only"
+        });
+        let (workspace, executor) =
+            execution_bindings_from_edge_profile(edge_profile.as_object().unwrap());
+
+        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
+        assert_eq!(workspace.cwd.as_deref(), Some("/Users/test/project"));
+        assert_eq!(workspace.authority, WorkspaceAuthority::ReadOnly);
+        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
     }
 
     #[test]
@@ -821,37 +767,29 @@ mod tests {
             root: None,
             source: None,
             authority: None,
-            fallback_policy: None,
         });
 
         assert!(
-            resolve_request_execution_bindings_without_server_workspace(
-                &request,
-                &Map::new(),
-                false
-            )
-            .is_none()
+            resolve_request_execution_bindings_without_server_workspace(&request, &Map::new())
+                .is_none()
         );
     }
 
     #[test]
-    fn legacy_edge_tools_without_profile_still_bind_to_edge_ledger() {
+    fn edge_tools_without_profile_do_not_create_provider_binding() {
         let request = test_request("use client tools");
 
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &request,
-            &Map::new(),
-            true,
-        )
-        .expect("legacy edge tools should resolve to edge ledger bindings");
+        let (workspace, executor) =
+            resolve_request_execution_bindings_without_server_workspace(&request, &Map::new())
+                .expect("missing profile should resolve to no-file control-plane bindings");
 
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.display_name, "Edge workspace");
+        assert_eq!(workspace.kind, WorkspaceBindingKind::None);
+        assert_eq!(workspace.display_name, "No file environment");
         assert_eq!(workspace.cwd, None);
-        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.executor_id, "edge-ledger");
-        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
+        assert_eq!(workspace.authority, WorkspaceAuthority::None);
+        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
+        assert_eq!(executor.executor_id, "server-control-plane");
+        assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
         assert_eq!(executor.status, ExecutorStatus::Online);
     }
 
@@ -862,8 +800,7 @@ mod tests {
                 "kind": "server_sandbox",
                 "display_name": "Server sandbox",
                 "cwd": "/stale/workspace",
-                "authority": "read_write",
-                "fallback_policy": "disabled"
+                "authority": "read_write"
             },
             "executor": {
                 "kind": "server_local",

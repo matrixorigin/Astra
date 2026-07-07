@@ -98,6 +98,22 @@ fn scripted_round(text: &str) -> Value {
     })
 }
 
+fn tool_schema_has_cache_control(tool: &Value) -> bool {
+    tool.get("cache_control").is_some()
+        || tool
+            .get("function")
+            .and_then(Value::as_object)
+            .is_some_and(|function| function.contains_key("cache_control"))
+}
+
+fn tool_cache_control_count(request: &CapturedLlmRequest) -> usize {
+    request
+        .tools
+        .iter()
+        .filter(|tool| tool_schema_has_cache_control(tool))
+        .count()
+}
+
 /// A (provider, model) pair and whether we expect the Anthropic-native
 /// marker contract to apply. Bundled so each matrix scenario is a short,
 /// self-describing data row instead of a soup of string literals.
@@ -406,10 +422,11 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
                 count = cap.system_cache_control_count,
                 label = case.label,
             );
-            assert!(
-                cap.last_tool_has_cache_control,
-                "[{label}] marker-isolated provider must mark last tool schema \
-                 with cache_control",
+            assert_eq!(
+                tool_cache_control_count(cap),
+                1,
+                "[{label}] marker-isolated provider must mark exactly one stable \
+                 tool schema with cache_control",
                 label = case.label,
             );
             assert_eq!(
@@ -444,8 +461,9 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
                 count = cap.system_cache_control_count,
                 label = case.label,
             );
-            assert!(
-                !cap.last_tool_has_cache_control,
+            assert_eq!(
+                tool_cache_control_count(cap),
+                0,
                 "[{label}] prefix-only provider must NOT mark tool schemas with \
                  cache_control",
                 label = case.label,

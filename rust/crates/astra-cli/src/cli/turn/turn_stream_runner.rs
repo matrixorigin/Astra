@@ -189,6 +189,7 @@ async fn await_stream_with_interrupts<'a>(
         biased;
         result = &mut stream_fut => (result, false),
         _ = tokio::signal::ctrl_c() => {
+            prepared.run_control.request_cancel();
             cancel_token_for_signal.cancel();
             notify_server_to_cancel_run(api, bearer, &incremental_state, "Ctrl+C");
             if tui_cancel_token.is_none() {
@@ -208,6 +209,7 @@ async fn await_stream_with_interrupts<'a>(
                 None => std::future::pending().await,
             }
         } => {
+            prepared.run_control.request_cancel();
             cancel_token_for_signal.cancel();
             notify_server_to_cancel_run(api, bearer, &incremental_state, "TUI cancel");
             let drained = drain_after_cancel(
@@ -296,6 +298,16 @@ mod tests {
             "await_stream_with_interrupts must call notify_server_to_cancel_run \
              on user-cancel paths so the server-side run does not keep \
              executing after the SSE reader closes"
+        );
+        assert!(
+            fn_body
+                .matches("prepared.run_control.request_cancel()")
+                .count()
+                >= 2,
+            "await_stream_with_interrupts must write user cancellation into the \
+             local RunControlProvider on both Ctrl+C and TUI cancel paths so \
+             CLI local runs use the same shared control-status contract as \
+             server runs"
         );
     }
 

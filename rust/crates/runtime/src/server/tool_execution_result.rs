@@ -2,9 +2,8 @@ use serde_json::{Map, Value};
 
 use super::tool_transport_metadata::{
     TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT, TOOL_ERROR_KIND_CANCELLED,
-    TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_FALLBACK_DISABLED,
-    TOOL_ERROR_KIND_TOOL_TIMEOUT, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
-    TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH,
+    TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_TOOL_TIMEOUT,
+    TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED, TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH,
 };
 
 pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
@@ -56,10 +55,6 @@ fn execution_boundary_wait_error_kind(reason: &str) -> Option<&'static str> {
         || normalized.starts_with(&format!("{TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED}:"))
     {
         Some(TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED)
-    } else if normalized == TOOL_ERROR_KIND_FALLBACK_DISABLED
-        || normalized.starts_with(&format!("{TOOL_ERROR_KIND_FALLBACK_DISABLED}:"))
-    {
-        Some(TOOL_ERROR_KIND_FALLBACK_DISABLED)
     } else {
         None
     }

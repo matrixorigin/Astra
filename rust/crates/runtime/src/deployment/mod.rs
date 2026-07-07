@@ -30,7 +30,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::capability_registry::CapabilityRegistry;
-use crate::provider::server_builtin::{SERVER_BUILTIN_TOOL_NAMES, ServerBuiltinProvider};
+use crate::provider::server_builtin::{ServerBuiltinProvider, server_builtin_tool_names};
 use crate::provider::traits::{ProviderError, ServerToolRuntime};
 use crate::provider::types::{ProviderKind, ToolCapability};
 use crate::storage::{MountType, StorageAccess, WorkspaceSource};
@@ -170,10 +170,9 @@ pub struct DeploymentProfile {
 
 /// All server-service/control-plane tool names that a server deployment can
 /// provide without an explicit workspace/runtime execution provider.
-///
-/// Ordered by category for readability.  Each tool name maps to the
-/// underlying handler registered in `server_tool_executor/tool_handlers.rs`.
-pub const SERVER_ALL_TOOLS: &[&str] = SERVER_BUILTIN_TOOL_NAMES;
+pub fn server_all_tools() -> &'static [String] {
+    server_builtin_tool_names()
+}
 
 impl DeploymentProfile {
     /// Standard server deployment with all server-service/control-plane
@@ -183,9 +182,9 @@ impl DeploymentProfile {
             profile_name: "server-default".into(),
             providers: vec![ProviderConfig {
                 kind: ProviderKind::ServerBuiltin,
-                capabilities: SERVER_ALL_TOOLS
+                capabilities: server_all_tools()
                     .iter()
-                    .map(|t| ToolCapability::Named(t.to_string()))
+                    .map(|t| ToolCapability::Named(t.clone()))
                     .collect(),
                 priority: 10,
                 sandbox: None,
@@ -341,7 +340,7 @@ mod tests {
         let profile = DeploymentProfile::server_default();
         assert_eq!(profile.providers.len(), 1);
         let caps = &profile.providers[0].capabilities;
-        assert_eq!(caps.len(), SERVER_ALL_TOOLS.len());
+        assert_eq!(caps.len(), server_all_tools().len());
         let names: Vec<&str> = caps
             .iter()
             .filter_map(|c| match c {
@@ -374,7 +373,7 @@ mod tests {
         assert!(!names.contains(&"web_fetch"));
         assert!(names.contains(&"memory"));
         assert!(names.contains(&"agent"));
-        assert_eq!(names.len(), SERVER_ALL_TOOLS.len() - 2);
+        assert_eq!(names.len(), server_all_tools().len() - 2);
     }
 
     #[test]

@@ -1,11 +1,41 @@
 use super::*;
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex as StdMutex};
 
 /// Global counters for fire-and-forget persistence failures.
 /// Exposed via `/health` and observable without a DB connection.
 pub static PERSIST_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static PERSIST_OK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+static ORDERED_SIDE_EFFECT_QUEUES: LazyLock<StdMutex<OrderedSideEffectQueues>> =
+    LazyLock::new(|| StdMutex::new(OrderedSideEffectQueues::default()));
+
+#[derive(Default)]
+struct OrderedSideEffectQueues {
+    queues: HashMap<String, VecDeque<BridgeHookSideEffectJob>>,
+    running: HashSet<String>,
+}
+
+struct BridgeHookSideEffectJob {
+    payload: serde_json::Value,
+    turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
+    turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
+    turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
+    turn_observer_worker: Arc<dyn TurnObserverWorker>,
+}
+
+impl BridgeHookSideEffectJob {
+    fn session_key(&self) -> String {
+        self.payload
+            .as_object()
+            .and_then(|payload| optional_object_str(payload, "session_id"))
+            .filter(|session_id| !session_id.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "__missing_session__".to_string())
+    }
+}
 
 /// Increment the failure counter and log the error.
 fn record_persist_failure(context: &str, error: &impl std::fmt::Display) {
@@ -28,35 +58,88 @@ pub fn run_bridge_hook_side_effects(
     let Some(payload) = payload else {
         return;
     };
-    tokio::spawn(async move {
-        if let Some((plan, writer)) =
-            build_hook_db_persist_from_payload(&payload, turn_hook_db_writer)
-            && let Err(error) = writer.persist(plan).await
-        {
-            record_persist_failure("hook_db_persist", &error);
-            return;
-        }
-        let reflection_actions = build_reflection_actions_from_payload(&payload);
-        let reflection_transfer =
-            resolve_reflection_transfer(turn_reflection_state_store.clone(), reflection_actions)
-                .await;
-        if let Some(mark) = reflection_transfer.mark
-            && let Err(error) = turn_reflection_state_store.mark_reflecting(mark).await
-        {
-            record_persist_failure("reflection_state_mark", &error);
-        }
-        if let Some(lesson) = reflection_transfer.lesson
-            && let Err(error) = turn_reflection_lesson_writer.persist_lesson(lesson).await
-        {
-            record_persist_failure("reflection_lesson_persist", &error);
-        }
-        if let Some(observer_request) = build_observer_request_from_payload(&payload)
-            && let Err(error) = turn_observer_worker.run(observer_request).await
-        {
-            record_persist_failure("observer_run", &error);
-        }
-        record_persist_ok();
+    enqueue_bridge_hook_side_effects(BridgeHookSideEffectJob {
+        payload,
+        turn_hook_db_writer,
+        turn_reflection_state_store,
+        turn_reflection_lesson_writer,
+        turn_observer_worker,
     });
+}
+
+fn enqueue_bridge_hook_side_effects(job: BridgeHookSideEffectJob) {
+    let key = job.session_key();
+    let should_spawn = {
+        let mut queues = ORDERED_SIDE_EFFECT_QUEUES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queues.queues.entry(key.clone()).or_default().push_back(job);
+        queues.running.insert(key.clone())
+    };
+    if should_spawn {
+        tokio::spawn(drain_bridge_hook_side_effect_queue(key));
+    }
+}
+
+async fn drain_bridge_hook_side_effect_queue(key: String) {
+    loop {
+        let Some(job) = pop_bridge_hook_side_effect_job(&key) else {
+            return;
+        };
+        execute_bridge_hook_side_effects(job).await;
+    }
+}
+
+fn pop_bridge_hook_side_effect_job(key: &str) -> Option<BridgeHookSideEffectJob> {
+    let mut queues = ORDERED_SIDE_EFFECT_QUEUES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(queue) = queues.queues.get_mut(key) else {
+        queues.running.remove(key);
+        return None;
+    };
+    if let Some(job) = queue.pop_front() {
+        return Some(job);
+    }
+    queues.queues.remove(key);
+    queues.running.remove(key);
+    None
+}
+
+async fn execute_bridge_hook_side_effects(job: BridgeHookSideEffectJob) {
+    let BridgeHookSideEffectJob {
+        payload,
+        turn_hook_db_writer,
+        turn_reflection_state_store,
+        turn_reflection_lesson_writer,
+        turn_observer_worker,
+    } = job;
+
+    if let Some((plan, writer)) = build_hook_db_persist_from_payload(&payload, turn_hook_db_writer)
+        && let Err(error) = writer.persist(plan).await
+    {
+        record_persist_failure("hook_db_persist", &error);
+        return;
+    }
+    let reflection_actions = build_reflection_actions_from_payload(&payload);
+    let reflection_transfer =
+        resolve_reflection_transfer(turn_reflection_state_store.clone(), reflection_actions).await;
+    if let Some(mark) = reflection_transfer.mark
+        && let Err(error) = turn_reflection_state_store.mark_reflecting(mark).await
+    {
+        record_persist_failure("reflection_state_mark", &error);
+    }
+    if let Some(lesson) = reflection_transfer.lesson
+        && let Err(error) = turn_reflection_lesson_writer.persist_lesson(lesson).await
+    {
+        record_persist_failure("reflection_lesson_persist", &error);
+    }
+    if let Some(observer_request) = build_observer_request_from_payload(&payload)
+        && let Err(error) = turn_observer_worker.run(observer_request).await
+    {
+        record_persist_failure("observer_run", &error);
+    }
+    record_persist_ok();
 }
 
 fn build_hook_db_persist_from_payload(
@@ -603,6 +686,22 @@ mod inprocess_hook_contract_tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct DelayedRecordingObserverWorker {
+        requests: Arc<Mutex<Vec<TurnObserverRequest>>>,
+    }
+
+    #[async_trait]
+    impl TurnObserverWorker for DelayedRecordingObserverWorker {
+        async fn run(&self, request: TurnObserverRequest) -> Result<(), String> {
+            if request.turn_count == 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            self.requests.lock().await.push(request);
+            Ok(())
+        }
+    }
+
     fn build_hook_payload_with_tool_call() -> Value {
         let messages = vec![json!({"role": "user", "content": "list files in src/"})];
         let tool_results: Vec<Value> = vec![json!({
@@ -746,6 +845,27 @@ mod inprocess_hook_contract_tests {
             None,
             false,
             true,
+            true,
+        ))
+    }
+
+    fn build_observer_payload_for_turn(session_id: &str, turn_count: i64) -> Value {
+        let messages = vec![json!({"role": "user", "content": format!("turn {turn_count}")})];
+        Value::Object(build_turn_hook_args(
+            "user-1",
+            session_id,
+            &messages,
+            &[],
+            &format!("answer {turn_count}"),
+            &[],
+            None,
+            Some("gpt-4"),
+            None,
+            Some(&format!("evt-{turn_count}")),
+            turn_count,
+            None,
+            true,
+            false,
             true,
         ))
     }
@@ -1040,6 +1160,47 @@ mod inprocess_hook_contract_tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert!(hook_writer.plans.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hook_side_effects_are_fifo_within_session_even_when_first_observer_is_slow() {
+        let hook_writer = RecordingHookDbWriter::default();
+        let reflection_store = RecordingReflectionStateStore::default();
+        let lesson_writer = RecordingReflectionLessonWriter::default();
+        let observer = DelayedRecordingObserverWorker::default();
+        let session_id = format!("ordered-session-{}", uuid::Uuid::now_v7());
+
+        run_bridge_hook_side_effects(
+            Some(build_observer_payload_for_turn(&session_id, 1)),
+            Arc::new(hook_writer.clone()),
+            Arc::new(reflection_store.clone()),
+            Arc::new(lesson_writer.clone()),
+            Arc::new(observer.clone()),
+        );
+        run_bridge_hook_side_effects(
+            Some(build_observer_payload_for_turn(&session_id, 2)),
+            Arc::new(hook_writer),
+            Arc::new(reflection_store),
+            Arc::new(lesson_writer),
+            Arc::new(observer.clone()),
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let turns = observer
+            .requests
+            .lock()
+            .await
+            .iter()
+            .map(|request| request.turn_count)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            turns,
+            vec![1, 2],
+            "same-session hook side effects must preserve enqueue order; \
+             observer does not carry enough state for downstream services to \
+             recover from out-of-order execution",
+        );
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ use uuid::Uuid;
 use super::harness::{
     E2E_PASSWORD, bootstrap, delete_json, get_json, grant_astra_admin_role, post_empty, post_json,
     put_json, revoke_astra_admin_role, seeded_model_name, selected_model,
+    wait_for_agent_event_types,
 };
 use super::journey_tasks_runs;
 use astra_services::ADMIN_CONFIG_KEY_REASONING_MODEL;
@@ -1582,6 +1583,15 @@ pub async fn run_saas_events_session_after_chat_positive() {
     )
     .await;
     assert_eq!(st_chat, StatusCode::OK, "chat: {chat_j}");
+
+    wait_for_agent_event_types(
+        &ctx.pool,
+        ctx.user_id.as_str(),
+        session_id,
+        &["user_query"],
+        std::time::Duration::from_secs(10),
+    )
+    .await;
 
     let (st_ev, ev_j) = get_json(
         app,

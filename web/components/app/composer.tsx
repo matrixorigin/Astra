@@ -3,10 +3,18 @@
 import { Mic, SendHorizontal, Square } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { IconButton } from '@/components/ui/icon-button';
-import { ComposerPlusMenu } from '@/components/app/composer-plus-menu';
+import {
+  ComposerEnvironmentChip,
+  ComposerPlusMenu,
+} from '@/components/app/composer-plus-menu';
 import { ModelSwitcher } from '@/components/app/model-switcher';
 import { SlashCommandPanel } from '@/components/app/slash-command-panel';
-import type { AttachmentRef, ComposerOptions } from '@/lib/api/types';
+import type {
+  AttachmentRef,
+  ComposerOptions,
+  EdgeStatusResponse,
+  WorkspaceSelection,
+} from '@/lib/api/types';
 import { filterSlashCommands, skillToSlashCommand, type SlashCommandItem } from '@/lib/composer/slash-commands';
 import { useSkillCatalog } from '@/hooks/use-skill-catalog';
 import { cn } from '@/lib/utils/cn';
@@ -30,6 +38,12 @@ type ComposerProps = {
   stopping?: boolean;
   stopDisabled?: boolean;
   onStop?: () => void;
+  workspaceSelection?: WorkspaceSelection | null;
+  edgeWorkspaces?: EdgeStatusResponse['edges'];
+  edgeWorkspacesLoading?: boolean;
+  edgeWorkspacesError?: string | null;
+  onWorkspaceSelectionChange?: (selection: WorkspaceSelection | null) => void;
+  onRefreshEdgeWorkspaces?: () => void;
 };
 
 const SKILL_TOKEN_SELECTOR = '[data-composer-skill-token="true"]';
@@ -205,6 +219,12 @@ export function Composer({
   stopping = false,
   stopDisabled = false,
   onStop,
+  workspaceSelection,
+  edgeWorkspaces = [],
+  edgeWorkspacesLoading = false,
+  edgeWorkspacesError = null,
+  onWorkspaceSelectionChange,
+  onRefreshEdgeWorkspaces,
 }: ComposerProps) {
   const [text, setText] = useState(initialValue);
   const [webSearch, setWebSearch] = useState(false);
@@ -559,6 +579,20 @@ export function Composer({
           onWebSearchChange={setWebSearch}
           activeSkills={activeSkills}
           onActiveSkillsChange={handleActiveSkillsChange}
+          workspaceSelection={workspaceSelection}
+          edgeWorkspaces={edgeWorkspaces}
+          edgeWorkspacesLoading={edgeWorkspacesLoading}
+          edgeWorkspacesError={edgeWorkspacesError}
+          onWorkspaceSelectionChange={onWorkspaceSelectionChange}
+          onRefreshEdgeWorkspaces={onRefreshEdgeWorkspaces}
+        />
+        <ComposerEnvironmentChip
+          workspaceSelection={workspaceSelection}
+          edgeWorkspaces={edgeWorkspaces}
+          edgeWorkspacesLoading={edgeWorkspacesLoading}
+          edgeWorkspacesError={edgeWorkspacesError}
+          onWorkspaceSelectionChange={onWorkspaceSelectionChange}
+          onRefreshEdgeWorkspaces={onRefreshEdgeWorkspaces}
         />
         <IconButton icon={Mic} label="Voice input" tooltip="Coming soon" disabled />
         <span

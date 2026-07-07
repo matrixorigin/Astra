@@ -581,7 +581,6 @@ fn run_status_response_serializes() {
         workspace: Some(json!({"kind": "server_sandbox"})),
         executor: Some(json!({"kind": "server_local"})),
         transport: Some("server_local".into()),
-        fallback_policy: Some("disabled".into()),
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["waiting_for"], "tool_call");
@@ -589,7 +588,6 @@ fn run_status_response_serializes() {
     assert_eq!(v["workspace"]["kind"], "server_sandbox");
     assert_eq!(v["executor"]["kind"], "server_local");
     assert_eq!(v["transport"], "server_local");
-    assert_eq!(v["fallback_policy"], "disabled");
 }
 
 #[test]
@@ -971,7 +969,6 @@ fn run_list_record_to_response_preserves_optional_total_and_cursor() {
             workspace: None,
             executor: None,
             transport: None,
-            fallback_policy: None,
         }],
         total: None,
         limit: 20,
@@ -1036,7 +1033,6 @@ fn run_status_record_to_response() {
         workspace: None,
         executor: None,
         transport: None,
-        fallback_policy: None,
     };
     let resp: RunStatusResponse = record.into();
     assert_eq!(resp.status, "waiting");
@@ -1053,7 +1049,6 @@ fn run_status_record_to_response() {
         workspace: None,
         executor: None,
         transport: None,
-        fallback_policy: None,
     };
     let resp: RunStatusResponse = record.into();
     assert!(resp.waiting_for.is_none());

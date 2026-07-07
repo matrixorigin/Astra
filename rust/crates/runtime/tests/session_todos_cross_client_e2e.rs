@@ -4,7 +4,7 @@
 //! Scenario:
 //!   1. Two `MatrixOneTaskStore` instances (one for each "node") share the
 //!      same MatrixOne pool — this is the cross-node setup in production.
-//!   2. An edge-side `TaskManager` creates a task through `task(action=create)`.
+//!   2. An edge-side `TaskManager` creates a task through `task_board(action=create)`.
 //!   3. A cloud-side `TaskManager` with the **same** `session_id` lists
 //!      tasks and must see it.
 //!   4. Snapshot → mutate → restore round-trips through MO (turn rollback
@@ -24,7 +24,7 @@ use astra_core::MatrixOneSettings;
 use astra_services::storage::ensure_core_schema;
 use astra_tools::task_mgmt::{SessionTask, SessionTaskStatusKind, TaskManager, TaskStore};
 use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
-use serde_json::json;
+use serde_json::{Value, json};
 
 async fn bootstrap_pool() -> sqlx::Pool<sqlx::MySql> {
     assert_eq!(
@@ -220,8 +220,9 @@ async fn unknown_task_fields_are_rejected_through_matrixone_store() {
         "MatrixOne-backed create must reject typo fields before insert: {create_typo}"
     );
     let empty = mgr.list(&json!({"status_filter": "all"})).await;
-    assert!(
-        empty.starts_with("No tasks"),
+    let empty: Value = serde_json::from_str(&empty).expect("empty list should be JSON");
+    assert_eq!(
+        empty["count"], 0,
         "rejected create must not insert a MatrixOne row: {empty}"
     );
 
@@ -1126,10 +1127,10 @@ async fn subtask_depends_on_blocks_out_of_order_start_in_matrixone() {
 
 #[tokio::test]
 #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-async fn second_in_progress_task_is_rejected_across_matrixone_clients() {
+async fn independent_in_progress_tasks_are_allowed_across_matrixone_clients() {
     let pool = bootstrap_pool().await;
-    let session_id = format!("s-single-running-{}", uuid::Uuid::new_v4());
-    let user_id = format!("u-single-running-{}", uuid::Uuid::new_v4());
+    let session_id = format!("s-parallel-running-{}", uuid::Uuid::new_v4());
+    let user_id = format!("u-parallel-running-{}", uuid::Uuid::new_v4());
     prepare_session(&pool, &session_id, &user_id).await;
     let edge_store: Arc<dyn TaskStore> =
         Arc::new(MatrixOneTaskStore::new_for_user(pool.clone(), &user_id).unwrap());
@@ -1149,22 +1150,22 @@ async fn second_in_progress_task_is_rejected_across_matrixone_clients() {
         .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
         .await;
     assert!(
-        second.starts_with("Error:")
-            && second.contains("already in_progress")
-            && second.contains("task-1"),
-        "MatrixOne must reject a second in_progress task across clients: {second}"
+        second.contains("\"success\":true") && second.contains("\"status\":\"in_progress\""),
+        "MatrixOne clients should allow independent tasks to run concurrently; ordering is explicit dependency state: {second}"
     );
 
-    let paused = edge
-        .update(&json!({"task_id": "task-1", "new_status": "paused"}))
-        .await;
-    assert!(!paused.starts_with("Error:"), "{paused}");
-    let second = cloud
-        .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
+    let visible = cloud.list(&json!({"status_filter": "in_progress"})).await;
+    assert!(
+        visible.contains("task-1") && visible.contains("task-2"),
+        "both concurrently running tasks should be visible across MatrixOne clients: {visible}"
+    );
+
+    let blocked = cloud
+        .update(&json!({"task_id": "task-2", "add_blocked_by": ["task-1"], "new_status": "in_progress"}))
         .await;
     assert!(
-        second.contains("\"success\":true") && second.contains("\"status\":\"in_progress\""),
-        "{second}"
+        blocked.starts_with("Error:") && blocked.contains("blocked_by is unresolved"),
+        "dependency edges, not a global active slot, should block task start: {blocked}"
     );
 
     cleanup(&pool, &session_id, &user_id).await;

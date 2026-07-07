@@ -1,5 +1,6 @@
 import { TextDecoder, TextEncoder } from 'util';
 import { streamChatMessage, streamExistingChatRun } from '@/lib/api/chats';
+import type { WebApiError } from '@/lib/api/errors';
 
 const defaultPayload = {
   content: 'hello',
@@ -290,7 +291,7 @@ describe('streamChatMessage cancellation semantics', () => {
       ok: true,
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-123"}\n\n',
-        'data: {"type":"run_blocked","session_id":"session-1","reason":"fallback_disabled","message":"Server fallback is disabled for this workspace."}\n\n',
+        'data: {"type":"run_blocked","session_id":"session-1","reason":"fallback_disabled","message":"No alternate execution provider is available for this file environment."}\n\n',
       ]),
     });
 
@@ -660,6 +661,39 @@ describe('streamChatMessage cancellation semantics', () => {
       '/api/chats/chat%20123/stream?runId=run%2F123&last_index=9&assistantMessageId=assistant-queued',
       { method: 'GET', signal: undefined },
     );
+  });
+
+  it('ignores malformed event indexes without aborting stream consumption', async () => {
+    const onDone = vi.fn();
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_input_queued","run_id":"run-123","index":"4"}\n\n',
+        'data: {"type":"text_done","full_text":"continued"}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, { onDone }),
+    ).resolves.toBe('continued');
+    expect(onDone).toHaveBeenCalledWith('continued');
+  });
+
+  it('preserves structured stream error status and code', async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"error","message":"Edge selection is stale.","status":409,"code":"workspace_edge_stale_selection"}\n\n',
+      ]),
+    });
+
+    await expect(
+      streamChatMessage('chat-123', defaultPayload, {}),
+    ).rejects.toMatchObject({
+      status: 409,
+      detail: 'Edge selection is stale.',
+      code: 'workspace_edge_stale_selection',
+    } satisfies Partial<WebApiError>);
   });
 });
 

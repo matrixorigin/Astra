@@ -3,9 +3,10 @@ use std::pin::Pin;
 
 use astra_core::SharedPool;
 use astra_tools::ToolExecutor;
+use astra_tools::session_tool_contract::{SessionAction, session_action_from_args};
 use serde_json::Value;
 
-use crate::server::server_tool_executor::ServerToolExecutor;
+use crate::server::runtime_tool_executor::RuntimeToolExecutor;
 use crate::server::tool_execution_result::tool_result_from_output;
 use crate::server::tool_session_history;
 
@@ -28,14 +29,9 @@ where
     Config: FnOnce(&Value) -> String,
     Sleep: FnOnce(&'a Value) -> SessionToolFuture<'a>,
 {
-    let action = match args.get("action") {
-        Some(Value::String(action)) => action.as_str(),
-        Some(_) => {
-            return astra_tools::ToolResult::error(
-                "Error: field `action` for `session` must be a string".to_string(),
-            );
-        }
-        None => return missing_action_result(),
+    let action = match session_action_from_args(args) {
+        Ok(action) => action,
+        Err(error) => return astra_tools::ToolResult::error(format!("Error: {error}")),
     };
 
     let session_history_context = || {
@@ -47,33 +43,24 @@ where
     };
 
     match action {
-        "config" => tool_result_from_output(config(args)),
-        "sleep" => sleep(args).await,
-        "history_page" => tool_session_history::history_page(session_history_context(), args).await,
-        "history_search" => {
+        SessionAction::Config => tool_result_from_output(config(args)),
+        SessionAction::Sleep => sleep(args).await,
+        SessionAction::HistoryPage => {
+            tool_session_history::history_page(session_history_context(), args).await
+        }
+        SessionAction::HistorySearch => {
             tool_session_history::history_search(session_history_context(), args).await
         }
-        "history_around" => {
+        SessionAction::HistoryAround => {
             tool_session_history::history_around(session_history_context(), args).await
         }
-        "" => missing_action_result(),
-        other => astra_tools::ToolResult::error(format!(
-            "Error: unknown `session` action '{other}'. For plan mode use `enter_plan_mode` / `exit_plan_mode`."
-        )),
     }
-}
-
-fn missing_action_result() -> astra_tools::ToolResult {
-    astra_tools::ToolResult::error(
-        "Error: missing required parameter `action` for `session`. Use: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, compress_context, enter_plan_mode, exit_plan_mode."
-            .to_string(),
-    )
 }
 
 /// Server-side entry point for the `session` tool. Constructs the runtime
 /// context and executor-owned closures, then delegates to [`execute_session_tool`].
 pub(super) async fn execute_with_executor(
-    executor: &ServerToolExecutor,
+    executor: &RuntimeToolExecutor,
     args: &Value,
 ) -> astra_tools::ToolResult {
     execute_session_tool(

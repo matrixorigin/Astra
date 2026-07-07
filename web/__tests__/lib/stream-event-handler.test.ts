@@ -151,7 +151,7 @@ describe("applyStreamEvent", () => {
     );
   });
 
-  it("projects blocked run events into active run state without assistant prose", () => {
+  it("projects blocked run events with explicit messages as visible feedback", () => {
     const state = makeState();
 
     applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
@@ -175,7 +175,15 @@ describe("applyStreamEvent", () => {
         waitingFor: "transport_disconnected",
       }),
     );
-    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "Edge transport disconnected.",
+        status: "streaming",
+      }),
+    );
     expect(state.runLifecycle).toBe("blocked");
   });
 
@@ -216,6 +224,23 @@ describe("applyStreamEvent", () => {
         nextEventIndex: 13,
       }),
     );
+  });
+
+  it("fails closed on malformed event cursors", () => {
+    const state = makeState();
+
+    expect(() =>
+      applyStreamEvent(
+        {
+          type: "run_input_queued",
+          run_id: "run-1",
+          index: "12" as never,
+        },
+        ctx,
+        state,
+      ),
+    ).toThrow("Malformed stream event index.");
+    expect(mockSetChatActiveRun).not.toHaveBeenCalled();
   });
 
   it("keeps execution-boundary run_waiting events blocked", () => {
@@ -325,6 +350,43 @@ describe("applyStreamEvent", () => {
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
   });
 
+  it("renders explicit blocked messages as visible non-terminal feedback", () => {
+    const state = makeState();
+
+    applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
+    applyStreamEvent(
+      {
+        type: "run_blocked",
+        run_id: "run-1",
+        reason: "executor_offline",
+        message:
+          "No alternate execution provider is available for this file environment.",
+      },
+      ctx,
+      state,
+    );
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "blocked",
+        waitingFor: "executor_offline",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content:
+          "No alternate execution provider is available for this file environment.",
+        status: "streaming",
+      }),
+    );
+  });
+
   it("derives waitingFor from run_blocked reason fields", () => {
     const state = makeState();
 
@@ -334,7 +396,6 @@ describe("applyStreamEvent", () => {
         type: "run_blocked",
         session_id: "session-1",
         reason: "fallback_disabled",
-        message: "Server fallback is disabled for this workspace.",
       },
       ctx,
       state,
@@ -413,9 +474,9 @@ describe("applyStreamEvent", () => {
         waiting_for: "task_board_intervention",
         message: "Task-board work remains open.",
         task_board: {
-          summary: "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
-          in_progress_count: 1,
-          active_tasks: ["task-2 Investigate [in_progress]"],
+          summary: "1 paused task(s) remain: task-2 Investigate [paused]",
+          paused_count: 1,
+          active_tasks: ["task-2 Investigate [paused]"],
         },
       },
       ctx,

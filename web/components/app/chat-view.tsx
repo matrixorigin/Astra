@@ -43,6 +43,7 @@ import {
   createEmptyWorkSurface,
   type AgentSurfaceItem,
   type SessionTask,
+  type ToolSurfaceItem,
 } from "@/lib/work-surface";
 import { useToast } from "@/components/ui/toast";
 
@@ -148,10 +149,8 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const activeAgentCount = workSurface.agents.filter((agent) =>
     ACTIVE_AGENT_SURFACE_STATUSES.has(agent.status.toLowerCase()),
   ).length;
-  const agentAttentionCount = workSurface.agents.filter((agent) =>
-    ["failed", "interrupted", "cancelled", "waiting"].includes(
-      agent.status.toLowerCase(),
-    ),
+  const agentSignalCount = workSurface.agents.filter(
+    agentNeedsConversationSignal,
   ).length;
   const activeToolCount = workSurface.tools.filter(
     (tool) =>
@@ -178,7 +177,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     (activeRunIsVisibleActivity ||
       taskBoardIntervention ||
       openTaskCount > 0 ||
-      agentAttentionCount > 0 ||
+      agentSignalCount > 0 ||
       toolAttentionCount > 0) &&
     (workSurface.tasks.length > 0 ||
       workSurface.agents.length > 0 ||
@@ -188,7 +187,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         openTaskCount,
         workSurface.agents.length,
         workSurface.tools.length,
-        agentAttentionCount,
+        agentSignalCount,
         toolAttentionCount,
       ].join(":")
     : "";
@@ -390,6 +389,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
 
         <div
           ref={scrollRef}
+          data-chat-scroll-container="true"
           data-testid="chat-scroll-container"
           onWheel={(event) => {
             if (event.deltaY < 0) {
@@ -426,9 +426,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               <ConversationWorkCard
                 tasks={workSurface.tasks}
                 agents={workSurface.agents}
-                toolCount={workSurface.tools.length}
+                tools={workSurface.tools}
                 activeToolCount={activeToolCount}
-                agentAttentionCount={agentAttentionCount}
+                agentSignalCount={agentSignalCount}
                 toolAttentionCount={toolAttentionCount}
                 taskBoardIntervention={taskBoardIntervention}
                 active={activeRunIsVisibleActivity}
@@ -484,6 +484,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                   stopDisabled={runControlBusy}
                   onStop={() => {
                     void stream.stopActiveRun();
+                  }}
+                  workspaceSelection={ws.workspaceSelection}
+                  edgeWorkspaces={ws.edgeWorkspaces}
+                  edgeWorkspacesLoading={ws.edgeWorkspacesLoading}
+                  edgeWorkspacesError={ws.edgeWorkspacesError}
+                  onWorkspaceSelectionChange={ws.setWorkspaceSelection}
+                  onRefreshEdgeWorkspaces={() => {
+                    void ws.refreshEdgeWorkspaces();
                   }}
                   projectContext={
                     detail.chat.projectId
@@ -549,7 +557,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                             Tasks
                           </button>
                         ) : null}
-                        {agentAttentionCount > 0 ? (
+                        {agentSignalCount > 0 ? (
                           <button
                             type="button"
                             onClick={() => openWorkSurface("agents")}
@@ -622,9 +630,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
 function ConversationWorkCard({
   tasks,
   agents,
-  toolCount,
+  tools,
   activeToolCount,
-  agentAttentionCount,
+  agentSignalCount,
   toolAttentionCount,
   taskBoardIntervention,
   active,
@@ -632,9 +640,9 @@ function ConversationWorkCard({
 }: {
   tasks: SessionTask[];
   agents: AgentSurfaceItem[];
-  toolCount: number;
+  tools: ToolSurfaceItem[];
   activeToolCount: number;
-  agentAttentionCount: number;
+  agentSignalCount: number;
   toolAttentionCount: number;
   taskBoardIntervention: boolean;
   active: boolean;
@@ -644,19 +652,32 @@ function ConversationWorkCard({
   const activeAgents = agents.filter((agent) =>
     ACTIVE_AGENT_SURFACE_STATUSES.has(agent.status.toLowerCase()),
   );
-  const attentionAgents = agents.filter((agent) =>
-    ["failed", "interrupted", "cancelled", "waiting"].includes(
-      agent.status.toLowerCase(),
-    ),
+  const signalAgents = agents.filter((agent) =>
+    agentNeedsConversationSignal(agent),
   );
+  const issueTools = tools.filter(
+    (tool) => tool.blocked || tool.status === "error",
+  );
+  const activeTools = tools.filter((tool) => isActiveToolStatus(tool.status));
   const primaryTask = openTasks[0] ?? tasks[0];
-  const primaryAgent = attentionAgents[0] ?? activeAgents[0] ?? agents[0];
-  const needsAttention =
-    taskBoardIntervention || agentAttentionCount > 0 || toolAttentionCount > 0;
+  const primaryAgent = signalAgents[0] ?? activeAgents[0] ?? agents[0];
+  const primaryTool = issueTools[0] ?? activeTools[0] ?? tools[0];
+  const agentDangerCount = agents.filter(isDangerAgent).length;
+  const agentWarningCount = agents.filter(isWarningAgent).length;
+  const cardTone: ConversationTone =
+    toolAttentionCount > 0 || agentDangerCount > 0
+      ? "danger"
+      : taskBoardIntervention || agentWarningCount > 0
+        ? "warning"
+        : active
+          ? "running"
+          : "neutral";
   const title = taskBoardIntervention
     ? "Needs direction"
-    : needsAttention
+    : cardTone === "danger"
       ? "Needs attention"
+      : cardTone === "warning"
+        ? "Waiting"
       : active
         ? "Working"
         : "Activity";
@@ -666,7 +687,8 @@ function ConversationWorkCard({
     label: string;
     count: number;
     activeCount?: number;
-    attention?: number;
+    highlightCount?: number;
+    tone?: ConversationTone;
   };
   const actionCandidates: ConversationActivityDescriptor[] = [
     {
@@ -675,7 +697,10 @@ function ConversationWorkCard({
       label: "Tasks",
       count: tasks.length,
       activeCount: openTasks.length,
-      attention: taskBoardIntervention ? openTasks.length || tasks.length : 0,
+      highlightCount: taskBoardIntervention
+        ? openTasks.length || tasks.length
+        : 0,
+      tone: taskBoardIntervention ? "warning" : undefined,
     },
     {
       tab: "agents",
@@ -683,15 +708,22 @@ function ConversationWorkCard({
       label: "Agents",
       count: agents.length,
       activeCount: activeAgents.length,
-      attention: agentAttentionCount,
+      highlightCount: agentSignalCount,
+      tone:
+        agentDangerCount > 0
+          ? "danger"
+          : agentWarningCount > 0
+            ? "warning"
+            : undefined,
     },
     {
       tab: "tools",
       icon: Wrench,
       label: "Tools",
-      count: toolCount,
+      count: tools.length,
       activeCount: activeToolCount,
-      attention: toolAttentionCount,
+      highlightCount: toolAttentionCount,
+      tone: toolAttentionCount > 0 ? "danger" : undefined,
     },
   ];
   const actions = actionCandidates.filter((action) => action.count > 0);
@@ -716,7 +748,7 @@ function ConversationWorkCard({
           status: taskBoardIntervention
             ? "Needs direction"
             : statusLabel(primaryTask.status),
-          attention: taskBoardIntervention,
+          tone: taskBoardIntervention ? ("warning" as const) : undefined,
         }
       : null,
     primaryAgent
@@ -732,8 +764,22 @@ function ConversationWorkCard({
               : primaryAgent.agentType
                 ? statusLabel(primaryAgent.agentType)
                 : undefined,
-          status: statusLabel(primaryAgent.status),
-          attention: attentionAgents.length > 0,
+          status: conversationStatusLabel(primaryAgent),
+          tone: conversationAgentTone(primaryAgent),
+        }
+      : null,
+    primaryTool
+      ? {
+          key: "tools",
+          tab: "tools" as WorkSurfaceTab,
+          icon: Wrench,
+          title: primaryTool.tool,
+          meta: toolMetaLabel(primaryTool, activeTools.length),
+          status: toolStatusLabel(primaryTool),
+          tone:
+            primaryTool.blocked || primaryTool.status === "error"
+              ? ("danger" as const)
+              : undefined,
         }
       : null,
   ].filter((row): row is NonNullable<typeof row> => Boolean(row));
@@ -741,23 +787,15 @@ function ConversationWorkCard({
   return (
     <section className="my-3 flex justify-center" aria-label="Background work">
       <div
-        className={
-          needsAttention
-            ? "w-full max-w-[680px] rounded-card border border-danger/20 bg-danger/5 p-3 shadow-sm"
-            : "w-full max-w-[680px] rounded-card border border-border/70 bg-surface/85 p-3 shadow-sm"
-        }
+        className={`w-full max-w-[680px] rounded-card border p-3 shadow-sm ${conversationCardToneClass(cardTone)}`}
       >
         <div className="flex min-w-0 items-center justify-between gap-3">
           <div
-            className={
-              needsAttention
-                ? "inline-flex min-w-0 items-center gap-1.5 text-sm font-medium text-danger"
-                : "inline-flex min-w-0 items-center gap-1.5 text-sm font-medium text-text-secondary"
-            }
+            className={`inline-flex min-w-0 items-center gap-1.5 text-sm font-medium ${conversationHeadingToneClass(cardTone)}`}
           >
             <Activity
               className={
-                active && !needsAttention
+                active && cardTone === "running"
                   ? "size-4 shrink-0 animate-pulse"
                   : "size-4 shrink-0"
               }
@@ -790,7 +828,7 @@ function ConversationWorkCard({
                 title={row.title}
                 meta={row.meta}
                 status={row.status}
-                attention={row.attention}
+                tone={row.tone ?? "neutral"}
                 onOpen={() => onOpen(row.tab)}
               />
             ))}
@@ -806,14 +844,14 @@ function ConversationWorkRow({
   title,
   meta,
   status,
-  attention,
+  tone,
   onOpen,
 }: {
   icon: LucideIcon;
   title: string;
   meta?: string;
   status: string;
-  attention: boolean;
+  tone: ConversationTone;
   onOpen: () => void;
 }) {
   return (
@@ -824,8 +862,10 @@ function ConversationWorkRow({
     >
       <Icon
         className={
-          attention
+          tone === "danger"
             ? "size-4 shrink-0 text-danger"
+            : tone === "warning"
+              ? "size-4 shrink-0 text-warning"
             : "size-4 shrink-0 text-accent"
         }
       />
@@ -839,8 +879,10 @@ function ConversationWorkRow({
       </span>
       <span
         className={
-          attention
+          tone === "danger"
             ? "shrink-0 rounded-full bg-danger/10 px-2 py-0.5 text-[11px] font-medium text-danger"
+            : tone === "warning"
+              ? "shrink-0 rounded-full bg-warning/10 px-2 py-0.5 text-[11px] font-medium text-warning"
             : "shrink-0 rounded-full bg-surface-muted px-2 py-0.5 text-[11px] font-medium text-text-muted"
         }
       >
@@ -855,35 +897,36 @@ function ConversationActivityAction({
   icon: Icon,
   label,
   count,
-  attention,
+  highlightCount,
+  tone,
   onOpen,
 }: {
   tab: WorkSurfaceTab;
   icon: LucideIcon;
   label: string;
   count: number;
-  attention?: number;
+  highlightCount?: number;
+  tone?: ConversationTone;
   onOpen: (tab: WorkSurfaceTab) => void;
 }) {
-  const badge = attention && attention > 0 ? attention : count;
-  const hasAttention = Boolean(attention && attention > 0);
+  const badge = highlightCount && highlightCount > 0 ? highlightCount : count;
+  const isHighlighted = Boolean(highlightCount && highlightCount > 0);
+  const activeTone = isHighlighted ? (tone ?? "danger") : "neutral";
   return (
     <button
       type="button"
       aria-label={`Open ${label.toLowerCase()} activity`}
       onClick={() => onOpen(tab)}
-      className={
-        hasAttention
-          ? "inline-flex h-7 items-center gap-1 rounded-full border border-danger/20 bg-bg px-2 text-xs font-medium text-danger transition-colors hover:bg-danger/10"
-          : "inline-flex h-7 items-center gap-1 rounded-full border border-border/70 bg-bg px-2 text-xs font-medium text-text-secondary transition-colors hover:bg-surface-muted"
-      }
+      className={`inline-flex h-7 items-center gap-1 rounded-full border bg-bg px-2 text-xs font-medium transition-colors ${conversationActionToneClass(activeTone)}`}
     >
       <Icon className="size-3.5" />
       <span>{label}</span>
       <span
         className={
-          hasAttention
+          activeTone === "danger"
             ? "tabular-nums text-danger"
+            : activeTone === "warning"
+              ? "tabular-nums text-warning"
             : "tabular-nums text-text-muted"
         }
       >
@@ -891,6 +934,122 @@ function ConversationActivityAction({
       </span>
     </button>
   );
+}
+
+type ConversationTone = "neutral" | "running" | "warning" | "danger";
+
+function agentNeedsConversationSignal(agent: AgentSurfaceItem) {
+  const status = agent.status.toLowerCase();
+  return (
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "interrupted" ||
+    status === "waiting" ||
+    Boolean(agent.error)
+  );
+}
+
+function isDangerAgent(agent: AgentSurfaceItem) {
+  const normalized = agent.status.toLowerCase();
+  if (normalized === "failed" || normalized === "cancelled") return true;
+  if (normalized === "interrupted") return !isSoftAgentInterruption(agent);
+  return Boolean(agent.error);
+}
+
+function isWarningAgent(agent: AgentSurfaceItem) {
+  const normalized = agent.status.toLowerCase();
+  if (normalized === "waiting") return true;
+  if (normalized === "interrupted") return !isDangerAgent(agent);
+  return false;
+}
+
+function isSoftAgentInterruption(agent: AgentSurfaceItem) {
+  const reason = (agent.reason ?? "").trim().toLowerCase();
+  return (
+    !reason ||
+    reason === "interrupted" ||
+    reason === "empty_completion" ||
+    reason === "budget_exhausted" ||
+    reason === "turn_budget_exhausted" ||
+    reason === "max_turns_exceeded" ||
+    reason === "max_turns"
+  );
+}
+
+function conversationAgentTone(agent: AgentSurfaceItem): ConversationTone {
+  const normalized = agent.status.toLowerCase();
+  if (isDangerAgent(agent)) return "danger";
+  if (normalized === "waiting") return "warning";
+  if (normalized === "interrupted") return "warning";
+  return "neutral";
+}
+
+function conversationStatusLabel(agentOrStatus: AgentSurfaceItem | string) {
+  if (typeof agentOrStatus === "string") {
+    return agentOrStatus.toLowerCase() === "waiting"
+      ? "Waiting"
+      : statusLabel(agentOrStatus);
+  }
+  const status = agentOrStatus.status.toLowerCase();
+  if (status === "waiting") return "Waiting";
+  if (status === "interrupted") {
+    const reason = (agentOrStatus.reason ?? "").trim().toLowerCase();
+    if (
+      !reason ||
+      reason === "interrupted" ||
+      reason === "empty_completion"
+    ) {
+      return "Needs final answer";
+    }
+    if (
+      reason === "budget_exhausted" ||
+      reason === "turn_budget_exhausted" ||
+      reason === "max_turns_exceeded" ||
+      reason === "max_turns"
+    ) {
+      return "Needs continuation";
+    }
+  }
+  return statusLabel(agentOrStatus.status);
+}
+
+function conversationCardToneClass(tone: ConversationTone) {
+  switch (tone) {
+    case "danger":
+      return "border-danger/20 bg-danger/5";
+    case "warning":
+      return "border-warning/25 bg-warning/10";
+    case "running":
+      return "border-border/70 bg-surface/85";
+    case "neutral":
+      return "border-border/70 bg-surface/85";
+  }
+}
+
+function conversationHeadingToneClass(tone: ConversationTone) {
+  switch (tone) {
+    case "danger":
+      return "text-danger";
+    case "warning":
+      return "text-warning";
+    case "running":
+      return "text-text-secondary";
+    case "neutral":
+      return "text-text-secondary";
+  }
+}
+
+function conversationActionToneClass(tone: ConversationTone) {
+  switch (tone) {
+    case "danger":
+      return "border-danger/20 text-danger hover:bg-danger/10";
+    case "warning":
+      return "border-warning/25 text-warning hover:bg-warning/10";
+    case "running":
+      return "border-border/70 text-text-secondary hover:bg-surface-muted";
+    case "neutral":
+      return "border-border/70 text-text-secondary hover:bg-surface-muted";
+  }
 }
 
 function isTerminalTaskStatus(status: string) {
@@ -904,6 +1063,40 @@ function isTerminalTaskStatus(status: string) {
     "skipped",
     "archived",
   ].includes(status.toLowerCase());
+}
+
+function isActiveToolStatus(status: string) {
+  return status.toLowerCase() === "running";
+}
+
+function toolStatusLabel(tool: ToolSurfaceItem) {
+  if (tool.blocked) return "Needs attention";
+  if (tool.status === "error") return "Failed";
+  if (isActiveToolStatus(tool.status)) return "Running";
+  return statusLabel(tool.status);
+}
+
+function toolMetaLabel(tool: ToolSurfaceItem, activeToolCount: number) {
+  if (tool.errorKind) {
+    return statusLabel(tool.errorKind);
+  }
+  if (activeToolCount > 1 && isActiveToolStatus(tool.status)) {
+    return `${activeToolCount} active tools`;
+  }
+  if (typeof tool.durationMs === "number" && tool.durationMs > 0) {
+    return formatDuration(tool.durationMs);
+  }
+  return statusLabel(tool.status);
+}
+
+function formatDuration(durationMs: number) {
+  const seconds = Math.max(1, Math.round(durationMs / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return remainingSeconds > 0
+    ? `${minutes}m ${remainingSeconds}s`
+    : `${minutes}m`;
 }
 
 function statusLabel(status: string) {

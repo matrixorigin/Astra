@@ -26,7 +26,7 @@
 //!   saw all-completed non-empty state and, on every subsequent tick,
 //!   flip `hidden = true` once `hide_at` is past.
 
-use astra_tools::task_mgmt::{SessionTask, TaskStore};
+use astra_tools::task_mgmt::{SessionTask, SessionTaskStatusKind, TaskStore};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -294,38 +294,15 @@ impl TaskBoardObserver {
         st.snapshot.clone()
     }
 
-    /// Snapshot with completed tasks past [`COMPLETED_TASK_TTL`]
-    /// removed. Header counts (rendered from [`Self::counts`]) still
-    /// reflect the full set so the user can audit "12 done" without
-    /// the rows monopolising scrollback. Use this in the renderer's
-    /// row loop; use [`Self::snapshot`] when you need the truth.
+    /// Snapshot with audit tombstones removed and terminal rows past their
+    /// TTL removed. Use this in the renderer; use [`Self::snapshot`] when
+    /// you need raw audit truth.
     pub fn snapshot_for_render(&self) -> TaskBoardSnapshot {
         let (st, _) = lock_state(&self.inner, "snapshot_for_render");
         let now = Instant::now();
         let mut snap = st.snapshot.clone();
-        snap.tasks.retain(|task| {
-            if !task.status.is_completed() && !task.status.is_cancelled() {
-                // Open work is always visible.
-                return true;
-            }
-            // Completed / cancelled tasks are visible only while still within
-            // their TTL window. This self-cleans the board: cancelled tasks
-            // fade after CANCELLED_TASK_TTL (10s), completed after COMPLETED_TASK_TTL (30s).
-            let ttl = if task.status.is_cancelled() {
-                CANCELLED_TASK_TTL
-            } else {
-                COMPLETED_TASK_TTL
-            };
-            let tracker = if task.status.is_cancelled() {
-                &st.cancelled_at
-            } else {
-                &st.completed_at
-            };
-            match tracker.get(&task.id) {
-                Some(at) => now.saturating_duration_since(*at) < ttl,
-                None => true, // unseen completion → safer to keep until next tick
-            }
-        });
+        snap.tasks
+            .retain(|task| task_visible_in_render_snapshot(task, &st, now));
         snap
     }
 
@@ -341,17 +318,24 @@ impl TaskBoardObserver {
         st.completed_at.insert(task_id.to_string(), stale);
     }
 
-    /// Cheap summary counts for the footer chip: `(open, total,
-    /// hidden)`. Reads under the sync mutex without cloning the task
-    /// vec — at ~60 draws/sec with 100 tasks the clone savings are
-    /// measurable.
+    /// Cheap render-visible summary counts for the footer chip: `(open,
+    /// total, hidden)`. Audit tombstones and terminal rows aged past their
+    /// TTL do not keep the task-board chip alive; raw audit callers should
+    /// use [`Self::snapshot`] instead.
     pub fn counts(&self) -> (usize, usize, bool) {
         let (st, _) = lock_state(&self.inner, "counts");
-        let total = st.snapshot.tasks.len();
+        let now = Instant::now();
+        let total = st
+            .snapshot
+            .tasks
+            .iter()
+            .filter(|task| task_visible_in_render_snapshot(task, &st, now))
+            .count();
         let open = st
             .snapshot
             .tasks
             .iter()
+            .filter(|task| task_visible_in_render_snapshot(task, &st, now))
             .filter(|t| t.status.is_open_work())
             .count();
         (open, total, st.snapshot.hidden)
@@ -717,6 +701,33 @@ fn same_board(a: &[SessionTask], b: &[SessionTask]) -> bool {
     })
 }
 
+fn task_visible_in_render_snapshot(
+    task: &SessionTask,
+    state: &ObserverState,
+    now: Instant,
+) -> bool {
+    if matches!(
+        task.status,
+        SessionTaskStatusKind::Archived
+            | SessionTaskStatusKind::Deleted
+            | SessionTaskStatusKind::Migrated
+    ) {
+        return false;
+    }
+    if !task.status.is_completed() && !task.status.is_cancelled() {
+        return true;
+    }
+    let (ttl, tracker) = if task.status.is_cancelled() {
+        (CANCELLED_TASK_TTL, &state.cancelled_at)
+    } else {
+        (COMPLETED_TASK_TTL, &state.completed_at)
+    };
+    match tracker.get(&task.id) {
+        Some(at) => now.saturating_duration_since(*at) < ttl,
+        None => true,
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────
 // Tests
 // ───────────────────────────────────────────────────────────────────────
@@ -771,7 +782,7 @@ mod tests {
     }
 
     /// REGRESSION (Phase 4 / problem 1): the in-turn `do_draw` path
-    /// must observe a task.create within UI-perceptible latency.
+    /// must observe a task_board.create within UI-perceptible latency.
     /// Pre-fix `FAST_POLL` was 250ms; user-reported behaviour was
     /// "task board never appears until the turn ends" because the
     /// outer-tick branch was the only place `maybe_refresh` ran.
@@ -1007,6 +1018,42 @@ mod tests {
             obs.snapshot().tasks.len(),
             1,
             "snapshot() must keep aged cancelled rows for counts/audit"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_tasks_are_audit_only_not_rendered_or_counted() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let store_dyn: Arc<dyn TaskStore> = store.clone();
+        let obs = TaskBoardObserver::new(store_dyn, "sess-deleted-hidden");
+        let m = mgr(store, "sess-deleted-hidden");
+
+        m.create(&json!({"title": "remove me"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "deleted"}))
+            .await;
+        wait_until(
+            || {
+                let s = obs.snapshot();
+                s.tasks.len() == 1 && s.tasks[0].status == SessionTaskStatusKind::Deleted
+            },
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+
+        assert!(
+            obs.snapshot_for_render().tasks.is_empty(),
+            "deleted tombstones must not render"
+        );
+        assert_eq!(
+            obs.counts(),
+            (0, 0, false),
+            "deleted tombstones must not keep the task-board chip alive"
+        );
+        assert_eq!(
+            obs.snapshot().tasks.len(),
+            1,
+            "snapshot() keeps deleted rows for audit/debug callers"
         );
     }
 

@@ -17,6 +17,12 @@ export {
 
 export type { RunWaitingProjection };
 
+export const WORKSPACE_EXECUTION_WAITING_MESSAGE =
+  "Run paused because this request needs a file environment that can execute tools. Choose an available file environment or managed runtime, then retry.";
+
+export const WORKSPACE_EXECUTION_BLOCKED_MESSAGE =
+  "This request needs a file environment that can execute tools. Choose an available file environment or managed runtime, then retry.";
+
 export function runWaitingStatusMessage(reason: string, blocked: boolean) {
   switch (reason) {
     case "executor_offline":
@@ -24,9 +30,8 @@ export function runWaitingStatusMessage(reason: string, blocked: boolean) {
     case "transport_disconnected":
       return "Run paused because the execution connection disconnected. Reconnect it before retrying.";
     case "fallback_disabled":
-      return "Run paused because this request needs a file or command environment. Connect one or choose a sandbox, then retry.";
     case "workspace_executor_unavailable":
-      return "Run paused because this request needs a file or command environment. Connect one or choose a sandbox, then retry.";
+      return WORKSPACE_EXECUTION_WAITING_MESSAGE;
     case "tool_approval":
     case "approval":
       return "Waiting for tool approval.";
@@ -48,13 +53,12 @@ export function blockedRunMessage(reason: string) {
     case "transport_disconnected":
       return "Execution connection disconnected. Reconnect it or retry after it recovers.";
     case "fallback_disabled":
-      return "This request needs a file or command environment. Connect one or choose a sandbox, then retry.";
     case "workspace_executor_unavailable":
-      return "This request needs a file or command environment. Connect one or choose a sandbox, then retry.";
+      return WORKSPACE_EXECUTION_BLOCKED_MESSAGE;
     case "approval_timeout":
       return "Approval timed out. Review the pending approval and retry the tool.";
     case "workspace_path_mismatch":
-      return "The referenced path is outside the selected file environment. Choose the environment that contains it or use a path inside the current one.";
+      return "The referenced path is outside the selected file environment. If you selected Server sandbox, use a relative path inside it; for host paths like ~/project, select the matching Edge workspace.";
     default:
       return "Tool execution is blocked. Review the execution environment before retrying.";
   }

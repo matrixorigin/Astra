@@ -1443,7 +1443,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock # 管理沙箱容器
     environment:
       - ASTRA_DEPLOYMENT_PROFILE=server
-      - ASTRA_DISABLED_TOOLS=git_push,github_create_issue
+      - ASTRA_DISABLED_TOOL_OFFERS=git_push@server-builtin,github_create_issue@server-builtin
       - ASTRA_SANDBOX_BACKEND=gvisor
       - ASTRA_SANDBOX_POOL_WARM=5
       - ASTRA_LLM_API_KEY=${LLM_API_KEY}
@@ -1605,16 +1605,16 @@ kubectl get hpa astra-server-hpa
 **日常操作**：
 
 ```bash
-# 查看当前禁用的工具
-curl https://astra.internal/admin/tools/disabled
+# 查看当前禁用的工具 offer
+curl https://astra.internal/admin/tool-offers/disabled
 
 # 紧急关停命令执行（如发现 0-day）
-curl -X PUT https://astra.internal/admin/tools/disabled \
+curl -X PUT https://astra.internal/admin/tool-offers/disabled \
   -H "Content-Type: application/json" \
-  -d '{"tool_name": "bash"}'
+  -d '{"offer_id": "bash@server-sandbox"}'
 
 # 恢复
-curl -X DELETE https://astra.internal/admin/tools/disabled/bash
+curl -X DELETE https://astra.internal/admin/tool-offers/disabled/bash@server-sandbox
 
 # 查看审计日志
 curl "https://astra.internal/admin/audit?user=zhangwei&tool=bash&from=2026-06-01&to=2026-06-14"
@@ -1673,13 +1673,13 @@ curl -X POST https://astra.internal/admin/sessions/cleanup \
 # 开发环境
 export ASTRA_SANDBOX_BACKEND=runc           # 开发不用 gVisor
 export ASTRA_LOG_LEVEL=debug
-export ASTRA_DISABLED_TOOLS=                # 开发不禁用任何工具
+export ASTRA_DISABLED_TOOL_OFFERS=         # 开发不禁用任何工具 offer
 
 # 生产环境
 export ASTRA_SANDBOX_BACKEND=gvisor
 export ASTRA_SANDBOX_POOL_WARM=10
 export ASTRA_LOG_LEVEL=info
-export ASTRA_DISABLED_TOOLS=git_force_push,mo_query_destructive
+export ASTRA_DISABLED_TOOL_OFFERS=git_force_push@server-builtin,mo_query_destructive@server-builtin
 export ASTRA_AUDIT_RETENTION_DAYS=90
 ```
 
@@ -1688,7 +1688,7 @@ export ASTRA_AUDIT_RETENTION_DAYS=90
 | 配置项                                | 类型     | 默认值  | 说明                                   |
 | ------------------------------------- | -------- | ------- | -------------------------------------- |
 | `deployment.profile`                  | string   | `cli`   | 部署形态：server/cli/web               |
-| `deployment.disabled_tools`           | string[] | `[]`    | 禁用的工具列表                         |
+| `deployment.disabled_tool_offers`      | string[] | `[]`    | 禁用的工具 offer 列表                  |
 | `sandbox.backend`                     | string   | `none`  | 沙箱后端：none/docker/gvisor/openshell |
 | `sandbox.pool_warm_size`              | int      | `0`     | 预热沙箱数量                           |
 | `sandbox.pool_max_size`               | int      | `50`    | 最大沙箱并发数                         |
@@ -1840,7 +1840,7 @@ K8s HPA 自动扩缩（Operator 声明，Astra 不参与决策）:
 
 - ✅ 策略驱动的工具路由
 - ✅ 多级隔离执行器
-- ✅ 部署级工具管控（disabled_tools TOML + 环境变量 + Admin API 实时调整）
+- ✅ 部署级工具 offer 管控（disabled_tool_offers TOML + 环境变量 + Admin API 实时调整）
 - ✅ 审计证据收集
 - 🔵 OpenShell 集成（Sandbox Manager 模式）
 

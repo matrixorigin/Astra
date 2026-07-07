@@ -720,7 +720,12 @@ fn validate_runtime_tool_name(
         ));
     }
     CapabilityResolver
-        .check_tool(registry, tool_name, &binding.capabilities)
+        .check_tool_for_surface(
+            registry,
+            tool_name,
+            &binding.capabilities,
+            &binding.tool_surface,
+        )
         .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
 }
 
@@ -737,7 +742,13 @@ fn validate_runtime_tool_call(
         ));
     }
     CapabilityResolver
-        .check_tool_call(registry, tool_name, args, &binding.capabilities)
+        .check_tool_call_for_surface(
+            registry,
+            tool_name,
+            args,
+            &binding.capabilities,
+            &binding.tool_surface,
+        )
         .map_err(|reason| RuntimeError::tool_unavailable(tool_name, reason))
 }
 
@@ -908,7 +919,7 @@ mod tests {
     fn gvisor_binding() -> RunBinding {
         let registry = ToolRegistry::builtins();
         RunBinding::resolve(
-            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
             ExecutorBinding::local_cli(),
             RuntimeBinding::gvisor("gvisor-1"),
             PolicyIntent::local_developer(),
@@ -1008,7 +1019,7 @@ mod tests {
         // host_process runtime cannot satisfy GVisor.
         let registry = ToolRegistry::builtins();
         let binding = RunBinding::resolve(
-            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
             ExecutorBinding::local_cli(),
             RuntimeBinding::gvisor("gvisor-1"),
             PolicyIntent::strict_orchestrator(),
@@ -1048,7 +1059,7 @@ mod tests {
     async fn prepare_session_rejects_requested_tool_outside_policy_allowlist() {
         let registry = ToolRegistry::builtins();
         let binding = RunBinding::resolve(
-            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
             ExecutorBinding::local_cli(),
             RuntimeBinding::gvisor("gvisor-1"),
             PolicyIntent::local_developer().with_allowed_tools(["read_file"]),
@@ -1107,11 +1118,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn invocation_validation_rejects_tools_not_selected_by_provider_surface() {
+        let registry = ToolRegistry::builtins();
+        let providers = vec![
+            crate::server_service_provider("server", &registry),
+            crate::control_plane_provider("control", &registry),
+        ];
+        let binding = RunBinding::resolve_with_provider_declarations(
+            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
+            ExecutorBinding::local_cli(),
+            RuntimeBinding::host_process("local-host"),
+            PolicyIntent::local_developer(),
+            &registry,
+            &providers,
+        );
+        let invocation = RuntimeToolInvocation::new(
+            "call-1",
+            "bash",
+            json!({"cmd": "pwd"}),
+            binding,
+            PolicyRevision::INITIAL,
+        );
+
+        let err = validate_runtime_tool_invocation(&registry, &invocation)
+            .expect_err("surface-hidden tool must not be executable through capability fallback");
+
+        assert_eq!(err.kind, RuntimeErrorKind::ToolUnavailable);
+        assert_eq!(
+            err.tool_reason,
+            Some(ToolUnavailableReason::ExecutorUnavailable(
+                "tool_not_selected_by_current_provider_surface".to_string()
+            ))
+        );
+    }
+
     #[tokio::test]
     async fn execute_tool_rejects_policy_disallowed_tool_before_execution() {
         let registry = ToolRegistry::builtins();
         let binding = RunBinding::resolve(
-            WorkspaceBinding::edge_workspace("/workspace/project", WorkspaceAuthority::ReadWrite),
+            WorkspaceBinding::local_filesystem("/workspace/project", WorkspaceAuthority::ReadWrite),
             ExecutorBinding::local_cli(),
             RuntimeBinding::gvisor("gvisor-1"),
             PolicyIntent::local_developer().with_allowed_tools(["read_file"]),

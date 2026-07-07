@@ -14,7 +14,7 @@
 //!    of stale `completed` / `failed` / `cancelled` rows to `archived` after
 //!    `COMPLETED_AUTO_ARCHIVE_DAYS`.
 //!    This keeps the live board focused on actionable work even when the
-//!    model forgets to call `task(action='archive')`.
+//!    model forgets to call `task_board(action='archive')`.
 //!
 //! 3. **Archived GC** (U-17): every week DELETE a bounded batch of rows
 //!    that have been `archived` for more than `ARCHIVE_RETENTION_DAYS`.

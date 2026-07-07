@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+
+#[cfg(test)]
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,11 +22,27 @@ struct McpToolRoute {
     original_tool_name: String,
 }
 
+/// Concrete MCP tool source that maps to a public tool name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolCollisionSource {
+    pub server: String,
+    pub original_tool_name: String,
+}
+
+/// Diagnostic record for multiple MCP tools mapping to one public tool name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolCollision {
+    pub public_name: String,
+    pub sources: Vec<McpToolCollisionSource>,
+}
+
 /// MCP client manager for multiple server connections.
 pub struct McpClientManager {
     connections: HashMap<String, Arc<McpConnection>>,
     states: HashMap<String, ConnectionState>,
     tool_routes_by_public_name: HashMap<String, McpToolRoute>,
+    /// Collisions detected during the last tool route index rebuild.
+    tool_collisions: Vec<McpToolCollision>,
     /// Shared roots list — returned to servers via `roots/list`.
     roots: Arc<RwLock<Vec<Root>>>,
 }
@@ -34,6 +53,7 @@ impl Default for McpClientManager {
             connections: HashMap::new(),
             states: HashMap::new(),
             tool_routes_by_public_name: HashMap::new(),
+            tool_collisions: Vec::new(),
             roots: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -145,36 +165,10 @@ impl McpClientManager {
     }
 
     /// Get all MCP tool schemas in OpenAI function-calling format.
-    /// Names follow the `mcp__{server}__{tool}` convention. Deduplicates on name collision.
+    /// Names follow the `mcp__{server}__{tool}` convention. Public-name
+    /// collisions fail closed instead of choosing an arbitrary route.
     pub fn all_tool_schemas(&self) -> Vec<Value> {
-        let mut seen: HashMap<String, &str> = HashMap::new();
-        let mut schemas = Vec::new();
-        let mut collision_count = 0usize;
-
-        for (server, tool) in self.all_tools() {
-            let schema = mcp_tool_to_schema(server, tool);
-            let name = schema["function"]["name"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            if let Some(prev_server) = seen.get(&name) {
-                tracing::warn!(
-                    public_name = %name,
-                    skipped_server = %server,
-                    kept_server = %prev_server,
-                    "MCP tool name collision; keeping first server and skipping duplicate"
-                );
-                collision_count += 1;
-                continue;
-            }
-            seen.insert(name, server);
-            schemas.push(schema);
-        }
-
-        if collision_count > 0 {
-            tracing::warn!("{collision_count} MCP tool(s) skipped due to name collisions");
-        }
-        schemas
+        build_tool_schemas(self.all_tools())
     }
 
     /// Find which server owns a sanitized MCP tool name (e.g. "mcp__moi__query_sql").
@@ -400,34 +394,95 @@ impl McpClientManager {
             .collect()
     }
 
+    /// Tool name collisions detected during the most recent tool route rebuild.
+    /// Each collision means all tools sharing that public name are hidden.
+    pub fn tool_collisions(&self) -> &[McpToolCollision] {
+        &self.tool_collisions
+    }
+
     fn rebuild_tool_route_index(&mut self) {
-        self.tool_routes_by_public_name = build_tool_route_index(self.all_tools());
+        let (routes, collisions) = build_tool_route_index(self.all_tools());
+        for collision in &collisions {
+            tracing::error!(
+                public_name = %collision.public_name,
+                sources = ?collision.sources,
+                "MCP tool name collision — multiple MCP tools map to the same public name"
+            );
+        }
+        self.tool_routes_by_public_name = routes;
+        self.tool_collisions = collisions;
     }
 }
 
-fn build_tool_route_index<'a, I>(tools: I) -> HashMap<String, McpToolRoute>
+fn build_tool_route_index<'a, I>(tools: I) -> (HashMap<String, McpToolRoute>, Vec<McpToolCollision>)
 where
     I: IntoIterator<Item = (&'a str, &'a Tool)>,
 {
+    let tools = tools.into_iter().collect::<Vec<_>>();
+    let collisions =
+        colliding_public_tool_names(tools.iter().map(|(server, tool)| (*server, *tool)));
     let mut routes: HashMap<String, McpToolRoute> = HashMap::new();
+    let mut collision_diagnostics: Vec<McpToolCollision> = Vec::new();
     for (server_name, tool) in tools {
-        let public_name = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool.name));
+        let public_name = public_tool_name(server_name, tool);
+        if collisions.contains_key(&public_name) {
+            continue;
+        }
         let route = McpToolRoute {
             server_name: server_name.to_string(),
             original_tool_name: tool.name.to_string(),
         };
-        if let Some(existing) = routes.get(&public_name) {
-            tracing::warn!(
-                public_name = %public_name,
-                skipped_server = %route.server_name,
-                kept_server = %existing.server_name,
-                "MCP tool route collision; keeping first server and skipping duplicate"
-            );
-            continue;
-        }
         routes.insert(public_name, route);
     }
-    routes
+    for (public_name, sources) in collisions {
+        collision_diagnostics.push(McpToolCollision {
+            public_name,
+            sources,
+        });
+    }
+    (routes, collision_diagnostics)
+}
+
+fn build_tool_schemas<'a, I>(tools: I) -> Vec<Value>
+where
+    I: IntoIterator<Item = (&'a str, &'a Tool)>,
+{
+    let tools = tools.into_iter().collect::<Vec<_>>();
+    let collisions =
+        colliding_public_tool_names(tools.iter().map(|(server, tool)| (*server, *tool)));
+    let mut schemas = Vec::new();
+    for (server, tool) in tools {
+        let public_name = public_tool_name(server, tool);
+        if collisions.contains_key(&public_name) {
+            continue;
+        }
+        schemas.push(mcp_tool_to_schema(server, tool));
+    }
+    schemas
+}
+
+fn colliding_public_tool_names<'a, I>(tools: I) -> HashMap<String, Vec<McpToolCollisionSource>>
+where
+    I: IntoIterator<Item = (&'a str, &'a Tool)>,
+{
+    let mut sources_by_public_name: HashMap<String, Vec<McpToolCollisionSource>> = HashMap::new();
+    for (server_name, tool) in tools {
+        sources_by_public_name
+            .entry(public_tool_name(server_name, tool))
+            .or_default()
+            .push(McpToolCollisionSource {
+                server: server_name.to_string(),
+                original_tool_name: tool.name.to_string(),
+            });
+    }
+    sources_by_public_name
+        .into_iter()
+        .filter(|(_, sources)| sources.len() > 1)
+        .collect()
+}
+
+fn public_tool_name(server_name: &str, tool: &Tool) -> String {
+    sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool.name))
 }
 
 #[cfg(test)]
@@ -445,6 +500,7 @@ mod tests {
         assert!(manager.connected_servers().is_empty());
         assert!(manager.all_tools().is_empty());
         assert!(manager.find_tool("any_tool").is_none());
+        assert!(manager.tool_collisions().is_empty());
     }
 
     #[test]
@@ -463,8 +519,10 @@ mod tests {
             ("sql", Tool::new("query.sql", "Query", empty_schema())),
         ];
 
-        let index = build_tool_route_index(tools.iter().map(|(server, tool)| (*server, tool)));
+        let (index, collisions) =
+            build_tool_route_index(tools.iter().map(|(server, tool)| (*server, tool)));
 
+        assert!(collisions.is_empty());
         assert_eq!(
             index.get("mcp__mock-server__echo_message"),
             Some(&McpToolRoute {
@@ -482,21 +540,55 @@ mod tests {
     }
 
     #[test]
-    fn tool_route_index_keeps_first_collision_winner() {
+    fn tool_route_index_drops_colliding_public_names_and_reports_collision() {
         let tools = [
             ("api", Tool::new("query.sql", "Query", empty_schema())),
             ("api", Tool::new("query sql", "Query", empty_schema())),
         ];
 
-        let index = build_tool_route_index(tools.iter().map(|(server, tool)| (*server, tool)));
+        let (index, collisions) =
+            build_tool_route_index(tools.iter().map(|(server, tool)| (*server, tool)));
 
+        assert!(!index.contains_key("mcp__api__query_sql"));
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].public_name, "mcp__api__query_sql");
         assert_eq!(
-            index.get("mcp__api__query_sql"),
-            Some(&McpToolRoute {
-                server_name: "api".to_string(),
-                original_tool_name: "query.sql".to_string(),
-            })
+            collisions[0].sources,
+            vec![
+                McpToolCollisionSource {
+                    server: "api".to_string(),
+                    original_tool_name: "query.sql".to_string(),
+                },
+                McpToolCollisionSource {
+                    server: "api".to_string(),
+                    original_tool_name: "query sql".to_string(),
+                },
+            ]
         );
+    }
+
+    #[test]
+    fn tool_schema_builder_drops_colliding_public_names() {
+        let tools = [
+            ("api", Tool::new("query.sql", "Query", empty_schema())),
+            ("api", Tool::new("query sql", "Query", empty_schema())),
+            ("api", Tool::new("status", "Status", empty_schema())),
+        ];
+
+        let schemas = build_tool_schemas(tools.iter().map(|(server, tool)| (*server, tool)));
+        let names: HashSet<String> = schemas
+            .iter()
+            .filter_map(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_string)
+            .collect();
+
+        assert!(!names.contains("mcp__api__query_sql"));
+        assert!(names.contains("mcp__api__status"));
     }
 
     #[test]
@@ -504,12 +596,12 @@ mod tests {
         let first_tools = [("api", Tool::new("old.query", "Old", empty_schema()))];
         let second_tools = [("api", Tool::new("new.query", "New", empty_schema()))];
 
-        let first =
+        let (first, _) =
             build_tool_route_index(first_tools.iter().map(|(server, tool)| (*server, tool)));
         assert!(first.contains_key("mcp__api__old_query"));
         assert!(!first.contains_key("mcp__api__new_query"));
 
-        let rebuilt =
+        let (rebuilt, _) =
             build_tool_route_index(second_tools.iter().map(|(server, tool)| (*server, tool)));
         assert!(!rebuilt.contains_key("mcp__api__old_query"));
         assert_eq!(
@@ -518,6 +610,37 @@ mod tests {
                 server_name: "api".to_string(),
                 original_tool_name: "new.query".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn same_server_sanitized_tool_collision_reports_original_tool_sources() {
+        // The public name includes the server prefix, so different servers with
+        // the same tool name produce different public names. Collision happens
+        // when distinct tools on the same server sanitize to the same suffix.
+        let tools = [
+            ("server-a", Tool::new("query sql", "Query", empty_schema())),
+            ("server-a", Tool::new("query.sql", "Query", empty_schema())),
+        ];
+
+        let (index, collisions) =
+            build_tool_route_index(tools.iter().map(|(server, tool)| (*server, tool)));
+
+        assert!(!index.contains_key("mcp__server-a__query_sql"));
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].public_name, "mcp__server-a__query_sql");
+        assert_eq!(
+            collisions[0].sources,
+            vec![
+                McpToolCollisionSource {
+                    server: "server-a".to_string(),
+                    original_tool_name: "query sql".to_string(),
+                },
+                McpToolCollisionSource {
+                    server: "server-a".to_string(),
+                    original_tool_name: "query.sql".to_string(),
+                },
+            ]
         );
     }
 }

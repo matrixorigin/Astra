@@ -5,6 +5,7 @@ export type RuntimeErrorContext = {
   path: string;
   status?: number;
   detail: string;
+  code?: string;
   cause?: unknown;
 };
 
@@ -13,6 +14,7 @@ export class RuntimeClientError extends Error {
   readonly path: string;
   readonly status?: number;
   readonly detail: string;
+  readonly code?: string;
   override readonly cause?: unknown;
 
   constructor(context: RuntimeErrorContext) {
@@ -22,6 +24,7 @@ export class RuntimeClientError extends Error {
     this.path = context.path;
     this.status = context.status;
     this.detail = context.detail;
+    this.code = context.code;
     this.cause = context.cause;
   }
 }

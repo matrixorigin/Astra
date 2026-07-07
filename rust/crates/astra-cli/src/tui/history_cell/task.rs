@@ -24,7 +24,7 @@ use std::any::Any;
 use std::time::Instant;
 
 use super::truncate_by_width;
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 

@@ -65,12 +65,12 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             axum::routing::put(resource_handlers::set_resource_limits_handler),
         )
         .route(
-            "/admin/tools/disabled",
-            get(admin_handlers::admin_list_disabled_tools_handler)
+            "/admin/tool-offers/disabled",
+            get(admin_handlers::admin_list_disabled_tool_offers_handler)
                 .put(admin_handlers::admin_disable_tool_handler),
         )
         .route(
-            "/admin/tools/disabled/{tool_name}",
+            "/admin/tool-offers/disabled/{offer_id}",
             delete(admin_handlers::admin_enable_tool_handler),
         )
 }

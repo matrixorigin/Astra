@@ -1,7 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -792,8 +792,21 @@ fn request(
         workspace_record: None,
         executor,
         runtime: None,
+        selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     }
+}
+
+fn request_scoped_mcp_request(tool_name: &str) -> ToolExecutionRequest {
+    request(
+        tool_name,
+        WorkspaceBinding::none(),
+        ExecutorBinding::request_scoped_mcp(),
+    )
+    .with_selected_offer(SelectedToolOfferSnapshot::new(
+        tool_name,
+        "request-scoped-mcp",
+    ))
 }
 
 #[test]
@@ -981,7 +994,7 @@ async fn server_sandbox_routes_to_server_local_transport() {
 }
 
 #[tokio::test]
-async fn no_workspace_local_code_blocks_without_server_fallback() {
+async fn no_file_environment_local_code_blocks_without_server_reroute() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let result = service
@@ -990,10 +1003,9 @@ async fn no_workspace_local_code_blocks_without_server_fallback() {
                 "bash",
                 WorkspaceBinding {
                     kind: WorkspaceBindingKind::None,
-                    display_name: "No workspace".to_string(),
+                    display_name: "No file environment".to_string(),
                     cwd: None,
                     authority: WorkspaceAuthority::None,
-                    fallback_policy: FallbackPolicy::Disabled,
                 },
                 ExecutorBinding::server_local(),
             ),
@@ -1002,11 +1014,6 @@ async fn no_workspace_local_code_blocks_without_server_fallback() {
         .await;
 
     assert!(result.is_error, "{result:?}");
-    assert!(
-        result.output.contains("no fallback was attempted"),
-        "{}",
-        result.output
-    );
     let metadata = result.metadata.expect("capability metadata");
     assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
     assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
@@ -1047,12 +1054,16 @@ async fn unknown_tool_is_denied_before_local_transport() {
         .await;
 
     assert!(result.is_error, "{result:?}");
-    let metadata = result.metadata.expect("capability metadata");
-    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
-    assert_eq!(
-        metadata["capability_denial"],
-        serde_json::json!("UnknownTool")
+    assert!(
+        result.metadata.is_none(),
+        "unknown tool is a schema/admission failure, not a runtime capability denial"
     );
+    let body: Value = serde_json::from_str(&result.output).expect("json error body");
+    assert_eq!(
+        body["error_kind"],
+        serde_json::json!(astra_core::ErrorKind::ToolNotFound.as_str())
+    );
+    assert_eq!(body["retryable"], serde_json::json!(false));
     assert_eq!(local.calls(), 0);
 }
 
@@ -1113,16 +1124,15 @@ async fn policy_allowed_tools_blocks_disallowed_tool_before_local_transport() {
 }
 
 #[test]
-fn no_workspace_binding_resolves_to_control_plane_tool_surface_only() {
+fn no_file_environment_binding_resolves_to_control_plane_tool_surface_only() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let request = request(
         "bash",
         WorkspaceBinding {
             kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
+            display_name: "No file environment".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::None,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding::server_local(),
     );
@@ -1184,18 +1194,12 @@ fn server_sandbox_binding_reports_host_process_runtime_not_provider_runtime() {
 }
 
 #[tokio::test]
-async fn no_workspace_mcp_retrieve_runs_as_request_scoped_mcp_without_runtime() {
+async fn mcp_prefixed_tool_is_not_request_scoped_mcp_without_explicit_executor() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let request = request(
         "mcp__rag__retrieve",
-        WorkspaceBinding {
-            kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
-            cwd: None,
-            authority: WorkspaceAuthority::None,
-            fallback_policy: FallbackPolicy::Disabled,
-        },
+        WorkspaceBinding::none(),
         ExecutorBinding::server_local(),
     );
     let registry = astra_runtime_env::ToolRegistry::builtins();
@@ -1203,11 +1207,12 @@ async fn no_workspace_mcp_retrieve_runs_as_request_scoped_mcp_without_runtime() 
 
     assert_eq!(
         service.routing_decision(&request),
-        ToolExecutionRouteKind::RequestScopedMcp
+        ToolExecutionRouteKind::Unsupported
     );
-    assert_eq!(
+    assert_ne!(
         binding.executor.kind,
-        astra_runtime_env::ExecutorBindingKind::RequestScopedMcp
+        astra_runtime_env::ExecutorBindingKind::Mcp,
+        "mcp__ prefix alone must not synthesize an MCP executor"
     );
     assert_eq!(
         binding.runtime.session_manager,
@@ -1217,25 +1222,31 @@ async fn no_workspace_mcp_retrieve_runs_as_request_scoped_mcp_without_runtime() 
         binding.runtime.isolation_backend,
         astra_runtime_env::RuntimeIsolationBackend::None
     );
-    assert_eq!(
-        astra_runtime_env::CapabilityResolver.check_tool_call(
-            &registry,
-            "mcp__rag__retrieve",
-            &serde_json::json!({"query": "what is astra?"}),
-            &binding.capabilities,
-        ),
-        Ok(())
+    assert!(
+        !binding.tool_surface.contains("mcp__rag__retrieve"),
+        "mcp__ prefix alone must not expose a provider offer"
+    );
+    assert!(
+        astra_runtime_env::CapabilityResolver
+            .check_tool_call_for_surface(
+                &registry,
+                "mcp__rag__retrieve",
+                &serde_json::json!({"query": "what is astra?"}),
+                &binding.capabilities,
+                &binding.tool_surface,
+            )
+            .is_err(),
+        "tool surface must reject mcp__ names without an explicit MCP provider"
     );
 
     let result = service.execute(request, &local).await;
 
-    assert!(!result.is_error, "{result:?}");
-    assert_eq!(result.output, "local:mcp__rag__retrieve");
-    assert_eq!(local.calls(), 1);
-    let metadata = result.metadata.expect("mcp metadata");
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(local.calls(), 0);
+    let metadata = result.metadata.expect("unsupported mcp metadata");
+    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
     assert_eq!(metadata["workspace"]["kind"], "none");
-    assert_eq!(metadata["executor"]["kind"], "mcp");
-    assert_eq!(metadata["transport"], "mcp_http");
+    assert_ne!(metadata["executor"]["kind"], "mcp");
 }
 
 #[test]
@@ -1432,7 +1443,6 @@ fn orchestrator_managed_unknown_status_hides_project_tools_until_runtime_ready()
             display_name: "Snapshot".to_string(),
             cwd: Some("/snapshot".to_string()),
             authority: WorkspaceAuthority::ReadOnly,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1566,7 +1576,6 @@ fn orchestrator_managed_with_ready_runtime_routes_through_resident_agent() {
             display_name: "Personal workspace".to_string(),
             cwd: Some("/workspace/personal".to_string()),
             authority: WorkspaceAuthority::ReadOnly,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1603,7 +1612,6 @@ fn orchestrator_managed_enterprise_binding_preserves_executor_kind() {
             display_name: "Team workspace".to_string(),
             cwd: Some("/workspace/team".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1640,7 +1648,6 @@ fn cloud_workspace_with_runtime_bound_orchestrator_exposes_read_write_project_to
             display_name: "Team workspace".to_string(),
             cwd: Some("/cloud/volumes/team-volume-1".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1684,7 +1691,6 @@ fn explicit_runtime_binding_overrides_executor_inference() {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1726,7 +1732,6 @@ async fn gateway_relay_transport_fails_closed_until_adapter_is_configured() {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1790,7 +1795,6 @@ async fn gateway_relay_executes_through_configured_transport() {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1831,7 +1835,6 @@ async fn gateway_relay_receives_args_without_internal_tool_metadata() {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -1960,7 +1963,6 @@ async fn sandbox_resident_agent_transport_fails_closed_until_adapter_is_configur
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -2027,7 +2029,6 @@ async fn sandbox_resident_agent_executes_through_configured_transport() {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -2062,7 +2063,6 @@ fn cloud_snapshot_request(tool_name: &str) -> ToolExecutionRequest {
             display_name: "Snapshot".to_string(),
             cwd: Some("/snapshot".to_string()),
             authority: WorkspaceAuthority::ReadOnly,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -2087,7 +2087,6 @@ fn openshell_gateway_request(tool_name: &str) -> ToolExecutionRequest {
             display_name: "OpenShell workspace".to_string(),
             cwd: Some("/sandbox".to_string()),
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding {
             kind: ExecutorBindingKind::OrchestratorManaged,
@@ -2266,8 +2265,7 @@ async fn orchestrator_managed_execute_timeout_reports_side_effect_uncertainty() 
 }
 
 #[tokio::test]
-async fn orchestrator_managed_without_sandbox_resident_agent_transport_does_not_fallback_to_local()
-{
+async fn orchestrator_managed_without_sandbox_resident_agent_transport_does_not_reroute_to_local() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
 
@@ -2295,7 +2293,7 @@ async fn orchestrator_managed_without_sandbox_resident_agent_transport_does_not_
 }
 
 #[tokio::test]
-async fn orchestrator_managed_transport_error_skips_local_fallback() {
+async fn orchestrator_managed_transport_error_skips_local_reroute() {
     let resident = Arc::new(StaticSandboxResidentAgentTransport::with_error(
         astra_runtime_env::RuntimeError::runtime_unavailable("orchestrator denied execution"),
     ));
@@ -2326,7 +2324,7 @@ async fn orchestrator_managed_transport_error_skips_local_fallback() {
 }
 
 #[tokio::test]
-async fn cloud_workspace_blocks_without_server_fallback() {
+async fn cloud_workspace_blocks_without_server_reroute() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let mut request = request(
@@ -2336,7 +2334,6 @@ async fn cloud_workspace_blocks_without_server_fallback() {
             display_name: "Cloud workspace".to_string(),
             cwd: Some("/checkout/repo".to_string()),
             authority: WorkspaceAuthority::ReadOnly,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         ExecutorBinding::server_local(),
     );
@@ -2346,7 +2343,26 @@ async fn cloud_workspace_blocks_without_server_fallback() {
 
     assert!(result.is_error, "{result:?}");
     assert!(
-        result.output.contains("No server fallback was attempted"),
+        result
+            .output
+            .contains("No alternate execution provider was attempted"),
+        "{}",
+        result.output
+    );
+    assert!(
+        result
+            .output
+            .contains("workspace provider with an available executor"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("Select Server sandbox"),
+        "{}",
+        result.output
+    );
+    assert!(
+        !result.output.contains("connected edge workspace"),
         "{}",
         result.output
     );
@@ -2365,7 +2381,7 @@ async fn cloud_workspace_blocks_without_server_fallback() {
 }
 
 #[tokio::test]
-async fn edge_offline_with_fallback_disabled_does_not_call_server_local() {
+async fn edge_offline_does_not_call_server_local() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let result = service
@@ -2390,7 +2406,7 @@ async fn edge_offline_with_fallback_disabled_does_not_call_server_local() {
 
     assert!(result.is_error, "{result:?}");
     assert!(
-        result.output.contains("fallback is disabled"),
+        result.output.contains("No alternate execution provider"),
         "{}",
         result.output
     );
@@ -2723,51 +2739,53 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
 }
 
 #[tokio::test]
-async fn edge_bound_explicit_offline_status_blocks_without_dispatch() {
-    let dispatch = Arc::new(StaticEdgeDispatch::default());
-    let _local = CountingLocalTransport::new();
+async fn edge_bound_offline_or_unknown_status_blocks_without_dispatch() {
+    for status in [ExecutorStatus::Offline, ExecutorStatus::Unknown] {
+        let dispatch = Arc::new(StaticEdgeDispatch::default());
+        let _local = CountingLocalTransport::new();
 
-    let service = ToolExecutionService::builder()
-        .edge_dispatch_service(dispatch.clone())
-        .edge_registry_service(Arc::new(StaticEdgeRegistry {
-            agents: vec![edge_agent_record("edge-selected")],
-        }))
-        .build();
-    let local = CountingLocalTransport::new();
+        let service = ToolExecutionService::builder()
+            .edge_dispatch_service(dispatch.clone())
+            .edge_registry_service(Arc::new(StaticEdgeRegistry {
+                agents: vec![edge_agent_record("edge-selected")],
+            }))
+            .build();
+        let local = CountingLocalTransport::new();
 
-    let result = service
-        .execute(
-            request(
-                "bash",
-                WorkspaceBinding::edge_workspace(
-                    "MacBook Pro",
-                    "/Users/test/project",
-                    WorkspaceAuthority::ReadWrite,
+        let result = service
+            .execute(
+                request(
+                    "bash",
+                    WorkspaceBinding::edge_workspace(
+                        "MacBook Pro",
+                        "/Users/test/project",
+                        WorkspaceAuthority::ReadWrite,
+                    ),
+                    ExecutorBinding::edge_agent(
+                        "edge-selected",
+                        "MacBook Pro",
+                        ToolTransportKind::EdgeWs,
+                        status,
+                    ),
                 ),
-                ExecutorBinding::edge_agent(
-                    "edge-selected",
-                    "MacBook Pro",
-                    ToolTransportKind::EdgeWs,
-                    ExecutorStatus::Offline,
-                ),
-            ),
-            &local,
-        )
-        .await;
+                &local,
+            )
+            .await;
 
-    assert!(result.is_error, "{result:?}");
-    let metadata = result.metadata.expect("offline metadata");
-    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_EXECUTOR_OFFLINE);
-    assert_eq!(metadata["executor"]["status"], "offline");
-    assert_eq!(local.calls(), 0);
-    assert!(
-        dispatch
-            .inserted_edge_agent_ids
-            .lock()
-            .expect("inserted edge agent ids lock")
-            .is_empty(),
-        "explicit offline executor status must block before edge ledger dispatch"
-    );
+        assert!(result.is_error, "{status:?}: {result:?}");
+        let metadata = result.metadata.expect("offline metadata");
+        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_EXECUTOR_OFFLINE);
+        assert_eq!(metadata["executor"]["status"], serde_json::json!(status));
+        assert_eq!(local.calls(), 0);
+        assert!(
+            dispatch
+                .inserted_edge_agent_ids
+                .lock()
+                .expect("inserted edge agent ids lock")
+                .is_empty(),
+            "explicit {status:?} executor status must block before edge ledger dispatch"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2927,9 +2945,6 @@ async fn server_runtime_tools_bypass_edge_transport() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
     let server_runtime_tools = [
-        "tool_search",
-        "web_search",
-        "web_fetch",
         "memory",
         "mo_query",
         "rollback_database_snapshots",
@@ -2970,6 +2985,251 @@ async fn server_runtime_tools_bypass_edge_transport() {
         assert_eq!(metadata["transport"], "server_local", "{tool}");
     }
     assert_eq!(local.calls(), server_runtime_tools.len());
+
+    let control_plane_request = request(
+        "tool_search",
+        WorkspaceBinding::edge_workspace(
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-macbook-1",
+            "MacBook Pro",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Offline,
+        ),
+    );
+    assert_eq!(
+        service.routing_decision(&control_plane_request),
+        ToolExecutionRouteKind::ServerControlPlane,
+        "tool_search is control-plane backbone and must not depend on edge transport"
+    );
+    let result = service.execute(control_plane_request, &local).await;
+    assert!(!result.is_error, "tool_search: {result:?}");
+    assert_eq!(result.output, "local:tool_search");
+    assert_eq!(local.calls(), server_runtime_tools.len() + 1);
+}
+
+#[tokio::test]
+async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_binding() {
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+
+    for tool in ["web_fetch", "web_search"] {
+        let server_request = request(
+            tool,
+            WorkspaceBinding::none(),
+            ExecutorBinding::server_local(),
+        );
+        assert_eq!(
+            service.routing_decision(&server_request),
+            ToolExecutionRouteKind::ServerRuntime,
+            "{tool} must be service-backed when no runtime executor is selected"
+        );
+        let server_result = service.execute(server_request, &local).await;
+        assert!(!server_result.is_error, "{tool}: {server_result:?}");
+        assert_eq!(server_result.output, format!("local:{tool}"));
+
+        let edge_request = request(
+            tool,
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-selected",
+                "MacBook Pro",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+        assert_eq!(
+            service.routing_decision(&edge_request),
+            ToolExecutionRouteKind::EdgeBound,
+            "{tool} must prefer the selected edge executor"
+        );
+        let edge_result = service.execute(edge_request, &local).await;
+        assert!(!edge_result.is_error, "{tool}: {edge_result:?}");
+        assert_eq!(edge_result.output, "ledger-result");
+    }
+
+    assert_eq!(local.calls(), 2);
+    assert_eq!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .as_slice(),
+        ["edge-selected", "edge-selected"]
+    );
+}
+
+#[tokio::test]
+async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .initial_disabled_tool_offers(&["web_fetch@server-builtin".to_string()])
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let server_result = service
+        .execute(
+            request(
+                "web_fetch",
+                WorkspaceBinding::none(),
+                ExecutorBinding::server_local(),
+            ),
+            &local,
+        )
+        .await;
+    assert!(server_result.is_error, "{server_result:?}");
+    let metadata = server_result.metadata.expect("disabled metadata");
+    assert_eq!(metadata["tool_disabled"], true);
+    assert_eq!(metadata["tool_offer_id"], "web_fetch@server-builtin");
+
+    let edge_result = service
+        .execute(
+            request(
+                "web_fetch",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+    assert!(!edge_result.is_error, "{edge_result:?}");
+    assert_eq!(edge_result.output, "ledger-result");
+    assert_eq!(local.calls(), 0);
+    assert_eq!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .as_slice(),
+        ["edge-selected"]
+    );
+}
+
+#[tokio::test]
+async fn selected_offer_route_mismatch_blocks_execution_without_provider_fallback() {
+    let service = ToolExecutionService::new_for_test();
+    let local = CountingLocalTransport::new();
+    let request = request(
+        "web_fetch",
+        WorkspaceBinding::none(),
+        ExecutorBinding::server_local(),
+    )
+    .with_selected_offer(SelectedToolOfferSnapshot::new_with_route(
+        "web_fetch",
+        "edge-selected",
+        ToolExecutionRouteKind::EdgeBound,
+    ));
+
+    assert_eq!(
+        service.routing_decision(&request),
+        ToolExecutionRouteKind::EdgeBound,
+        "selected offer route is the execution source of truth"
+    );
+    let boundary = crate::server::tool_route_boundary::ToolRouteBoundary::new(
+        request,
+        ToolExecutionRouteKind::ServerRuntime,
+    );
+    let result = service
+        .execute_boundary_with_cancel(&boundary, &local, None)
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(
+        local.calls(),
+        0,
+        "selected offer route mismatch must block before server fallback execution"
+    );
+    assert!(
+        result.output.contains("Refusing to run"),
+        "{}",
+        result.output
+    );
+    let metadata = result.metadata.expect("route mismatch metadata");
+    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_ROUTE_MISMATCH);
+    assert_eq!(metadata["runtime_error"]["kind"], "route_mismatch");
+    assert_eq!(
+        metadata["selected_tool_offer"]["offer_id"],
+        "web_fetch@edge-selected"
+    );
+    assert_eq!(metadata["selected_tool_offer"]["route"], "edge_bound");
+    assert_eq!(metadata["actual_route"], "server_runtime");
+}
+
+#[tokio::test]
+async fn provider_allowlist_blocks_selected_edge_offer_without_server_reroute() {
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .initial_provider_allowed_tools(HashMap::from([(
+            "edge-selected".to_string(),
+            HashSet::from(["bash".to_string()]),
+        )]))
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(
+            request(
+                "web_fetch",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("provider disallowed metadata");
+    assert_eq!(metadata["tool_provider_disallowed"], true);
+    assert_eq!(metadata["tool_offer_id"], "web_fetch@edge-selected");
+    assert_eq!(metadata["provider_id"], "edge-selected");
+    assert_eq!(local.calls(), 0);
+    assert!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .is_empty(),
+        "disallowed selected offer must be blocked before edge dispatch"
+    );
 }
 
 #[tokio::test]
@@ -3011,20 +3271,7 @@ async fn request_scoped_mcp_tools_bypass_edge_transport() {
         }))
         .build();
     let local = CountingLocalTransport::new();
-    let edge_request = request(
-        "mcp__demo__search",
-        WorkspaceBinding::edge_workspace(
-            "MacBook Pro",
-            "/Users/test/project",
-            WorkspaceAuthority::ReadWrite,
-        ),
-        ExecutorBinding::edge_agent(
-            "edge-macbook-1",
-            "MacBook Pro",
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Offline,
-        ),
-    );
+    let edge_request = request_scoped_mcp_request("mcp__demo__search");
 
     assert_eq!(
         service.routing_decision(&edge_request),
@@ -3044,13 +3291,79 @@ async fn request_scoped_mcp_tools_bypass_edge_transport() {
         "request-scoped MCP tools must not dispatch to edge"
     );
     let metadata = result.metadata.expect("request-scoped MCP metadata");
-    assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
-    assert_eq!(metadata["workspace"]["cwd"], "/Users/test/project");
+    assert_eq!(metadata["workspace"]["kind"], "none");
     assert_eq!(metadata["executor"]["kind"], "mcp");
     assert_eq!(metadata["executor"]["executor_id"], "request-scoped-mcp");
-    assert_eq!(metadata["executor"]["display_name"], "MCP server");
+    assert_eq!(metadata["executor"]["display_name"], "Request-scoped MCP");
     assert_eq!(metadata["executor"]["transport"], "mcp_http");
     assert_eq!(metadata["transport"], "mcp_http");
+}
+
+#[tokio::test]
+async fn request_scoped_mcp_execution_requires_selected_offer_snapshot() {
+    let service = ToolExecutionService::new_for_test();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(
+            request(
+                "mcp__demo__search",
+                WorkspaceBinding::none(),
+                ExecutorBinding::request_scoped_mcp(),
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(local.calls(), 0);
+    let metadata = result.metadata.expect("missing selected offer metadata");
+    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CAPABILITY_DENIED);
+    assert_eq!(metadata["executor"]["kind"], "mcp");
+    assert_eq!(metadata["transport"], "mcp_http");
+}
+
+#[tokio::test]
+async fn disabled_request_scoped_mcp_offer_blocks_selected_offer_without_schema_inventory() {
+    let service = ToolExecutionService::builder()
+        .initial_disabled_tool_offers(&["mcp__demo__search@request-scoped-mcp".to_string()])
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(request_scoped_mcp_request("mcp__demo__search"), &local)
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("disabled metadata");
+    assert_eq!(metadata["tool_disabled"], true);
+    assert_eq!(
+        metadata["tool_offer_id"],
+        "mcp__demo__search@request-scoped-mcp"
+    );
+    assert_eq!(local.calls(), 0);
+}
+
+#[tokio::test]
+async fn request_scoped_mcp_provider_allowlist_blocks_selected_offer_without_schema_inventory() {
+    let service = ToolExecutionService::builder()
+        .initial_provider_allowed_tools(HashMap::from([(
+            "request-scoped-mcp".to_string(),
+            HashSet::from(["mcp__demo__allowed".to_string()]),
+        )]))
+        .build();
+    let local = CountingLocalTransport::new();
+    let result = service
+        .execute(request_scoped_mcp_request("mcp__demo__search"), &local)
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("provider disallowed metadata");
+    assert_eq!(metadata["tool_provider_disallowed"], true);
+    assert_eq!(
+        metadata["tool_offer_id"],
+        "mcp__demo__search@request-scoped-mcp"
+    );
+    assert_eq!(metadata["provider_id"], "request-scoped-mcp");
+    assert_eq!(local.calls(), 0);
 }
 
 // ── Cancel token propagation ──────────────────────────────────────────
@@ -3166,15 +3479,13 @@ async fn request_scoped_mcp_cancel_reports_mcp_binding() {
     cancel.cancel();
     let request = request(
         "mcp__rag__retrieve",
-        WorkspaceBinding {
-            kind: WorkspaceBindingKind::None,
-            display_name: "No workspace".to_string(),
-            cwd: None,
-            authority: WorkspaceAuthority::None,
-            fallback_policy: FallbackPolicy::Disabled,
-        },
-        ExecutorBinding::server_local(),
-    );
+        WorkspaceBinding::none(),
+        ExecutorBinding::request_scoped_mcp(),
+    )
+    .with_selected_offer(SelectedToolOfferSnapshot::new(
+        "mcp__rag__retrieve",
+        "request-scoped-mcp",
+    ));
 
     let result = service
         .execute_with_cancel(request, &local, Some(cancel))
@@ -3446,7 +3757,6 @@ fn edge_executor_id_returns_none_for_empty_id() {
             display_name: "test-ws".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         workspace_record: None,
         runtime: None,
@@ -3456,6 +3766,7 @@ fn edge_executor_id_returns_none_for_empty_id() {
         run_id: "run-1".to_string(),
         session_id: "session-1".to_string(),
         tool_call_id: "tc-1".to_string(),
+        selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     };
     assert_eq!(
@@ -3481,7 +3792,6 @@ fn edge_executor_id_rejects_whitespace_only_id() {
             display_name: "test-ws".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         workspace_record: None,
         runtime: None,
@@ -3491,6 +3801,7 @@ fn edge_executor_id_rejects_whitespace_only_id() {
         run_id: "run-1".to_string(),
         session_id: "session-1".to_string(),
         tool_call_id: "tc-1".to_string(),
+        selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     };
     assert_eq!(
@@ -3516,7 +3827,6 @@ fn edge_executor_id_returns_some_for_valid_id() {
             display_name: "test-ws".to_string(),
             cwd: None,
             authority: WorkspaceAuthority::ReadWrite,
-            fallback_policy: FallbackPolicy::Disabled,
         },
         workspace_record: None,
         runtime: None,
@@ -3526,6 +3836,7 @@ fn edge_executor_id_returns_some_for_valid_id() {
         run_id: "run-1".to_string(),
         session_id: "session-1".to_string(),
         tool_call_id: "tc-1".to_string(),
+        selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     };
     assert_eq!(edge_executor_id(&request), Some("valid-edge-123"));

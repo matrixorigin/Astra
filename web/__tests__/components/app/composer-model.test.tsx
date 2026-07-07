@@ -3,6 +3,7 @@ import { Composer } from "@/components/app/composer";
 import { listModels } from "@/lib/api/models";
 
 vi.mock("@/components/app/composer-plus-menu", () => ({
+  ComposerEnvironmentChip: () => null,
   ComposerPlusMenu: () => null,
 }));
 

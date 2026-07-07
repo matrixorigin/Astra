@@ -5358,7 +5358,7 @@ async fn sse_no_reasoning_done_without_reasoning() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Area 3: /chat/stream Integration (Bridge Route)
+// Area 3: /chat/stream Integration (Unified Lifecycle Route)
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Helper: POST /chat/stream with bridge-e2e test secret
@@ -5389,12 +5389,11 @@ async fn chat_stream(app: &Router, message: &str, extra: Value) -> (StatusCode, 
     (st, String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// /chat/stream with bridge-e2e test secret routes through bridge.
-/// Note: chat_stream_bridge_fallback_payload() doesn't forward test_llm_rounds,
-/// so the bridge will fall through to the real LLM path (which has no API key → error).
-/// We verify the routing works by checking we get a valid SSE response (even if it errors).
+/// /chat/stream must not route through the in-process bridge. The bridge test
+/// secret is accepted only by /chat/turn's single-turn transport; Web streaming
+/// uses the run lifecycle / ServerAgenticLoopHost path.
 #[tokio::test]
-async fn chat_stream_bridge_route_emits_session_info() {
+async fn chat_stream_bridge_secret_does_not_route_to_bridge() {
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
@@ -5406,22 +5405,16 @@ async fn chat_stream_bridge_route_emits_session_info() {
     )
     .await;
 
-    // The response should be valid SSE (200 OK with SSE content)
-    // Even if the bridge fails internally, the SSE envelope starts successfully
-    assert_eq!(
-        st,
-        StatusCode::OK,
-        "bridge route returns 200 OK SSE envelope"
-    );
+    assert_eq!(st, StatusCode::OK, "SSE error envelope should use 200 OK");
 
-    // session_info is emitted before LLM call, so it should always appear
     let events = parse_sse_events(&raw);
     let si = events_of_type(&events, "session_info");
-    assert_eq!(
-        si.len(),
-        1,
-        "session_info present — routing to bridge worked"
+    assert!(
+        si.is_empty(),
+        "bridge session_info must not be emitted by /chat/stream: {raw}"
     );
+    let errors = events_of_type(&events, "error");
+    assert_eq!(errors.len(), 1, "lifecycle error should be returned: {raw}");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -8,14 +8,19 @@
 //! It can be replayed, exported, or analyzed by `/session` commands.
 //!
 //! **Test isolation:** use [`JournalDirGuard`] to redirect all `sessions`-rooted I/O on the
-//! current thread (journal JSONL, workspace, step checkpoints) without mutating `HOME`.
+//! current thread (journal JSONL, workspace, step checkpoints) without mutating `HOME`. Use
+//! [`ProcessJournalDirGuard`] only for integration tests that must observe journal writes from
+//! background tasks running on different Tokio worker threads.
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{
+    LazyLock, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
 
@@ -29,6 +34,17 @@ thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
+#[derive(Debug, Clone)]
+struct ProcessSessionsDirOverride {
+    id: u64,
+    dir: PathBuf,
+}
+
+static NEXT_PROCESS_SESSIONS_DIR_OVERRIDE_ID: AtomicU64 = AtomicU64::new(1);
+static PROCESS_SESSIONS_DIR_OVERRIDE_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+static PROCESS_SESSIONS_DIR_OVERRIDES: LazyLock<Mutex<Vec<ProcessSessionsDirOverride>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
 fn merge_execution_boundary_metadata(
     metadata: &mut serde_json::Value,
     execution_metadata: Option<&serde_json::Value>,
@@ -39,7 +55,7 @@ fn merge_execution_boundary_metadata(
     let Some(execution_metadata) = execution_metadata.and_then(serde_json::Value::as_object) else {
         return;
     };
-    for key in ["workspace", "executor", "transport", "fallback_policy"] {
+    for key in ["workspace", "executor", "transport"] {
         if let Some(value) = execution_metadata.get(key).cloned() {
             metadata.entry(key.to_string()).or_insert(value);
         }
@@ -106,13 +122,29 @@ fn with_session_start_state_cache<R>(f: impl FnOnce(&mut BoundedSessionCache) ->
     }
 }
 
-/// Resolved local `sessions` directory (`~/.astra/sessions` or a per-thread override).
+/// Resolved local `sessions` directory (`~/.astra/sessions` or a test override).
 ///
 /// Step checkpoints, workspace metadata, and session journal files all live under this root.
 pub fn local_sessions_dir() -> PathBuf {
     LOCAL_SESSIONS_DIR_OVERRIDE.with(|c| {
         if let Some(ref p) = *c.borrow() {
             return p.clone();
+        }
+        let process_override = match PROCESS_SESSIONS_DIR_OVERRIDES.lock() {
+            Ok(overrides) => overrides.last().map(|override_| override_.dir.clone()),
+            Err(poisoned) => {
+                PROCESS_SESSIONS_DIR_OVERRIDE_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    "process_sessions_dir_overrides mutex poisoned; using last stored override"
+                );
+                poisoned
+                    .into_inner()
+                    .last()
+                    .map(|override_| override_.dir.clone())
+            }
+        };
+        if let Some(p) = process_override {
+            return p;
         }
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -504,6 +536,50 @@ impl Drop for JournalDirGuard {
         LOCAL_SESSIONS_DIR_OVERRIDE.with(|c| {
             *c.borrow_mut() = prev;
         });
+    }
+}
+
+/// Redirect session journal + workspace + step checkpoint paths process-wide.
+///
+/// Use this only in tests that intentionally exercise cross-thread async
+/// background work. Prefer [`JournalDirGuard`] for ordinary single-threaded
+/// unit tests, because this guard affects every thread in the current process.
+#[must_use = "drop restores the previous process-wide sessions-dir override"]
+pub struct ProcessJournalDirGuard {
+    id: u64,
+}
+
+impl ProcessJournalDirGuard {
+    pub fn new(dir: impl AsRef<Path>) -> Self {
+        let dir = dir.as_ref().to_path_buf();
+        let id = NEXT_PROCESS_SESSIONS_DIR_OVERRIDE_ID.fetch_add(1, Ordering::Relaxed);
+        PROCESS_SESSIONS_DIR_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(ProcessSessionsDirOverride {
+                id,
+                dir: dir.clone(),
+            });
+        Self { id }
+    }
+}
+
+impl Drop for ProcessJournalDirGuard {
+    fn drop(&mut self) {
+        let mut overrides = PROCESS_SESSIONS_DIR_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if overrides
+            .last()
+            .is_some_and(|override_| override_.id == self.id)
+        {
+            overrides.pop();
+        } else if let Some(index) = overrides
+            .iter()
+            .rposition(|override_| override_.id == self.id)
+        {
+            overrides.remove(index);
+        }
     }
 }
 
@@ -964,13 +1040,16 @@ impl ToolCallRecord {
         if self.surgically_removed == Some(true) {
             return true;
         }
+        if self.is_structured_noop_or_cached_result() {
+            return true;
+        }
 
         let Some(result_preview) = self.result_preview.as_deref() else {
             return false;
         };
 
         result_preview.starts_with("Skipped:")
-            || result_preview.starts_with("Deferred:")
+            || (self.error.is_none() && result_preview.starts_with("Deferred:"))
             || (self.name == "skill"
                 && result_preview.starts_with("Skill '")
                 && result_preview.contains(" was already loaded (turn "))
@@ -1410,6 +1489,7 @@ pub enum SessionMemoryExtractionSkipReason {
     NoSessionId,
     BelowInitGate,
     NoGrowth,
+    LowInformation,
     InFlight,
     SelectorCooldown,
     /// Memoria endpoint tripped the circuit breaker after consecutive
@@ -3707,6 +3787,52 @@ impl JournalEvent {
         self
     }
 
+    /// Attach structured user-input events that arrived after the turn had
+    /// already started. The top-level `user_input` remains the human-readable
+    /// turn input; this metadata preserves individual mid-turn input events for
+    /// resume/session-history projections.
+    pub fn with_deferred_user_inputs<'a, I>(mut self, inputs: I) -> Self
+    where
+        I: IntoIterator<Item = (usize, &'a str)>,
+    {
+        let redacted = journal_content_redact_enabled();
+        let events = inputs
+            .into_iter()
+            .filter_map(|(event_index, content)| {
+                let content = content.trim();
+                if content.is_empty() {
+                    return None;
+                }
+                let content = if redacted {
+                    journal_content_marker(content)
+                } else {
+                    truncate(content, 500)
+                };
+                Some(serde_json::json!({
+                    "event_index": event_index,
+                    "content": content,
+                }))
+            })
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            return self;
+        }
+
+        let metadata = self.metadata.get_or_insert_with(|| serde_json::json!({}));
+        if !metadata.is_object() {
+            *metadata = serde_json::json!({
+                "previous_metadata": metadata.clone(),
+            });
+        }
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert(
+                "deferred_user_inputs".into(),
+                serde_json::Value::Array(events),
+            );
+        }
+        self
+    }
+
     /// Turn error event.
     pub fn turn_error(
         session_id: Option<&str>,
@@ -5572,6 +5698,48 @@ mod tests {
             assert_eq!(local_sessions_dir(), inner_sessions);
         }
         assert_eq!(local_sessions_dir(), outer_sessions);
+    }
+
+    #[test]
+    #[serial_test::serial(process_journal_dir_guard)]
+    fn process_journal_dir_guard_interleaved_drop_uses_guard_identity() {
+        let shared = tempdir().unwrap();
+        let shared_sessions = shared.path().join("sessions");
+        std::fs::create_dir_all(&shared_sessions).unwrap();
+
+        let outer = ProcessJournalDirGuard::new(&shared_sessions);
+        let outer_id = outer.id;
+        let inner = ProcessJournalDirGuard::new(&shared_sessions);
+        let inner_id = inner.id;
+
+        assert_ne!(outer_id, inner_id);
+        assert_eq!(local_sessions_dir(), shared_sessions);
+
+        drop(outer);
+        {
+            let overrides = PROCESS_SESSIONS_DIR_OVERRIDES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                !overrides.iter().any(|override_| override_.id == outer_id),
+                "dropping the outer guard must remove the outer override, not the same-path inner override"
+            );
+            assert!(
+                overrides.iter().any(|override_| override_.id == inner_id),
+                "the same-path inner override must remain active after interleaved outer drop"
+            );
+        }
+        assert_eq!(local_sessions_dir(), shared_sessions);
+
+        drop(inner);
+        let overrides = PROCESS_SESSIONS_DIR_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !overrides
+                .iter()
+                .any(|override_| { override_.id == outer_id || override_.id == inner_id })
+        );
     }
 
     #[test]
@@ -7718,6 +7886,21 @@ mod tests {
             assert!(
                 base_tool_record("read_file", false, Some("Deferred: skill invoked"))
                     .is_synthetic_placeholder()
+            );
+            let deferred_protocol_failure = ToolCallRecord {
+                name: "agent_fanout".into(),
+                ok: false,
+                ms: 0,
+                error: Some("tool_not_admitted".into()),
+                result_preview: Some(
+                    "Deferred: Error: Tool 'agent_fanout' is not available in this turn yet."
+                        .into(),
+                ),
+                ..Default::default()
+            };
+            assert!(
+                !deferred_protocol_failure.is_synthetic_placeholder(),
+                "not-admitted deferred calls are protocol failures, not synthetic placeholders"
             );
             assert!(
                 base_tool_record(

@@ -30,7 +30,7 @@ pub struct HeadlessResolvedToolSlot {
 pub fn resolve_headless_tool_slot(
     item: HeadlessRoundToolIdx,
     server_tool_calls: &[Value],
-    mut edge_lookup: impl FnMut(usize) -> (String, Value),
+    mut edge_lookup: impl FnMut(usize) -> (String, String, Value),
 ) -> HeadlessResolvedToolSlot {
     match item {
         HeadlessRoundToolIdx::ServerToolCall(i) => {
@@ -46,9 +46,9 @@ pub fn resolve_headless_tool_slot(
             }
         }
         HeadlessRoundToolIdx::SyntheticEdge(i) => {
-            let (name, args) = edge_lookup(i);
+            let (id, name, args) = edge_lookup(i);
             HeadlessResolvedToolSlot {
-                id: format!("edge-{i}"),
+                id,
                 name,
                 args,
                 synthetic_edge_index: Some(i),
@@ -398,7 +398,7 @@ fn no_matching_edge_execution_message(name: &str) -> String {
         );
     }
 
-    if matches!(name, "agent" | "agent_fanout") {
+    if astra_tools::agent_tool_contract::is_agent_runtime_tool(name) {
         return format!(
             "Error: headless edge protocol — tool `{name}` has no matching \
              edge execution in this turn.\n\n\
@@ -836,9 +836,13 @@ mod tests {
 
         let s1 = resolve_headless_tool_slot(HeadlessRoundToolIdx::SyntheticEdge(2), &[], |i| {
             assert_eq!(i, 2);
-            ("bash".into(), json!({"command":"ls"}))
+            (
+                "edge-request-2".into(),
+                "bash".into(),
+                json!({"command":"ls"}),
+            )
         });
-        assert_eq!(s1.id, "edge-2");
+        assert_eq!(s1.id, "edge-request-2");
         assert_eq!(s1.name, "bash");
         assert_eq!(s1.args, json!({"command":"ls"}));
         assert_eq!(s1.synthetic_edge_index, Some(2));
@@ -1177,6 +1181,31 @@ mod tests {
         let msg = openai_assistant_with_tool_calls_message(&[], &edge, "");
         let tc = msg["tool_calls"].as_array().unwrap();
         assert_eq!(tc[0]["id"], "req-abc");
+    }
+
+    #[test]
+    fn synthetic_edge_slot_id_matches_assistant_tool_call_id() {
+        let edge = vec![RowWithRequestId {
+            tool: "agent_fanout".into(),
+            args: json!({"action": "start"}),
+            output: r#"{"status":"started","group_id":"fanout-1"}"#.into(),
+            request_id: "req-fanout-1".into(),
+        }];
+        let opening = begin_headless_tool_round_opening(&[], &edge, "");
+        let assistant_id = opening.assistant_message["tool_calls"][0]["id"]
+            .as_str()
+            .expect("assistant tool call id");
+        let slot = resolve_headless_tool_slot(opening.indices[0], &[], |i| {
+            let edge = &edge[i];
+            (
+                edge.assistant_tool_call_id(i),
+                edge.tool_name().to_string(),
+                edge.tool_args().clone(),
+            )
+        });
+
+        assert_eq!(assistant_id, "req-fanout-1");
+        assert_eq!(slot.id, assistant_id);
     }
 
     #[test]

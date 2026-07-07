@@ -88,6 +88,31 @@ pub(crate) struct HeadlessResolvedExecution {
 const EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD: &str =
     "runtime_environment_advertisement";
 const EDGE_RESULT_RUNTIME_ENVIRONMENT_FIELD: &str = "runtime_environment";
+const HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX: &str = "Error: headless edge protocol";
+
+fn server_owned_edge_result_should_be_rejected(
+    execution: &HeadlessResolvedExecution,
+    runtime_executor_available: bool,
+) -> bool {
+    if !runtime_executor_available || !execution.is_edge_tool {
+        return false;
+    }
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    registry.get(&execution.name).is_some_and(|spec| {
+        matches!(
+            spec.required.executor,
+            astra_runtime_env::RequiredExecutor::ControlPlane
+                | astra_runtime_env::RequiredExecutor::ServiceExecutor
+        )
+    })
+}
+
+fn server_owned_edge_result_error(execution: &HeadlessResolvedExecution) -> String {
+    format!(
+        "{HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX}: server-owned tool `{}` received a client/edge result. The selected executor and result producer disagree; fail closed to avoid duplicate side effects. Retry in a turn whose visible tool surface binds `{}` to the server/control-plane provider.",
+        execution.name, execution.name
+    )
+}
 
 fn edge_result_runtime_environment_denial(execution: &HeadlessResolvedExecution) -> Option<String> {
     if !execution.is_edge_tool {
@@ -136,11 +161,12 @@ fn edge_result_runtime_environment_denial(execution: &HeadlessResolvedExecution)
         ));
     }
     astra_runtime_env::CapabilityResolver
-        .check_tool_call(
+        .check_tool_call_for_surface(
             &registry,
             &execution.name,
             &execution.args,
             &advertisement.binding.capabilities,
+            &advertisement.binding.tool_surface,
         )
         .err()
         .map(|reason| {
@@ -241,7 +267,8 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub effective_permission_timeout: Duration,
     /// Optional server-side tool executor for web agent sessions (no CLI edge agent).
     /// When present, tools that have no edge match are executed directly by the server.
-    pub server_tool_executor: Option<&'a crate::server::server_tool_executor::ServerToolExecutor>,
+    pub runtime_tool_executor:
+        Option<&'a crate::server::runtime_tool_executor::RuntimeToolExecutor>,
     // ── Observability (Phase 1) ──
     /// Turn start instant for computing start_offset_ms on tool records.
     pub turn_start: Option<std::time::Instant>,
@@ -301,7 +328,7 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
     let consumed_after = consumed_edge.iter().filter(|&&c| c).count();
     let is_edge_tool = synthetic_edge_index.is_some() || consumed_after > consumed_before;
     if !is_edge_tool
-        && matches!(name.as_str(), "agent" | "agent_fanout")
+        && astra_tools::agent_tool_contract::is_agent_runtime_tool(&name)
         && !edge_tool_round.is_empty()
     {
         let edge_candidates = edge_tool_round
@@ -316,7 +343,7 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
             tool_call_id = %id,
             edge_round_len = edge_tool_round.len(),
             edge_candidates = %edge_candidates,
-            "executor-gated tool had edge rows but no matching edge result; falling back to runtime binding"
+            "executor-gated tool had edge rows but no matching edge result; preserving runtime binding failure"
         );
     }
     let early_exit_ms = if is_edge_tool && edge_duration_ms > 0 {
@@ -393,7 +420,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     fn resolve_slot(&self, item: HeadlessRoundToolIdx) -> HeadlessResolvedToolSlot {
         resolve_headless_tool_slot(item, self.ctx.tool_calls, |i| {
             let edge = &self.ctx.edge_tool_round[i];
-            (edge.tool_name().to_string(), edge.tool_args().clone())
+            (
+                edge.assistant_tool_call_id(i),
+                edge.tool_name().to_string(),
+                edge.tool_args().clone(),
+            )
         })
     }
 
@@ -447,11 +478,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             .map(|p| (p.execution, p.idem_key))
             .collect();
 
-        let server_executor = self.ctx.server_tool_executor;
+        let server_executor = self.ctx.runtime_tool_executor;
         let api = self.ctx.api;
         let token = self.ctx.token;
         let session_id = self.ctx.current_session_id;
         let session_turn = self.ctx.session_turn;
+        let edge_round_present = !self.ctx.edge_tool_round.is_empty();
 
         let started_at: Vec<Instant> = executions
             .iter()
@@ -464,7 +496,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let futs: Vec<_> = executions
             .iter_mut()
             .map(|(exec, _)| {
-                execute_tool_pure(exec, server_executor, api, token, session_id, session_turn)
+                execute_tool_pure(
+                    exec,
+                    server_executor,
+                    api,
+                    token,
+                    session_id,
+                    session_turn,
+                    edge_round_present,
+                )
             })
             .collect();
         futures_util::future::join_all(futs).await;
@@ -603,8 +643,8 @@ mod tests {
     fn server_executor_for_test_workspace(
         workspace: &std::path::Path,
         session_id: &str,
-    ) -> crate::server::server_tool_executor::ServerToolExecutor {
-        let mut executor = crate::server::server_tool_executor::ServerToolExecutor::new(
+    ) -> crate::server::runtime_tool_executor::RuntimeToolExecutor {
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
             workspace.to_path_buf(),
             "test-user".into(),
             session_id.to_string(),
@@ -686,15 +726,15 @@ mod tests {
         fn pipeline_with_server_executor<'a>(
             &'a mut self,
             turn_index: usize,
-            server_tool_executor: Option<
-                &'a crate::server::server_tool_executor::ServerToolExecutor,
+            runtime_tool_executor: Option<
+                &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
             >,
         ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
             let session_turn = turn_index.saturating_add(1).min(u32::MAX as usize) as u32;
             self.pipeline_with_server_executor_for_session_turn(
                 turn_index,
                 session_turn.max(1),
-                server_tool_executor,
+                runtime_tool_executor,
             )
         }
 
@@ -702,8 +742,8 @@ mod tests {
             &'a mut self,
             turn_index: usize,
             session_turn: u32,
-            server_tool_executor: Option<
-                &'a crate::server::server_tool_executor::ServerToolExecutor,
+            runtime_tool_executor: Option<
+                &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
             >,
         ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
             HeadlessToolExecutionPipeline::new(
@@ -740,7 +780,7 @@ mod tests {
                     permission_context: self.permission_context.as_ref(),
                     progress_emitter: None,
                     effective_permission_timeout: Duration::from_secs(30),
-                    server_tool_executor,
+                    runtime_tool_executor,
                     turn_start: None,
                     llm_round: 0,
                     plan_mode_active: false,
@@ -1077,6 +1117,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permit_execution_blocks_edge_result_when_tool_is_not_in_advertised_surface() {
+        let mut harness = PipelineHarness::new();
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut binding =
+            astra_runtime_env::RunBinding::edge_developer("/workspace/project", &registry);
+        assert!(
+            astra_runtime_env::CapabilityResolver
+                .check_tool_call(
+                    &registry,
+                    "grep",
+                    &json!({ "pattern": "headless" }),
+                    &binding.capabilities,
+                )
+                .is_ok(),
+            "test setup must keep aggregate capability available"
+        );
+        binding
+            .tool_surface
+            .tool_names
+            .retain(|name| name != "grep");
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(binding);
+        harness.edge_tool_round[0].tool_result_fields = Some(Map::from_iter([(
+            EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD.to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )]));
+        begin_recorded_turn(&mut harness, 1);
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::ShortCircuit => {}
+            _ => panic!("expected edge runtime surface denial"),
+        }
+        assert_eq!(pipeline.ctx.tool_results.len(), 1);
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("tool_not_selected_by_current_provider_surface"),
+            "got: {}",
+            pipeline.ctx.tool_results[0]
+        );
+    }
+
+    #[tokio::test]
     async fn permit_execution_blocks_edge_result_when_advertised_policy_disallows_tool() {
         let mut harness = PipelineHarness::new();
         let registry = astra_runtime_env::ToolRegistry::builtins();
@@ -1114,6 +1202,56 @@ mod tests {
         assert!(
             result.contains("tool 'grep' is not in allowed_tools"),
             "got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_owned_tool_rejects_edge_result_without_server_reroute() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round[0] = EdgeToolExecResult {
+            request_id: "call-task".to_string(),
+            tool: "task_board".to_string(),
+            args: json!({ "action": "create", "title": "server-owned task" }),
+            output: "stale client-side task result".to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
+            status: "completed".to_string(),
+            duration_ms: 9,
+        };
+        harness.valid_tool_names = HashSet::from(["task_board".to_string()]);
+        begin_recorded_turn(&mut harness, 1);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
+
+        {
+            let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
+            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+                HeadlessPipelineStage::Continue(validated) => validated,
+                _ => panic!("expected validated execution"),
+            };
+            match pipeline.permit_execution(validated).await {
+                HeadlessPipelineStage::ShortCircuit => {}
+                _ => panic!("server-owned edge result must fail closed before execution"),
+            }
+        }
+
+        let result = harness
+            .tool_results
+            .last()
+            .expect("blocked result")
+            .to_string();
+        assert!(
+            result.contains("server-owned tool `task_board` received a client/edge result"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("fail closed to avoid duplicate side effects"),
+            "got: {result}"
+        );
+        let tasks = server_exec.task_manager().snapshot().await.unwrap();
+        assert!(
+            tasks.is_empty(),
+            "wrong-executor edge result must not trigger a server mutation"
         );
     }
 
@@ -1782,8 +1920,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_fallback_sets_turn_index_for_current_turn_rollback() {
+    async fn server_executor_sets_turn_index_for_current_turn_rollback() {
         let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
         let dir = tempfile::TempDir::new().unwrap();
         let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline =
@@ -1822,8 +1961,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_fallback_preserves_tool_result_fields() {
+    async fn server_executor_preserves_tool_result_fields() {
         let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
         let dir = tempfile::TempDir::new().unwrap();
         init_git_repo(dir.path());
         std::fs::write(dir.path().join("tracked.txt"), "hello\n").unwrap();
@@ -1855,7 +1995,7 @@ mod tests {
             .execution
             .tool_result_fields
             .as_ref()
-            .expect("server fallback metadata");
+            .expect("alternate execution provider metadata");
         assert!(result_fields["commit_sha"].as_str().is_some());
         pipeline.record_execution(executed).await;
         assert!(
@@ -1868,8 +2008,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_fallback_surfaces_read_file_large_file_preview() {
+    async fn server_executor_surfaces_read_file_large_file_preview() {
         let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
             dir.path().join("large.txt"),
@@ -1908,8 +2049,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_fallback_surfaces_bash_timeout_partial_output() {
+    async fn server_executor_surfaces_bash_timeout_partial_output() {
         let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
         let dir = tempfile::TempDir::new().unwrap();
         let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline = harness.pipeline_with_server_executor(4, Some(&server_exec));
@@ -1950,6 +2092,53 @@ mod tests {
             !executed.execution.result_str.contains("done"),
             "got: {}",
             executed.execution.result_str
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_selected_runtime_tool_without_edge_result_does_not_fallback_to_server_executor() {
+        let mut harness = PipelineHarness::new();
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
+        let mut pipeline = harness.pipeline_with_server_executor(3, Some(&server_exec));
+        let args = json!({"path": "must_not_write.txt", "content": "wrong provider"});
+        let permitted = PermittedExecution {
+            execution: HeadlessResolvedExecution {
+                id: "call-write".into(),
+                name: "write_file".into(),
+                args: args.clone(),
+                result_str: "Error: headless edge protocol: no matching edge result".into(),
+                tool_result_fields: None,
+                edge_duration_ms: 0,
+                is_edge_tool: false,
+                early_exit_ms: 0,
+            },
+            idem_key: IdempotencyKey::semantic("write_file", &args),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+
+        assert!(executed.is_err);
+        assert!(
+            executed
+                .execution
+                .result_str
+                .contains("headless edge protocol"),
+            "no matching selected edge result must remain a binding error, got: {}",
+            executed.execution.result_str
+        );
+        assert!(
+            !dir.path().join("must_not_write.txt").exists(),
+            "server executor must not run a runtime tool when the selected edge provider failed to return a result"
+        );
+        assert_eq!(
+            executed
+                .execution
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
         );
     }
 
@@ -2562,7 +2751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_fallback_unknown_tool_records_health_failure() {
+    async fn server_executor_unknown_tool_records_health_failure() {
         // Simulates the DefaultToolExecutor "not available" path:
         // tool passes valid_tool_names but executor returns error.
         let mut harness = PipelineHarness::new();
@@ -2589,7 +2778,7 @@ mod tests {
             _ => panic!("expected Continue"),
         };
 
-        // execute_execution: ServerToolExecutor doesn't know the tool,
+        // execute_execution: RuntimeToolExecutor doesn't know the tool,
         // returns an explicit not-available error.
         let executed = pipeline.execute_execution(permitted).await;
         assert!(
@@ -2604,12 +2793,12 @@ mod tests {
         let health = pipeline.ctx.turn_guard.health.get(missing_tool);
         assert!(
             health.is_some(),
-            "missing tool should be tracked after server fallback error"
+            "missing tool should be tracked after alternate execution provider error"
         );
         let h = health.unwrap();
         assert_eq!(
             h.total_failures, 1,
-            "server fallback error should count as failure"
+            "alternate execution provider error should count as failure"
         );
         assert_eq!(h.consecutive_failures, 1);
     }
@@ -2797,7 +2986,7 @@ mod tests {
             );
             assert!(
                 !body.contains("headless edge protocol"),
-                "stale executor-gated calls must be denied before no-matching-edge fallback for {tool_name}: {body}"
+                "stale executor-gated calls must be denied before no-matching-edge binding failure for {tool_name}: {body}"
             );
             let record = pipeline
                 .ctx
@@ -2818,6 +3007,7 @@ mod tests {
     #[tokio::test]
     async fn semantic_dedup_does_not_block_git_action_diff_path_after_stat_only() {
         let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
         harness.valid_tool_names.insert("git".to_string());
 
         let dir = tempfile::TempDir::new().unwrap();

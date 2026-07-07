@@ -4,6 +4,7 @@ import {
   hydrateWorkSurface,
   resetWorkSurfaceForRun,
 } from '@/lib/work-surface';
+import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from '@/lib/run-status-messages';
 
 const task = {
   id: 'task-1',
@@ -375,7 +376,7 @@ describe('work surface reducer', () => {
       route: 'server_runtime',
       workspace: {
         kind: 'none',
-        display_name: 'No workspace',
+        display_name: 'No file environment',
         authority: 'none',
         fallback_policy: 'disabled',
       },
@@ -396,7 +397,7 @@ describe('work surface reducer', () => {
       status: 'running',
       workspace: {
         kind: 'none',
-        display_name: 'No workspace',
+        display_name: 'No file environment',
       },
       executor: {
         kind: 'server_local',
@@ -414,7 +415,7 @@ describe('work surface reducer', () => {
       duration_ms: 8,
       workspace: {
         kind: 'none',
-        display_name: 'No workspace',
+        display_name: 'No file environment',
         authority: 'none',
         fallback_policy: 'disabled',
       },
@@ -443,7 +444,7 @@ describe('work surface reducer', () => {
       status: 'done',
       workspace: {
         kind: 'none',
-        display_name: 'No workspace',
+        display_name: 'No file environment',
       },
       executor: {
         kind: 'server_local',
@@ -554,7 +555,7 @@ describe('work surface reducer', () => {
     });
   });
 
-  it('does not mark active tool cards failed when a run pauses from interruption', () => {
+  it('does not mark active tool or agent cards failed when a run pauses from interruption', () => {
     let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
       type: 'run_started',
       run_id: 'run-1',
@@ -593,10 +594,96 @@ describe('work surface reducer', () => {
     expect(state.tools[0]?.errorKind).toBeUndefined();
     expect(state.agents[0]).toMatchObject({
       agentId: 'agent-running',
+      status: 'waiting',
+      reason: 'parent_run_paused',
+      resultSummary:
+        'Parent run paused before a terminal subagent event was observed.',
+      updatedAt: 1_801_000_000_000,
+    });
+  });
+
+  it('keeps explicit child interruption terminal instead of inferring it from parent pause', () => {
+    let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'run_started',
+      run_id: 'run-1',
+      session_id: 'session-1',
+    });
+    state = applyWorkSurfaceEvent(state, {
+      type: 'agent_spawned',
+      agent_id: 'agent-running',
+      run_id: 'child-run',
+      parent_run_id: 'run-1',
+      agent_type: 'code-review',
+      description: 'Review while parent is running',
+    });
+
+    state = applyWorkSurfaceEvent(state, {
+      type: 'run_interrupted',
+      run_id: 'run-1',
+      kind: 'empty_completion',
+      resumable: true,
+      timestamp: 1_801_000_000_000,
+    });
+
+    expect(state.agents[0]).toMatchObject({
+      agentId: 'agent-running',
+      status: 'waiting',
+      reason: 'parent_run_paused',
+    });
+
+    state = applyWorkSurfaceEvent(state, {
+      type: 'agent_interrupted',
+      agent_id: 'agent-running',
+      run_id: 'child-run',
+      parent_run_id: 'run-1',
+      reason: 'budget_exhausted',
+      result_summary: 'Child agent budget exhausted.',
+      timestamp: 1_801_000_001_000,
+    });
+
+    expect(state.agents[0]).toMatchObject({
+      agentId: 'agent-running',
       status: 'interrupted',
       reason: 'budget_exhausted',
-      resultSummary: 'Budget exhausted. You can continue.',
-      updatedAt: 1_801_000_000_000,
+      resultSummary: 'Child agent budget exhausted.',
+      updatedAt: 1_801_000_001_000,
+    });
+    expect(state.agents[0].events?.at(-1)).toMatchObject({
+      label: 'Needs continuation',
+      tone: 'warning',
+    });
+  });
+
+  it('renders empty-completion child interruptions as continuation work, not failure', () => {
+    let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'agent_spawned',
+      agent_id: 'agent-weather',
+      run_id: 'child-weather',
+      parent_run_id: 'run-1',
+      agent_type: 'research',
+      description: 'Fetch Shanghai weather',
+    });
+
+    state = applyWorkSurfaceEvent(state, {
+      type: 'agent_interrupted',
+      agent_id: 'agent-weather',
+      run_id: 'child-weather',
+      parent_run_id: 'run-1',
+      reason: 'empty_completion',
+      result_summary: '上海今日小雨，33°C / 25°C。',
+      timestamp: 1_801_000_001_000,
+    });
+
+    expect(state.agents[0]).toMatchObject({
+      agentId: 'agent-weather',
+      status: 'interrupted',
+      reason: 'empty_completion',
+      resultSummary: '上海今日小雨，33°C / 25°C。',
+    });
+    expect(state.agents[0].events?.at(-1)).toMatchObject({
+      label: 'Needs final answer',
+      detail: '上海今日小雨，33°C / 25°C。',
+      tone: 'warning',
     });
   });
 
@@ -726,7 +813,7 @@ describe('work surface reducer', () => {
       tool: 'bash',
       success: false,
       error:
-        "Error: executor 'MacBook Pro' is offline. Server fallback is disabled.",
+        "Error: executor 'MacBook Pro' is offline. No alternate execution provider is available for this file environment.",
       error_kind: 'executor_offline',
       blocked: true,
       workspace: {
@@ -949,7 +1036,8 @@ describe('work surface reducer', () => {
     let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
       type: 'run_blocked',
       reason: 'fallback_disabled',
-      message: 'Server fallback is disabled for this workspace.',
+      message:
+        'No alternate execution provider is available for this file environment.',
     });
     expect(state.blocked).not.toBeNull();
 
@@ -1027,7 +1115,8 @@ describe('work surface reducer', () => {
       call_id: 'call-write',
       tool: 'write_file',
       reason: 'fallback_disabled',
-      message: 'Server fallback is disabled for this workspace.',
+      message:
+        'No alternate execution provider is available for this file environment.',
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
@@ -1048,8 +1137,7 @@ describe('work surface reducer', () => {
 
     expect(state.blocked).toMatchObject({
       reason: 'fallback_disabled',
-      message:
-        'This request needs a file or command environment. Connect one or choose a sandbox, then retry.',
+      message: WORKSPACE_EXECUTION_BLOCKED_MESSAGE,
       callId: 'call-write',
       tool: 'write_file',
       transport: 'edge_ws',
@@ -1073,7 +1161,7 @@ describe('work surface reducer', () => {
       tool: 'bash',
       success: false,
       error:
-        "Error: workspace 'Cloud checkout' (git_checkout) is not routed to an available executor transport. No server fallback was attempted.",
+        "Error: workspace 'Cloud checkout' (git_checkout) is not routed to an available executor transport. No alternate execution provider was attempted.",
       error_kind: 'workspace_executor_unavailable',
       reason: 'workspace_executor_unavailable',
       blocked: true,
@@ -1109,8 +1197,7 @@ describe('work surface reducer', () => {
     });
     expect(state.blocked).toMatchObject({
       reason: 'workspace_executor_unavailable',
-      message:
-        'This request needs a file or command environment. Connect one or choose a sandbox, then retry.',
+      message: WORKSPACE_EXECUTION_BLOCKED_MESSAGE,
       tool: 'bash',
       callId: 'call-cloud',
       workspace: { kind: 'git_checkout', cwd: '/checkout/repo' },
@@ -1279,7 +1366,7 @@ describe('work surface reducer', () => {
       tool: 'bash',
       success: false,
       error:
-        "Error: command references local path '~/github/astra', but this run is bound to Server sandbox.",
+        "Error: command references local path '~/github/astra', but the current workspace provider is rooted at /tmp/astra-workspaces/session-1. Select a workspace provider rooted at that path, or use a path inside the current workspace, then retry.",
       error_kind: 'workspace_path_mismatch',
       reason: 'workspace_path_mismatch',
       blocked: true,
@@ -1318,7 +1405,7 @@ describe('work surface reducer', () => {
     expect(state.blocked).toMatchObject({
       reason: 'workspace_path_mismatch',
       message:
-        'The referenced path is outside the selected file environment. Choose the environment that contains it or use a path inside the current one.',
+        'The referenced path is outside the selected file environment. If you selected Server sandbox, use a relative path inside it; for host paths like ~/project, select the matching Edge workspace.',
       callId: 'call-path',
       tool: 'bash',
       transport: 'server_local',

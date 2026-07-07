@@ -475,6 +475,13 @@ function workspaceSelectionMetadata(selection: WorkspaceSelection) {
   };
 }
 
+function hasWorkspaceSelectionMetadata(session: RuntimeSessionResponse) {
+  return Object.prototype.hasOwnProperty.call(
+    session.metadata ?? {},
+    WORKSPACE_SELECTION_METADATA_KEY,
+  );
+}
+
 function seedStore(): Store {
   const now = nowIso();
   const projectId = "project-web-agent";
@@ -810,11 +817,15 @@ export async function createChatWithMessage(
     model: string;
     options: Omit<ComposerOptions, "model">;
     projectId?: string | null;
+    workspaceSelection?: WorkspaceSelection | null;
   },
 ) {
   const store = getStore(ownerUserId);
   const timestamp = nowIso();
   const projectId = payload.projectId ?? null;
+  const workspaceSelection = payload.workspaceSelection
+    ? normalizeWorkspaceSelection(payload.workspaceSelection)
+    : undefined;
   if (
     projectId &&
     !store.projects.some((project) => project.id === projectId)
@@ -839,6 +850,7 @@ export async function createChatWithMessage(
     lastMessagePreview: payload.message,
     model: payload.model,
     backendSessionId: null,
+    ...(workspaceSelection ? { workspaceSelection } : {}),
     messages: [userMessage],
     activeRun: undefined,
     pendingTurn: {
@@ -1496,12 +1508,13 @@ export async function updateChatModel(
 export async function updateChatWorkspaceSelection(
   ownerUserId: string,
   chatId: string,
-  selection: WorkspaceSelection,
+  selection: WorkspaceSelection | null,
 ) {
-  const normalized = normalizeWorkspaceSelection(selection);
-  if (!normalized) {
-    return null;
-  }
+  const normalized: WorkspaceSelection | null =
+    selection === null
+      ? null
+      : (normalizeWorkspaceSelection(selection) ?? null);
+  if (selection !== null && normalized === null) return null;
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
@@ -1509,13 +1522,21 @@ export async function updateChatWorkspaceSelection(
   }
 
   const previous = chat.workspaceSelection;
-  chat.workspaceSelection = normalized;
+  if (normalized) {
+    chat.workspaceSelection = normalized;
+  } else {
+    delete chat.workspaceSelection;
+  }
   try {
     if (chat.backendSessionId) {
       await updateBackendSessionWorkspaceSelection(chat, normalized);
     }
   } catch (error) {
-    chat.workspaceSelection = previous;
+    if (previous) {
+      chat.workspaceSelection = previous;
+    } else {
+      delete chat.workspaceSelection;
+    }
     throw error;
   }
   return getChat(ownerUserId, chatId);
@@ -1825,10 +1846,11 @@ function chatRecordFromBackendSession(
     null;
   const title = session.title ?? existing?.title ?? null;
   const archivedAt = session.status === "archived" ? updatedAt : null;
-  const workspaceSelection =
-    normalizeWorkspaceSelection(
-      session.metadata?.[WORKSPACE_SELECTION_METADATA_KEY],
-    ) ?? existing?.workspaceSelection;
+  const workspaceSelection = hasWorkspaceSelectionMetadata(session)
+    ? normalizeWorkspaceSelection(
+        session.metadata?.[WORKSPACE_SELECTION_METADATA_KEY],
+      )
+    : existing?.workspaceSelection;
 
   return {
     id: existing?.id ?? session.session_id,
@@ -2214,7 +2236,7 @@ async function updateBackendSessionModel(
 
 async function updateBackendSessionWorkspaceSelection(
   chat: ChatRecord,
-  selection: WorkspaceSelection,
+  selection: WorkspaceSelection | null,
 ): Promise<void> {
   const sessionId = backendSessionIdForChat(chat);
   const client = await requireRuntimeClient({
@@ -2233,7 +2255,9 @@ async function updateBackendSessionWorkspaceSelection(
 
   const metadata = {
     ...(parsed.metadata ?? {}),
-    [WORKSPACE_SELECTION_METADATA_KEY]: workspaceSelectionMetadata(selection),
+    [WORKSPACE_SELECTION_METADATA_KEY]: selection
+      ? workspaceSelectionMetadata(selection)
+      : null,
   };
 
   try {

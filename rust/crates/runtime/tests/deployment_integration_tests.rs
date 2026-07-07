@@ -14,7 +14,7 @@ fn tool_names(profile: &DeploymentProfile) -> Vec<String> {
 }
 
 /// Verify that DeploymentProfile factories produce the correct tool lists.
-/// The full E2E chain (disabled tools → dispatch reject → LLM surface) is
+/// The full E2E chain (disabled tool offers -> dispatch reject -> LLM surface) is
 /// covered in unit tests inside the astra-runtime crate
 /// (tool_execution_service and server_loop_host).
 #[tokio::test]
@@ -32,11 +32,22 @@ async fn server_without_excludes_tools() {
     assert!(!names.iter().any(|n| n == "web_search"));
     assert!(!names.iter().any(|n| n == "web_fetch"));
     assert!(names.iter().any(|n| n == "memory"));
+    assert!(names.iter().any(|n| n == "agent"));
     assert!(!names.iter().any(|n| n == "bash"));
 }
 
 #[tokio::test]
-async fn server_with_only_restricts_tools() {
+async fn server_with_only_restricts_to_server_builtin_tools() {
+    let profile = DeploymentProfile::server_with_only(&["bash", "read_file"]);
+    let names = tool_names(&profile);
+    assert!(
+        names.is_empty(),
+        "workspace/process executor tools require an explicit runtime provider, got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn server_with_only_keeps_server_service_tools() {
     let profile = DeploymentProfile::server_with_only(&["memory", "web_fetch"]);
     let names = tool_names(&profile);
     assert!(names.iter().any(|n| n == "memory"));

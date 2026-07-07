@@ -310,26 +310,6 @@ fn validate_task_can_start_after_projected_edges(
     ))
 }
 
-fn validate_single_in_progress_slot(tasks: &[SessionTask], task_id: &str) -> Result<(), String> {
-    let conflicting: Vec<&SessionTask> = tasks
-        .iter()
-        .filter(|task| task.id != task_id && task.status.is_in_progress())
-        .collect();
-    if conflicting.is_empty() {
-        return Ok(());
-    }
-
-    let active = conflicting
-        .iter()
-        .map(|task| format!("{} '{}'", task.id, task.title))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(format!(
-        "task '{}' cannot start because another task is already in_progress: {}. Complete, pause, or stop the current in_progress task before starting another",
-        task_id, active
-    ))
-}
-
 fn validate_subtask_dependencies_resolved(
     task: &SessionTask,
     subtask_id: &str,
@@ -1314,7 +1294,7 @@ fn normalize_update_status(args: &Value) -> Result<Option<SessionTaskStatusKind>
     let raw_new_status = args.get("new_status");
     if args.get("status").is_some() {
         return Err(
-            "field 'status' is not supported for task.update; use 'new_status'".to_string(),
+            "field 'status' is not supported for task_board.update; use 'new_status'".to_string(),
         );
     }
     let Some(raw_status) = raw_new_status else {
@@ -1343,13 +1323,17 @@ fn validate_parent_status_transition(
     if new_status == previous_status || new_status == SessionTaskStatusKind::Deleted {
         return Ok(());
     }
-    // Terminal tasks cannot be moved backward.
+    // Terminal/tombstone tasks cannot be moved backward. Every persisted
+    // status may still transition to Deleted above so users can clear the
+    // task board without losing the audit tombstone.
     if matches!(
         previous_status,
         SessionTaskStatusKind::Completed
             | SessionTaskStatusKind::Failed
             | SessionTaskStatusKind::Cancelled
             | SessionTaskStatusKind::Archived
+            | SessionTaskStatusKind::Deleted
+            | SessionTaskStatusKind::Migrated
     ) {
         return Err(format!(
             "task is already terminal ({previous_status}); create a new task for follow-up work, or use new_status='deleted' to hide it from active views while keeping an audit tombstone"
@@ -1365,14 +1349,17 @@ fn validate_subtask_status_transition(
     if new_status == previous_status || new_status == SessionTaskStatusKind::Deleted {
         return Ok(());
     }
-    // Terminal subtasks cannot be moved backward, except for the
+    // Terminal/tombstone subtasks cannot be moved backward, except for the
     // Completed→Pending reversal that triggers parent auto-complete undo.
+    // Every persisted status may still transition to Deleted above.
     if matches!(
         previous_status,
         SessionTaskStatusKind::Completed
             | SessionTaskStatusKind::Failed
             | SessionTaskStatusKind::Cancelled
             | SessionTaskStatusKind::Archived
+            | SessionTaskStatusKind::Deleted
+            | SessionTaskStatusKind::Migrated
     ) && !(previous_status == SessionTaskStatusKind::Completed
         && new_status == SessionTaskStatusKind::Pending)
     {
@@ -1393,95 +1380,13 @@ fn is_reversible_auto_completed_parent(task: &SessionTask) -> bool {
             .unwrap_or(false)
 }
 
-fn task_actions_allowing_field(field: &str, current_action: &str) -> Vec<&'static str> {
-    const TASK_ACTION_FIELDS: &[(&str, &[&str])] = &[
-        (
-            "create",
-            &[
-                "action",
-                "title",
-                "description",
-                "subtasks",
-                "active_form",
-                "owner",
-                "metadata",
-                "add_blocks",
-                "add_blocked_by",
-            ],
-        ),
-        ("list", &["action", "status_filter"]),
-        ("get", &["action", "task_id"]),
-        (
-            "update",
-            &[
-                "action",
-                "task_id",
-                "new_status",
-                "title",
-                "description",
-                "subtask_id",
-                "active_form",
-                "owner",
-                "metadata",
-                "add_blocks",
-                "add_blocked_by",
-                "remove_blocks",
-                "remove_blocked_by",
-                "reason",
-                "error_message",
-            ],
-        ),
-        ("stop", &["action", "task_id", "reason"]),
-        (
-            "archive",
-            &["action", "task_id", "older_than_days", "reason"],
-        ),
-    ];
-
-    TASK_ACTION_FIELDS
-        .iter()
-        .filter_map(|(action, fields)| {
-            (*action != current_action && fields.contains(&field)).then_some(*action)
-        })
-        .collect()
-}
-
-fn unknown_task_field_message(action: &str, key: &str, allowed: &[&str]) -> String {
-    let other_actions = task_actions_allowing_field(key, action);
-    let action_hint = if other_actions.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "; field is valid for: {}",
-            other_actions
-                .iter()
-                .map(|action| format!("task.{action}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    format!(
-        "unknown field '{key}' for task.{action} (valid: {}{})",
-        allowed.join(", "),
-        action_hint
-    )
-}
-
 fn validate_allowed_fields(args: &Value, action: &str, allowed: &[&str]) -> Result<(), String> {
-    let Some(obj) = args.as_object() else {
-        return Err(format!("task.{action} arguments must be an object"));
-    };
-    for key in obj.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(unknown_task_field_message(action, key, allowed));
-        }
-    }
-    if let Some(action_value) = obj.get("action")
-        && !action_value.is_string()
-    {
-        return Err("field 'action' must be a string".to_string());
-    }
-    Ok(())
+    debug_assert_eq!(
+        crate::task_tool_contract::task_action_allowed_fields(action),
+        Some(allowed),
+        "TaskManager field list for task_board.{action} must match task_tool_contract"
+    );
+    crate::task_tool_contract::validate_public_task_tool_args_for_action(action, args)
 }
 
 fn validate_string_chars(text: &str, field: &str, max: usize) -> Result<(), String> {
@@ -1557,7 +1462,7 @@ fn parse_create_subtasks(
         for key in obj.keys() {
             if !["id", "title", "description", "depends_on", "owner"].contains(&key.as_str()) {
                 return Err(format!(
-                    "unknown field 'subtasks[{index}].{key}' for task.create"
+                    "unknown field 'subtasks[{index}].{key}' for task_board.create"
                 ));
             }
         }
@@ -2358,7 +2263,7 @@ impl TaskManager {
                                 "duplicate_title": dup.title,
                                 "duplicate_status": dup.status,
                                 "message": format!(
-                                    "Refused: an open task with the same normalized title already exists (id={}). Use task(action='update') or task(action='get') instead of creating a duplicate.",
+                                    "Refused: an open task with the same normalized title already exists (id={}). Use task_board(action='update') or task_board(action='get') instead of creating a duplicate.",
                                     dup.id
                                 ),
                             })
@@ -2383,7 +2288,7 @@ impl TaskManager {
                             format!(
                                 "Error: task counter desync — id '{task_id}' already exists. \
                                  The session's counter may need to be reset. \
-                                 Contact support or use `task(action='list')` to see the \
+                                 Contact support or use `task_board(action='list')` to see the \
                                  current task list and manually continue from the last id."
                             ),
                             json!({
@@ -2522,7 +2427,7 @@ impl TaskManager {
                     entry["blocked_by"] = json!(t.blocked_by);
                 }
                 // U-5: surface the failure reason inline so the model
-                // sees "why" without a follow-up `task.get`. Only on
+                // sees "why" without a follow-up `task_board.get`. Only on
                 // failed rows; other statuses don't have an
                 // error_message so the field would be confusing noise.
                 if t.status.is_failed() {
@@ -2548,10 +2453,6 @@ impl TaskManager {
                 entry
             })
             .collect();
-
-        if filtered.is_empty() {
-            return format!("No tasks found with status '{}'", status_filter);
-        }
 
         json!({
             "count": filtered.len(),
@@ -2767,7 +2668,7 @@ impl TaskManager {
                 || error_message.is_some()
                 || reason.is_some();
             if !has_parent_update {
-                return "Error: task.update requires at least one update field: new_status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message".to_string();
+                return "Error: task_board.update requires at least one update field: new_status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message".to_string();
             }
         }
         let sid = self.sid();
@@ -2824,11 +2725,6 @@ impl TaskManager {
                             validate_subtask_dependencies_resolved(&projected_task, st_id)?;
                         }
                         reconcile_subtask_completion(&mut projected_task);
-                        if projected_task.status.is_in_progress()
-                            && !tasks[task_index].status.is_in_progress()
-                        {
-                            validate_single_in_progress_slot(&tasks, &task_id)?;
-                        }
 
                         let task = &mut tasks[task_index];
                         let Some(subtask) = task.subtasks.iter_mut().find(|st| st.id == st_id)
@@ -2899,7 +2795,7 @@ impl TaskManager {
                             json!({
                                 "success": true,
                                 "task_id": task_id,
-                                "previous_status": previous_status,
+                                "previous_status": previous_status.to_string(),
                                 "status": "deleted",
                                 "message": format!("Task '{}' hidden from active views; audit tombstone retained", task_id)
                             })
@@ -2939,7 +2835,7 @@ impl TaskManager {
                                     "duplicate_status": dup.status,
                                     "task_id": task_id,
                                     "message": format!(
-                                        "Refused: renaming task '{}' would duplicate open task '{}' (id={}). Use task(action='update') or task(action='get') on the existing task instead.",
+                                        "Refused: renaming task '{}' would duplicate open task '{}' (id={}). Use task_board(action='update') or task_board(action='get') on the existing task instead.",
                                         task_id,
                                         dup.title,
                                         dup.id
@@ -2990,9 +2886,6 @@ impl TaskManager {
                             || !proposed_blocks.is_empty()
                             || !remove_blocked_by.is_empty()
                             || !remove_blocks.is_empty();
-                        if starting_now {
-                            validate_single_in_progress_slot(&tasks, &task_id)?;
-                        }
                         if starting_now || dependency_edges_changed {
                             validate_task_can_start_after_projected_edges(
                                 &tasks,
@@ -3559,6 +3452,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_empty_board_returns_stable_json_shape() {
+        let m = mgr();
+
+        let list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "active"})).await).unwrap();
+
+        assert_eq!(list["count"], 0, "{list}");
+        assert_eq!(list["tasks"].as_array().map(Vec::len), Some(0), "{list}");
+    }
+
+    #[tokio::test]
     async fn create_rejects_blank_title_and_wrong_type_top_level_fields() {
         let m = mgr();
 
@@ -3608,8 +3512,9 @@ mod tests {
         }
 
         let list = m.list(&json!({"status_filter": "all"})).await;
-        assert!(
-            list.starts_with("No tasks"),
+        let list: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            list["count"], 0,
             "invalid create attempts must not persist tasks: {list}"
         );
     }
@@ -3649,8 +3554,9 @@ mod tests {
         }
 
         let list = m.list(&json!({"status_filter": "all"})).await;
-        assert!(
-            list.starts_with("No tasks"),
+        let list: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            list["count"], 0,
             "oversized create attempts must not persist tasks: {list}"
         );
     }
@@ -3699,11 +3605,11 @@ mod tests {
             .update(&json!({"task_id": "task-1", "subtasks": []}))
             .await;
         assert!(
-            create_only_field_on_update.contains("unknown field 'subtasks' for task.update"),
+            create_only_field_on_update.contains("unknown field 'subtasks' for task_board.update"),
             "{create_only_field_on_update}"
         );
         assert!(
-            create_only_field_on_update.contains("field is valid for: task.create"),
+            create_only_field_on_update.contains("field is valid for: task_board.create"),
             "{create_only_field_on_update}"
         );
 
@@ -3720,8 +3626,9 @@ mod tests {
         );
 
         let list = m.list(&json!({"status_filter": "all"})).await;
-        assert!(
-            list.starts_with("No tasks"),
+        let list: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            list["count"], 0,
             "unknown-field attempts must not create or mutate tasks: {list}"
         );
     }
@@ -3918,16 +3825,17 @@ mod tests {
         );
 
         let list = m.list(&json!({"status_filter": "all"})).await;
-        assert!(
-            list.starts_with("No tasks"),
+        let list: Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(
+            list["count"], 0,
             "malformed create attempts must not persist partial tasks: {list}"
         );
     }
 
     /// U-5 (unhappy path): when a task is marked `failed` with an
-    /// `error_message`, `task.list` must surface that reason as
+    /// `error_message`, `task_board.list` must surface that reason as
     /// `error_preview` (truncated to ~80 chars). Pre-fix the model
-    /// had to call `task.get(id)` to see why something failed —
+    /// had to call `task_board.get(id)` to see why something failed —
     /// most models don't, so the failure context was lost.
     #[tokio::test]
     async fn list_surfaces_failure_reason_for_failed_tasks() {
@@ -4786,7 +4694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_rejects_second_in_progress_parent_task() {
+    async fn update_allows_multiple_independent_in_progress_parent_tasks() {
         let m = mgr();
         m.create(&json!({"title": "first"})).await;
         m.create(&json!({"title": "second"})).await;
@@ -4798,32 +4706,16 @@ mod tests {
         let second = m
             .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
             .await;
-        assert!(second.starts_with("Error:"), "{second}");
-        assert!(
-            second.contains("already in_progress")
-                && second.contains("task-1")
-                && second.contains("pause"),
-            "second in_progress refusal should name the current running task and recovery path: {second}"
-        );
-        let task_2: SessionTask =
-            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
-        assert_eq!(
-            task_2.status,
-            SessionTaskStatusKind::Pending,
-            "rejected second start must not mutate the second task"
-        );
-
-        let pause_first = m
-            .update(&json!({"task_id": "task-1", "new_status": "paused"}))
-            .await;
-        assert!(!pause_first.starts_with("Error:"), "{pause_first}");
-        let second = m
-            .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
-            .await;
         assert!(
             second.contains("\"success\":true") && second.contains("\"status\":\"in_progress\""),
-            "{second}"
+            "independent tasks should be allowed to run concurrently; ordering belongs in dependency edges: {second}"
         );
+        let task_1: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        let task_2: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
+        assert_eq!(task_1.status, SessionTaskStatusKind::InProgress);
+        assert_eq!(task_2.status, SessionTaskStatusKind::InProgress);
     }
 
     #[tokio::test]
@@ -4845,7 +4737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subtask_start_rejects_when_another_parent_is_in_progress() {
+    async fn subtask_start_allows_independent_parent_concurrency() {
         let m = mgr();
         m.create(&json!({"title": "running parent"})).await;
         m.create(&json!({
@@ -4865,15 +4757,15 @@ mod tests {
                 "new_status": "in_progress"
             }))
             .await;
-        assert!(subtask_start.starts_with("Error:"), "{subtask_start}");
         assert!(
-            subtask_start.contains("already in_progress") && subtask_start.contains("task-1"),
-            "subtask start should respect the single in_progress parent slot: {subtask_start}"
+            subtask_start.contains("\"success\":true")
+                && subtask_start.contains("\"status\":\"in_progress\""),
+            "a subtask in one task should not be blocked by an unrelated in_progress task: {subtask_start}"
         );
         let task_2: SessionTask =
             serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
-        assert_eq!(task_2.status, SessionTaskStatusKind::Pending);
-        assert_eq!(task_2.subtasks[0].status, SessionTaskStatusKind::Pending);
+        assert_eq!(task_2.status, SessionTaskStatusKind::InProgress);
+        assert_eq!(task_2.subtasks[0].status, SessionTaskStatusKind::InProgress);
     }
 
     #[tokio::test]
@@ -5357,6 +5249,56 @@ mod tests {
         assert!(
             !task_b.blocked_by.contains(&"task-1".to_string()),
             "b still references a: {task_b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_is_available_from_every_persisted_parent_status() {
+        let m = mgr();
+        let statuses = [
+            SessionTaskStatusKind::Pending,
+            SessionTaskStatusKind::InProgress,
+            SessionTaskStatusKind::Paused,
+            SessionTaskStatusKind::Completed,
+            SessionTaskStatusKind::Failed,
+            SessionTaskStatusKind::Cancelled,
+            SessionTaskStatusKind::Archived,
+            SessionTaskStatusKind::Deleted,
+            SessionTaskStatusKind::Migrated,
+            SessionTaskStatusKind::Other,
+        ];
+
+        for (idx, status) in statuses.into_iter().enumerate() {
+            let task_id = format!("task-{}", idx + 1);
+            m.create(&json!({"title": format!("status {status}")}))
+                .await;
+            set_task_status_fixture(&m, &task_id, status).await;
+
+            let out = m
+                .update(&json!({"task_id": task_id, "new_status": "deleted"}))
+                .await;
+            assert!(
+                !out.starts_with("Error:"),
+                "{status} should be clearable to deleted: {out}"
+            );
+        }
+
+        let deleted_list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "deleted"})).await).unwrap();
+        assert_eq!(deleted_list["count"], 10, "{deleted_list}");
+        let active_list: Value =
+            serde_json::from_str(&m.list(&json!({"status_filter": "active"})).await).unwrap();
+        assert_eq!(
+            active_list["count"], 0,
+            "deleted tombstones must not remain active: {active_list}"
+        );
+
+        let revive = m
+            .update(&json!({"task_id": "task-1", "new_status": "pending"}))
+            .await;
+        assert!(
+            revive.starts_with("Error:"),
+            "deleted tombstones must not be revived by status update: {revive}"
         );
     }
 
@@ -6291,7 +6233,7 @@ mod tests {
 
     // ── U-8: status_filter SQL pushdown ──────────────────────────────
     //
-    // Pre-fix: `task.list(status_filter='active')` called
+    // Pre-fix: `task_board.list(status_filter='active')` called
     // `store.load()` (all rows) then filtered in Rust. With 5 000
     // tasks and the index `idx_session_todos_owner_session_status_updated`,
     // the DB can answer "active only" in a single index scan instead
@@ -6301,13 +6243,13 @@ mod tests {
     // production uses the index.
     //
     // These tests pin:
-    //   (a) `task.list(status_filter='active')` returns only open-work
+    //   (a) `task_board.list(status_filter='active')` returns only open-work
     //       rows (pending/in_progress/paused), even on the in-memory store
     //       (correctness — same before and after, but now via a
     //       dedicated path that the MO impl overrides).
-    //   (b) `task.list(status_filter='completed')` still works
+    //   (b) `task_board.list(status_filter='completed')` still works
     //       after the refactor.
-    //   (c) `task.list` with no filter still returns all rows.
+    //   (c) `task_board.list` with no filter still returns all rows.
 
     // ── U-8 spy test pin ──────────────────────────────────────────────
     // When status_filter='active', the store's load_active is used, not
@@ -6485,7 +6427,7 @@ mod tests {
         assert!(
             legacy.contains("unknown field 'status'")
                 && !legacy.contains("valid: action, status_filter, status"),
-            "status must not remain a recognized task.list argument: {legacy}"
+            "status must not remain a recognized task_board.list argument: {legacy}"
         );
     }
 
@@ -6514,8 +6456,9 @@ mod tests {
             .collect();
         assert!(archived_titles.contains(&"alpha"), "{archived_list}");
         let active_out = m.list(&json!({"status_filter": "active"})).await;
-        assert!(
-            active_out.starts_with("No tasks"),
+        let active_out: Value = serde_json::from_str(&active_out).unwrap();
+        assert_eq!(
+            active_out["count"], 0,
             "no active tasks should remain after archive; got: {active_out}"
         );
     }
