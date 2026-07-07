@@ -872,6 +872,34 @@ mod tests {
         assert_eq!(err.1.error_code.as_deref(), Some("agent_binding_invalid"));
     }
 
+    #[test]
+    fn binding_deserializes_legacy_runtime_endpoint_url() {
+        let servers: Vec<CapabilityServerEndpoint> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "tools",
+                "type": "mcp",
+                "transport": "streamable_http",
+                "endpoint_url": "http://legacy-catalog.local/mcp"
+            },
+            {
+                "id": "skills",
+                "type": "skill",
+                "transport": "streamable_http",
+                "endpoint_url": "http://legacy-catalog.local/skills"
+            }
+        ]))
+        .expect("legacy capability_servers_json should remain readable");
+
+        assert_eq!(
+            servers[0].endpoint_url.as_deref(),
+            Some("http://legacy-catalog.local/mcp")
+        );
+        assert_eq!(
+            servers[1].endpoint_url.as_deref(),
+            Some("http://legacy-catalog.local/skills")
+        );
+    }
+
     #[tokio::test]
     async fn binding_rejects_agent_md_above_configured_byte_limit() {
         let svc = InMemoryAgentBindingService::new();

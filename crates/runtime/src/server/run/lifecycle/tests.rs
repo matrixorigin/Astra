@@ -2732,6 +2732,54 @@ fn runtime_binding_request(id: String, mcp: &str, skills: &str) -> AgentBindingR
     }
 }
 
+struct StaticAgentBindingService {
+    record: astra_services::AgentBindingRecord,
+}
+
+#[async_trait]
+impl astra_services::AgentBindingService for StaticAgentBindingService {
+    async fn create_binding(
+        &self,
+        _request: astra_services::AgentBindingCreateRequestData,
+    ) -> Result<astra_services::AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response_coded(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "static agent binding service does not create bindings",
+            "agent_binding_test_static",
+        ))
+    }
+
+    async fn get_binding(
+        &self,
+        id: String,
+    ) -> Result<astra_services::AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
+        if id == self.record.id {
+            return Ok(self.record.clone());
+        }
+        Err(error_response_coded(
+            StatusCode::NOT_FOUND,
+            "agent binding not found",
+            "agent_binding_not_found",
+        ))
+    }
+
+    async fn disable_binding(
+        &self,
+        id: String,
+    ) -> Result<astra_services::AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
+        if id == self.record.id {
+            let mut record = self.record.clone();
+            record.status = astra_services::AgentBindingStatus::Disabled;
+            return Ok(record);
+        }
+        Err(error_response_coded(
+            StatusCode::NOT_FOUND,
+            "agent binding not found",
+            "agent_binding_not_found",
+        ))
+    }
+}
+
 async fn service_with_in_memory_binding() -> (
     AgenticRunLifecycleService,
     Arc<astra_services::InMemoryAgentBindingService>,
@@ -2746,6 +2794,38 @@ async fn service_with_in_memory_binding() -> (
     .expect("binding create");
     let service = test_service().with_agent_binding_service(binding_service.clone());
     (service, binding_service, record)
+}
+
+fn legacy_endpoint_agent_binding_record() -> astra_services::AgentBindingRecord {
+    astra_services::AgentBindingRecord {
+        id: "ab_legacy_endpoint_binding_01".to_string(),
+        binding_name: "legacy-endpoint-binding".to_string(),
+        idempotency_key: "idem-legacy-endpoint-binding".to_string(),
+        status: astra_services::AgentBindingStatus::Active,
+        agent_md: "Always follow the binding contract.".to_string(),
+        capability_servers: vec![
+            astra_services::CapabilityServerEndpoint {
+                id: "tools".to_string(),
+                server_type: astra_services::CapabilityServerType::Mcp,
+                transport: astra_services::CapabilityServerTransport::StreamableHttp,
+                endpoint_url: Some("http://127.0.0.1:9/legacy-mcp".to_string()),
+            },
+            astra_services::CapabilityServerEndpoint {
+                id: "skills".to_string(),
+                server_type: astra_services::CapabilityServerType::Skill,
+                transport: astra_services::CapabilityServerTransport::StreamableHttp,
+                endpoint_url: Some("http://127.0.0.1:9/legacy-skills".to_string()),
+            },
+        ],
+        runtime_policy: astra_services::RuntimePolicy {
+            max_steps: Some(5),
+            tool_mode: astra_services::ToolMode::McpGateway,
+        },
+        metadata: None,
+        binding_schema_version: "v1".to_string(),
+        created_at: "2026-06-19T00:00:00Z".to_string(),
+        disabled_at: None,
+    }
 }
 
 #[tokio::test]
@@ -6468,7 +6548,7 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
 }
 
 #[tokio::test]
-async fn agent_binding_runtime_uses_request_capability_descriptor_endpoints() {
+async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
     use axum::{Router, extract::State, http::HeaderMap, routing::post};
     use tokio::sync::Mutex;
 
@@ -6533,7 +6613,10 @@ async fn agent_binding_runtime_uses_request_capability_descriptor_endpoints() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let (service, _binding_service, record) = service_with_in_memory_binding().await;
+    let record = legacy_endpoint_agent_binding_record();
+    let service = test_service().with_agent_binding_service(Arc::new(StaticAgentBindingService {
+        record: record.clone(),
+    }));
     let mut request = test_request("use binding tools");
     request.provider_runtime_authorized = true;
     request.runtime_profile = Some(RuntimeProfileRequest::AgentBindingRegistry);
@@ -6566,7 +6649,22 @@ async fn agent_binding_runtime_uses_request_capability_descriptor_endpoints() {
         .expect("agent binding descriptors should prepare capabilities");
 
     assert!(capabilities.mcp_bundle.is_some());
-    assert!(capabilities.agent_binding.is_some());
+    let binding_context = capabilities
+        .agent_binding
+        .as_ref()
+        .expect("legacy agent binding should remain runnable");
+    assert_eq!(
+        binding_context.binding.capability_servers[0]
+            .endpoint_url
+            .as_deref(),
+        Some("http://127.0.0.1:9/legacy-mcp")
+    );
+    assert_eq!(
+        binding_context.binding.capability_servers[1]
+            .endpoint_url
+            .as_deref(),
+        Some("http://127.0.0.1:9/legacy-skills")
+    );
     assert_eq!(
         capture.mcp_authorization.lock().await.as_deref(),
         Some("Bearer runtime-grant")
