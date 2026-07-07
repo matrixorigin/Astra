@@ -438,7 +438,6 @@ pub(crate) fn has_explicit_runtime_executor_provider(
         )
         && runtime.is_none_or(|runtime| {
             runtime.status == astra_runtime_env::RuntimeStatus::Ready
-                && runtime.isolation_backend != astra_runtime_env::RuntimeIsolationBackend::None
         })
         && !matches!(
             provider_type,

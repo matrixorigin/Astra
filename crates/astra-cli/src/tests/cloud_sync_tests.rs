@@ -4,9 +4,41 @@ use crate::cli::cloud_sync::{
     try_cloud_push_preferences,
 };
 use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress};
+use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::slash::{slash_health, slash_router::handle_slash_command};
-use astra_services::session_journal;
+use astra_core::{SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
+use astra_services::SyncOutboxStore;
+use astra_services::session_journal::{self, JournalDirGuard};
+use serde_json::{Value, json};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
 
 // ── slash_health::format_sync_age tests ────────────────────────────────────────────
 
@@ -199,6 +231,8 @@ fn append_cloud_pull_sync_journal_skips_without_session_id() {
 
 #[test]
 fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _guard = JournalDirGuard::new(temp.path());
     let sid = format!("test-cloud-pull-journal-{}", uuid::Uuid::new_v4());
     let state = SessionState {
         session_id: Some(sid.clone()),
@@ -233,11 +267,17 @@ fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
         cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
         Some(false)
     );
+    let outbox = SyncOutboxStore::local().status().expect("outbox status");
+    assert_eq!(outbox.pending, 1);
+    assert_eq!(outbox.ready, 1);
+    assert_eq!(outbox.poisoned, 0);
     std::fs::remove_file(session_journal::journal_file_path(&sid)).ok();
 }
 
 #[test]
 fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _guard = JournalDirGuard::new(temp.path());
     let sid = format!("test-cloud-pull-empty-{}", uuid::Uuid::new_v4());
     let state = SessionState {
         session_id: Some(sid.clone()),
@@ -266,7 +306,157 @@ fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
         cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
         Some(true)
     );
+    let outbox = SyncOutboxStore::local().status().expect("outbox status");
+    assert_eq!(outbox.pending, 1);
+    assert_eq!(outbox.ready, 1);
+    assert_eq!(outbox.poisoned, 0);
     std::fs::remove_file(session_journal::journal_file_path(&sid)).ok();
+}
+
+#[test]
+fn enqueue_ingestion_does_not_patch_missing_session_id_from_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _guard = JournalDirGuard::new(temp.path());
+    let state = SessionState {
+        session_id: Some("state-session".to_string()),
+        ..Default::default()
+    };
+    let mut event = session_journal::JournalEvent::config_change(None, "model", "gpt-5");
+    event.ts = "2026-07-08T00:00:00Z".to_string();
+
+    enqueue_ingestion_pub(&state, &event);
+
+    let outbox = SyncOutboxStore::local().status().expect("outbox status");
+    assert_eq!(outbox.total, 0);
+    assert_eq!(outbox.pending, 0);
+    assert_eq!(outbox.skipped, 1);
+    assert_eq!(
+        outbox.last_skipped_reason.as_deref(),
+        Some("journal event has no session_id and cannot be delivered to /events")
+    );
+    assert!(outbox.degraded);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _guard = JournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+
+    let sid = format!("test-cloud-drain-ok-{}", uuid::Uuid::new_v4());
+    let state = SessionState {
+        session_id: Some(sid.clone()),
+        ..Default::default()
+    };
+    let pull = CloudPullResult {
+        cloud_reachable: true,
+    };
+    append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
+
+    let ready = SyncOutboxStore::local()
+        .ready_records(10)
+        .expect("ready records");
+    assert_eq!(ready.len(), 1);
+    let record = ready[0].clone();
+    let mut metadata = record
+        .payload
+        .get("metadata")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    metadata.insert(
+        "sync_outbox".to_string(),
+        json!({
+            "schema_version": record.schema_version,
+            "record_id": record.record_id,
+            "sequence": record.sequence,
+            "payload_hash": record.payload_hash,
+            "event_ts": record.event_ts,
+        }),
+    );
+    let expected_body = json!({
+        "event_id": record.record_id,
+        "session_id": record.session_id,
+        "event_type": record.event_type,
+        "content": record.canonical_payload_json(),
+        "agent_id": "edge_sync",
+        "agent_version": env!("CARGO_PKG_VERSION"),
+        "metadata": Value::Object(metadata),
+    });
+    let expected_signature = sync_outbox_request_signature("token", &expected_body);
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events"))
+        .and(header("authorization", "Bearer token"))
+        .and(header(SYNC_OUTBOX_SIGNATURE_HEADER, expected_signature))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "event_id": record.record_id,
+            "user_id": "user-a",
+            "session_id": sid,
+            "event_type": record.event_type,
+            "content": "{}",
+            "agent_id": "edge_sync",
+            "agent_version": "0.1.0",
+            "parent_event_id": null,
+            "causal_chain_id": null,
+            "metadata": {
+                "sync_outbox": {
+                    "payload_hash": record.payload_hash
+                }
+            },
+            "created_at": "2026-07-08T00:00:00.000000"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let report = cloud_sync::try_drain_sync_outbox(10).await;
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.acked, 1);
+    assert_eq!(report.failed, 0);
+    let status = SyncOutboxStore::local().status().expect("status");
+    assert_eq!(status.acked, 1);
+    assert_eq!(status.pending, 0);
+    assert_eq!(status.ack_watermark, 1);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _guard = JournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+
+    let sid = format!("test-cloud-drain-fail-{}", uuid::Uuid::new_v4());
+    let state = SessionState {
+        session_id: Some(sid),
+        ..Default::default()
+    };
+    let pull = CloudPullResult {
+        cloud_reachable: true,
+    };
+    append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
+
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let report = cloud_sync::try_drain_sync_outbox(10).await;
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.acked, 0);
+    assert_eq!(report.failed, 1);
+    let status = SyncOutboxStore::local().status().expect("status");
+    assert_eq!(status.acked, 0);
+    assert_eq!(status.pending, 1);
+    assert_eq!(status.retry_deferred, 1);
+    assert_eq!(status.ack_watermark, 0);
 }
 
 #[tokio::test]

@@ -13,17 +13,137 @@
 
 use astra_services::session_journal;
 use astra_services::state_sync::pref_keys;
+use astra_services::{
+    SyncOutboxDeliverySettlement, SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus,
+    SyncOutboxStore,
+};
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
+use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::{ExplainMode, SessionState};
+
+const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
+const SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS: usize = 4;
+const SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+static SYNC_OUTBOX_DRAIN_SCHEDULED: AtomicBool = AtomicBool::new(false);
+static SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Result from cloud pull attempt at session start.
 pub(crate) struct CloudPullResult {
     /// True when the server's preferences endpoint responded
     /// successfully (regardless of whether it returned data).
     pub cloud_reachable: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SyncOutboxDrainReport {
+    pub cloud_configured: bool,
+    pub attempted: u32,
+    pub acked: u32,
+    pub failed: u32,
+    pub remaining_ready: u32,
+}
+
+pub(crate) fn schedule_sync_outbox_drain() {
+    schedule_sync_outbox_drain_after(Duration::ZERO);
+}
+
+fn schedule_sync_outbox_drain_after(delay: Duration) {
+    if resolve_cloud_base().is_none() {
+        return;
+    }
+    if !delay.is_zero() {
+        schedule_sync_outbox_retry_wake(delay);
+        return;
+    }
+    if !try_claim_sync_outbox_drain_schedule() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        release_sync_outbox_drain_schedule();
+        return;
+    };
+    handle.spawn(async {
+        for _ in 0..SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS {
+            let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
+            if !report.cloud_configured || report.remaining_ready == 0 || report.attempted == 0 {
+                break;
+            }
+        }
+        let next_delay = SyncOutboxStore::local()
+            .status()
+            .ok()
+            .and_then(|status| next_sync_outbox_drain_delay(&status));
+        release_sync_outbox_drain_schedule();
+        if let Some(delay) = next_delay {
+            schedule_sync_outbox_drain_after(delay);
+        }
+    });
+}
+
+fn schedule_sync_outbox_retry_wake(delay: Duration) {
+    let deadline = unix_ms().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64);
+    if !claim_sync_outbox_retry_wake_deadline(deadline) {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        release_sync_outbox_retry_wake_schedule();
+        return;
+    };
+    handle.spawn(async move {
+        tokio::time::sleep(delay).await;
+        if SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS
+            .compare_exchange(deadline, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            schedule_sync_outbox_drain();
+        }
+    });
+}
+
+fn try_claim_sync_outbox_drain_schedule() -> bool {
+    SYNC_OUTBOX_DRAIN_SCHEDULED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+fn release_sync_outbox_drain_schedule() {
+    SYNC_OUTBOX_DRAIN_SCHEDULED.store(false, Ordering::Release);
+}
+
+fn claim_sync_outbox_retry_wake_deadline(deadline: u64) -> bool {
+    let mut current = SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.load(Ordering::Acquire);
+    loop {
+        if current != 0 && current <= deadline {
+            return false;
+        }
+        match SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.compare_exchange_weak(
+            current,
+            deadline,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn release_sync_outbox_retry_wake_schedule() {
+    SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.store(0, Ordering::Release);
+}
+
+fn next_sync_outbox_drain_delay(status: &SyncOutboxStatus) -> Option<Duration> {
+    if status.claimable > 0 {
+        return Some(Duration::ZERO);
+    }
+    let retry_at = status.next_retry_after_unix_ms?;
+    let delay_ms = retry_at.saturating_sub(unix_ms()).max(1);
+    Some(Duration::from_millis(delay_ms))
 }
 
 /// Parse a boolean preference value. Accepts "true"/"1"/"yes"/"on" as true,
@@ -201,6 +321,179 @@ pub(crate) async fn try_cloud_push_preferences(state: &SessionState) {
             );
         }
     }
+    let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
+    if report.failed > 0 {
+        tracing::warn!(
+            target: "astra_cli::cloud_sync",
+            attempted = report.attempted,
+            acked = report.acked,
+            failed = report.failed,
+            remaining_ready = report.remaining_ready,
+            "sync outbox drain completed with failures"
+        );
+    }
+}
+
+pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport {
+    let Some(cloud_base) = resolve_cloud_base() else {
+        return SyncOutboxDrainReport::default();
+    };
+    let mut report = SyncOutboxDrainReport {
+        cloud_configured: true,
+        ..Default::default()
+    };
+    let token = session_runtime::current_access_token(None);
+    let client = match astra_thin_client::ThinClient::new(&cloud_base, token.clone()) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                "sync outbox drain skipped because cloud base URL is invalid"
+            );
+            return report;
+        }
+    };
+    let store = SyncOutboxStore::local();
+    let records = match store.claim_ready_records(limit) {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                "sync outbox drain skipped because local outbox is unreadable"
+            );
+            return report;
+        }
+    };
+    let mut settlements = Vec::new();
+    for record in records {
+        report.attempted += 1;
+        let body = event_body_from_outbox_record(&record);
+        let delivery = tokio::time::timeout(
+            SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT,
+            client.post_sync_outbox_event_json(token.as_deref(), &body),
+        )
+        .await;
+        match delivery {
+            Ok(Ok(response)) if event_response_ack_matches(&record, &response) => {
+                settlements.push(SyncOutboxDeliverySettlement::Ack {
+                    record_id: record.record_id,
+                    payload_hash: record.payload_hash,
+                });
+            }
+            Ok(Ok(response)) => {
+                settlements.push(SyncOutboxDeliverySettlement::Failed {
+                    record_id: record.record_id,
+                    error: format!("cloud ack mismatch for sync outbox record: {response}"),
+                });
+            }
+            Ok(Err(error)) => {
+                settlements.push(SyncOutboxDeliverySettlement::Failed {
+                    record_id: record.record_id,
+                    error: error.to_string(),
+                });
+            }
+            Err(_) => {
+                settlements.push(SyncOutboxDeliverySettlement::Failed {
+                    record_id: record.record_id,
+                    error: format!(
+                        "cloud event delivery timed out after {}ms",
+                        SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT.as_millis()
+                    ),
+                });
+            }
+        }
+    }
+    if !settlements.is_empty() {
+        record_settlement_result(
+            &mut report,
+            settlements.len(),
+            store.settle_delivery_batch(&settlements),
+        );
+    }
+    report.remaining_ready = store
+        .status()
+        .map(|status| status.claimable.min(u64::from(u32::MAX)) as u32)
+        .unwrap_or(0);
+    report
+}
+
+fn record_settlement_result(
+    report: &mut SyncOutboxDrainReport,
+    attempted_settlements: usize,
+    result: std::io::Result<SyncOutboxSettlementReport>,
+) {
+    match result {
+        Ok(settlement) => {
+            report.acked += settlement.acked;
+            report.failed += settlement
+                .failed
+                .saturating_add(settlement.missing)
+                .saturating_add(settlement.poisoned);
+            if settlement.missing > 0 || settlement.poisoned > 0 {
+                tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    missing = settlement.missing,
+                    poisoned = settlement.poisoned,
+                    "sync outbox settlement produced non-retryable local outcomes"
+                );
+            }
+        }
+        Err(error) => {
+            report.failed += attempted_settlements.min(u32::MAX as usize) as u32;
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                "failed to persist sync outbox delivery settlements"
+            );
+        }
+    }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn event_body_from_outbox_record(record: &SyncOutboxRecord) -> Value {
+    let mut metadata = record
+        .payload
+        .get("metadata")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    metadata.insert(
+        "sync_outbox".to_string(),
+        json!({
+            "schema_version": record.schema_version,
+            "record_id": record.record_id,
+            "sequence": record.sequence,
+            "payload_hash": record.payload_hash,
+            "event_ts": record.event_ts,
+        }),
+    );
+    json!({
+        "event_id": record.record_id,
+        "session_id": record.session_id,
+        "event_type": record.event_type,
+        "content": record.canonical_payload_json(),
+        "agent_id": "edge_sync",
+        "agent_version": env!("CARGO_PKG_VERSION"),
+        "metadata": Value::Object(metadata),
+    })
+}
+
+fn event_response_ack_matches(record: &SyncOutboxRecord, response: &Value) -> bool {
+    response.get("event_id").and_then(Value::as_str) == Some(record.record_id.as_str())
+        && response
+            .get("metadata")
+            .and_then(|metadata| metadata.get("sync_outbox"))
+            .and_then(|sync| sync.get("payload_hash"))
+            .and_then(Value::as_str)
+            == Some(record.payload_hash.as_str())
 }
 
 // ═══════════════════════════════════════════ Journal Helpers ═══════════════════════
@@ -285,13 +578,21 @@ pub(crate) async fn post_auth_cloud_resync(profile: Option<&str>, state: &mut Se
     let pull = try_cloud_pull(profile_name).await;
     let pref_keys = try_cloud_pull_preferences(state).await;
     append_cloud_pull_sync_journal(state, profile_name, "post_login", &pull, &pref_keys);
+    let _ = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        CloudPullResult, cloud_pull_warrants_sync_marker, should_append_cloud_pull_journal,
+        CloudPullResult, SyncOutboxDrainReport, cloud_pull_warrants_sync_marker,
+        claim_sync_outbox_retry_wake_deadline, next_sync_outbox_drain_delay,
+        record_settlement_result, release_sync_outbox_drain_schedule,
+        release_sync_outbox_retry_wake_schedule, should_append_cloud_pull_journal,
+        try_claim_sync_outbox_drain_schedule,
     };
+    use astra_services::{SyncOutboxSettlementReport, SyncOutboxStatus};
 
     #[test]
     fn cloud_pull_result_default_not_reachable() {
@@ -335,5 +636,60 @@ mod tests {
             &[],
             "post_login"
         ));
+    }
+
+    #[test]
+    fn settlement_report_counts_only_real_local_ack_as_acked() {
+        let mut report = SyncOutboxDrainReport::default();
+
+        record_settlement_result(
+            &mut report,
+            2,
+            Ok(SyncOutboxSettlementReport {
+                missing: 1,
+                poisoned: 1,
+                ..Default::default()
+            }),
+        );
+        record_settlement_result(
+            &mut report,
+            1,
+            Ok(SyncOutboxSettlementReport {
+                acked: 1,
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(report.acked, 1);
+        assert_eq!(report.failed, 2);
+    }
+
+    #[test]
+    fn drain_scheduler_allows_only_one_worker_until_released() {
+        release_sync_outbox_drain_schedule();
+        release_sync_outbox_retry_wake_schedule();
+
+        assert!(try_claim_sync_outbox_drain_schedule());
+        assert!(!try_claim_sync_outbox_drain_schedule());
+        release_sync_outbox_drain_schedule();
+        assert!(try_claim_sync_outbox_drain_schedule());
+
+        release_sync_outbox_drain_schedule();
+        assert!(claim_sync_outbox_retry_wake_deadline(200));
+        assert!(claim_sync_outbox_retry_wake_deadline(100));
+        assert!(!claim_sync_outbox_retry_wake_deadline(150));
+        release_sync_outbox_retry_wake_schedule();
+    }
+
+    #[test]
+    fn retry_delay_uses_ready_or_next_retry_after_without_user_action() {
+        let mut status = SyncOutboxStatus {
+            next_retry_after_unix_ms: Some(super::unix_ms().saturating_add(10)),
+            ..Default::default()
+        };
+
+        assert!(next_sync_outbox_drain_delay(&status).is_some());
+        status.claimable = 1;
+        assert_eq!(next_sync_outbox_drain_delay(&status), Some(Duration::ZERO));
     }
 }

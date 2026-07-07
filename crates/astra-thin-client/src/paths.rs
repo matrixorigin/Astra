@@ -21,6 +21,10 @@ pub const AGENTS_EDGE: &str = "/agents/edge";
 /// `POST` — edge heartbeat / liveness (paired with [`AGENTS_EDGE`]).
 pub const AGENTS_EDGE_HEARTBEAT: &str = "/agents/edge/heartbeat";
 
+/// `POST/GET` — automation event facts (`agent_events`).
+pub const EVENTS: &str = "/events";
+pub const SYNC_OUTBOX_EVENTS: &str = "/sync/outbox/events";
+
 pub const SESSIONS: &str = "/sessions";
 pub const SESSIONS_RESUMABLE: &str = "/sessions/resumable";
 

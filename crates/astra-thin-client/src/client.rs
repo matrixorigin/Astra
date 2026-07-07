@@ -9,6 +9,7 @@ use reqwest::{
     Client, Response, Url,
     header::{self, HeaderMap, HeaderValue},
 };
+use astra_core::{SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -146,6 +147,10 @@ impl ThinClient {
             h.insert(header::AUTHORIZATION, v);
         }
         h
+    }
+
+    fn resolved_bearer_token<'a>(&'a self, token_override: Option<&'a str>) -> Option<&'a str> {
+        token_override.or(self.bearer_token.as_deref())
     }
 
     async fn text_or_api(resp: Response) -> Result<String, ThinClientError> {
@@ -1073,6 +1078,7 @@ impl ThinClient {
             .post(url)
             .headers(self.auth_headers_for(bearer_override))
             .json(body)
+            .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1382,6 +1388,49 @@ impl ThinClient {
             .http
             .post(url)
             .headers(self.auth_headers_for(bearer_override))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /events` — create or replay an idempotent automation event.
+    pub async fn post_event_json(
+        &self,
+        bearer_override: Option<&str>,
+        body: &Value,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::EVENTS)?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /sync/outbox/events` — ingest durable edge sync outbox events.
+    pub async fn post_sync_outbox_event_json(
+        &self,
+        bearer_override: Option<&str>,
+        body: &Value,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::SYNC_OUTBOX_EVENTS)?;
+        let mut headers = self.auth_headers_for(bearer_override);
+        if let Some(token) = self.resolved_bearer_token(bearer_override)
+            && let Ok(signature) =
+                HeaderValue::from_str(&sync_outbox_request_signature(token, body))
+        {
+            headers.insert(SYNC_OUTBOX_SIGNATURE_HEADER, signature);
+        }
+        let resp = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(body)
+            .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -2123,6 +2172,82 @@ mod tests {
             .unwrap();
         assert_eq!(v["parent_run_id"], "run-1");
         assert_eq!(v["affected"], 2);
+    }
+
+    #[tokio::test]
+    async fn wiremock_post_event_json() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/events"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "event_id": "event_1",
+                "metadata": {
+                    "source": "ordinary"
+                }
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client
+            .post_event_json(
+                Some("tok"),
+                &serde_json::json!({
+                    "event_id": "event_1",
+                    "session_id": "session-1",
+                    "event_type": "ordinary_marker",
+                    "content": "{}",
+                    "metadata": {
+                        "source": "ordinary"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["event_id"], "event_1");
+        assert_eq!(v["metadata"]["source"], "ordinary");
+    }
+
+    #[tokio::test]
+    async fn wiremock_post_sync_outbox_event_json() {
+        let srv = MockServer::start().await;
+        let body = serde_json::json!({
+            "event_id": "sync_evt_1",
+            "session_id": "session-1",
+            "event_type": "sync_marker",
+            "content": "{}",
+            "metadata": {
+                "sync_outbox": {
+                    "payload_hash": "sha256:abc"
+                }
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(header("authorization", "Bearer tok"))
+            .and(header(
+                "x-astra-sync-outbox-signature",
+                sync_outbox_request_signature("tok", &body),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "event_id": "sync_evt_1",
+                "metadata": {
+                    "sync_outbox": {
+                        "payload_hash": "sha256:abc"
+                    }
+                }
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client
+            .post_sync_outbox_event_json(Some("tok"), &body)
+            .await
+            .unwrap();
+        assert_eq!(v["event_id"], "sync_evt_1");
+        assert_eq!(v["metadata"]["sync_outbox"]["payload_hash"], "sha256:abc");
     }
 
     #[tokio::test]

@@ -4,7 +4,45 @@ use astra_services::session_journal;
 use std::time::Instant;
 
 /// Cloud journal ingestion is server-owned; CLI keeps the local journal path.
-fn enqueue_ingestion(_state: &SessionState, _event: &session_journal::JournalEvent) {}
+fn enqueue_ingestion(_state: &SessionState, event: &session_journal::JournalEvent) {
+    let store = astra_services::SyncOutboxStore::local();
+    if event
+        .session_id
+        .as_deref()
+        .is_none_or(|session_id| session_id.trim().is_empty())
+    {
+        if let Err(error) = store.record_skipped_journal_event(
+            event,
+            astra_services::SyncOutboxSkipKind::MissingSessionId,
+            "journal event has no session_id and cannot be delivered to /events",
+        ) {
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                event_type = ?event.event_type,
+                "failed to record skipped sync outbox event"
+            );
+        }
+        tracing::warn!(
+            target: "astra_cli::cloud_sync",
+            event_type = ?event.event_type,
+            "skipping sync outbox enqueue for journal event without a session_id"
+        );
+        return;
+    }
+    match store.enqueue_journal_event(event) {
+        Ok(_) => crate::cli::cloud_sync::schedule_sync_outbox_drain(),
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                event_type = ?event.event_type,
+                session_id = event.session_id.as_deref().unwrap_or(""),
+                "failed to enqueue journal event into durable sync outbox"
+            );
+        }
+    }
+}
 
 pub(crate) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
     enqueue_ingestion(state, event);

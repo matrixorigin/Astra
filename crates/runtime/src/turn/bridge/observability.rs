@@ -144,6 +144,8 @@ pub(crate) async fn persist_legacy_bridge_trace_and_quality(
         .create_event(
             user_id,
             EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
                 session_id,
                 event_type: "context_trace_signal".to_string(),
                 content,

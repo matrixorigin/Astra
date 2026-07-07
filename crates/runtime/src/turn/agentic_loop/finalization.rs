@@ -177,6 +177,8 @@ async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
         .create_event(
             persistence.user_id.clone(),
             EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
                 session_id: session_id.clone(),
                 event_type: "context_trace_signal".to_string(),
                 content,

@@ -29,48 +29,7 @@ pub fn parse_registry_status(
 }
 
 pub(crate) fn canonical_json_string(value: &Value) -> String {
-    fn write(value: &Value, out: &mut String) {
-        match value {
-            Value::Null => out.push_str("null"),
-            Value::Bool(v) => out.push_str(if *v { "true" } else { "false" }),
-            Value::Number(v) => out.push_str(&v.to_string()),
-            Value::String(v) => {
-                out.push_str(&serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_string()));
-            }
-            Value::Array(values) => {
-                out.push('[');
-                for (idx, item) in values.iter().enumerate() {
-                    if idx > 0 {
-                        out.push(',');
-                    }
-                    write(item, out);
-                }
-                out.push(']');
-            }
-            Value::Object(map) => {
-                let mut keys = map.keys().collect::<Vec<_>>();
-                keys.sort();
-                out.push('{');
-                for (idx, key) in keys.iter().enumerate() {
-                    if idx > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(
-                        &serde_json::to_string(key.as_str()).unwrap_or_else(|_| "\"\"".to_string()),
-                    );
-                    out.push(':');
-                    if let Some(item) = map.get(*key) {
-                        write(item, out);
-                    }
-                }
-                out.push('}');
-            }
-        }
-    }
-
-    let mut out = String::new();
-    write(value, &mut out);
-    out
+    astra_core::canonical_json_string(value)
 }
 
 pub(crate) fn canonical_serialize<T: Serialize>(

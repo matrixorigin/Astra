@@ -9,11 +9,116 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
 pub mod canonical_names;
 #[cfg(any(test, feature = "dev-defaults"))]
 pub mod test_paths;
+
+pub const SYNC_OUTBOX_SIGNATURE_HEADER: &str = "x-astra-sync-outbox-signature";
+
+pub fn canonical_json_string(value: &serde_json::Value) -> String {
+    fn write(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::Null => out.push_str("null"),
+            serde_json::Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+            serde_json::Value::Number(value) => out.push_str(&value.to_string()),
+            serde_json::Value::String(value) => {
+                out.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()));
+            }
+            serde_json::Value::Array(values) => {
+                out.push('[');
+                for (index, item) in values.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    write(item, out);
+                }
+                out.push(']');
+            }
+            serde_json::Value::Object(map) => {
+                let mut keys = map.keys().collect::<Vec<_>>();
+                keys.sort();
+                out.push('{');
+                for (index, key) in keys.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(
+                        &serde_json::to_string(key.as_str())
+                            .unwrap_or_else(|_| "\"\"".to_string()),
+                    );
+                    out.push(':');
+                    if let Some(item) = map.get(*key) {
+                        write(item, out);
+                    }
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    let mut out = String::new();
+    write(value, &mut out);
+    out
+}
+
+pub fn sync_outbox_request_signature(token: &str, body: &serde_json::Value) -> String {
+    format!(
+        "sha256={}",
+        hmac_sha256_hex(token.as_bytes(), canonical_json_string(body).as_bytes())
+    )
+}
+
+fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        key_block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; BLOCK_SIZE];
+    let mut outer_pad = [0x5cu8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        inner_pad[index] ^= key_block[index];
+        outer_pad[index] ^= key_block[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_hash = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_hash);
+    outer
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod sync_outbox_signature_tests {
+    use super::*;
+
+    #[test]
+    fn sync_outbox_signature_uses_canonical_json_and_token() {
+        let left = serde_json::json!({"b":2,"a":1});
+        let right = serde_json::json!({"a":1,"b":2});
+
+        assert_eq!(canonical_json_string(&left), canonical_json_string(&right));
+        assert_eq!(
+            sync_outbox_request_signature("token-a", &left),
+            sync_outbox_request_signature("token-a", &right)
+        );
+        assert_ne!(
+            sync_outbox_request_signature("token-a", &left),
+            sync_outbox_request_signature("token-b", &left)
+        );
+    }
+}
 
 /// Global cap on the sum of `max_connections` across all pools.
 /// Prevents unbounded pool creation from exhausting database connections.

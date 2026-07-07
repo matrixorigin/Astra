@@ -999,6 +999,8 @@ async fn persist_runtime_promotion_events(
             .create_event(
                 user_id.to_string(),
                 EventCreateRequestData {
+                    ingestion_source: astra_services::events::EventIngestionSource::Client,
+                    event_id: None,
                     session_id: session_id.to_string(),
                     event_type: RUNTIME_PROMOTION_EVENT_TYPE.to_string(),
                     content: promotion.summary.clone(),

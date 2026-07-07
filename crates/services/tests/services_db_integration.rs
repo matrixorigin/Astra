@@ -5105,6 +5105,8 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         .create_event(
             owner_user_id.clone(),
             EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
                 session_id: session_id.clone(),
                 event_type: "owner_evt".into(),
                 content: "owner visible".into(),
@@ -7074,6 +7076,110 @@ async fn skill_selection_version_update_is_owner_session_scoped_on_live_matrixon
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn sync_outbox_create_event_upserts_missing_session_header_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let mut journal_event = astra_services::session_journal::JournalEvent::config_change(
+        Some(session_id.as_str()),
+        "model",
+        "db-it",
+    );
+    journal_event.ts = "2026-07-08T00:00:00Z".to_string();
+    let content = serde_json::to_value(&journal_event).expect("journal content");
+    let payload_hash = astra_services::sync_outbox_canonical_payload_hash(&content);
+    let event_id = astra_services::sync_outbox_stable_event_id(&journal_event, &payload_hash)
+        .expect("stable sync outbox event id");
+    let event_service = DatabaseEventService::new(settings).with_pool(shared);
+
+    let created = event_service
+        .create_event(
+            user_id.clone(),
+            EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
+                event_id: Some(event_id),
+                session_id: session_id.clone(),
+                event_type: "config_change".into(),
+                content: content.to_string(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: Some(serde_json::json!({
+                    "sync_outbox": {
+                        "payload_hash": payload_hash
+                    }
+                })),
+            },
+        )
+        .await
+        .expect("sync outbox create event should upsert session header");
+
+    let row = sqlx::query(
+        "SELECT event_count, last_event_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load upserted session header");
+    assert_eq!(
+        row.try_get::<i64, _>("event_count")
+            .expect("decode event_count"),
+        1
+    );
+    assert_eq!(
+        row.try_get::<String, _>("last_event_id")
+            .expect("decode last_event_id"),
+        created.event_id
+    );
+
+    cleanup_agent_sessions_and_events_for_owner(
+        &pool,
+        &user_id,
+        std::slice::from_ref(&session_id),
+        &[created.event_id],
+        &[],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn ordinary_create_event_requires_existing_session_header_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let event_service = DatabaseEventService::new(settings).with_pool(shared);
+
+    let error = event_service
+        .create_event(
+            user_id,
+            EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
+                session_id,
+                event_type: "it_requires_session_header".into(),
+                content: "ordinary events must not create sessions".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("ordinary create_event must require a pre-existing session");
+    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn event_count_delta_service_context_state_paths_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -7100,6 +7206,8 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         .create_event(
             user_id.clone(),
             EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
                 session_id: service_session.clone(),
                 event_type: "it_create".into(),
                 content: "first".into(),
@@ -7117,6 +7225,8 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         .create_event(
             user_id.clone(),
             EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
                 session_id: service_session.clone(),
                 event_type: "it_create".into(),
                 content: "second".into(),

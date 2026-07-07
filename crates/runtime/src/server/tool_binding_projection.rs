@@ -9,6 +9,7 @@ use crate::server::tool_admission::{
     ToolAdmissionContext, ToolAdmissionDecision, ToolHiddenReason,
     active_provider_declarations_for_binding, has_explicit_runtime_executor_provider,
 };
+#[cfg(test)]
 use crate::server::tool_route_selection::ToolExecutionRouteKind;
 
 use super::tool_execution_binding::{
@@ -134,7 +135,13 @@ pub(crate) fn resolve_tool_visibility_for_providers_with_context(
         );
     if admission.visible
         && !runtime_surface_allows_selected_decision(
-            &admission, workspace, executor, runtime, providers, registry,
+            &admission,
+            workspace,
+            executor,
+            runtime,
+            &ToolPolicySnapshot::default(),
+            providers,
+            registry,
         )
     {
         admission.visible = false;
@@ -148,26 +155,17 @@ fn runtime_surface_allows_selected_decision(
     workspace: &WorkspaceBinding,
     executor: &ExecutorBinding,
     runtime: Option<&astra_runtime_env::RuntimeBinding>,
+    policy: &ToolPolicySnapshot,
     providers: &[astra_runtime_env::CapacityProviderDeclaration],
     registry: &astra_runtime_env::ToolRegistry,
 ) -> bool {
     let tool_name = admission.tool_name.as_str();
-    if admission.selected_route() == ToolExecutionRouteKind::ServerRuntime
-        && registry.get(tool_name).is_some_and(|spec| {
-            matches!(
-                spec.required.executor,
-                astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
-            )
-        })
-    {
-        return true;
-    }
     let binding = runtime_environment_binding_for_parts_with_provider_declarations(
         tool_name,
         workspace,
         executor,
         runtime.cloned(),
-        &ToolPolicySnapshot::default(),
+        policy,
         registry,
         providers,
     );
@@ -1505,6 +1503,26 @@ mod tests {
     }
 
     #[test]
+    fn ready_runtime_without_isolation_backend_does_not_hide_runtime_provider() {
+        let mut runtime = astra_runtime_env::RuntimeBinding::host_process("runtime-no-isolation");
+        runtime.isolation_backend = astra_runtime_env::RuntimeIsolationBackend::None;
+
+        let names = schema_names(capability_filtered_server_tool_schemas(
+            &crate::capabilities::full_server_capabilities_for_tests(),
+            &WorkspaceBinding::server_sandbox("/workspace"),
+            &ExecutorBinding::server_local(),
+            Some(&runtime),
+        ));
+
+        for expected in ["bash", "read_file", "write_file", "git"] {
+            assert!(
+                names.contains(expected),
+                "{expected} must remain visible when runtime capacity is ready; isolation backend is policy evidence, not provider existence"
+            );
+        }
+    }
+
+    #[test]
     fn local_filesystem_maps_to_unknown_in_conversion() {
         // When the server receives a client-only LocalFilesystem workspace
         // kind, it should map to Unknown rather than propagating the variant.
@@ -1608,6 +1626,44 @@ mod provider_decision_projection_tests {
         assert!(
             projected.is_empty(),
             "projection must consume the same provider decision instead of running a private filter"
+        );
+    }
+
+    #[test]
+    fn service_or_runtime_server_route_still_obeys_runtime_surface_policy() {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let workspace = WorkspaceBinding::server_sandbox("/workspace");
+        let executor = ExecutorBinding::server_local();
+        let providers = active_provider_declarations_for_binding(
+            &[],
+            &workspace,
+            &executor,
+            None,
+            &registry,
+            &ToolAdmissionContext::default(),
+        );
+        let admission =
+            crate::server::tool_admission::resolve_tool_admission_for_providers_with_context(
+                "web_fetch",
+                &workspace,
+                &executor,
+                &providers,
+                &registry,
+                &ToolAdmissionContext::default(),
+            );
+        assert!(admission.visible);
+        assert_eq!(
+            admission.selected_route(),
+            ToolExecutionRouteKind::ServerRuntime
+        );
+
+        let mut policy = ToolPolicySnapshot::default();
+        policy.network_policy = Some("disabled".to_string());
+        assert!(
+            !runtime_surface_allows_selected_decision(
+                &admission, &workspace, &executor, None, &policy, &providers, &registry,
+            ),
+            "route selection must not bypass runtime capability or policy checks"
         );
     }
 

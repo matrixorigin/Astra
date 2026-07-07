@@ -962,17 +962,6 @@ impl RuntimeToolExecutor {
         if let Some(denial) = admission_hidden_reason_to_denial(admission.hidden_reason) {
             return Some(denial);
         }
-        if matches!(
-            admission.selected_route(),
-            crate::server::tool_route_selection::ToolExecutionRouteKind::ServerRuntime
-        ) && registry.get(name).is_some_and(|spec| {
-            matches!(
-                spec.required.executor,
-                astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
-            )
-        }) {
-            return None;
-        }
         let binding = crate::server::tool_binding_projection::runtime_environment_binding_for_parts_with_provider_declarations(
             name,
             self.execution_binding.workspace(),
