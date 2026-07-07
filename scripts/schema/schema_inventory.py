@@ -36,7 +36,7 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
     SchemaSource(
         owner="astra_services::storage",
         domain="core_storage",
-        path="rust/crates/services/src/storage.rs",
+        path="crates/services/src/storage.rs",
         startup_owner="ensure_core_schema",
         state_class_hint="mixed",
         hot_path_hint="mixed",
@@ -44,7 +44,7 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
     SchemaSource(
         owner="astra_services::config_version_cloud",
         domain="config_versions",
-        path="rust/crates/services/src/config_version_cloud.rs",
+        path="crates/services/src/config_version_cloud.rs",
         startup_owner="ensure_core_schema via CONFIG_VERSIONS_CREATE_SQL",
         state_class_hint="durable fact",
         hot_path_hint="warm append/read",
@@ -52,7 +52,7 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
     SchemaSource(
         owner="astra_messaging::db_transport",
         domain="messaging",
-        path="rust/crates/astra-messaging/src/db_transport.rs",
+        path="crates/astra-messaging/src/db_transport.rs",
         startup_owner="astra_messaging::db_transport::ensure_schema",
         state_class_hint="coordination fact",
         hot_path_hint="hot queue",
@@ -60,7 +60,7 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
     SchemaSource(
         owner="astra_services::resource_governor",
         domain="resource_governor",
-        path="rust/crates/services/src/resource_governor.rs",
+        path="crates/services/src/resource_governor.rs",
         startup_owner="DatabaseResourceGovernor::ensure_tables",
         state_class_hint="quota fact",
         hot_path_hint="warm quota read/write",
@@ -68,7 +68,7 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
     SchemaSource(
         owner="astra_services::workspace_records",
         domain="workspace_records",
-        path="rust/crates/services/src/workspace_records.rs",
+        path="crates/services/src/workspace_records.rs",
         startup_owner="DatabaseWorkspaceRecordStore::ensure_tables",
         state_class_hint="durable workspace fact / cleanup debt",
         hot_path_hint="run start/end workspace persistence",
@@ -76,7 +76,7 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
     SchemaSource(
         owner="astra_runtime::llm_provider_admission",
         domain="runtime_admission",
-        path="rust/crates/runtime/src/llm_provider_admission.rs",
+        path="crates/runtime/src/llm_provider_admission.rs",
         startup_owner="ensure_llm_provider_admission_schema_if_configured",
         state_class_hint="coordination fact",
         hot_path_hint="LLM admission hot path when enabled",
@@ -1187,7 +1187,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         ),
         test_evidence=[
             "scripts/schema/test_schema_inventory.py::test_session_sync_log_is_removed_from_production_schema",
-            "rust/crates/services/tests/services_db_integration.rs::sync_audit_no_longer_persists_session_sync_log_on_live_matrixone",
+            "crates/services/tests/services_db_integration.rs::sync_audit_no_longer_persists_session_sync_log_on_live_matrixone",
         ],
         rationale=(
             "session_sync_log was a best-effort audit side effect, not a recovery or product fact; "
@@ -1198,11 +1198,11 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         candidate="data_versioning_checkpoints",
         decision="keep",
         current_read_paths=[
-            "rust/crates/services/src/data_versioning.rs::get_checkpoint",
-            "rust/crates/services/src/data_versioning.rs::list_checkpoints",
+            "crates/services/src/data_versioning.rs::get_checkpoint",
+            "crates/services/src/data_versioning.rs::list_checkpoints",
         ],
         current_write_paths=[
-            "rust/crates/services/src/data_versioning.rs::create_checkpoint",
+            "crates/services/src/data_versioning.rs::create_checkpoint",
         ],
         user_api_impact=(
             "data versioning rollback/list workflows depend on named checkpoint identity and created_at audit"
@@ -1215,7 +1215,7 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "preserved equivalent identity/name/timestamp data"
         ),
         test_evidence=[
-            "rust/crates/services/tests/data_versioning_db_it.rs",
+            "crates/services/tests/data_versioning_db_it.rs",
             "scripts/schema/test_schema_inventory.py::test_p1_5_consolidation_reviews_are_evidence_backed",
         ],
         rationale=(
@@ -1226,12 +1226,12 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         candidate="preview_template_registry + raw_ref_scheme_registry",
         decision="keep_separate",
         current_read_paths=[
-            "rust/crates/services/src/runs.rs::preview_template_registry",
-            "rust/crates/services/src/context_manifest.rs::raw_ref_scheme_registry",
+            "crates/services/src/runs.rs::preview_template_registry",
+            "crates/services/src/context_manifest.rs::raw_ref_scheme_registry",
         ],
         current_write_paths=[
-            "rust/crates/services/src/storage.rs::seed raw_ref_scheme_registry",
-            "rust/crates/services/src/storage.rs::seed preview_template_registry",
+            "crates/services/src/storage.rs::seed raw_ref_scheme_registry",
+            "crates/services/src/storage.rs::seed preview_template_registry",
         ],
         user_api_impact=(
             "preview templates affect artifact/tool-output rendering; raw-ref schemes affect dereference "
@@ -1246,9 +1246,9 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "into scheme metadata and template metadata"
         ),
         test_evidence=[
-            "rust/crates/services/tests/schema_assertions.rs::preview_template_registry",
-            "rust/crates/services/tests/schema_assertions.rs::raw_ref_scheme_registry",
-            "rust/crates/runtime/tests/phase6_artifact_preview.rs",
+            "crates/services/tests/schema_assertions.rs::preview_template_registry",
+            "crates/services/tests/schema_assertions.rs::raw_ref_scheme_registry",
+            "crates/runtime/tests/phase6_artifact_preview.rs",
         ],
         rationale=(
             "same bootstrap area does not imply same lifecycle; resolver/access semantics differ from rendering"
@@ -1258,12 +1258,12 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         candidate="harness_skill_drafts + harness_skill_rules",
         decision="keep_separate",
         current_read_paths=[
-            "rust/crates/services/src/harness.rs::list_skill_drafts",
-            "rust/crates/services/src/harness.rs::harness_skill_rules SELECT paths",
+            "crates/services/src/harness.rs::list_skill_drafts",
+            "crates/services/src/harness.rs::harness_skill_rules SELECT paths",
         ],
         current_write_paths=[
-            "rust/crates/services/src/harness.rs::create skill drafts",
-            "rust/crates/services/src/harness.rs::create/update skill rules",
+            "crates/services/src/harness.rs::create skill drafts",
+            "crates/services/src/harness.rs::create/update skill rules",
         ],
         user_api_impact=(
             "Skillify draft review/publish workflow and evidence-backed rule review have distinct "
@@ -1278,8 +1278,8 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "identity and citation references"
         ),
         test_evidence=[
-            "rust/crates/services/tests/harness_skillify_db_it.rs",
-            "rust/crates/services/tests/services_db_integration.rs::harness_skill_rules",
+            "crates/services/tests/harness_skillify_db_it.rs",
+            "crates/services/tests/services_db_integration.rs::harness_skill_rules",
         ],
         rationale=(
             "rules are evidence-backed child assertions, not just optional columns on a draft"
@@ -1289,12 +1289,12 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
         candidate="team_execution_history + team_snapshots",
         decision="keep_separate",
         current_read_paths=[
-            "rust/crates/services/src/team_persistence.rs::list_executions_page",
-            "rust/crates/services/src/team_persistence.rs::list_snapshots_page",
+            "crates/services/src/team_persistence.rs::list_executions_page",
+            "crates/services/src/team_persistence.rs::list_snapshots_page",
         ],
         current_write_paths=[
-            "rust/crates/services/src/team_persistence.rs::record_execution_start",
-            "rust/crates/services/src/team_persistence.rs::save_snapshot",
+            "crates/services/src/team_persistence.rs::record_execution_start",
+            "crates/services/src/team_persistence.rs::save_snapshot",
         ],
         user_api_impact=(
             "/teams/{name}/executions and /teams/{name}/snapshots expose different resources: "
@@ -1308,9 +1308,9 @@ P1_5_CONSOLIDATION_REVIEWS: tuple[ConsolidationReview, ...] = (
             "and separate cursor compatibility"
         ),
         test_evidence=[
-            "rust/crates/services/tests/team_persistence_integration.rs",
-            "rust/crates/runtime/tests/system_matrix_http_e2e/journey_team_snapshots_matrix.rs",
-            "rust/crates/runtime/src/server/team_handlers.rs::team handler cursor tests",
+            "crates/services/tests/team_persistence_integration.rs",
+            "crates/runtime/tests/system_matrix_http_e2e/journey_team_snapshots_matrix.rs",
+            "crates/runtime/src/server/team_handlers.rs::team handler cursor tests",
         ],
         rationale=(
             "execution history is append-like run audit; snapshots are named reproducibility artifacts"

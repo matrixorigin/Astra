@@ -85,8 +85,8 @@ The durable evidence kept in the repository is:
 
 - The scenario specs in this directory (`S01` through `S14`).
 - The implementation contract in `IMPL-TEST-PLAN.md`.
-- The regression and E2E tests under `rust/crates/runtime/tests/`.
-- The schema assertions under `rust/crates/services/tests/schema_assertions.rs`.
+- The regression and E2E tests under `crates/runtime/tests/`.
+- The schema assertions under `crates/services/tests/schema_assertions.rs`.
 - This final delivery summary, including the gap resolution index above.
 
 ## §2 Code Delivery Inventory
@@ -122,27 +122,27 @@ The implementation also seeds:
 
 Services:
 
-- `rust/crates/services/src/context_manifest.rs`
-- `rust/crates/services/src/state_projection.rs`
-- `rust/crates/services/src/personal_skills.rs`
-- `rust/crates/services/src/artifact_policy.rs`
-- `rust/crates/services/src/runs.rs` extended for database-backed durable runs and tool-output batches.
-- `rust/crates/services/src/storage.rs` extended for v1 schema creation/migration and registry seed data.
+- `crates/services/src/context_manifest.rs`
+- `crates/services/src/state_projection.rs`
+- `crates/services/src/personal_skills.rs`
+- `crates/services/src/artifact_policy.rs`
+- `crates/services/src/runs.rs` extended for database-backed durable runs and tool-output batches.
+- `crates/services/src/storage.rs` extended for v1 schema creation/migration and registry seed data.
 
 Runtime/server:
 
-- `rust/crates/runtime/src/capabilities.rs` centralizes CLI/Web capability
+- `crates/runtime/src/capabilities.rs` centralizes CLI/Web capability
   resolution: Web and remote CLI surfaces see server-executable tools plus the
   server-visible skill catalog; local CLI sees client-executable tools/MCP plus
   project/home skills and the authenticated server catalog.
-- `rust/crates/runtime/src/server/device_lease_sweeper.rs`
-- `rust/crates/runtime/src/server/artifact_retention_sweeper.rs`
-- `rust/crates/runtime/src/server/user_skill_handlers.rs`
-- `rust/crates/runtime/src/server/session_handlers.rs` extended for state, transcript, devices, artifacts, and anchor memory.
-- `rust/crates/runtime/src/server/run_handlers.rs` extended for durable run stream/input/cancel.
-- `rust/crates/runtime/src/server/run_lifecycle.rs` restores web-agent history from CSL and persists completed assistant text back into CSL. Transcript display rows remain an audit/UI projection, not an automatic prompt source.
-- `rust/crates/runtime/src/server/server_tool_executor.rs` exposes read-only session history tools so the LLM can page, search, and expand old transcript details on demand without loading the full session.
-- `rust/crates/runtime/src/server/server_tool_executor.rs` exposes the
+- `crates/runtime/src/server/device_lease_sweeper.rs`
+- `crates/runtime/src/server/artifact_retention_sweeper.rs`
+- `crates/runtime/src/server/user_skill_handlers.rs`
+- `crates/runtime/src/server/session_handlers.rs` extended for state, transcript, devices, artifacts, and anchor memory.
+- `crates/runtime/src/server/run_handlers.rs` extended for durable run stream/input/cancel.
+- `crates/runtime/src/server/run_lifecycle.rs` restores web-agent history from CSL and persists completed assistant text back into CSL. Transcript display rows remain an audit/UI projection, not an automatic prompt source.
+- `crates/runtime/src/server/server_tool_executor.rs` exposes read-only session history tools so the LLM can page, search, and expand old transcript details on demand without loading the full session.
+- `crates/runtime/src/server/server_tool_executor.rs` exposes the
   server-side `publish_artifact` capability: files already generated in the
   session workspace or `/tmp` are validated, persisted to
   `session_artifacts`, and returned as `artifact://` references. Chart/image
@@ -150,18 +150,18 @@ Runtime/server:
   that makes the resulting file previewable and downloadable in Web. Web chat
   only renders `source='publish_artifact'` / `artifact_file_v1` rows as
   attachments; internal rows such as `composite_snapshot_index` stay storage-only.
-- `rust/crates/runtime/src/server/server_tool_executor.rs` now executes the
+- `crates/runtime/src/server/server_tool_executor.rs` now executes the
   schema-advertised `run_script` tool in server mode. Its Python RPC helper
   list is the server-routable subset only, and
-  `rust/crates/runtime/src/turn/agentic_loop_tool_phase.rs` batch-persists
+  `crates/runtime/src/turn/agentic_loop_tool_phase.rs` batch-persists
   model-visible tool results into `session_tool_outputs`.
-- `rust/crates/runtime/src/server/delegation_engine.rs` wired to state projection and bubble-up.
-- `rust/crates/runtime/src/server/state_builder.rs` starts device lease and artifact retention sweepers.
+- `crates/runtime/src/server/delegation_engine.rs` wired to state projection and bubble-up.
+- `crates/runtime/src/server/state_builder.rs` starts device lease and artifact retention sweepers.
 
 Turn/runtime loop:
 
-- `rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs` writes per-LLM-call context manifests and applies turn-intent budget flex.
-- `rust/crates/runtime/src/turn/agentic_loop_host.rs`, `bridge_inprocess.rs`, `loop_dispatcher.rs`, and `llm_exchange_capture.rs` were extended for runtime integration and manifest/debug capture.
+- `crates/runtime/src/turn/agentic_loop_execution_phase.rs` writes per-LLM-call context manifests and applies turn-intent budget flex.
+- `crates/runtime/src/turn/agentic_loop_host.rs`, `bridge_inprocess.rs`, `loop_dispatcher.rs`, and `llm_exchange_capture.rs` were extended for runtime integration and manifest/debug capture.
 
 ### §2.3 HTTP Endpoints
 
@@ -282,15 +282,15 @@ Implementation and scenario tests:
 
 | File | Test Count |
 | --- | ---: |
-| `rust/crates/services/tests/schema_assertions.rs` | 6 |
-| `rust/crates/runtime/tests/phase1_run_durability.rs` | 11 |
-| `rust/crates/runtime/tests/phase2_web_hydration.rs` | 8 |
-| `rust/crates/runtime/tests/phase3_context_manifest.rs` | 18 |
-| `rust/crates/runtime/tests/phase4_state_projection.rs` | 18 |
-| `rust/crates/runtime/tests/phase5_personal_skill.rs` | 7 |
-| `rust/crates/runtime/tests/phase6_artifact_preview.rs` | 10 |
-| `rust/crates/runtime/tests/e2e_joint.rs` | 5 |
-| `rust/crates/runtime/tests/perf_benchmarks.rs` | 5 |
+| `crates/services/tests/schema_assertions.rs` | 6 |
+| `crates/runtime/tests/phase1_run_durability.rs` | 11 |
+| `crates/runtime/tests/phase2_web_hydration.rs` | 8 |
+| `crates/runtime/tests/phase3_context_manifest.rs` | 18 |
+| `crates/runtime/tests/phase4_state_projection.rs` | 18 |
+| `crates/runtime/tests/phase5_personal_skill.rs` | 7 |
+| `crates/runtime/tests/phase6_artifact_preview.rs` | 10 |
+| `crates/runtime/tests/e2e_joint.rs` | 5 |
+| `crates/runtime/tests/perf_benchmarks.rs` | 5 |
 
 Total tracked Rust verification tests in the v1 implementation path: **88**.
 

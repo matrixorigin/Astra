@@ -26,12 +26,12 @@ from journal events and tracker-visible records over inferred architecture diagr
 
 | Concern | Source |
 | --- | --- |
-| Engine, tracker, state transitions, verification/checkpoint gates | `rust/crates/runtime/src/server/delegation/engine.rs` |
-| HTTP handlers for delegate/list/pause/resume | `rust/crates/runtime/src/server/delegation/handlers.rs` |
-| Patterns, tiers, request/result types, aggregation | `rust/crates/services/src/coordination.rs` |
-| Journal event builders and metadata fields | `rust/crates/services/src/session_journal.rs` |
-| Parent/child messaging and broadcast groups | `rust/crates/astra-messaging/src/` |
-| Runtime lifecycle delegation hints | `rust/crates/runtime/src/server/server_loop_host.rs` |
+| Engine, tracker, state transitions, verification/checkpoint gates | `crates/runtime/src/server/delegation/engine.rs` |
+| HTTP handlers for delegate/list/pause/resume | `crates/runtime/src/server/delegation/handlers.rs` |
+| Patterns, tiers, request/result types, aggregation | `crates/services/src/coordination.rs` |
+| Journal event builders and metadata fields | `crates/services/src/session_journal.rs` |
+| Parent/child messaging and broadcast groups | `crates/astra-messaging/src/` |
+| Runtime lifecycle delegation hints | `crates/runtime/src/server/server_loop_host.rs` |
 
 Do not use the old path `runtime/src/server/delegation_engine.rs`; the engine lives under
 `runtime/src/server/delegation/`.

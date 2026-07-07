@@ -481,7 +481,7 @@ Retrieve L1 (at compaction time):
 
 ### 4.5 Extraction Pipeline Internals
 
-代码位于 `rust/crates/runtime/src/session_memory/`，每次 turn 结束由 `agentic_loop_finalization.rs` 触发：
+代码位于 `crates/runtime/src/session_memory/`，每次 turn 结束由 `agentic_loop_finalization.rs` 触发：
 
 ```
 MemoryExtractionService::maybe_spawn()

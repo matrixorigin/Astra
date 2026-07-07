@@ -1,6 +1,6 @@
 /**
  * Canonical HTTP paths for the Astra runtime thin-client API.
- * Keep in sync with `rust/crates/astra-thin-client/src/paths.rs`.
+ * Keep in sync with `crates/astra-thin-client/src/paths.rs`.
  */
 
 export const PATH_AUTH_REGISTER = "/auth/register";

@@ -476,12 +476,12 @@ Do not add `default_agent_binding_id` to `agent_sessions` in this step. A bindin
 New crate/module location:
 
 ```text
-rust/crates/services/src/agent_bindings.rs
-rust/crates/services/src/model_gateways.rs
-rust/crates/runtime/src/server/agent_binding_handlers.rs
-rust/crates/runtime/src/server/agent_binding_runtime.rs
-rust/crates/runtime/src/server/model_gateway_handlers.rs
-rust/crates/runtime/src/server/model_gateway_runtime.rs
+crates/services/src/agent_bindings.rs
+crates/services/src/model_gateways.rs
+crates/runtime/src/server/agent_binding_handlers.rs
+crates/runtime/src/server/agent_binding_runtime.rs
+crates/runtime/src/server/model_gateway_handlers.rs
+crates/runtime/src/server/model_gateway_runtime.rs
 ```
 
 ### Binding API Types

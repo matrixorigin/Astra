@@ -3,7 +3,7 @@ description: "工具结果语义压缩 (gap #2)：当工具返回结果超过上
 requires: [llm]
 
 turns:
-  - user: "列出 rust/crates 目录下所有的子目录（递归一层即可），并统计一共有多少个 crate。"
+  - user: "列出 crates 目录下所有的子目录（递归一层即可），并统计一共有多少个 crate。"
     checks:
       rules:
         - db:

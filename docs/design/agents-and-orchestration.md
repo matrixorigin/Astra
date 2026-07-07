@@ -244,7 +244,7 @@ Orchestrator → delegate(code_agent, "Review code")     ─┐
              ← collect all results → synthesize
 ```
 
-**Status**: ✅ Implemented — `rust/crates/runtime/src/turn/delegation.rs`
+**Status**: ✅ Implemented — `crates/runtime/src/turn/delegation.rs`
 
 Fan-in returns structured `AggregatedResult` with:
 - Quality metrics: `success_rate`, `succeeded`/`failed` counts

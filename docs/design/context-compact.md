@@ -17,7 +17,7 @@ This document compares **interactive context control** with Claude Code (CC) and
 
 ## Implementation pointers
 
-- **Session memory anchor**: `rust/crates/astra-cli/src/cli/chat_turn.rs` — `fetch_compact_memory_anchor_snippet`, `compact_assistant_message`；`/compact` 与自动 compact 共用。
+- **Session memory anchor**: `crates/astra-cli/src/cli/chat_turn.rs` — `fetch_compact_memory_anchor_snippet`, `compact_assistant_message`；`/compact` 与自动 compact 共用。
 - **Post-compact**: `recent_tools.clear()` 在 `apply_auto_compact_result` 与 `slash_state` `/compact` 成功替换 history 之后执行。
 - **Plan tip**: `plan_mode` 或 `executing_plan` 为真时，compact 成功后打印一行 dim 提示。
 - **Cloud pull journal**（审计，与 compact 正交）：`docs/design/multi-agent-cloud-runtime.md` — `sync_marker` / `metadata.cloud_pull`。

@@ -2,7 +2,7 @@
 
 > **Status**: Core Design — single source of truth for skill/tool/MCP architecture
 > **Last Updated**: 2026-06-23
-> **Implementation**: Rust — `rust/crates/runtime/src/skills/`, `rust/crates/runtime/src/tool_registry/`
+> **Implementation**: Rust — `crates/runtime/src/skills/`, `crates/runtime/src/tool_registry/`
 >
 > 🟢 **Implemented**: UnifiedSkillRegistry, SKILL.md parser, 16 bundled skills, local/MCP providers,
 > ToolRegistry with deterministic always-load/deferred surface, explicit deferred activation, surface reporting, file watcher hot-reload,
@@ -77,7 +77,7 @@ We support all CC frontmatter fields (`name`, `description`, `when-to-use`,
 ### 1.3 SkillManifest (Universal Descriptor)
 
 ```rust
-// rust/crates/runtime/src/skills/manifest.rs
+// crates/runtime/src/skills/manifest.rs
 pub struct SkillManifest {
     pub name: String,
     pub version: Version,              // Semantic version
@@ -102,7 +102,7 @@ pub struct SkillManifest {
 ### 1.4 LoadedSkill (Full Content)
 
 ```rust
-// rust/crates/runtime/src/skills/manifest.rs
+// crates/runtime/src/skills/manifest.rs
 pub struct LoadedSkill {
     pub manifest: SkillManifest,
     pub instructions: String,          // Markdown body below frontmatter
@@ -157,7 +157,7 @@ This means a project's local override always wins over a bundled or remote skill
 ### 2.3 SkillSourceKind
 
 ```rust
-// rust/crates/runtime/src/skills/manifest.rs
+// crates/runtime/src/skills/manifest.rs
 pub enum SkillSourceKind {
     Local,       // Filesystem: .astra/skills/, .claude/skills/, .agent/skills/, HOME skills
     Bundled,     // Compiled into binary (16 built-in skills)
@@ -172,7 +172,7 @@ pub enum SkillSourceKind {
 Each source implements `SkillProvider`:
 
 ```rust
-// rust/crates/runtime/src/skills/traits.rs
+// crates/runtime/src/skills/traits.rs
 #[async_trait]
 pub trait SkillProvider: Send + Sync {
     fn source_kind(&self) -> SkillSourceKind;
@@ -206,7 +206,7 @@ UnifiedSkillRegistry::discover_all()
 ### 2.6 Local Skill Search Paths
 
 ```rust
-// rust/crates/runtime/src/skills/loader.rs
+// crates/runtime/src/skills/loader.rs
 pub fn skill_search_paths() -> Vec<PathBuf> {
     vec![
         cwd/.astra/skills/,     // Project-specific
@@ -398,7 +398,7 @@ catalog filtering and `discover_skills`, not by long-lived inclusion flags.
 ### 5.1 ToolRegistry Architecture
 
 ```rust
-// rust/crates/runtime/src/tool_registry/registry.rs
+// crates/runtime/src/tool_registry/registry.rs
 pub struct ToolRegistry {
     all_schemas: Vec<Value>,                // All tool JSON schemas
     budget_tokens: u32,                     // Tool-surface report budget total
@@ -445,7 +445,7 @@ when they intentionally want that schema in `tools[]`.
 The `skill` tool is injected into the ToolRegistry as an always-load, cache-stable schema:
 
 ```rust
-// rust/crates/runtime/src/turn/skill_tool.rs
+// crates/runtime/src/turn/skill_tool.rs
 pub fn skill_tool_schema_v2() -> Value; // open-string `skill_name`, no catalog enum
 
 // Injected via:
@@ -455,7 +455,7 @@ registry.inject_schema("skill", schema);
 The available catalog is rendered separately as a session-scoped prompt section:
 
 ```rust
-// rust/crates/runtime/src/prompts/system.rs
+// crates/runtime/src/prompts/system.rs
 pub fn build_skill_listing_section_for_model(
     skills: &[SkillToolInfo],
     model: Option<&str>,
@@ -487,7 +487,7 @@ paths:
 ### 6.2 Activation Tracking
 
 ```rust
-// rust/crates/runtime/src/skills/activation.rs
+// crates/runtime/src/skills/activation.rs
 pub struct ConditionalSkillTracker {
     activated: HashSet<String>,     // Skill names that matched
     seen_paths: HashSet<String>,    // Dedup: don't re-check same path
@@ -530,7 +530,7 @@ MCP Server
 ### 7.2 McpSkillProvider
 
 ```rust
-// rust/crates/runtime/src/skills/providers/mcp.rs
+// crates/runtime/src/skills/providers/mcp.rs
 pub struct McpSkillProvider {
     cache: RwLock<HashMap<(String, String), McpSkillEntry>>,
     // Keyed by (server_name, skill_name) to prevent cross-server collisions
@@ -588,7 +588,7 @@ runtime. For normal TUI sessions, `spawn_blocking()` used for terminal prompt.
 ## 9. Error Handling [IMPLEMENTED]
 
 ```rust
-// rust/crates/runtime/src/skills/traits.rs
+// crates/runtime/src/skills/traits.rs
 pub enum SkillError {
     NotFound(String),          // Skill not found
     LoadFailed(String),        // Disk read failure
@@ -787,8 +787,8 @@ Both come from same MCP server but enter different systems.
 | Skill tool schema + budget          | ✅ Done    | `runtime/src/turn/skill_tool.rs`                 | 10+   |
 | Conditional activation              | ✅ Done    | `runtime/src/skills/activation.rs`               | 15+   |
 | File watcher hot-reload             | ✅ Done    | `runtime/src/skills/watcher.rs`                  | 3     |
-| CLI /skill commands                 | ✅ Done    | `rust/crates/astra-cli/src/cli/slash_skill.rs`   | 12    |
-| Non-blocking permission             | ✅ Done    | `rust/crates/astra-cli/src/cli/stream_render.rs` | —     |
+| CLI /skill commands                 | ✅ Done    | `crates/astra-cli/src/cli/slash_skill.rs`   | 12    |
+| Non-blocking permission             | ✅ Done    | `crates/astra-cli/src/cli/stream_render.rs` | —     |
 | Per-turn active skill hints         | ✅ Done    | `edge_profile.active_skills`, `allow_skills`     | 10+   |
 | Catalog-backed skills (DB)          | 🔵 Design  | —                                                | —     |
 | Marketplace (Stage)                 | 🔵 Design  | —                                                | —     |

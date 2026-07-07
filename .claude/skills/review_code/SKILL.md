@@ -57,7 +57,7 @@ For each changed behavior, identify:
 Use `rg` to find tests before reading them:
 
 ```bash
-rg -n "<function|type|route|event_name>" rust/crates tests web packages --glob '!target/**'
+rg -n "<function|type|route|event_name>" crates tests web packages --glob '!target/**'
 ```
 
 ## Step 3: Classify Gaps
@@ -92,7 +92,7 @@ Covered:
 - <behavior> proven by <test>
 
 Suggested Checks:
-- <exact command(s), usually cd rust && cargo test -p <crate> <filter>>
+- <exact command(s), usually cargo test -p <crate> <filter>>
 ```
 
 If coverage is adequate, say so and name the tests that prove it.

@@ -1,0 +1,60 @@
+name: compaction_pairing_integrity
+description: |
+  **What**: Interleave tool calls with text responses over many rounds, then verify
+  the session completes without API errors (which happen when tool_use/tool_result
+  messages get unpaired by buggy compaction).
+  **Tests**: Message pairing invariant — every tool_use block must have a matching
+  tool_result. If compaction removes one without the other, Anthropic/Bedrock APIs
+  return 400 "messages: tool_use and tool_result blocks must be paired".
+  **Why**: This is the #1 compaction bug class. The microcompact algorithm clears
+  tool_result content but keeps the structure; if it accidentally drops entire messages
+  or splits paired blocks, the next LLM call crashes.
+  **Pass means**: 6+ tool calls across 3+ turns complete without 400/500 errors.
+  **Fail means**: API rejected the conversation due to unpaired messages (compaction bug).
+prompt: |
+  Do these in separate tool calls, one at a time:
+  1. Run: echo "step-1-marker"
+  2. Run: echo "step-2-marker"
+  3. Read file: Cargo.toml (first 10 lines)
+  Then say "phase-1-complete".
+capability: tool_use
+difficulty: 2
+weight: 1.5
+timeout_seconds: 180
+steps:
+  - prompt: |
+      Continue with more tool calls:
+      4. Run: echo "step-4-marker"
+      5. Run: echo "step-5-marker"
+      6. Read file: Makefile (first 10 lines)
+      Then say "phase-2-complete".
+    criteria:
+      - type: text_contains
+        needle: phase-2-complete
+      - type: tool_called
+        name: bash
+  - prompt: |
+      One final batch:
+      7. Run: echo "step-7-marker"
+      8. Run: echo "step-8-final"
+      Then tell me how many total echo commands you ran across all phases.
+    criteria:
+      - type: text_contains
+        needle: "8"
+      - type: tool_called
+        name: bash
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: bash
+  - type: tool_called
+    name: read_file
+  - type: text_contains
+    needle: phase-1-complete
+  - type: tools_count_between
+    min: 6
+    max: 20
+  - type: turn_rounds_between
+    min: 3
+    max: 40

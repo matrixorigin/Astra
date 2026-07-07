@@ -10,7 +10,7 @@ Typical flow:
     --model-name capacity-mock \
     --write-model-yaml tmp/capacity-mock-model.yaml
 
-  ./rust/target/debug/astra admin model load tmp/capacity-mock-model.yaml --update-existing
+  ./target/debug/astra admin model load tmp/capacity-mock-model.yaml --update-existing
   python3 scripts/load/multi_cli_capacity_probe.py --profile 500-cli \
     --model capacity-mock --register-users --require-distinct-users \
     --require-metrics --require-error-codes-for-failures

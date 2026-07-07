@@ -53,7 +53,7 @@ else
 fi
 
 # ── Optional: fast linker (mold) ──
-CARGO_CONFIG="$PROJECT_ROOT/rust/.cargo/config.toml"
+CARGO_CONFIG="$PROJECT_ROOT/.cargo/config.toml"
 if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
     if command -v mold >/dev/null 2>&1 && command -v clang >/dev/null 2>&1; then
         if [ ! -f "$CARGO_CONFIG" ]; then

@@ -99,7 +99,7 @@ Only the REPL top-level component subscribes via
   `MatrixOneTaskStore::save()` does not notify anyone. Cross-process
   discovery requires polling.
 - TUI rendering: **none**. Zero references to `task_manager` /
-  `session_todos` in `rust/crates/astra-cli/src/tui/`.
+  `session_todos` in `crates/astra-cli/src/tui/`.
 
 ## 3. Design
 

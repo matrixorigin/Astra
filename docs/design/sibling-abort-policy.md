@@ -148,11 +148,11 @@ Until then, "abort on any mutating failure" stays the default.
 
 ## 7. Related code & docs
 
-- `rust/crates/astra-turn-core/src/parallel_tool_exec.rs` — `execute_parallel_round`
-- `rust/crates/astra-turn-core/src/tool_result_semantics.rs` — `ToolErrorSeverity`,
+- `crates/astra-turn-core/src/parallel_tool_exec.rs` — `execute_parallel_round`
+- `crates/astra-turn-core/src/tool_result_semantics.rs` — `ToolErrorSeverity`,
   `is_mutation_tool`
-- `rust/crates/astra-pipeline/src/step_protocol.rs` — `classify_tool_idempotency`
-- `rust/crates/astra-turn-core/tests/parallel_tool_exec_cap_test.rs` — regression
+- `crates/astra-pipeline/src/step_protocol.rs` — `classify_tool_idempotency`
+- `crates/astra-turn-core/tests/parallel_tool_exec_cap_test.rs` — regression
   coverage for both happy (5-tool parallel) and unhappy (bash-failure,
   write-failure) abort paths.
 - PR #222 / #224 / #225 / #227 — the post-merge review follow-ups that

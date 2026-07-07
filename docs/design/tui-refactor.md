@@ -4,7 +4,7 @@
 **Author:** Claude (via xupeng).
 **Supersedes:** nothing formal; absorbs the accumulated patch-series
 `befe51c8b..d1cfb0f3a` (orbiter, thinking window, transcript persist).
-**Scope:** `rust/crates/astra-cli/src/tui/`.
+**Scope:** `crates/astra-cli/src/tui/`.
 
 ---
 

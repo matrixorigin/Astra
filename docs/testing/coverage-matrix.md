@@ -2,7 +2,7 @@
 
 This document maps **user-visible capabilities** to **where they are tested**, so stub/JSON contract tests can be removed without losing the last line of defense. It extends [`system-e2e-matrix.md`](./system-e2e-matrix.md).
 
-Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TEST_DB_IT=1` (real MatrixOne + HTTP + `sqlx` where noted). **Stub** = `build_app(AppState::new(...))` with in-memory/stub services (no DB). **Unit** = `#[cfg(test)]` in crate sources or small integration tests without HTTP.
+Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TEST_DB_IT=1` (real MatrixOne + HTTP + `sqlx` where noted). **Stub** = `build_app(AppState::new(...))` with in-memory/stub services (no DB). **Unit** = `#[cfg(test)]` in crate sources or small integration tests without HTTP.
 
 ## Configuration (`AppSettings`)
 
@@ -60,10 +60,10 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 | `improvement_proofs.rs` | Token/budget/compaction **proofs** vs baselines | None (no HTTP/DB) | **Keep**; move overlapping cases into `astra-runtime` unit tests only if duplicates appear in `src/`. |
 | `utterance_regression.rs` | Utterance/tool-selection regression | Partial overlap with `phase8_regression` / cloud routing | **Keep** for NLP surface; dedupe individual cases incrementally if two tests assert the same ranking. |
 | `bridge_e2e_comprehensive.rs` | 13 E2E tests covering persistence, multi-turn, cancellation, errors via `bridge-e2e-hooks` mock LLM | `chat_turn_bridge_ledger_inject_e2e`, `edge_cloud_round_trip_e2e` | **Keep**; uses `test_llm_rounds` for deterministic testing without real LLM. |
-| Chat turn **pure helpers** (stall, state, persist, routing, cloud/history, …) | `#[cfg(test)]` next to each module under `rust/crates/runtime/src/turn/` | Removed ~33 `chat_turn_*_contract.rs` + matching `fixtures/contracts/chat_turn_*.json` (duplicated JSON snapshots) |
+| Chat turn **pure helpers** (stall, state, persist, routing, cloud/history, …) | `#[cfg(test)]` next to each module under `crates/runtime/src/turn/` | Removed ~33 `chat_turn_*_contract.rs` + matching `fixtures/contracts/chat_turn_*.json` (duplicated JSON snapshots) |
 | Run/chat lifecycle (stub `RunLifecycleService` + `/chat/stream` SSE) | — (Matrix journeys exercise `/runs` list and `journey_tasks_runs` for pause/resume) | `chat_lifecycle_contract` |
 | Memory prefetch (`prefetch_memories` + mock Memoria HTTP) | `bridge_inprocess.rs` unit tests around `prefetch_memories` | `memory_prefetch_contract` |
-| Token / context budget / retrieval JSON tables | `rust/crates/runtime/src/prompts/mod.rs`, `context.rs` `#[cfg(test)]` | `token_retrieval_contract` + `token_retrieval_contract.json` |
+| Token / context budget / retrieval JSON tables | `crates/runtime/src/prompts/mod.rs`, `context.rs` `#[cfg(test)]` | `token_retrieval_contract` + `token_retrieval_contract.json` |
 
 ## Chat turn / bridge (what remains)
 
@@ -78,18 +78,18 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 | Test | Gate |
 |------|------|
 | `astra-services` `multi_agent_integration` | `ASTRA_TEST_DB_IT=1` (PR CI when enabled in [`.github/workflows/test.yml`](../../.github/workflows/test.yml)) |
-| `astra-services` `team_persistence_integration` | `ASTRA_TEST_DB_IT=1` + live MatrixOne (`#[ignore]`); see module doc in `rust/crates/services/tests/team_persistence_integration.rs` |
+| `astra-services` `team_persistence_integration` | `ASTRA_TEST_DB_IT=1` + live MatrixOne (`#[ignore]`); see module doc in `crates/services/tests/team_persistence_integration.rs` |
 
 ## Team (`/teams/*`, orchestration, persistence)
 
 | Capability | E2E (`system_matrix_http_e2e`) | Stub / integration | Other |
 |------------|-------------------------------|----------------------|-------|
-| Team CRUD + list/detail + upsert + delete; empty executions list; snapshots create/list/delete; HTTP negatives (401/404/400 validation); HTTP↔DB column fidelity + cross-user isolation | `journey_team_crud_matrix.rs`, `journey_team_snapshots_matrix.rs`, `journey_team_http_negatives_matrix.rs`, `journey_team_data_fidelity_matrix.rs`, `journey_team_isolation_matrix.rs` (`e2e_matrix_team_*` tests); DB: `team_definitions`, `team_snapshots` | `rust/crates/runtime/tests/team_api_integration.rs` (Tower oneshot, `InMemoryTeamStore`, no DB) | — |
+| Team CRUD + list/detail + upsert + delete; empty executions list; snapshots create/list/delete; HTTP negatives (401/404/400 validation); HTTP↔DB column fidelity + cross-user isolation | `journey_team_crud_matrix.rs`, `journey_team_snapshots_matrix.rs`, `journey_team_http_negatives_matrix.rs`, `journey_team_data_fidelity_matrix.rs`, `journey_team_isolation_matrix.rs` (`e2e_matrix_team_*` tests); DB: `team_definitions`, `team_snapshots` | `crates/runtime/tests/team_api_integration.rs` (Tower oneshot, `InMemoryTeamStore`, no DB) | — |
 | `POST /teams/{name}/execute` (HTTP → `TeamExecutionOrchestrator`, mock `SubRunExecutor`) | — (prod server uses real `ServerSubRunExecutor`; keep execute coverage offline) | `team_execute_http_integration.rs` includes built-in **`review`** + task `review the latest commit` (CLI parity with `/team run review review the latest commit`) happy + failing executor paths | Handler: `team_handlers::execute_team_handler` |
-| `TeamExecutionOrchestrator` + `DelegationEngine` (coordination modes, gates, failure paths) | — | `rust/crates/runtime/tests/team_delegation_integration.rs` (`StubSubRunExecutor` + custom `SubRunExecutor` fakes) | `rust/crates/runtime/src/server/team_orchestrator.rs` `#[cfg(test)]` |
+| `TeamExecutionOrchestrator` + `DelegationEngine` (coordination modes, gates, failure paths) | — | `crates/runtime/tests/team_delegation_integration.rs` (`StubSubRunExecutor` + custom `SubRunExecutor` fakes) | `crates/runtime/src/server/team_orchestrator.rs` `#[cfg(test)]` |
 | Sub-run uses scripted `MockHost` + `run_agentic_loop_with_host` (non-zero usage vs `StubSubRunExecutor`) | — | — | `team_orchestrator.rs` `mock_host_subrun_*` tests |
 | Team definitions + execution history (SQL store) | CRUD + snapshots SQL in team journeys above | — | `team_persistence_integration` (MatrixOne, `#[ignore]`, direct service API) |
-| Delegation mailbox with team-shaped agent ids | — | — | `rust/crates/runtime/src/messaging/orchestrator_mailbox_tests.rs` |
+| Delegation mailbox with team-shaped agent ids | — | — | `crates/runtime/src/messaging/orchestrator_mailbox_tests.rs` |
 
 ## How to run
 

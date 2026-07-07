@@ -100,7 +100,7 @@ def build_command(args: argparse.Namespace) -> ProbeCommand:
         "cargo",
         "test",
         "--manifest-path",
-        "rust/Cargo.toml",
+        "Cargo.toml",
         "-p",
         "astra-runtime",
         "--lib",

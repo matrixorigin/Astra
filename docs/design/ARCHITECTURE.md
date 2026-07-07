@@ -121,7 +121,7 @@ This is the index. Each document is the **single source of truth** for its domai
 
 | Document | Scope |
 |----------|-------|
-| [Edge-Cloud Sync Architecture (Rust audit)](../../rust/docs/edge-cloud-sync-architecture.md) | Learning/events sync, local `~/.astra` layout, `HybridRestoreService` / Step Protocol / resume layering, skill registry vs cloud catalog |
+| [Edge-Cloud Sync Architecture (Rust audit)](../../docs/edge-cloud-sync-architecture.md) | Learning/events sync, local `~/.astra` layout, `HybridRestoreService` / Step Protocol / resume layering, skill registry vs cloud catalog |
 | [Authentication](../implementation/authentication.md) | JWT, ownership-based authorization |
 | [LLM Integration](../implementation/llm-integration.md) | Provider abstraction, auto-detection from DB tokens, routing, cost tracking |
 | [GitHub Integration](../implementation/github-integration.md) | Repo operations, token management |

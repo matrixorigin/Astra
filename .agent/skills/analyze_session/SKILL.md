@@ -38,7 +38,7 @@ astra journal digest <SESSION_ID> --focus summary --format json
 ```
 
 If `astra` is not on `PATH`, try an existing local binary such as
-`rust/target/debug/astra` or `rust/target/release/astra`.
+`target/debug/astra` or `target/release/astra`.
 
 For `/tmp/debug-*.json` input, skip digest metrics and use the debug dump only for
 the message/tool/prompt snapshot it contains.
@@ -46,7 +46,7 @@ the message/tool/prompt snapshot it contains.
 ## Phase 2: Trust The Digest Schema
 
 Stable schema: `schema_version = "astra-journal-digest-v1"` from
-`rust/crates/astra-cli/src/cli/journal_digest.rs`.
+`crates/astra-cli/src/cli/journal_digest.rs`.
 
 Use these fields directly. Do not invent numbers.
 
@@ -100,9 +100,9 @@ Use only when the digest does not answer the question.
 | Heavy prompt checkpoint        | `~/.astra/sessions/<id>/step_checkpoints/*-heavy.json`                              |
 | Debug full turn dump           | `/tmp/debug-*-turn*-full.json`                                                      |
 | Local journal                  | `~/.astra/sessions/<id>.jsonl`                                                      |
-| Session journal implementation | `rust/crates/services/src/session_journal.rs`                                       |
-| Stall/guard implementation     | `rust/crates/runtime/src/turn/`                                                     |
-| Tool surface implementation    | `rust/crates/runtime/src/tool_registry/`, `rust/crates/runtime/src/capabilities.rs` |
+| Session journal implementation | `crates/services/src/session_journal.rs`                                       |
+| Stall/guard implementation     | `crates/runtime/src/turn/`                                                     |
+| Tool surface implementation    | `crates/runtime/src/tool_registry/`, `crates/runtime/src/capabilities.rs` |
 
 ## Output Contract
 

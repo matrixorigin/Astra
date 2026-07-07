@@ -56,10 +56,10 @@ astra admin model load .models.yaml
 astra chat -m "hello"   # prompts login/register on first run
 ```
 
-Binaries are at `rust/target/release/`. Add to your PATH or use full paths:
+Binaries are at `target/release/`. Add to your PATH or use full paths:
 
 ```bash
-export PATH="$PWD/rust/target/release:$PATH"
+export PATH="$PWD/target/release:$PATH"
 ```
 
 ## Basic Usage
@@ -132,7 +132,7 @@ make check              # lint + format
 ## Repository Layout
 
 ```
-rust/crates/
+crates/
   core/        shared types and config
   services/    sessions, journals, durable tasks
   runtime/     Axum HTTP server + contract tests

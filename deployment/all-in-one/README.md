@@ -72,12 +72,12 @@ data volume this performs the initial admin bootstrap. After an admin exists,
 `astra admin register` must be run while logged in as an existing admin.
 
 ```bash
-./rust/target/debug/astra admin --api-url http://127.0.0.1:17001 register \
+./target/debug/astra admin --api-url http://127.0.0.1:17001 register \
   --username admin \
   --email admin@example.com \
   --password '<password>'
 
-./rust/target/debug/astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
+./target/debug/astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
 ```
 
 `astra admin register` stores the returned admin credentials locally. It prints

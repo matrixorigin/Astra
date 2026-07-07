@@ -309,7 +309,7 @@ mod tests {
 
 Run CLI tests:
 ```bash
-cd rust && cargo test -p astra-cli
+cargo test -p astra-cli
 ```
 
 ## Performance Considerations

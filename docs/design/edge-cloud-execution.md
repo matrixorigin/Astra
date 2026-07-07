@@ -53,7 +53,7 @@ Three related paths:
 
 3. **HTTP catalog** — `GET /skills` (via `ThinClient`) supports slash commands, marketplace version checks, published/user skill flows, and the Web composer picker. It returns the same server-visible catalog used by runtime selection: `~/.astra/skills`, `~/.claude/skills`, and `skills_registry` rows where `created_by = user OR is_public = 1`.
 
-For sync-oriented diagrams and resume/checkpoint behavior, see [`rust/docs/edge-cloud-sync-architecture.md`](../../rust/docs/edge-cloud-sync-architecture.md) §8.5.
+For sync-oriented diagrams and resume/checkpoint behavior, see [`docs/edge-cloud-sync-architecture.md`](../../docs/edge-cloud-sync-architecture.md) §8.5.
 
 ### What the cloud does per `/chat/turn` (not just proxying)
 

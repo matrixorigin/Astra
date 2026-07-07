@@ -8,9 +8,9 @@ LOG_FILE="api_server.log"
 
 BUILD_MODE="${BUILD_MODE:-release}"
 if [ "$BUILD_MODE" = "debug" ]; then
-    BIN_PATH="rust/target/debug/astra-server"
+    BIN_PATH="target/debug/astra-server"
 else
-    BIN_PATH="rust/target/release/astra-server"
+    BIN_PATH="target/release/astra-server"
 fi
 
 echo "Starting API server (mode: $BUILD_MODE)..."
@@ -75,11 +75,11 @@ if [ "${SKIP_BUILD:-}" = "1" ] && [ -f "$BIN_PATH" ]; then
     echo "⏩ Skipping build (SKIP_BUILD=1)"
 elif [ "$BUILD_MODE" = "debug" ]; then
     echo "Building debug API binary..."
-    cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --bin astra-server
+    cargo build -q --manifest-path Cargo.toml -p astra-runtime --bin astra-server
     echo "✅ Using $BIN_PATH"
 else
     echo "Building release API binary..."
-    cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server
+    cargo build -q --manifest-path Cargo.toml -p astra-runtime --release --bin astra-server
     echo "✅ Using $BIN_PATH"
 fi
 

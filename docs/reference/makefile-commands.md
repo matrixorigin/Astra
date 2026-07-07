@@ -39,7 +39,7 @@
 | Command | Description |
 | --- | --- |
 | `make build` | Build the Rust workspace in release mode (same as `build-release`) |
-| `make build-release` | Build the Rust workspace in release mode (`rust/target/release`) |
+| `make build-release` | Build the Rust workspace in release mode (`target/release`) |
 | `make build-server` | Build `astra-server` in release mode (same as `build-server-release`) |
 | `make build-server-release` | Build `astra-server` in release mode |
 | `make build-cli` | Build the `astra` CLI in release mode (same as `build-cli-release`) |
@@ -58,7 +58,7 @@
 ## Useful Direct Cargo Commands
 
 ```bash
-cargo test --manifest-path rust/Cargo.toml -q
-cargo check --manifest-path rust/Cargo.toml
-cargo fmt --all --manifest-path rust/Cargo.toml
+cargo test --manifest-path Cargo.toml -q
+cargo check --manifest-path Cargo.toml
+cargo fmt --all --manifest-path Cargo.toml
 ```

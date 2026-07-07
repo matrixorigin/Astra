@@ -290,7 +290,7 @@ These are not shared runtime semantics:
 
 Shared runtime module:
 
-`rust/crates/runtime/src/orchestration/agent_tool.rs`
+`crates/runtime/src/orchestration/agent_tool.rs`
 
 Responsibilities:
 
@@ -323,7 +323,7 @@ pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> 
 
 `handle_agent_tool` returns the stringified tool output because the existing CLI and server tool interfaces both consume string output. JSON construction still lives in the shared handler so wrappers do not own rendering semantics.
 
-Compatibility note: keep `rust/crates/astra-cli/src/edge_tools/agent_spawning.rs` as a thin wrapper during migration, but remove its independent parsing logic. It should delegate to runtime.
+Compatibility note: keep `crates/astra-cli/src/edge_tools/agent_spawning.rs` as a thin wrapper during migration, but remove its independent parsing logic. It should delegate to runtime.
 
 Hard rule: `ServerToolExecutor` must not copy or reimplement spawn/get_result validation. It should call this shared module.
 
@@ -340,7 +340,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
 
 The current implementation places it near `ServerSubRunExecutor` in:
 
-`rust/crates/runtime/src/server/run_lifecycle.rs`
+`crates/runtime/src/server/run_lifecycle.rs`
 
 It can be moved later to a dedicated module if the file is split, but the
 adapter boundary must stay the same:

@@ -27,9 +27,9 @@ fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
 if [ "$BUILD_MODE" = "release" ]; then
-    BIN_PATH="$REPO_ROOT/rust/target/release/astra-edge"
+    BIN_PATH="$REPO_ROOT/target/release/astra-edge"
 else
-    BIN_PATH="$REPO_ROOT/rust/target/debug/astra-edge"
+    BIN_PATH="$REPO_ROOT/target/debug/astra-edge"
 fi
 
 echo "Starting astra-edge provider (mode: $BUILD_MODE, workspace: $WORKSPACE_DIR)..."
@@ -83,10 +83,10 @@ fi
 
 if [ "$BUILD_MODE" = "release" ]; then
     echo "Building release astra-edge binary..."
-    cargo build -q --manifest-path "$REPO_ROOT/rust/Cargo.toml" -p astra-edge --release --bin astra-edge
+    cargo build -q --manifest-path "$REPO_ROOT/Cargo.toml" -p astra-edge --release --bin astra-edge
 else
     echo "Building debug astra-edge binary..."
-    cargo build -q --manifest-path "$REPO_ROOT/rust/Cargo.toml" -p astra-edge --bin astra-edge
+    cargo build -q --manifest-path "$REPO_ROOT/Cargo.toml" -p astra-edge --bin astra-edge
 fi
 
 if ! NO_PROXY=localhost,127.0.0.1 curl -s --connect-timeout 1 --max-time 2 "$SERVER_HEALTH_URL" >/dev/null 2>&1; then

@@ -227,13 +227,13 @@ The first implementation should follow existing runtime/service layering.
 
 | Module | Contents |
 | --- | --- |
-| `rust/crates/services/src/tuning_job.rs` | Core structs, enums, repository trait, service logic |
-| `rust/crates/services/src/tuning_job_repository.rs` | SQL-backed repository and in-memory repository |
-| `rust/crates/services/src/tuning_job_controller.rs` | MVP `JobController` state-machine runner |
-| `rust/crates/services/src/tuning_harness.rs` | Harness adapter trait and first benchmark adapter |
-| `rust/crates/runtime/src/server/tuning_handlers.rs` | HTTP handlers and request/response validation |
-| `rust/crates/astra-cli/src/cli/slash/slash_tuning.rs` | `/tuning` command parsing and rendering |
-| `rust/crates/services/src/introspection/...` | Observation provider for tuning events/status |
+| `crates/services/src/tuning_job.rs` | Core structs, enums, repository trait, service logic |
+| `crates/services/src/tuning_job_repository.rs` | SQL-backed repository and in-memory repository |
+| `crates/services/src/tuning_job_controller.rs` | MVP `JobController` state-machine runner |
+| `crates/services/src/tuning_harness.rs` | Harness adapter trait and first benchmark adapter |
+| `crates/runtime/src/server/tuning_handlers.rs` | HTTP handlers and request/response validation |
+| `crates/astra-cli/src/cli/slash/slash_tuning.rs` | `/tuning` command parsing and rendering |
+| `crates/services/src/introspection/...` | Observation provider for tuning events/status |
 
 The module names can move to match crate conventions, but the boundaries should
 stay: repository owns persistence, service owns user/API semantics, controller

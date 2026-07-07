@@ -6,7 +6,7 @@ Layered security model adapted to the existing Rust codebase.
 
 ### 1. Permission/Approval System (VERY HIGH — Security)
 
-**File: `rust/crates/astra-cli/src/cli/permission_manager.rs`**
+**File: `crates/astra-cli/src/cli/permission_manager.rs`**
 
 - **Rule-based permissions**: Added `PermissionRule` with glob-style matching (`Bash(git commit:*)`)
 - **Settings persistence**: `PermissionSettings` loads/saves from `.kiro/permissions.json`
@@ -24,7 +24,7 @@ Layered security model adapted to the existing Rust codebase.
 
 ### 2. Git Commit/Push Safety (HIGH — Safety)
 
-**New file: `rust/crates/runtime/src/tool_sandbox/git_safety.rs`**
+**New file: `crates/runtime/src/tool_sandbox/git_safety.rs`**
 
 Validates git commands before execution:
 - **Commit message injection**: Blocks `$()`, backticks, `${}` in double-quoted `-m` messages
@@ -39,7 +39,7 @@ Validates git commands before execution:
 
 ### 3. Shell Output Streaming (HIGH — UX)
 
-**File: `rust/crates/astra-cli/src/edge_tools/shell.rs`**
+**File: `crates/astra-cli/src/edge_tools/shell.rs`**
 
 - **`run_command_streaming()`**: New streaming execution function alongside existing `run_command_with_cleanup()`
   - Reads stdout/stderr incrementally via background threads
@@ -49,7 +49,7 @@ Validates git commands before execution:
 
 ### 4. Timeout Auto-Backgrounding (MEDIUM — UX)
 
-**File: `rust/crates/astra-cli/src/edge_tools/shell.rs`**
+**File: `crates/astra-cli/src/edge_tools/shell.rs`**
 
 - **Auto-backgrounding**: When `allow_background=true` and timeout hits, the process is detached instead of killed
 - **Size watchdog**: Background thread monitors process, kills after 30 minutes max
@@ -57,7 +57,7 @@ Validates git commands before execution:
 
 ### 5. Security Hardening (MEDIUM — Hardening)
 
-**New file: `rust/crates/runtime/src/tool_sandbox/shell_hardening.rs`**
+**New file: `crates/runtime/src/tool_sandbox/shell_hardening.rs`**
 
 - **Extglob disable**: `shopt -u extglob || setopt NO_EXTENDED_GLOB` (bash/zsh compatible)
   - Prevents malicious filename expansion after security validation
@@ -71,7 +71,7 @@ Validates git commands before execution:
 - **Dangerous file paths**: `DANGEROUS_FILE_PATHS` constant + `is_dangerous_file_path()` check
   - .git/, .bashrc, .zshrc, .ssh/, .kiro/, .vscode/, etc.
 
-**File: `rust/crates/runtime/src/tool_sandbox/command.rs`**
+**File: `crates/runtime/src/tool_sandbox/command.rs`**
 
 - `wrap_command_with_limits()` now applies shell hardening preamble in Standard+ modes
 - `filter_environment()` now scrubs secrets in Standard+ modes

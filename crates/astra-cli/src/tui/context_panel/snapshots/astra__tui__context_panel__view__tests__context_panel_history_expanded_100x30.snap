@@ -1,0 +1,26 @@
+---
+source: crates/astra-cli/src/tui/context_panel/view.rs
+assertion_line: 2081
+expression: buffer_to_string(&buf)
+---
+  2.0k / 100.0k tokens  (2.0%)
+  ↑/↓ select · Enter drill · Tab next · Esc back
+
+  ⛁ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛁ System prompt     2.0k  ( 2.0%)
+  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   ⛶ Free space       98.0k  (98.0%)
+  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶
+  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶
+  ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶
+
+ ▼ History · conversation turns
+    └ 3 turns  (3 retained · 0 compressed · 0 dropped)
+    ↑/↓ select · Enter drill · Tab next · Esc back
+        └ #0 user   80 tokens
+             Can you refactor the auth module so the session validator lives
+             in its own file?
+      ▸ └ #1 assistant   4.2k tokens  [tools]
+             I'll start by reading auth.rs and mapping out every caller.
+
+             Let me look at the module structure first, then identify what…
+        └ #2 user   40 tokens
+             Thanks — now make the helper private.

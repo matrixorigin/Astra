@@ -214,7 +214,7 @@ The server-side ChatLoop must be refactored to support per-turn execution (edge 
 
 ### B4: Admin API endpoints + astra admin migration
 
-**Modified file**: `api/routers/admin.py` (already exists); admin CLI is `rust/crates/astra-cli`
+**Modified file**: `api/routers/admin.py` (already exists); admin CLI is `crates/astra-cli`
 
 | Endpoint | What it does | Auth |
 |---|---|---|
@@ -232,7 +232,7 @@ Migrate astra admin commands to use API client instead of direct DB.
 
 ### B5: Remove direct DB path + CLI packaging
 
-**Modified files** (historical Python layout; current code: `rust/crates/astra-cli`, `rust/crates/astra-cli`)
+**Modified files** (historical Python layout; current code: `crates/astra-cli`, `crates/astra-cli`)
 
 | Item | Detail |
 |---|---|

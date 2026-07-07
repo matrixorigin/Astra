@@ -4,7 +4,7 @@
 
 set -e
 
-ASTRA_BIN="${ASTRA_BIN:-$(cd "$(dirname "$0")/../.." && pwd)/rust/target/release/astra}"
+ASTRA_BIN="${ASTRA_BIN:-$(cd "$(dirname "$0")/../.." && pwd)/target/release/astra}"
 CODEX_BIN=$(which codex 2>/dev/null || echo "")
 WIDTH=100
 HEIGHT=30

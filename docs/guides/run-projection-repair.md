@@ -127,20 +127,20 @@ repair endpoint so list queries and indexed projection reads are restored.
 Fast HTTP tests:
 
 ```bash
-cargo test --manifest-path rust/Cargo.toml -p astra-runtime \
+cargo test --manifest-path Cargo.toml -p astra-runtime \
   repair_run_projection_http_rebuilds_and_returns_projection --lib -- --nocapture
 ```
 
 MatrixOne-backed repair test:
 
 ```bash
-ASTRA_TEST_DB_IT=1 cargo test --manifest-path rust/Cargo.toml -p astra-runtime \
+ASTRA_TEST_DB_IT=1 cargo test --manifest-path Cargo.toml -p astra-runtime \
   repair_run_projection_http_repairs_real_database_projection --lib -- --ignored --nocapture
 ```
 
 Service-level rebuild test:
 
 ```bash
-cargo test --manifest-path rust/Cargo.toml -p astra-services \
+cargo test --manifest-path Cargo.toml -p astra-services \
   rebuild_run_projection_repairs_stale_projection_from_facts --lib -- --nocapture
 ```

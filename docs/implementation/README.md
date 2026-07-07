@@ -10,7 +10,7 @@ This directory contains detailed implementation documentation for astra-engine f
 Unified tool surface with a stable always-load set, deferred manifest, and explicit `tool_search` activation.
 
 - **Architecture:** [../design/tool-discovery-claude-code.md](../design/tool-discovery-claude-code.md)
-- **Implementation:** `rust/crates/runtime/src/tool_registry/`
+- **Implementation:** `crates/runtime/src/tool_registry/`
 
 ### Other Features
 

@@ -48,7 +48,7 @@ yarn-error.log*
 .eslintcache
 
 # Rust
-rust/target/
+target/
 
 # Agent tool configs (track project rules, ignore user-local extras)
 .cursor/plans/
@@ -97,11 +97,11 @@ review/
 # fixtures/vcr_cassettes/*.yaml
 *.spec
 .mo-session/
-rust/budget-app/
+budget-app/
 .mo-delivery-*.json
 # Local cargo config lives here; only audit policy is tracked for CI.
-rust/.cargo/*
-!rust/.cargo/audit.toml
+.cargo/*
+!.cargo/audit.toml
 
 
 # Benchmarks (local SWE-bench workspaces, runs, reports)

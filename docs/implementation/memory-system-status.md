@@ -4,7 +4,7 @@
 > [../design/memory-runtime.md](../design/memory-runtime.md). This file
 > describes the Python-era memory backend (`core/memory/tabular/`, Python
 > `GovernanceScheduler`, `SessionSummarizer`) that has been replaced by
-> Memoria HTTP + the runtime path in `rust/crates/runtime/src/turn/`. It is
+> Memoria HTTP + the runtime path in `crates/runtime/src/turn/`. It is
 > retained for historical context only.
 
 > **Last Updated**: 2026-03-15 (Python-era, frozen)

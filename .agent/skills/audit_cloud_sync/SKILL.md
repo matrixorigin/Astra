@@ -31,12 +31,12 @@ $ARGUMENTS
 Before querying data, confirm table names and owner modules from the repo:
 
 ```bash
-rg -n "CREATE TABLE IF NOT EXISTS (agent_events|agent_sessions|session_checkpoints|run_checkpoints|agent_tasks|task_contracts|verification_results|user_preferences|skills_registry)" rust/crates/services/src/storage.rs
-rg -n "HybridRestoreService|RestoredSession|restore_recent_tools|session_checkpoints|run_checkpoints|learning_snapshots|skills_registry" rust/crates/services rust/crates/runtime rust/crates/astra-cli --glob '!target/**'
+rg -n "CREATE TABLE IF NOT EXISTS (agent_events|agent_sessions|session_checkpoints|run_checkpoints|agent_tasks|task_contracts|verification_results|user_preferences|skills_registry)" crates/services/src/storage.rs
+rg -n "HybridRestoreService|RestoredSession|restore_recent_tools|session_checkpoints|run_checkpoints|learning_snapshots|skills_registry" crates/services crates/runtime crates/astra-cli --glob '!target/**'
 ```
 
 Reference document when the issue involves restore, checkpoints, or skill paths:
-`rust/docs/edge-cloud-sync-architecture.md`, especially section 8.
+`docs/edge-cloud-sync-architecture.md`, especially section 8.
 
 Important current facts:
 
