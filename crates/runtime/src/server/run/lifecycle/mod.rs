@@ -3218,10 +3218,22 @@ impl AgenticRunLifecycleService {
         format!("## Agent Binding Instruction\n{}", binding.agent_md)
     }
 
+    fn agent_binding_turn_context_section(context: &Map<String, Value>) -> Option<String> {
+        if context.is_empty() {
+            return None;
+        }
+        let payload = serde_json::to_string_pretty(&Value::Object(context.clone()))
+            .expect("serde_json::Value serialization should not fail");
+        Some(format!(
+            "## Runtime Turn Context\nThe following JSON is provided by the runtime for this turn. Treat it as authoritative MOI context.\n```json\n{payload}\n```"
+        ))
+    }
+
     fn apply_agent_binding_prompt_override(
         edge_profile: &mut Map<String, Value>,
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         runtime_system_prompt: Option<&str>,
+        request_context: Option<&Map<String, Value>>,
     ) {
         let existing = edge_profile
             .get("system_prompt_override")
@@ -3230,13 +3242,21 @@ impl AgenticRunLifecycleService {
             .map(str::to_string);
         let binding_section = agent_binding_context
             .map(|context| Self::agent_binding_prompt_section(&context.binding));
+        let turn_context_section = agent_binding_context
+            .and_then(|_| request_context)
+            .and_then(Self::agent_binding_turn_context_section);
         let runtime_section = runtime_system_prompt
             .filter(|prompt| !prompt.is_empty())
             .map(str::to_string);
-        let sections = [existing, binding_section, runtime_section]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let sections = [
+            existing,
+            binding_section,
+            turn_context_section,
+            runtime_section,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         if sections.is_empty() {
             return;
         }
@@ -5019,6 +5039,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut edge_profile,
             runtime_capabilities.agent_binding.as_ref(),
             request.runtime_system_prompt.as_deref(),
+            request.context.as_ref(),
         );
 
         // Guard: reject if this session already has a blocking run.
@@ -5899,6 +5920,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut edge_profile,
             runtime_capabilities.agent_binding.as_ref(),
             request.runtime_system_prompt.as_deref(),
+            request.context.as_ref(),
         );
 
         // Provision explicit workspace bindings early so build_initial_state

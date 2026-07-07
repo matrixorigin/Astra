@@ -6327,6 +6327,7 @@ fn agent_binding_prompt_override_appends_stable_section() {
         &mut edge_profile,
         Some(&context),
         None,
+        None,
     );
 
     assert_eq!(
@@ -6351,6 +6352,7 @@ fn agent_binding_prompt_override_appends_runtime_system_prompt() {
         &mut edge_profile,
         Some(&context),
         Some("Runtime SQL scope db_name: retail."),
+        None,
     );
 
     assert_eq!(
@@ -6361,6 +6363,47 @@ fn agent_binding_prompt_override_appends_runtime_system_prompt() {
             "## Agent Binding Instruction\nAlways follow the binding contract.\n\nRuntime SQL scope db_name: retail."
         )
     );
+}
+
+#[test]
+fn agent_binding_prompt_override_appends_moi_turn_context() {
+    let context = PreparedAgentBindingLoopContext {
+        binding: test_agent_binding_record(Some(3)),
+        skill_resolver: None,
+    };
+    let mut edge_profile = serde_json::Map::new();
+    let request_context = json!({
+        "mode": "create",
+        "raw_advice": "Build a GitHub triage agent.",
+        "resources": {
+            "models": [{"name": "qwen3.7-max", "model_name": "qwen3.7-max"}],
+            "tools": [{"name": "GitHub"}],
+            "skills": [{"name": "Artifacts"}],
+            "knowledge_bases": []
+        }
+    })
+    .as_object()
+    .expect("context object")
+    .clone();
+
+    AgenticRunLifecycleService::apply_agent_binding_prompt_override(
+        &mut edge_profile,
+        Some(&context),
+        None,
+        Some(&request_context),
+    );
+
+    let prompt = edge_profile
+        .get("system_prompt_override")
+        .and_then(Value::as_str)
+        .expect("system prompt override");
+    assert!(prompt.contains("## Agent Binding Instruction"));
+    assert!(prompt.contains("## Runtime Turn Context"));
+    assert!(prompt.contains("\"mode\": \"create\""));
+    assert!(prompt.contains("\"raw_advice\": \"Build a GitHub triage agent.\""));
+    assert!(prompt.contains("\"name\": \"GitHub\""));
+    assert!(prompt.contains("\"name\": \"Artifacts\""));
+    assert!(prompt.contains("\"model_name\": \"qwen3.7-max\""));
 }
 
 #[test]
@@ -6382,6 +6425,7 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_max_steps() {
         &mut edge_profile,
         Some(&binding_context),
         None,
+        req.context.as_ref(),
     );
 
     let state = svc.build_initial_state_inner(
