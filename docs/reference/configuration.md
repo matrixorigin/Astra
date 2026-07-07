@@ -48,10 +48,14 @@ External identities are configured as server-side providers under `auth.external
 the server into a separate auth mode.
 
 ```toml
-[auth]
-external_providers = [
-  { id = "moi", display_name = "MOI", external_auth_endpoint = "http://moi-catalog/api/v1/astra/external-auth" }
-]
+[[auth.external_providers]]
+id = "moi"
+display_name = "MOI"
+external_auth_endpoint = "http://moi-catalog/api/v1/astra/external-auth"
+
+[auth.external_providers.request_auth]
+type = "hmac"
+key = "${ASTRA_PROVIDER_HMAC_KEY}"
 ```
 
 ### LLM

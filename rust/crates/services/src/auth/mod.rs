@@ -8,7 +8,9 @@ use axum::{
     Json,
     http::{HeaderMap, StatusCode},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bcrypt::{hash as bcrypt_hash, verify as bcrypt_verify};
+use hmac::{Hmac, Mac};
 
 /// Resolve bcrypt cost from `ASTRA_BCRYPT_COST`, falling back to `bcrypt::DEFAULT_COST` (12).
 /// Tests set a low cost (e.g. `4`) to avoid multi-hundred-millisecond hashing in debug builds;
@@ -24,6 +26,8 @@ fn bcrypt_cost_from_env() -> u32 {
     })
 }
 use chrono::{Duration as ChronoDuration, Utc};
+use serde::Deserialize;
+use sha2::Sha256;
 use sqlx::{MySql, Row, query};
 use tracing::warn;
 use uuid::Uuid;
@@ -69,6 +73,142 @@ use validation::validate_register_request;
 type AuthHttpError = (StatusCode, Json<ErrorResponse>);
 type ExternalRequestAuthHeaders = Option<(String, String, String)>;
 type ParsedTokenSession = (String, String, Option<String>);
+type HmacSha256 = Hmac<Sha256>;
+const PROVIDER_REQUEST_TOKEN_PREFIX: &str = "moi-provider-v1";
+
+#[derive(Debug, Deserialize)]
+struct ProviderRequestClaims {
+    sub: String,
+    scope: String,
+    provider: String,
+    iat: i64,
+    exp: i64,
+}
+
+fn verify_provider_request_hmac_token(
+    expected_provider: &str,
+    key: &str,
+    bearer_token: &str,
+) -> Result<ExternalAuthorizedRequest, AuthHttpError> {
+    if key.is_empty() || key.trim() != key {
+        return Err(provider_request_auth_error(
+            "Provider request HMAC key is not configured",
+        ));
+    }
+    let token = bearer_token.strip_prefix("Bearer ").ok_or_else(|| {
+        error_response_coded(
+            StatusCode::UNAUTHORIZED,
+            "Provider request token must use Bearer authorization",
+            "external_request_auth_invalid",
+        )
+    })?;
+    if token.is_empty() || token.trim() != token {
+        return Err(provider_request_auth_error(
+            "Provider request token must not be empty or padded",
+        ));
+    }
+    let mut parts = token.split('.');
+    let Some(prefix) = parts.next() else {
+        return Err(provider_request_auth_error(
+            "Provider request token is malformed",
+        ));
+    };
+    let Some(encoded_claims) = parts.next() else {
+        return Err(provider_request_auth_error(
+            "Provider request token is malformed",
+        ));
+    };
+    let Some(encoded_signature) = parts.next() else {
+        return Err(provider_request_auth_error(
+            "Provider request token is malformed",
+        ));
+    };
+    if parts.next().is_some() || prefix != PROVIDER_REQUEST_TOKEN_PREFIX {
+        return Err(provider_request_auth_error(
+            "Provider request token is malformed",
+        ));
+    }
+    if !verify_provider_request_signature(key.as_bytes(), encoded_claims, encoded_signature) {
+        return Err(provider_request_auth_error(
+            "Provider request token signature is invalid",
+        ));
+    }
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(encoded_claims)
+        .map_err(|_| provider_request_auth_error("Provider request token claims are malformed"))?;
+    let claims: ProviderRequestClaims = serde_json::from_slice(&claims_bytes)
+        .map_err(|_| provider_request_auth_error("Provider request token claims are malformed"))?;
+    validate_provider_request_claims(expected_provider, &claims)?;
+    Ok(ExternalAuthorizedRequest {
+        provider_id: expected_provider.to_string(),
+        external_subject: claims.sub,
+        provider_scope_id: claims.scope,
+        request_authorization_id: format!("{PROVIDER_REQUEST_TOKEN_PREFIX}:{encoded_signature}"),
+    })
+}
+
+fn validate_provider_request_claims(
+    expected_provider: &str,
+    claims: &ProviderRequestClaims,
+) -> Result<(), AuthHttpError> {
+    for (field, value) in [
+        ("sub", claims.sub.as_str()),
+        ("scope", claims.scope.as_str()),
+        ("provider", claims.provider.as_str()),
+    ] {
+        if value.is_empty() || value.trim() != value {
+            return Err(provider_request_auth_error(format!(
+                "Provider request claim {field} must not be empty or padded"
+            )));
+        }
+    }
+    if claims.provider != expected_provider {
+        return Err(provider_request_auth_error(
+            "Provider request token provider does not match request provider",
+        ));
+    }
+    if claims.iat <= 0 || claims.exp <= 0 || claims.exp <= claims.iat {
+        return Err(provider_request_auth_error(
+            "Provider request token time claims are invalid",
+        ));
+    }
+    if Utc::now().timestamp() >= claims.exp {
+        return Err(provider_request_auth_error(
+            "Provider request token has expired",
+        ));
+    }
+    Ok(())
+}
+
+fn provider_request_auth_error(message: impl Into<String>) -> AuthHttpError {
+    error_response_coded(
+        StatusCode::UNAUTHORIZED,
+        message.into(),
+        "external_request_auth_invalid",
+    )
+}
+
+#[cfg(test)]
+fn provider_request_signature(key: &[u8], encoded_claims: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(encoded_claims.as_bytes());
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+fn verify_provider_request_signature(
+    key: &[u8],
+    encoded_claims: &str,
+    encoded_signature: &str,
+) -> bool {
+    let Ok(signature) = URL_SAFE_NO_PAD.decode(encoded_signature) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+        return false;
+    };
+    mac.update(encoded_claims.as_bytes());
+    mac.verify_slice(&signature).is_ok()
+}
 
 #[async_trait]
 pub trait AuthService: Send + Sync {
@@ -1553,17 +1693,30 @@ impl AuthService for DatabaseAuthService {
             return self.current_principal(headers).await;
         };
         let provider = self.provider_config(&provider_id)?.clone();
-        let authorized = self
-            .external_client
-            .authorize_request(
-                &provider,
-                ExternalAuthorizeRequestData {
-                    provider_id: provider_id.clone(),
-                    token,
-                    request,
-                },
-            )
-            .await?;
+        let authorized = if let Some(request_auth) = &provider.request_auth {
+            let Some(key) = request_auth.hmac_key() else {
+                return Err(provider_request_auth_error(
+                    "Provider request auth configuration is unsupported",
+                ));
+            };
+            verify_provider_request_hmac_token(&provider.id, key, &token)?
+        } else {
+            if provider.id == "moi" {
+                return Err(provider_request_auth_error(
+                    "MOI provider request auth requires local hmac configuration",
+                ));
+            }
+            self.external_client
+                .authorize_request(
+                    &provider,
+                    ExternalAuthorizeRequestData {
+                        provider_id: provider_id.clone(),
+                        token,
+                        request,
+                    },
+                )
+                .await?
+        };
         let user_id = format!(
             "external_authorized:{}:{}",
             authorized.provider_id, authorized.external_subject
@@ -1742,8 +1895,83 @@ impl AuthService for StubAuthService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_core::ExternalRequestAuthConfig;
     use async_trait::async_trait;
     use chrono::Utc;
+    use serde_json::json;
+
+    const TEST_PROVIDER_HMAC_KEY: &str = "test-provider-hmac-key";
+
+    fn hmac_provider_token(
+        subject: &str,
+        scope: &str,
+        provider: &str,
+        iat: i64,
+        exp: i64,
+    ) -> String {
+        let claims = json!({
+            "sub": subject,
+            "scope": scope,
+            "provider": provider,
+            "iat": iat,
+            "exp": exp,
+        });
+        let encoded_claims =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims json"));
+        let signature =
+            provider_request_signature(TEST_PROVIDER_HMAC_KEY.as_bytes(), &encoded_claims);
+        format!("{PROVIDER_REQUEST_TOKEN_PREFIX}.{encoded_claims}.{signature}")
+    }
+
+    fn hmac_provider_service() -> DatabaseAuthService {
+        DatabaseAuthService::new(
+            astra_core::MatrixOneSettings::mock(),
+            JwtSettings {
+                secret_key: "test-secret-key-for-unit-tests".into(),
+                algorithm: "HS256".into(),
+                access_token_expire_minutes: 60,
+                refresh_token_expire_days: 7,
+            },
+        )
+        .with_external_providers(vec![ExternalAuthProviderConfig {
+            id: "moi".to_string(),
+            display_name: "MOI".to_string(),
+            external_auth_endpoint: "http://127.0.0.1/external-auth".to_string(),
+            request_auth: Some(ExternalRequestAuthConfig::Hmac {
+                key: TEST_PROVIDER_HMAC_KEY.to_string(),
+            }),
+        }])
+    }
+
+    fn provider_headers(token: &str, provider: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {token}")
+                .parse()
+                .expect("authorization header"),
+        );
+        headers.insert(
+            "x-astra-external-provider",
+            provider.parse().expect("provider header"),
+        );
+        headers.insert(
+            "x-astra-external-action",
+            "authorize_request".parse().expect("action header"),
+        );
+        headers
+    }
+
+    fn chat_stream_descriptor() -> ExternalRequestDescriptor {
+        ExternalRequestDescriptor {
+            method: "POST".to_string(),
+            path: "/chat/stream".to_string(),
+            route: Some("/chat/stream".to_string()),
+            request_id: None,
+            body_digest: None,
+        }
+    }
+
     struct AuthorizingProviderClient;
 
     #[async_trait]
@@ -1753,13 +1981,13 @@ mod tests {
             provider: &ExternalAuthProviderConfig,
             request: ExternalAuthorizeRequestData,
         ) -> Result<ExternalAuthorizedRequest, (StatusCode, Json<ErrorResponse>)> {
-            assert_eq!(provider.id, "moi");
+            assert_eq!(provider.id, "legacy");
             assert_eq!(request.token, "Bearer provider-token");
             assert_eq!(request.request.method, "POST");
             assert_eq!(request.request.path, "/chat/stream");
             assert!(request.request.body_digest.is_none());
             Ok(ExternalAuthorizedRequest {
-                provider_id: "moi".to_string(),
+                provider_id: "legacy".to_string(),
                 external_subject: "moi-user-1".to_string(),
                 provider_scope_id: "workspace-1".to_string(),
                 request_authorization_id: "authz-1".to_string(),
@@ -1822,9 +2050,10 @@ mod tests {
             },
         )
         .with_external_providers(vec![ExternalAuthProviderConfig {
-            id: "moi".to_string(),
-            display_name: "MOI".to_string(),
+            id: "legacy".to_string(),
+            display_name: "Legacy".to_string(),
             external_auth_endpoint: "http://127.0.0.1/external-auth".to_string(),
+            request_auth: None,
         }])
         .with_external_provider_client(std::sync::Arc::new(AuthorizingProviderClient));
         let mut headers = HeaderMap::new();
@@ -1836,7 +2065,7 @@ mod tests {
         );
         headers.insert(
             "x-astra-external-provider",
-            "moi".parse().expect("provider header"),
+            "legacy".parse().expect("provider header"),
         );
         headers.insert(
             "x-astra-external-action",
@@ -1859,13 +2088,171 @@ mod tests {
 
         match principal.origin {
             AuthPrincipalOrigin::ExternalAuthorizedRequest(context) => {
-                assert_eq!(context.provider_id, "moi");
+                assert_eq!(context.provider_id, "legacy");
                 assert_eq!(context.external_subject, "moi-user-1");
                 assert_eq!(context.provider_scope_id, "workspace-1");
                 assert_eq!(context.request_authorization_id, "authz-1");
             }
             other => panic!("expected external_authorized_request, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_moi_without_hmac_request_auth() {
+        let service = DatabaseAuthService::new(
+            astra_core::MatrixOneSettings::mock(),
+            JwtSettings {
+                secret_key: "test-secret-key-for-unit-tests".into(),
+                algorithm: "HS256".into(),
+                access_token_expire_minutes: 60,
+                refresh_token_expire_days: 7,
+            },
+        )
+        .with_external_providers(vec![ExternalAuthProviderConfig {
+            id: "moi".to_string(),
+            display_name: "MOI".to_string(),
+            external_auth_endpoint: "http://127.0.0.1/external-auth".to_string(),
+            request_auth: None,
+        }])
+        .with_external_provider_client(std::sync::Arc::new(AuthorizingProviderClient));
+        let (status, body) = service
+            .current_principal_for_request(
+                &provider_headers("provider-token", "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect_err("moi provider request without hmac should be rejected");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("external_request_auth_invalid")
+        );
+        assert!(body.0.detail.contains("local hmac"));
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_verifies_provider_hmac_token() {
+        let now = Utc::now().timestamp();
+        let token = hmac_provider_token("user_1", "workspace_1", "moi", now, now + 300);
+        let principal = hmac_provider_service()
+            .current_principal_for_request(
+                &provider_headers(&token, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect("hmac provider request should resolve");
+
+        assert_eq!(principal.user.user_id, "external_authorized:moi:user_1");
+        assert_eq!(principal.user.username, "user_1");
+        match principal.origin {
+            AuthPrincipalOrigin::ExternalAuthorizedRequest(context) => {
+                assert_eq!(context.provider_id, "moi");
+                assert_eq!(context.external_subject, "user_1");
+                assert_eq!(context.provider_scope_id, "workspace_1");
+                assert!(
+                    context
+                        .request_authorization_id
+                        .starts_with(PROVIDER_REQUEST_TOKEN_PREFIX)
+                );
+            }
+            other => panic!("expected external_authorized_request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_preserves_hmac_subjects_per_user() {
+        let now = Utc::now().timestamp();
+        let service = hmac_provider_service();
+        let first = hmac_provider_token("user_1", "workspace_1", "moi", now, now + 300);
+        let second = hmac_provider_token("user_2", "workspace_1", "moi", now, now + 300);
+
+        let first_principal = service
+            .current_principal_for_request(
+                &provider_headers(&first, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect("first hmac provider request should resolve");
+        let second_principal = service
+            .current_principal_for_request(
+                &provider_headers(&second, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect("second hmac provider request should resolve");
+
+        assert_eq!(
+            first_principal.user.user_id,
+            "external_authorized:moi:user_1"
+        );
+        assert_eq!(
+            second_principal.user.user_id,
+            "external_authorized:moi:user_2"
+        );
+        assert_ne!(first_principal.user.user_id, second_principal.user.user_id);
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_expired_hmac_token() {
+        let now = Utc::now().timestamp();
+        let token = hmac_provider_token("user_1", "workspace_1", "moi", now - 600, now - 300);
+        let (status, body) = hmac_provider_service()
+            .current_principal_for_request(
+                &provider_headers(&token, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect_err("expired hmac provider request should be rejected");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("external_request_auth_invalid")
+        );
+        assert!(body.0.detail.contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_bad_hmac_signature() {
+        let now = Utc::now().timestamp();
+        let token = hmac_provider_token("user_1", "workspace_1", "moi", now, now + 300);
+        let replacement = if token.ends_with('x') { "y" } else { "x" };
+        let tampered = format!("{}{}", &token[..token.len() - 1], replacement);
+        let (status, body) = hmac_provider_service()
+            .current_principal_for_request(
+                &provider_headers(&tampered, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect_err("tampered hmac provider request should be rejected");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("external_request_auth_invalid")
+        );
+        assert!(body.0.detail.contains("signature"));
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_provider_mismatch() {
+        let now = Utc::now().timestamp();
+        let token = hmac_provider_token("user_1", "workspace_1", "other", now, now + 300);
+        let (status, body) = hmac_provider_service()
+            .current_principal_for_request(
+                &provider_headers(&token, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect_err("mismatched hmac provider request should be rejected");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("external_request_auth_invalid")
+        );
+        assert!(body.0.detail.contains("provider"));
     }
 
     #[test]

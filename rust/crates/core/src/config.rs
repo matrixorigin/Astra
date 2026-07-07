@@ -253,6 +253,59 @@ pub struct ExternalAuthProviderConfig {
     pub id: String,
     pub display_name: String,
     pub external_auth_endpoint: String,
+    pub request_auth: Option<ExternalRequestAuthConfig>,
+}
+
+/// Local request authentication for provider-originated API calls.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExternalRequestAuthConfig {
+    Hmac { key: String },
+}
+
+impl fmt::Debug for ExternalRequestAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hmac { key } => f
+                .debug_struct("Hmac")
+                .field("key", &(!key.is_empty()).then_some("[REDACTED]"))
+                .finish(),
+        }
+    }
+}
+
+impl ExternalRequestAuthConfig {
+    fn apply_env_overrides(&mut self) {
+        match self {
+            Self::Hmac { key } => {
+                if let Some(env_var) = exact_env_placeholder(key)
+                    && let Ok(value) = env::var(env_var)
+                {
+                    *key = value;
+                }
+            }
+        }
+    }
+
+    fn validate(&self, field: &str) -> Result<(), String> {
+        match self {
+            Self::Hmac { key } => {
+                validate_exact_non_empty(&format!("{field}.key"), key)?;
+                if exact_env_placeholder(key).is_some() {
+                    return Err(format!(
+                        "{field}.key references an unset environment variable"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn hmac_key(&self) -> Option<&str> {
+        match self {
+            Self::Hmac { key } => Some(key.as_str()),
+        }
+    }
 }
 
 impl fmt::Debug for AuthConfig {
@@ -300,6 +353,11 @@ impl AuthConfig {
         apply_env_override(&mut self.refresh_ttl_days, "ASTRA_JWT_REFRESH_TTL_DAYS");
         apply_env_override_str(&mut self.bridge_secret, "ASTRA_BRIDGE_SECRET");
         apply_env_override_str(&mut self.token_encryption_key, "ASTRA_TOKEN_ENCRYPTION_KEY");
+        for provider in &mut self.external_providers {
+            if let Some(request_auth) = &mut provider.request_auth {
+                request_auth.apply_env_overrides();
+            }
+        }
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -327,8 +385,29 @@ impl AuthConfig {
                     provider.id
                 )
             })?;
+            if let Some(request_auth) = &provider.request_auth {
+                request_auth.validate(&format!(
+                    "auth.external_providers '{}'.request_auth",
+                    provider.id
+                ))?;
+            }
         }
         Ok(())
+    }
+}
+
+fn exact_env_placeholder(value: &str) -> Option<&str> {
+    let inner = value.strip_prefix("${")?.strip_suffix('}')?;
+    if inner.is_empty() {
+        return None;
+    }
+    if inner
+        .chars()
+        .all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit())
+    {
+        Some(inner)
+    } else {
+        None
     }
 }
 
@@ -1910,6 +1989,60 @@ auth_mode = "legacy"
                 );
             },
         );
+    }
+
+    #[test]
+    fn server_config_env_override_external_provider_hmac_key() {
+        temp_env::with_var(
+            "ASTRA_PROVIDER_HMAC_KEY",
+            Some("env-provider-hmac-key"),
+            || {
+                let mut config = ServerConfig::default();
+                config
+                    .auth
+                    .external_providers
+                    .push(ExternalAuthProviderConfig {
+                        id: "moi".to_string(),
+                        display_name: "MOI".to_string(),
+                        external_auth_endpoint: "http://127.0.0.1/external-auth".to_string(),
+                        request_auth: Some(ExternalRequestAuthConfig::Hmac {
+                            key: "${ASTRA_PROVIDER_HMAC_KEY}".to_string(),
+                        }),
+                    });
+                config.apply_env_overrides();
+                let Some(ExternalRequestAuthConfig::Hmac { key }) =
+                    config.auth.external_providers[0].request_auth.as_ref()
+                else {
+                    panic!("expected hmac request_auth");
+                };
+                assert_eq!(key, "env-provider-hmac-key");
+                config.auth.validate().expect("auth config should validate");
+            },
+        );
+    }
+
+    #[test]
+    fn server_config_validate_rejects_unresolved_provider_hmac_key_env() {
+        temp_env::with_var("ASTRA_PROVIDER_HMAC_KEY", None::<&str>, || {
+            let mut config = ServerConfig::default();
+            config
+                .auth
+                .external_providers
+                .push(ExternalAuthProviderConfig {
+                    id: "moi".to_string(),
+                    display_name: "MOI".to_string(),
+                    external_auth_endpoint: "http://127.0.0.1/external-auth".to_string(),
+                    request_auth: Some(ExternalRequestAuthConfig::Hmac {
+                        key: "${ASTRA_PROVIDER_HMAC_KEY}".to_string(),
+                    }),
+                });
+            config.apply_env_overrides();
+            let err = config
+                .auth
+                .validate()
+                .expect_err("unresolved hmac key env should be rejected");
+            assert!(err.contains("request_auth.key references an unset environment variable"));
+        });
     }
 
     #[test]

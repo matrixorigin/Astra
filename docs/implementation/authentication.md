@@ -25,6 +25,8 @@ Client → Authorization: Bearer <access_token> → API validates → extracts u
 External users enter through configured `auth.external_providers`. The provider endpoint validates
 the external credential and returns an Astra-compatible session descriptor. Astra then issues its
 own access and refresh tokens, so subsequent requests use the same session mechanism as local users.
+Provider-originated requests can additionally use configured local request auth, such as HMAC
+provider request tokens, so request admission does not require a callback to the provider.
 
 ## Authorization: Resource Ownership
 

@@ -1107,6 +1107,7 @@ mod tests {
             id: "moi".to_string(),
             display_name: "MOI".to_string(),
             external_auth_endpoint: endpoint,
+            request_auth: None,
         }
     }
 

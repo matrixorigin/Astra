@@ -64,6 +64,7 @@ fernet = "0.2.2"
 flate2 = "1.1.2"
 tar = "0.4"
 futures-util = "0.3.31"
+hmac = "0.12.1"
 jsonwebtoken = "9.3.1"
 nix = { version = "0.31.2", features = ["fs", "signal"] }
 regex = "1.12.2"
