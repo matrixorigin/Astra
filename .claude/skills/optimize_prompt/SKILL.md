@@ -59,12 +59,12 @@ Do not optimize from vague impressions such as "prompt feels long".
 
 | Component | Owner |
 | --- | --- |
-| System prompt strings/builders | `rust/crates/runtime/src/prompts/`, `rust/crates/astra-prompts/src/` |
-| Context budget and token estimation | `rust/crates/runtime/src/prompts/context.rs`, runtime turn budget modules |
-| Tool schema surface | `rust/crates/runtime/src/tool_registry/`, `rust/crates/runtime/src/capabilities.rs`, `astra-turn-core::tool_surface` |
-| Skill instructions/listing | `rust/crates/astra-prompts/src/skills.rs`, `rust/crates/astra-skills/src/`, `.claude/skills/`, `.agent/skills/` |
-| Learning/context pipeline | `rust/crates/astra-pipeline/src/` |
-| Turn telemetry | `rust/crates/services/src/session_journal.rs`, `rust/crates/astra-cli/src/cli/journal_digest.rs` |
+| System prompt strings/builders | `crates/runtime/src/prompts/`, `crates/astra-prompts/src/` |
+| Context budget and token estimation | `crates/runtime/src/prompts/context.rs`, runtime turn budget modules |
+| Tool schema surface | `crates/runtime/src/tool_registry/`, `crates/runtime/src/capabilities.rs`, `astra-turn-core::tool_surface` |
+| Skill instructions/listing | `crates/astra-prompts/src/skills.rs`, `crates/astra-skills/src/`, `.claude/skills/`, `.agent/skills/` |
+| Learning/context pipeline | `crates/astra-pipeline/src/` |
+| Turn telemetry | `crates/services/src/session_journal.rs`, `crates/astra-cli/src/cli/journal_digest.rs` |
 
 ## Phase 3: Measure Waste
 

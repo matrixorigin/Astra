@@ -53,19 +53,19 @@ the explicit context contract are incomplete.
 
 ### Existing Strengths
 
-- `rust/crates/services/src/storage.rs` already creates the core MatrixOne schema
+- `crates/services/src/storage.rs` already creates the core MatrixOne schema
   for sessions, events, context snapshots, skills, preferences, sync logs,
   plans, plan step runs, session checkpoints, artifacts, tasks, contracts, and
   auth.
-- `rust/crates/astra-turn-core/src/conversation_log/*` implements an append-only
+- `crates/astra-turn-core/src/conversation_log/*` implements an append-only
   conversation state log with snapshots and deltas. It can materialize the
   latest assistant context from `conversation_log`.
-- `rust/crates/runtime/src/server/run_lifecycle.rs` restores CSL history for
+- `crates/runtime/src/server/run_lifecycle.rs` restores CSL history for
   resumed sessions and persists CSL after a turn.
-- `rust/crates/runtime/src/server/bridge_prep.rs` has a typed `/chat/turn`
+- `crates/runtime/src/server/bridge_prep.rs` has a typed `/chat/turn`
   bridge protocol with turn identity, state-sync headers, edge tool caching,
   routing metadata, and execution state headers.
-- `rust/crates/services/src/state_sync.rs` already treats cloud state as a sync
+- `crates/services/src/state_sync.rs` already treats cloud state as a sync
   source for learning snapshots, preferences, plans, and tasks.
 - Existing design docs already state the right principle:
   `docs/design/context-window-management.md` says runtime context and audit
@@ -3494,7 +3494,7 @@ This projection is for UI hydration. It is not the LLM prompt.
 
 - Add MatrixOne schema for `agent_runs`, `run_counters`, and
   `agent_run_events`.
-- Implement `DatabaseRunStateStore` in `rust/crates/services/src/runs.rs`.
+- Implement `DatabaseRunStateStore` in `crates/services/src/runs.rs`.
 - Implement run owner lease, counter allocation, checkpoint_v1, and
   idempotency-key dedupe for run input.
 - Wire `state_builder.rs` to use DB store when a shared MatrixOne pool exists.

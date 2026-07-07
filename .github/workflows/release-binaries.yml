@@ -97,7 +97,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/registry/index
             ~/.cargo/git/db
-          key: cargo-registry-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('rust/Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-registry-${{ runner.os }}-${{ matrix.target }}-
 
@@ -118,12 +118,12 @@ jobs:
       - name: Build with cross
         if: ${{ matrix.use-cross }}
         run: |
-          cross build --release --no-default-features ${{ matrix.features }} --manifest-path rust/Cargo.toml --target "${{ matrix.target }}" -p astra-cli --bin "${BINARY}"
+          cross build --release --no-default-features ${{ matrix.features }} --manifest-path Cargo.toml --target "${{ matrix.target }}" -p astra-cli --bin "${BINARY}"
 
       - name: Build native
         if: ${{ !matrix.use-cross }}
         run: |
-          cargo build --release --no-default-features ${{ matrix.features }} --manifest-path rust/Cargo.toml --target "${{ matrix.target }}" -p astra-cli --bin "${BINARY}"
+          cargo build --release --no-default-features ${{ matrix.features }} --manifest-path Cargo.toml --target "${{ matrix.target }}" -p astra-cli --bin "${BINARY}"
 
       - name: Package archive
         shell: bash
@@ -141,7 +141,7 @@ jobs:
           mkdir -p dist
           archive="${BINARY}-v${{ needs.version.outputs.value }}-${{ matrix.suffix }}.tar.gz"
           tar -czf "dist/${archive}" \
-            -C "rust/target/${{ matrix.target }}/release" \
+            -C "target/${{ matrix.target }}/release" \
             "${BINARY}"
           (cd dist && checksum_file "${archive}" | tee "${archive}.sha256" > /dev/null)
 

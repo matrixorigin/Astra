@@ -68,6 +68,6 @@ runs:
 
     - uses: Swatinem/rust-cache@v2
       with:
-        workspaces: rust
+        workspaces: .
         shared-key: ${{ inputs.shared-key }}-${{ github.base_ref || github.ref_name }}
         save-if: ${{ inputs.save-cache }}

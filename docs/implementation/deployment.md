@@ -38,7 +38,7 @@ astra-engine/
 │   └── validation.py       # Input validation utilities
 │
 ├── cli/                    # Command-line interface
-│   └── astra (Rust)        # Chat, skill, session, replay, and admin commands — `rust/crates/astra-cli`
+│   └── astra (Rust)        # Chat, skill, session, replay, and admin commands — `crates/astra-cli`
 │
 ├── config/                 # Configuration
 │   └── settings.py         # Environment-based settings

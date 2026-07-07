@@ -62,10 +62,10 @@ parallelism.
 
 For broad diffs, group files by owner before reading details:
 
-- Runtime/server: `rust/crates/runtime/`
-- Services/storage/tasks/journal: `rust/crates/services/`
-- Turn/tool/prompt core: `rust/crates/astra-turn-*`, `rust/crates/astra-prompts/`, `rust/crates/astra-pipeline/`
-- CLI/TUI: `rust/crates/astra-cli/`
+- Runtime/server: `crates/runtime/`
+- Services/storage/tasks/journal: `crates/services/`
+- Turn/tool/prompt core: `crates/astra-turn-*`, `crates/astra-prompts/`, `crates/astra-pipeline/`
+- CLI/TUI: `crates/astra-cli/`
 - Skills/docs: `.claude/skills/`, `.agent/skills/`, docs
 - Frontend/SDK: `web/`, `packages/`
 

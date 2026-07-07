@@ -19,16 +19,16 @@ make build-cli-release
 Direct `cargo` equivalents:
 
 ```bash
-cargo build --manifest-path rust/Cargo.toml -p astra-cli -p astra-runtime --bins
-cargo build --manifest-path rust/Cargo.toml -p astra-cli -p astra-runtime --release --bins
+cargo build --manifest-path Cargo.toml -p astra-cli -p astra-runtime --bins
+cargo build --manifest-path Cargo.toml -p astra-cli -p astra-runtime --release --bins
 ```
 
 Binary locations:
 
-- Debug profile: `rust/target/debug/astra`, `rust/target/debug/astra-server`
-- Release profile: `rust/target/release/astra`, `rust/target/release/astra-server`
+- Debug profile: `target/debug/astra`, `target/debug/astra-server`
+- Release profile: `target/release/astra`, `target/release/astra-server`
 
-`rust/target/debug/` is the normal Cargo location for development builds; it is intentionally separate from `release/`.
+`target/debug/` is the normal Cargo location for development builds; it is intentionally separate from `release/`.
 
 ## astra
 

@@ -51,7 +51,7 @@ Old format is auto-converted to `Dependency(name=..., version="*", type=skill)`.
 Tools have version information tracked in metadata:
 
 ```rust
-// rust/crates/runtime/src/tool_registry/tool_catalog.rs
+// crates/runtime/src/tool_registry/tool_catalog.rs
 pub struct ToolMetadata {
     pub name: &'static str,
     pub version: &'static str,  // default "1.0.0"
@@ -164,7 +164,7 @@ SkillManifest.depends_on: list[Dependency]
 ```
 
 Key files:
-- `rust/crates/runtime/src/skills/version.rs` — Version parsing and constraint matching
-- `rust/crates/runtime/src/skills/manifest.rs` — SkillManifest with Dependency type
-- `rust/crates/runtime/src/skills/loader.rs` — SKILL.md frontmatter parsing
-- `rust/crates/runtime/src/skills/registry.rs` — UnifiedSkillRegistry (discovery + resolution)
+- `crates/runtime/src/skills/version.rs` — Version parsing and constraint matching
+- `crates/runtime/src/skills/manifest.rs` — SkillManifest with Dependency type
+- `crates/runtime/src/skills/loader.rs` — SKILL.md frontmatter parsing
+- `crates/runtime/src/skills/registry.rs` — UnifiedSkillRegistry (discovery + resolution)

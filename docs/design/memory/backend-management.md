@@ -3,7 +3,7 @@
 > **Status**: Draft — pending review  
 > **Depends on**: [backend-coexistence.md](backend-coexistence.md), [graph-memory.md](graph-memory.md)  
 > **Note**: Code examples use Python-style pseudocode for design illustration.
-> Actual implementation is in Rust — see `rust/crates/services/src/` and `rust/crates/runtime/src/`.  
+> Actual implementation is in Rust — see `crates/services/src/` and `crates/runtime/src/`.  
 > **Related (Rust paths)**: `services/src/memory/`, `services/src/evaluation/`, `runtime/src/sandbox/`
 
 ---
@@ -1227,7 +1227,7 @@ CREATE TABLE mem_edit_log (
 1. ✅ MemoryProgrammer module (script parser + action dispatcher) — core/memory/programmer.py
 2. ✅ YAML script schema + validation — parse_script() with field normalization
 3. ✅ LLM natural-language → script conversion — nl_to_script() with model="cheapest"
-4. ✅ CLI commands (program, run, commit, discard, review) — `rust/crates/astra-cli`
+4. ✅ CLI commands (program, run, commit, discard, review) — `crates/astra-cli`
 5. ✅ Permission scoping (user-self vs admin-batch)
 6. ✅ EdgeTool for LLM chat loop — cli/tools/memory_program.py
 ```

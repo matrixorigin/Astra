@@ -27,14 +27,14 @@ make type-check
 Direct `cargo` usage:
 
 ```bash
-cargo test --manifest-path rust/Cargo.toml -q
-cargo check --manifest-path rust/Cargo.toml
+cargo test --manifest-path Cargo.toml -q
+cargo check --manifest-path Cargo.toml
 ```
 
 ## Where Tests Live
 
-- `rust/crates/runtime/tests/` — HTTP integration tests for `astra-runtime` (including `*_contract.rs`, `system_matrix_http_e2e/`, bridge E2E).
-- `rust/crates/services/tests/` — service-layer tests (e.g. `multi_agent_integration` with live DB when `ASTRA_TEST_DB_IT=1`).
+- `crates/runtime/tests/` — HTTP integration tests for `astra-runtime` (including `*_contract.rs`, `system_matrix_http_e2e/`, bridge E2E).
+- `crates/services/tests/` — service-layer tests (e.g. `multi_agent_integration` with live DB when `ASTRA_TEST_DB_IT=1`).
 - `fixtures/contracts/` — JSON fixtures for contract tests that load shared request/response shapes.
 - `tests/fixtures/golden_sessions/` — golden session payloads for selected flows.
 - Capability ↔ route ↔ E2E mapping: [`docs/testing/system-e2e-matrix.md`](../testing/system-e2e-matrix.md).
@@ -56,7 +56,7 @@ Requires the same environment as `astra-server`: `MATRIXONE_*`, `ASTRA_JWT_SECRE
 
 ```bash
 # 1. Smallest relevant target while iterating
-cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test http_contract
+cargo test --manifest-path Cargo.toml -p astra-runtime --test http_contract
 
 # 2. Core HTTP contract smoke
 make test-contract

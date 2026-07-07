@@ -10,7 +10,7 @@ session lifecycle closes the loop. It supersedes the Python-era
 `docs/design/memory/` and `docs/implementation/memory-*.md`.
 
 For the narrow question of *what the LLM sees as a tool*, see the
-`memory` tool schema in [`astra-tools/src/schemas.rs`](../../rust/crates/astra-tools/src/schemas.rs).
+`memory` tool schema in [`astra-tools/src/schemas.rs`](../../crates/astra-tools/src/schemas.rs).
 For the session compaction / anchor / L1a-b layering, see
 [session-memory-protocol.md](session-memory-protocol.md) — that layer is
 *upstream* of this one (it handles in-session context; this doc handles
@@ -506,16 +506,16 @@ Concrete applications of these rules:
 
 | Concern | File |
 |---|---|
-| Tool schema (LLM-facing) | `rust/crates/astra-tools/src/schemas.rs` |
-| v2→v1 verb translation, conflict gate, decorator | `rust/crates/astra-tools/src/memoria.rs` |
-| Bridge-side prefetch + cache lanes | `rust/crates/runtime/src/turn/bridge_inprocess.rs` |
-| Pure prefetch helpers | `rust/crates/runtime/src/turn/memory_prefetch.rs` |
-| Canonical session stores (SEEN_STORE + RECALL_LEDGER) | `rust/crates/astra-tools/src/memoria.rs` (`record_seen`, `seen_snapshot`, `reset_seen`, `record_recall`, `drain_recalls`, `reset_recall_ledger`) |
-| Session-end governance + store_scene | `rust/crates/runtime/src/turn/cloud/session_end_governance.rs` |
-| HTTP client + store_scene + purge_working + freshness | `rust/crates/runtime/src/turn/cloud/memoria_compact.rs` |
-| Per-session debouncer | `rust/crates/runtime/src/turn/session_end_debounce.rs` |
-| Freshness helper (single source of truth) | `rust/crates/astra-turn-types/src/memory_ranking.rs` |
-| Background extraction with update-vs-store | `rust/crates/astra-cli/src/cli/memory_extraction.rs` |
-| Post-loop cleanup dispatcher | `rust/crates/runtime/src/server/run_lifecycle.rs::post_loop_memory_cleanup` |
-| Auto-memory prompt | `rust/crates/astra-prompts/src/memory_types.rs` |
-| Memoria orchestrator (facade, wired into bridge) | `rust/crates/runtime/src/turn/cloud/memory_orchestrator.rs` |
+| Tool schema (LLM-facing) | `crates/astra-tools/src/schemas.rs` |
+| v2→v1 verb translation, conflict gate, decorator | `crates/astra-tools/src/memoria.rs` |
+| Bridge-side prefetch + cache lanes | `crates/runtime/src/turn/bridge_inprocess.rs` |
+| Pure prefetch helpers | `crates/runtime/src/turn/memory_prefetch.rs` |
+| Canonical session stores (SEEN_STORE + RECALL_LEDGER) | `crates/astra-tools/src/memoria.rs` (`record_seen`, `seen_snapshot`, `reset_seen`, `record_recall`, `drain_recalls`, `reset_recall_ledger`) |
+| Session-end governance + store_scene | `crates/runtime/src/turn/cloud/session_end_governance.rs` |
+| HTTP client + store_scene + purge_working + freshness | `crates/runtime/src/turn/cloud/memoria_compact.rs` |
+| Per-session debouncer | `crates/runtime/src/turn/session_end_debounce.rs` |
+| Freshness helper (single source of truth) | `crates/astra-turn-types/src/memory_ranking.rs` |
+| Background extraction with update-vs-store | `crates/astra-cli/src/cli/memory_extraction.rs` |
+| Post-loop cleanup dispatcher | `crates/runtime/src/server/run_lifecycle.rs::post_loop_memory_cleanup` |
+| Auto-memory prompt | `crates/astra-prompts/src/memory_types.rs` |
+| Memoria orchestrator (facade, wired into bridge) | `crates/runtime/src/turn/cloud/memory_orchestrator.rs` |

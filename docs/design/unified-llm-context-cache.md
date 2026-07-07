@@ -25,7 +25,7 @@ This document proposes a single shared LLM context assembly interface. CLI and w
 
 ## Implementation status
 
-The initial integration is implemented around `rust/crates/runtime/src/turn/llm_context.rs`.
+The initial integration is implemented around `crates/runtime/src/turn/llm_context.rs`.
 
 Implemented entry points:
 
@@ -109,11 +109,11 @@ This design does not introduce a fallback prompt path. Any emergency behavior mu
 
 The current code already has the right shared primitives:
 
-- `rust/crates/astra-turn-core/src/context_sources.rs`
-- `rust/crates/astra-turn-core/src/pipeline_session.rs`
-- `rust/crates/runtime/src/turn/context_pipeline_adapter.rs`
-- `rust/crates/runtime/src/turn/wire_assembly.rs`
-- `rust/crates/runtime/src/turn/prompt_cache.rs`
+- `crates/astra-turn-core/src/context_sources.rs`
+- `crates/astra-turn-core/src/pipeline_session.rs`
+- `crates/runtime/src/turn/context_pipeline_adapter.rs`
+- `crates/runtime/src/turn/wire_assembly.rs`
+- `crates/runtime/src/turn/prompt_cache.rs`
 
 The intended shape is clear:
 
@@ -138,10 +138,10 @@ The CLI path prepares a `/chat/turn` payload before the runtime bridge or server
 
 Relevant current source:
 
-- `rust/crates/astra-cli/src/cli/chat_stream/sse_loop/agentic_loop_turn.rs`
-- `rust/crates/astra-cli/src/cli/chat_stream/sse_loop/mod.rs`
-- `rust/crates/astra-turn-core/src/chat_turn_payload.rs`
-- `rust/crates/astra-turn-core/src/agentic_prepare_payload.rs`
+- `crates/astra-cli/src/cli/chat_stream/sse_loop/agentic_loop_turn.rs`
+- `crates/astra-cli/src/cli/chat_stream/sse_loop/mod.rs`
+- `crates/astra-turn-core/src/chat_turn_payload.rs`
+- `crates/astra-turn-core/src/agentic_prepare_payload.rs`
 
 The CLI path contributes these context sources:
 
@@ -172,11 +172,11 @@ The web agent runs primarily through the server-side agentic loop host.
 
 Relevant current source:
 
-- `rust/crates/runtime/src/server/run_lifecycle.rs`
-- `rust/crates/runtime/src/server/server_loop_host.rs`
-- `rust/crates/runtime/src/server/server_tool_executor.rs`
-- `rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs`
-- `rust/crates/runtime/src/turn/agentic_loop_tool_phase.rs`
+- `crates/runtime/src/server/run_lifecycle.rs`
+- `crates/runtime/src/server/server_loop_host.rs`
+- `crates/runtime/src/server/server_tool_executor.rs`
+- `crates/runtime/src/turn/agentic_loop_execution_phase.rs`
+- `crates/runtime/src/turn/agentic_loop_tool_phase.rs`
 
 The web path contributes these context sources:
 
@@ -214,8 +214,8 @@ This was close to the target architecture before this implementation. The CLI br
 
 The latest `main` adds a per-LLM-call context manifest writer in:
 
-- `rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs`
-- `rust/crates/services/src/context_manifest.rs`
+- `crates/runtime/src/turn/agentic_loop_execution_phase.rs`
+- `crates/services/src/context_manifest.rs`
 
 It writes a DB record after each attempted LLM call. The manifest currently records zones like:
 
@@ -326,7 +326,7 @@ The assembler and feedback path must not recombine these into ambiguous totals.
 Create a shared runtime module:
 
 ```text
-rust/crates/runtime/src/turn/llm_context/
+crates/runtime/src/turn/llm_context/
 ```
 
 Suggested files:

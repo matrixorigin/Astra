@@ -17,7 +17,7 @@ export $(cat .env.production | grep -v '^#' | xargs)
 
 # 3. Run tests
 echo "Running repository validation..."
-if command -v cargo >/dev/null 2>&1 && [ -f rust/Cargo.toml ]; then
+if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ]; then
     make check && make test || {
         echo "❌ Validation failed. Aborting deployment."
         exit 1

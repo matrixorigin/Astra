@@ -1,6 +1,162 @@
 [profile.default]
-test-threads = 4
+fail-fast = false
+slow-timeout = { period = "15s", terminate-after = 1 }
+# `cargo nextest run --workspace` spawns ~100 test binaries each with
+# their own tokio runtime + thread pool. On a kernel where
+# `fs.inotify.max_user_instances` is small (default 128) or where
+# tmpfs is undersized for the concurrent test-temp-dir burst, the
+# default thread pool produces ENOSPC (errno 28) on tempfile creation
+# — flaky failures that pass when re-run alone.
+#
+# 2 was the empirically-stable cap on a 24-core / 30G RAM box with
+# default kernel limits. Increase if your kernel is tuned:
+#   sudo sysctl -w fs.inotify.max_user_instances=512
+#   sudo sysctl -w fs.aio-max-nr=1048576
+# then run with `cargo nextest run --test-threads N` to override.
+#
+# `make test-offline` uses the `strict` profile without a global cap.
+# `make test-online` uses the `strict-online` profile, which is capped
+# because the live MatrixOne database is a shared external bottleneck.
+test-threads = 2
 
-[[profile.default.overrides]]
-filter = "all()"
-slow-timeout = { period = "6s", terminate-after = 1 }
+# All profiles share a uniform 15s per-test-case hard budget. TIMEOUT = FAIL;
+# no per-test/per-binary carve-outs. 15s is deliberately lax so flake from
+# known contention (e.g. the `session_sync_log` prune hot path tracked in
+# `plans/session-sync-log-prune-hotpath-2026-05-01.md`) doesn't block work,
+# but any genuinely runaway test still fails loudly. Tighten later when the
+# prune contention is fixed — ideally back toward 1–2s per case.
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "30s", terminate-after = 1 }
+failure-output = "immediate"
+
+[profile.strict]
+fail-fast = false
+failure-output = "immediate"
+slow-timeout = { period = "30s", terminate-after = 1 }
+# When invoked via `make test-offline`, the Makefile overrides this
+# with `--test-threads N` computed from the live inotify headroom.
+# Direct `cargo nextest run --profile strict` uses num-cpus (fast on
+# tuned hosts; may ENOSPC on default-kernel boxes without the
+# Makefile wrapper — use `make test-offline` instead).
+test-threads = "num-cpus"
+
+[profile.strict-online]
+fail-fast = false
+failure-output = "immediate"
+slow-timeout = { period = "30s", terminate-after = 1 }
+test-threads = 2
+
+[profile.strict-online-ci]
+fail-fast = false
+failure-output = "immediate"
+slow-timeout = { period = "30s", terminate-after = 1 }
+# Online suites share one live MatrixOne instance. Keep CI at the same
+# concurrency as local test-online so connection pressure cannot turn
+# healthy DB tests into EOF/timeouts.
+test-threads = 2
+
+# ── Parallelism caps for heavy integration suites ────────────────────────
+# Group membership is set via `[[profile.X.overrides]]` below. These test
+# groups cap how many members run in parallel — they exist to stop DB / mock
+# LLM contention, not to affect the slow-timeout budget (the budget is 15s
+# for everyone, uniformly).
+[test-groups]
+integration_e2e = { max-threads = 2 }
+cli_agent_e2e = { max-threads = 1 }
+db_scoped_trim = { max-threads = 1 }
+# Tests that create tempfiles/dirs heavily; inotify-sensitive on
+# default-kernel boxes (max_user_instances=128). Cap at 4 so these
+# packages never exhaust inotify even when the rest runs at num-cpus.
+fs_heavy = { max-threads = 2 }
+
+# Every test that runs the production agentic loop / SSE handler /
+# delegation engine end-to-end belongs here (2-wide cap).
+[[profile.strict.overrides]]
+filter = """
+test(/stress_multi_turn_state_continuity_50_turns/)
+ or test(/stress_full_adaptive_loop_20_turns/)
+ or test(/server_git_boundary_/)
+ or test(/server_file_boundary_/)
+ or test(/server_database_boundary_/)
+ or test(/server_session_state_boundary_/)
+ or test(/two_hosts_same_input_same_outcome_shape/)
+ or test(/e2e_delegation_round_trip_through_loop/)
+ or test(/rollback_session_state_current_turn_restores_server_self_mod_and_tasks/)
+ or package(astra-runtime) and binary(team_delegation_integration)
+ or package(astra-runtime) and binary(team_execute_http_integration)
+ or package(astra-runtime) and binary(phase_f_nested_cancel)
+ or package(astra-runtime) and binary(web_agent_e2e)
+ or package(astra-runtime) and binary(bridge_e2e_comprehensive)
+ or package(astra-runtime) and binary(edge_5_5_http_e2e)
+ or package(astra-services) and binary(phase_g_crash_recovery)
+ or package(astra-services) and binary(phase_i_approval_journaling)
+ or package(astra-server-types) and test(/worktree_isolation/)
+ or package(astra-runtime) and test(server_fallback_preserves_tool_result_fields)
+ or package(astra-cli) and test(cooperative_cancel_and_await_has_no_late_renew)
+"""
+test-group = "integration_e2e"
+
+# CLI agent-loop tests share mock HTTP servers, session files, and background
+# task runtimes. Keep them in one group so nextest does not run chat SSE and
+# plan executor flows against each other under the strict profile.
+[[profile.strict.overrides]]
+filter = "package(astra-cli) and (test(/stream_chat_sse_/) or test(/spawn_plan_executor_/))"
+test-group = "cli_agent_e2e"
+
+# Packages that create tempfiles/dirs — inotify-sensitive on default
+# kernels (max_user_instances=128). Cap their parallelism to 4 so
+# the rest of the workspace can still run at full speed.
+[[profile.strict.overrides]]
+filter = """
+package(astra-tools)
+ or package(astra-skills)
+ or package(astra-services)
+ or package(astra-server-types)
+ or package(astra-test-harness)
+ or package(astra-runtime)
+ or package(astra-turn-core)
+ or package(astra-cli)
+"""
+test-group = "fs_heavy"
+
+# Heavy online integration binaries share a 2-wide cap.
+[[profile.strict-online.overrides]]
+filter = """
+package(astra-plan) and binary(plan_repository_db_it)
+ or package(astra-runtime) and binary(system_matrix_http_e2e)
+ or package(astra-runtime) and binary(phase2_web_hydration)
+ or package(astra-runtime) and binary(phase3_context_manifest)
+ or package(astra-runtime) and binary(phase4_state_projection)
+ or package(astra-runtime) and binary(phase5_personal_skill)
+ or package(astra-runtime) and binary(phase6_artifact_preview)
+ or package(astra-runtime) and binary(e2e_joint)
+ or test(/migration_dedupe_removes_duplicate_attempt_tuples/)
+"""
+test-group = "integration_e2e"
+
+# Retention pressure tests invoke production global cleanup and must not run
+# concurrently with another copy of their broad DB-maintenance path.
+[[profile.strict-online.overrides]]
+filter = "package(astra-services) and binary(prompt_retention_db_it)"
+test-group = "db_scoped_trim"
+
+# CI reuses the same filters; declared separately so CI config can
+# reference a stable profile name without coupling to local dev defaults.
+[[profile.strict-online-ci.overrides]]
+filter = """
+package(astra-plan) and binary(plan_repository_db_it)
+ or package(astra-runtime) and binary(system_matrix_http_e2e)
+ or package(astra-runtime) and binary(phase2_web_hydration)
+ or package(astra-runtime) and binary(phase3_context_manifest)
+ or package(astra-runtime) and binary(phase4_state_projection)
+ or package(astra-runtime) and binary(phase5_personal_skill)
+ or package(astra-runtime) and binary(phase6_artifact_preview)
+ or package(astra-runtime) and binary(e2e_joint)
+ or test(/migration_dedupe_removes_duplicate_attempt_tuples/)
+"""
+test-group = "integration_e2e"
+
+[[profile.strict-online-ci.overrides]]
+filter = "package(astra-services) and binary(prompt_retention_db_it)"
+test-group = "db_scoped_trim"

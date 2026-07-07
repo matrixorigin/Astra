@@ -26,9 +26,9 @@ coverage
 dist
 build
 target
-rust/target
+target
 rust/.rustc_info.json
-rust/Cargo.lock.patch
+Cargo.lock.patch
 rust/*.patch
 .runtime
 *.egg-info

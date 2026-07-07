@@ -10,16 +10,16 @@ A second file at `.claude/CLAUDE.md` is also loaded — it carries the MANDATORY
 
 ## ⚠ Cargo Workspace Lives Under `rust/`
 
-The Rust workspace `Cargo.toml` is at `rust/Cargo.toml`, NOT at the repo root. All raw `cargo` commands must run from `rust/` or pass `--manifest-path rust/Cargo.toml`:
+The Rust workspace `Cargo.toml` is at `Cargo.toml`, NOT at the repo root. All raw `cargo` commands must run from `rust/` or pass `--manifest-path Cargo.toml`:
 
 ```bash
 # ✗ WRONG — no Cargo.toml at repo root
 cargo build -p astra-runtime
 
 # ✓ RIGHT
-cd rust && cargo build -p astra-runtime
+cargo build -p astra-runtime
 # or
-cargo build --manifest-path rust/Cargo.toml -p astra-runtime
+cargo build --manifest-path Cargo.toml -p astra-runtime
 ```
 
 Prefer `make <target>` from the repo root — those already cd correctly.
@@ -51,10 +51,10 @@ Run a single Rust test:
 cd rust
 cargo nextest run -p astra-runtime --test http_contract
 cargo nextest run -p astra-runtime some_test_name           # filter by name
-cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test http_contract -- --nocapture
+cargo test --manifest-path Cargo.toml -p astra-runtime --test http_contract -- --nocapture
 ```
 
-`cargo nextest` uses profiles in `rust/.config/nextest.toml`. Default per-case slow-timeout is 30s (relaxed because of known contention in `session_sync_log` prune; see `plans/session-sync-log-prune-hotpath-*.md`). Override with `NEXTEST_OFFLINE_PROFILE=` / `NEXTEST_ONLINE_PROFILE=`.
+`cargo nextest` uses profiles in `.config/nextest.toml`. Default per-case slow-timeout is 30s (relaxed because of known contention in `session_sync_log` prune; see `plans/session-sync-log-prune-hotpath-*.md`). Override with `NEXTEST_OFFLINE_PROFILE=` / `NEXTEST_ONLINE_PROFILE=`.
 
 Important env vars for tests:
 
@@ -89,7 +89,7 @@ make dev-api-logs
 make dev-seed           # End-to-end bootstrap: recreate DB, restart API, register admin@mo.com / 11111111, load .models.yaml
 ```
 
-After `make build`, binaries live at `rust/target/release/` (or `debug/`): `astra-server`, `astra`.
+After `make build`, binaries live at `target/release/` (or `debug/`): `astra-server`, `astra`.
 
 ## Logging & Observability
 

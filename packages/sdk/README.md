@@ -2,7 +2,7 @@
 
 TypeScript SDK for the Astra agent runtime: JWT auth, sessions, runs, **run list**, **multi-agent delegation**, **session lifecycle** (update / close / resume / cancel / activity), **reflect** and **decision-trace**, **events** (session timeline and causal chains), **edge connection status**, memory, **§5.5** edge callbacks, task leases, **SSE** (`POST /chat/stream`), and **WebSocket** (`/chat/ws`).
 
-Paths match the Rust server and [`astra-thin-client`](../../rust/crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`).
+Paths match the Rust server and [`astra-thin-client`](../../crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`).
 
 **Distribution:** This package is versioned in the Astra monorepo and consumed via `file:../packages/sdk` (see `web/package.json`). Publishing to the public npm registry is optional; set `repository` / `publishConfig` when you are ready to release.
 

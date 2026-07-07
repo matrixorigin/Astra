@@ -115,7 +115,7 @@ Re-open exploration only when one of these happens:
 5. For Rust code, after each logical edit batch run a narrow compile gate:
 
 ```bash
-cd rust && cargo check -p <crate>
+cargo check -p <crate>
 ```
 
 6. Add or update tests at the same layer as the behavior:
@@ -148,11 +148,11 @@ Run from repo root for `make` targets and from `rust/` for raw cargo.
 
 | Change | Gate |
 | --- | --- |
-| Rust formatting only | `cd rust && cargo fmt --check` |
-| Single Rust crate | `cd rust && cargo check -p <crate>` plus focused tests |
-| Shared Rust API | `cd rust && cargo check --workspace --all-targets` plus affected crate tests |
-| Runtime/server lifecycle | Focused runtime tests, then `cd rust && cargo check -p astra-runtime` |
-| Turn behavior | `cd rust && cargo check -p astra-turn-core` plus focused turn tests |
+| Rust formatting only | `cargo fmt --check` |
+| Single Rust crate | `cargo check -p <crate>` plus focused tests |
+| Shared Rust API | `cargo check --workspace --all-targets` plus affected crate tests |
+| Runtime/server lifecycle | Focused runtime tests, then `cargo check -p astra-runtime` |
+| Turn behavior | `cargo check -p astra-turn-core` plus focused turn tests |
 | Services/storage/MatrixOne | Focused service/storage tests; note if online DB checks were skipped |
 | Skills/docs only | Validate frontmatter, metadata JSON, path references, and `.claude`/`.agent` sync |
 | Shell/deployment | Run the exact make/script/config dry-run that owns the behavior |
@@ -162,11 +162,11 @@ Useful focused runtime tests:
 
 | Area | Test target |
 | --- | --- |
-| Run lifecycle | `cd rust && cargo test -p astra-runtime server::run::lifecycle::tests -- --nocapture` |
-| Server loop host | `cd rust && cargo test -p astra-runtime server::server_loop_host::tests -- --nocapture` |
-| Capabilities | `cd rust && cargo test -p astra-runtime capabilities::tests -- --nocapture` |
-| Delegation | `cd rust && cargo test -p astra-runtime server::delegation -- --nocapture` |
-| Skills | `cd rust && cargo test -p astra-skills` |
+| Run lifecycle | `cargo test -p astra-runtime server::run::lifecycle::tests -- --nocapture` |
+| Server loop host | `cargo test -p astra-runtime server::server_loop_host::tests -- --nocapture` |
+| Capabilities | `cargo test -p astra-runtime capabilities::tests -- --nocapture` |
+| Delegation | `cargo test -p astra-runtime server::delegation -- --nocapture` |
+| Skills | `cargo test -p astra-skills` |
 
 ## Delivery Report
 
@@ -182,24 +182,24 @@ End with:
 | Area | Owner / anchor |
 | --- | --- |
 | HTTP server, run lifecycle, delegation engine | `astra-runtime` |
-| Main server loop and tool host behavior | `rust/crates/runtime/src/server/server_loop_host.rs` |
-| Run lifecycle startup/admission/projection | `rust/crates/runtime/src/server/run/lifecycle/` |
-| Delegation sub-runs, retries, pause/resume | `rust/crates/runtime/src/server/delegation/` |
-| Capability-gated tool visibility | `rust/crates/runtime/src/capabilities.rs`, `astra-turn-core::tool_surface` |
-| Built-in tools and schemas | `rust/crates/astra-tools/` |
-| Turn execution/finalization | `rust/crates/astra-turn-core/`, `rust/crates/astra-turn-types/` |
-| Prompt blocks and context pressure | `rust/crates/astra-prompts/`, `rust/crates/astra-pipeline/`, `rust/crates/runtime/src/prompts/` |
-| Journals, durable tasks, sync, coordination types | `rust/crates/services/` |
-| Skill parsing/discovery/invocation | `rust/crates/astra-skills/`, `.claude/skills/`, `.agent/skills/` |
-| Thin HTTP/SSE client | `rust/crates/astra-thin-client/` |
-| Declarative harnesses | `rust/crates/astra-test-harness/`, `rust/crates/astra-harness/` |
+| Main server loop and tool host behavior | `crates/runtime/src/server/server_loop_host.rs` |
+| Run lifecycle startup/admission/projection | `crates/runtime/src/server/run/lifecycle/` |
+| Delegation sub-runs, retries, pause/resume | `crates/runtime/src/server/delegation/` |
+| Capability-gated tool visibility | `crates/runtime/src/capabilities.rs`, `astra-turn-core::tool_surface` |
+| Built-in tools and schemas | `crates/astra-tools/` |
+| Turn execution/finalization | `crates/astra-turn-core/`, `crates/astra-turn-types/` |
+| Prompt blocks and context pressure | `crates/astra-prompts/`, `crates/astra-pipeline/`, `crates/runtime/src/prompts/` |
+| Journals, durable tasks, sync, coordination types | `crates/services/` |
+| Skill parsing/discovery/invocation | `crates/astra-skills/`, `.claude/skills/`, `.agent/skills/` |
+| Thin HTTP/SSE client | `crates/astra-thin-client/` |
+| Declarative harnesses | `crates/astra-test-harness/`, `crates/astra-harness/` |
 | Frontend/admin surfaces | `web/`, `packages/sdk/` |
 
 ## Appendix: Astra Invariants
 
 | Domain | Rule |
 | --- | --- |
-| Cargo | Workspace lives under `rust/`; raw cargo commands run there or use `--manifest-path rust/Cargo.toml`. |
+| Cargo | Workspace lives under `rust/`; raw cargo commands run there or use `--manifest-path Cargo.toml`. |
 | Errors | Library code uses `thiserror`; include operation, entity ID, and source context. Log at HTTP/CLI boundaries. |
 | Persistent state | State transitions are explicit status fields and traceable through session/run/event IDs. |
 | MatrixOne | Use `astra_core::resolve_database_name`; avoid hardcoded DB names and JSON-column WHERE filters. |

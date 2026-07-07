@@ -75,7 +75,7 @@ Turn-flow integration
 All references file:line, verified.
 
 ### 1.1 Tool registry and dispatch
-- Schemas centrally defined in `rust/crates/astra-tools/src/schemas.rs::all_tool_schemas_core`.
+- Schemas centrally defined in `crates/astra-tools/src/schemas.rs::all_tool_schemas_core`.
 - Tool visibility is capability-driven via `astra-turn-core::tool_surface`; legacy edge/cloud tool-name allowlists have been removed.
 - Server dispatch: `runtime/src/server/server_tool_executor.rs::execute_local_with_metadata`, match arm on tool name.
 - Edge dispatch: `astra-tools/src/executor.rs::DefaultToolExecutor::dispatch`.
@@ -566,21 +566,21 @@ Rationale: location is an implementation detail the agent rarely has signal to r
 
 ## Critical files for implementation
 
-- `rust/crates/astra-tools/src/task_mgmt.rs`
-- `rust/crates/astra-tools/src/schemas.rs`
-- `rust/crates/astra-tools/src/executor.rs`
-- `rust/crates/runtime/src/server/server_tool_executor.rs`
-- `rust/crates/runtime/src/orchestration/spawner.rs`
-- `rust/crates/runtime/src/server/server_skill_subrun.rs`
-- `rust/crates/runtime/src/server/run_lifecycle.rs`
-- `rust/crates/runtime/src/server/delegation_engine.rs`
-- `rust/crates/runtime/src/turn/agentic_loop_host.rs`
-- `rust/crates/runtime/src/turn/agentic_loop_finalization.rs`
-- `rust/crates/astra-turn-core/src/orchestration_builtin_agents.rs`
-- `rust/crates/astra-turn-core/src/orchestration_team_config.rs`
-- `rust/crates/astra-turn-core/src/orchestration_spawn_tool.rs`
-- `rust/crates/services/` — new migrations + pubsub handle module
-- `rust/crates/astra-cli/src/edge_tools/worktree.rs` (promote to shared crate Phase 3)
+- `crates/astra-tools/src/task_mgmt.rs`
+- `crates/astra-tools/src/schemas.rs`
+- `crates/astra-tools/src/executor.rs`
+- `crates/runtime/src/server/server_tool_executor.rs`
+- `crates/runtime/src/orchestration/spawner.rs`
+- `crates/runtime/src/server/server_skill_subrun.rs`
+- `crates/runtime/src/server/run_lifecycle.rs`
+- `crates/runtime/src/server/delegation_engine.rs`
+- `crates/runtime/src/turn/agentic_loop_host.rs`
+- `crates/runtime/src/turn/agentic_loop_finalization.rs`
+- `crates/astra-turn-core/src/orchestration_builtin_agents.rs`
+- `crates/astra-turn-core/src/orchestration_team_config.rs`
+- `crates/astra-turn-core/src/orchestration_spawn_tool.rs`
+- `crates/services/` — new migrations + pubsub handle module
+- `crates/astra-cli/src/edge_tools/worktree.rs` (promote to shared crate Phase 3)
 
 ---
 

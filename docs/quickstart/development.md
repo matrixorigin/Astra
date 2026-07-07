@@ -14,7 +14,7 @@ See [README.md](../../README.md) Quick Start for initial configuration and start
 ## Project Structure
 
 ```
-rust/crates/
+crates/
   core/          shared types, config, error types
   services/      sessions, journals, durable tasks, storage DDL
   runtime/       Axum HTTP server, handlers, pipeline, contract tests
@@ -52,7 +52,7 @@ make lint                 # cargo clippy --workspace -- -D warnings
 make format-check         # formatting check
 ```
 
-Contract tests live in `rust/crates/runtime/tests/`. Fixtures in `fixtures/contracts/`.
+Contract tests live in `crates/runtime/tests/`. Fixtures in `fixtures/contracts/`.
 
 Each DB test must be fully isolated: unique IDs, no shared mutable state, no order dependency.
 
@@ -72,7 +72,7 @@ make dev-db-connect       # mysql CLI into MatrixOne
 ```
 
 - Schema auto-created on API startup when `ASTRA_AUTO_CREATE_DATABASE=1`
-- DDL lives in `rust/crates/services/src/storage.rs`
+- DDL lives in `crates/services/src/storage.rs`
 - All tables use `IF NOT EXISTS` — safe to re-run
 
 ## Useful Make Targets

@@ -56,10 +56,10 @@ jobs:
           set -euo pipefail
           FILTER="${TEST_NAME_FILTER:-}"
           if [ -n "$FILTER" ]; then
-            cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
+            cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
               --features bridge-e2e-hooks -- "$FILTER" --ignored --nocapture
           else
-            cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
+            cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
               --features bridge-e2e-hooks -- --ignored --nocapture
           fi
 

@@ -89,7 +89,7 @@ def build_commands(args: argparse.Namespace) -> list[ProbeCommand]:
         "ASTRA_AUTO_CREATE_DATABASE": "1",
         "ASTRA_DATABASE_PREFIX": os.environ.get("ASTRA_DATABASE_PREFIX", ""),
     }
-    manifest = ["cargo", "test", "--manifest-path", "rust/Cargo.toml"]
+    manifest = ["cargo", "test", "--manifest-path", "Cargo.toml"]
 
     return [
         ProbeCommand(

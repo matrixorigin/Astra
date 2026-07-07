@@ -87,5 +87,5 @@ Wire helper: `chatRequestToWire` — see `chatRequestToWire` tests in [`client.t
 
 ## Contract with runtime
 
-- Paths: keep in sync with `rust/crates/astra-thin-client/src/paths.rs` (see comment in [`src/paths.ts`](src/paths.ts)).
+- Paths: keep in sync with `crates/astra-thin-client/src/paths.rs` (see comment in [`src/paths.ts`](src/paths.ts)).
 - Request bodies: `chatRequestToWire` and JSON field names (snake_case) should match the server’s expected JSON for `/chat/stream` and related routes.

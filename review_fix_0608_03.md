@@ -9,7 +9,7 @@
 
 #### 1. **shell_ops.rs:602-644 — Detach handle not restored on error path**
 
-**File:** `rust/crates/astra-tools/src/shell_ops.rs`  
+**File:** `crates/astra-tools/src/shell_ops.rs`  
 **Problem:** The detach handle lifecycle fix (commit `bbfcea67`) correctly restores the handle on the `Completed` path but fails to restore it on error paths. If `run_bash_with_output` returns `Err`, the handle remains consumed, preventing subsequent bash calls in the same turn from being detachable.
 
 **First-principles analysis:**  
@@ -55,7 +55,7 @@ Or manually restore in a `finally` block. The guard approach is preferred becaus
 
 #### 2. **shell_ops.rs:472 — rm -rf protection delegates to external crate without validation**
 
-**File:** `rust/crates/astra-tools/src/shell_ops.rs:472`  
+**File:** `crates/astra-tools/src/shell_ops.rs:472`  
 **Problem:** The function `is_rm_catastrophic_rm_path` is imported from `astra_sandbox` but the actual implementation is not visible in this branch. The tests show it blocks root/home/system paths, but the logic is opaque. If the sandbox crate has a bug or is updated independently, this code silently weakens.
 
 **First-principles analysis:**  
@@ -88,7 +88,7 @@ assert!(validate_execute_bash_command("rm -rf ./build").is_ok());
 
 #### 3. **task_mgmt.rs:5775 lines — Validation logic is comprehensive but error paths may leave state inconsistent**
 
-**File:** `rust/crates/astra-tools/src/task_mgmt.rs`  
+**File:** `crates/astra-tools/src/task_mgmt.rs`  
 **Problem:** The file has grown to 5,775 lines with extensive validation (duplicate detection, blocker validation, metadata schema enforcement). However, the error handling strategy is unclear. If `task.update` fails mid-way (e.g., metadata validation passes but DB write fails), the state may be partially updated.
 
 **First-principles analysis:**  
@@ -122,7 +122,7 @@ match self.store.update_task(...).await {
 
 #### 4. **session_todo_sweeper.rs — Auto-pause logic may race with concurrent updates**
 
-**File:** `rust/crates/runtime/src/server/session/session_todo_sweeper.rs`  
+**File:** `crates/runtime/src/server/session/session_todo_sweeper.rs`  
 **Problem:** The sweeper auto-pauses stale `in_progress` tasks (line ~200-300 in the diff). However, if a task is being actively updated by the agent while the sweeper runs, the sweeper may pause a task that is actually progressing.
 
 **First-principles analysis:**  
@@ -189,7 +189,7 @@ These should be separate branches with separate reviews.
 
 #### 7. **shell_ops.rs — Consider using `std::mem::take` for clearer ownership transfer**
 
-**File:** `rust/crates/astra-tools/src/shell_ops.rs:605`  
+**File:** `crates/astra-tools/src/shell_ops.rs:605`  
 **Improvement:** The current code uses `slot.lock().await.take()` which is correct but verbose. `std::mem::take` is more idiomatic and makes the ownership transfer explicit.
 
 **Current:**
@@ -215,7 +215,7 @@ let detach_handle = ctx.detach_shell_handle
 
 #### 8. **task_mgmt.rs — Add structured logging for validation failures**
 
-**File:** `rust/crates/astra-tools/src/task_mgmt.rs`  
+**File:** `crates/astra-tools/src/task_mgmt.rs`  
 **Improvement:** The validation logic returns string errors. Add structured logging with context (task ID, field name, invalid value) to aid debugging.
 
 **Current:**

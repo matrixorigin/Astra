@@ -61,7 +61,7 @@ COPY --from=planner /app/rust/recipe.json recipe.json
 # Test-only mock_mcp_server and the standalone astra-edge daemon are excluded.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/rust/target \
+    --mount=type=cache,target=/app/target \
     cargo chef cook --release --no-default-features --recipe-path recipe.json \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra
@@ -69,7 +69,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY rust/ ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/rust/target \
+    --mount=type=cache,target=/app/target \
     cargo build --release --no-default-features \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra && \

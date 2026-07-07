@@ -40,10 +40,10 @@ git diff --name-only
 
 | Concept | Source |
 | --- | --- |
-| Criteria schema | `rust/crates/services/src/verification.rs` |
-| Durable task lifecycle | `rust/crates/services/src/durable_task.rs` |
-| CLI display/report bridge | `rust/crates/astra-cli/src/cli/durable_bridge.rs` |
-| Verification journal event | `rust/crates/services/src/session_journal.rs` |
+| Criteria schema | `crates/services/src/verification.rs` |
+| Durable task lifecycle | `crates/services/src/durable_task.rs` |
+| CLI display/report bridge | `crates/astra-cli/src/cli/durable_bridge.rs` |
+| Verification journal event | `crates/services/src/session_journal.rs` |
 
 Current verifier kinds are `command`, `command_output`, `file_exists`, `grep_check`,
 `build_pass`, `test_pass`, `read_file_contains`, `llm_judge`, and `composite`.
@@ -62,10 +62,10 @@ Run only gates that can be affected by the change.
 | Change | Required gate |
 | --- | --- |
 | Skill/docs only | Frontmatter parse, metadata JSON parse, stale path scan, `.claude`/`.agent` sync; no Rust build |
-| Rust formatting only | `cd rust && cargo fmt --check` |
-| Single Rust crate | `cd rust && cargo check -p <crate>` plus focused tests |
-| Shared Rust API | `cd rust && cargo check --workspace --all-targets` plus affected tests |
-| Runtime/server lifecycle | Focused runtime tests, then `cd rust && cargo check -p astra-runtime` |
+| Rust formatting only | `cargo fmt --check` |
+| Single Rust crate | `cargo check -p <crate>` plus focused tests |
+| Shared Rust API | `cargo check --workspace --all-targets` plus affected tests |
+| Runtime/server lifecycle | Focused runtime tests, then `cargo check -p astra-runtime` |
 | Turn/tool/prompt behavior | Focused turn/runtime tests plus prompt/tool surface assertions |
 | Services/storage/MatrixOne | Focused services tests; online DB check only when configured and relevant |
 | CLI/TUI | Focused `astra-cli` tests or command dry run |

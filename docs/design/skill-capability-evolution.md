@@ -208,7 +208,7 @@ Tools have session-scoped health feedback. Skills do not yet have an equivalent 
 ### Design: SkillQualityTracker
 
 ```rust
-// New: rust/crates/runtime/src/skills/quality.rs
+// New: crates/runtime/src/skills/quality.rs
 
 pub struct SkillQualityTracker {
     metrics: HashMap<String, SkillMetrics>,
@@ -444,7 +444,7 @@ pub struct SkillExecutionResult {
 4. Add `/skill stats [name]` CLI command
 5. Persist metrics (local config file → later DB)
 
-**Files**: `runtime/src/skills/quality.rs` (new), `runtime/src/turn/skill_tool.rs`, `rust/crates/astra-cli/src/cli/slash_skill.rs`
+**Files**: `runtime/src/skills/quality.rs` (new), `runtime/src/turn/skill_tool.rs`, `crates/astra-cli/src/cli/slash_skill.rs`
 
 ### Phase 3: Marketplace Signals (问题3核心)
 

@@ -2,7 +2,7 @@
 
 This document maps **user-visible capabilities** to **HTTP routes**, **persistence (MatrixOne tables or in-process stores)**, and the **integration tests** that assert them. It complements `router_builder.rs` unit tests (route registration only).
 
-**Layout (system E2E plan):** the integration binary is `rust/crates/runtime/tests/system_matrix_http_e2e/main.rs` with shared **`harness.rs`** (env gate, HTTP, `sqlx`, `bootstrap`) and journey modules such as **`journey_full.rs`**, **`journey_tasks_runs.rs`**, **`journey_extended.rs`**, **`journey_branches_matrix.rs`**, **`journey_delegate_http_matrix.rs`**, **`journey_admin_smoke_matrix.rs`**, and other `journey_*.rs` files. `Cargo.toml` names the test target `system_matrix_http_e2e` and enables `bridge-e2e-hooks`.
+**Layout (system E2E plan):** the integration binary is `crates/runtime/tests/system_matrix_http_e2e/main.rs` with shared **`harness.rs`** (env gate, HTTP, `sqlx`, `bootstrap`) and journey modules such as **`journey_full.rs`**, **`journey_tasks_runs.rs`**, **`journey_extended.rs`**, **`journey_branches_matrix.rs`**, **`journey_delegate_http_matrix.rs`**, **`journey_admin_smoke_matrix.rs`**, and other `journey_*.rs` files. `Cargo.toml` names the test target `system_matrix_http_e2e` and enables `bridge-e2e-hooks`.
 
 ## How to run
 
@@ -128,7 +128,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 
 ## Router groups alignment
 
-Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../rust/crates/runtime/src/server/router_builder.rs) (integration tests only check registration; this table tracks **system E2E**).
+Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../crates/runtime/src/server/router_builder.rs) (integration tests only check registration; this table tracks **system E2E**).
 
 | Group (`router_builder`) | Prefix | System E2E | Notes |
 |--------------------------|--------|------------|--------|

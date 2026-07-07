@@ -698,14 +698,14 @@ class SchemaInventoryTest(unittest.TestCase):
             "sync audit is tracing-only now; session_sync_log must not return to production DDL",
         )
 
-        storage = (schema_inventory.REPO_ROOT / "rust/crates/services/src/storage.rs").read_text(
+        storage = (schema_inventory.REPO_ROOT / "crates/services/src/storage.rs").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("CREATE TABLE IF NOT EXISTS session_sync_log", storage)
         self.assertIn("DROP TABLE IF EXISTS session_sync_log", storage)
 
         state_sync = (
-            schema_inventory.REPO_ROOT / "rust/crates/services/src/state_sync.rs"
+            schema_inventory.REPO_ROOT / "crates/services/src/state_sync.rs"
         ).read_text(encoding="utf-8")
         self.assertIn("SyncAuditWriter", state_sync)
         self.assertIn("Audit is intentionally not persisted to MatrixOne", state_sync)
@@ -765,28 +765,28 @@ class SchemaInventoryTest(unittest.TestCase):
 
     def test_p1_5_consolidation_source_evidence_still_exists(self) -> None:
         expectations = {
-            "rust/crates/services/src/state_sync.rs": [
+            "crates/services/src/state_sync.rs": [
                 "SyncAuditWriter",
                 "Audit is intentionally not persisted to MatrixOne",
             ],
-            "rust/crates/services/src/data_versioning.rs": [
+            "crates/services/src/data_versioning.rs": [
                 "data_versioning_checkpoints",
                 "create_checkpoint",
                 "list_checkpoints",
             ],
-            "rust/crates/services/src/storage.rs": [
+            "crates/services/src/storage.rs": [
                 "preview_template_registry",
                 "raw_ref_scheme_registry",
                 "INSERT IGNORE INTO raw_ref_scheme_registry",
                 "INSERT IGNORE INTO preview_template_registry",
             ],
-            "rust/crates/services/src/harness.rs": [
+            "crates/services/src/harness.rs": [
                 "harness_skill_drafts",
                 "harness_skill_rules",
                 "INSERT INTO harness_skill_drafts",
                 "INSERT INTO harness_skill_rules",
             ],
-            "rust/crates/services/src/team_persistence.rs": [
+            "crates/services/src/team_persistence.rs": [
                 "team_execution_history",
                 "team_snapshots",
                 "record_execution_start",

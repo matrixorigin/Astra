@@ -2,11 +2,11 @@
 
 ## Behavior
 
-When the agentic loop believes the model is **done**, astra can inject a **user message** that asks the model to run **verification commands via the normal `bash` tool** (permissions, TurnGuard, audit). See `rust/crates/runtime/src/turn/stop_hooks.rs`.
+When the agentic loop believes the model is **done**, astra can inject a **user message** that asks the model to run **verification commands via the normal `bash` tool** (permissions, TurnGuard, audit). See `crates/runtime/src/turn/stop_hooks.rs`.
 
 Sources of hooks (merged in order):
 
-1. **Declarative** — **`.astra/stop-hooks.yaml`** or **`.astra/stop-hooks.yml`** under the **project root** (resolved via `git_root` / `cwd` in `EdgeContext`). Matches `rust/crates/runtime/src/turn/stop_hooks_yaml.rs`.
+1. **Declarative** — **`.astra/stop-hooks.yaml`** or **`.astra/stop-hooks.yml`** under the **project root** (resolved via `git_root` / `cwd` in `EdgeContext`). Matches `crates/runtime/src/turn/stop_hooks_yaml.rs`.
 2. **Auto-detect** — optional single `verify-changes` hook with stack hints (Cargo, npm, Go, Python) when `auto_detect` is true (default).
 
 ## Declarative file format
@@ -49,7 +49,7 @@ For **delegation sub-runs**, the optional keys **`git_root`**, **`workspace_root
 
 Cloud chat uses the same **plan subtask** rule as the CLI: put **`plan_subtask_id`** (non-empty string) or **`is_plan_subtask`: true** in the top-level request `context` map to select `when: task_completed` hooks instead of `when: stop`.
 
-For **`POST /chat/stream`**, you may send the same keys as **top-level JSON fields** next to `message` (they are merged into `context` server-side). [`ChatStreamRequest`](../../rust/crates/astra-thin-client/src/protocol.rs) includes optional `plan_subtask_id` and `is_plan_subtask`.
+For **`POST /chat/stream`**, you may send the same keys as **top-level JSON fields** next to `message` (they are merged into `context` server-side). [`ChatStreamRequest`](../../crates/astra-thin-client/src/protocol.rs) includes optional `plan_subtask_id` and `is_plan_subtask`.
 
 The **astra CLI** embeds **`plan_subtask_id`** and **`is_plan_subtask`** on each **`POST /chat/turn`** body when executing a durable plan subtask so proxies and future server paths can read them without extra client code.
 
@@ -59,10 +59,10 @@ The **astra CLI** embeds **`plan_subtask_id`** and **`is_plan_subtask`** on each
 
 ## Code
 
-- Loader / merge: `rust/crates/runtime/src/turn/stop_hooks_yaml.rs` — `detect_turn_hook_sets`, `project_root_for_stop_hooks` (edge chat), `project_root_from_delegation_context` (delegation sub-runs)
-- CLI: `rust/crates/astra-cli/src/cli/chat_stream/sse_loop/mod.rs` calls `astra_runtime::turn::stop_hooks_yaml::detect_turn_hook_sets` with process cwd
-- Cloud chat: `rust/crates/runtime/src/server/run_lifecycle.rs` — `build_initial_state` resolves root from `EdgeContext.edge_profile` (`git_root` then `cwd`) and respects `plan_subtask_id` / `is_plan_subtask` in request `context`
-- Runtime injection: `rust/crates/runtime/src/turn/agentic_loop_host.rs` (completion + post-delegation), `rust/crates/runtime/src/turn/stop_hooks.rs` — `build_stop_hook_prompt`, `build_teammate_idle_hook_prompt`
+- Loader / merge: `crates/runtime/src/turn/stop_hooks_yaml.rs` — `detect_turn_hook_sets`, `project_root_for_stop_hooks` (edge chat), `project_root_from_delegation_context` (delegation sub-runs)
+- CLI: `crates/astra-cli/src/cli/chat_stream/sse_loop/mod.rs` calls `astra_runtime::turn::stop_hooks_yaml::detect_turn_hook_sets` with process cwd
+- Cloud chat: `crates/runtime/src/server/run_lifecycle.rs` — `build_initial_state` resolves root from `EdgeContext.edge_profile` (`git_root` then `cwd`) and respects `plan_subtask_id` / `is_plan_subtask` in request `context`
+- Runtime injection: `crates/runtime/src/turn/agentic_loop_host.rs` (completion + post-delegation), `crates/runtime/src/turn/stop_hooks.rs` — `build_stop_hook_prompt`, `build_teammate_idle_hook_prompt`
 
 ## Comparison (Claude Code)
 

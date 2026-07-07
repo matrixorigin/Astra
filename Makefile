@@ -48,7 +48,7 @@ help:
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
-	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see rust/.config/nextest.toml)"
+	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see .config/nextest.toml)"
 	@echo "  make test-runtime-profiles - Server-only + server+edge + managed runtime + CLI-local profile guardrails"
 	@echo "  make test-server-only   - Focused Web/runtime tests for server-only access surface"
 	@echo "  make test-server-edge   - Focused tests for edge provider protocol and routing"
@@ -114,11 +114,11 @@ help:
 # Variables
 # ============================================================================
 
-CARGO_MANIFEST := rust/Cargo.toml
+CARGO_MANIFEST := Cargo.toml
 CARGO := cargo
 CARGO_MANIFEST_FLAG := --manifest-path $(CARGO_MANIFEST)
 API_SHELL_PKG := -p astra-runtime
-RUST_TARGET_DIR := rust/target
+RUST_TARGET_DIR := target
 RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
 RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
 API_SERVER_BIN := astra-server
@@ -144,7 +144,7 @@ STACK_REQUIRED_ENV := $(STACK_SECRET_ENV) MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBE
 # Per-test-case hard budget. Any case running longer than the budget is
 # killed and counted as FAIL. Nextest has no CLI override for slow-timeout
 # (`--config` is Cargo-only, not nextest), so budgets live as named profiles
-# in `rust/.config/nextest.toml`. All profiles currently use 30s (relaxed
+# in `.config/nextest.toml`. All profiles currently use 30s (relaxed
 # from original 1-2s due to known session_sync_log prune contention — see
 # nextest.toml comment for tracking details).
 # To switch budgets, override the profile name:
@@ -186,7 +186,7 @@ setup:
 .PHONY: install-dev-deps
 install-dev-deps:
 	@echo "Installing Rust workspace dependencies..."
-	@cargo fetch --manifest-path rust/Cargo.toml
+	@cargo fetch --manifest-path Cargo.toml
 	@$(MAKE) dev-web-deps
 	@echo "✅ Development dependencies ready"
 
@@ -207,7 +207,7 @@ check-runtime:
 	fi
 	@echo ""
 	@echo "2. Rust API binary:"
-	@cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server && echo "   ✅ Rust binary build OK"
+	@cargo build -q --manifest-path Cargo.toml -p astra-runtime --release --bin astra-server && echo "   ✅ Rust binary build OK"
 
 # ============================================================================
 # Dependencies (MatrixOne + Memoria)
@@ -772,13 +772,13 @@ dev-seed:
 	@$(MAKE) dev-api-restart-debug build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
-	@NO_PROXY=localhost ./rust/target/debug/astra admin register \
+	@NO_PROXY=localhost ./target/debug/astra admin register \
 		--username admin --password 11111111 --email admin@mo.com
 	@echo "Logging in as admin..."
-	@NO_PROXY=localhost ./rust/target/debug/astra admin login \
+	@NO_PROXY=localhost ./target/debug/astra admin login \
 		--username admin --password 11111111
 	@echo "Loading models from .models.yaml..."
-	@NO_PROXY=localhost ./rust/target/debug/astra admin model load .models.yaml --update-existing
+	@NO_PROXY=localhost ./target/debug/astra admin model load .models.yaml --update-existing
 	@echo ""
 	@echo "✅ Seed complete — admin@mo.com / 11111111"
 
@@ -925,8 +925,8 @@ test: test-offline test-online
 
 .PHONY: test-dashboard
 test-dashboard: ## Build astra-test and launch live dashboard
-	@cd rust && cargo build --release -p astra-test-harness
-	./rust/target/release/astra-test --live-dashboard
+	@cargo build --release -p astra-test-harness
+	./target/release/astra-test --live-dashboard
 
 .PHONY: test-offline
 # Run the focused runtime profile gate first so provider/surface regressions fail
@@ -1335,7 +1335,7 @@ test-contract:
 # ----------------------------------------------------------------------------
 # Declarative CLI test harness (astra-test-harness).
 #
-# Runs the YAML cases at rust/crates/astra-test-harness/cases against
+# Runs the YAML cases at crates/astra-test-harness/cases against
 # a fallback model list. Requires a running API server + fresh login.
 #
 # Variables:
@@ -1362,7 +1362,7 @@ test-harness:
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-test-harness
 	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-test-harness --release
 	@MODELS="$${MODELS:-qwen-flash}"; \
-	CASES="$${CASES:-rust/crates/astra-test-harness/cases}"; \
+	CASES="$${CASES:-crates/astra-test-harness/cases}"; \
 	FILTER="$${FILTER:-}"; \
 	FORCE_MODEL="$${FORCE_MODEL:-}"; \
 	PARALLEL="$${PARALLEL:-1}"; \
@@ -1386,7 +1386,7 @@ test-harness:
 	fi; \
 	[ -n "$${SUMMARIZE:-}" ] && ARGS="$$ARGS --summarize"; \
 	[ -n "$${SUMMARIZE_MODEL:-}" ] && ARGS="$$ARGS --summarize-model $${SUMMARIZE_MODEL}"; \
-	./rust/target/release/astra-test $$ARGS
+	./target/release/astra-test $$ARGS
 
 # ============================================================================
 # Code Quality
@@ -1422,7 +1422,7 @@ format-check:
 .PHONY: audit
 audit:
 	@command -v cargo-audit >/dev/null 2>&1 || { echo "cargo-audit not found; install with: cargo install cargo-audit"; exit 1; }
-	@cd rust && cargo audit --no-fetch --stale
+	@cargo audit --no-fetch --stale
 
 .PHONY: type-check
 type-check: sweep

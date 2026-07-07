@@ -7,7 +7,7 @@ Use these files as the canonical configuration references:
 - `.env.example` (development)
 - `.env.production.example` (production)
 - `deployment/all-in-one/.env.example`
-- `rust/crates/core/src/config.rs` — `AppSettings`, all struct loaders
+- `crates/core/src/config.rs` — `AppSettings`, all struct loaders
 
 ## Core Variables
 
