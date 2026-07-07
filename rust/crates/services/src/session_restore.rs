@@ -45,6 +45,35 @@ const CLOUD_CHECKPOINT_COUNT_SQL: &str = "\
     SELECT COUNT(*) AS checkpoint_count \
     FROM session_checkpoints \
     WHERE user_id = ? AND session_id = ? AND state_json IS NULL";
+pub const PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL: &str = "\
+    SELECT sti.role, sti.content \
+    FROM session_transcript_items sti \
+    LEFT JOIN agent_runs r \
+      ON r.user_id = sti.user_id \
+     AND r.session_id = sti.session_id \
+     AND r.run_id = sti.run_id \
+    WHERE sti.session_id = ? \
+      AND sti.user_id = ? \
+      AND ( \
+          sti.run_id IS NULL \
+          OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
+      ) \
+    ORDER BY sti.item_seq";
+pub const PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL: &str = "\
+    SELECT 1 AS present \
+    FROM session_transcript_items sti \
+    LEFT JOIN agent_runs r \
+      ON r.user_id = sti.user_id \
+     AND r.session_id = sti.session_id \
+     AND r.run_id = sti.run_id \
+    WHERE sti.session_id = ? \
+      AND sti.user_id = ? \
+      AND sti.role IN ('user', 'assistant', 'system') \
+      AND ( \
+          sti.run_id IS NULL \
+          OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
+      ) \
+    LIMIT 1";
 const PUSH_SESSION_STATE_UPSERT_SQL: &str = "INSERT INTO agent_sessions \
              (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
              VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6)) \
@@ -1194,15 +1223,12 @@ impl HybridRestoreService {
             None => return Ok(Vec::new()),
         };
 
-        let rows = sqlx::query(
-            "SELECT role, content FROM session_transcript_items \
-             WHERE session_id = ? AND user_id = ? ORDER BY item_seq",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("restore_cloud_transcript_messages: {e}"))?;
+        let rows = sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("restore_cloud_transcript_messages: {e}"))?;
 
         let mut messages = Vec::new();
         for row in &rows {
@@ -3777,6 +3803,39 @@ mod tests {
                 .to_ascii_uppercase()
                 .contains("COUNT(*)"),
             "checkpoint count must stay a lightweight aggregate"
+        );
+    }
+
+    #[test]
+    fn prompt_history_transcript_query_restores_only_root_conversation_rows() {
+        for sql in [
+            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL,
+            PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL,
+        ] {
+            let upper = sql.to_ascii_uppercase();
+
+            assert!(
+                upper.contains("LEFT JOIN AGENT_RUNS"),
+                "prompt-history transcript restore must classify transcript rows by durable run lineage: {sql}"
+            );
+            assert!(
+                upper.contains("R.SESSION_ID = STI.SESSION_ID"),
+                "run lineage lookup must stay scoped to the same session: {sql}"
+            );
+            assert!(
+                upper.contains("STI.RUN_ID IS NULL"),
+                "system/session transcript rows without a run owner remain restorable: {sql}"
+            );
+            assert!(
+                upper.contains("R.RUN_ID IS NOT NULL") && upper.contains("R.PARENT_RUN_ID IS NULL"),
+                "child/subrun transcript rows must not be restored as main prompt history: {sql}"
+            );
+        }
+        assert!(
+            PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL
+                .to_ascii_uppercase()
+                .contains("ORDER BY STI.ITEM_SEQ"),
+            "prompt-history transcript restore must preserve transcript order: {PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL}"
         );
     }
 

@@ -49,7 +49,10 @@ use astra_services::runs::{
     durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
-use astra_services::session_restore::SessionRestoreService;
+use astra_services::session_restore::{
+    PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL, PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL,
+    SessionRestoreService,
+};
 use astra_services::skills::SkillService;
 use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
@@ -142,6 +145,13 @@ const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 #[cfg(test)]
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
+
+fn should_restore_prior_prompt_history(
+    request_targets_existing_session: bool,
+    session_has_prior_prompt_history: bool,
+) -> bool {
+    request_targets_existing_session && session_has_prior_prompt_history
+}
 
 fn is_non_blocking_task_board_settlement(
     interruption: &astra_turn_core::interruption::InterruptionRecord,
@@ -1933,14 +1943,11 @@ impl AgenticRunLifecycleService {
         let Some(pool) = self.shared_pool.as_ref() else {
             return Vec::new();
         };
-        let rows = match sqlx::query(
-            "SELECT role, content FROM session_transcript_items \
-             WHERE session_id = ? AND user_id = ? ORDER BY item_seq",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(pool.get())
-        .await
+        let rows = match sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_all(pool.get())
+            .await
         {
             Ok(rows) => rows,
             Err(error) => {
@@ -3375,6 +3382,57 @@ impl AgenticRunLifecycleService {
                         &error,
                     ),
                 )
+            }
+        }
+    }
+
+    async fn session_has_prior_prompt_history(&self, user_id: &str, session_id: &str) -> bool {
+        let Some(shared) = &self.shared_pool else {
+            return false;
+        };
+        let pool = shared.get();
+
+        match sqlx::query(
+            "SELECT 1 AS present
+             FROM conversation_log
+             WHERE user_id = ? AND session_id = ?
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::resume_hydration",
+                    user_id,
+                    session_id,
+                    error = %error,
+                    "failed to check canonical conversation history before resume hydration"
+                );
+            }
+        }
+
+        match sqlx::query(PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::resume_hydration",
+                    user_id,
+                    session_id,
+                    error = %error,
+                    "failed to check transcript history before resume hydration"
+                );
+                false
             }
         }
     }
@@ -4999,12 +5057,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             astra_plan::PlanResumeSnapshot::default()
         };
+        let restore_prior_prompt_history = should_restore_prior_prompt_history(
+            request.session_id.is_some(),
+            self.session_has_prior_prompt_history(&user_id, &session_id)
+                .await,
+        );
         let session_resume_hint = self
             .session_resume_hydration_hint_for_session(
                 &user_id,
                 &session_id,
                 &run_id,
-                request.session_id.is_some(),
+                restore_prior_prompt_history,
             )
             .await;
         let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
@@ -5087,18 +5150,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // compaction, and context-window counters. Without this, server-side
         // session resume starts cold even though finalization persisted the
         // state needed for long-running sessions.
-        if let Ok(Some(restored)) =
-            astra_pipeline::step_restore::restore_session(&user_id, &session_id)
-        {
-            restore_step_checkpoint_runtime_state(
-                restored,
-                &fresh_session_current_date,
-                &mut loop_state,
-            );
+        if restore_prior_prompt_history {
+            if let Ok(Some(restored)) =
+                astra_pipeline::step_restore::restore_session(&user_id, &session_id)
+            {
+                restore_step_checkpoint_runtime_state(
+                    restored,
+                    &fresh_session_current_date,
+                    &mut loop_state,
+                );
+            }
         }
 
         // ── CSL: Load conversation history from the log ─────────────
-        let csl_manager = if request.session_id.is_some() {
+        let csl_manager = if restore_prior_prompt_history {
             self.restore_csl_history(&user_id, &session_id, &run_id, &mut loop_state)
                 .await
         } else {
@@ -5873,7 +5938,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
 
         // ── Runtime warm-start from step checkpoint ────────────────
-        if request.session_id.is_some() {
+        let restore_prior_prompt_history = should_restore_prior_prompt_history(
+            request.session_id.is_some(),
+            self.session_has_prior_prompt_history(&user_id, &session_id)
+                .await,
+        );
+
+        if restore_prior_prompt_history {
             if let Ok(Some(restored)) =
                 astra_pipeline::step_restore::restore_session(&user_id, &session_id)
             {
@@ -5886,7 +5957,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         // ── CSL: Load conversation history from the log ─────────────
-        let csl_manager = if request.session_id.is_some() {
+        let csl_manager = if restore_prior_prompt_history {
             self.restore_csl_history(&user_id, &session_id, &run_id, &mut state)
                 .await
         } else {
@@ -5904,7 +5975,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &user_id,
                 &session_id,
                 &run_id,
-                request.session_id.is_some(),
+                restore_prior_prompt_history,
             )
             .await;
         let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
@@ -7903,6 +7974,42 @@ impl ServerSubRunExecutor {
         }
     }
 
+    async fn persist_durable_subrun_usage(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        tool_calls: u32,
+    ) {
+        let Some(run_engine) = self.durable_run_engine() else {
+            return;
+        };
+        if let Err(error) = run_engine
+            .persist_usage(
+                user_id,
+                run_id,
+                prompt_tokens,
+                completion_tokens,
+                tool_calls,
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "astra_runtime::subrun",
+                user_id,
+                session_id,
+                run_id,
+                prompt_tokens,
+                completion_tokens,
+                tool_calls,
+                error = %error,
+                "failed to persist durable subrun usage"
+            );
+        }
+    }
+
     /// Provision a workspace directory for a delegation sub-run.
     ///
     /// Sub-runs get a subdirectory under the parent session workspace to
@@ -8458,6 +8565,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 .await;
             }
         }
+        self.persist_durable_subrun_usage(
+            &durable_user_id,
+            &durable_session_id,
+            &durable_run_id,
+            prompt_tokens,
+            loop_state.total_completion,
+            loop_state.total_tool_calls,
+        )
+        .await;
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => {
                 let status = server_subrun_completed_status(&loop_state);

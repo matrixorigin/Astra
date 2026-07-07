@@ -2111,6 +2111,57 @@ fn test_service() -> AgenticRunLifecycleService {
     .with_model_service(Arc::new(ActiveTestModelService))
 }
 
+#[test]
+fn resume_hydration_requires_existing_session_with_prior_prompt_history() {
+    assert!(
+        !should_restore_prior_prompt_history(false, false),
+        "new sessions must not enter resume hydration"
+    );
+    assert!(
+        !should_restore_prior_prompt_history(false, true),
+        "prior history is irrelevant when the request does not target an existing session"
+    );
+    assert!(
+        !should_restore_prior_prompt_history(true, false),
+        "a pre-created web session id without prompt history is not a resume"
+    );
+    assert!(
+        should_restore_prior_prompt_history(true, true),
+        "resume is only valid when an existing session has prompt-facing history"
+    );
+}
+
+#[test]
+fn transcript_prompt_restore_uses_shared_root_conversation_query() {
+    let source = include_str!("mod.rs");
+    let fn_start = source
+        .find("async fn restore_transcript_prompt_messages")
+        .expect("transcript prompt restore helper must exist");
+    let fn_end = source[fn_start..]
+        .find("fn restore_csl_messages_into_loop_state")
+        .map(|offset| fn_start + offset)
+        .expect("transcript prompt restore helper end");
+    let body = &source[fn_start..fn_end];
+
+    assert!(
+        body.contains("sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)"),
+        "server prompt-history fallback must use the shared root-conversation transcript query"
+    );
+
+    let exists_start = source
+        .find("async fn session_has_prior_prompt_history")
+        .expect("resume-history presence helper must exist");
+    let exists_end = source[exists_start..]
+        .find("fn session_resume_hydration_hint_from_sources")
+        .map(|offset| exists_start + offset)
+        .expect("resume-history presence helper end");
+    let exists_body = &source[exists_start..exists_end];
+    assert!(
+        exists_body.contains("sqlx::query(PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL)"),
+        "resume gating must use the same root-conversation transcript boundary"
+    );
+}
+
 #[tokio::test]
 async fn server_resume_hydration_failure_is_not_prompt_facing() {
     let service = test_service();
@@ -8840,12 +8891,12 @@ fn stream_chat_persists_usage_unconditionally() {
 }
 
 #[test]
-fn durable_run_usage_uses_provider_input_tokens() {
+fn durable_top_level_run_usage_uses_provider_input_tokens() {
     let source = include_str!("mod.rs");
     let production = source
-        .split("\n#[cfg(test)]\nmod tests")
+        .split("/// Production sub-run executor backed by")
         .next()
-        .expect("production lifecycle source");
+        .expect("top-level production lifecycle source");
     let mut checked_calls = 0;
     let mut cursor = production;
     while let Some(pos) = cursor.find(".persist_usage(") {
@@ -8863,7 +8914,37 @@ fn durable_run_usage_uses_provider_input_tokens() {
     }
     assert!(
         checked_calls >= 2,
-        "stream_chat must persist usage on terminal paths"
+        "top-level run paths must persist usage on terminal paths"
+    );
+}
+
+#[test]
+fn server_subrun_persists_durable_usage() {
+    let source = include_str!("mod.rs");
+    let fn_start = source
+        .find("impl SubRunExecutor for ServerSubRunExecutor")
+        .expect("server sub-run executor must exist");
+    let fn_end = source[fn_start..]
+        .find("// ─── Tests")
+        .map(|p| fn_start + p)
+        .expect("server sub-run executor body");
+    let fn_body = &source[fn_start..fn_end];
+    let call_pos = fn_body
+        .find("self.persist_durable_subrun_usage(")
+        .expect("sub-runs must persist durable usage after execution");
+    let snippet = &fn_body[call_pos..fn_body.len().min(call_pos + 360)];
+
+    assert!(
+        snippet.contains("prompt_tokens"),
+        "sub-run usage must use provider input tokens including cache buckets: {snippet}"
+    );
+    assert!(
+        snippet.contains("loop_state.total_completion"),
+        "sub-run completion token usage must be persisted: {snippet}"
+    );
+    assert!(
+        snippet.contains("loop_state.total_tool_calls"),
+        "sub-run tool-call usage must be persisted: {snippet}"
     );
 }
 
