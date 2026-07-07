@@ -9,7 +9,6 @@ use std::sync::RwLock;
 use crate::registry_payload::{
     RegistryStatus, canonical_serialize, exact_id_string, exact_non_empty_markdown_string,
     exact_non_empty_string, parse_registry_status, reject_secret_like_json,
-    validate_registered_endpoint_url,
 };
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, error_response_coded, internal_error,
@@ -38,7 +37,8 @@ pub struct CapabilityServerEndpoint {
     #[serde(rename = "type")]
     pub server_type: CapabilityServerType,
     pub transport: CapabilityServerTransport,
-    pub endpoint_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,11 +595,13 @@ fn validate_capability_servers(
                 "agent_binding_invalid",
             ));
         }
-        validate_registered_endpoint_url(
-            "capability_servers[].endpoint_url",
-            &server.endpoint_url,
-            "agent_binding_invalid",
-        )?;
+        if server.endpoint_url.is_some() {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "capability_servers[].endpoint_url must not be set; provide runtime endpoints in capability_descriptors",
+                "agent_binding_invalid",
+            ));
+        }
         match server.server_type {
             CapabilityServerType::Mcp => has_mcp = true,
             CapabilityServerType::Skill => has_skill = true,
@@ -772,13 +774,13 @@ mod tests {
                         id: "tools".into(),
                         server_type: CapabilityServerType::Mcp,
                         transport: CapabilityServerTransport::StreamableHttp,
-                        endpoint_url: "https://capabilities.example.com/mcp".into(),
+                        endpoint_url: None,
                     },
                     CapabilityServerEndpoint {
                         id: "skills".into(),
                         server_type: CapabilityServerType::Skill,
                         transport: CapabilityServerTransport::StreamableHttp,
-                        endpoint_url: "https://capabilities.example.com/skills".into(),
+                        endpoint_url: None,
                     },
                 ],
                 runtime_policy: RuntimePolicy {
@@ -860,11 +862,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binding_rejects_credential_bearing_endpoint() {
+    async fn binding_rejects_runtime_endpoint_url() {
         let svc = InMemoryAgentBindingService::new();
         let mut request = valid_request();
         request.binding.capability_servers[0].endpoint_url =
-            "https://capabilities.example.com/mcp?token=secret".into();
+            Some("https://capabilities.example.com/mcp".into());
         let err = svc.create_binding(request).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1.error_code.as_deref(), Some("agent_binding_invalid"));

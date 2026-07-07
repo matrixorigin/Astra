@@ -20,13 +20,13 @@ fn binding_request(suffix: &str) -> AgentBindingCreateRequestData {
                     id: "tools".to_string(),
                     server_type: CapabilityServerType::Mcp,
                     transport: CapabilityServerTransport::StreamableHttp,
-                    endpoint_url: "https://capabilities.example.com/mcp".to_string(),
+                    endpoint_url: None,
                 },
                 CapabilityServerEndpoint {
                     id: "skills".to_string(),
                     server_type: CapabilityServerType::Skill,
                     transport: CapabilityServerTransport::StreamableHttp,
-                    endpoint_url: "https://capabilities.example.com/skills".to_string(),
+                    endpoint_url: None,
                 },
             ],
             runtime_policy: RuntimePolicy {

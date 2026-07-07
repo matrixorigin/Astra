@@ -2481,6 +2481,13 @@ impl AgenticRunLifecycleService {
         Self::validate_runtime_auth_shape(request, selected_model)?;
         let provider_model_descriptor = Self::provider_model_descriptor(request)?;
         if let Some(gateway_id) = selected_model.gateway.as_deref() {
+            if provider_model_descriptor.is_some() {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "selected_model.gateway must be absent when capability_descriptors.model_gateway is present",
+                    "selected_model_invalid",
+                ));
+            }
             self.load_active_selected_model_gateway(gateway_id).await?;
         } else if provider_model_descriptor.is_some() {
             Self::validate_provider_runtime_authorized(request)?;
@@ -2888,6 +2895,36 @@ impl AgenticRunLifecycleService {
         })
     }
 
+    fn agent_binding_runtime_descriptor<'a>(
+        label: &'static str,
+        descriptor: Option<&'a astra_services::runs::RuntimeCapabilityDescriptorRequest>,
+        expected_id: &str,
+        expected_type: &str,
+    ) -> Result<
+        &'a astra_services::runs::RuntimeCapabilityDescriptorRequest,
+        (StatusCode, Json<ErrorResponse>),
+    > {
+        let descriptor = descriptor.ok_or_else(|| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                format!("{label} is required when agent_binding is present"),
+                "provider_runtime_context_required",
+            )
+        })?;
+        astra_services::auth::provider_request::validate_runtime_capability_descriptor(
+            descriptor,
+            expected_type,
+        )?;
+        if descriptor.id != expected_id {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                format!("{label}.id must match agent_binding capability server ref"),
+                "agent_binding_capability_ref_invalid",
+            ));
+        }
+        Ok(descriptor)
+    }
+
     async fn prepare_runtime_capabilities(
         &self,
         request: &ChatRequestData,
@@ -2924,6 +2961,29 @@ impl AgenticRunLifecycleService {
                 "agent_binding_runtime_auth_missing",
             )
         })?;
+        let descriptors = request.capability_descriptors.as_ref().ok_or_else(|| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "capability_descriptors is required when agent_binding is present",
+                "provider_runtime_context_required",
+            )
+        })?;
+        let mcp_endpoint_url = Self::agent_binding_runtime_descriptor(
+            "capability_descriptors.mcp",
+            descriptors.mcp.as_ref(),
+            &resolved.mcp_server.id,
+            "mcp",
+        )?
+        .endpoint_url
+        .clone();
+        let skill_endpoint_url = Self::agent_binding_runtime_descriptor(
+            "capability_descriptors.skills",
+            descriptors.skills.as_ref(),
+            &resolved.skill_server.id,
+            "skills",
+        )?
+        .endpoint_url
+        .clone();
         tracing::debug!(
             binding_id = %resolved.binding.id,
             binding_name = %resolved.binding.binding_name,
@@ -2933,13 +2993,13 @@ impl AgenticRunLifecycleService {
         );
         let bundle = runtime_mcp::prepare_agent_binding_mcp_bundle(
             &resolved.mcp_server.id,
-            &resolved.mcp_server.endpoint_url,
+            &mcp_endpoint_url,
             &runtime_auth.authorization,
         )
         .await?;
         let skill_resolver = agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
             &resolved.skill_server.id,
-            &resolved.skill_server.endpoint_url,
+            &skill_endpoint_url,
             &runtime_auth.authorization,
         )
         .await?;
@@ -3008,11 +3068,29 @@ impl AgenticRunLifecycleService {
         workspace_executor_admitted: bool,
     ) -> Option<Value> {
         let selected_model = request.selected_model.as_ref()?;
-        let selected_model_json = json!({
-            "model": &selected_model.model,
-            "gateway": &selected_model.gateway,
-        });
-        let model_resolution = if selected_model.gateway.is_some() {
+        let selected_model_json = match selected_model.id.as_ref() {
+            Some(id) => json!({
+                "id": id,
+                "model": &selected_model.model,
+            }),
+            None => json!({
+                "model": &selected_model.model,
+            }),
+        };
+        let model_resolution = if let Some(model_gateway) = request
+            .capability_descriptors
+            .as_ref()
+            .and_then(|descriptors| descriptors.model_gateway.as_ref())
+        {
+            json!({
+                "source": "provider_descriptor",
+                "descriptor": {
+                    "id": &model_gateway.id,
+                    "protocol": &model_gateway.protocol,
+                    "invoke_url_present": true
+                }
+            })
+        } else if selected_model.gateway.is_some() {
             json!({
                 "source": "model_gateway",
                 "gateway": &selected_model.gateway,

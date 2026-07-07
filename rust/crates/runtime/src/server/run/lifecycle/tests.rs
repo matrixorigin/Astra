@@ -2416,13 +2416,13 @@ fn test_agent_binding_record(max_steps: Option<u32>) -> astra_services::AgentBin
                 id: "mcp-main".to_string(),
                 server_type: astra_services::CapabilityServerType::Mcp,
                 transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                endpoint_url: "https://cap.example.com/mcp".to_string(),
+                endpoint_url: None,
             },
             astra_services::CapabilityServerEndpoint {
                 id: "skills-main".to_string(),
                 server_type: astra_services::CapabilityServerType::Skill,
                 transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                endpoint_url: "https://cap.example.com/skills".to_string(),
+                endpoint_url: None,
             },
         ],
         runtime_policy: astra_services::RuntimePolicy {
@@ -2447,13 +2447,13 @@ fn test_agent_binding_create_request() -> astra_services::AgentBindingCreateRequ
                     id: "tools".to_string(),
                     server_type: astra_services::CapabilityServerType::Mcp,
                     transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                    endpoint_url: "https://cap.example.com/mcp".to_string(),
+                    endpoint_url: None,
                 },
                 astra_services::CapabilityServerEndpoint {
                     id: "skills".to_string(),
                     server_type: astra_services::CapabilityServerType::Skill,
                     transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                    endpoint_url: "https://cap.example.com/skills".to_string(),
+                    endpoint_url: None,
                 },
             ],
             runtime_policy: astra_services::RuntimePolicy {
@@ -3957,6 +3957,41 @@ async fn validate_request_constraints_accepts_provider_descriptor_without_regist
             .as_ref()
             .map(|config| &config.url),
         Some(&"http://127.0.0.1/model-gateway".to_string())
+    );
+}
+
+#[tokio::test]
+async fn validate_request_constraints_rejects_provider_descriptor_with_selected_model_gateway() {
+    let service = test_service();
+    let mut request = test_request("hello");
+    request.provider_runtime_authorized = true;
+    request.selected_model = Some(SelectedModelRequest {
+        id: None,
+        model: "qwen3.7-max".to_string(),
+        gateway: Some("primary-gateway".to_string()),
+    });
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer runtime-grant".to_string(),
+    });
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "moi-model-gateway",
+                "model_gateway",
+                "http://127.0.0.1/model-gateway",
+            )),
+            mcp: None,
+            skills: None,
+        });
+
+    let err = service
+        .validate_request_constraints("u1", &request)
+        .await
+        .expect_err("provider descriptor path must not accept selected_model.gateway");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        err.1.0.error_code.as_deref(),
+        Some("selected_model_invalid")
     );
 }
 
@@ -6052,6 +6087,130 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
     server.abort();
 }
 
+#[tokio::test]
+async fn agent_binding_runtime_uses_request_capability_descriptor_endpoints() {
+    use axum::{Router, extract::State, http::HeaderMap, routing::post};
+    use tokio::sync::Mutex;
+
+    #[derive(Default)]
+    struct Capture {
+        mcp_authorization: Mutex<Option<String>>,
+        skill_authorization: Mutex<Option<String>>,
+    }
+
+    async fn mcp_handler(
+        State(capture): State<Arc<Capture>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        *capture.mcp_authorization.lock().await = headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": body.get("id").cloned().unwrap_or(Value::Null),
+            "result": {"tools": []}
+        }))
+    }
+
+    async fn skills_handler(
+        State(capture): State<Arc<Capture>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        *capture.skill_authorization.lock().await = headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": body.get("id").cloned().unwrap_or(Value::Null),
+            "result": {
+                "skills": [{
+                    "name": "moi-skill",
+                    "description": "Skill from descriptor endpoint",
+                    "when_to_use": "when the binding grants it",
+                    "instructions": "Use the request-scoped endpoint.",
+                    "allowed_tools": [],
+                    "input_schema": {"type": "object"},
+                    "output_schema": {"type": "object"}
+                }]
+            }
+        }))
+    }
+
+    let capture = Arc::new(Capture::default());
+    let app = Router::new()
+        .route("/mcp", post(mcp_handler))
+        .route("/skills", post(skills_handler))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local capability server");
+    let addr = listener.local_addr().expect("listener addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let (service, _binding_service, record) = service_with_in_memory_binding().await;
+    let mut request = test_request("use binding tools");
+    request.provider_runtime_authorized = true;
+    request.runtime_profile = Some(RuntimeProfileRequest::AgentBindingRegistry);
+    request.agent_binding = Some(runtime_binding_request(record.id, "tools", "skills"));
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer runtime-grant".to_string(),
+    });
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "moi-model-gateway",
+                "model_gateway",
+                &format!("http://{addr}/model"),
+            )),
+            mcp: Some(test_runtime_descriptor(
+                "tools",
+                "mcp",
+                &format!("http://{addr}/mcp"),
+            )),
+            skills: Some(test_runtime_descriptor(
+                "skills",
+                "skills",
+                &format!("http://{addr}/skills"),
+            )),
+        });
+
+    let capabilities = service
+        .prepare_runtime_capabilities(&request, &RequestConstraints::default())
+        .await
+        .expect("agent binding descriptors should prepare capabilities");
+
+    assert!(capabilities.mcp_bundle.is_some());
+    assert!(capabilities.agent_binding.is_some());
+    assert_eq!(
+        capture.mcp_authorization.lock().await.as_deref(),
+        Some("Bearer runtime-grant")
+    );
+    assert_eq!(
+        capture.skill_authorization.lock().await.as_deref(),
+        Some("Bearer runtime-grant")
+    );
+    let manifest =
+        AgenticRunLifecycleService::build_runtime_manifest(&request, &capabilities, false)
+            .expect("selected_model should produce a runtime manifest");
+    assert_eq!(manifest["selected_model"]["model"], "test-model");
+    assert!(manifest["selected_model"].get("gateway").is_none());
+    assert_eq!(
+        manifest["model_resolution"]["source"],
+        "provider_descriptor"
+    );
+    assert_eq!(
+        manifest["model_resolution"]["descriptor"]["id"],
+        "moi-model-gateway"
+    );
+    server.abort();
+}
+
 #[test]
 fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
     let mut request = test_request("use binding tools");
@@ -6095,6 +6254,7 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
             .expect("selected_model should produce a runtime manifest");
 
     assert_eq!(manifest["selected_model"]["model"], "test-model");
+    assert!(manifest["selected_model"].get("gateway").is_none());
     assert_eq!(manifest["runtime_profile"], "agent_binding_registry");
     assert_eq!(manifest["turn"]["message"], "use binding tools");
     assert_eq!(manifest["turn"]["parts"][0]["type"], "text");
