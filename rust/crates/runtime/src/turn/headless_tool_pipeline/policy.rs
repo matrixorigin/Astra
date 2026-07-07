@@ -906,7 +906,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             mut execution,
             idem_key,
         } = validated;
-        if server_owned_edge_result_should_be_rerouted(
+        if server_owned_edge_result_should_be_rejected(
             &execution,
             self.ctx.runtime_tool_executor.is_some(),
         ) {

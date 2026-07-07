@@ -455,6 +455,15 @@ fn tool_execution_outcome_from_output(output: String) -> ToolExecutionOutcome {
     }
 }
 
+fn tool_result_from_cli_outcome(outcome: ToolExecutionOutcome) -> astra_tools::ToolResult {
+    astra_tools::ToolResult {
+        output: outcome.output,
+        metadata: outcome.tool_result_fields,
+        is_error: outcome.is_error,
+        exit_semantics: None,
+    }
+}
+
 struct EdgeToolRun {
     output: String,
     error_kind: Option<astra_core::ErrorKind>,
@@ -1049,7 +1058,7 @@ pub struct ToolExecutor {
     /// Per-turn mutation accounting for adjust_config governor.
     /// (turn_number, mutations_applied_on_turn)
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
-    /// Shared tool executor for delegating unknown tools to astra-tools.
+    /// Shared implementation host for explicitly delegated tools.
     default_executor: astra_tools::executor::DefaultToolExecutor,
     /// Schemas declared by CLI-side providers except CLI MCP
     /// (server service, control plane, and CLI local executor). MCP schemas live
@@ -1511,6 +1520,22 @@ impl ToolExecutor {
                     .is_some_and(|name| self.tool_has_public_schema_runtime_binding(name))
             })
             .collect()
+    }
+
+    fn runtime_available_tool_schemas(&self) -> Vec<Value> {
+        let mut schemas = local_tool_schemas();
+        schemas.extend(self.provider_owned_schemas_snapshot("shared_tool_executor_surface"));
+        let mut seen = HashSet::new();
+        let mut schemas: Vec<Value> = self
+            .runtime_bound_tool_schemas(schemas)
+            .into_iter()
+            .filter(|schema| {
+                astra_turn_core::tool::schema::tool_schema_name(schema)
+                    .is_some_and(|name| seen.insert(name.to_string()))
+            })
+            .collect();
+        astra_core::tool_schema::sort_tool_schemas_by_name(&mut schemas);
+        schemas
     }
 
     fn tool_has_public_schema_runtime_binding(&self, name: &str) -> bool {
@@ -4734,6 +4759,25 @@ impl ToolExecutor {
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
                     astra_tools::web_fetch::fetch_with_cache_scope(None, args, &cache_scope).await
                 }
+                "display_sixel" => {
+                    astra_tools::ToolExecutor::execute(&self.default_executor, name, args)
+                        .await
+                        .output
+                }
+                "run_script" => {
+                    #[cfg(unix)]
+                    {
+                        let config = astra_tools::run_script::RunScriptConfig::default();
+                        astra_tools::run_script::handle_run_script(args, self, config)
+                            .await
+                            .output
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        "Error: run_script is not available on this platform (requires Unix domain sockets)"
+                            .to_string()
+                    }
+                }
                 "memory" => {
                     let action =
                         match astra_tools::memory_tool_contract::memory_action_from_args(args) {
@@ -4974,11 +5018,7 @@ impl ToolExecutor {
                 _ if astra_runtime_env::is_mcp_namespaced_tool_name(name) => {
                     self.execute_mcp_tool(name, args).await
                 }
-                _ => {
-                    // Delegate unknown tools to the shared DefaultToolExecutor.
-                    use astra_tools::ToolExecutor as _;
-                    self.default_executor.execute(name, args).await.output
-                }
+                _ => format!("Error: Tool '{name}' is not implemented by the CLI executor"),
             }
         };
         // Normalize empty output, then apply global safety net
@@ -5710,6 +5750,25 @@ impl ToolExecutor {
     }
 }
 
+#[async_trait::async_trait]
+impl astra_tools::ToolExecutor for ToolExecutor {
+    async fn execute(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+        tool_result_from_cli_outcome(ToolExecutor::execute_with_metadata(self, name, args).await)
+    }
+
+    fn tool_schemas(&self) -> Vec<Value> {
+        self.runtime_available_tool_schemas()
+    }
+
+    fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+        tool_result_from_cli_outcome(ToolExecutor::execute_with_metadata(self, name, args).await)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5822,6 +5881,91 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }
         })
+    }
+
+    #[tokio::test]
+    async fn cli_executor_implements_shared_tool_executor_contract() {
+        let (_dir, executor) = temp_executor();
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "list_dir",
+            &serde_json::json!({"path": "."}),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "shared trait execution failed: {result:?}"
+        );
+        assert!(
+            result.output.contains("Directory")
+                || result.output.contains("No entries")
+                || result.output.contains("empty"),
+            "shared trait must return the CLI tool output, got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn cli_shared_tool_schemas_are_runtime_bound_stable_and_deduped() {
+        let executor = test_executor();
+        let duplicate_schema = function_schema("read_file");
+        executor.set_cli_local_provider_schemas(vec![duplicate_schema]);
+
+        let first = astra_tools::ToolExecutor::tool_schemas(&executor);
+        let second = astra_tools::ToolExecutor::tool_schemas(&executor);
+        assert_eq!(first, second, "shared schema surface must be byte-stable");
+
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(&first);
+        assert!(
+            names.contains("read_file"),
+            "runtime-bound CLI surface must include core local tools"
+        );
+        assert!(
+            names.contains("task_board"),
+            "runtime-bound CLI surface must include control-plane local tools"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == "read_file")
+                .count(),
+            1,
+            "duplicate provider schemas must not create duplicate prompt tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_executor_rejects_provider_tool_without_explicit_handler() {
+        let executor = test_executor();
+        let schema = function_schema("custom_provider_probe");
+        executor.set_cli_local_provider_schemas(vec![schema.clone()]);
+        executor.set_current_visible_tool_schemas(&[schema]);
+
+        let output = executor
+            .execute("custom_provider_probe", &serde_json::json!({}))
+            .await;
+
+        assert!(
+            output.contains("not implemented by the CLI executor"),
+            "provider-owned tools without a CLI handler must fail closed: {output}"
+        );
+        assert!(
+            !output.contains("DefaultToolExecutor"),
+            "unknown CLI tools must not leak through the shared default executor: {output}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cli_run_script_is_explicit_shared_tool_delegate() {
+        let executor = test_executor();
+        let output = executor.execute("run_script", &serde_json::json!({})).await;
+
+        assert!(
+            output.contains("run_script requires a non-empty top-level `script` string"),
+            "run_script must be handled by its shared contract, got: {output}"
+        );
     }
 
     #[test]

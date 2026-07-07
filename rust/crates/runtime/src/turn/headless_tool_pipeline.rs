@@ -90,7 +90,7 @@ const EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD: &str =
 const EDGE_RESULT_RUNTIME_ENVIRONMENT_FIELD: &str = "runtime_environment";
 const HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX: &str = "Error: headless edge protocol";
 
-fn server_owned_edge_result_should_be_rerouted(
+fn server_owned_edge_result_should_be_rejected(
     execution: &HeadlessResolvedExecution,
     runtime_executor_available: bool,
 ) -> bool {
