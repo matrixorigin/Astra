@@ -8,8 +8,6 @@ export const PATH_AUTH_LOGIN = "/auth/login";
 export const PATH_AUTH_REFRESH = "/auth/refresh";
 export const PATH_AUTH_LOGOUT = "/auth/logout";
 export const PATH_AUTH_ME = "/auth/me";
-export const PATH_AUTH_EXTERNAL_PROVIDERS = "/auth/external/providers";
-export const PATH_AUTH_EXTERNAL_LOGIN = "/auth/external/login";
 
 export const PATH_SESSIONS = "/sessions";
 

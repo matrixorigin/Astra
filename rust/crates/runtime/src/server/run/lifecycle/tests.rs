@@ -3990,7 +3990,7 @@ async fn validate_request_constraints_rejects_descriptor_without_provider_author
     assert_eq!(err.0, StatusCode::BAD_REQUEST);
     assert_eq!(
         err.1.0.error_code.as_deref(),
-        Some("external_runtime_context_required")
+        Some("provider_runtime_context_required")
     );
 }
 

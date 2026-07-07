@@ -1,32 +1,4 @@
 //! `/login` and `/register` form as a first-class TUI view.
-//!
-//! Replaces the previous behaviour of `with_restored()`-ing out of the
-//! TUI to run blocking `rpassword::read_password()` prompts against the
-//! bare terminal — which looked disjoint, bypassed theming, and stole
-//! key handling.
-//!
-//! The view is a small card rendered inside the bottom pane:
-//!
-//! ```text
-//!   ┌ /login ───────────────────────────────────────────────┐
-//!   │                                                        │
-//!   │   ▸ Astra user login                                   │
-//!   │     External provider user login                       │
-//!   │                                                        │
-//!   │   ↑↓ select · Enter continue · Esc cancel              │
-//!   │                                                        │
-//!   └────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! On `Enter` with both fields populated, the view completes with a
-//! `result` string formatted as `"<username>\n<password>"` so the
-//! outer event loop can hand it to `do_login` without dragging the
-//! auth-flow crate into this module. On `Esc` / Ctrl+C the view
-//! completes with no result (cancelled).
-//!
-//! The register variant adds an email field. Form shape is the same.
-
-#![allow(dead_code)]
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
@@ -42,28 +14,6 @@ use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
 pub(crate) enum LoginMode {
     Login,
     Register,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExternalLoginProvider {
-    pub id: String,
-    pub display_name: String,
-    pub credential_type: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoginAuthKind {
-    AstraUser,
-    ExternalProvider,
-}
-
-impl LoginAuthKind {
-    fn label(self) -> &'static str {
-        match self {
-            LoginAuthKind::AstraUser => "Astra user login",
-            LoginAuthKind::ExternalProvider => "External provider user login",
-        }
-    }
 }
 
 impl LoginMode {
@@ -121,36 +71,17 @@ pub(crate) struct LoginView {
     values: Vec<String>,
     focus: usize,
     error: Option<String>,
-    provider_load_error: Option<String>,
-    choosing_auth_kind: bool,
-    auth_kind: LoginAuthKind,
-    external_providers: Vec<ExternalLoginProvider>,
-    provider_index: usize,
     done_value: Option<String>,
     cancelled: bool,
 }
 
 impl LoginView {
     pub fn new(mode: LoginMode) -> Self {
-        Self::new_with_external_providers(mode, Vec::new(), None)
-    }
-
-    pub fn new_with_external_providers(
-        mode: LoginMode,
-        external_providers: Vec<ExternalLoginProvider>,
-        provider_load_error: Option<String>,
-    ) -> Self {
-        let values = mode.fields().iter().map(|_| String::new()).collect();
         Self {
             mode,
-            values,
+            values: mode.fields().iter().map(|_| String::new()).collect(),
             focus: 0,
             error: None,
-            provider_load_error,
-            choosing_auth_kind: mode == LoginMode::Login,
-            auth_kind: LoginAuthKind::AstraUser,
-            external_providers,
-            provider_index: 0,
             done_value: None,
             cancelled: false,
         }
@@ -160,179 +91,33 @@ impl LoginView {
         self.mode.fields()
     }
 
-    fn visible_rows(&self) -> Vec<LoginRow> {
-        match self.mode {
-            LoginMode::Register => (0..self.fields().len()).map(LoginRow::Text).collect(),
-            LoginMode::Login if self.choosing_auth_kind => vec![
-                LoginRow::AuthOption(LoginAuthKind::AstraUser),
-                LoginRow::AuthOption(LoginAuthKind::ExternalProvider),
-            ],
-            LoginMode::Login => {
-                let mut rows = Vec::new();
-                if self.auth_kind == LoginAuthKind::ExternalProvider {
-                    rows.push(LoginRow::Provider);
-                }
-                rows.extend((0..self.fields().len()).map(LoginRow::Text));
-                rows
-            }
-        }
-    }
-
-    fn row_count(&self) -> usize {
-        self.visible_rows().len()
-    }
-
-    fn focused_row(&self) -> LoginRow {
-        let rows = self.visible_rows();
-        rows[self.focus.min(rows.len().saturating_sub(1))]
-    }
-
-    fn choose_auth_kind(&mut self, auth_kind: LoginAuthKind) {
-        self.auth_kind = auth_kind;
-        self.choosing_auth_kind = false;
-        self.focus = 0;
-        self.error = None;
-    }
-
-    fn focused_auth_kind(&self) -> Option<LoginAuthKind> {
-        match self.focused_row() {
-            LoginRow::AuthOption(kind) => Some(kind),
-            _ => None,
-        }
-    }
-
-    fn provider_display(&self) -> String {
-        if self.external_providers.is_empty() {
-            return "No providers".to_string();
-        }
-        self.external_providers
-            .iter()
-            .enumerate()
-            .map(|(index, provider)| {
-                let label = if provider.display_name == provider.id {
-                    provider.id.clone()
-                } else {
-                    format!("{} ({})", provider.display_name, provider.id)
-                };
-                if index == self.provider_index {
-                    format!("[{label}]")
-                } else {
-                    label
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" / ")
-    }
-
     fn submit(&mut self) {
-        if self.mode == LoginMode::Login && self.choosing_auth_kind {
-            if let Some(kind) = self.focused_auth_kind() {
-                self.choose_auth_kind(kind);
-            }
-            return;
-        }
-
-        if self.mode == LoginMode::Login && self.auth_kind == LoginAuthKind::ExternalProvider {
-            match self.selected_provider() {
-                Some(provider) if provider.credential_type == "password" => {}
-                Some(provider) => {
-                    self.error = Some(format!(
-                        "External provider '{}' uses unsupported credential type '{}'",
-                        provider.id, provider.credential_type
-                    ));
-                    self.focus = self
-                        .visible_rows()
-                        .iter()
-                        .position(|row| *row == LoginRow::Provider)
-                        .unwrap_or(self.focus);
-                    return;
-                }
-                None => {
-                    self.error = Some("No external providers are configured".to_string());
-                    self.focus = self
-                        .visible_rows()
-                        .iter()
-                        .position(|row| *row == LoginRow::Provider)
-                        .unwrap_or(self.focus);
-                    return;
-                }
-            }
-        }
-        // Require every field to be non-empty before submitting. Show
-        // an inline error and keep focus on the first empty field so
-        // the user knows what's missing without re-typing anything.
-        for (i, v) in self.values.iter().enumerate() {
-            if v.trim().is_empty() {
-                self.error = Some(format!("{} cannot be empty", self.fields()[i].label.trim()));
-                self.focus = self
-                    .visible_rows()
-                    .iter()
-                    .position(|row| *row == LoginRow::Text(i))
-                    .unwrap_or(self.focus);
+        for (index, value) in self.values.iter().enumerate() {
+            if value.trim().is_empty() {
+                self.error = Some(format!(
+                    "{} cannot be empty",
+                    self.fields()[index].label.trim()
+                ));
+                self.focus = index;
                 return;
             }
         }
         self.done_value = Some(match self.mode {
-            LoginMode::Register => self.values.join("\n"),
-            LoginMode::Login if self.auth_kind == LoginAuthKind::ExternalProvider => {
-                let provider = self
-                    .selected_provider()
-                    .map(|p| p.id.as_str())
-                    .unwrap_or("");
-                format!("{}\n{}", provider, self.values.join("\n"))
-            }
             LoginMode::Login => self.values.join("\n"),
+            LoginMode::Register => self.values.join("\n"),
         });
     }
 
-    fn provider_load_error_visible(&self) -> bool {
-        self.mode == LoginMode::Login
-            && !self.choosing_auth_kind
-            && self.auth_kind == LoginAuthKind::ExternalProvider
-            && self.provider_load_error.is_some()
-    }
-
     fn hint_text(&self) -> &'static str {
-        if self.mode == LoginMode::Login && self.choosing_auth_kind {
-            "  ↑↓ select · Enter continue · Esc cancel"
-        } else if self.mode == LoginMode::Login && self.auth_kind == LoginAuthKind::ExternalProvider
-        {
-            "  Tab / ↑↓ switch field · ←→ choose provider · Enter submit · Esc cancel"
-        } else {
-            "  Tab / ↑↓ switch field · Enter submit · Esc cancel"
+        "  Tab / ↑↓ switch field · Enter submit · Esc cancel"
+    }
+
+    fn rendered_value(&self, index: usize) -> String {
+        match self.fields()[index].kind {
+            FieldKind::Plain => self.values[index].clone(),
+            FieldKind::Secret => "•".repeat(self.values[index].chars().count()),
         }
     }
-
-    fn toggle_auth_choice_focus(&mut self) {
-        self.focus = match self.focused_row() {
-            LoginRow::AuthOption(LoginAuthKind::AstraUser) => 1,
-            LoginRow::AuthOption(LoginAuthKind::ExternalProvider) => 0,
-            _ => self.focus,
-        };
-        self.focus = self.focus.min(self.row_count().saturating_sub(1));
-        self.error = None;
-    }
-
-    fn cycle_provider(&mut self, delta: isize) {
-        let len = self.external_providers.len();
-        if len == 0 {
-            return;
-        }
-        let current = self.provider_index.min(len - 1) as isize;
-        self.provider_index = (current + delta).rem_euclid(len as isize) as usize;
-        self.error = None;
-    }
-
-    fn selected_provider(&self) -> Option<&ExternalLoginProvider> {
-        self.external_providers.get(self.provider_index)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoginRow {
-    AuthOption(LoginAuthKind),
-    Provider,
-    Text(usize),
 }
 
 impl BottomPaneView for LoginView {
@@ -354,89 +139,33 @@ impl BottomPaneView for LoginView {
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::default());
-
-        for (row_index, row) in self.visible_rows().iter().enumerate() {
-            let focused = row_index == self.focus;
-            let caret = if focused {
-                Span::styled(
-                    "▸ ",
-                    Style::default()
-                        .fg(crate::tui::theme::current().accent)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::raw("  ")
-            };
-            let label_style = if focused {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let (label, display) = match *row {
-                LoginRow::AuthOption(kind) => {
-                    let option_style = if focused {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    };
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        caret,
-                        Span::styled(kind.label(), option_style),
-                    ]));
-                    continue;
-                }
-                LoginRow::Provider => ("Provider", self.provider_display()),
-                LoginRow::Text(i) => {
-                    let spec = self.fields()[i];
-                    let display = match spec.kind {
-                        FieldKind::Plain => self.values[i].clone(),
-                        FieldKind::Secret => "•".repeat(self.values[i].chars().count()),
-                    };
-                    (spec.label, display)
-                }
-            };
-            let value_style = if focused {
-                Style::default()
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let spans = vec![
-                Span::raw("  "),
-                caret,
-                Span::styled(format!("{:<9}  ", label), label_style),
-                Span::styled(display, value_style),
-            ];
-            lines.push(Line::from(spans));
-        }
-
-        lines.push(Line::default());
-
-        if self.provider_load_error_visible()
-            && let Some(ref err) = self.provider_load_error
-        {
+        for (index, field) in self.fields().iter().enumerate() {
+            let focused = index == self.focus;
+            let caret = if focused { "▸" } else { " " };
+            let value = self.rendered_value(index);
             lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("! ", Style::default().fg(Color::Yellow)),
-                Span::styled(err.clone(), Style::default().fg(Color::Yellow)),
-            ]));
-            lines.push(Line::default());
-        }
-
-        if let Some(ref err) = self.error {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
                 Span::styled(
-                    "✗ ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    format!("  {caret} "),
+                    Style::default().fg(crate::tui::theme::current().accent),
                 ),
-                Span::styled(err.clone(), Style::default().fg(Color::Red)),
+                Span::styled(field.label, Style::default().fg(Color::Gray)),
+                Span::raw("  "),
+                Span::styled(
+                    value,
+                    Style::default().fg(if focused { Color::White } else { Color::Gray }),
+                ),
             ]));
-            lines.push(Line::default());
         }
-
+        if let Some(error) = &self.error {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!("  {error}"),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            self.hint_text().to_string(),
+            self.hint_text(),
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -444,97 +173,52 @@ impl BottomPaneView for LoginView {
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
-        // border(2) + blank + N field rows + blank + optional error row + hint
-        let rows = self.row_count() as u16;
-        let error_rows = if self.error.is_some() { 2 } else { 0 };
-        let provider_error_rows = if self.provider_load_error_visible() {
-            2
-        } else {
-            0
-        };
-        2 + 1 + rows + 1 + provider_error_rows + error_rows + 1
+        let error_rows = u16::from(self.error.is_some()) * 2;
+        self.fields().len() as u16 + 5 + error_rows
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Esc => self.cancelled = true,
-            KeyCode::Enter => {
-                // Enter in any field submits the whole form.
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.cancelled = true;
+            }
+            (KeyCode::Tab | KeyCode::Down, _) => {
+                self.focus = (self.focus + 1).min(self.fields().len().saturating_sub(1));
                 self.error = None;
-                self.submit();
             }
-            KeyCode::Tab | KeyCode::Down => {
-                self.focus = (self.focus + 1) % self.row_count();
+            (KeyCode::BackTab | KeyCode::Up, _) => {
+                self.focus = self.focus.saturating_sub(1);
+                self.error = None;
             }
-            KeyCode::BackTab | KeyCode::Up => {
-                let n = self.row_count();
-                self.focus = (self.focus + n - 1) % n;
+            (KeyCode::Enter, _) => self.submit(),
+            (KeyCode::Backspace, _) => {
+                self.values[self.focus].pop();
+                self.error = None;
             }
-            KeyCode::Left => match self.focused_row() {
-                LoginRow::AuthOption(_) => self.toggle_auth_choice_focus(),
-                LoginRow::Provider => self.cycle_provider(-1),
-                LoginRow::Text(_) => {}
-            },
-            KeyCode::Right => match self.focused_row() {
-                LoginRow::AuthOption(_) => self.toggle_auth_choice_focus(),
-                LoginRow::Provider => self.cycle_provider(1),
-                LoginRow::Text(_) => {}
-            },
-            KeyCode::Backspace => {
-                if let LoginRow::Text(i) = self.focused_row() {
-                    self.values[i].pop();
-                    self.error = None;
-                }
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                self.values[self.focus].clear();
+                self.error = None;
             }
-            KeyCode::Char('u') if ctrl => {
-                // Codex-style "clear current field" shortcut.
-                if let LoginRow::Text(i) = self.focused_row() {
-                    self.values[i].clear();
-                    self.error = None;
-                }
-            }
-            KeyCode::Char(' ') if !ctrl => match self.focused_row() {
-                LoginRow::AuthOption(kind) => self.choose_auth_kind(kind),
-                LoginRow::Provider => self.cycle_provider(1),
-                LoginRow::Text(i) => {
-                    self.values[i].push(' ');
-                    self.error = None;
-                }
-            },
-            KeyCode::Char(c) if !ctrl => {
-                if let LoginRow::Text(i) = self.focused_row() {
-                    self.values[i].push(c);
-                    self.error = None;
-                }
+            (KeyCode::Char(c), modifiers)
+                if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.values[self.focus].push(c);
+                self.error = None;
             }
             _ => {}
         }
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        // Place the cursor at the end of the currently focused value.
-        // Layout mirrors `render`: outer block border (1) + top blank
-        // row (1) above the first field, then 1 row per field.
-        let inner = Rect::new(
-            area.x + 1,
-            area.y + 1,
-            area.width.saturating_sub(2),
-            area.height.saturating_sub(2),
-        );
-        let LoginRow::Text(text_index) = self.focused_row() else {
+        if self.cancelled || self.done_value.is_some() {
             return None;
-        };
-        let row = inner.y + 1 + self.focus as u16;
-        // "  ▸ Username    " prefix (2 + 2 + 9 + 2 = 15).
-        let prefix_cols = 15u16;
-        let spec = self.fields()[text_index];
-        let value = &self.values[text_index];
-        let disp_width = match spec.kind {
-            FieldKind::Plain => UnicodeWidthStr::width(value.as_str()) as u16,
-            FieldKind::Secret => value.chars().count() as u16,
-        };
-        Some((inner.x + prefix_cols + disp_width, row))
+        }
+        let x = 6
+            + self.fields()[self.focus].label.width() as u16
+            + 2
+            + self.rendered_value(self.focus).width() as u16;
+        let y = 2 + self.focus as u16;
+        Some((area.x.saturating_add(x), area.y.saturating_add(y)))
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
@@ -554,12 +238,7 @@ impl BottomPaneView for LoginView {
             });
         }
         self.done_value.clone().map(|raw| ViewCompletion {
-            // Prefix the result so the outer event loop can tell this
-            // came from a login/register form and which flow to call.
             result: Some(match self.mode {
-                LoginMode::Login if self.auth_kind == LoginAuthKind::ExternalProvider => {
-                    format!("__external_login__\n{raw}")
-                }
                 LoginMode::Login => format!("__login__\n{raw}"),
                 LoginMode::Register => format!("__register__\n{raw}"),
             }),
@@ -572,7 +251,6 @@ impl BottomPaneView for LoginView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        // Hint is baked into the rendered card, so no outer hint bar.
         None
     }
 
@@ -584,7 +262,7 @@ impl BottomPaneView for LoginView {
 #[cfg(test)]
 mod tests {
     use super::super::view::BottomPaneView;
-    use super::{ExternalLoginProvider, LoginMode, LoginView};
+    use super::{LoginMode, LoginView};
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::buffer::Buffer;
@@ -606,24 +284,20 @@ mod tests {
     }
 
     #[test]
-    fn renders_login_choice_screen_and_hint() {
+    fn renders_login_fields_and_hint() {
         let v = LoginView::new(LoginMode::Login);
         let buf = draw_widget(W(&v), 100, 10);
         let s = buffer_to_string(&buf);
         assert!(s.contains("/login"));
-        assert!(s.contains("Astra user login"));
-        assert!(s.contains("External provider user login"));
-        assert!(!s.contains("Username"));
-        assert!(!s.contains("Password"));
-        assert!(s.contains("select"));
-        assert!(s.contains("continue"));
+        assert!(s.contains("Username"));
+        assert!(s.contains("Password"));
+        assert!(s.contains("Enter submit"));
         assert!(s.contains("Esc"));
     }
 
     #[test]
     fn typing_fills_focused_field_then_tab_moves_focus() {
         let mut v = LoginView::new(LoginMode::Login);
-        v.handle_key(k(KeyCode::Enter)); // choose Astra user login
         for c in "alice".chars() {
             v.handle_key(ck(c, KeyModifiers::NONE));
         }
@@ -639,8 +313,7 @@ mod tests {
     #[test]
     fn enter_with_empty_field_shows_error_and_doesnt_complete() {
         let mut v = LoginView::new(LoginMode::Login);
-        v.handle_key(k(KeyCode::Enter)); // choose Astra user login
-        v.handle_key(k(KeyCode::Enter)); // submit empty form
+        v.handle_key(k(KeyCode::Enter));
         assert!(!v.is_complete());
         assert!(v.error.is_some());
     }
@@ -648,7 +321,6 @@ mod tests {
     #[test]
     fn enter_with_both_fields_completes_with_encoded_result() {
         let mut v = LoginView::new(LoginMode::Login);
-        v.handle_key(k(KeyCode::Enter)); // choose Astra user login
         for c in "alice".chars() {
             v.handle_key(ck(c, KeyModifiers::NONE));
         }
@@ -658,55 +330,6 @@ mod tests {
         }
         v.handle_key(k(KeyCode::Enter));
         assert!(v.is_complete());
-        let vc = v.completion().unwrap();
-        let result = vc.result.unwrap();
-        assert!(result.starts_with("__login__\n"));
-        assert!(result.contains("alice"));
-        assert!(result.contains("secret"));
-    }
-
-    #[test]
-    fn default_login_mode_completes_as_astra_user_without_provider() {
-        let mut v = LoginView::new_with_external_providers(
-            LoginMode::Login,
-            vec![ExternalLoginProvider {
-                id: "moi".to_string(),
-                display_name: "MOI".to_string(),
-                credential_type: "password".to_string(),
-            }],
-            None,
-        );
-        v.handle_key(k(KeyCode::Enter)); // choose Astra user login
-        for c in "alice".chars() {
-            v.handle_key(ck(c, KeyModifiers::NONE));
-        }
-        v.handle_key(k(KeyCode::Tab)); // password
-        for c in "secret".chars() {
-            v.handle_key(ck(c, KeyModifiers::NONE));
-        }
-        v.handle_key(k(KeyCode::Enter));
-
-        let result = v.completion().unwrap().result.unwrap();
-        assert_eq!(result, "__login__\nalice\nsecret");
-    }
-
-    #[test]
-    fn provider_load_error_does_not_block_astra_user_login() {
-        let mut v = LoginView::new_with_external_providers(
-            LoginMode::Login,
-            Vec::new(),
-            Some("failed to load providers".to_string()),
-        );
-        v.handle_key(k(KeyCode::Enter)); // choose Astra user login
-        for c in "alice".chars() {
-            v.handle_key(ck(c, KeyModifiers::NONE));
-        }
-        v.handle_key(k(KeyCode::Tab)); // password
-        for c in "secret".chars() {
-            v.handle_key(ck(c, KeyModifiers::NONE));
-        }
-        v.handle_key(k(KeyCode::Enter));
-
         let result = v.completion().unwrap().result.unwrap();
         assert_eq!(result, "__login__\nalice\nsecret");
     }
@@ -723,8 +346,7 @@ mod tests {
     #[test]
     fn password_field_renders_as_bullets_not_plaintext() {
         let mut v = LoginView::new(LoginMode::Login);
-        v.handle_key(k(KeyCode::Enter)); // choose Astra user login
-        v.handle_key(k(KeyCode::Tab)); // focus password
+        v.handle_key(k(KeyCode::Tab));
         for c in "hunter2".chars() {
             v.handle_key(ck(c, KeyModifiers::NONE));
         }
@@ -737,7 +359,6 @@ mod tests {
     #[test]
     fn ctrl_u_clears_current_field() {
         let mut v = LoginView::new(LoginMode::Login);
-        v.handle_key(k(KeyCode::Enter)); // choose Astra user login
         for c in "abcde".chars() {
             v.handle_key(ck(c, KeyModifiers::NONE));
         }
@@ -771,37 +392,6 @@ mod tests {
         }
         v.handle_key(k(KeyCode::Enter));
         let vc = v.completion().unwrap();
-        assert!(vc.result.unwrap().starts_with("__register__\n"));
-    }
-
-    #[test]
-    fn external_login_renders_provider_and_encodes_provider_sentinel() {
-        let mut v = LoginView::new_with_external_providers(
-            LoginMode::Login,
-            vec![ExternalLoginProvider {
-                id: "moi".to_string(),
-                display_name: "MOI".to_string(),
-                credential_type: "password".to_string(),
-            }],
-            None,
-        );
-        v.handle_key(k(KeyCode::Down)); // focus external provider login
-        v.handle_key(k(KeyCode::Enter)); // choose external provider login
-        let buf = draw_widget(W(&v), 80, 12);
-        let s = buffer_to_string(&buf);
-        assert!(s.contains("Provider"));
-        assert!(s.contains("MOI (moi)"));
-
-        v.handle_key(k(KeyCode::Tab)); // username
-        for c in "admin".chars() {
-            v.handle_key(ck(c, KeyModifiers::NONE));
-        }
-        v.handle_key(k(KeyCode::Tab)); // password
-        for c in "admin".chars() {
-            v.handle_key(ck(c, KeyModifiers::NONE));
-        }
-        v.handle_key(k(KeyCode::Enter));
-        let result = v.completion().unwrap().result.unwrap();
-        assert_eq!(result, "__external_login__\nmoi\nadmin\nadmin");
+        assert_eq!(vc.result.unwrap(), "__register__\nalice\na@b.c\npw");
     }
 }

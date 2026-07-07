@@ -1596,7 +1596,7 @@ impl InProcessChatTurnBridge {
                 Err(error) => {
                     yield render_sse_map(&build_stream_error_event(
                         &error,
-                        "EXTERNAL_RUNTIME_CONTEXT_INVALID",
+                        "PROVIDER_RUNTIME_CONTEXT_INVALID",
                         false,
                     ));
                     mark_disconnect_capture_finalized(&disconnect_capture_state);
@@ -4940,7 +4940,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_model_gateway_invocation_from_payload_reads_external_runtime_context() {
+    fn provider_model_gateway_invocation_from_payload_reads_provider_runtime_context() {
         let invocation = provider_model_gateway_invocation_from_payload(&json!({
             "selected_model": {"id": "model-qwen", "model": "qwen3.5-flash"},
             "runtime_auth": {"authorization": "Bearer runtime-grant"},

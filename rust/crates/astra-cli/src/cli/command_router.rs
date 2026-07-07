@@ -3,9 +3,7 @@ use crate::cli::arg_render::{
     render_diff_args, render_grep_args, render_memory_args, render_messaging_args,
     render_permissions_args, render_review_args, render_task_args, render_team_args,
 };
-use crate::cli::auth_flow::{
-    clear_profile_auth, do_external_login, do_login, do_register, is_auth_error,
-};
+use crate::cli::auth_flow::{clear_profile_auth, do_login, do_register, is_auth_error};
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
     TaskRunArgs, TaskSubcommand, TaskWorkerArgs,
@@ -1518,19 +1516,7 @@ async fn execute_cli_command_impl(
             );
             let username = prompt_or("Username", args.username)?;
             let password = prompt_password_masked("Password", args.password)?;
-            if let Some(provider_id) = args.external_provider.as_deref() {
-                do_external_login(
-                    api,
-                    profile.as_deref(),
-                    provider_id,
-                    args.external_scope.as_deref(),
-                    &username,
-                    &password,
-                )
-                .await?;
-            } else {
-                do_login(api, profile.as_deref(), &username, &password).await?;
-            }
+            do_login(api, profile.as_deref(), &username, &password).await?;
             eprintln!(
                 "{}",
                 "  ✓  Logged in. Run `astra` to start chatting.".green()

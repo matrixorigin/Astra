@@ -32,7 +32,7 @@ class SchemaInventoryTest(unittest.TestCase):
         ]
         self.assertEqual(
             len(core_tables),
-            90,
+            88,
             "core storage DDL count changed; update the schema plan and inventory baseline",
         )
 
@@ -255,7 +255,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "auth_users",
             "auth_roles",
             "auth_refresh_tokens",
-            "auth_external_sessions",
             "auth_tokens",
             "auth_audit_logs",
             "infra_llm_models",
@@ -309,14 +308,6 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn(
             "high-churn secrets",
             self.tables["auth_refresh_tokens"]["merge_guidance"],
-        )
-        self.assertIn(
-            "encrypted provider session handle",
-            self.tables["auth_external_sessions"]["rebuildability"],
-        )
-        self.assertIn(
-            "provider session",
-            self.tables["auth_external_sessions"]["merge_guidance"],
         )
         self.assertIn(
             "encrypted_value or secret_ref",
@@ -875,7 +866,6 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertNotIn("context_manifest_items", auto_increment)
         self.assertNotIn("session_state_item_events", auto_increment)
         self.assertNotIn("auth_user_roles", auto_increment)
-        self.assertNotIn("auth_external_identities", auto_increment)
         self.assertNotIn("mcp_servers", auto_increment)
         self.assertNotIn("mcp_bindings", auto_increment)
         self.assertNotIn("mcp_tools", auto_increment)
@@ -916,18 +906,12 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
         self.assertIn("state item audit", row["primary_query"])
 
-    def test_auth_grants_and_external_identities_use_product_identity(self) -> None:
+    def test_auth_grants_use_product_identity(self) -> None:
         role_row = self.tables["auth_user_roles"]
         self.assertEqual(role_row["primary_key"], ["user_id", "role_id"])
         self.assertEqual(role_row["auto_increment_columns"], [])
         self.assertEqual(role_row["auto_increment_hotspot_risk"], "not_applicable")
         self.assertIn("many-to-many grant fact", role_row["merge_guidance"])
-
-        identity_row = self.tables["auth_external_identities"]
-        self.assertEqual(identity_row["primary_key"], ["provider_id", "external_subject"])
-        self.assertEqual(identity_row["auto_increment_columns"], [])
-        self.assertEqual(identity_row["auto_increment_hotspot_risk"], "not_applicable")
-        self.assertIn("external identity link", identity_row["state_class"])
 
     def test_mcp_registry_uses_owner_bound_string_identity(self) -> None:
         server_row = self.tables["mcp_servers"]

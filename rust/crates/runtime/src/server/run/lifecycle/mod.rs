@@ -2492,7 +2492,7 @@ impl AgenticRunLifecycleService {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "capability_descriptors require provider-authorized request authentication",
-                "external_runtime_context_required",
+                "provider_runtime_context_required",
             ));
         }
         if request.llm_token_service.is_some() {
@@ -2722,10 +2722,10 @@ impl AgenticRunLifecycleService {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "capability_descriptors.model_gateway is required",
-                "external_runtime_context_required",
+                "provider_runtime_context_required",
             ));
         };
-        astra_services::auth::external::validate_runtime_capability_descriptor(
+        astra_services::auth::provider_request::validate_runtime_capability_descriptor(
             model_gateway,
             "model_gateway",
         )?;
@@ -2739,7 +2739,7 @@ impl AgenticRunLifecycleService {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "provider runtime descriptors require provider-authorized request authentication",
-                "external_runtime_context_required",
+                "provider_runtime_context_required",
             ));
         }
         Ok(())

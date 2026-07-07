@@ -9,7 +9,7 @@ pub(super) fn build_auth_service(
         DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
             .with_pool(shared_pool.clone())
             .with_encryptor(shared_encryptor.as_ref().clone())
-            .with_external_providers(settings.external_auth_providers.clone()),
+            .with_provider_request_auth(settings.provider_request_auth.clone()),
     ))
 }
 

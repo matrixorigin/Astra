@@ -3186,41 +3186,6 @@ pub(crate) async fn run_tui_session(
                                         frame_requester.schedule_frame();
                                         continue;
                                     }
-                                    if let Some(rest) = name.strip_prefix("__external_login__\n") {
-                                        let mut parts = rest.splitn(3, '\n');
-                                        let provider_id = parts.next().unwrap_or("").to_string();
-                                        let username = parts.next().unwrap_or("").to_string();
-                                        let password = parts.next().unwrap_or("").to_string();
-                                        match crate::cli::auth_flow::do_external_login(api, profile, &provider_id, None, &username, &password).await {
-                                            Ok(token) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username} via {provider_id}")));
-                                                crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(model) = sync_default_model_after_auth(
-                                                    api,
-                                                    &token,
-                                                    &mut state,
-                                                    &mut bottom_pane,
-                                                )
-                                                .await
-                                                {
-                                                    chat_widget.commit_system(
-                                                        history_cell::system::SystemCell::response(
-                                                            format!("Default model: {model}"),
-                                                        ),
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::error(format!("External login failed: {e}")));
-                                            }
-                                        }
-                                        pending_deferred_slash_flush = false;
-                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                        bottom_pane.sync_popups();
-                                        frame_requester.schedule_frame();
-                                        continue;
-                                    }
                                     if let Some(rest) = name.strip_prefix("__register__\n") {
                                         let mut parts = rest.splitn(3, '\n');
                                         let username = parts.next().unwrap_or("").to_string();

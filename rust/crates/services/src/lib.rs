@@ -133,16 +133,13 @@ pub use astra_core::composite_snapshot::{
     SnapshotSpec,
 };
 pub use auth::{
-    AuthExternalSessionContext, AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin,
-    AuthRefreshRequestData, AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
+    AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthRefreshRequestData,
+    AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord,
     DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
     DatabaseAdminInitializer, DatabaseAdminTokenReader, DatabaseAdminTokenWriter,
     DatabaseAdminUserRoleManager, DatabaseAuthService, DatabaseSessionService,
-    ExternalCatalogResponse, ExternalLoginRequestData, ExternalProviderPublicRecord,
-    ExternalRequestDescriptor, ExternalRuntimeContextRequestData, ExternalRuntimeContextResponse,
-    ExternalSessionRecord, FernetTokenEncryptor, HttpExternalProviderClient,
-    SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-    SessionUpdateRequestData,
+    FernetTokenEncryptor, ProviderRequestDescriptor, SessionCreateRequestData, SessionListFilter,
+    SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
 };
 pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService};
 pub use context::{

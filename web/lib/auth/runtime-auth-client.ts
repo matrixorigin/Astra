@@ -1,6 +1,4 @@
 import {
-  PATH_AUTH_EXTERNAL_LOGIN,
-  PATH_AUTH_EXTERNAL_PROVIDERS,
   PATH_AUTH_LOGIN,
   PATH_AUTH_LOGOUT,
   PATH_AUTH_ME,
@@ -20,16 +18,6 @@ export type AuthRegisterResponse = AuthTokens & AuthUser;
 
 export type AuthLogoutResponse = {
   message?: string;
-};
-
-export type ExternalAuthProvider = {
-  id: string;
-  display_name: string;
-  credential_type: string;
-};
-
-export type ExternalAuthProvidersResponse = {
-  providers: ExternalAuthProvider[];
 };
 
 export type RuntimeAuthResult<T> =
@@ -92,25 +80,6 @@ function isAuthUser(value: unknown): value is AuthUser {
 
 function isLogoutResponse(value: unknown): value is AuthLogoutResponse {
   return isRecord(value);
-}
-
-function isExternalAuthProvider(value: unknown): value is ExternalAuthProvider {
-  return (
-    isRecord(value) &&
-    typeof value.id === "string" &&
-    typeof value.display_name === "string" &&
-    typeof value.credential_type === "string"
-  );
-}
-
-function isExternalAuthProvidersResponse(
-  value: unknown,
-): value is ExternalAuthProvidersResponse {
-  return (
-    isRecord(value) &&
-    Array.isArray(value.providers) &&
-    value.providers.every(isExternalAuthProvider)
-  );
 }
 
 function runtimeClientForAuth(
@@ -223,30 +192,6 @@ async function postRuntimeAuth<T>(
   }
 }
 
-async function getRuntimeAuth<T>(
-  apiUrl: string,
-  path: string,
-  defaultError: string,
-  guard: (value: unknown) => value is T,
-): Promise<RuntimeAuthResult<T>> {
-  try {
-    const client = runtimeClientForAuth(apiUrl);
-    const response = await client.fetchResponse(path, {
-      method: "GET",
-      auth: "none",
-      operation: defaultError,
-    });
-    return decodeRuntimeResponse(response, defaultError, guard);
-  } catch (error) {
-    return {
-      ok: false,
-      status: 502,
-      error:
-        error instanceof Error ? error.message : "Cannot reach Astra runtime.",
-    };
-  }
-}
-
 export function runtimeLogin(
   apiUrl: string,
   input: { username: string; password: string },
@@ -258,47 +203,6 @@ export function runtimeLogin(
     "Login failed",
     hasAuthTokens,
   );
-}
-
-export function runtimeExternalProviders(
-  apiUrl: string,
-): Promise<RuntimeAuthResult<ExternalAuthProvidersResponse>> {
-  return getRuntimeAuth(
-    apiUrl,
-    PATH_AUTH_EXTERNAL_PROVIDERS,
-    "Fetch external auth providers failed",
-    isExternalAuthProvidersResponse,
-  );
-}
-
-export function runtimeExternalLogin(
-  apiUrl: string,
-  input: {
-    provider_id: string;
-    username: string;
-    password: string;
-    scope_id?: string;
-  },
-): Promise<RuntimeAuthResult<AuthTokens>> {
-  return postRuntimeAuth(
-    apiUrl,
-    PATH_AUTH_EXTERNAL_LOGIN,
-    input,
-    "External login failed",
-    hasAuthTokens,
-  ).then((result) => {
-    if (!result.ok) {
-      return result;
-    }
-
-    return {
-      ok: true,
-      data: {
-        access_token: result.data.access_token,
-        refresh_token: result.data.refresh_token,
-      },
-    };
-  });
 }
 
 export function runtimeRegister(

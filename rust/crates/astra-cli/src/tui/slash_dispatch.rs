@@ -129,35 +129,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // ── Auth forms (inline TUI card instead of dropping out to
         //    bare-terminal prompts that looked disjoint and stole keys) ─
         "/login" => {
-            use crate::tui::bottom_pane::login_view::{
-                ExternalLoginProvider, LoginMode, LoginView,
-            };
-            let (providers, provider_error) =
-                match crate::cli::auth_flow::fetch_external_providers(ctx.api).await {
-                    Ok(providers) => (
-                        providers
-                            .into_iter()
-                            .map(|provider| ExternalLoginProvider {
-                                id: provider.id,
-                                display_name: provider.display_name,
-                                credential_type: provider.credential_type,
-                            })
-                            .collect(),
-                        None,
-                    ),
-                    Err(err) => (
-                        Vec::new(),
-                        Some(format!("Failed to load external providers: {err}")),
-                    ),
-                };
-            ctx.open_deferred_view(
-                "Opened login",
-                Box::new(LoginView::new_with_external_providers(
-                    LoginMode::Login,
-                    providers,
-                    provider_error,
-                )),
-            );
+            use crate::tui::bottom_pane::login_view::{LoginMode, LoginView};
+            ctx.open_deferred_view("Opened login", Box::new(LoginView::new(LoginMode::Login)));
             SlashResult::Deferred
         }
         "/register" => {

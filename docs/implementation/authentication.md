@@ -20,13 +20,11 @@ Client → Authorization: Bearer <access_token> → API validates → extracts u
 - Refresh token: 7 day TTL
 - Stateless validation (no DB lookup per request)
 
-## External Authentication
+## Provider Request Authentication
 
-External users enter through configured `auth.external_providers`. The provider endpoint validates
-the external credential and returns an Astra-compatible session descriptor. Astra then issues its
-own access and refresh tokens, so subsequent requests use the same session mechanism as local users.
-Provider-originated requests can additionally use configured local request auth, such as HMAC
-provider request tokens, so request admission does not require a callback to the provider.
+Service providers can call Astra with provider request tokens configured under
+`auth.provider_request_auth`. Astra validates those tokens locally and does not call back to a
+provider endpoint for request admission.
 
 ## Authorization: Resource Ownership
 

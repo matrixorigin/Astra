@@ -9,8 +9,6 @@ import {
   DEFAULT_API_URL,
 } from "@/lib/runtime-config";
 import {
-  runtimeExternalLogin,
-  runtimeExternalProviders,
   runtimeLogin,
   runtimeLogout,
   runtimeMe,
@@ -18,17 +16,12 @@ import {
   runtimeRegister,
   type AuthTokens,
   type AuthUser,
-  type ExternalAuthProvider,
 } from "@/lib/auth/runtime-auth-client";
 
 type ActionResult = {
   ok: boolean;
   error?: string;
 };
-
-type ExternalProvidersActionResult =
-  | { ok: true; providers: ExternalAuthProvider[] }
-  | { ok: false; error: string };
 
 const TOKEN_MAX_AGE = 365 * 24 * 60 * 60; // 1 year for cookie persistence
 
@@ -58,8 +51,6 @@ export async function loginAction(
   _prev: ActionResult,
   formData: FormData,
 ): Promise<ActionResult> {
-  const mode =
-    formData.get("auth_mode") === "external" ? "external" : "internal";
   const username = formData.get("username") as string | null;
   const password = formData.get("password") as string | null;
 
@@ -69,61 +60,13 @@ export async function loginAction(
 
   const cookieStore = await cookies();
   const apiUrl = getApiUrl(cookieStore);
-  const result =
-    mode === "external"
-      ? await loginWithExternalProvider(apiUrl, formData, username, password)
-      : await runtimeLogin(apiUrl, { username, password });
+  const result = await runtimeLogin(apiUrl, { username, password });
   if (!result.ok) {
     return { ok: false, error: result.error };
   }
 
   await saveTokens(result.data);
   return { ok: true };
-}
-
-async function loginWithExternalProvider(
-  apiUrl: string,
-  formData: FormData,
-  username: string,
-  password: string,
-) {
-  const providerId = externalProviderId(formData);
-  if (!providerId) {
-    return {
-      ok: false,
-      status: 400,
-      error: "External provider is required.",
-    } as const;
-  }
-
-  return runtimeExternalLogin(apiUrl, {
-    provider_id: providerId,
-    username,
-    password,
-    scope_id: optionalString(formData.get("scope_id")),
-  });
-}
-
-function externalProviderId(formData: FormData): string | undefined {
-  const providerId = formData.get("provider_id");
-  if (typeof providerId !== "string" || providerId.length === 0) {
-    return undefined;
-  }
-  return providerId;
-}
-
-function optionalString(value: FormDataEntryValue | null): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-export async function externalProvidersAction(): Promise<ExternalProvidersActionResult> {
-  const cookieStore = await cookies();
-  const apiUrl = getApiUrl(cookieStore);
-  const result = await runtimeExternalProviders(apiUrl);
-  if (!result.ok) {
-    return { ok: false, error: result.error };
-  }
-  return { ok: true, providers: result.data.providers };
 }
 
 export async function registerAction(

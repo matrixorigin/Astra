@@ -298,9 +298,7 @@ pub(crate) struct RegisterArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(
-    after_help = "Examples:\n  astra login --username alice --password secret\n  astra login --external-provider moi --username admin --password admin"
-)]
+#[command(after_help = "Examples:\n  astra login --username alice --password secret")]
 pub(crate) struct LoginArgs {
     /// Username to log in with
     #[arg(long)]
@@ -308,12 +306,6 @@ pub(crate) struct LoginArgs {
     /// Password to log in with
     #[arg(long)]
     pub password: Option<String>,
-    /// External auth provider id, for example `moi`
-    #[arg(long = "external-provider")]
-    pub external_provider: Option<String>,
-    /// Optional provider scope id for external auth providers that expose scopes
-    #[arg(long = "external-scope")]
-    pub external_scope: Option<String>,
 }
 
 #[derive(Args, Debug)]

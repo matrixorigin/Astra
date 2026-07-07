@@ -121,40 +121,6 @@ pub(super) async fn auth_logout_handler(
     }))
 }
 
-pub(super) async fn auth_external_providers_handler(
-    State(state): State<AppState>,
-) -> Result<Json<AuthExternalProvidersResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let providers = state.auth_service.external_providers().await?;
-    Ok(Json(AuthExternalProvidersResponse {
-        providers: providers
-            .into_iter()
-            .map(AuthExternalProviderResponse::from)
-            .collect(),
-    }))
-}
-
-pub(super) async fn auth_external_login_handler(
-    Extension(trace): Extension<RequestTrace>,
-    State(state): State<AppState>,
-    Json(request): Json<AuthExternalLoginRequest>,
-) -> Result<Json<AuthTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tokens = state
-        .auth_service
-        .external_login(ExternalLoginRequestData {
-            provider_id: request.provider_id,
-            username: request.username,
-            password: request.password,
-            scope_id: request.scope_id,
-        })
-        .await?;
-    tracing::info!(
-        target: "astra_runtime::auth",
-        request_id = %trace.request_id,
-        "external login succeeded"
-    );
-    Ok(Json(AuthTokenResponse::from(tokens)))
-}
-
 pub(super) async fn auth_me_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

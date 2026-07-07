@@ -75,16 +75,6 @@ pub struct AuthRefreshRequest {
 }
 
 #[cfg(feature = "server")]
-#[derive(Deserialize)]
-pub struct AuthExternalLoginRequest {
-    pub provider_id: String,
-    pub username: String,
-    pub password: String,
-    #[serde(default)]
-    pub scope_id: Option<String>,
-}
-
-#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct ChatRouteRequest {
     #[serde(default)]
@@ -372,20 +362,6 @@ pub struct AuthTokenResponse {
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AuthLogoutResponse {
     pub message: String,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq, Eq)]
-pub struct AuthExternalProviderResponse {
-    pub id: String,
-    pub display_name: String,
-    pub credential_type: String,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq, Eq)]
-pub struct AuthExternalProvidersResponse {
-    pub providers: Vec<AuthExternalProviderResponse>,
 }
 
 #[cfg(feature = "server")]
@@ -1196,17 +1172,6 @@ impl From<AuthTokenRecord> for AuthTokenResponse {
             refresh_token: value.refresh_token,
             token_type: value.token_type,
             expires_in: value.expires_in,
-        }
-    }
-}
-
-#[cfg(feature = "server")]
-impl From<astra_services::ExternalProviderPublicRecord> for AuthExternalProviderResponse {
-    fn from(value: astra_services::ExternalProviderPublicRecord) -> Self {
-        Self {
-            id: value.id,
-            display_name: value.display_name,
-            credential_type: value.credential_type,
         }
     }
 }

@@ -39,8 +39,8 @@
 #[cfg(test)]
 use super::chat_handlers::is_session_service_unconfigured_error;
 use super::chat_handlers::resolve_or_create_chat_session;
-use super::external_runtime_context::inject_effective_runtime_context;
 use super::header_utils::collect_forward_headers;
+use super::provider_runtime_context::inject_effective_runtime_context;
 use super::*;
 use crate::server::run::handlers::transform_stream_run_events_for_client_with_pending;
 use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
@@ -2532,14 +2532,9 @@ async fn send_msg(socket: &mut WebSocket, msg: &WsServerMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_services::auth::external::{
-        ExternalRuntimeAuthResponse, ExternalRuntimeCapabilityDescriptor,
-        ExternalRuntimeCapabilityDescriptors, ExternalRuntimeScopeResponse,
-        ExternalSelectedModelResponse,
-    };
     use async_trait::async_trait;
     use axum::{Json, http::StatusCode};
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
     use tokio::sync::Mutex;
 
     use crate::{
@@ -2548,9 +2543,8 @@ mod tests {
         SessionService, SessionUpdateRequestData,
     };
     use astra_services::{
-        AuthExternalSessionContext, AuthPrincipal, AuthPrincipalOrigin, AuthRefreshRequestData,
-        AuthRegisterRequestData, AuthService, AuthTokenRecord, ExternalRuntimeContextRequestData,
-        ExternalRuntimeContextResponse,
+        AuthPrincipal, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
+        AuthTokenRecord,
     };
     use astra_tools::{AskUserGate, ToolApprovalGate};
 
@@ -2671,125 +2665,6 @@ mod tests {
             username: "alice".into(),
             email: "alice@example.com".into(),
             display_name: Some("Alice".into()),
-        }
-    }
-
-    fn external_test_principal() -> AuthPrincipal {
-        AuthPrincipal {
-            user: AuthUserRecord {
-                user_id: "external:moi:user-1".to_string(),
-                username: "user-1".to_string(),
-                email: String::new(),
-                display_name: None,
-            },
-            session_id: Some("external-session-1".to_string()),
-            origin: AuthPrincipalOrigin::External(AuthExternalSessionContext {
-                provider_id: "moi".to_string(),
-                external_subject: "user-1".to_string(),
-                external_session_id: "external-session-1".to_string(),
-                provider_scope_id: "workspace-1".to_string(),
-                provider_scope_display_name: Some("Workspace 1".to_string()),
-            }),
-        }
-    }
-
-    fn external_test_conn() -> WsConnection {
-        let principal = external_test_principal();
-        WsConnection {
-            principal,
-            authorization: "Bearer external-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: None,
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        }
-    }
-
-    #[derive(Default)]
-    struct WsRuntimeContextAuthService {
-        requested_model_ids: StdMutex<Vec<String>>,
-    }
-
-    #[async_trait]
-    impl AuthService for WsRuntimeContextAuthService {
-        async fn register(
-            &self,
-            _request: AuthRegisterRequestData,
-        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("not used")
-        }
-
-        async fn login(
-            &self,
-            _request: astra_services::AuthLoginRequestData,
-        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("not used")
-        }
-
-        async fn refresh(
-            &self,
-            _request: AuthRefreshRequestData,
-        ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("not used")
-        }
-
-        async fn logout(
-            &self,
-            _request: AuthRefreshRequestData,
-        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("not used")
-        }
-
-        async fn current_user(
-            &self,
-            _headers: &HeaderMap,
-        ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("not used")
-        }
-
-        async fn external_runtime_context(
-            &self,
-            _principal: &AuthPrincipal,
-            request: ExternalRuntimeContextRequestData,
-        ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
-            self.requested_model_ids
-                .lock()
-                .expect("requested ids")
-                .push(request.requested_model_id.clone());
-            Ok(ExternalRuntimeContextResponse {
-                selected_model: ExternalSelectedModelResponse {
-                    id: request.requested_model_id,
-                    model: "qwen3.7-max".to_string(),
-                },
-                runtime_auth: ExternalRuntimeAuthResponse {
-                    auth_type: "moi_runtime_grant".to_string(),
-                    authorization: "Bearer runtime-grant".to_string(),
-                    expires_at: "2026-01-01T00:00:00Z".to_string(),
-                },
-                capability_descriptors: ExternalRuntimeCapabilityDescriptors {
-                    model_gateway: Some(ExternalRuntimeCapabilityDescriptor {
-                        id: "moi-model-gateway".to_string(),
-                        descriptor_type: "model_gateway".to_string(),
-                        transport: "streamable_http".to_string(),
-                        endpoint_url: "http://127.0.0.1/model".to_string(),
-                        protocol: "model_gateway".to_string(),
-                        metadata: serde_json::Map::new(),
-                    }),
-                    mcp: None,
-                    skills: None,
-                },
-                runtime_scope: ExternalRuntimeScopeResponse {
-                    allowed_model_id: "model-qwen".to_string(),
-                    allowed_tools: Vec::new(),
-                    allowed_skills: Vec::new(),
-                    allowed_knowledge_bases: Vec::new(),
-                },
-                runtime_system_prompt: None,
-                task_id: "task-1".to_string(),
-                manifest_id: "manifest-1".to_string(),
-                provider_scope_id: "workspace-1".to_string(),
-            })
         }
     }
 
@@ -3064,107 +2939,6 @@ mod tests {
             Some(astra_services::runs::RequestedTurnInteractionMode::Auto)
         );
         assert!(request.interactive_client);
-    }
-
-    #[tokio::test]
-    async fn ws_external_user_session_injects_provider_runtime_context() {
-        let auth = Arc::new(WsRuntimeContextAuthService::default());
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-            .with_auth_service(auth.clone());
-        let conn = external_test_conn();
-        let mut request = build_ws_chat_request(
-            "hello",
-            None,
-            None,
-            astra_services::runs::SelectedModelRequest {
-                id: Some("model-qwen".into()),
-                model: "client-display-name".into(),
-                gateway: None,
-            },
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-            None,
-        );
-
-        inject_ws_effective_runtime_context(&state, &conn, &mut request)
-            .await
-            .expect("external websocket chat should inject provider runtime context");
-
-        assert_eq!(
-            auth.requested_model_ids
-                .lock()
-                .expect("requested ids")
-                .as_slice(),
-            ["model-qwen"]
-        );
-        assert_eq!(request.model.as_deref(), Some("qwen3.7-max"));
-        assert_eq!(
-            request
-                .selected_model
-                .as_ref()
-                .and_then(|selected| selected.id.as_deref()),
-            Some("model-qwen")
-        );
-        assert_eq!(
-            request
-                .runtime_auth
-                .as_ref()
-                .map(|runtime_auth| runtime_auth.authorization.as_str()),
-            Some("Bearer runtime-grant")
-        );
-        assert!(request.provider_runtime_authorized);
-        assert!(request.capability_descriptors.is_some());
-    }
-
-    #[tokio::test]
-    async fn ws_external_user_session_requires_provider_model_id() {
-        let auth = Arc::new(WsRuntimeContextAuthService::default());
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-            .with_auth_service(auth.clone());
-        let conn = external_test_conn();
-        let mut request = build_ws_chat_request(
-            "hello",
-            None,
-            None,
-            astra_services::runs::SelectedModelRequest {
-                id: None,
-                model: "qwen3.7-max".into(),
-                gateway: None,
-            },
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-            None,
-        );
-
-        let (status, error) = inject_ws_effective_runtime_context(&state, &conn, &mut request)
-            .await
-            .expect_err("external websocket chat must require selected_model.id");
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error.error_code.as_deref(),
-            Some("external_requested_model_required")
-        );
-        assert!(
-            auth.requested_model_ids
-                .lock()
-                .expect("requested ids")
-                .is_empty()
-        );
     }
 
     #[test]

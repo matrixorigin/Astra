@@ -41,19 +41,15 @@ host-facing published port; the API container listens on port `17001`.
 - `ASTRA_TOKEN_ENCRYPTION_KEY` (Fernet key)
 - `ASTRA_BRIDGE_SECRET`
 
-### External Auth Providers
+### Provider Request Auth
 
-External identities are configured as server-side providers under `auth.external_providers` in
-`server.toml`. Astra exchanges a provider login for a normal Astra session instead of switching
-the server into a separate auth mode.
+Provider-originated service requests are authenticated under `auth.provider_request_auth` in
+`server.toml`. Astra validates these request tokens locally; it does not call a provider callback
+endpoint during request admission.
 
 ```toml
-[[auth.external_providers]]
-id = "moi"
-display_name = "MOI"
-external_auth_endpoint = "http://moi-catalog/api/v1/astra/external-auth"
-
-[auth.external_providers.request_auth]
+[[auth.provider_request_auth]]
+provider = "moi"
 type = "hmac"
 key = "${ASTRA_PROVIDER_HMAC_KEY}"
 ```

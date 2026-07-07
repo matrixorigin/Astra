@@ -3,8 +3,6 @@ import {
   chatRunDelegatePath,
   eventsSessionPath,
   joinApiPath,
-  PATH_AUTH_EXTERNAL_LOGIN,
-  PATH_AUTH_EXTERNAL_PROVIDERS,
   modelCheckPath,
   modelPath,
   sessionArtifactDownloadPath,
@@ -48,13 +46,6 @@ describe("paths — joinApiPath", () => {
   test("empty prefix returns path", () => {
     expect(joinApiPath("", "/runs")).toBe("/runs");
     expect(joinApiPath(undefined, "/runs")).toBe("/runs");
-  });
-});
-
-describe("paths — auth external", () => {
-  test("external auth paths are canonical", () => {
-    expect(PATH_AUTH_EXTERNAL_PROVIDERS).toBe("/auth/external/providers");
-    expect(PATH_AUTH_EXTERNAL_LOGIN).toBe("/auth/external/login");
   });
 });
 

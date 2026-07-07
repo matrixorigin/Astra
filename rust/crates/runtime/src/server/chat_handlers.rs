@@ -2,7 +2,7 @@ use super::bridge_prep::normalize_chat_turn_session_error;
 use super::header_utils::collect_forward_headers;
 use super::*;
 use crate::server::{
-    external_runtime_context::{
+    provider_runtime_context::{
         inject_effective_runtime_context, inject_effective_runtime_context_body,
     },
     run::handlers::transform_stream_run_events_for_client,

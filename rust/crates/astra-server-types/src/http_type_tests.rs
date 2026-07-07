@@ -205,19 +205,6 @@ fn chat_request_rejects_legacy_top_level_model_field() {
 }
 
 #[test]
-fn chat_request_rejects_external_auth_body_envelope() {
-    let result = serde_json::from_str::<ChatRequest>(
-        r#"{"message":"hello","selected_model":{"model":"gpt-4"},"external_auth":{"provider_id":"moi","action":"authorize_request"}}"#,
-    );
-    assert!(result.is_err(), "external auth must not be in chat body");
-    let err = result.err().unwrap();
-    assert!(
-        err.to_string().contains("unknown field `external_auth`"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
 fn chat_request_rejects_selected_model_string_form() {
     let result =
         serde_json::from_str::<ChatRequest>(r#"{"message":"hello","selected_model":"gpt-4"}"#);
