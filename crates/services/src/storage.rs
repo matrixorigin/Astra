@@ -1022,13 +1022,6 @@ pub async fn ensure_core_schema(
     )
     .await?;
 
-    query("DROP TABLE IF EXISTS auth_external_sessions")
-        .execute(&pool)
-        .await?;
-    query("DROP TABLE IF EXISTS auth_external_identities")
-        .execute(&pool)
-        .await?;
-
     query(
         "CREATE TABLE IF NOT EXISTS auth_tokens (
             token_id VARCHAR(64) PRIMARY KEY,
@@ -6090,6 +6083,22 @@ mod tests {
             !varchar_width_body.contains("try_get::<Option<u64>, _>(\"CHARACTER_MAXIMUM_LENGTH\")"),
             "varchar width introspection must not decode signed information_schema values as unsigned"
         );
+    }
+
+    #[test]
+    fn retired_external_auth_tables_are_not_dropped_by_schema_bootstrap() {
+        let source = include_str!("storage.rs");
+        let ensure_body = source
+            .split("pub async fn ensure_core_schema")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("ensure_core_schema body");
+        for table in ["auth_external_sessions", "auth_external_identities"] {
+            assert!(
+                !ensure_body.contains(&format!("DROP TABLE IF EXISTS {table}")),
+                "retired external auth table {table} must be left for an explicit migration, not dropped during startup"
+            );
+        }
     }
 
     #[test]
