@@ -1946,6 +1946,7 @@ impl AgenticRunLifecycleService {
         let rows = match sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)
             .bind(session_id)
             .bind(user_id)
+            .bind(astra_services::session_restore::MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
             .fetch_all(pool.get())
             .await
         {

@@ -205,7 +205,8 @@ async fn l2_52_preview_template_normalize_versions_are_seeded_and_deterministic(
     let pool = setup_pool().await;
     let rows = sqlx::query(
         "SELECT tool_name, normalize_version FROM preview_template_registry
-         WHERE tool_name IN ('pg_dump', 'fetch_url', 'parse_pdf', 'SKILL.md')
+         WHERE tool_name IN ('pg_dump', 'fetch_url', 'parse_pdf', 'SKILL.md',
+             'list_dir', 'task_board', 'agent_fanout', 'session', 'web_fetch', 'mo_query')
            AND status = 'active'",
     )
     .fetch_all(pool.get())
@@ -220,7 +221,18 @@ async fn l2_52_preview_template_normalize_versions_are_seeded_and_deterministic(
             )
         })
         .collect::<std::collections::HashMap<_, _>>();
-    for expected in ["pg_dump", "fetch_url", "parse_pdf", "SKILL.md"] {
+    for expected in [
+        "pg_dump",
+        "fetch_url",
+        "parse_pdf",
+        "SKILL.md",
+        "list_dir",
+        "task_board",
+        "agent_fanout",
+        "session",
+        "web_fetch",
+        "mo_query",
+    ] {
         let normalize_version = seeded.get(expected).expect("baseline template missing");
         let a = content_hash_with_normalize_version("sha256:content", Some(normalize_version));
         let b = content_hash_with_normalize_version("sha256:content", Some(normalize_version));

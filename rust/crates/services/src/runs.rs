@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     time::Duration,
 };
@@ -4181,7 +4182,8 @@ fn build_tool_output_preview_row(
     contract: &ToolPreviewContract,
 ) -> ToolOutputPreviewRow {
     let content_hash = format!("sha256:{}", sha256_hex(payload.as_bytes()));
-    let preview_text = truncate_utf8_bytes(payload, contract.max_preview_bytes);
+    let preview_source = tool_output_preview_source(&item.output_json, payload);
+    let preview_text = truncate_utf8_bytes(preview_source.as_ref(), contract.max_preview_bytes);
     let explicit_artifact_ref = extract_optional_string(&item.output_json, "artifact_ref")
         .or_else(|| extract_optional_string(&item.output_json, "artifact_uri"));
     let large_payload_ref = (payload.len() > contract.max_preview_bytes).then(|| {
@@ -4192,7 +4194,7 @@ fn build_tool_output_preview_row(
     });
     let preview_status = if !contract.found {
         "fallback"
-    } else if payload.len() > contract.max_preview_bytes {
+    } else if preview_source.len() > contract.max_preview_bytes {
         "truncated"
     } else {
         "template"
@@ -4206,6 +4208,36 @@ fn build_tool_output_preview_row(
         content_hash,
         normalize_version: contract.normalize_version.clone(),
         parent_output_id: extract_optional_string(&item.output_json, "parent_output_id"),
+    }
+}
+
+fn tool_output_preview_source<'a>(
+    output_json: &'a serde_json::Value,
+    payload: &'a str,
+) -> Cow<'a, str> {
+    for key in [
+        "result", "output", "content", "text", "message", "error", "stderr", "stdout",
+    ] {
+        if let Some(text) = extract_preview_string_field(output_json, key) {
+            return text;
+        }
+    }
+    Cow::Borrowed(payload)
+}
+
+fn extract_preview_string_field<'a>(
+    output_json: &'a serde_json::Value,
+    key: &str,
+) -> Option<Cow<'a, str>> {
+    let value = output_json.get(key)?;
+    match value {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then_some(Cow::Borrowed(text))
+        }
+        serde_json::Value::Number(number) => Some(Cow::Owned(number.to_string())),
+        serde_json::Value::Bool(value) => Some(Cow::Owned(value.to_string())),
+        _ => None,
     }
 }
 
@@ -5798,6 +5830,123 @@ mod tests {
             decode_tool_preview_contract_row(&FakeRunStateRow::with_i64("max_preview_bytes", 0)),
             "max_preview_bytes",
         );
+    }
+
+    fn preview_contract(max_preview_bytes: usize, found: bool) -> ToolPreviewContract {
+        ToolPreviewContract {
+            max_preview_bytes,
+            normalize_version: "raw_v1".to_string(),
+            found,
+        }
+    }
+
+    fn preview_item(tool_name: &str, output_json: serde_json::Value) -> ToolOutputBatchItem {
+        ToolOutputBatchItem {
+            output_id: "output-1".to_string(),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: tool_name.to_string(),
+            output_json,
+        }
+    }
+
+    #[test]
+    fn tool_output_preview_prefers_semantic_result_over_transport_metadata() {
+        let output_json = json!({
+            "capacity_provider_coverage": [
+                {
+                    "provider_id": "server-control-plane",
+                    "capabilities": ["session", "task_board", "introspect"]
+                },
+                {
+                    "provider_id": "edge-macpro.local",
+                    "capabilities": ["workspace_read", "workspace_write", "shell"]
+                }
+            ],
+            "executor": {
+                "display_name": "macpro.local",
+                "status": "online",
+            },
+            "policy": {
+                "filesystem": "read_write_workspace",
+                "network": "open",
+            },
+            "result": ".agent/\n.github/\nrust/\nweb/\n",
+        });
+        let item = preview_item("list_dir", output_json);
+        let payload = serde_json::to_string(&item.output_json).expect("payload serializes");
+
+        let row = build_tool_output_preview_row(
+            "session-1",
+            &item,
+            &payload,
+            &preview_contract(120, true),
+        );
+
+        assert_eq!(row.payload, payload, "audit payload must remain lossless");
+        assert_eq!(row.preview_text, ".agent/\n.github/\nrust/\nweb/");
+        assert_eq!(row.preview_status, "template");
+        assert!(
+            !row.preview_text.contains("capacity_provider_coverage"),
+            "preview should show the tool result, not transport metadata"
+        );
+        assert!(
+            row.artifact_ref.is_some(),
+            "large wrapper payload should still be addressable even when the preview is compact"
+        );
+    }
+
+    #[test]
+    fn tool_output_preview_large_result_is_borrowed_then_bounded() {
+        let large_result = format!("{}{}", "x".repeat(256 * 1024), "tail");
+        let item = preview_item(
+            "read_file",
+            json!({
+                "capacity_provider_coverage": [{"provider_id": "edge-1"}],
+                "result": large_result,
+            }),
+        );
+        let payload = serde_json::to_string(&item.output_json).expect("payload serializes");
+
+        let source = tool_output_preview_source(&item.output_json, &payload);
+        assert!(
+            matches!(source, Cow::Borrowed(_)),
+            "large string result must be borrowed before the bounded preview allocation"
+        );
+
+        let row = build_tool_output_preview_row(
+            "session-1",
+            &item,
+            &payload,
+            &preview_contract(128, true),
+        );
+
+        assert_eq!(row.preview_text.len(), 128);
+        assert!(row.preview_text.chars().all(|ch| ch == 'x'));
+        assert_eq!(row.preview_status, "truncated");
+        assert_eq!(row.payload.len(), payload.len());
+        assert!(row.payload.contains("capacity_provider_coverage"));
+    }
+
+    #[test]
+    fn tool_output_preview_falls_back_to_payload_without_scalar_result() {
+        let item = preview_item(
+            "custom_tool",
+            json!({
+                "result": {"nested": "not a scalar preview"},
+                "data": ["also", "not", "scalar"],
+            }),
+        );
+        let payload = serde_json::to_string(&item.output_json).expect("payload serializes");
+
+        let row = build_tool_output_preview_row(
+            "session-1",
+            &item,
+            &payload,
+            &preview_contract(64, false),
+        );
+
+        assert_eq!(row.preview_text, truncate_utf8_bytes(&payload, 64));
+        assert_eq!(row.preview_status, "fallback");
     }
 
     #[test]

@@ -1489,6 +1489,7 @@ pub enum SessionMemoryExtractionSkipReason {
     NoSessionId,
     BelowInitGate,
     NoGrowth,
+    LowInformation,
     InFlight,
     SelectorCooldown,
     /// Memoria endpoint tripped the circuit breaker after consecutive

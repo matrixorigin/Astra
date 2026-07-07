@@ -152,11 +152,23 @@ fn lifecycle_token_usage_json(
         .saturating_add(cached_input_tokens)
         .saturating_add(cache_creation_tokens);
     let total_tokens = usage.total_tokens();
+    let cache_hit_ratio = if billable_input == 0 {
+        0.0
+    } else {
+        cached_input_tokens as f64 / billable_input as f64
+    };
     let mut usage_json = usage.to_json_map();
     usage_json.insert("prompt".into(), Value::from(billable_input));
     usage_json.insert("completion".into(), Value::from(output_tokens));
     usage_json.insert("cache_read".into(), Value::from(cached_input_tokens));
     usage_json.insert("cache_write".into(), Value::from(cache_creation_tokens));
+    usage_json.insert("raw_prompt_tokens".into(), Value::from(billable_input));
+    usage_json.insert("uncached_input_tokens".into(), Value::from(input_tokens));
+    usage_json.insert("effective_input_tokens".into(), Value::from(input_tokens));
+    usage_json.insert(
+        "prompt_cache_hit_ratio".into(),
+        Value::from(cache_hit_ratio),
+    );
     usage_json.insert("total".into(), Value::from(total_tokens));
     Some(Value::Object(usage_json))
 }
@@ -2517,6 +2529,13 @@ mod tests {
         assert_eq!(usage["completion"], 5);
         assert_eq!(usage["cache_read"], 4);
         assert_eq!(usage["cache_write"], 3);
+        assert_eq!(usage["raw_prompt_tokens"], 17);
+        assert_eq!(usage["uncached_input_tokens"], 10);
+        assert_eq!(usage["effective_input_tokens"], 10);
+        assert_eq!(
+            usage["prompt_cache_hit_ratio"],
+            serde_json::json!(4.0 / 17.0)
+        );
         assert_eq!(usage["total"], 22);
         assert!(
             usage.get("cache_read_tokens").is_none(),
