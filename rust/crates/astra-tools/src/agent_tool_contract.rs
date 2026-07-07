@@ -1,10 +1,15 @@
 use serde_json::Value;
 
+pub const AGENT_RUNTIME_TOOL_NAMES: &[&str] = &["agent", "agent_fanout"];
 pub const AGENT_ACTIONS: &[&str] = &["spawn", "get_result", "run_chain", "send_message"];
 pub const AGENT_ACTIONS_DISPLAY: &str = "spawn, get_result, run_chain, send_message";
 
 pub const AGENT_FANOUT_ACTIONS: &[&str] = &["start", "get_results", "stop_slot"];
 pub const AGENT_FANOUT_ACTIONS_DISPLAY: &str = "start, get_results, stop_slot";
+
+pub fn is_agent_runtime_tool(name: &str) -> bool {
+    AGENT_RUNTIME_TOOL_NAMES.contains(&name)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentAction {
@@ -128,6 +133,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(parsed_actions, AGENT_ACTIONS);
+    }
+
+    #[test]
+    fn agent_runtime_tool_names_are_explicit_contract() {
+        assert_eq!(AGENT_RUNTIME_TOOL_NAMES, &["agent", "agent_fanout"]);
+        assert!(is_agent_runtime_tool("agent"));
+        assert!(is_agent_runtime_tool("agent_fanout"));
+        assert!(!is_agent_runtime_tool("task_board"));
     }
 
     #[test]

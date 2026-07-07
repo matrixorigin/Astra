@@ -223,6 +223,16 @@ fn conditional_required_for(schema: &serde_json::Value, target_action: &str) -> 
         .collect()
 }
 
+fn conditional_allowed_for(schema: &serde_json::Value, target_action: &str) -> Vec<String> {
+    schema["function"]["parameters"]["x-astra-per-action-allowed"][target_action]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect()
+}
+
 fn required_fields(schema: &serde_json::Value) -> Vec<String> {
     schema["function"]["parameters"]["required"]
         .as_array()
@@ -483,6 +493,39 @@ fn task_board_schema_requires_title_and_task_id() {
     assert_eq!(
         conditional_required_for(task, "stop"),
         vec!["task_id".to_string()]
+    );
+}
+
+#[test]
+fn task_board_schema_publishes_action_owned_fields() {
+    let schemas = all_tool_schemas();
+    let task = tool_schema(&schemas, "task_board");
+    let create = conditional_allowed_for(task, "create");
+    let update = conditional_allowed_for(task, "update");
+
+    assert_eq!(
+        create,
+        astra_tools::task_tool_contract::task_action_allowed_fields("create")
+            .unwrap()
+            .iter()
+            .map(|field| (*field).to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !create.iter().any(|field| field == "new_status"),
+        "task_board.create must not advertise update-only status fields"
+    );
+    assert!(
+        update.iter().any(|field| field == "new_status"),
+        "task_board.update must advertise status changes"
+    );
+    assert_eq!(
+        update,
+        astra_tools::task_tool_contract::task_action_allowed_fields("update")
+            .unwrap()
+            .iter()
+            .map(|field| (*field).to_string())
+            .collect::<Vec<_>>()
     );
 }
 

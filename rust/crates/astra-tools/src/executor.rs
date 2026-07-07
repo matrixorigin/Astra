@@ -18,6 +18,28 @@ use crate::github::GitHubClient;
 use crate::task_mgmt::{InMemoryTaskStore, TaskManager, TaskStore};
 use crate::{ToolApprovalGate, ToolContext, ToolExecutor, ToolProgressCallback, ToolResult};
 
+/// Tools the server runtime may safely route straight through the shared
+/// [`DefaultToolExecutor`] without adding server-specific journaling,
+/// rollback, approval, or transport behavior.
+///
+/// Keep mutating wrappers (`write_file`, `str_replace`, `bash`, `run_script`,
+/// rollback tools, task/session/control-plane tools) out of this list. They
+/// need server-local handlers so observability and rollback stay authoritative.
+pub const SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
+    "web_fetch",
+    "read_file",
+    "list_dir",
+    "grep",
+    "glob",
+    "symbols",
+    "git",
+    "github",
+];
+
+pub fn is_server_direct_default_executor_tool(name: &str) -> bool {
+    SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES.contains(&name)
+}
+
 // ─── Helper ─────────────────────────────────────────────────────────────────
 
 /// Convert a String-returning tool function to ToolResult.
@@ -793,6 +815,31 @@ mod tests {
         let ctx = ToolContext::test(tmp.path());
         let exec = DefaultToolExecutor::new(ctx);
         (tmp, exec)
+    }
+
+    #[test]
+    fn server_direct_default_executor_tools_are_read_or_self_contained() {
+        for name in SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES {
+            assert!(
+                crate::schemas::schema_exists_for_tool(name),
+                "direct default executor tool must have a model-facing schema: {name}"
+            );
+        }
+        for wrapped in [
+            "write_file",
+            "str_replace",
+            "bash",
+            "run_script",
+            "task_board",
+            "session",
+            "memory",
+            "rollback_file_edits",
+        ] {
+            assert!(
+                !is_server_direct_default_executor_tool(wrapped),
+                "server-specific tool `{wrapped}` must keep a dedicated handler"
+            );
+        }
     }
 
     fn init_git_repo(dir: &Path) {

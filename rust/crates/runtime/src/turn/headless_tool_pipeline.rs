@@ -107,15 +107,11 @@ fn server_owned_edge_result_should_be_rerouted(
     })
 }
 
-fn reroute_server_owned_edge_result_to_server_execution(execution: &mut HeadlessResolvedExecution) {
-    execution.result_str = format!(
-        "{HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX}: server-owned tool `{}` received a client/edge result and must execute on the server",
-        execution.name
-    );
-    execution.tool_result_fields = None;
-    execution.edge_duration_ms = 0;
-    execution.is_edge_tool = false;
-    execution.early_exit_ms = 0;
+fn server_owned_edge_result_error(execution: &HeadlessResolvedExecution) -> String {
+    format!(
+        "{HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX}: server-owned tool `{}` received a client/edge result. The selected executor and result producer disagree; fail closed to avoid duplicate side effects. Retry in a turn whose visible tool surface binds `{}` to the server/control-plane provider.",
+        execution.name, execution.name
+    )
 }
 
 fn edge_result_runtime_environment_denial(execution: &HeadlessResolvedExecution) -> Option<String> {
@@ -332,7 +328,7 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
     let consumed_after = consumed_edge.iter().filter(|&&c| c).count();
     let is_edge_tool = synthetic_edge_index.is_some() || consumed_after > consumed_before;
     if !is_edge_tool
-        && matches!(name.as_str(), "agent" | "agent_fanout")
+        && astra_tools::agent_tool_contract::is_agent_runtime_tool(&name)
         && !edge_tool_round.is_empty()
     {
         let edge_candidates = edge_tool_round
@@ -1210,7 +1206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_owned_tool_ignores_edge_result_and_executes_on_server() {
+    async fn server_owned_tool_rejects_edge_result_without_server_reroute() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round[0] = EdgeToolExecResult {
             request_id: "call-task".to_string(),
@@ -1227,47 +1223,36 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
 
-        let executed = {
+        {
             let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
             let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
                 HeadlessPipelineStage::Continue(validated) => validated,
                 _ => panic!("expected validated execution"),
             };
-            let permitted = match pipeline.permit_execution(validated).await {
-                HeadlessPipelineStage::Continue(permitted) => permitted,
-                _ => panic!("server-owned task must be rerouted instead of edge-denied"),
-            };
+            match pipeline.permit_execution(validated).await {
+                HeadlessPipelineStage::ShortCircuit => {}
+                _ => panic!("server-owned edge result must fail closed before execution"),
+            }
+        }
 
-            assert!(!permitted.execution.is_edge_tool);
-            assert!(permitted.execution.tool_result_fields.is_none());
-            assert!(
-                permitted
-                    .execution
-                    .result_str
-                    .starts_with(HEADLESS_EDGE_PROTOCOL_ERROR_PREFIX),
-                "rerouted server-owned tools must use the server-executor sentinel"
-            );
-
-            pipeline.execute_execution(permitted).await
-        };
-
-        assert!(!executed.is_err, "got: {}", executed.execution.result_str);
+        let result = harness
+            .tool_results
+            .last()
+            .expect("blocked result")
+            .to_string();
         assert!(
-            !executed
-                .execution
-                .result_str
-                .contains("edge runtime capability denied"),
-            "server-owned tool must not be failed by edge capability checks: {}",
-            executed.execution.result_str
+            result.contains("server-owned tool `task_board` received a client/edge result"),
+            "got: {result}"
         );
         assert!(
-            executed.execution.result_str.contains("server-owned task"),
-            "task should execute on the server executor, got: {}",
-            executed.execution.result_str
+            result.contains("fail closed to avoid duplicate side effects"),
+            "got: {result}"
         );
         let tasks = server_exec.task_manager().snapshot().await.unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].title, "server-owned task");
+        assert!(
+            tasks.is_empty(),
+            "wrong-executor edge result must not trigger a server mutation"
+        );
     }
 
     #[tokio::test]

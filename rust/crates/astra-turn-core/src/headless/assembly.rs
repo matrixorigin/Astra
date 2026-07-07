@@ -398,7 +398,7 @@ fn no_matching_edge_execution_message(name: &str) -> String {
         );
     }
 
-    if matches!(name, "agent" | "agent_fanout") {
+    if astra_tools::agent_tool_contract::is_agent_runtime_tool(name) {
         return format!(
             "Error: headless edge protocol — tool `{name}` has no matching \
              edge execution in this turn.\n\n\

@@ -910,13 +910,36 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &execution,
             self.ctx.runtime_tool_executor.is_some(),
         ) {
+            let err_msg = server_owned_edge_result_error(&execution);
             tracing::warn!(
                 target: "astra_runtime::headless_tool_pipeline",
                 tool_name = %execution.name,
                 tool_call_id = %execution.id,
-                "ignored client/edge result for server-owned tool; rerouting to server executor"
+                "rejected client/edge result for server-owned tool"
             );
-            reroute_server_owned_edge_result_to_server_execution(&mut execution);
+            emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &execution.id,
+                    name: &execution.name,
+                    args: &execution.args,
+                    reason_code: "wrong_executor_result",
+                    journal_kind: HeadlessShortCircuitJournalKind::HardBlocked,
+                    journal_reason: err_msg.clone(),
+                    err_msg,
+                    early_exit_ms: execution.early_exit_ms,
+                    status_line: Some(format!(
+                        "  ⚠ Wrong executor result rejected: {}",
+                        execution.name
+                    )),
+                },
+                self.ctx.step_recorder,
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
         }
         if let Some(err_msg) = edge_result_runtime_environment_denial(&execution) {
             emit_blocked_tool_result(

@@ -33,7 +33,7 @@ fn task_board_schema() -> Value {
     let mut props = serde_json::Map::new();
     props.insert(
         "action".to_string(),
-        json!({"type": "string", "enum": crate::task_tool_contract::TASK_ACTIONS, "description": "Task-board operation."}),
+        json!({"type": "string", "enum": crate::task_tool_contract::TASK_ACTIONS, "description": "Task-board operation; use only fields allowed for this action."}),
     );
     props.insert(
         "source_session_id".to_string(),
@@ -61,7 +61,7 @@ fn task_board_schema() -> Value {
     );
     props.insert(
         "new_status".to_string(),
-        json!({"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update) Parent/subtask status. deleted keeps an audit tombstone."}),
+        json!({"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only; never with create) Parent/subtask status. deleted keeps an audit tombstone."}),
     );
     props.insert(
         "status_filter".to_string(),
@@ -104,7 +104,7 @@ fn task_board_schema() -> Value {
         json!({
             "type": "array",
             "maxItems": crate::task_mgmt::MAX_CREATE_SUBTASKS,
-            "description": "(create) Optional subtasks; update existing subtasks with subtask_id + new_status.",
+            "description": "(create only) Optional subtasks; update existing subtasks with subtask_id + new_status.",
             "items": {
                 "type": "object",
                 "additionalProperties": false,
@@ -137,12 +137,16 @@ fn task_board_schema() -> Value {
             "adopt": ["source_session_id", "task_id"]
         }),
     );
+    params.insert(
+        "x-astra-per-action-allowed".to_string(),
+        crate::task_tool_contract::task_action_allowed_fields_json(),
+    );
 
     json!({
         "type": "function",
         "function": {
             "name": crate::task_tool_contract::TASK_BOARD_TOOL_NAME,
-            "description": "Durable task board for multi-step work. Use action=create/update/list/get/stop/list_user/adopt/archive.",
+            "description": "Durable task board. Pick one action; use only that action's allowed fields. create makes tasks; update changes status.",
             "parameters": Value::Object(params)
         }
     })
@@ -1703,6 +1707,27 @@ mod tests {
             per_action_required["adopt"],
             json!(["source_session_id", "task_id"]),
             "task_board.adopt required fields must stay explicit"
+        );
+        let per_action_allowed = task_board["function"]["parameters"]["x-astra-per-action-allowed"]
+            .as_object()
+            .expect("task_board per-action allowed fields");
+        assert_eq!(
+            per_action_allowed["create"],
+            json!(crate::task_tool_contract::task_action_allowed_fields("create").unwrap()),
+            "task_board.create allowed fields must be generated from task_tool_contract"
+        );
+        assert!(
+            !per_action_allowed["create"]
+                .as_array()
+                .expect("create allowed fields")
+                .iter()
+                .any(|field| field.as_str() == Some("new_status")),
+            "task_board.create must not advertise update-only status fields"
+        );
+        assert_eq!(
+            per_action_allowed["update"],
+            json!(crate::task_tool_contract::task_action_allowed_fields("update").unwrap()),
+            "task_board.update allowed fields must be generated from task_tool_contract"
         );
     }
 

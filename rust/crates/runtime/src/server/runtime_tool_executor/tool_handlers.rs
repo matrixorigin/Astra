@@ -6,6 +6,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use astra_tools::ToolExecutor;
+use astra_tools::executor::SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES;
 use astra_tools::tool_engine::{
     DynamicToolHandler, NotifyToolHandler, ToolEngine, ToolHandler, WebSearchToolHandler,
 };
@@ -50,27 +51,14 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     register_handler_or_log!(engine, "notify", NotifyToolHandler);
     register_handler_or_log!(engine, "web_search", WebSearchToolHandler);
 
-    for name in [
-        "web_fetch",
-        "read_file",
-        "list_dir",
-        "grep",
-        "glob",
-        "symbols",
-    ] {
-        register_handler_or_log!(engine, name, DefaultExecutorToolHandler { name });
+    for name in SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES {
+        register_handler_or_log!(engine, *name, DefaultExecutorToolHandler { name });
     }
 
     register_handler_or_log!(engine, "write_file", WriteFileToolHandler);
     register_handler_or_log!(engine, "str_replace", StrReplaceToolHandler);
     register_handler_or_log!(engine, "rollback_file_edits", RollbackFileEditsToolHandler);
     register_handler_or_log!(engine, "bash", BashToolHandler);
-    register_handler_or_log!(engine, "git", DefaultExecutorToolHandler { name: "git" });
-    register_handler_or_log!(
-        engine,
-        "github",
-        DefaultExecutorToolHandler { name: "github" }
-    );
     register_handler_or_log!(engine, "get_agent_info", GetAgentInfoToolHandler);
     register_handler_or_log!(engine, "tool_search", ToolSearchToolHandler);
     register_handler_or_log!(engine, "memory", MemoryToolHandler);
@@ -845,5 +833,44 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
             ));
         }
         context.execute_mcp_tool(name, args).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_direct_default_executor_handlers_follow_shared_contract() {
+        let engine = runtime_tool_engine();
+        let handlers = engine
+            .handler_names()
+            .collect::<std::collections::HashSet<_>>();
+
+        for name in SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES {
+            assert!(
+                handlers.contains(name),
+                "server runtime must register direct DefaultToolExecutor handler for {name}"
+            );
+        }
+        for wrapped in [
+            "write_file",
+            "str_replace",
+            "bash",
+            "run_script",
+            "task_board",
+            "session",
+            "memory",
+            "rollback_file_edits",
+        ] {
+            assert!(
+                !astra_tools::executor::is_server_direct_default_executor_tool(wrapped),
+                "server-specific wrapper `{wrapped}` must not be classified as direct default executor"
+            );
+            assert!(
+                handlers.contains(wrapped),
+                "server-specific wrapper `{wrapped}` must still have a runtime handler"
+            );
+        }
     }
 }
