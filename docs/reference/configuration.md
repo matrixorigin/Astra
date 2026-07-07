@@ -54,6 +54,11 @@ type = "hmac"
 key = "${ASTRA_PROVIDER_HMAC_KEY}"
 ```
 
+For MOI, `ASTRA_PROVIDER_HMAC_KEY` is an unpadded base64url text secret derived
+by MOI deployment tooling. Astra uses the configured string's UTF-8 bytes
+directly as the provider request HMAC key; it does not base64url-decode the
+string before verifying request tokens.
+
 ### LLM
 
 LLM models are **not** configured via env vars. Use the admin CLI:

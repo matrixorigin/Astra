@@ -1253,6 +1253,8 @@ mod tests {
     use serde_json::json;
 
     const TEST_PROVIDER_HMAC_KEY: &str = "test-provider-hmac-key";
+    const GOLDEN_PROVIDER_HMAC_KEY: &str = "WrE2irtwGEq1Ih2stZUtgFfLFNv2gVhOAwsBD999QLI";
+    const GOLDEN_PROVIDER_TOKEN: &str = "moi-provider-v1.eyJzdWIiOiJ1c2VyXzEiLCJzY29wZSI6IndvcmtzcGFjZV8xIiwicHJvdmlkZXIiOiJtb2kiLCJpYXQiOjQxMDI0NDQ1MDAsImV4cCI6NDEwMjQ0NDgwMH0.wZS9mRKasIEmreqhzGheguYYPbq1URTYkJoSK3nfW3M";
 
     fn hmac_provider_token(
         subject: &str,
@@ -1290,6 +1292,29 @@ mod tests {
             auth_type: "hmac".to_string(),
             key: TEST_PROVIDER_HMAC_KEY.to_string(),
         }])
+    }
+
+    #[test]
+    fn provider_request_hmac_golden_vector_uses_encoded_key_bytes() {
+        let mut parts = GOLDEN_PROVIDER_TOKEN.split('.');
+        assert_eq!(parts.next(), Some(PROVIDER_REQUEST_TOKEN_PREFIX));
+        let encoded_claims = parts.next().expect("encoded claims");
+        let encoded_signature = parts.next().expect("encoded signature");
+        assert!(parts.next().is_none());
+
+        assert!(verify_provider_request_signature(
+            GOLDEN_PROVIDER_HMAC_KEY.as_bytes(),
+            encoded_claims,
+            encoded_signature,
+        ));
+        let decoded_key = URL_SAFE_NO_PAD
+            .decode(GOLDEN_PROVIDER_HMAC_KEY)
+            .expect("golden key should be base64url decodable");
+        assert!(!verify_provider_request_signature(
+            &decoded_key,
+            encoded_claims,
+            encoded_signature,
+        ));
     }
 
     fn provider_headers(token: &str, provider: &str) -> HeaderMap {
