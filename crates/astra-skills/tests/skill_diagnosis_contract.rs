@@ -260,17 +260,8 @@ fn returns_none_when_cause_tag_is_unknown() {
 fn skill_md_example_blocks_are_parseable() {
     // Dog-food: every SKILL.md ships an example JSON block for LLM authors
     // to copy. If a future edit breaks the example, this test fails early.
-    // CARGO_MANIFEST_DIR points at crates/astra-skills; walk up to the
-    // repo root where the top-level `skills/` directory lives.
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let repo_root = std::path::Path::new(manifest_dir)
-        .ancestors()
-        .nth(3)
-        .expect("walk up to repo root");
-
     for skill_name in ["analyze_session", "optimize_prompt"] {
-        let path = repo_root
-            .join(".agent/skills")
+        let path = astra_core::test_paths::workspace_path(".agent/skills")
             .join(skill_name)
             .join("SKILL.md");
         let text = std::fs::read_to_string(&path)
@@ -290,13 +281,7 @@ fn skill_md_example_blocks_are_parseable() {
 
 #[test]
 fn review_changes_skill_requires_parallel_fallback_and_self_critique_gate() {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let repo_root = std::path::Path::new(manifest_dir)
-        .ancestors()
-        .nth(3)
-        .expect("walk up to repo root");
-    let path = repo_root
-        .join(".agent/skills")
+    let path = astra_core::test_paths::workspace_path(".agent/skills")
         .join("review_changes")
         .join("SKILL.md");
     let text =

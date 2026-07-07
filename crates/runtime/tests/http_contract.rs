@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, sync::Arc};
 
 use astra_runtime::{AppState, HealthChecker, ServiceInfo, build_app};
 use async_trait::async_trait;
@@ -41,10 +41,10 @@ impl HealthChecker for StubHealthChecker {
 }
 
 fn load_contract() -> HttpShellContract {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("fixtures/contracts/http_shell_contract.json");
-    let content = fs::read_to_string(path).expect("contract fixture should exist");
+    let content = fs::read_to_string(astra_core::test_paths::workspace_path(
+        "fixtures/contracts/http_shell_contract.json",
+    ))
+    .expect("contract fixture should exist");
     serde_json::from_str(&content).expect("contract fixture should be valid JSON")
 }
 

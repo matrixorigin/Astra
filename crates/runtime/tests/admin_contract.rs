@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, sync::Arc};
 
 use astra_runtime::{
     AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer,
@@ -327,10 +327,10 @@ impl AdminUserRoleManager for StubAdminUserRoleManager {
 }
 
 fn load_contract() -> AdminContract {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("fixtures/contracts/admin_contract.json");
-    let content = fs::read_to_string(path).expect("admin contract fixture should exist");
+    let content = fs::read_to_string(astra_core::test_paths::workspace_path(
+        "fixtures/contracts/admin_contract.json",
+    ))
+    .expect("admin contract fixture should exist");
     serde_json::from_str(&content).expect("admin contract fixture should be valid JSON")
 }
 

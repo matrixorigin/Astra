@@ -289,8 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn review_changes_skill_keeps_agent_available_for_parallel_reviews() {
-        let repo_skills = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../.agent/skills")
+        let repo_skills = astra_core::test_paths::workspace_path(".agent/skills")
             .canonicalize()
             .expect("repo skills dir should resolve in workspace tests");
         let provider = LocalSkillProvider::with_paths(vec![repo_skills]);

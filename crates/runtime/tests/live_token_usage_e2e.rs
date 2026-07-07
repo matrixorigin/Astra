@@ -39,7 +39,6 @@
 //! than a hard failure, so a broken API key in one model doesn't mask real
 //! regressions in another.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use astra_runtime::turn::bedrock::eventstream::FrameDecoder;
@@ -83,7 +82,7 @@ struct ModelDef {
 /// Read `.models.yaml` from the repo root. Returns an empty vec if the file
 /// is missing — tests should then soft-skip rather than panic.
 fn load_models_yaml() -> Vec<ModelDef> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../.models.yaml");
+    let path = astra_core::test_paths::workspace_path(".models.yaml");
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {

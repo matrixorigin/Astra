@@ -706,7 +706,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|v| v.as_str() == Some("Cargo.toml")),
+                .any(|v| v.as_str() == Some("rust/Cargo.toml")),
             "should list nested Cargo.toml, got: {ctx}"
         );
         assert_eq!(ctx["manifest_roots"][0]["path"], "rust");
@@ -714,7 +714,7 @@ mod tests {
 
         let env = build_static_environment_context(tmp.path());
         assert!(
-            env.contains("Workspace manifests: Cargo.toml (rust)"),
+            env.contains("Workspace manifests: rust/Cargo.toml (rust)"),
             "{env}"
         );
     }

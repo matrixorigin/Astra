@@ -50,5 +50,6 @@ astra-pipeline = { path = "../astra-pipeline", optional = true }
 crash-recovery = ["astra-pipeline"]
 
 [dev-dependencies]
+astra-core = { path = "../core", features = ["dev-defaults"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3"

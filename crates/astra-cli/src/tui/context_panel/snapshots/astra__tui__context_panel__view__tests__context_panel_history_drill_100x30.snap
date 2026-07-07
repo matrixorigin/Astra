@@ -1,6 +1,6 @@
 ---
 source: crates/astra-cli/src/tui/context_panel/view.rs
-assertion_line: 2157
+assertion_line: 2122
 expression: buffer_to_string(&buf)
 ---
   2.0k / 100.0k tokens  (2.0%)
@@ -16,11 +16,9 @@ expression: buffer_to_string(&buf)
     Esc back · drill: turn #0 assistant   4.2k tokens  [tools]
         I'll start by reading auth.rs and mapping out every caller.
 
-
         Let me look at the module structure first, then identify what
         to move. The validate_session function has three call sites
         that I'll need to update.
-
 
         Plan:
         1. Extract validate_session into src/auth/session_validator.rs.

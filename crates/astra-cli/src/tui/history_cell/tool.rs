@@ -1366,7 +1366,16 @@ mod tests {
 
         let out = render(&t, 100, 6);
         assert!(out.contains("Bash"));
-        assert!(out.contains("boom\tok"));
+        let boom = out
+            .find("boom")
+            .expect("sanitized command keeps visible stdout");
+        let ok = out
+            .find("ok")
+            .expect("sanitized command keeps text after tab");
+        assert!(
+            boom < ok,
+            "sanitized command should preserve visible text order: {out}"
+        );
         assert!(out.contains("line-1"));
         assert!(out.contains("line-2"));
         assert!(!out.contains("[2J"));

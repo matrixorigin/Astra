@@ -1674,7 +1674,7 @@ mod tests {
 /// JSON fixture parity for `AppSettings::from_map` (was `astra-runtime` `config_contract` binary).
 #[cfg(test)]
 mod settings_contract_tests {
-    use std::{collections::HashMap, fs, path::PathBuf};
+    use std::{collections::HashMap, fs};
 
     use serde::{Deserialize, Serialize};
 
@@ -1698,10 +1698,10 @@ mod settings_contract_tests {
     }
 
     fn load_contract() -> SettingsContract {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../..")
-            .join("fixtures/contracts/settings_contract.json");
-        let content = fs::read_to_string(path).expect("settings contract fixture should exist");
+        let content = fs::read_to_string(crate::test_paths::workspace_path(
+            "fixtures/contracts/settings_contract.json",
+        ))
+        .expect("settings contract fixture should exist");
         serde_json::from_str(&content).expect("settings contract fixture should be valid JSON")
     }
 

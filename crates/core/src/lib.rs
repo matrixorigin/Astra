@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
 pub mod canonical_names;
+#[cfg(any(test, feature = "dev-defaults"))]
+pub mod test_paths;
 
 /// Global cap on the sum of `max_connections` across all pools.
 /// Prevents unbounded pool creation from exhausting database connections.
