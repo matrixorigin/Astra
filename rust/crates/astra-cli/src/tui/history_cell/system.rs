@@ -10,7 +10,7 @@
 
 use std::any::Any;
 
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;

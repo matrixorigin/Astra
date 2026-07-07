@@ -25,11 +25,11 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 url = "2.5"
-scraper = "0.22"
+scraper = "0.27"
 futures = "0.3"
 
 # Git operations (gix)
-gix = { version = "0.81.0", features = ["status", "blame", "mailmap", "revision"] }
+gix = { version = "0.85.0", features = ["status", "blame", "mailmap", "revision"] }
 
 # Code intelligence (tree-sitter)
 tree-sitter = "0.24"

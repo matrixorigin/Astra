@@ -82,6 +82,30 @@ fn display_width(s: &str) -> usize {
     visible.width()
 }
 
+pub(crate) fn to_crossterm_color(color: Color) -> crossterm::style::Color {
+    match color {
+        Color::Reset => crossterm::style::Color::Reset,
+        Color::Black => crossterm::style::Color::Black,
+        Color::Red => crossterm::style::Color::DarkRed,
+        Color::Green => crossterm::style::Color::DarkGreen,
+        Color::Yellow => crossterm::style::Color::DarkYellow,
+        Color::Blue => crossterm::style::Color::DarkBlue,
+        Color::Magenta => crossterm::style::Color::DarkMagenta,
+        Color::Cyan => crossterm::style::Color::DarkCyan,
+        Color::Gray => crossterm::style::Color::Grey,
+        Color::DarkGray => crossterm::style::Color::DarkGrey,
+        Color::LightRed => crossterm::style::Color::Red,
+        Color::LightGreen => crossterm::style::Color::Green,
+        Color::LightYellow => crossterm::style::Color::Yellow,
+        Color::LightBlue => crossterm::style::Color::Blue,
+        Color::LightMagenta => crossterm::style::Color::Magenta,
+        Color::LightCyan => crossterm::style::Color::Cyan,
+        Color::White => crossterm::style::Color::White,
+        Color::Rgb(r, g, b) => crossterm::style::Color::Rgb { r, g, b },
+        Color::Indexed(index) => crossterm::style::Color::AnsiValue(index),
+    }
+}
+
 #[derive(Debug, Hash)]
 pub struct Frame<'a> {
     /// Where should the cursor be after drawing this frame?
@@ -183,10 +207,14 @@ where
     B: Backend,
     B: Write,
 {
+    fn backend_io<T>(result: Result<T, B::Error>) -> io::Result<T> {
+        result.map_err(|err| io::Error::other(err.to_string()))
+    }
+
     /// Creates a new [`Terminal`] with the given [`Backend`] and [`TerminalOptions`].
     pub fn with_options(mut backend: B) -> io::Result<Self> {
-        let screen_size = backend.size()?;
-        let cursor_pos = backend.get_cursor_position().unwrap_or_else(|err| {
+        let screen_size = Self::backend_io(backend.size())?;
+        let cursor_pos = Self::backend_io(backend.get_cursor_position()).unwrap_or_else(|err| {
             // Some PTYs do not answer CPR (`ESC[6n`); continue with a safe default instead
             // of failing TUI startup.
             tracing::warn!("failed to read initial cursor position; defaulting to origin: {err}");
@@ -379,21 +407,21 @@ where
 
         self.swap_buffers();
 
-        Backend::flush(&mut self.backend)?;
+        Self::backend_io(Backend::flush(&mut self.backend))?;
 
         Ok(())
     }
 
     /// Hides the cursor.
     pub fn hide_cursor(&mut self) -> io::Result<()> {
-        self.backend.hide_cursor()?;
+        Self::backend_io(self.backend.hide_cursor())?;
         self.hidden_cursor = true;
         Ok(())
     }
 
     /// Shows the cursor.
     pub fn show_cursor(&mut self) -> io::Result<()> {
-        self.backend.show_cursor()?;
+        Self::backend_io(self.backend.show_cursor())?;
         self.hidden_cursor = false;
         Ok(())
     }
@@ -403,13 +431,13 @@ where
     /// This is the position of the cursor after the last draw call.
     #[allow(dead_code)]
     pub fn get_cursor_position(&mut self) -> io::Result<Position> {
-        self.backend.get_cursor_position()
+        Self::backend_io(self.backend.get_cursor_position())
     }
 
     /// Sets the cursor position.
     pub fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
         let position = position.into();
-        self.backend.set_cursor_position(position)?;
+        Self::backend_io(self.backend.set_cursor_position(position))?;
         self.last_known_cursor_pos = position;
         Ok(())
     }
@@ -424,8 +452,8 @@ where
 
     /// Clear from `position` through the end of the visible screen and force a full redraw.
     pub(crate) fn clear_after_position(&mut self, position: Position) -> io::Result<()> {
-        self.backend.set_cursor_position(position)?;
-        self.backend.clear_region(ClearType::AfterCursor)?;
+        Self::backend_io(self.backend.set_cursor_position(position))?;
+        Self::backend_io(self.backend.clear_region(ClearType::AfterCursor))?;
         // Reset the back buffer to make sure the next update will redraw everything.
         self.previous_buffer_mut().reset();
         Ok(())
@@ -462,7 +490,7 @@ where
         // with an explicit cursor-home before/after, matching the common `clear`
         // sequence (`CSI 2J` + `CSI H`).
         self.set_cursor_position(home)?;
-        self.backend.clear_region(ClearType::All)?;
+        Self::backend_io(self.backend.clear_region(ClearType::All))?;
         self.set_cursor_position(home)?;
         std::io::Write::flush(&mut self.backend)?;
         self.visible_history_rows = 0;
@@ -508,7 +536,7 @@ where
 
     /// Queries the real size of the backend.
     pub fn size(&self) -> io::Result<Size> {
-        self.backend.size()
+        Self::backend_io(self.backend.size())
     }
 }
 
@@ -616,7 +644,10 @@ where
                 if cell.fg != fg || cell.bg != bg {
                     queue!(
                         writer,
-                        SetColors(Colors::new(cell.fg.into(), cell.bg.into()))
+                        SetColors(Colors::new(
+                            to_crossterm_color(cell.fg),
+                            to_crossterm_color(cell.bg)
+                        ))
                     )?;
                     fg = cell.fg;
                     bg = cell.bg;
@@ -627,7 +658,7 @@ where
             DrawCommand::ClearToEnd { bg: clear_bg, .. } => {
                 queue!(writer, SetAttribute(crossterm::style::Attribute::Reset))?;
                 modifier = Modifier::empty();
-                queue!(writer, SetBackgroundColor(clear_bg.into()))?;
+                queue!(writer, SetBackgroundColor(to_crossterm_color(clear_bg)))?;
                 bg = clear_bg;
                 queue!(writer, Clear(crossterm::terminal::ClearType::UntilNewLine))?;
             }

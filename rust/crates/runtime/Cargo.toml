@@ -81,14 +81,14 @@ http-body-util.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 astra-harness = { workspace = true, optional = true }
-notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+notify = { version = "8.2", default-features = false, features = ["macos_kqueue"] }
 dashmap = "6.1.0"
 fs2 = "0.4"
 tempfile = "3"
 
 [dev-dependencies]
 astra-core = { workspace = true, features = ["dev-defaults"] }
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+criterion = { version = "0.5", default-features = false, features = ["html_reports", "async_tokio"] }
 futures-util.workspace = true
 serial_test = "3"
 sqlx.workspace = true

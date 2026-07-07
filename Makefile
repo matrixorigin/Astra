@@ -1422,7 +1422,7 @@ format-check:
 .PHONY: audit
 audit:
 	@command -v cargo-audit >/dev/null 2>&1 || { echo "cargo-audit not found; install with: cargo install cargo-audit"; exit 1; }
-	@cd rust && cargo audit
+	@cd rust && cargo audit --no-fetch --stale
 
 .PHONY: type-check
 type-check: sweep

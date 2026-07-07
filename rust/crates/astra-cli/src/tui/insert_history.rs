@@ -8,7 +8,7 @@ use crossterm::{
 };
 use ratatui::backend::Backend;
 use ratatui::layout::Size;
-use ratatui::style::Modifier;
+use ratatui::style::{Color as RColor, Modifier};
 use ratatui::text::Line;
 use unicode_width::UnicodeWidthStr;
 
@@ -202,9 +202,25 @@ fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()
     Ok(())
 }
 
-fn color_to_rgb(color: ratatui::style::Color) -> (u8, u8, u8) {
-    match <ratatui::style::Color as Into<CColor>>::into(color) {
+fn color_to_rgb(color: RColor) -> (u8, u8, u8) {
+    match custom_terminal::to_crossterm_color(color) {
         CColor::Rgb { r, g, b } => (r, g, b),
+        CColor::Black => (0, 0, 0),
+        CColor::DarkRed => (128, 0, 0),
+        CColor::DarkGreen => (0, 128, 0),
+        CColor::DarkYellow => (128, 128, 0),
+        CColor::DarkBlue => (0, 0, 128),
+        CColor::DarkMagenta => (128, 0, 128),
+        CColor::DarkCyan => (0, 128, 128),
+        CColor::Grey => (192, 192, 192),
+        CColor::DarkGrey => (128, 128, 128),
+        CColor::Red => (255, 0, 0),
+        CColor::Green => (0, 255, 0),
+        CColor::Yellow => (255, 255, 0),
+        CColor::Blue => (0, 0, 255),
+        CColor::Magenta => (255, 0, 255),
+        CColor::Cyan => (0, 255, 255),
+        CColor::White => (255, 255, 255),
         _ => (55, 55, 60),
     }
 }
@@ -227,8 +243,14 @@ fn apply_style_from_clean_state(
         writer,
         SetAttribute(Attribute::Reset),
         SetColors(Colors::new(
-            style.fg.map(Into::into).unwrap_or(CColor::Reset),
-            style.bg.map(Into::into).unwrap_or(CColor::Reset),
+            style
+                .fg
+                .map(custom_terminal::to_crossterm_color)
+                .unwrap_or(CColor::Reset),
+            style
+                .bg
+                .map(custom_terminal::to_crossterm_color)
+                .unwrap_or(CColor::Reset),
         ))
     )?;
 
