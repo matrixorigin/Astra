@@ -822,6 +822,14 @@ pub fn durable_run_status_is_terminal(status: &str) -> bool {
     )
 }
 
+/// Whether a root/session run owns the session execution slot.
+///
+/// `paused` is split intentionally:
+/// - `paused(waiting_for = Some(_))` is a manual/user-held pause and keeps the
+///   slot so resume cannot race with a different root turn in the same session.
+/// - `paused(waiting_for = None)` is non-interactive/budget-exhausted or
+///   terminal-buffered state and releases the slot; resuming it either performs
+///   completion promotion or reacquires the slot before executing.
 pub fn durable_run_status_blocks_session(status: &str, waiting_for: Option<&str>) -> bool {
     matches!(
         durable_run_status_kind(status),
@@ -898,6 +906,25 @@ const RUN_DISPLAY_PROJECTION_COLUMNS: &str = "run_id, user_id, session_id, statu
 /// Implementations:
 /// - `InMemoryRunStateStore` — deterministic durable fake for tests
 /// - `DatabaseRunStateStore` — MatrixOne-backed persistence
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardedRunStatusTransition {
+    Updated,
+    StatusConflict,
+    SessionBlocked,
+}
+
+#[derive(Debug)]
+pub struct GuardedRunStatusTransitionRequest<'a> {
+    pub user_id: &'a str,
+    pub run_id: &'a str,
+    pub session_id: &'a str,
+    pub expected_statuses: &'a [&'a str],
+    pub status: &'a str,
+    pub waiting_for: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+    pub event: serde_json::Value,
+}
+
 #[async_trait]
 pub trait RunStateStore: Send + Sync {
     /// Insert a new run record.
@@ -950,6 +977,25 @@ pub trait RunStateStore: Send + Sync {
         error_message: Option<&str>,
         event: serde_json::Value,
     ) -> Result<bool, String>;
+
+    /// Atomically update run status and append one durable event only when no
+    /// other run in the same user/session currently blocks execution.
+    ///
+    /// The current run is excluded from the session-blocking check so a
+    /// manual-paused run can resume itself. Store implementations should make
+    /// the status CAS and session guard one durable operation. The default
+    /// fails closed so new store implementations cannot silently inherit a
+    /// non-atomic check-then-update fallback.
+    async fn update_run_status_with_event_if_current_unless_session_blocked(
+        &self,
+        request: GuardedRunStatusTransitionRequest<'_>,
+    ) -> Result<GuardedRunStatusTransition, String> {
+        let _ = request;
+        Err(
+            "session-guarded run status transition is not implemented for this run store"
+                .to_string(),
+        )
+    }
 
     /// Atomically update run status and append a durable event batch if the
     /// current status is one of `expected_statuses`.
@@ -1116,6 +1162,7 @@ pub trait RunStateStore: Send + Sync {
 /// In-memory run state store for tests and single-process deployments.
 pub struct InMemoryRunStateStore {
     runs: tokio::sync::RwLock<std::collections::HashMap<String, DurableRunRecord>>,
+    execution_slots: tokio::sync::RwLock<std::collections::HashMap<(String, String), String>>,
     checkpoints:
         tokio::sync::RwLock<std::collections::HashMap<String, Vec<DurableRunCheckpointRecord>>>,
     projections:
@@ -1130,6 +1177,7 @@ impl InMemoryRunStateStore {
     pub fn new() -> Self {
         Self {
             runs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            execution_slots: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             checkpoints: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             projections: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
@@ -1175,6 +1223,121 @@ fn run_requires_session_exclusive_start(record: &DurableRunRecord) -> bool {
         && record.retry_of.is_none()
         && record.delegation_id.is_none()
         && record.agent_id.is_none()
+}
+
+fn run_record_owns_session_execution_slot(run: &DurableRunRecord) -> bool {
+    run_requires_session_exclusive_start(run)
+}
+
+fn sync_in_memory_execution_slot(
+    slots: &mut std::collections::HashMap<(String, String), String>,
+    run: &DurableRunRecord,
+    status: &str,
+    waiting_for: Option<&str>,
+) -> Result<(), String> {
+    if !run_record_owns_session_execution_slot(run) {
+        return Ok(());
+    }
+    let key = (run.user_id.clone(), run.session_id.clone());
+    if durable_run_status_blocks_session(status, waiting_for) {
+        match slots.get(&key) {
+            Some(owner) if owner != &run.run_id => Err("session already has an active run".into()),
+            _ => {
+                slots.insert(key, run.run_id.clone());
+                Ok(())
+            }
+        }
+    } else {
+        if slots.get(&key).is_some_and(|owner| owner == &run.run_id) {
+            slots.remove(&key);
+        }
+        Ok(())
+    }
+}
+
+fn apply_in_memory_status_transition(
+    slots: &mut std::collections::HashMap<(String, String), String>,
+    run: &mut DurableRunRecord,
+    status: &str,
+    waiting_for: Option<&str>,
+    error_message: Option<&str>,
+    terminal_error_code: Option<&str>,
+) -> Result<(), String> {
+    sync_in_memory_execution_slot(slots, run, status, waiting_for)?;
+    run.status = status.to_string();
+    run.waiting_for = waiting_for.map(ToString::to_string);
+    if let Some(msg) = error_message {
+        run.error_message = Some(msg.to_string());
+    }
+    if let Some(code) = terminal_error_code {
+        run.error_code = Some(code.to_string());
+    }
+    run.updated_at = chrono::Utc::now().to_rfc3339();
+    Ok(())
+}
+
+fn session_execution_slot_owner_reclaimable(
+    status: &str,
+    waiting_for: Option<&str>,
+    owner_lease_expired: bool,
+    slot_is_stale: bool,
+) -> bool {
+    let blocks = durable_run_status_blocks_session(status, waiting_for);
+    if !blocks {
+        return true;
+    }
+    matches!(
+        durable_run_status_kind(status),
+        DurableRunStatusKind::Running
+            | DurableRunStatusKind::InputQueued
+            | DurableRunStatusKind::Waiting
+    ) && owner_lease_expired
+        && slot_is_stale
+}
+
+fn in_memory_session_execution_slot_drift(
+    slots: &std::collections::HashMap<(String, String), String>,
+    runs: &std::collections::HashMap<String, DurableRunRecord>,
+    user_id: &str,
+    session_id: &str,
+) -> Option<String> {
+    let key = (user_id.to_string(), session_id.to_string());
+    let slot_owner = slots.get(&key);
+    for run in runs.values().filter(|run| {
+        run.user_id == user_id
+            && run.session_id == session_id
+            && run_record_owns_session_execution_slot(run)
+            && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
+    }) {
+        match slot_owner {
+            Some(owner) if owner == &run.run_id => {}
+            Some(owner) => {
+                return Some(format!(
+                    "in-memory session execution slot drift: slot owner {owner} conflicts with blocking run {}",
+                    run.run_id
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "in-memory session execution slot drift: missing slot for blocking run {}",
+                    run.run_id
+                ));
+            }
+        }
+    }
+    if let Some(owner) = slot_owner
+        && !runs.get(owner).is_some_and(|run| {
+            run.user_id == user_id
+                && run.session_id == session_id
+                && run_record_owns_session_execution_slot(run)
+                && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
+        })
+    {
+        return Some(format!(
+            "in-memory session execution slot drift: stale slot owner {owner}"
+        ));
+    }
+    None
 }
 
 fn checkpoint_metadata(
@@ -1351,17 +1514,15 @@ fn status_projection_patch_hash(
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
+        let mut slots = self.execution_slots.write().await;
         let mut runs = self.runs.write().await;
         let run_id = record.run_id.clone();
-        if run_requires_session_exclusive_start(&record)
-            && runs.values().any(|run| {
-                run.user_id == record.user_id
-                    && run.session_id == record.session_id
-                    && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
-            })
-        {
-            return Err("session already has an active run".to_string());
-        }
+        sync_in_memory_execution_slot(
+            &mut slots,
+            &record,
+            &record.status,
+            record.waiting_for.as_deref(),
+        )?;
         runs.insert(run_id.clone(), record);
         let Some(inserted) = runs.get(run_id.as_str()).cloned() else {
             return Err(format!(
@@ -1388,9 +1549,11 @@ impl RunStateStore for InMemoryRunStateStore {
         if !evicted_ids.is_empty() {
             let mut projections = self.projections.write().await;
             let mut checkpoints = self.checkpoints.write().await;
+            let mut slots = self.execution_slots.write().await;
             for id in evicted_ids {
                 projections.remove(&id);
                 checkpoints.remove(&id);
+                slots.retain(|_, owner| owner != &id);
             }
         }
         self.sync_projection(&inserted, Some("run_started".to_string()), None)
@@ -1420,20 +1583,20 @@ impl RunStateStore for InMemoryRunStateStore {
     ) -> Result<bool, String> {
         let terminal_error_code = terminal_error_code_from_message(status, error_message);
         let updated = {
+            let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
                 if run.user_id != user_id {
                     None
                 } else {
-                    run.status = status.to_string();
-                    run.waiting_for = waiting_for.map(ToString::to_string);
-                    if let Some(msg) = error_message {
-                        run.error_message = Some(msg.to_string());
-                    }
-                    if let Some(code) = terminal_error_code.as_ref() {
-                        run.error_code = Some(code.clone());
-                    }
-                    run.updated_at = chrono::Utc::now().to_rfc3339();
+                    apply_in_memory_status_transition(
+                        &mut slots,
+                        run,
+                        status,
+                        waiting_for,
+                        error_message,
+                        terminal_error_code.as_deref(),
+                    )?;
                     Some(run.clone())
                 }
             } else {
@@ -1462,20 +1625,20 @@ impl RunStateStore for InMemoryRunStateStore {
         }
         let terminal_error_code = terminal_error_code_from_message(status, error_message);
         let updated = {
+            let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
                 if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
                     None
                 } else {
-                    run.status = status.to_string();
-                    run.waiting_for = waiting_for.map(ToString::to_string);
-                    if let Some(msg) = error_message {
-                        run.error_message = Some(msg.to_string());
-                    }
-                    if let Some(code) = terminal_error_code.as_ref() {
-                        run.error_code = Some(code.clone());
-                    }
-                    run.updated_at = chrono::Utc::now().to_rfc3339();
+                    apply_in_memory_status_transition(
+                        &mut slots,
+                        run,
+                        status,
+                        waiting_for,
+                        error_message,
+                        terminal_error_code.as_deref(),
+                    )?;
                     Some(run.clone())
                 }
             } else {
@@ -1510,22 +1673,22 @@ impl RunStateStore for InMemoryRunStateStore {
             std::slice::from_ref(&event),
         );
         let updated = {
+            let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
                 if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
                     None
                 } else {
-                    run.status = status.to_string();
-                    run.waiting_for = waiting_for.map(ToString::to_string);
-                    if let Some(msg) = error_message {
-                        run.error_message = Some(msg.to_string());
-                    }
-                    if let Some(code) = terminal_error_code.as_ref() {
-                        run.error_code = Some(code.clone());
-                    }
+                    apply_in_memory_status_transition(
+                        &mut slots,
+                        run,
+                        status,
+                        waiting_for,
+                        error_message,
+                        terminal_error_code.as_deref(),
+                    )?;
                     run.events.push(event);
                     run.last_event_idx = run.events.len() as i64 - 1;
-                    run.updated_at = chrono::Utc::now().to_rfc3339();
                     Some(run.clone())
                 }
             } else {
@@ -1538,6 +1701,76 @@ impl RunStateStore for InMemoryRunStateStore {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    async fn update_run_status_with_event_if_current_unless_session_blocked(
+        &self,
+        request: GuardedRunStatusTransitionRequest<'_>,
+    ) -> Result<GuardedRunStatusTransition, String> {
+        let GuardedRunStatusTransitionRequest {
+            user_id,
+            run_id,
+            session_id,
+            expected_statuses,
+            status,
+            waiting_for,
+            error_message,
+            event,
+        } = request;
+        if expected_statuses.is_empty() {
+            return Ok(GuardedRunStatusTransition::StatusConflict);
+        }
+        let latest_event_type = extract_event_type(&event);
+        let terminal_error_code = terminal_error_code_from_transition(
+            status,
+            error_message,
+            std::slice::from_ref(&event),
+        );
+        let updated = {
+            let mut slots = self.execution_slots.write().await;
+            let mut runs = self.runs.write().await;
+            if let Some(error) =
+                in_memory_session_execution_slot_drift(&slots, &runs, user_id, session_id)
+            {
+                return Err(error);
+            }
+            let slot_key = (user_id.to_string(), session_id.to_string());
+            if slots
+                .get(&slot_key)
+                .is_some_and(|owner| owner.as_str() != run_id)
+            {
+                return Ok(GuardedRunStatusTransition::SessionBlocked);
+            }
+            if let Some(run) = runs.get_mut(run_id) {
+                if run.user_id != user_id
+                    || run.session_id != session_id
+                    || !expected_statuses.contains(&run.status.as_str())
+                {
+                    None
+                } else {
+                    apply_in_memory_status_transition(
+                        &mut slots,
+                        run,
+                        status,
+                        waiting_for,
+                        error_message,
+                        terminal_error_code.as_deref(),
+                    )?;
+                    run.events.push(event);
+                    run.last_event_idx = run.events.len() as i64 - 1;
+                    Some(run.clone())
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(run) = updated {
+            self.sync_projection(&run, Some(latest_event_type), None)
+                .await;
+            Ok(GuardedRunStatusTransition::Updated)
+        } else {
+            Ok(GuardedRunStatusTransition::StatusConflict)
         }
     }
 
@@ -1558,24 +1791,24 @@ impl RunStateStore for InMemoryRunStateStore {
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
         let updated = {
+            let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
                 if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
                     None
                 } else {
-                    run.status = status.to_string();
-                    run.waiting_for = waiting_for.map(ToString::to_string);
-                    if let Some(msg) = error_message {
-                        run.error_message = Some(msg.to_string());
-                    }
-                    if let Some(code) = terminal_error_code.as_ref() {
-                        run.error_code = Some(code.clone());
-                    }
+                    apply_in_memory_status_transition(
+                        &mut slots,
+                        run,
+                        status,
+                        waiting_for,
+                        error_message,
+                        terminal_error_code.as_deref(),
+                    )?;
                     if !events.is_empty() {
                         run.events.extend(events.iter().cloned());
                         run.last_event_idx = run.events.len() as i64 - 1;
                     }
-                    run.updated_at = chrono::Utc::now().to_rfc3339();
                     Some(run.clone())
                 }
             } else {
@@ -1956,16 +2189,19 @@ pub struct DatabaseRunStateStore {
     pool: SharedPool,
     owner_pod_id: String,
     lease_ttl: Duration,
+    session_execution_slot_stale_after: Duration,
 }
 
 impl DatabaseRunStateStore {
     pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(45);
+    pub const DEFAULT_SESSION_EXECUTION_SLOT_STALE_AFTER: Duration = Duration::from_secs(120);
 
     pub fn new(pool: SharedPool) -> Self {
         Self {
             pool,
             owner_pod_id: default_owner_pod_id(),
             lease_ttl: Self::DEFAULT_LEASE_TTL,
+            session_execution_slot_stale_after: Self::DEFAULT_SESSION_EXECUTION_SLOT_STALE_AFTER,
         }
     }
 
@@ -1979,6 +2215,11 @@ impl DatabaseRunStateStore {
         self
     }
 
+    pub fn with_session_execution_slot_stale_after(mut self, stale_after: Duration) -> Self {
+        self.session_execution_slot_stale_after = stale_after;
+        self
+    }
+
     pub fn owner_pod_id(&self) -> &str {
         &self.owner_pod_id
     }
@@ -1988,6 +2229,201 @@ impl DatabaseRunStateStore {
             + chrono::Duration::from_std(self.lease_ttl)
                 .unwrap_or_else(|_| chrono::Duration::seconds(45));
         lease_expires_at.naive_utc()
+    }
+
+    async fn acquire_session_execution_slot_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<bool> {
+        let insert = sqlx::query(
+            "INSERT IGNORE INTO agent_session_execution_slots
+             (user_id, session_id, run_id, acquired_at, updated_at)
+             VALUES (?, ?, ?, NOW(6), NOW(6))",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|source| db_error("acquire_session_execution_slot", session_id, source))?;
+        if insert.rows_affected() > 0 {
+            return Ok(true);
+        }
+
+        let slot = sqlx::query(
+            "SELECT run_id, updated_at FROM agent_session_execution_slots
+             WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("load_session_execution_slot", session_id, source))?
+        .map(|row| {
+            Ok::<_, sqlx::Error>((
+                row.try_get::<String, _>("run_id")?,
+                row.try_get::<chrono::NaiveDateTime, _>("updated_at")?,
+            ))
+        })
+        .transpose()
+        .map_err(|source| db_error("decode_session_execution_slot", session_id, source))?;
+
+        let Some((owner, slot_updated_at)) = slot else {
+            let retry = sqlx::query(
+                "INSERT IGNORE INTO agent_session_execution_slots
+                 (user_id, session_id, run_id, acquired_at, updated_at)
+                 VALUES (?, ?, ?, NOW(6), NOW(6))",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .bind(run_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| {
+                db_error(
+                    "retry_acquire_missing_session_execution_slot",
+                    session_id,
+                    source,
+                )
+            })?;
+            return Ok(retry.rows_affected() > 0);
+        };
+
+        if owner != run_id {
+            let slot_age = chrono::Utc::now()
+                .naive_utc()
+                .signed_duration_since(slot_updated_at)
+                .to_std()
+                .unwrap_or_default();
+            let slot_is_stale = slot_age >= self.session_execution_slot_stale_after;
+            {
+                let owner_state = sqlx::query(
+                    "SELECT status, waiting_for, owner_lease_expires_at FROM agent_runs
+                     WHERE user_id = ? AND run_id = ?",
+                )
+                .bind(user_id)
+                .bind(&owner)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|source| {
+                    db_error("load_session_execution_slot_owner", session_id, source)
+                })?;
+                let owner_reclaimable = owner_state
+                    .as_ref()
+                    .map(|row| {
+                        let status = row.try_get::<String, _>("status")?;
+                        let waiting_for = row.try_get::<Option<String>, _>("waiting_for")?;
+                        let owner_lease_expires_at = row
+                            .try_get::<Option<chrono::NaiveDateTime>, _>(
+                                "owner_lease_expires_at",
+                            )?;
+                        let owner_lease_expired = owner_lease_expires_at
+                            .is_some_and(|expires_at| expires_at < chrono::Utc::now().naive_utc());
+                        Ok::<_, sqlx::Error>(session_execution_slot_owner_reclaimable(
+                            &status,
+                            waiting_for.as_deref(),
+                            owner_lease_expired,
+                            slot_is_stale,
+                        ))
+                    })
+                    .transpose()
+                    .map_err(|source| {
+                        db_error("decode_session_execution_slot_owner", session_id, source)
+                    })?
+                    .unwrap_or(true);
+                if owner_reclaimable {
+                    sqlx::query(
+                        "DELETE FROM agent_session_execution_slots
+                         WHERE user_id = ? AND session_id = ? AND run_id = ?",
+                    )
+                    .bind(user_id)
+                    .bind(session_id)
+                    .bind(&owner)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|source| {
+                        db_error("cleanup_stale_session_execution_slot", session_id, source)
+                    })?;
+                    let retry = sqlx::query(
+                        "INSERT IGNORE INTO agent_session_execution_slots
+                         (user_id, session_id, run_id, acquired_at, updated_at)
+                         VALUES (?, ?, ?, NOW(6), NOW(6))",
+                    )
+                    .bind(user_id)
+                    .bind(session_id)
+                    .bind(run_id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|source| {
+                        db_error("retry_acquire_session_execution_slot", session_id, source)
+                    })?;
+                    if retry.rows_affected() > 0 {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "UPDATE agent_session_execution_slots
+             SET updated_at = NOW(6)
+             WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|source| db_error("refresh_session_execution_slot", session_id, source))?;
+        Ok(true)
+    }
+
+    async fn release_session_execution_slot_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<()> {
+        sqlx::query(
+            "DELETE FROM agent_session_execution_slots
+             WHERE user_id = ? AND session_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|source| db_error("release_session_execution_slot", session_id, source))?;
+        Ok(())
+    }
+
+    async fn sync_session_execution_slot_after_status_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        run: &DurableRunRecord,
+        status: &str,
+        waiting_for: Option<&str>,
+    ) -> DbStoreResult<bool> {
+        if !run_record_owns_session_execution_slot(run) {
+            return Ok(true);
+        }
+        if durable_run_status_blocks_session(status, waiting_for) {
+            debug_assert!(
+                durable_run_status_kind(status) != DurableRunStatusKind::Paused
+                    || waiting_for.is_some(),
+                "paused without waiting_for must release the session execution slot"
+            );
+            self.acquire_session_execution_slot_tx(tx, &run.user_id, &run.session_id, &run.run_id)
+                .await
+        } else {
+            Self::release_session_execution_slot_tx(tx, &run.user_id, &run.session_id, &run.run_id)
+                .await?;
+            Ok(true)
+        }
     }
 
     async fn load_tool_preview_contracts(
@@ -2833,8 +3269,28 @@ impl RunStateStore for DatabaseRunStateStore {
             record.last_event_idx = -1;
         }
 
-        let insert_result = if run_requires_session_exclusive_start(&record) {
-            sqlx::query(
+        let insert_result = if run_requires_session_exclusive_start(&record)
+            && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref())
+        {
+            let mut tx = self.pool.get().begin().await.map_err(|source| {
+                db_error("insert_run_begin", &record.run_id, source).to_string()
+            })?;
+            if !self
+                .acquire_session_execution_slot_tx(
+                    &mut tx,
+                    &record.user_id,
+                    &record.session_id,
+                    &record.run_id,
+                )
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                tx.rollback().await.map_err(|source| {
+                    db_error("insert_run_rollback_slot_blocked", &record.run_id, source).to_string()
+                })?;
+                return Err("session already has an active run".to_string());
+            }
+            let result = sqlx::query(
                 "INSERT INTO agent_runs
                  (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
                   delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
@@ -2844,16 +3300,7 @@ impl RunStateStore for DatabaseRunStateStore {
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
                   selected_model_json, selected_model_name, selected_model_gateway,
                   capability_server_refs_json, runtime_profile, created_at, updated_at)
-                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6)
-                 FROM DUAL
-                 WHERE NOT EXISTS (
-                     SELECT 1
-                     FROM agent_runs
-                     WHERE user_id = ?
-                       AND session_id = ?
-                       AND (status IN ('running', 'waiting') OR (status = 'paused' AND waiting_for IS NOT NULL))
-                     LIMIT 1
-                 )",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             )
             .bind(&record.run_id)
             .bind(&record.user_id)
@@ -2888,11 +3335,13 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(&record.selected_model_gateway)
             .bind(&record.capability_server_refs_json)
             .bind(&record.runtime_profile)
-            .bind(&record.user_id)
-            .bind(&record.session_id)
-            .execute(self.pool.get())
+            .execute(&mut *tx)
             .await
-            .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?
+            .map_err(|source| db_error("insert_run", &record.run_id, source).to_string())?;
+            tx.commit().await.map_err(|source| {
+                db_error("insert_run_commit", &record.run_id, source).to_string()
+            })?;
+            result
         } else {
             sqlx::query(
                 "INSERT INTO agent_runs
@@ -3004,7 +3453,18 @@ impl RunStateStore for DatabaseRunStateStore {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
+        let Some(run) = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
         let terminal_error_code = terminal_error_code_from_message(status, error_message);
+        let mut tx =
+            self.pool.get().begin().await.map_err(|source| {
+                db_error("update_run_status_begin", run_id, source).to_string()
+            })?;
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
         query.push_bind(status);
         query.push(", waiting_for = ");
@@ -3023,9 +3483,28 @@ impl RunStateStore for DatabaseRunStateStore {
         query.push_bind(run_id);
         let result = query
             .build()
-            .execute(self.pool.get())
+            .execute(&mut *tx)
             .await
             .map_err(|source| db_error("update_run_status", run_id, source).to_string())?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await.map_err(|source| {
+                db_error("update_run_status_rollback_conflict", run_id, source).to_string()
+            })?;
+            return Ok(false);
+        }
+        if !self
+            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error("update_run_status_rollback_slot_blocked", run_id, source).to_string()
+            })?;
+            return Ok(false);
+        }
+        tx.commit()
+            .await
+            .map_err(|source| db_error("update_run_status_commit", run_id, source).to_string())?;
         if result.rows_affected() > 0
             && let Err(error) = self
                 .sync_projection_for_user(user_id, run_id, None, None)
@@ -3038,7 +3517,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 "run status committed but display projection refresh failed"
             );
         }
-        Ok(result.rows_affected() > 0)
+        Ok(true)
     }
 
     async fn update_run_status_if_current(
@@ -3053,6 +3532,16 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
+        let Some(run) = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let mut tx = self.pool.get().begin().await.map_err(|source| {
+            db_error("update_run_status_if_current_begin", run_id, source).to_string()
+        })?;
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
         query.push_bind(status);
         query.push(", waiting_for = ");
@@ -3076,13 +3565,38 @@ impl RunStateStore for DatabaseRunStateStore {
             separated.push_bind(*expected);
         }
         separated.push_unseparated(")");
-        let result = query
-            .build()
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error("update_run_status_if_current", run_id, source).to_string()
+        let result = query.build().execute(&mut *tx).await.map_err(|source| {
+            db_error("update_run_status_if_current", run_id, source).to_string()
+        })?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "update_run_status_if_current_rollback_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
             })?;
+            return Ok(false);
+        }
+        if !self
+            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "update_run_status_if_current_rollback_slot_blocked",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(false);
+        }
+        tx.commit().await.map_err(|source| {
+            db_error("update_run_status_if_current_commit", run_id, source).to_string()
+        })?;
         if result.rows_affected() > 0
             && let Err(error) = self
                 .sync_projection_for_user(user_id, run_id, None, None)
@@ -3095,7 +3609,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 "run status CAS committed but display projection refresh failed"
             );
         }
-        Ok(result.rows_affected() > 0)
+        Ok(true)
     }
 
     async fn update_run_status_with_event_if_current(
@@ -3111,6 +3625,13 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
+        let Some(run) = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
         let terminal_error_code = terminal_error_code_from_transition(
             status,
             error_message,
@@ -3234,6 +3755,21 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         }
+        if !self
+            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_event_rollback_slot_blocked",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(false);
+        }
 
         let insert_result = sqlx::query(
             "INSERT INTO agent_run_events
@@ -3288,6 +3824,227 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(true)
     }
 
+    async fn update_run_status_with_event_if_current_unless_session_blocked(
+        &self,
+        request: GuardedRunStatusTransitionRequest<'_>,
+    ) -> Result<GuardedRunStatusTransition, String> {
+        let GuardedRunStatusTransitionRequest {
+            user_id,
+            run_id,
+            session_id,
+            expected_statuses,
+            status,
+            waiting_for,
+            error_message,
+            event,
+        } = request;
+        if expected_statuses.is_empty() {
+            return Ok(GuardedRunStatusTransition::StatusConflict);
+        }
+        let terminal_error_code = terminal_error_code_from_transition(
+            status,
+            error_message,
+            std::slice::from_ref(&event),
+        );
+
+        let mut tx = self.pool.get().begin().await.map_err(|source| {
+            db_error(
+                "guarded_transition_run_status_with_event_begin",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+
+        let load_sql =
+            format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ?");
+        let Some(row) = sqlx::query(&load_sql)
+            .bind(user_id)
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|source| {
+                db_error(
+                    "guarded_transition_run_status_with_event_load_run",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?
+        else {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "guarded_transition_run_status_with_event_rollback_missing",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(GuardedRunStatusTransition::StatusConflict);
+        };
+
+        let run = run_record_from_row(row).map_err(|error| error.to_string())?;
+        if run.session_id != session_id {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "guarded_transition_run_status_with_event_rollback_session_mismatch",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(GuardedRunStatusTransition::StatusConflict);
+        }
+        let last_event_idx = run.last_event_idx;
+        let event_idx = last_event_idx + 1;
+
+        let event_row = match build_run_event_insert_row(
+            user_id,
+            run_id,
+            session_id,
+            run.agent_id.as_deref(),
+            event_idx,
+            &self.owner_pod_id,
+            &event,
+        ) {
+            Ok(row) => row,
+            Err(error) => {
+                tx.rollback().await.map_err(|source| {
+                    db_error(
+                        "guarded_transition_run_status_with_event_rollback_prepare_event",
+                        run_id,
+                        source,
+                    )
+                    .to_string()
+                })?;
+                return Err(error.to_string());
+            }
+        };
+
+        let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
+        update.push_bind(status);
+        update.push(", waiting_for = ");
+        update.push_bind(waiting_for);
+        if let Some(error_message) = error_message {
+            update.push(", error_message = ");
+            update.push_bind(error_message);
+        }
+        if let Some(error_code) = terminal_error_code.as_deref() {
+            update.push(", error_code = ");
+            update.push_bind(error_code);
+        }
+        update.push(", last_event_idx = ");
+        update.push_bind(event_idx);
+        update.push(", updated_at = NOW(6) WHERE user_id = ");
+        update.push_bind(user_id);
+        update.push(" AND run_id = ");
+        update.push_bind(run_id);
+        update.push(" AND session_id = ");
+        update.push_bind(session_id);
+        update.push(" AND last_event_idx = ");
+        update.push_bind(last_event_idx);
+        update.push(" AND status IN (");
+        {
+            let mut separated = update.separated(", ");
+            for expected in expected_statuses {
+                separated.push_bind(*expected);
+            }
+            separated.push_unseparated(")");
+        }
+
+        let update_result = update.build().execute(&mut *tx).await.map_err(|source| {
+            db_error(
+                "guarded_transition_run_status_with_event_update",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+        if update_result.rows_affected() == 0 {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "guarded_transition_run_status_with_event_rollback_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(GuardedRunStatusTransition::StatusConflict);
+        }
+        if !self
+            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "guarded_transition_run_status_with_event_rollback_slot_blocked",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(GuardedRunStatusTransition::SessionBlocked);
+        }
+
+        let insert_result = sqlx::query(
+            "INSERT INTO agent_run_events
+             (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
+              idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(&event_row.id)
+        .bind(&event_row.run_id)
+        .bind(event_row.event_idx)
+        .bind(&event_row.user_id)
+        .bind(&event_row.session_id)
+        .bind(&event_row.event_type)
+        .bind(&event_row.event_id)
+        .bind(&event_row.agent_id)
+        .bind(&event_row.idempotency_key)
+        .bind(&event_row.event_hash)
+        .bind(&event_row.producer_pod_id)
+        .bind(&event_row.payload_json)
+        .execute(&mut *tx)
+        .await;
+        if let Err(source) = insert_result {
+            let rollback_error = tx.rollback().await.err();
+            let mut detail = db_error(
+                "guarded_transition_run_status_with_event_insert_event",
+                run_id,
+                source,
+            )
+            .to_string();
+            if let Some(rollback_error) = rollback_error {
+                detail.push_str(&format!(
+                    "; rollback after insert failure also failed: {rollback_error}"
+                ));
+            }
+            return Err(detail);
+        }
+
+        tx.commit().await.map_err(|source| {
+            db_error(
+                "guarded_transition_run_status_with_event_commit",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+
+        self.patch_or_repair_run_projection_status_for_user(
+            user_id,
+            run_id,
+            status,
+            waiting_for,
+            error_message,
+            event_row.event_idx,
+            Some(&event_row.event_type),
+        )
+        .await;
+        Ok(GuardedRunStatusTransition::Updated)
+    }
+
     async fn update_run_status_with_events_if_current(
         &self,
         user_id: &str,
@@ -3301,6 +4058,13 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
+        let Some(run) = self
+            .load_run_metadata_for_user(user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
 
@@ -3417,6 +4181,21 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error(
                     "transition_run_status_with_events_rollback_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(false);
+        }
+        if !self
+            .sync_session_execution_slot_after_status_tx(&mut tx, &run, status, waiting_for)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_events_rollback_slot_blocked",
                     run_id,
                     source,
                 )
@@ -5480,6 +6259,42 @@ mod tests {
         ));
         assert!(!durable_run_status_blocks_session(STATUS_PAUSED, None));
         assert!(!durable_run_status_blocks_session(STATUS_COMPLETED, None));
+        assert!(session_execution_slot_owner_reclaimable(
+            STATUS_COMPLETED,
+            None,
+            false,
+            false
+        ));
+        assert!(session_execution_slot_owner_reclaimable(
+            STATUS_PAUSED,
+            None,
+            false,
+            false
+        ));
+        assert!(!session_execution_slot_owner_reclaimable(
+            STATUS_RUNNING,
+            None,
+            false,
+            true
+        ));
+        assert!(!session_execution_slot_owner_reclaimable(
+            STATUS_RUNNING,
+            None,
+            true,
+            false
+        ));
+        assert!(session_execution_slot_owner_reclaimable(
+            STATUS_RUNNING,
+            None,
+            true,
+            true
+        ));
+        assert!(!session_execution_slot_owner_reclaimable(
+            STATUS_PAUSED,
+            Some("user_resume"),
+            true,
+            true
+        ));
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_WAITING),
             SubRunState::Paused
@@ -6112,6 +6927,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guarded_resume_uses_session_execution_slot_not_predicate_scan() {
+        let source = include_str!("runs.rs");
+        let database_impl = source
+            .split("impl RunStateStore for DatabaseRunStateStore")
+            .nth(1)
+            .expect("database RunStateStore impl");
+        let body = database_impl
+            .split("async fn update_run_status_with_event_if_current_unless_session_blocked")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn update_run_status_with_events_if_current")
+                    .next()
+            })
+            .expect("guarded transition body");
+
+        assert!(
+            body.contains("sync_session_execution_slot_after_status_tx"),
+            "guarded resume must acquire the durable session execution slot"
+        );
+        assert!(
+            !body.contains("NOT EXISTS") && !body.contains("blocking_runs"),
+            "guarded resume must not use an agent_runs predicate scan; it is write-skew-prone"
+        );
+        let storage_source = include_str!("storage.rs");
+        assert!(
+            storage_source.contains("CREATE TABLE IF NOT EXISTS agent_session_execution_slots")
+                && storage_source.contains("PRIMARY KEY (user_id, session_id)"),
+            "schema must expose session execution as a unique durable resource"
+        );
+        assert!(
+            source.contains("cleanup_stale_session_execution_slot")
+                && source.contains("retry_acquire_session_execution_slot"),
+            "slot acquisition must clean stale non-blocking owners before retrying"
+        );
+    }
+
     #[tokio::test]
     async fn in_memory_store_allows_new_root_run_when_existing_run_is_paused_without_waiting() {
         let store = InMemoryRunStateStore::new();
@@ -6143,6 +6995,244 @@ mod tests {
             .await
             .expect_err("approval-waiting paused run must still block the session");
         assert_eq!(error, "session already has an active run");
+    }
+
+    #[tokio::test]
+    async fn in_memory_session_execution_slot_releases_on_nonblocking_status() {
+        let store = InMemoryRunStateStore::new();
+
+        store
+            .insert_run(durable_run_record("slot-owner"))
+            .await
+            .unwrap();
+        let blocked = store
+            .insert_run(durable_run_record("blocked-while-running"))
+            .await
+            .expect_err("running root run must own the session slot");
+        assert_eq!(blocked, "session already has an active run");
+
+        assert!(
+            store
+                .update_run_status_if_current(
+                    "u1",
+                    "slot-owner",
+                    &[STATUS_RUNNING],
+                    STATUS_PAUSED,
+                    None,
+                    None
+                )
+                .await
+                .unwrap()
+        );
+        store
+            .insert_run(durable_run_record("fresh-after-paused-none"))
+            .await
+            .expect("paused without waiting_for must release the session slot");
+
+        assert!(
+            store
+                .update_run_status_if_current(
+                    "u1",
+                    "fresh-after-paused-none",
+                    &[STATUS_RUNNING],
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+        store
+            .insert_run(durable_run_record("fresh-after-terminal"))
+            .await
+            .expect("terminal root run must release the session slot");
+    }
+
+    #[tokio::test]
+    async fn guarded_status_transition_excludes_current_paused_run_from_session_blocker() {
+        let store = InMemoryRunStateStore::new();
+
+        let mut paused = durable_run_record("paused-self");
+        paused.status = STATUS_PAUSED.into();
+        paused.waiting_for = Some("user_resume".into());
+        store.insert_run(paused).await.unwrap();
+
+        let outcome = store
+            .update_run_status_with_event_if_current_unless_session_blocked(
+                GuardedRunStatusTransitionRequest {
+                    user_id: "u1",
+                    run_id: "paused-self",
+                    session_id: "s1",
+                    expected_statuses: &[STATUS_PAUSED],
+                    status: STATUS_RUNNING,
+                    waiting_for: None,
+                    error_message: None,
+                    event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GuardedRunStatusTransition::Updated);
+        let run = store.load_run("u1", "paused-self").await.unwrap().unwrap();
+        assert_eq!(run.status, STATUS_RUNNING);
+        assert_eq!(run.events.last().unwrap()["event_type"], "run_resumed");
+    }
+
+    #[tokio::test]
+    async fn guarded_status_transition_rejects_other_durable_session_blocker() {
+        let store = InMemoryRunStateStore::new();
+
+        let mut paused = durable_run_record("paused-target");
+        paused.status = STATUS_PAUSED.into();
+        paused.waiting_for = None;
+        store.insert_run(paused).await.unwrap();
+
+        store
+            .insert_run(durable_run_record("blocking-root"))
+            .await
+            .unwrap();
+
+        let outcome = store
+            .update_run_status_with_event_if_current_unless_session_blocked(
+                GuardedRunStatusTransitionRequest {
+                    user_id: "u1",
+                    run_id: "paused-target",
+                    session_id: "s1",
+                    expected_statuses: &[STATUS_PAUSED],
+                    status: STATUS_RUNNING,
+                    waiting_for: None,
+                    error_message: None,
+                    event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GuardedRunStatusTransition::SessionBlocked);
+        let target = store
+            .load_run("u1", "paused-target")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.status, STATUS_PAUSED);
+        assert!(
+            target
+                .events
+                .iter()
+                .all(|event| event["event_type"] != "run_resumed")
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_status_transition_status_mismatch_does_not_acquire_slot_or_event() {
+        let store = InMemoryRunStateStore::new();
+
+        let mut paused = durable_run_record("paused-mismatch");
+        paused.status = STATUS_PAUSED.into();
+        paused.waiting_for = None;
+        store.insert_run(paused).await.unwrap();
+
+        let outcome = store
+            .update_run_status_with_event_if_current_unless_session_blocked(
+                GuardedRunStatusTransitionRequest {
+                    user_id: "u1",
+                    run_id: "paused-mismatch",
+                    session_id: "s1",
+                    expected_statuses: &[STATUS_RUNNING],
+                    status: STATUS_RUNNING,
+                    waiting_for: None,
+                    error_message: None,
+                    event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GuardedRunStatusTransition::StatusConflict);
+        let run = store
+            .load_run("u1", "paused-mismatch")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_PAUSED);
+        assert!(
+            run.events
+                .iter()
+                .all(|event| event["event_type"] != "run_resumed")
+        );
+        store
+            .insert_run(durable_run_record("fresh-after-cas-miss"))
+            .await
+            .expect("CAS miss must not acquire the session slot");
+    }
+
+    #[tokio::test]
+    async fn concurrent_guarded_resume_allows_only_one_root_run_per_session() {
+        let store = std::sync::Arc::new(InMemoryRunStateStore::new());
+        for run_id in ["paused-a", "paused-b"] {
+            let mut run = durable_run_record(run_id);
+            run.status = STATUS_PAUSED.into();
+            run.waiting_for = None;
+            store.insert_run(run).await.unwrap();
+        }
+
+        let resume_a = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .update_run_status_with_event_if_current_unless_session_blocked(
+                        GuardedRunStatusTransitionRequest {
+                            user_id: "u1",
+                            run_id: "paused-a",
+                            session_id: "s1",
+                            expected_statuses: &[STATUS_PAUSED],
+                            status: STATUS_RUNNING,
+                            waiting_for: None,
+                            error_message: None,
+                            event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
+                        },
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        let resume_b = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .update_run_status_with_event_if_current_unless_session_blocked(
+                        GuardedRunStatusTransitionRequest {
+                            user_id: "u1",
+                            run_id: "paused-b",
+                            session_id: "s1",
+                            expected_statuses: &[STATUS_PAUSED],
+                            status: STATUS_RUNNING,
+                            waiting_for: None,
+                            error_message: None,
+                            event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
+                        },
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+
+        let outcomes = [resume_a.await.unwrap(), resume_b.await.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == GuardedRunStatusTransition::Updated)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == GuardedRunStatusTransition::SessionBlocked)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -6320,463 +7410,459 @@ mod tests {
         assert_eq!(version, "phase_checkpoint_v1");
     }
 
+    /// Covers all event types that reach the client via transform_run_event_for_client:
+    /// type mapping, field preservation, pass-through, drop, and error-surface semantics.
     #[test]
-    fn sse_text_events() {
-        // text_delta
-        let out = transform_run_event_for_client(make_event("text_delta", json!({"chunk": "hi"})));
-        assert_eq!(out["type"], "text_delta");
-        assert_eq!(out["content"], "hi");
-        // text_delta missing chunk
-        let out = transform_run_event_for_client(make_event("text_delta", json!({})));
-        assert_eq!(out["content"], "");
-        // assistant_delta maps to text_delta
-        let out =
-            transform_run_event_for_client(make_event("assistant_delta", json!({"text": "hi"})));
-        assert_eq!(out["type"], "text_delta");
-        assert_eq!(out["content"], "hi");
-        // text_done
-        let out =
-            transform_run_event_for_client(make_event("text_done", json!({"full_text": "all"})));
-        assert_eq!(out["type"], "text_done");
-        assert_eq!(out["full_text"], "all");
-    }
-
-    #[test]
-    fn sse_thinking_events() {
-        // reasoning_message_content
-        let out = transform_run_event_for_client(make_event(
-            "reasoning_message_content",
-            json!({"content": "think"}),
-        ));
-        assert_eq!(out["type"], "reasoning_message_content");
-        assert_eq!(out["content"], "think");
-        // thinking_delta
-        let out =
-            transform_run_event_for_client(make_event("thinking_delta", json!({"chunk": "t"})));
-        assert_eq!(out["type"], "thinking_delta");
-        assert_eq!(out["content"], "t");
-        // thinking_done
-        let out = transform_run_event_for_client(make_event(
-            "thinking_done",
-            json!({"full_text": "all think"}),
-        ));
-        assert_eq!(out["type"], "thinking_done");
-        // reasoning_done
-        let out = transform_run_event_for_client(make_event(
-            "reasoning_done",
-            json!({"full_text": "reason"}),
-        ));
-        assert_eq!(out["type"], "reasoning_done");
-    }
-
-    #[test]
-    fn tool_call_start() {
-        let out = transform_run_event_for_client(make_event(
-            "tool_call_start",
-            json!({
-                "name": "bash",
-                "tool_call_id": "c1",
-                "args": {"command": "ls"},
-                "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
-                "executor": {"kind": "server_local", "transport": "server_local"},
-                "transport": "server_local"
+    fn event_transform_to_client_surface_covers_all_event_types() {
+        type EventTransformCase<'a> = (&'a str, serde_json::Value, &'a dyn Fn(&serde_json::Value));
+        let cases: Vec<EventTransformCase<'_>> = vec![
+            // ── text / thinking: durable journal → client SSE shape ──
+            (
+                "text_delta",
+                make_event("text_delta", json!({"chunk": "hi"})),
+                &|o| {
+                    assert_eq!(o["type"], "text_delta");
+                    assert_eq!(o["content"], "hi");
+                },
+            ),
+            (
+                "text_delta (no chunk)",
+                make_event("text_delta", json!({})),
+                &|o| {
+                    assert_eq!(o["content"], "");
+                },
+            ),
+            (
+                "assistant_delta→text_delta",
+                make_event("assistant_delta", json!({"text": "hi"})),
+                &|o| {
+                    assert_eq!(o["type"], "text_delta");
+                    assert_eq!(o["content"], "hi");
+                },
+            ),
+            (
+                "text_done",
+                make_event("text_done", json!({"full_text": "all"})),
+                &|o| {
+                    assert_eq!(o["type"], "text_done");
+                    assert_eq!(o["full_text"], "all");
+                },
+            ),
+            (
+                "reasoning_message_content",
+                make_event("reasoning_message_content", json!({"content": "think"})),
+                &|o| {
+                    assert_eq!(o["type"], "reasoning_message_content");
+                    assert_eq!(o["content"], "think");
+                },
+            ),
+            (
+                "thinking_delta",
+                make_event("thinking_delta", json!({"chunk": "t"})),
+                &|o| {
+                    assert_eq!(o["type"], "thinking_delta");
+                    assert_eq!(o["content"], "t");
+                },
+            ),
+            (
+                "thinking_done",
+                make_event("thinking_done", json!({"full_text": "all think"})),
+                &|o| {
+                    assert_eq!(o["type"], "thinking_done");
+                },
+            ),
+            (
+                "reasoning_done",
+                make_event("reasoning_done", json!({"full_text": "reason"})),
+                &|o| {
+                    assert_eq!(o["type"], "reasoning_done");
+                },
+            ),
+            // ── tool events ──
+            (
+                "tool_call_start",
+                make_event(
+                    "tool_call_start",
+                    json!({
+                        "name": "bash", "tool_call_id": "c1", "args": {"command": "ls"},
+                        "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
+                        "executor": {"kind": "server_local", "transport": "server_local"},
+                        "transport": "server_local"
+                    }),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "tool_call_start");
+                    assert_eq!(o["tool"], "bash");
+                    assert_eq!(o["call_id"], "c1");
+                    assert_eq!(o["arguments"]["command"], "ls");
+                    assert_eq!(o["workspace"]["kind"], "server_sandbox");
+                },
+            ),
+            (
+                "tool_result→tool_call_end",
+                make_event(
+                    "tool_result",
+                    json!({
+                        "tool_call_id": "c1", "name": "bash", "output": "ok", "success": true,
+                        "duration_ms": 42,
+                        "workspace": {"kind": "edge_workspace", "cwd": "/Users/xupeng/github/astra"},
+                        "executor": {"kind": "edge_agent", "executor_id": "edge-1", "transport": "edge_ws"},
+                        "transport": "edge_ws"
+                    }),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "tool_call_end");
+                    assert_eq!(o["call_id"], "c1");
+                    assert_eq!(o["result"], "ok");
+                    assert_eq!(o["success"], true);
+                    assert_eq!(o["duration_ms"], 42);
+                },
+            ),
+            // ── run lifecycle ──
+            (
+                "run_started",
+                make_event(
+                    "run_started",
+                    json!({
+                        "run_id": "run-1", "session_id": "sess-1", "interaction_mode": "auto",
+                        "suppressed_loop_nudges": true, "interactive_client": true,
+                        "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
+                        "executor": {"kind": "server_local", "status": "online"},
+                        "transport": "server_local"
+                    }),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "run_started");
+                    assert_eq!(o["run_id"], "run-1");
+                    assert_eq!(o["interaction_mode"], "auto");
+                },
+            ),
+            (
+                "run_finished",
+                make_event(
+                    "run_finished",
+                    json!({
+                        "run_id": "run-1", "status": "paused", "error": "boom",
+                        "error_code": "network", "waiting_for": "task_board_intervention"
+                    }),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "run_finished");
+                    assert_eq!(o["status"], "paused");
+                    assert_eq!(o["error_code"], "network");
+                },
+            ),
+            (
+                "run_waiting",
+                make_event(
+                    "run_waiting",
+                    json!({"reason": "waiting: executor_offline"}),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "run_waiting");
+                },
+            ),
+            (
+                "run_interrupted",
+                make_event(
+                    "run_interrupted",
+                    json!({
+                        "kind": "budget_exhausted", "resumable": true,
+                        "user_message": "You can continue in the next message."
+                    }),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "run_interrupted");
+                    assert_eq!(o["resumable"], true);
+                },
+            ),
+            // ── run_error surface ──
+            (
+                "run_error basic",
+                make_event("run_error", json!({"error": "boom"})),
+                &|o| {
+                    assert_eq!(o["type"], "run_error");
+                    assert_eq!(o["code"], "RUN_ERROR");
+                },
+            ),
+            (
+                "run_error rate_limit",
+                make_event(
+                    "run_error",
+                    json!({"error": "slow down", "error_kind": "rate_limit"}),
+                ),
+                &|o| {
+                    assert_eq!(o["code"], "LLM_RATE_LIMIT");
+                    assert_eq!(o["retryable"], true);
+                    assert_eq!(o["retry_after_ms"], 5_000);
+                },
+            ),
+            (
+                "run_error server_error",
+                make_event(
+                    "run_error",
+                    json!({"error": "provider 500", "error_kind": "server_error"}),
+                ),
+                &|o| {
+                    assert_eq!(o["code"], "SERVER_ERROR");
+                    assert_eq!(o["retryable"], true);
+                    assert_eq!(o["retry_after_ms"], 2_000);
+                },
+            ),
+            (
+                "run_error empty→default msg",
+                make_event("run_error", json!({})),
+                &|o| {
+                    assert_eq!(o["message"], "Unknown error");
+                },
+            ),
+            // ── approval / user_input ──
+            (
+                "approval_request→approval_required",
+                make_event("approval_request", json!({"approval_id": "a-1"})),
+                &|o| {
+                    assert_eq!(o["type"], "approval_required");
+                    assert_eq!(o["approval_id"], "a-1");
+                },
+            ),
+            (
+                "approval_required canonical",
+                make_event("approval_required", json!({"approval_id": "a-2"})),
+                &|o| {
+                    assert_eq!(o["type"], "approval_required");
+                    assert_eq!(o["approval_id"], "a-2");
+                },
+            ),
+            (
+                "user_input",
+                make_event("user_input", json!({"text": "approved"})),
+                &|o| {
+                    assert_eq!(o["type"], "user_input");
+                    assert_eq!(o["text"], "approved");
+                },
+            ),
+            // ── plan events ──
+            (
+                "plan_created",
+                make_event("plan_created", json!({"plan": {"steps": []}})),
+                &|o| {
+                    assert_eq!(o["type"], "plan_created");
+                },
+            ),
+            (
+                "plan_step_start",
+                make_event("plan_step_start", json!({"step": "s1"})),
+                &|o| {
+                    assert_eq!(o["type"], "plan_step_start");
+                },
+            ),
+            (
+                "plan_step_done",
+                make_event("plan_step_done", json!({"step": "s1", "result": "ok"})),
+                &|o| {
+                    assert_eq!(o["type"], "plan_step_done");
+                },
+            ),
+            (
+                "plan_revised",
+                make_event("plan_revised", json!({"plan": {}})),
+                &|o| {
+                    assert_eq!(o["type"], "plan_revised");
+                },
+            ),
+            // ── agent subrun events ──
+            (
+                "agent_delegated",
+                make_event("agent_delegated", json!({"agent_id": "a1", "task": "t"})),
+                &|o| {
+                    assert_eq!(o["type"], "agent_delegated");
+                },
+            ),
+            (
+                "agent_progress",
+                make_event(
+                    "agent_progress",
+                    json!({"agent_id": "a1", "progress": "50%"}),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "agent_progress");
+                },
+            ),
+            (
+                "agent_completed",
+                make_event(
+                    "agent_completed",
+                    json!({"agent_id": "a1", "result": "done"}),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "agent_completed");
+                },
+            ),
+            (
+                "agent_failed",
+                make_event("agent_failed", json!({"agent_id": "a1", "error": "boom"})),
+                &|o| {
+                    assert_eq!(o["type"], "agent_failed");
+                },
+            ),
+            (
+                "agent_waiting",
+                make_event(
+                    "agent_waiting",
+                    json!({
+                        "agent_id": "a1", "reason": "executor_offline",
+                        "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
+                        "executor": {"kind": "edge_agent", "status": "offline"},
+                        "transport": "edge_ws"
+                    }),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "agent_waiting");
+                    assert_eq!(o["reason"], "executor_offline");
+                },
+            ),
+            (
+                "agent_cancelled",
+                make_event(
+                    "agent_cancelled",
+                    json!({"agent_id": "a1", "reason": "user request"}),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "agent_cancelled");
+                },
+            ),
+            (
+                "agent_interrupted",
+                make_event(
+                    "agent_interrupted",
+                    json!({"agent_id": "a1", "reason": "budget_exhausted"}),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "agent_interrupted");
+                },
+            ),
+            // ── keepalive → ping ──
+            (
+                "keepalive→ping",
+                make_event("keepalive", json!({})),
+                &|o| {
+                    assert_eq!(o["type"], "ping");
+                },
+            ),
+            // ── drop cases ──
+            (
+                "unknown→dropped",
+                make_event("custom_event", json!({})),
+                &|o| assert!(o.is_null()),
+            ),
+            (
+                "team_prepare→dropped",
+                make_event(
+                    "team_prepare",
+                    json!({"delegation_id": "d1", "phase": "prepare"}),
+                ),
+                &|o| assert!(o.is_null()),
+            ),
+            ("no type→dropped", json!({"data": {}}), &|o| {
+                assert!(o.is_null())
             }),
-        ));
-        assert_eq!(out["type"], "tool_call_start");
-        assert_eq!(out["tool"], "bash");
-        assert_eq!(out["call_id"], "c1");
-        assert_eq!(out["arguments"]["command"], "ls");
-        assert_eq!(out["workspace"]["kind"], "server_sandbox");
-        assert_eq!(out["executor"]["kind"], "server_local");
-        assert_eq!(out["transport"], "server_local");
-    }
-
-    #[test]
-    fn tool_result() {
-        let out = transform_run_event_for_client(make_event(
-            "tool_result",
-            json!({
-                "tool_call_id": "c1",
-                "name": "bash",
-                "output": "ok",
-                "success": true,
-                "duration_ms": 42,
-                "workspace": {"kind": "edge_workspace", "cwd": "/Users/xupeng/github/astra"},
-                "executor": {"kind": "edge_agent", "executor_id": "edge-1", "transport": "edge_ws"},
-                "transport": "edge_ws"
-            }),
-        ));
-        assert_eq!(out["type"], "tool_call_end");
-        assert_eq!(out["call_id"], "c1");
-        assert_eq!(out["tool"], "bash");
-        assert_eq!(out["result"], "ok");
-        assert_eq!(out["success"], true);
-        assert_eq!(out["duration_ms"], 42);
-        assert_eq!(out["workspace"]["kind"], "edge_workspace");
-        assert_eq!(out["executor"]["executor_id"], "edge-1");
-        assert_eq!(out["transport"], "edge_ws");
-    }
-
-    #[test]
-    fn run_started_and_finished() {
-        let started = transform_run_event_for_client(make_event(
-            "run_started",
-            json!({
-                "run_id": "run-1",
-                "session_id": "sess-1",
-                "interaction_mode": "auto",
-                "suppressed_loop_nudges": true,
-                "interactive_client": true,
-                "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
-                "executor": {"kind": "server_local", "status": "online"},
-                "transport": "server_local"
-            }),
-        ));
-        assert_eq!(started["type"], "run_started");
-        assert_eq!(started["run_id"], "run-1");
-        assert_eq!(started["session_id"], "sess-1");
-        assert_eq!(started["interaction_mode"], "auto");
-        assert_eq!(started["suppressed_loop_nudges"], true);
-        assert_eq!(started["interactive_client"], true);
-        assert_eq!(started["workspace"]["kind"], "server_sandbox");
-        assert_eq!(started["workspace"]["cwd"], "/tmp/astra-workspaces/run-1");
-        assert_eq!(started["executor"]["kind"], "server_local");
-        assert_eq!(started["executor"]["status"], "online");
-        assert_eq!(started["transport"], "server_local");
-
-        let finished = transform_run_event_for_client(make_event(
-            "run_finished",
-            json!({
-                "run_id": "run-1",
-                "status": "paused",
-                "error": "boom",
-                "error_code": "network",
-                "waiting_for": "task_board_intervention"
-            }),
-        ));
-        assert_eq!(finished["type"], "run_finished");
-        assert_eq!(finished["run_id"], "run-1");
-        assert_eq!(finished["status"], "paused");
-        assert_eq!(finished["error"], "boom");
-        assert_eq!(finished["error_code"], "network");
-        assert_eq!(finished["waiting_for"], "task_board_intervention");
-
-        let waiting = transform_run_event_for_client(make_event(
-            "run_waiting",
-            json!({"reason": "waiting: executor_offline"}),
-        ));
-        assert_eq!(waiting["type"], "run_waiting");
-        assert_eq!(waiting["reason"], "waiting: executor_offline");
-    }
-
-    #[test]
-    fn run_error_maps_to_run_lifecycle_type() {
-        let out = transform_run_event_for_client(make_event("run_error", json!({"error": "boom"})));
-        assert_eq!(out["type"], "run_error");
-        assert_eq!(out["message"], "boom");
-        assert_eq!(out["error"], "boom");
-        assert_eq!(out["code"], "RUN_ERROR");
-    }
-
-    #[test]
-    fn run_error_uses_semantic_client_code_when_error_kind_is_known() {
-        let out = transform_run_event_for_client(make_event(
-            "run_error",
-            json!({"error": "slow down", "error_kind": "rate_limit"}),
-        ));
-        assert_eq!(out["type"], "run_error");
-        assert_eq!(out["message"], "slow down");
-        assert_eq!(out["error_kind"], "rate_limit");
-        assert_eq!(out["error_code"], "rate_limit");
-        assert_eq!(out["code"], "LLM_RATE_LIMIT");
-        assert_eq!(out["retryable"], true);
-        assert_eq!(out["retry_after_ms"], 5_000);
-
-        let out = transform_run_event_for_client(make_event(
-            "run_error",
-            json!({"error": "provider 500", "error_kind": "server_error"}),
-        ));
-        assert_eq!(out["code"], "SERVER_ERROR");
-        assert_eq!(out["error_code"], "server_error");
-        assert_eq!(out["retryable"], true);
-        assert_eq!(out["retry_after_ms"], 2_000);
-    }
-
-    #[test]
-    fn run_error_default_message() {
-        let out = transform_run_event_for_client(make_event("run_error", json!({})));
-        assert_eq!(out["message"], "Unknown error");
-    }
-
-    #[test]
-    fn run_interrupted_is_client_visible() {
-        let out = transform_run_event_for_client(make_event(
-            "run_interrupted",
-            json!({
-                "kind": "budget_exhausted",
-                "resumable": true,
-                "user_message": "You can continue in the next message."
-            }),
-        ));
-        assert_eq!(out["type"], "run_interrupted");
-        assert_eq!(out["kind"], "budget_exhausted");
-        assert_eq!(out["resumable"], true);
-        assert_eq!(out["message"], "You can continue in the next message.");
-    }
-
-    #[test]
-    fn approval_and_user_input_events_are_client_visible_for_replay() {
-        let approval = transform_run_event_for_client(make_event(
-            "approval_request",
-            json!({"approval_id": "approval-1"}),
-        ));
-        assert_eq!(approval["type"], "approval_required");
-        assert_eq!(approval["approval_id"], "approval-1");
-        let canonical_approval = transform_run_event_for_client(make_event(
-            "approval_required",
-            json!({"approval_id": "approval-2"}),
-        ));
-        assert_eq!(canonical_approval["type"], "approval_required");
-        assert_eq!(canonical_approval["approval_id"], "approval-2");
-
-        let input =
-            transform_run_event_for_client(make_event("user_input", json!({"text": "approved"})));
-        assert_eq!(input["type"], "user_input");
-        assert_eq!(input["text"], "approved");
-    }
-
-    #[test]
-    fn plan_events() {
-        let created = transform_run_event_for_client(make_event(
-            "plan_created",
-            json!({"plan": {"steps": []}}),
-        ));
-        assert_eq!(created["type"], "plan_created");
-        let step_start =
-            transform_run_event_for_client(make_event("plan_step_start", json!({"step": "s1"})));
-        assert_eq!(step_start["type"], "plan_step_start");
-        let step_done = transform_run_event_for_client(make_event(
-            "plan_step_done",
-            json!({"step": "s1", "result": "ok"}),
-        ));
-        assert_eq!(step_done["type"], "plan_step_done");
-        let revised =
-            transform_run_event_for_client(make_event("plan_revised", json!({"plan": {}})));
-        assert_eq!(revised["type"], "plan_revised");
-    }
-
-    #[test]
-    fn agent_events() {
-        let delegated = transform_run_event_for_client(make_event(
-            "agent_delegated",
-            json!({"agent_id": "a1", "task": "t"}),
-        ));
-        assert_eq!(delegated["type"], "agent_delegated");
-        let progress = transform_run_event_for_client(make_event(
-            "agent_progress",
-            json!({"agent_id": "a1", "progress": "50%"}),
-        ));
-        assert_eq!(progress["type"], "agent_progress");
-        let completed = transform_run_event_for_client(make_event(
-            "agent_completed",
-            json!({"agent_id": "a1", "result": "done"}),
-        ));
-        assert_eq!(completed["type"], "agent_completed");
-        let failed = transform_run_event_for_client(make_event(
-            "agent_failed",
-            json!({"agent_id": "a1", "error": "boom"}),
-        ));
-        assert_eq!(failed["type"], "agent_failed");
-        let waiting = transform_run_event_for_client(make_event(
-            "agent_waiting",
-            json!({
-                "agent_id": "a1",
-                "reason": "executor_offline",
-                "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
-                "executor": {"kind": "edge_agent", "status": "offline"},
-                "transport": "edge_ws",
-            }),
-        ));
-        assert_eq!(waiting["type"], "agent_waiting");
-        assert_eq!(waiting["agent_id"], "a1");
-        assert_eq!(waiting["reason"], "executor_offline");
-        assert_eq!(waiting["workspace"]["kind"], "edge_workspace");
-        assert_eq!(waiting["executor"]["kind"], "edge_agent");
-        assert_eq!(waiting["transport"], "edge_ws");
-        let cancelled = transform_run_event_for_client(make_event(
-            "agent_cancelled",
-            json!({"agent_id": "a1", "reason": "user request"}),
-        ));
-        assert_eq!(cancelled["type"], "agent_cancelled");
-        let interrupted = transform_run_event_for_client(make_event(
-            "agent_interrupted",
-            json!({"agent_id": "a1", "reason": "budget_exhausted"}),
-        ));
-        assert_eq!(interrupted["type"], "agent_interrupted");
-    }
-
-    #[test]
-    fn keepalive_maps_to_ping() {
-        let out = transform_run_event_for_client(make_event("keepalive", json!({})));
-        assert_eq!(out["type"], "ping");
-    }
-
-    #[test]
-    fn unknown_and_missing_events_are_dropped() {
-        // unknown event_type (with and without data)
-        assert!(transform_run_event_for_client(make_event("custom_event", json!({}))).is_null());
-        assert!(
-            transform_run_event_for_client(make_event(
-                "team_prepare",
-                json!({"delegation_id":"d1","phase":"prepare"})
-            ))
-            .is_null()
-        );
-
-        // missing event_type AND type
-        assert!(transform_run_event_for_client(json!({"data": {}})).is_null());
-
-        // missing data object but event_type present
-        let out = transform_run_event_for_client(json!({"event_type": "text_delta"}));
-        assert_eq!(out["type"], "text_delta");
-        assert_eq!(out["content"], "");
-    }
-
-    #[test]
-    fn already_shaped_client_events_allowlist() {
-        // not in allowlist → dropped
-        let event = json!({"type": "injection_freshness", "channels": [{"tag":"self_awareness","hash":0u64,"bytes":0u64,"is_empty":true}]});
-        assert!(
-            transform_run_event_for_client(event).is_null(),
-            "client-shaped internal event must be dropped"
-        );
-
-        // in allowlist → pass through
-        let event = json!({"type": "text_delta", "content": "hello", "index": 3});
-        assert_eq!(transform_run_event_for_client(event.clone()), event);
-
-        // work surface tool events → pass through
-        let start = json!({"type": "tool_call", "tool_call": {"id": "c1"}});
-        let end = json!({"type": "tool_call_end", "call_id": "c1", "result": "ok"});
-        assert_eq!(transform_run_event_for_client(start.clone()), start);
-        assert_eq!(transform_run_event_for_client(end.clone()), end);
-    }
-
-    #[test]
-    fn already_shaped_agent_live_events_pass_through() {
-        let event = json!({
-            "type": "agent_live_event",
-            "agent_id": "agent-1",
-            "event_kind": "output_delta",
-            "content": "child output",
-        });
-        assert_eq!(transform_run_event_for_client(event.clone()), event);
-
-        let waiting = json!({
-            "type": "agent_waiting",
-            "agent_id": "agent-1",
-            "reason": "executor_offline",
-            "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
-            "executor": {"kind": "edge_agent", "status": "offline"},
-            "transport": "edge_ws",
-        });
-        assert_eq!(transform_run_event_for_client(waiting.clone()), waiting);
-    }
-
-    #[test]
-    fn already_shaped_work_surface_binding_and_transport_events_pass_through() {
-        for event in [
-            json!({
-                "type": "workspace_bound",
-                "workspace": {"kind": "server_sandbox"},
-                "executor": {"kind": "server_local"},
-            }),
-            json!({
-                "type": "executor_bound",
-                "workspace": {"kind": "server_sandbox"},
-                "executor": {"kind": "server_local"},
-            }),
-            json!({
-                "type": "tool_routing_decision",
-                "call_id": "c1",
-                "tool": "bash",
-                "route": "server_sandbox",
-            }),
-            json!({
-                "type": "tool_transport_started",
-                "call_id": "c1",
-                "tool": "bash",
-            }),
-            json!({
-                "type": "tool_transport_completed",
-                "call_id": "c1",
-                "duration_ms": 12,
-            }),
-            json!({
-                "type": "tool_transport_failed",
-                "call_id": "c1",
-                "error": "offline",
-            }),
-            json!({
-                "type": "run_blocked",
-                "call_id": "c1",
-                "tool": "bash",
-                "reason": "executor_offline",
-            }),
-            json!({
-                "type": "run_blocked",
-                "call_id": "c1",
-                "tool": "bash",
-                "reason": "transport_disconnected",
-            }),
-            json!({
-                "type": "run_blocked",
-                "call_id": "c1",
-                "tool": "bash",
-                "reason": "executor_offline",
-            }),
-            json!({
-                "type": "run_blocked",
-                "call_id": "c1",
-                "tool": "bash",
-                "reason": "workspace_executor_unavailable",
-                "workspace": {"kind": "cloud_workspace"},
-                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
-            }),
-        ] {
-            assert_eq!(transform_run_event_for_client(event.clone()), event);
+            (
+                "text_delta no data",
+                json!({"event_type": "text_delta"}),
+                &|o| {
+                    assert_eq!(o["type"], "text_delta");
+                    assert_eq!(o["content"], "");
+                },
+            ),
+            // ── already-shaped (allowlist / pass-through) ──
+            (
+                "internal injection_freshness→dropped",
+                json!({"type": "injection_freshness", "channels": [{"tag":"self_awareness","hash":0u64,"bytes":0u64,"is_empty":true}]}),
+                &|o| {
+                    assert!(o.is_null(), "client-shaped internal event must be dropped");
+                },
+            ),
+            (
+                "shaped text_delta pass-through",
+                json!({"type": "text_delta", "content": "hello", "index": 3}),
+                &|o| {
+                    assert_eq!(o["type"], "text_delta");
+                    assert_eq!(o["content"], "hello");
+                },
+            ),
+            (
+                "shaped tool_call pass-through",
+                json!({"type": "tool_call", "tool_call": {"id": "c1"}}),
+                &|o| {
+                    assert_eq!(o["type"], "tool_call");
+                },
+            ),
+            (
+                "shaped tool_call_end pass-through",
+                json!({"type": "tool_call_end", "call_id": "c1", "result": "ok"}),
+                &|o| {
+                    assert_eq!(o["type"], "tool_call_end");
+                },
+            ),
+            (
+                "agent_live_event pass-through",
+                json!({"type": "agent_live_event", "agent_id": "agent-1", "event_kind": "output_delta", "content": "child output"}),
+                &|o| {
+                    assert_eq!(o["type"], "agent_live_event");
+                },
+            ),
+            (
+                "shaped agent_waiting pass-through",
+                json!({"type": "agent_waiting", "agent_id": "agent-1", "reason": "executor_offline", "workspace": {"kind": "edge_workspace", "cwd": "/repo"}, "executor": {"kind": "edge_agent", "status": "offline"}, "transport": "edge_ws"}),
+                &|o| {
+                    assert_eq!(o["type"], "agent_waiting");
+                },
+            ),
+            // ── work-surface / transport pass-through ──
+            (
+                "workspace_bound pass-through",
+                json!({"type": "workspace_bound", "workspace": {"kind": "server_sandbox"}, "executor": {"kind": "server_local"}}),
+                &|o| {
+                    assert_eq!(o["type"], "workspace_bound");
+                },
+            ),
+            (
+                "tool_transport_started pass-through",
+                json!({"type": "tool_transport_started", "call_id": "c1", "tool": "bash"}),
+                &|o| {
+                    assert_eq!(o["type"], "tool_transport_started");
+                },
+            ),
+            (
+                "run_blocked pass-through",
+                json!({"type": "run_blocked", "call_id": "c1", "tool": "bash", "reason": "executor_offline"}),
+                &|o| {
+                    assert_eq!(o["type"], "run_blocked");
+                },
+            ),
+            // ── durable-prefix → client shape (strip event_type/data envelope) ──
+            (
+                "durable run_blocked→client",
+                json!({
+                    "event_type": "run_blocked", "index": 4,
+                    "data": {"call_id": "c1", "tool": "bash", "reason": "workspace_executor_unavailable",
+                        "message": "Workspace is not routed to an available executor.",
+                        "workspace": {"kind": "cloud_workspace"},
+                        "executor": {"kind": "orchestrator_managed", "status": "degraded"},
+                        "transport": "sandbox_resident_agent"}
+                }),
+                &|o| {
+                    assert_eq!(o["type"], "run_blocked");
+                    assert_eq!(o["reason"], "workspace_executor_unavailable");
+                    assert_eq!(o["transport"], "sandbox_resident_agent");
+                    assert!(o["index"].is_null(), "durable index stripped");
+                },
+            ),
+        ];
+        for (_label, input, check) in &cases {
+            let out = transform_run_event_for_client(input.clone());
+            check(&out);
         }
-    }
-
-    #[test]
-    fn durable_blocked_run_event_transform_for_client() {
-        let out = transform_run_event_for_client(json!({
-            "event_type": "run_blocked",
-            "data": {
-                "call_id": "c1",
-                "tool": "bash",
-                "reason": "workspace_executor_unavailable",
-                "message": "Workspace is not routed to an available executor.",
-                "workspace": {"kind": "cloud_workspace"},
-                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
-                "transport": "sandbox_resident_agent"
-            },
-            "index": 4
-        }));
-
-        assert_eq!(
-            out,
-            json!({
-                "type": "run_blocked",
-                "call_id": "c1",
-                "tool": "bash",
-                "reason": "workspace_executor_unavailable",
-                "message": "Workspace is not routed to an available executor.",
-                "workspace": {"kind": "cloud_workspace"},
-                "executor": {"kind": "orchestrator_managed", "status": "degraded"},
-                "transport": "sandbox_resident_agent"
-            })
-        );
     }
 
     #[test]

@@ -37,9 +37,9 @@ use astra_services::{
     DatabaseStateProjectionStore,
     runs::{
         CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
-        DurableRunListPage, DurableRunRecord, DurableRunStatusKind, RequestedTurnInteractionMode,
-        RunListCursor, RunStateStore, RuntimeProfileRequest, SelectedModelRequest,
-        durable_run_status_kind,
+        DurableRunListPage, DurableRunRecord, DurableRunStatusKind, GuardedRunStatusTransition,
+        GuardedRunStatusTransitionRequest, RequestedTurnInteractionMode, RunListCursor,
+        RunStateStore, RuntimeProfileRequest, SelectedModelRequest, durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
@@ -701,6 +701,62 @@ impl RunEngine {
             }
         }
         Ok(updated)
+    }
+
+    /// Atomically persist a status transition and durable audit event only
+    /// when the session has no other blocking run.
+    ///
+    /// The current run is excluded from the session guard so a paused run can
+    /// resume itself; any sibling active/input/waiting/manual-paused run blocks
+    /// the transition.
+    ///
+    /// Delegation projection refresh after a committed transition is
+    /// intentionally best-effort and outside the store transaction. The
+    /// authoritative facts are the durable run row, run events, and session
+    /// execution slot; projection failures are repairable derived-state lag.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn transition_status_with_event_if_current_unless_session_blocked(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        session_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        event: serde_json::Value,
+    ) -> Result<GuardedRunStatusTransition, String> {
+        let outcome = self
+            .store
+            .update_run_status_with_event_if_current_unless_session_blocked(
+                GuardedRunStatusTransitionRequest {
+                    user_id,
+                    run_id,
+                    session_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                    event,
+                },
+            )
+            .await?;
+        if outcome == GuardedRunStatusTransition::Updated {
+            let summary = error_message.or(waiting_for);
+            if let Err(error) = self
+                .project_delegation_run_if_needed(user_id, run_id, summary)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    status,
+                    error = %error,
+                    "guarded run transition committed but delegation projection refresh failed"
+                );
+            }
+        }
+        Ok(outcome)
     }
 
     /// Atomically persist a status transition and a durable audit event batch.

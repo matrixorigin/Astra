@@ -119,6 +119,16 @@ fn llm_nonstream_fallback_metrics_registry() -> Option<Arc<MetricsRegistry>> {
     astra_core::sync_poison::recover_rwlock_read(llm_nonstream_fallback_metrics_slot()).clone()
 }
 
+#[cfg(test)]
+mod test_fallback_metrics {
+    use super::Arc;
+    use super::MetricsRegistry;
+    use std::cell::RefCell;
+    thread_local! {
+        pub(super) static REGISTRY: RefCell<Option<Arc<MetricsRegistry>>> = const { RefCell::new(None) };
+    }
+}
+
 fn register_llm_nonstream_fallback_metrics(registry: &MetricsRegistry) {
     registry.register_counter(
         METRIC_LLM_NONSTREAM_FALLBACK_ATTEMPTS_TOTAL,
@@ -134,7 +144,13 @@ fn record_llm_nonstream_fallback_outcome(
     trigger: NonstreamFallbackTrigger,
     result: &Result<LlmCallResult, astra_core::ClassifiedError>,
 ) {
-    let Some(registry) = llm_nonstream_fallback_metrics_registry() else {
+    #[cfg(test)]
+    let registry = test_fallback_metrics::REGISTRY
+        .with(|c| c.borrow().clone())
+        .or_else(llm_nonstream_fallback_metrics_registry);
+    #[cfg(not(test))]
+    let registry = llm_nonstream_fallback_metrics_registry();
+    let Some(registry) = registry else {
         return;
     };
     register_llm_nonstream_fallback_metrics(&registry);
@@ -4347,17 +4363,22 @@ mod tests {
         Guard
     }
 
+    struct LlmFallbackMetricsGuard {
+        prev: Option<Arc<MetricsRegistry>>,
+    }
+
+    impl Drop for LlmFallbackMetricsGuard {
+        fn drop(&mut self) {
+            test_fallback_metrics::REGISTRY.with(|c| *c.borrow_mut() = self.prev.take());
+        }
+    }
+
     async fn install_llm_fallback_metrics_for_test()
-    -> (tokio::sync::OwnedMutexGuard<()>, Arc<MetricsRegistry>) {
-        static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
-        let guard = LOCK
-            .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-            .lock_owned()
-            .await;
+    -> (LlmFallbackMetricsGuard, Arc<MetricsRegistry>) {
+        let prev = test_fallback_metrics::REGISTRY.with(|c| c.borrow().clone());
         let registry = Arc::new(MetricsRegistry::new());
-        set_llm_nonstream_fallback_metrics_registry(registry.clone());
-        (guard, registry)
+        test_fallback_metrics::REGISTRY.with(|c| *c.borrow_mut() = Some(registry.clone()));
+        (LlmFallbackMetricsGuard { prev }, registry)
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]

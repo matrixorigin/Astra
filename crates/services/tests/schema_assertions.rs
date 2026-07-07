@@ -1070,6 +1070,33 @@ async fn phase1_run_durability_schema_contract() {
         ["user_id", "retry_of"],
         "retry lineage lookups must be owner-bound"
     );
+    assert_eq!(
+        index_columns(&pool, &schema, "agent_session_execution_slots", "PRIMARY").await,
+        ["user_id", "session_id"],
+        "session execution slot must be a first-class unique owner/session resource"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_session_execution_slots",
+            "idx_session_execution_slots_run"
+        )
+        .await,
+        ["user_id", "run_id"],
+        "slot release/cleanup must be owner/run indexed"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_session_execution_slots",
+            "idx_session_execution_slots_updated"
+        )
+        .await,
+        ["updated_at"],
+        "stale slot cleanup must not require scanning the slot table"
+    );
     assert!(
         index_columns(
             &pool,

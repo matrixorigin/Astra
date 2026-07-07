@@ -1396,6 +1396,47 @@ pub async fn ensure_core_schema(
     }
 
     query(
+        "CREATE TABLE IF NOT EXISTS agent_session_execution_slots (
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NOT NULL,
+            acquired_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id),
+            INDEX idx_session_execution_slots_run (user_id, run_id),
+            INDEX idx_session_execution_slots_updated (updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "agent_session_execution_slots",
+        &["user_id", "session_id"],
+        "ALTER TABLE agent_session_execution_slots ADD PRIMARY KEY (user_id, session_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "agent_session_execution_slots",
+        "idx_session_execution_slots_run",
+        &["user_id", "run_id"],
+        "ALTER TABLE agent_session_execution_slots ADD INDEX idx_session_execution_slots_run (user_id, run_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "agent_session_execution_slots",
+        "idx_session_execution_slots_updated",
+        &["updated_at"],
+        "ALTER TABLE agent_session_execution_slots ADD INDEX idx_session_execution_slots_updated (updated_at)",
+    )
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS agent_run_events (
             id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NOT NULL,

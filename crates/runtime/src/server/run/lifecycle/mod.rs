@@ -7594,6 +7594,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             return Err(Self::run_state_conflict("resume", &durable.status));
         }
 
+        // Buffered completion resume is completion promotion, not execution
+        // resumption. It deliberately bypasses the session execution slot so a
+        // paused run with an already-buffered terminal answer can be finalized
+        // even if another root turn later acquired the session slot.
         if has_buffered_terminal_completion(&durable.events) {
             let status_updated = self
                 .run_engine
@@ -7641,11 +7645,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let resume_event = json!({"event_type": "run_resumed", "data": {}});
         // Always write to DB first — the source of truth for cross-pod control.
-        let status_updated = self
+        let transition = self
             .run_engine
-            .transition_status_with_event_if_current(
+            .transition_status_with_event_if_current_unless_session_blocked(
                 &user_id,
                 &run_id,
+                &durable.session_id,
                 &[STATUS_PAUSED],
                 STATUS_RUNNING,
                 None,
@@ -7654,9 +7659,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await
             .map_err(|error| Self::durable_persist_error("resume transition", error))?;
-        if !status_updated {
-            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
-            return Err(Self::run_state_conflict("resume", &current.status));
+        match transition {
+            astra_services::runs::GuardedRunStatusTransition::Updated => {}
+            astra_services::runs::GuardedRunStatusTransition::SessionBlocked => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "session already has an active run".to_string(),
+                ));
+            }
+            astra_services::runs::GuardedRunStatusTransition::StatusConflict => {
+                let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+                return Err(Self::run_state_conflict("resume", &current.status));
+            }
         }
 
         {
