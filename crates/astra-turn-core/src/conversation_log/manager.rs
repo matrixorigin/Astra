@@ -829,10 +829,12 @@ mod tests {
             user_msg("right"),
             assistant_msg("right done"),
         ];
+        let left_state = default_state();
+        let right_state = default_state();
 
         let (left_result, right_result) = tokio::join!(
-            left.persist_turn(2, &left_messages, &default_state()),
-            right.persist_turn(2, &right_messages, &default_state())
+            left.persist_turn(2, &left_messages, &left_state),
+            right.persist_turn(2, &right_messages, &right_state)
         );
 
         let success_count = usize::from(left_result.is_ok()) + usize::from(right_result.is_ok());
