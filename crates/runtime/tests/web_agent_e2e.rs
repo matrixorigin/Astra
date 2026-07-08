@@ -55,8 +55,9 @@ const DEFAULT_TOOL_RESULT_RUN_ID: &str = "web-agent-e2e-run";
 const DEFAULT_TOOL_RESULT_TURN_CHAIN_ID: &str = "web-agent-e2e-turn-chain";
 
 static SECRET_INIT: OnceLock<()> = OnceLock::new();
-static TOOL_REQUEST_IDENTITY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Vec<(u128, ToolResultIdentity)>>> =
-    OnceLock::new();
+static TOOL_REQUEST_IDENTITY_CACHE: OnceLock<
+    tokio::sync::Mutex<HashMap<String, Vec<(u128, ToolResultIdentity)>>>,
+> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct ToolResultIdentity {
@@ -65,7 +66,8 @@ struct ToolResultIdentity {
     turn_chain_id: String,
 }
 
-fn tool_request_identity_cache() -> &'static tokio::sync::Mutex<HashMap<String, Vec<(u128, ToolResultIdentity)>>> {
+fn tool_request_identity_cache()
+-> &'static tokio::sync::Mutex<HashMap<String, Vec<(u128, ToolResultIdentity)>>> {
     TOOL_REQUEST_IDENTITY_CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 

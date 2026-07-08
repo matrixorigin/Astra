@@ -152,6 +152,10 @@ pub(crate) fn model_identity_prompt_section_for_cache_capability(
     }
 }
 
+fn saturating_usize_to_u32(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
 impl PromptCacheConfig {
     /// Latch config from environment and provider info. Call once at session start.
     pub fn latch(provider: &str, model_name: &str) -> Self {
@@ -477,11 +481,10 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         run_id: String::new(),
         model_id: model_id.to_string(),
         provider_name: provider.to_string(),
-        model_limit: u32::try_from(
+        model_limit: saturating_usize_to_u32(
             crate::prompts::budget_for_model_with_override(Some(model_id), context_window)
                 .model_limit,
-        )
-        .unwrap_or(u32::MAX),
+        ),
         provider_policy: provider_policy.clone(),
         provider_strategy,
         project_context: project_context.unwrap_or("").to_string(),
@@ -1136,6 +1139,84 @@ mod tests {
             tool_schemas[0]["function"]["description"].as_str().unwrap(),
             "Normal tier must not strip description text"
         );
+    }
+
+    #[test]
+    fn bridge_pipeline_outcome_preserves_many_extra_sections() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let stable: Vec<_> = (0..125)
+            .map(|idx| {
+                prompts::PromptSection::stable(
+                    format!("\n[stable-extra-{idx}]\n"),
+                    prompts::CacheScope::Session,
+                )
+            })
+            .collect();
+        let volatile: Vec<_> = (0..125)
+            .map(|idx| {
+                prompts::PromptSection::dynamic(
+                    format!("\n[volatile-extra-{idx}]\n"),
+                    prompts::PromptTokenBucket::Environment,
+                )
+            })
+            .collect();
+
+        let outcome = assemble_bridge_pipeline_outcome(
+            &[],
+            &[],
+            &stable,
+            &volatile,
+            &[],
+            None,
+            None,
+            &cache_cfg,
+            None,
+            "sid-many-extra",
+            "gpt-4o",
+            None,
+            "openai",
+            None,
+            None,
+            None,
+            "",
+            "",
+            "2026-05-25",
+        );
+        let trace_text = outcome
+            .prompt_sections
+            .iter()
+            .map(|section| section.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            trace_text.contains("[stable-extra-124]"),
+            "bridge extras must not be truncated by section count"
+        );
+        assert!(
+            trace_text.contains("[volatile-extra-124]"),
+            "bridge extras must not be truncated by section count"
+        );
+        let primary_text = outcome.primary_system["content"]
+            .as_str()
+            .unwrap_or_default();
+        let dynamic_text = outcome
+            .dynamic_system
+            .as_ref()
+            .and_then(|value| value["content"].as_str())
+            .unwrap_or_default();
+        assert!(primary_text.contains("[stable-extra-124]"));
+        assert!(dynamic_text.contains("[volatile-extra-124]"));
+    }
+
+    #[test]
+    fn bridge_model_limit_conversion_saturates() {
+        assert_eq!(saturating_usize_to_u32(200_000), 200_000);
+        assert_eq!(saturating_usize_to_u32(u32::MAX as usize + 1), u32::MAX);
     }
 
     #[test]

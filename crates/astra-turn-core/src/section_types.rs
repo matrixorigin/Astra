@@ -28,8 +28,9 @@ pub enum CacheScope {
     /// Stable across sessions — identity, core rules, output format.
     /// Changes only on agent code updates (weeks/months).
     Global,
-    /// Stable within a session — tool-conditional guidance, task-type rules.
-    /// Changes when tool set or task type changes (per turn, but usually stable).
+    /// Stable within a session — project context, skill catalogs, and user
+    /// preferences that are byte-stable for the session. Per-turn tool
+    /// surfaces and task-type hints belong in [`CacheScope::None`].
     Session,
     /// Changes every turn — project profile, memory signals, and other volatile context.
     None,

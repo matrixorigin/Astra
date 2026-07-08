@@ -24,12 +24,15 @@ pub(crate) async fn execute_local_transport<L>(
     result_executor: &ExecutorBinding,
     result_transport: ToolTransportKind,
     local_transport: &L,
-    cancel_token: Option<&Arc<CancellationToken>>,
+    cancel_token: Option<CancellationToken>,
 ) -> astra_tools::ToolResult
 where
     L: ServerLocalToolTransport + ?Sized,
 {
-    if cancel_token.is_some_and(|token| token.is_cancelled()) {
+    if cancel_token
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+    {
         return cancelled_runtime_tool_result_for_binding(
             result_workspace,
             result_executor,
@@ -39,9 +42,8 @@ where
             false,
         );
     }
-    let execution =
-        local_transport.execute_server_local_tool(request, cancel_token.map(|a| a.as_ref()));
-    if let Some(token) = cancel_token {
+    let execution = local_transport.execute_server_local_tool(request, cancel_token.as_ref());
+    if let Some(ref token) = cancel_token {
         tokio::select! {
             _ = token.cancelled() => cancelled_runtime_tool_result_for_binding(
                 result_workspace,

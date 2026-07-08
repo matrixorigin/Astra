@@ -12,6 +12,14 @@ use super::tool_transport_metadata::{
     runtime_execution_timeout_duration, runtime_tool_timeout_result,
 };
 
+/// Helper to extract `&CancellationToken` from `Option<Arc<CancellationToken>>`.
+///
+/// Avoids repetitive `cancel_token.as_ref().map(|v| &**v)` at call sites.
+#[inline]
+fn as_cancel_ref(cancel_token: Option<&Arc<CancellationToken>>) -> Option<&CancellationToken> {
+    cancel_token.map(|arc| &**arc)
+}
+
 /// Unified trait for external tool transport backends.
 ///
 /// Covers both gateway relay and sandbox resident agent — the execution
@@ -84,7 +92,7 @@ pub(crate) async fn execute_external_route(
         &request,
         binding,
         transport_kind,
-        cancel_token.as_ref(),
+        as_cancel_ref(cancel_token.as_ref()),
         transport.health_check(),
     )
     .await
@@ -105,7 +113,7 @@ pub(crate) async fn execute_external_route(
             &request,
             binding,
             transport_kind,
-            cancel_token.as_ref(),
+            as_cancel_ref(cancel_token.as_ref()),
             transport.reconnect(),
         )
         .await
@@ -125,7 +133,7 @@ pub(crate) async fn execute_external_route(
             &request,
             binding,
             transport_kind,
-            cancel_token.as_ref(),
+            as_cancel_ref(cancel_token.as_ref()),
             transport.health_check(),
         )
         .await
@@ -167,7 +175,7 @@ async fn preflight_or_cancel<T, Fut>(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
     transport_kind: ToolTransportKind,
-    cancel_token: Option<&Arc<CancellationToken>>,
+    cancel_token: Option<&CancellationToken>,
     future: Fut,
 ) -> Result<T, astra_tools::ToolResult>
 where
@@ -266,7 +274,7 @@ async fn execute_external_transport(
                 &request,
                 binding,
                 transport_kind,
-                cancel_token.as_ref(),
+                as_cancel_ref(cancel_token.as_ref()),
                 transport.health_check(),
             )
             .await
@@ -285,7 +293,7 @@ async fn execute_external_transport(
                     &request,
                     binding,
                     transport_kind,
-                    cancel_token.as_ref(),
+                    as_cancel_ref(cancel_token.as_ref()),
                     transport.reconnect(),
                 )
                 .await;

@@ -2219,11 +2219,11 @@ impl AgenticRunLifecycleService {
         loop_state: &mut AgenticLoopState,
         cancel_flag: &Arc<AtomicBool>,
         pause_flag: &Arc<AtomicBool>,
-        llm_cancel_token: &Arc<CancellationToken>,
+        llm_cancel_token: CancellationToken,
     ) {
         loop_state.cancellation.flag = Some(cancel_flag.clone());
         loop_state.cancellation.pause_flag = Some(pause_flag.clone());
-        loop_state.cancellation.token = Some(llm_cancel_token.clone());
+        loop_state.cancellation.token = Some(Arc::new(llm_cancel_token));
         loop_state.delegation_engine = self.delegation_engine.clone();
         // Wire cross-pod cancel/pause provider so the agentic loop can poll
         // DB for control signals from other pods in horizontally-scaled deployments.
@@ -5495,7 +5495,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut loop_state,
             &cancel_flag,
             &pause_flag,
-            &llm_cancel_token,
+            (*llm_cancel_token).clone(),
         );
         configure_runtime_controllers(
             &self.matrixone,
@@ -6444,7 +6444,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut state,
             &cancel_flag,
             &pause_flag,
-            &llm_cancel_token,
+            (*llm_cancel_token).clone(),
         );
         configure_runtime_controllers(
             &self.matrixone,

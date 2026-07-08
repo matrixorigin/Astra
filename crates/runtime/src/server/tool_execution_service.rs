@@ -456,7 +456,7 @@ impl ToolExecutionService {
                     &binding,
                     route,
                     local_transport,
-                    cancel_token.as_ref(),
+                    cancel_token.map(|t| (*t).clone()),
                 )
                 .await
             }
@@ -466,7 +466,7 @@ impl ToolExecutionService {
                     &binding,
                     route,
                     local_transport,
-                    cancel_token.as_ref(),
+                    cancel_token.map(|t| (*t).clone()),
                 )
                 .await;
                 append_route_binding_metadata(&mut result, route, &transport_request);
@@ -593,7 +593,7 @@ async fn execute_local_route<L>(
     binding: &astra_runtime_env::RunBinding,
     route: ToolExecutionRouteKind,
     local_transport: &L,
-    cancel_token: Option<&Arc<CancellationToken>>,
+    cancel_token: Option<CancellationToken>,
 ) -> astra_tools::ToolResult
 where
     L: ServerLocalToolTransport + ?Sized,

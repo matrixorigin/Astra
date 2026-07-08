@@ -1390,11 +1390,15 @@ pub fn build_system_prompt_sections_with_style(
 
     let tool_cond = tool_conditional_section(tool_names, profile_desc);
     if !tool_cond.is_empty() {
-        // Even though tool-conditional guidance is composed from live tool
-        // list and runtime profile (both per-turn dynamic), the content
-        // *shape* is stable per-session — same structure, similar length.
-        // Putting it under `BasePersona` keeps the cache prefix stable.
-        sections.push(PromptSection::stable(tool_cond, CacheScope::Session));
+        // Tool-conditional guidance is composed from live tool list and runtime
+        // profile — both per-turn dynamic. Even though the structure is similar,
+        // the actual content (tool names in conditionals) varies. Using
+        // CacheScope::None prevents cache invalidation on content changes while
+        // still billing to BasePersona for accurate token accounting.
+        sections.push(PromptSection::dynamic(
+            tool_cond,
+            PromptTokenBucket::BasePersona,
+        ));
     }
 
     let tt = task_type_section(task_type, tool_names);
@@ -2665,14 +2669,14 @@ mod tests {
         let bd = build_system_prompt_trace(&sections, vec![], vec![], None);
         assert!(bd.base_persona_tokens <= 3600);
 
-        // Tool-conditional guidance is billed to BasePersona for cache stability —
-        // the content shape is stable per session even though it's composed from
-        // live tool lists. See build_system_prompt_sections_with_style.
+        // Tool-conditional guidance is billed to BasePersona but remains
+        // volatile because the live tool list can vary per turn.
         let timer = sections
             .iter()
             .find(|s| s.text.contains("Tool Availability Protocol"))
             .unwrap();
         assert_eq!(timer.token_bucket, PromptTokenBucket::BasePersona);
+        assert_eq!(timer.scope, CacheScope::None);
 
         // Search strategy billed to environment bucket
         let sections = build_system_prompt_sections(&["glob", "grep", "read_file"], "", None);
