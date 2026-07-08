@@ -45,7 +45,8 @@ use crate::server::tool_transport::{
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopState, FactualRetryFallbackJudgeContext, HostTurnResult,
-    TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
+    SkillAutoRouteDecision, SkillAutoRouteJudgeContext, TurnInteractionMode, TurnInteractionPolicy,
+    interaction_scoped_tool_restrictions,
 };
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge::llm_stream::rate_limit_cooldown;
@@ -61,6 +62,7 @@ use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
 use astra_services::multi_agent::EdgeDispatchService;
 use astra_services::runs::RequestedTurnInteractionMode;
+use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, SharedAgentLiveEventSink,
 };
@@ -151,16 +153,12 @@ fn llm_main_attempt_metrics_slot() -> &'static RwLock<Option<Arc<MetricsRegistry
 
 pub(crate) fn set_llm_main_attempt_metrics_registry(registry: Arc<MetricsRegistry>) {
     register_llm_main_attempt_metrics(&registry);
-    *llm_main_attempt_metrics_slot()
-        .write()
-        .expect("llm main attempt metrics registry lock poisoned") = Some(registry);
+    *astra_core::sync_poison::recover_rwlock_write(llm_main_attempt_metrics_slot()) =
+        Some(registry);
 }
 
 fn llm_main_attempt_metrics_registry() -> Option<Arc<MetricsRegistry>> {
-    llm_main_attempt_metrics_slot()
-        .read()
-        .expect("llm main attempt metrics registry lock poisoned")
-        .clone()
+    astra_core::sync_poison::recover_rwlock_read(llm_main_attempt_metrics_slot()).clone()
 }
 
 fn register_llm_main_attempt_metrics(registry: &MetricsRegistry) {
@@ -655,6 +653,10 @@ struct SummaryClientTurnIntentJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
 }
 
+struct SummaryClientSkillAutoRouteJudge {
+    client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+}
+
 const RESOLVED_TURN_LLM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[async_trait]
@@ -670,6 +672,45 @@ impl astra_services::TurnIntentJudge for SummaryClientTurnIntentJudge {
             .await
             .map_err(astra_services::TurnIntentJudgeError::Transport)?;
         astra_services::parse_turn_intent_response(response.text.as_str())
+    }
+}
+
+#[async_trait]
+impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
+    async fn judge(
+        &self,
+        ctx: &astra_services::SkillAutoRouteJudgeContext,
+    ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
+        let messages = astra_services::skill_auto_route_judge_messages(ctx)?;
+        let allowed = ctx
+            .visible_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>();
+        let response = self
+            .client
+            .summarize(&messages)
+            .await
+            .map_err(SkillAutoRouteJudgeError::Transport)?;
+        astra_services::parse_skill_auto_route_response(response.text.as_str(), &allowed)
+    }
+}
+
+fn skill_auto_route_service_context(
+    ctx: SkillAutoRouteJudgeContext<'_>,
+) -> astra_services::SkillAutoRouteJudgeContext {
+    astra_services::SkillAutoRouteJudgeContext {
+        query: ctx.query.to_string(),
+        visible_skills: ctx
+            .visible_skills
+            .iter()
+            .map(|skill| SkillAutoRouteCandidate {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                when_to_use: skill.when_to_use.clone(),
+                aliases: skill.aliases.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1214,6 +1255,10 @@ pub struct ServerAgenticLoopHost {
     /// the judge to classify the user's message. Judge failure is non-fatal:
     /// the turn proceeds without explicit semantic intent.
     turn_intent_judge: Option<Arc<dyn astra_services::TurnIntentJudge>>,
+    /// Optional LLM-based skill auto-route judge. When unset, the host may use
+    /// the configured auxiliary LLM path; failure is non-fatal and leaves
+    /// pre-routing disabled for that turn.
+    skill_auto_route_judge: Option<Arc<dyn SkillAutoRouteJudge>>,
 }
 
 #[derive(Clone)]
@@ -1718,6 +1763,7 @@ impl ServerAgenticLoopHostBuilder {
                 .provider_allowed_tools
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashMap::new()))),
             turn_intent_judge: None,
+            skill_auto_route_judge: None,
         }
     }
 
@@ -1909,6 +1955,10 @@ impl ServerAgenticLoopHost {
     /// intent.
     pub fn set_turn_intent_judge(&mut self, judge: Arc<dyn astra_services::TurnIntentJudge>) {
         self.turn_intent_judge = Some(judge);
+    }
+
+    pub fn set_skill_auto_route_judge(&mut self, judge: Arc<dyn SkillAutoRouteJudge>) {
+        self.skill_auto_route_judge = Some(judge);
     }
 
     async fn resolve_llm_config_for_state(
@@ -2714,7 +2764,8 @@ impl ServerAgenticLoopHost {
             // Record to the cross-host log, but do NOT use it to filter:
             // per-round new ids always emit. Lock span is kept minimal.
             {
-                let mut shared = self.emitted_tool_call_ids.lock().unwrap();
+                let mut shared =
+                    astra_core::sync_poison::recover_mutex_lock(&self.emitted_tool_call_ids);
                 shared.insert(key);
             }
             self.emit_event(json!({ "type": "tool_call", "tool_call": tc }));
@@ -4180,11 +4231,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Use 1-based turn count: llm_rounds_completed counts *prior* rounds,
         // so the current user turn is +1.
         let turn_count = state.llm_rounds_completed.saturating_add(1);
+        let user_intent = state.runtime_decision_user_intent();
 
         if let Some(judge) = self.turn_intent_judge.as_ref() {
             return crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
                 judge.as_ref(),
-                &state.message,
+                &user_intent,
                 turn_count,
                 &state.recent_tools,
                 has_prior_assistant_turn,
@@ -4206,12 +4258,60 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let judge = SummaryClientTurnIntentJudge { client };
         crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
             &judge,
-            &state.message,
+            &user_intent,
             turn_count,
             &state.recent_tools,
             has_prior_assistant_turn,
         )
         .await
+    }
+
+    async fn judge_skill_auto_route(
+        &mut self,
+        state: &AgenticLoopState,
+        ctx: SkillAutoRouteJudgeContext<'_>,
+    ) -> Option<SkillAutoRouteDecision> {
+        if ctx.query.trim().is_empty() || ctx.visible_skills.is_empty() {
+            return None;
+        }
+        let service_ctx = skill_auto_route_service_context(ctx);
+
+        let judged = if let Some(judge) = self.skill_auto_route_judge.as_ref() {
+            judge.judge(&service_ctx).await
+        } else {
+            if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
+                tracing::debug!(
+                    target: "astra::skill_auto_route_judge",
+                    policy = auxiliary_llm_policy_label(),
+                    reason,
+                    "skill auto-route judge skipped by capacity policy"
+                );
+                return None;
+            }
+            let client = self.turn_intent_summary_client(state).await?;
+            let judge = SummaryClientSkillAutoRouteJudge { client };
+            judge.judge(&service_ctx).await
+        };
+
+        match judged {
+            Ok(Some(skill_name)) => {
+                tracing::debug!(
+                    target: "astra::skill_auto_route_judge",
+                    skill_name,
+                    "skill auto-route judged"
+                );
+                Some(SkillAutoRouteDecision { skill_name })
+            }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra::skill_auto_route_judge",
+                    error = %error,
+                    "skill auto-route judge unavailable; proceeding without pre-route"
+                );
+                None
+            }
+        }
     }
 
     async fn judge_factual_retry_fallback(
@@ -6118,6 +6218,24 @@ mod tests {
         ));
         assert!(rendered.contains(
             r#"astra_llm_main_attempt_tokens_total{attempt="retry",outcome="admission_rejected",phase="admission"} 4096"#
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial(llm_main_attempt_metrics)]
+    fn llm_main_attempt_metrics_registry_recovers_from_poisoned_slot() {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard =
+                astra_core::sync_poison::recover_rwlock_write(llm_main_attempt_metrics_slot());
+            panic!("poison main attempt metrics slot");
+        });
+
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        set_llm_main_attempt_metrics_registry(registry.clone());
+
+        assert!(Arc::ptr_eq(
+            &llm_main_attempt_metrics_registry().expect("registry should be readable"),
+            &registry
         ));
     }
 
@@ -9106,8 +9224,10 @@ mod tests {
                 astra_turn_core::pipeline_config::PipelineConfig::default(),
             )),
             message: "test query".to_string(),
+            user_intent: "test query".to_string(),
             recent_tools: Vec::new(),
             has_prior_assistant_turn: false,
+            turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
@@ -10316,6 +10436,7 @@ mod tests {
         .build();
         let mut state = create_test_state();
         state.message = "capture this turn".to_string();
+        state.user_intent = state.message.clone();
 
         host.run_one_mock_turn_for_test(&mut state)
             .await
@@ -10380,6 +10501,7 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "capture this turn"}));
         state.message = "capture this turn".to_string();
+        state.user_intent = state.message.clone();
 
         host.execute_turn(&mut state).await.expect("execute turn");
 
@@ -10506,6 +10628,7 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "capture this failed turn"}));
         state.message = "capture this failed turn".to_string();
+        state.user_intent = state.message.clone();
 
         let error = match host.execute_turn(&mut state).await {
             Ok(_) => panic!("execute turn should fail"),
@@ -10603,6 +10726,7 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "capture disabled should stay quiet"}));
         state.message = "capture disabled should stay quiet".to_string();
+        state.user_intent = state.message.clone();
 
         host.execute_turn(&mut state).await.expect("execute turn");
 
@@ -10661,6 +10785,7 @@ mod tests {
         .build();
         let mut state = create_test_state();
         state.message = "fail this turn".to_string();
+        state.user_intent = state.message.clone();
 
         let error = match host.run_one_mock_turn_for_test(&mut state).await {
             Ok(_) => panic!("mock round should fail"),
@@ -10990,6 +11115,7 @@ mod tests {
         let mut state = create_test_state();
         state.max_turn_input_tokens = 100;
         state.message = "Fix the regression".to_string();
+        state.user_intent = state.message.clone();
         for i in 0..6 {
             state
                 .messages
@@ -11121,6 +11247,7 @@ mod tests {
         let mut state = create_test_state();
         state.max_turn_input_tokens = 100;
         state.message = "Fix the regression".to_string();
+        state.user_intent = state.message.clone();
         for i in 0..6 {
             state
                 .messages
@@ -12244,7 +12371,9 @@ mod tests {
         use super::*;
         use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
         use astra_services::{
-            LlmTokenServiceConfig, TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError,
+            LlmTokenServiceConfig, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
+            SkillAutoRouteJudgeError, TurnIntentJudge, TurnIntentJudgeContext,
+            TurnIntentJudgeError,
         };
         use async_trait::async_trait;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -12287,6 +12416,46 @@ mod tests {
             }
         }
 
+        struct ScriptedSkillRouteJudge {
+            calls: std::sync::Mutex<Vec<SkillAutoRouteJudgeContext>>,
+            response: std::sync::Mutex<Option<Result<Option<String>, SkillAutoRouteJudgeError>>>,
+        }
+
+        impl ScriptedSkillRouteJudge {
+            fn ok(skill_name: Option<&str>) -> Arc<Self> {
+                Arc::new(Self {
+                    calls: std::sync::Mutex::new(Vec::new()),
+                    response: std::sync::Mutex::new(Some(Ok(skill_name.map(str::to_string)))),
+                })
+            }
+
+            fn err(error: SkillAutoRouteJudgeError) -> Arc<Self> {
+                Arc::new(Self {
+                    calls: std::sync::Mutex::new(Vec::new()),
+                    response: std::sync::Mutex::new(Some(Err(error))),
+                })
+            }
+
+            fn calls(&self) -> Vec<SkillAutoRouteJudgeContext> {
+                self.calls.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait]
+        impl SkillAutoRouteJudge for ScriptedSkillRouteJudge {
+            async fn judge(
+                &self,
+                ctx: &SkillAutoRouteJudgeContext,
+            ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
+                self.calls.lock().unwrap().push(ctx.clone());
+                self.response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("ScriptedSkillRouteJudge consumed twice")
+            }
+        }
+
         fn host_with_judge(judge: Arc<dyn TurnIntentJudge>) -> ServerAgenticLoopHost {
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
@@ -12296,6 +12465,20 @@ mod tests {
             )
             .build();
             host.set_turn_intent_judge(judge);
+            host
+        }
+
+        fn host_with_skill_route_judge(
+            judge: Arc<dyn SkillAutoRouteJudge>,
+        ) -> ServerAgenticLoopHost {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .build();
+            host.set_skill_auto_route_judge(judge);
             host
         }
 
@@ -12336,6 +12519,7 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "可以了，按你刚才说的方向继续往下走".to_string();
+            state.user_intent = state.message.clone();
             state.messages = vec![
                 serde_json::json!({"role": "user", "content": "earlier"}),
                 serde_json::json!({"role": "assistant", "content": "ok"}),
@@ -12370,6 +12554,7 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "please inspect the current changes".to_string();
+            state.user_intent = state.message.clone();
 
             assert_eq!(host.judge_turn_intent(&state).await, None);
         }
@@ -12386,8 +12571,75 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "please inspect the current changes".to_string();
+            state.user_intent = state.message.clone();
 
             assert_eq!(host.judge_turn_intent(&state).await, None);
+        }
+
+        #[tokio::test]
+        async fn judge_skill_auto_route_invokes_wired_judge_with_visible_catalog() {
+            let judge = ScriptedSkillRouteJudge::ok(Some("review-changes"));
+            let mut host =
+                host_with_skill_route_judge(judge.clone() as Arc<dyn SkillAutoRouteJudge>);
+            let state = crate::turn::agentic_loop::host::tests::make_state();
+            let visible_skills = vec![crate::turn::skill_tool::SkillToolInfo {
+                name: "review-changes".into(),
+                description: "Review local changes".into(),
+                when_to_use: Some("Use for code review workflows".into()),
+                aliases: vec!["review".into()],
+                ..Default::default()
+            }];
+
+            let decision = host
+                .judge_skill_auto_route(
+                    &state,
+                    crate::turn::agentic_loop::host::SkillAutoRouteJudgeContext {
+                        query: "review current branch",
+                        visible_skills: &visible_skills,
+                    },
+                )
+                .await;
+
+            assert_eq!(
+                decision,
+                Some(crate::turn::agentic_loop::host::SkillAutoRouteDecision {
+                    skill_name: "review-changes".into()
+                })
+            );
+            let calls = judge.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].query, "review current branch");
+            assert_eq!(calls[0].visible_skills.len(), 1);
+            assert_eq!(calls[0].visible_skills[0].name, "review-changes");
+            assert_eq!(calls[0].visible_skills[0].aliases, vec!["review"]);
+        }
+
+        #[tokio::test]
+        async fn judge_skill_auto_route_returns_none_when_judge_errors() {
+            let judge = ScriptedSkillRouteJudge::err(SkillAutoRouteJudgeError::Transport(
+                "connection reset".into(),
+            ));
+            let mut host =
+                host_with_skill_route_judge(judge.clone() as Arc<dyn SkillAutoRouteJudge>);
+            let state = crate::turn::agentic_loop::host::tests::make_state();
+            let visible_skills = vec![crate::turn::skill_tool::SkillToolInfo {
+                name: "review-changes".into(),
+                description: "Review local changes".into(),
+                ..Default::default()
+            }];
+
+            assert_eq!(
+                host.judge_skill_auto_route(
+                    &state,
+                    crate::turn::agentic_loop::host::SkillAutoRouteJudgeContext {
+                        query: "review current branch",
+                        visible_skills: &visible_skills,
+                    },
+                )
+                .await,
+                None
+            );
+            assert_eq!(judge.calls().len(), 1);
         }
 
         #[tokio::test]
@@ -12429,7 +12681,7 @@ mod tests {
                     "choices": [
                         {
                             "message": {
-                                "content": "{\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":true}"
+                                "content": "{\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":true,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}"
                             },
                             "finish_reason": "stop"
                         }
@@ -12466,6 +12718,7 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "不对，我要的是系统性修复，不是临时补丁".to_string();
+            state.user_intent = state.message.clone();
             state.messages = vec![
                 serde_json::json!({"role": "user", "content": "earlier"}),
                 serde_json::json!({"role": "assistant", "content": "ok"}),
@@ -12494,6 +12747,11 @@ mod tests {
                 "judge response should drive reanchor behavior"
             );
             assert_eq!(
+                intent.workspace_mutation,
+                astra_config::user_profile::WorkspaceMutationIntent::MustMutate
+            );
+            assert!(!intent.browser_verification_required);
+            assert_eq!(
                 capture.authorization.lock().await.as_deref(),
                 Some("Bearer forwarded-token")
             );
@@ -12509,6 +12767,14 @@ mod tests {
             assert!(
                 prompt.contains("reanchors_current_objective"),
                 "judge prompt must request the structured reanchor field"
+            );
+            assert!(
+                prompt.contains("workspace_mutation"),
+                "judge prompt must request the structured workspace mutation field"
+            );
+            assert!(
+                prompt.contains("browser_verification_required"),
+                "judge prompt must request the structured browser verification field"
             );
             assert!(
                 prompt.contains("不对，我要的是系统性修复，不是临时补丁"),
@@ -12573,6 +12839,7 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "继续，但要系统性一点".to_string();
+            state.user_intent = state.message.clone();
 
             assert_eq!(host.judge_turn_intent(&state).await, None);
             assert_eq!(

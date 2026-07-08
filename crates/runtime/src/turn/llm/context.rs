@@ -6,10 +6,11 @@
 //! should route through this module instead of hand-assembling system prompts,
 //! volatile preambles, provider cache placement, or tier-pruned tool schemas.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use astra_services::SessionArtifactStore;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use super::super::agentic_loop::host::AgenticLoopState;
 use super::super::prompt_cache::PromptCacheConfig;
@@ -309,6 +310,44 @@ fn cache_control_count(value: &Value) -> usize {
         Value::Array(values) => values.iter().map(cache_control_count).sum(),
         _ => 0,
     }
+}
+
+fn canonical_wire_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_wire_value).collect()),
+        Value::Object(map) => {
+            let sorted = map
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_wire_value(value)))
+                .collect::<BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn canonical_wire_sha256(value: &Value) -> String {
+    let canonical = canonical_wire_value(value);
+    let bytes =
+        serde_json::to_vec(&canonical).expect("serde_json::Value serialization is infallible");
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
+fn message_role(message: &Value) -> String {
+    message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn role_counts_json(roles: &[String]) -> Value {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for role in roles {
+        *counts.entry(role.clone()).or_default() += 1;
+    }
+    json!(counts)
 }
 
 /// Bridge-facing context assembly input.
@@ -793,7 +832,6 @@ pub(crate) fn assemble_context_pipeline(
     let mut external = build_external_sources(
         input.runtime_signals.edge_profile,
         state,
-        input.user_content,
         &tool_names,
         input.runtime_signals.plan_resume_hint.as_deref(),
         Some(cache_cap),
@@ -870,10 +908,16 @@ pub(crate) fn assemble_context_pipeline(
     };
 
     let pipeline_result = {
-        let pipeline_sess = state
-            .pipeline_session
-            .as_mut()
-            .expect("pipeline_session must be initialized for all production paths");
+        let pipeline_sess = state.pipeline_session.get_or_insert_with(|| {
+            tracing::warn!(
+                session_id = input.session_id,
+                "pipeline_session missing during context assembly; creating a fresh session"
+            );
+            astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+                session_current_date.clone(),
+            )
+        });
         if let Some(session_id) = state.current_session_id.as_deref()
             && let Ok(session_dir) =
                 astra_services::local_session_artifact_store().session_dir(session_id)
@@ -915,7 +959,7 @@ pub(crate) fn assemble_context_pipeline(
     let round_within_turn = state.current_round_index;
     let inject_volatile = cache_cap.should_inject_volatile_on_round(round_within_turn);
 
-    let (system_messages, volatile_preamble) = match cache_cap.volatile_placement {
+    let (system_messages, mut volatile_preamble) = match cache_cap.volatile_placement {
         VolatilePlacement::MarkerIsolated => {
             let stable_content: Vec<Value> = pipeline_output
                 .serialized
@@ -963,6 +1007,14 @@ pub(crate) fn assemble_context_pipeline(
             (system, preamble)
         }
     };
+    if let Some(required_text) = astra_turn_core::chat_turn_edge_profile::edge_profile_joined_text(
+        input.runtime_signals.edge_profile,
+        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+    )
+    .and_then(|text| crate::turn::wire_assembly::required_runtime_preamble_message(&text))
+    {
+        volatile_preamble.push(required_text);
+    }
     let stable_system_message_count = system_messages.len();
     let volatile_preamble_count = volatile_preamble.len();
     let tool_schema_count = pipeline_output.optimized.tool_schemas.len();
@@ -1009,20 +1061,14 @@ fn volatile_preamble_from_text(text: String, inject: bool) -> Vec<Value> {
 }
 
 fn ensure_system_reminder_wrapper(text: &str) -> String {
-    const SYSTEM_REMINDER_PREFIX: &str = "<system-reminder>";
-    const SYSTEM_REMINDER_SUFFIX: &str = "</system-reminder>";
-    if text.starts_with(SYSTEM_REMINDER_PREFIX) && text.ends_with(SYSTEM_REMINDER_SUFFIX) {
-        text.to_string()
-    } else {
-        format!("{SYSTEM_REMINDER_PREFIX}\n{text}{SYSTEM_REMINDER_SUFFIX}")
-    }
+    crate::turn::wire_assembly::system_reminder_wrapped_text(text)
 }
 
 fn record_pipeline_abort(
     state: &mut AgenticLoopState,
     abort: &astra_turn_core::context_pipeline::PipelineAbort,
 ) {
-    let turn = state.llm_rounds_completed;
+    let turn = state.current_session_turn_number();
     let alert = astra_turn_core::trace_alert::TraceAlert {
         severity: astra_turn_core::trace_alert::AlertSeverity::Error,
         rule: "system_prompt_abort".into(),
@@ -1258,11 +1304,12 @@ pub(crate) fn apply_bridge_message_cache_metadata(
 ///
 /// The bridge currently compacts and mutates its message vector inline. This
 /// helper centralizes the cache-sensitive tail rule shared with
-/// [`assemble_wire_messages`]: volatile runtime text must live on the true
-/// tail, not be spliced into historical user turns.
+/// [`assemble_wire_messages`]: runtime control text must live on a structured
+/// runtime system tail, not be spliced into user turns.
 pub(crate) fn finalize_bridge_wire_messages(
     llm_messages: &mut Vec<Value>,
     volatile_text: Option<String>,
+    required_runtime_text: Option<String>,
     provider: &str,
     model_name: &str,
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
@@ -1285,38 +1332,42 @@ pub(crate) fn finalize_bridge_wire_messages(
             model_name,
         );
     let mut synthetic_tail_prefix_end = None;
-    if let Some(text) = volatile_text
-        && !text.is_empty()
+    let suppress_volatile = matches!(
+        cache_cap.volatile_placement,
+        astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+    );
+    let mut runtime_parts = Vec::new();
+    if let Some(text) = required_runtime_text
+        && !text.trim().is_empty()
     {
-        if matches!(
-            cache_cap.volatile_placement,
-            astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
-        ) {
-            return None;
-        }
-        let wrapped = ensure_system_reminder_wrapper(&text);
-        let tail_role = llm_messages
-            .last()
-            .and_then(|m| m.get("role").and_then(Value::as_str));
-        if tail_role == Some("user") {
-            let last_user = llm_messages
-                .last_mut()
-                .expect("tail_role=user implies a last message exists");
-            let existing = last_user
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            last_user["content"] = Value::String(format!("{wrapped}\n\n{existing}"));
-        } else if tail_role == Some("tool") {
-            synthetic_tail_prefix_end = Some(llm_messages.len());
-            llm_messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": "Understood.",
-            }));
-            llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
+        runtime_parts.push(text);
+    }
+    if !suppress_volatile
+        && let Some(text) = volatile_text
+        && !text.trim().is_empty()
+    {
+        runtime_parts.push(text);
+    }
+    let text = runtime_parts.join("\n\n");
+    if !text.is_empty() {
+        if let Some(runtime_message) =
+            crate::turn::wire_assembly::required_runtime_preamble_message(&text)
+        {
+            let tail_role = llm_messages
+                .last()
+                .and_then(|m| m.get("role").and_then(Value::as_str));
+            if tail_role == Some("tool") {
+                synthetic_tail_prefix_end = Some(llm_messages.len());
+                llm_messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": "Understood.",
+                }));
+            } else {
+                synthetic_tail_prefix_end = Some(llm_messages.len());
+            }
+            llm_messages.push(runtime_message);
         } else {
-            synthetic_tail_prefix_end = Some(llm_messages.len());
-            llm_messages.push(serde_json::json!({"role": "user", "content": wrapped}));
+            synthetic_tail_prefix_end = None;
         }
     }
     synthetic_tail_prefix_end
@@ -1329,6 +1380,34 @@ pub(crate) fn augment_manifest_trace_with_wire(
 ) {
     let message_cache_control_count = messages.iter().map(cache_control_count).sum::<usize>();
     let tool_cache_control_count = tool_schemas.iter().map(cache_control_count).sum::<usize>();
+    let message_roles: Vec<String> = messages.iter().map(message_role).collect();
+    let conversation_messages: Vec<Value> = messages
+        .iter()
+        .filter(|message| message_role(message) != "system")
+        .cloned()
+        .collect();
+    let conversation_roles: Vec<String> = conversation_messages.iter().map(message_role).collect();
+    let system_messages: Vec<Value> = messages
+        .iter()
+        .filter(|message| message_role(message) == "system")
+        .cloned()
+        .collect();
+    let message_hashes: Vec<Value> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            json!({
+                "index": index,
+                "role": message_role(message),
+                "sha256": canonical_wire_sha256(message),
+            })
+        })
+        .collect();
+    let estimated_message_tokens = messages.iter().map(estimate_json_tokens).sum::<u32>();
+    let estimated_conversation_tokens = conversation_messages
+        .iter()
+        .map(estimate_json_tokens)
+        .sum::<u32>();
 
     if let Some(trace_obj) = trace.as_object_mut() {
         trace_obj.insert(
@@ -1336,9 +1415,29 @@ pub(crate) fn augment_manifest_trace_with_wire(
             serde_json::json!({
                 "message_count": messages.len(),
                 "tool_schema_count": tool_schemas.len(),
+                "message_roles": message_roles.clone(),
+                "message_role_counts": role_counts_json(&message_roles),
+                "estimated_message_tokens": estimated_message_tokens,
                 "message_cache_control_count": message_cache_control_count,
                 "tool_cache_control_count": tool_cache_control_count,
                 "total_cache_control_count": message_cache_control_count + tool_cache_control_count,
+                "conversation_projection": {
+                    "message_count": conversation_messages.len(),
+                    "message_roles": conversation_roles.clone(),
+                    "role_counts": role_counts_json(&conversation_roles),
+                    "estimated_tokens": estimated_conversation_tokens,
+                },
+                "fingerprint": {
+                    "message_sequence_sha256": canonical_wire_sha256(&Value::Array(messages.to_vec())),
+                    "system_message_sequence_sha256": canonical_wire_sha256(&Value::Array(system_messages.clone())),
+                    "conversation_message_sequence_sha256": canonical_wire_sha256(&Value::Array(conversation_messages)),
+                    "tool_schema_sequence_sha256": canonical_wire_sha256(&Value::Array(tool_schemas.to_vec())),
+                    "system_and_tools_sha256": canonical_wire_sha256(&json!({
+                        "system_messages": system_messages,
+                        "tool_schemas": tool_schemas,
+                    })),
+                    "message_hashes": message_hashes,
+                },
             }),
         );
     }
@@ -1366,6 +1465,46 @@ mod context_cache_contract_tests {
             .iter()
             .filter_map(|tool| tool_name(tool).map(str::to_string))
             .collect()
+    }
+
+    #[test]
+    fn pipeline_abort_journal_event_uses_session_turn() {
+        let mut state = crate::turn::agentic_loop::host::tests::make_state();
+        state.current_session_id = Some("session-1".to_string());
+        state.session_turn = 9;
+        state.llm_rounds_completed = 1;
+        state.turn_event_buffer = Some(
+            astra_services::session_journal::TurnEventBuffer::begin_turn(
+                state.current_session_id.as_deref(),
+                state.session_turn,
+            ),
+        );
+
+        record_pipeline_abort(
+            &mut state,
+            &astra_turn_core::context_pipeline::PipelineAbort::InvalidModelLimit { model_limit: 0 },
+        );
+
+        let mut buffer = state
+            .turn_event_buffer
+            .take()
+            .expect("pipeline abort should be buffered");
+        let events = buffer.drain();
+        let alert_event = events
+            .iter()
+            .find(|event| {
+                event.event_type == astra_services::session_journal::JournalEventType::PipelineAlert
+            })
+            .expect("pipeline alert event");
+        assert_eq!(alert_event.turn, Some(9));
+        assert_eq!(
+            alert_event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("turn"))
+                .and_then(|turn| turn.as_u64()),
+            Some(9)
+        );
     }
 
     fn message_text(message: &Value) -> String {
@@ -1593,9 +1732,50 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn assemble_context_pipeline_initializes_missing_pipeline_session() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.pipeline_session = None;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+        let edge_profile = serde_json::Map::new();
+        let visible_tools = vec![tool("bash")];
+        let restricted_tools = HashSet::new();
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+
+        let output = assemble_context_pipeline(LlmContextAssemblyInput {
+            state: &mut state,
+            session_id: "sid-missing-pipeline",
+            tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
+            runtime_signals: RuntimeSignals::new(&edge_profile, None),
+            cache_cfg: &cache_cfg,
+            provider: "openai",
+            model_name: "gpt-4",
+            context_window: Some(200_000),
+            cache_capability: None,
+            user_content: "hello",
+            query_source: "test",
+        })
+        .expect("missing pipeline session should degrade to a fresh session");
+
+        assert!(
+            state.pipeline_session.is_some(),
+            "context assembly must repair missing pipeline state for subsequent turns"
+        );
+        assert!(
+            !output.system_messages.is_empty(),
+            "fresh pipeline fallback should still produce context"
+        );
+    }
+
+    #[test]
     fn assemble_wire_messages_auto_injects_active_turn_frame() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.message = "相关的测试够硬核吗？".to_string();
+        state.user_intent = state.message.clone();
         state.session_turn = 7;
         state.llm_rounds_completed = 3;
         state.messages = vec![
@@ -1628,12 +1808,17 @@ mod context_cache_contract_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(user_text.contains("相关的测试够硬核吗"));
+        assert!(!user_text.contains("[active-turn-frame:v1]"));
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "相关的测试够硬核吗？");
+        assert_eq!(messages[4]["role"], "system");
+        let runtime_system = message_text(&messages[4]);
         assert!(
-            user_text.contains("[active-turn-frame:v1]"),
-            "runtime goal frame must be appended after the real tail user intent"
+            runtime_system.contains("[active-turn-frame:v1]"),
+            "runtime goal frame must be visible in the runtime system frame"
         );
-        assert!(user_text.contains("\"turn_id\":7"));
-        assert!(user_text.contains("\"round_id\":3"));
+        assert!(runtime_system.contains("\"turn_id\":7"));
+        assert!(runtime_system.contains("\"round_id\":3"));
         let system_text = messages
             .iter()
             .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
@@ -1641,8 +1826,8 @@ mod context_cache_contract_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            !system_text.contains("[active-turn-frame:v1]"),
-            "active-turn runtime context must not require a provider-invalid post-history system role"
+            system_text.contains("[active-turn-frame:v1]"),
+            "active-turn runtime context must use the system control lane"
         );
         assert!(
             state.volatile_pending.is_empty(),
@@ -1805,6 +1990,107 @@ mod context_cache_contract_tests {
         assert_eq!(trace["wire"]["message_cache_control_count"], 1);
         assert_eq!(trace["wire"]["tool_cache_control_count"], 1);
         assert_eq!(trace["wire"]["total_cache_control_count"], 2);
+        assert_eq!(trace["wire"]["message_roles"], json!(["system", "user"]));
+        assert_eq!(
+            trace["wire"]["message_role_counts"],
+            json!({"system": 1, "user": 1})
+        );
+        assert_eq!(trace["wire"]["conversation_projection"]["message_count"], 1);
+        assert_eq!(
+            trace["wire"]["conversation_projection"]["role_counts"],
+            json!({"user": 1})
+        );
+        assert!(
+            trace["wire"]["fingerprint"]["message_sequence_sha256"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert!(
+            trace["wire"]["fingerprint"]["system_and_tools_sha256"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert_eq!(
+            trace["wire"]["fingerprint"]["message_hashes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn augment_manifest_trace_records_wire_fingerprints_without_prompt_content() {
+        let prompt_secret = "PROMPT_SECRET_DO_NOT_LOG";
+        let tool_secret = "TOOL_SECRET_DO_NOT_LOG";
+        let messages = vec![
+            json!({"role": "system", "content": "stable policy"}),
+            json!({"role": "user", "content": prompt_secret}),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "secret_tool",
+                "description": tool_secret,
+                "parameters": {"type": "object"}
+            }
+        })];
+        let mut trace = json!({"source": "llm_context"});
+
+        augment_manifest_trace_with_wire(&mut trace, &messages, &tools);
+
+        let rendered = trace.to_string();
+        assert!(!rendered.contains(prompt_secret), "{rendered}");
+        assert!(!rendered.contains(tool_secret), "{rendered}");
+        let baseline_message_hash = trace["wire"]["fingerprint"]["message_sequence_sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let baseline_tool_hash = trace["wire"]["fingerprint"]["tool_schema_sequence_sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut changed_messages = messages.clone();
+        changed_messages[1]["content"] = json!("changed user content");
+        let mut changed_message_trace = json!({"source": "llm_context"});
+        augment_manifest_trace_with_wire(&mut changed_message_trace, &changed_messages, &tools);
+
+        assert_ne!(
+            changed_message_trace["wire"]["fingerprint"]["message_sequence_sha256"]
+                .as_str()
+                .unwrap(),
+            baseline_message_hash
+        );
+        assert_eq!(
+            changed_message_trace["wire"]["fingerprint"]["tool_schema_sequence_sha256"]
+                .as_str()
+                .unwrap(),
+            baseline_tool_hash
+        );
+
+        let mut changed_tools = tools.clone();
+        changed_tools[0]["function"]["parameters"] = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}}
+        });
+        let mut changed_tool_trace = json!({"source": "llm_context"});
+        augment_manifest_trace_with_wire(&mut changed_tool_trace, &messages, &changed_tools);
+
+        assert_eq!(
+            changed_tool_trace["wire"]["fingerprint"]["message_sequence_sha256"]
+                .as_str()
+                .unwrap(),
+            baseline_message_hash
+        );
+        assert_ne!(
+            changed_tool_trace["wire"]["fingerprint"]["tool_schema_sequence_sha256"]
+                .as_str()
+                .unwrap(),
+            baseline_tool_hash
+        );
     }
 
     #[test]
@@ -1818,6 +2104,7 @@ mod context_cache_contract_tests {
         finalize_bridge_wire_messages(
             &mut messages,
             Some("volatile".to_string()),
+            None,
             "openai",
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -1827,10 +2114,11 @@ mod context_cache_contract_tests {
         assert_eq!(messages[0]["content"], "original user");
         assert_eq!(messages[3]["role"], "assistant");
         assert_eq!(messages[3]["content"], "Understood.");
-        assert_eq!(
-            messages[4]["content"],
-            "<system-reminder>\nvolatile</system-reminder>"
-        );
+        assert_eq!(messages[4]["role"], "system");
+        assert_eq!(messages[4]["content"], "volatile");
+        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
+            &messages[4]
+        ));
     }
 
     #[test]
@@ -1854,6 +2142,7 @@ mod context_cache_contract_tests {
         let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
             &mut messages,
             Some("volatile".to_string()),
+            None,
             "bedrock",
             "us.anthropic.claude-haiku-4-5-20251001-v1:0",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -1878,42 +2167,50 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn finalize_bridge_wire_messages_prepends_to_tail_user_when_available() {
+    fn finalize_bridge_wire_messages_appends_runtime_system_tail_when_user_available() {
         let mut messages = vec![json!({"role": "user", "content": "original user"})];
 
-        finalize_bridge_wire_messages(
+        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
             &mut messages,
             Some("volatile".to_string()),
+            None,
             "openai",
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
         );
 
-        assert_eq!(messages.len(), 1);
-        assert_eq!(
-            messages[0]["content"],
-            "<system-reminder>\nvolatile</system-reminder>\n\noriginal user"
-        );
+        assert_eq!(synthetic_tail_prefix_end, Some(1));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "original user");
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[1]["content"], "volatile");
+        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
+            &messages[1]
+        ));
     }
 
     #[test]
-    fn finalize_bridge_wire_messages_preserves_existing_system_reminder_wrapper() {
+    fn finalize_bridge_wire_messages_keeps_runtime_wrapper_out_of_user_content() {
         let mut messages = vec![json!({"role": "user", "content": "original user"})];
 
         finalize_bridge_wire_messages(
             &mut messages,
             Some("<system-reminder>\nvolatile</system-reminder>".to_string()),
+            None,
             "openai",
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
         );
 
-        assert_eq!(messages.len(), 1);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "original user");
+        assert_eq!(messages[1]["role"], "system");
         assert_eq!(
-            messages[0]["content"],
-            "<system-reminder>\nvolatile</system-reminder>\n\noriginal user"
+            messages[1]["content"],
+            "<system-reminder>\nvolatile</system-reminder>"
         );
     }
 
@@ -1923,6 +2220,7 @@ mod context_cache_contract_tests {
 
         let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
             &mut messages,
+            None,
             None,
             "openai",
             "gpt-4",
@@ -1944,6 +2242,7 @@ mod context_cache_contract_tests {
         let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
             &mut messages,
             Some("volatile".to_string()),
+            None,
             "openai",
             "deepseek-v4-flash",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -1953,6 +2252,31 @@ mod context_cache_contract_tests {
         assert!(synthetic_tail_prefix_end.is_none());
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["content"], "original user");
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_keeps_required_context_for_current_user_only_models() {
+        let mut messages = vec![json!({"role": "user", "content": "original user"})];
+
+        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
+            &mut messages,
+            Some("best effort volatile".to_string()),
+            Some("required resume context".to_string()),
+            "openai",
+            "deepseek-v4-flash",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+        );
+
+        assert_eq!(synthetic_tail_prefix_end, Some(1));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "original user");
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[1]["content"], "required resume context");
+        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
+            &messages[1]
+        ));
     }
 
     #[test]
@@ -1968,6 +2292,7 @@ mod context_cache_contract_tests {
         let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
             &mut messages,
             Some("volatile".to_string()),
+            None,
             "openai",
             "gpt-4o",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,

@@ -3218,18 +3218,203 @@ impl AgenticRunLifecycleService {
         format!("## Agent Binding Instruction\n{}", binding.agent_md)
     }
 
+    fn prompt_visible_context_key_tokens(key: &str) -> Vec<String> {
+        let chars = key.chars().collect::<Vec<_>>();
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        for (index, ch) in chars.iter().copied().enumerate() {
+            if !ch.is_ascii_alphanumeric() {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                continue;
+            }
+            let prev = index
+                .checked_sub(1)
+                .and_then(|prev| chars.get(prev))
+                .copied();
+            let next = chars.get(index + 1).copied();
+            let camel_boundary = ch.is_ascii_uppercase()
+                && !current.is_empty()
+                && prev.is_some_and(|prev| prev.is_ascii_alphanumeric())
+                && (prev.is_some_and(|prev| prev.is_ascii_lowercase() || prev.is_ascii_digit())
+                    || next.is_some_and(|next| next.is_ascii_lowercase()));
+            if camel_boundary && !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            current.push(ch.to_ascii_lowercase());
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+        tokens
+    }
+
+    fn prompt_context_key_id(key: &str) -> String {
+        let tokens = Self::prompt_visible_context_key_tokens(key);
+        if tokens.is_empty() {
+            key.to_ascii_lowercase()
+        } else {
+            tokens.join("_")
+        }
+    }
+
+    fn prompt_visible_context_key(path: &[String], key: &str) -> Option<String> {
+        let normalized = Self::prompt_context_key_id(key);
+        let allowed = if path.is_empty() {
+            matches!(
+                normalized.as_str(),
+                "mode" | "raw_advice" | "model_name" | "author" | "authority" | "resources"
+            )
+        } else {
+            match path.last().map(String::as_str) {
+                Some("resources") => matches!(
+                    normalized.as_str(),
+                    "models" | "tools" | "skills" | "knowledge_bases"
+                ),
+                Some("models") => matches!(normalized.as_str(), "name" | "model_name"),
+                Some("tools" | "skills" | "knowledge_bases") => normalized == "name",
+                _ => false,
+            }
+        };
+        allowed.then_some(normalized)
+    }
+
+    fn prompt_visible_context_shape(path: &[String], value: &Value) -> bool {
+        match path {
+            [field]
+                if matches!(
+                    field.as_str(),
+                    "mode" | "raw_advice" | "model_name" | "author" | "authority"
+                ) =>
+            {
+                matches!(
+                    value,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            }
+            [field] if field == "resources" => value.is_object(),
+            [parent, field]
+                if parent == "resources"
+                    && matches!(
+                        field.as_str(),
+                        "models" | "tools" | "skills" | "knowledge_bases"
+                    ) =>
+            {
+                value.is_array()
+            }
+            [root, collection, field]
+                if root == "resources"
+                    && matches!(
+                        collection.as_str(),
+                        "models" | "tools" | "skills" | "knowledge_bases"
+                    )
+                    && matches!(field.as_str(), "name" | "model_name") =>
+            {
+                matches!(
+                    value,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn prompt_visible_context_value(
+        value: &Value,
+        depth: usize,
+        path: &mut Vec<String>,
+    ) -> Option<Value> {
+        const MAX_DEPTH: usize = 4;
+        const MAX_OBJECT_FIELDS: usize = 48;
+        const MAX_ARRAY_ITEMS: usize = 24;
+        const MAX_STRING_CHARS: usize = 2_000;
+
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => Some(value.clone()),
+            Value::String(text) => {
+                if text.is_empty() {
+                    Some(Value::String(String::new()))
+                } else if text.chars().count() <= MAX_STRING_CHARS {
+                    Some(Value::String(text.clone()))
+                } else {
+                    let truncated = text.chars().take(MAX_STRING_CHARS).collect::<String>();
+                    Some(Value::String(format!("{truncated}...[truncated]")))
+                }
+            }
+            Value::Array(items) => {
+                if depth >= MAX_DEPTH {
+                    return None;
+                }
+                let values = items
+                    .iter()
+                    .take(MAX_ARRAY_ITEMS)
+                    .filter_map(|item| Self::prompt_visible_context_value(item, depth + 1, path))
+                    .collect::<Vec<_>>();
+                Some(Value::Array(values))
+            }
+            Value::Object(object) => {
+                if depth >= MAX_DEPTH {
+                    return None;
+                }
+                let mut visible = Map::new();
+                for (key, value) in object {
+                    if visible.len() >= MAX_OBJECT_FIELDS {
+                        break;
+                    }
+                    let Some(normalized_key) = Self::prompt_visible_context_key(path, key) else {
+                        continue;
+                    };
+                    path.push(normalized_key);
+                    if Self::prompt_visible_context_shape(path, value)
+                        && let Some(value) =
+                            Self::prompt_visible_context_value(value, depth + 1, path)
+                    {
+                        visible.insert(key.clone(), value);
+                    }
+                    path.pop();
+                }
+                (!visible.is_empty()).then_some(Value::Object(visible))
+            }
+        }
+    }
+
     fn agent_binding_turn_context_section(context: &Map<String, Value>) -> Option<String> {
         if context.is_empty() {
             return None;
         }
-        let payload = serde_json::to_string_pretty(&Value::Object(context.clone()))
+        let mut path = Vec::new();
+        let payload_value =
+            Self::prompt_visible_context_value(&Value::Object(context.clone()), 0, &mut path)?;
+        let payload = serde_json::to_string(&payload_value)
             .expect("serde_json::Value serialization should not fail");
         Some(format!(
             "## Runtime Turn Context\nThe following JSON is provided by the runtime for this turn. Treat it as authoritative MOI context.\n```json\n{payload}\n```"
         ))
     }
 
-    fn apply_agent_binding_prompt_override(
+    fn append_runtime_volatile_prompt_text(edge_profile: &mut Map<String, Value>, text: String) {
+        use astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS;
+
+        if text.trim().is_empty() {
+            return;
+        }
+        let entry = edge_profile
+            .entry(EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        match entry {
+            Value::Array(items) => items.push(Value::String(text)),
+            Value::String(existing) if !existing.is_empty() => {
+                let previous = std::mem::take(existing);
+                *entry = Value::Array(vec![Value::String(previous), Value::String(text)]);
+            }
+            _ => {
+                *entry = Value::Array(vec![Value::String(text)]);
+            }
+        }
+    }
+
+    fn apply_agent_binding_prompt_context(
         edge_profile: &mut Map<String, Value>,
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         runtime_system_prompt: Option<&str>,
@@ -3242,26 +3427,26 @@ impl AgenticRunLifecycleService {
             .map(str::to_string);
         let binding_section = agent_binding_context
             .map(|context| Self::agent_binding_prompt_section(&context.binding));
-        let turn_context_section = agent_binding_context
-            .and(request_context)
-            .and_then(Self::agent_binding_turn_context_section);
+        // `runtime_system_prompt` is a session-stable system override. Per-turn
+        // facts must use `runtime_volatile_texts` so they land in
+        // RuntimeVolatile / CacheScope::None and do not churn the cached prefix.
         let runtime_section = runtime_system_prompt
             .filter(|prompt| !prompt.is_empty())
             .map(str::to_string);
-        let sections = [
-            existing,
-            binding_section,
-            turn_context_section,
-            runtime_section,
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        if sections.is_empty() {
-            return;
+        let sections = [existing, binding_section, runtime_section]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if !sections.is_empty() {
+            let merged = sections.join("\n\n");
+            edge_profile.insert("system_prompt_override".to_string(), Value::String(merged));
         }
-        let merged = sections.join("\n\n");
-        edge_profile.insert("system_prompt_override".to_string(), Value::String(merged));
+        if let Some(turn_context_section) = agent_binding_context
+            .and(request_context)
+            .and_then(Self::agent_binding_turn_context_section)
+        {
+            Self::append_runtime_volatile_prompt_text(edge_profile, turn_context_section);
+        }
     }
 
     /// Build a [`ServerAgenticLoopHost`] for a single run.
@@ -3684,12 +3869,24 @@ impl AgenticRunLifecycleService {
         };
         use astra_turn_core::turn_guard::TurnGuard;
 
+        let prompt_user_message =
+            astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(
+                &request.message,
+            );
+        let prompt_user_intent =
+            astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(
+                request
+                    .user_intent
+                    .as_deref()
+                    .filter(|intent| !intent.trim().is_empty())
+                    .unwrap_or(request.message.as_str()),
+            );
         let user_message = json!({
             "role": "user",
-            "content": request.message,
+            "content": prompt_user_message,
         });
 
-        let task_profile = infer_task_execution_profile(&request.message);
+        let task_profile = infer_task_execution_profile(&prompt_user_message);
         let runtime_turn_ceiling = astra_config::runtime_config::RuntimeConfig::cached()
             .runtime_limits
             .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context));
@@ -3882,9 +4079,11 @@ impl AgenticRunLifecycleService {
                     crate::turn::session_current_date::resolve_session_current_date(session_id),
                 ),
             ),
-            message: request.message.clone(),
+            message: prompt_user_message.clone(),
+            user_intent: prompt_user_intent,
             recent_tools: Vec::new(),
             has_prior_assistant_turn: false,
+            turn_intent: None,
             task_profile,
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
@@ -4465,6 +4664,7 @@ fn build_shutdown_extraction_request(
     state: &AgenticLoopState,
 ) -> Option<crate::session_memory::ExtractionRequest> {
     let user_id = state.context_manifest_user_id.clone()?;
+    let runtime_decision_user_intent = state.runtime_decision_user_intent();
     state.current_session_id.as_ref().map(|session_id| {
         crate::session_memory::ExtractionRequest {
             user_id,
@@ -4479,9 +4679,9 @@ fn build_shutdown_extraction_request(
             current_tool_calls: state.total_tool_calls as usize,
             had_error: state.error_recovery.consecutive_same_error > 0,
             had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(
-                &state.message,
+                &runtime_decision_user_intent,
             ),
-            turn_number: state.max_turns.saturating_sub(state.remaining_turns) as u32,
+            turn_number: state.current_session_turn_number(),
             config:
                 astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
                 ),
@@ -5035,7 +5235,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await?;
         let requires_runtime_mcp_executor = runtime_capabilities.mcp_bundle.is_some();
         let mut edge_profile = edge_context.edge_profile.to_map();
-        Self::apply_agent_binding_prompt_override(
+        Self::apply_agent_binding_prompt_context(
             &mut edge_profile,
             runtime_capabilities.agent_binding.as_ref(),
             request.runtime_system_prompt.as_deref(),
@@ -5916,7 +6116,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await?;
         let requires_runtime_mcp_executor = runtime_capabilities.mcp_bundle.is_some();
         let mut edge_profile = edge_context.edge_profile.to_map();
-        Self::apply_agent_binding_prompt_override(
+        Self::apply_agent_binding_prompt_context(
             &mut edge_profile,
             runtime_capabilities.agent_binding.as_ref(),
             request.runtime_system_prompt.as_deref(),
@@ -8385,9 +8585,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     ),
                 ),
             ),
-            message: full_task,
+            message: full_task.clone(),
+            user_intent: full_task,
             recent_tools: Vec::new(),
             has_prior_assistant_turn: false,
+            turn_intent: None,
             task_profile,
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)

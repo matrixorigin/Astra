@@ -203,6 +203,7 @@ pub(crate) struct PrepareTurnTelemetry<'a> {
 
 struct PrepareChatTurnRequest<'a> {
     messages: &'a [Value],
+    runtime_required_texts: &'a [String],
     runtime_volatile_texts: &'a [String],
     ephemeral_prefix: Option<&'a Value>,
     current_session_id: Option<&'a str>,
@@ -213,6 +214,7 @@ struct PrepareChatTurnRequest<'a> {
     explain: AgenticChatExplainFlags,
     project_root: &'a Path,
     message: &'a str,
+    user_intent: &'a str,
     semantic_query_override: Option<&'a str>,
     history: &'a [(String, String)],
     recent_tools: &'a [String],
@@ -383,6 +385,27 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Starting…");
 
+    let normalized_prompt =
+        astra_turn_core::runtime_scaffolding::normalize_prompt_facing_runtime_messages(
+            ctx.messages.to_vec(),
+        );
+    let prompt_messages = normalized_prompt.messages;
+    let mut runtime_required_texts = Vec::new();
+    for text in normalized_prompt
+        .required_runtime_texts
+        .iter()
+        .chain(ctx.runtime_required_texts.iter())
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+    {
+        if !runtime_required_texts
+            .iter()
+            .any(|existing| existing == text)
+        {
+            runtime_required_texts.push(text.to_string());
+        }
+    }
+
     let git_branch = read_git_branch_abbrev();
     let requested_model = astra_core::model_override::normalize_model_override(ctx.model);
     let (resolved_model, thinking_config) = match requested_model {
@@ -401,7 +424,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         None => (None, astra_turn_core::thinking_config::ThinkingConfig::Off),
     };
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
-        messages: ctx.messages,
+        messages: &prompt_messages,
+        user_intent: Some(ctx.user_intent),
         session_id: ctx.current_session_id,
         agent_id: Some("astra-cli"),
         model_id: ctx.model_id,
@@ -415,6 +439,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         git_branch,
         thinking: thinking_config,
     });
+
+    if !runtime_required_texts.is_empty()
+        && let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        ep_obj.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS
+                .to_string(),
+            json!(runtime_required_texts),
+        );
+    }
 
     if !ctx.runtime_volatile_texts.is_empty()
         && let Some(root) = payload.as_object_mut()
@@ -468,7 +504,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Recalling memory…");
 
     let budget_pressure = chat_turn_budget_pressure(
-        ctx.messages,
+        &prompt_messages,
         ctx.registry,
         ctx.effective_input_budget_tokens,
     );
@@ -936,7 +972,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     }
     // ─── Recent-argument hints (gap #5): surface just-used paths + commands ───
     if let Some(hints_text) =
-        astra_runtime::recent_arg_hints::prompt_block_from_messages(ctx.messages)
+        astra_runtime::recent_arg_hints::prompt_block_from_messages(&prompt_messages)
         && let Some(root) = payload.as_object_mut()
         && let Some(ep) = root.get_mut("edge_profile")
         && let Some(ep_obj) = ep.as_object_mut()
@@ -1000,7 +1036,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let schema_tokens =
             trace_token_count_u32(visible_tool_tokens_total_u64, "tool_schema_tokens");
         let max_tokens = trace_token_count_u32(ctx.effective_input_budget_tokens, "max_tokens");
-        let history_messages = retained_history_messages(ctx.messages);
+        let history_messages = retained_history_messages(&prompt_messages);
 
         // Estimate retained history tokens from prior messages only.
         let history_tokens_u64: u64 = history_messages
@@ -1132,6 +1168,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub term_width: usize,
     pub render_policy: RenderPolicy,
     pub message: &'a str,
+    pub user_intent: &'a str,
     pub semantic_query_override: Option<&'a str>,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
@@ -1139,6 +1176,10 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub executor: Arc<ToolExecutor>,
     pub registry: &'a ToolRegistry,
     pub messages: &'a [Value],
+    /// Runtime-owned per-turn control context that must reach the current model
+    /// call but must stay out of user content and persisted prompt-facing
+    /// history.
+    pub runtime_required_texts: &'a [String],
     /// CLI runtime nudges drained from the structured volatile lane. Sent as
     /// edge metadata so the runtime can apply model-resolved cache capability
     /// before deciding whether to inject or drop them.
@@ -1300,12 +1341,14 @@ pub(crate) async fn fetch_chat_turn_sse(
         term_width,
         render_policy,
         message,
+        user_intent,
         history,
         recent_tools,
         project_root,
         executor,
         registry,
         messages,
+        runtime_required_texts,
         runtime_volatile_texts,
         ephemeral_prefix,
         current_session_id,
@@ -1377,6 +1420,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         &ui,
         PrepareChatTurnRequest {
             messages,
+            runtime_required_texts,
             runtime_volatile_texts,
             ephemeral_prefix,
             current_session_id,
@@ -1391,6 +1435,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             }),
             project_root,
             message,
+            user_intent,
             semantic_query_override,
             history,
             recent_tools,
@@ -1511,7 +1556,8 @@ mod tests {
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
     use astra_turn_core::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
-        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
+        EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+        EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
     };
     use serde_json::{Value, json};
 
@@ -1535,6 +1581,174 @@ mod tests {
                 "parameters": { "type": "object", "properties": {} }
             }
         })
+    }
+
+    async fn prepare_payload_for_runtime_lane_test(
+        runtime_required_texts: &[String],
+        runtime_volatile_texts: &[String],
+    ) -> Value {
+        prepare_payload_with_messages_for_runtime_lane_test(
+            vec![json!({"role": "user", "content": "continue"})],
+            runtime_required_texts,
+            runtime_volatile_texts,
+        )
+        .await
+    }
+
+    async fn prepare_payload_with_messages_for_runtime_lane_test(
+        messages: Vec<Value>,
+        runtime_required_texts: &[String],
+        runtime_volatile_texts: &[String],
+    ) -> Value {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas: Vec<Value> = Vec::new();
+        let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(100);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut valid_tool_names = HashSet::new();
+        let mut widen_selection_pending = false;
+        let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        prepare_chat_turn_payload(PrepareChatTurnRequest {
+            messages: &messages,
+            runtime_required_texts,
+            runtime_volatile_texts,
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model_id: None,
+            model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "continue",
+            user_intent: "continue",
+            semantic_query_override: None,
+            history: &history,
+            recent_tools: &recent_tools,
+            executor,
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            valid_tool_names: &mut valid_tool_names,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            widen_selection_pending: &mut widen_selection_pending,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                trace_collector: None,
+            },
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_resume_hint: None,
+            plan_mode_active: false,
+            lessons_text: None,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_routes_runtime_context_through_edge_profile_lanes() {
+        let required = vec!["Resume the interrupted turn before answering.".to_string()];
+        let volatile = vec!["Background task completed.".to_string()];
+
+        let payload = prepare_payload_for_runtime_lane_test(&required, &volatile).await;
+
+        assert_eq!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS],
+            json!(required)
+        );
+        assert_eq!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS],
+            json!(volatile)
+        );
+        let messages = serde_json::to_string(&payload["messages"]).unwrap();
+        assert!(messages.contains("continue"));
+        assert!(!messages.contains("Resume the interrupted turn"));
+        assert!(!messages.contains("Background task completed"));
+        assert!(!messages.contains("<system-reminder>"));
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_normalizes_cli_server_prompt_boundary() {
+        let messages = vec![
+            json!({"role": "user", "content": "我说过的所有话\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "skill-auto-route-analyze-session",
+                    "type": "function",
+                    "function": {"name": "skill", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "skill-auto-route-analyze-session", "content": "<skill-loaded name=\"analyze-session\"/>"}),
+            json!({"role": "assistant", "content": "你问过我总结这段会话。"}),
+            json!({"role": "user", "content": "继续"}),
+        ];
+        let structured = vec!["structured resume lane".to_string()];
+
+        let payload =
+            prepare_payload_with_messages_for_runtime_lane_test(messages, &structured, &[]).await;
+        let payload_messages = serde_json::to_string(&payload["messages"]).unwrap();
+
+        assert!(payload_messages.contains("我说过的所有话"));
+        assert!(payload_messages.contains("你问过我总结这段会话。"));
+        assert!(payload_messages.contains("继续"));
+        assert!(!payload_messages.contains("<system-reminder>"));
+        assert!(!payload_messages.contains("[session-resume:v1]"));
+        assert!(!payload_messages.contains("skill-auto-route"));
+        assert!(!payload_messages.contains("<skill-loaded"));
+        assert_eq!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS],
+            json!([
+                "[session-resume:v1]\nHydrated previous session context",
+                "structured resume lane"
+            ])
+        );
     }
 
     #[test]
@@ -2077,6 +2291,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -2087,6 +2302,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repo state",
+            user_intent: "inspect the repo state",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -2260,6 +2476,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -2270,6 +2487,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repo state",
+            user_intent: "inspect the repo state",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -2383,6 +2601,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-empty-surface"),
@@ -2393,6 +2612,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: empty_surface_message,
+            user_intent: empty_surface_message,
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -2502,6 +2722,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-pending-activation"),
@@ -2512,6 +2733,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: empty_surface_message,
+            user_intent: empty_surface_message,
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -2600,6 +2822,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-empty"),
@@ -2610,6 +2833,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repository",
+            user_intent: "inspect the repository",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -2715,6 +2939,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -2725,6 +2950,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "run make check",
+            user_intent: "run make check",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -2831,6 +3057,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -2841,6 +3068,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message,
+            user_intent: message,
             semantic_query_override: Some(semantic_query_override),
             history: &history,
             recent_tools: &recent_tools,
@@ -2958,6 +3186,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -2968,6 +3197,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "implement the approved plan",
+            user_intent: "implement the approved plan",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -3085,6 +3315,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -3095,6 +3326,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "remember this",
+            user_intent: "remember this",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -3198,6 +3430,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -3208,6 +3441,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "no deferred tools",
+            user_intent: "no deferred tools",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -3304,6 +3538,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -3314,6 +3549,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "delegate review with parallel agents",
+            user_intent: "delegate review with parallel agents",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -3418,6 +3654,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -3428,6 +3665,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "fan out this work",
+            user_intent: "fan out this work",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -3528,6 +3766,7 @@ mod tests {
 
         let first_payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -3538,6 +3777,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "update the file",
+            user_intent: "update the file",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -3595,6 +3835,7 @@ mod tests {
 
         let second_payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -3605,6 +3846,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "update the file",
+            user_intent: "update the file",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -3700,6 +3942,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -3710,6 +3953,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "fix the bug",
+            user_intent: "fix the bug",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,
@@ -3801,6 +4045,7 @@ mod tests {
 
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
+            runtime_required_texts: &[],
             runtime_volatile_texts: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
@@ -3811,6 +4056,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "hi",
+            user_intent: "hi",
             semantic_query_override: None,
             history: &history,
             recent_tools: &recent_tools,

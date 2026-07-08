@@ -657,6 +657,60 @@ fn restore_step_checkpoint_runtime_state_restores_replay_guards_and_runtime_stat
 }
 
 #[test]
+fn shutdown_extraction_request_uses_outer_session_turn() {
+    let svc = test_service();
+    let request = test_request("resume");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.context_manifest_user_id = Some("test-user".to_string());
+    state.session_turn = 12;
+    state.max_turns = 50;
+    state.remaining_turns = 49;
+
+    let req = build_shutdown_extraction_request(&state)
+        .expect("shutdown extraction request should build");
+
+    assert_eq!(
+        req.turn_number, 12,
+        "shutdown extraction must record the persisted session turn, not the request-local loop step"
+    );
+}
+
+#[test]
+fn shutdown_extraction_request_detects_correction_from_structured_user_intent() {
+    let svc = test_service();
+    let mut request = test_request(
+        "<project-instructions>\nDo not classify this wrapper.\n</project-instructions>\n\ncontinue",
+    );
+    request.user_intent = Some("no, that's wrong, fix it the way I said".to_string());
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.context_manifest_user_id = Some("test-user".to_string());
+
+    let req = build_shutdown_extraction_request(&state)
+        .expect("shutdown extraction request should build");
+
+    assert!(
+        req.had_user_correction,
+        "shutdown extraction must classify pure user intent, not prompt-facing runtime content"
+    );
+}
+
+#[test]
 fn run_scoped_agent_progress_filter_replays_early_events_after_spawn() {
     let mut filter = server_loop_host::RunScopedAgentProgressFilter::new("root-run".to_string());
 
@@ -1393,9 +1447,13 @@ async fn server_spawn_runtime_context_requires_parent_lineage() {
 
 #[test]
 fn subrun_turn_budget_keeps_profile_extensions_when_spawn_budget_is_small() {
-    let profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-        "explore the codebase and implement the fix",
-    );
+    let profile =
+        astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+            true,
+            true,
+            astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
+            true,
+        );
     let budget = resolve_subrun_agentic_turn_budget(profile, Some(3));
 
     assert!(
@@ -2580,6 +2638,7 @@ async fn seed_lifecycle_run_for_pause_resume_it(
 fn test_request(message: &str) -> ChatRequestData {
     ChatRequestData {
         message: message.to_string(),
+        user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
         runtime_system_prompt: None,
@@ -6057,6 +6116,7 @@ fn extract_edge_tools_from_context() {
     );
     let req = ChatRequestData {
         message: "hi".into(),
+        user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
         runtime_system_prompt: None,
@@ -6225,6 +6285,7 @@ fn extract_edge_profile_from_context() {
     );
     let req = ChatRequestData {
         message: "hi".into(),
+        user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
         runtime_system_prompt: None,
@@ -6286,6 +6347,44 @@ fn build_initial_state_sets_user_message() {
 }
 
 #[test]
+fn build_initial_state_strips_runtime_affix_from_user_message() {
+    let svc = test_service();
+    let req = test_request(
+        "我说过的所有话\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>",
+    );
+
+    let state = svc.build_initial_state("test-user", &req, "sess-1", "run-1", None, None, None);
+
+    assert_eq!(state.messages.len(), 1);
+    assert_eq!(state.messages[0]["role"], "user");
+    assert_eq!(state.messages[0]["content"], "我说过的所有话");
+    assert_eq!(state.message, "我说过的所有话");
+    assert_eq!(state.user_intent, "我说过的所有话");
+}
+
+#[test]
+fn build_initial_state_preserves_structured_user_intent_separate_from_prompt_message() {
+    let svc = test_service();
+    let mut req = test_request(
+        "<project-instructions>\nUse the repo policy.\n</project-instructions>\n\nreview changes",
+    );
+    req.user_intent = Some("review changes".to_string());
+
+    let state = svc.build_initial_state("test-user", &req, "sess-1", "run-1", None, None, None);
+
+    assert_eq!(
+        state.messages[0]["content"],
+        "<project-instructions>\nUse the repo policy.\n</project-instructions>\n\nreview changes"
+    );
+    assert_eq!(
+        state.message,
+        "<project-instructions>\nUse the repo policy.\n</project-instructions>\n\nreview changes"
+    );
+    assert_eq!(state.user_intent, "review changes");
+    assert_eq!(state.runtime_decision_user_intent(), "review changes");
+}
+
+#[test]
 fn build_initial_state_applies_execution_budget_override() {
     let svc = test_service();
     let mut req = test_request("go");
@@ -6323,7 +6422,7 @@ fn agent_binding_prompt_override_appends_stable_section() {
         Value::String("Existing instruction.".to_string()),
     )]);
 
-    AgenticRunLifecycleService::apply_agent_binding_prompt_override(
+    AgenticRunLifecycleService::apply_agent_binding_prompt_context(
         &mut edge_profile,
         Some(&context),
         None,
@@ -6348,7 +6447,7 @@ fn agent_binding_prompt_override_appends_runtime_system_prompt() {
     };
     let mut edge_profile = serde_json::Map::new();
 
-    AgenticRunLifecycleService::apply_agent_binding_prompt_override(
+    AgenticRunLifecycleService::apply_agent_binding_prompt_context(
         &mut edge_profile,
         Some(&context),
         Some("Runtime SQL scope db_name: retail."),
@@ -6366,7 +6465,7 @@ fn agent_binding_prompt_override_appends_runtime_system_prompt() {
 }
 
 #[test]
-fn agent_binding_prompt_override_appends_moi_turn_context() {
+fn agent_binding_prompt_context_routes_turn_context_to_volatile_lane() {
     let context = PreparedAgentBindingLoopContext {
         binding: test_agent_binding_record(Some(3)),
         skill_resolver: None,
@@ -6375,18 +6474,41 @@ fn agent_binding_prompt_override_appends_moi_turn_context() {
     let request_context = json!({
         "mode": "create",
         "raw_advice": "Build a GitHub triage agent.",
+        "model_name": {"secret": "object-model-secret"},
         "resources": {
             "models": [{"name": "qwen3.7-max", "model_name": "qwen3.7-max"}],
             "tools": [{"name": "GitHub"}],
             "skills": [{"name": "Artifacts"}],
             "knowledge_bases": []
+        },
+        "author": "alice",
+        "authority": "normal-business-field",
+        "cookie": "session=secret-cookie",
+        "headers": {"authorization": "Bearer header-secret"},
+        "connection_string": "mysql://root:password@127.0.0.1/db",
+        "dsn": "postgres://root:password@127.0.0.1/db",
+        "host": "internal.local",
+        "safe_but_unlisted": "should-not-appear",
+        "api_key": "secret-api-key",
+        "apiKey": "camel-api-key",
+        "accessToken": "camel-access-token",
+        "authToken": "camel-auth-token",
+        "secretKey": "camel-secret-key",
+        "endpointUrl": "http://127.0.0.1:9/endpoint",
+        "runtime_auth": {"authorization": "Bearer secret"},
+        "runtimeAuth": {"authorization": "Bearer camel-secret"},
+        "capability_descriptors": {
+            "mcp": {"endpoint_url": "http://127.0.0.1:9/mcp"}
+        },
+        "capabilityDescriptors": {
+            "mcp": {"endpointUrl": "http://127.0.0.1:9/camel-mcp"}
         }
     })
     .as_object()
     .expect("context object")
     .clone();
 
-    AgenticRunLifecycleService::apply_agent_binding_prompt_override(
+    AgenticRunLifecycleService::apply_agent_binding_prompt_context(
         &mut edge_profile,
         Some(&context),
         None,
@@ -6398,12 +6520,127 @@ fn agent_binding_prompt_override_appends_moi_turn_context() {
         .and_then(Value::as_str)
         .expect("system prompt override");
     assert!(prompt.contains("## Agent Binding Instruction"));
-    assert!(prompt.contains("## Runtime Turn Context"));
-    assert!(prompt.contains("\"mode\": \"create\""));
-    assert!(prompt.contains("\"raw_advice\": \"Build a GitHub triage agent.\""));
-    assert!(prompt.contains("\"name\": \"GitHub\""));
-    assert!(prompt.contains("\"name\": \"Artifacts\""));
-    assert!(prompt.contains("\"model_name\": \"qwen3.7-max\""));
+    assert!(!prompt.contains("## Runtime Turn Context"));
+
+    let volatile = edge_profile
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS)
+        .and_then(Value::as_array)
+        .expect("runtime volatile texts");
+    let text = volatile
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("## Runtime Turn Context"));
+    assert!(text.contains("\"mode\":\"create\""));
+    assert!(text.contains("\"raw_advice\":\"Build a GitHub triage agent.\""));
+    assert!(text.contains("\"name\":\"GitHub\""));
+    assert!(text.contains("\"name\":\"Artifacts\""));
+    assert!(text.contains("\"model_name\":\"qwen3.7-max\""));
+    assert!(text.contains("\"author\":\"alice\""));
+    assert!(text.contains("\"authority\":\"normal-business-field\""));
+    assert!(!text.contains("Bearer secret"));
+    assert!(!text.contains("Bearer camel-secret"));
+    assert!(!text.contains("header-secret"));
+    assert!(!text.contains("secret-cookie"));
+    assert!(!text.contains("connection_string"));
+    assert!(!text.contains("should-not-appear"));
+    assert!(!text.contains("internal.local"));
+    assert!(!text.contains("object-model-secret"));
+    assert!(!text.contains("secret-api-key"));
+    assert!(!text.contains("camel-api-key"));
+    assert!(!text.contains("camel-access-token"));
+    assert!(!text.contains("camel-auth-token"));
+    assert!(!text.contains("camel-secret-key"));
+    assert!(!text.contains("api_key"));
+    assert!(!text.contains("apiKey"));
+    assert!(!text.contains("accessToken"));
+    assert!(!text.contains("authToken"));
+    assert!(!text.contains("secretKey"));
+    assert!(!text.contains("endpointUrl"));
+    assert!(!text.contains("runtimeAuth"));
+    assert!(!text.contains("capabilityDescriptors"));
+    assert!(!text.contains("endpoint_url"));
+    assert!(!text.contains("127.0.0.1"));
+}
+
+#[test]
+fn agent_binding_prompt_context_keeps_stable_prompt_identical_when_turn_context_changes() {
+    let context = PreparedAgentBindingLoopContext {
+        binding: test_agent_binding_record(Some(3)),
+        skill_resolver: None,
+    };
+    let first_turn = serde_json::json!({
+        "mode": "create",
+        "raw_advice": "first turn advice",
+        "resources": {
+            "models": [{"name": "qwen3.7-max", "model_name": "qwen3.7-max"}]
+        }
+    })
+    .as_object()
+    .expect("first turn context")
+    .clone();
+    let second_turn = serde_json::json!({
+        "mode": "refine",
+        "raw_advice": "second turn advice",
+        "resources": {
+            "models": [{"name": "qwen3.7-max", "model_name": "qwen3.7-max"}]
+        }
+    })
+    .as_object()
+    .expect("second turn context")
+    .clone();
+    let mut first_profile = serde_json::Map::new();
+    let mut second_profile = serde_json::Map::new();
+
+    AgenticRunLifecycleService::apply_agent_binding_prompt_context(
+        &mut first_profile,
+        Some(&context),
+        Some("Session-level runtime system prompt."),
+        Some(&first_turn),
+    );
+    AgenticRunLifecycleService::apply_agent_binding_prompt_context(
+        &mut second_profile,
+        Some(&context),
+        Some("Session-level runtime system prompt."),
+        Some(&second_turn),
+    );
+
+    let first_stable = first_profile
+        .get("system_prompt_override")
+        .and_then(Value::as_str)
+        .expect("first stable prompt");
+    let second_stable = second_profile
+        .get("system_prompt_override")
+        .and_then(Value::as_str)
+        .expect("second stable prompt");
+    assert_eq!(
+        first_stable, second_stable,
+        "per-turn runtime context must not churn the session-stable prompt prefix"
+    );
+    assert!(first_stable.contains("Session-level runtime system prompt."));
+    assert!(!first_stable.contains("first turn advice"));
+    assert!(!first_stable.contains("second turn advice"));
+
+    let first_volatile = first_profile
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS)
+        .and_then(Value::as_array)
+        .expect("first volatile texts")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let second_volatile = second_profile
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS)
+        .and_then(Value::as_array)
+        .expect("second volatile texts")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(first_volatile, second_volatile);
+    assert!(first_volatile.contains("first turn advice"));
+    assert!(second_volatile.contains("second turn advice"));
 }
 
 #[test]
@@ -6421,7 +6658,7 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_max_steps() {
     let edge_context =
         AgenticRunLifecycleService::extract_edge_context(&req).expect("edge context");
     let mut edge_profile = edge_context.edge_profile.to_map();
-    AgenticRunLifecycleService::apply_agent_binding_prompt_override(
+    AgenticRunLifecycleService::apply_agent_binding_prompt_context(
         &mut edge_profile,
         Some(&binding_context),
         None,

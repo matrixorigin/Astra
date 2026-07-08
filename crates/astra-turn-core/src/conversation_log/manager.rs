@@ -4,6 +4,8 @@
 
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 use super::{
     AppendMeta, CslEntry, CslStore, CslStoreError, MaterializedState, SessionStateCompact,
     SessionStatePatch, materialize, validate_session_id,
@@ -30,7 +32,7 @@ pub struct CslManager {
     config: CslManagerConfig,
     last_seq: u64,
     last_turn: u32,
-    turn_start_message_count: usize,
+    last_prompt_message_hashes: Vec<PromptMessageHash>,
     trace_id: Option<String>,
     last_session_state: SessionStateCompact,
 }
@@ -48,7 +50,7 @@ impl CslManager {
             config,
             last_seq: 0,
             last_turn: 0,
-            turn_start_message_count: 0,
+            last_prompt_message_hashes: Vec::new(),
             trace_id: None,
             last_session_state: SessionStateCompact::default(),
         })
@@ -87,19 +89,21 @@ impl CslManager {
         if entries.is_empty() {
             return Ok(None);
         }
-        let mat = materialize(&entries)?;
+        let mut mat = materialize(&entries)?;
+        mat.messages = crate::prompt_facing::sanitize_prompt_facing_messages(mat.messages);
         self.last_seq = mat.last_seq;
         self.last_turn = mat.last_turn;
-        self.turn_start_message_count = mat.messages.len();
+        self.last_prompt_message_hashes = prompt_message_hashes(&mat.messages);
         self.last_session_state = mat.session_state.clone();
         Ok(Some(mat))
     }
 
     /// Record the message count at the start of the current turn.
-    /// `persist_turn` uses this to compute appended messages.
-    pub fn mark_turn_start(&mut self, message_count: usize) {
-        self.turn_start_message_count = message_count;
-    }
+    ///
+    /// This remains available to callers that track turn boundaries, but
+    /// `persist_turn` computes CSL deltas from the last canonical prompt-facing
+    /// message sequence instead of trusting a caller-provided count.
+    pub fn mark_turn_start(&mut self, _message_count: usize) {}
 
     /// Persist the outcome of the current turn.
     ///
@@ -111,16 +115,20 @@ impl CslManager {
         messages: &[serde_json::Value],
         session_state: &SessionStateCompact,
     ) -> Result<(), CslStoreError> {
+        let prompt_messages =
+            crate::prompt_facing::sanitize_prompt_facing_messages(messages.to_vec());
+        let prompt_message_count = prompt_messages.len();
         let meta = AppendMeta {
             trace_id: self.trace_id.clone(),
-            message_count: Some(messages.len() as u32),
+            message_count: Some(prompt_message_count as u32),
         };
 
         if self.last_seq == 0 {
+            let prompt_message_hashes = prompt_message_hashes(&prompt_messages);
             let snapshot = CslEntry::Snapshot {
                 seq: 1,
                 turn,
-                messages: messages.to_vec(),
+                messages: prompt_messages.clone(),
                 session_state: session_state.clone(),
             };
             self.store
@@ -128,17 +136,34 @@ impl CslManager {
                 .await?;
             self.last_seq = 1;
             self.last_turn = turn;
-            self.turn_start_message_count = messages.len();
+            self.last_prompt_message_hashes = prompt_message_hashes;
             self.last_session_state = session_state.clone();
             return Ok(());
         }
 
-        // Compute appended messages from the turn_start marker.
-        let appended = if self.turn_start_message_count < messages.len() {
-            messages[self.turn_start_message_count..].to_vec()
-        } else {
-            Vec::new()
-        };
+        let prompt_message_hashes = prompt_message_hashes(&prompt_messages);
+        let common_prefix_len =
+            common_prompt_prefix_len(&self.last_prompt_message_hashes, &prompt_message_hashes);
+        if common_prefix_len < self.last_prompt_message_hashes.len() {
+            let next_seq = self.last_seq + 1;
+            let snapshot = CslEntry::Snapshot {
+                seq: next_seq,
+                turn,
+                messages: prompt_messages.clone(),
+                session_state: session_state.clone(),
+            };
+            self.store
+                .append(&self.session_id, &snapshot, &meta)
+                .await?;
+            self.last_seq = next_seq;
+            self.last_turn = turn;
+            self.last_prompt_message_hashes = prompt_message_hashes;
+            self.last_session_state = session_state.clone();
+            self.gc().await?;
+            return Ok(());
+        }
+
+        let appended = prompt_messages[common_prefix_len..].to_vec();
 
         let next_seq = self.last_seq + 1;
         let delta = CslEntry::TurnDelta {
@@ -150,7 +175,7 @@ impl CslManager {
         self.store.append(&self.session_id, &delta, &meta).await?;
         self.last_seq = next_seq;
         self.last_turn = turn;
-        self.turn_start_message_count = messages.len();
+        self.last_prompt_message_hashes = prompt_message_hashes.clone();
         self.last_session_state = session_state.clone();
 
         // Periodic snapshot + GC.
@@ -162,13 +187,14 @@ impl CslManager {
             let snapshot = CslEntry::Snapshot {
                 seq: snap_seq,
                 turn,
-                messages: messages.to_vec(),
+                messages: prompt_messages.clone(),
                 session_state: session_state.clone(),
             };
             self.store
                 .append(&self.session_id, &snapshot, &meta)
                 .await?;
             self.last_seq = snap_seq;
+            self.last_prompt_message_hashes = prompt_message_hashes;
 
             self.gc().await?;
         }
@@ -208,7 +234,7 @@ impl CslManager {
             .await?;
         self.last_seq = 0;
         self.last_turn = 0;
-        self.turn_start_message_count = 0;
+        self.last_prompt_message_hashes.clear();
         self.last_session_state = SessionStateCompact::default();
         Ok(())
     }
@@ -232,6 +258,24 @@ impl CslManager {
             .await?;
         Ok(())
     }
+}
+
+type PromptMessageHash = [u8; 32];
+
+fn prompt_message_hashes(messages: &[serde_json::Value]) -> Vec<PromptMessageHash> {
+    messages.iter().map(prompt_message_hash).collect()
+}
+
+fn prompt_message_hash(message: &serde_json::Value) -> PromptMessageHash {
+    let bytes = serde_json::to_vec(message).unwrap_or_else(|_| format!("{message:?}").into_bytes());
+    Sha256::digest(bytes).into()
+}
+
+fn common_prompt_prefix_len(left: &[PromptMessageHash], right: &[PromptMessageHash]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 impl SessionStatePatch {
@@ -694,7 +738,7 @@ mod tests {
         assert_eq!(mat.messages[0]["content"], "fresh");
     }
 
-    // ── Review fix: persist_turn auto-advances turn_start_message_count ──
+    // ── Review fix: persist_turn auto-advances canonical prompt state ───
 
     #[tokio::test]
     async fn persist_turn_auto_advances_turn_start_so_deltas_are_incremental() {
@@ -735,6 +779,128 @@ mod tests {
         } else {
             panic!("entry[1] should be TurnDelta");
         }
+    }
+
+    #[tokio::test]
+    async fn persist_turn_sanitizes_prompt_facing_history_at_manager_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        let mut mgr = CslManager::new(
+            Arc::clone(&store),
+            "manager-sanitizes".into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+
+        let t1 = vec![
+            user_msg(
+                "review changes\n\n<system-reminder>\n[session-resume:v1]\nresume hint\n</system-reminder>",
+            ),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "function": {"name": "skill", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "<skill-loaded name=\"review-changes\"/>"}),
+            assistant_msg("reviewed"),
+        ];
+        mgr.persist_turn(1, &t1, &default_state()).await.unwrap();
+
+        let t2 = vec![
+            t1[0].clone(),
+            t1[1].clone(),
+            t1[2].clone(),
+            t1[3].clone(),
+            user_msg("next step\n\n<system-reminder>\nbackground update\n</system-reminder>"),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c2", "function": {"name": "bash", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": "raw command output"}),
+            assistant_msg("next done"),
+        ];
+        mgr.persist_turn(2, &t2, &default_state()).await.unwrap();
+
+        let entries = store.load_after("manager-sanitizes", 0).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        if let CslEntry::TurnDelta { appended, .. } = &entries[1] {
+            assert_eq!(
+                appended,
+                &vec![user_msg("next step"), assistant_msg("next done")]
+            );
+        } else {
+            panic!("entry[1] should be TurnDelta");
+        }
+
+        let mut loader = CslManager::new(
+            Arc::clone(&store),
+            "manager-sanitizes".into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+        let mat = loader.load().await.unwrap().unwrap();
+        assert_eq!(
+            mat.messages,
+            vec![
+                user_msg("review changes"),
+                assistant_msg("reviewed"),
+                user_msg("next step"),
+                assistant_msg("next done"),
+            ]
+        );
+        let joined = mat
+            .messages
+            .iter()
+            .filter_map(|msg| msg["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains("<system-reminder>"));
+        assert!(!joined.contains("[session-resume:v1]"));
+        assert!(!joined.contains("<skill-loaded"));
+        assert!(mat.messages.iter().all(|msg| msg["role"] != "tool"));
+        assert!(
+            mat.messages
+                .iter()
+                .all(|msg| msg.get("tool_calls").is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_history_divergence_writes_snapshot_instead_of_count_based_delta() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        let mut mgr = CslManager::new(
+            Arc::clone(&store),
+            "canonical-divergence".into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+
+        let t1 = vec![
+            user_msg("1+1"),
+            user_msg("1+2"),
+            assistant_msg("1+1 = 2\n1+2 = 3"),
+        ];
+        mgr.persist_turn(1, &t1, &default_state()).await.unwrap();
+
+        let t2 = vec![
+            user_msg("1+1\n\n1+2"),
+            assistant_msg("1+1 = 2\n1+2 = 3"),
+            user_msg("1+4"),
+            assistant_msg("1+4 = 5"),
+        ];
+        mgr.mark_turn_start(t1.len());
+        mgr.persist_turn(2, &t2, &default_state()).await.unwrap();
+
+        let entries = store.load_after("canonical-divergence", 0).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_snapshot());
+        assert!(
+            entries[1].is_snapshot(),
+            "non-prefix canonical history must replace state with a snapshot"
+        );
+
+        let mut loader = CslManager::new(
+            Arc::clone(&store),
+            "canonical-divergence".into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+        let mat = loader.load().await.unwrap().unwrap();
+        assert_eq!(mat.messages, t2);
     }
 
     // ── Review fix: reset with large before_seq must actually truncate ──
@@ -866,7 +1032,7 @@ mod tests {
         assert_eq!(mat.messages[5]["content"], "a3");
     }
 
-    // ── R1: GC failure must not leave turn_start_message_count stale ────
+    // ── R1: GC failure must not leave canonical prompt state stale ──────
 
     /// Store wrapper that delegates to an inner store but fails `truncate_before`.
     struct FailingGcStore {
@@ -920,7 +1086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_failure_still_updates_turn_start_message_count() {
+    async fn gc_failure_still_updates_canonical_prompt_state() {
         let tmp = TempDir::new().unwrap();
         let real_store = make_store(&tmp);
         let failing_store: Arc<dyn CslStore> = Arc::new(FailingGcStore {
@@ -938,7 +1104,7 @@ mod tests {
         mgr.persist_turn(1, &t1, &default_state()).await.unwrap();
 
         // Turn 2 triggers snapshot+GC. GC will fail — but persist_turn should
-        // still update turn_start_message_count so the NEXT turn's delta is correct.
+        // still update the canonical prompt state so the NEXT turn's delta is correct.
         let t2 = vec![
             user_msg("q1"),
             assistant_msg("a1"),
@@ -950,9 +1116,8 @@ mod tests {
         // The GC error propagates — that's expected.
         assert!(gc_result.is_err(), "GC failure should propagate");
 
-        // KEY ASSERTION: even though GC failed, turn_start_message_count
-        // must reflect the 4 messages from turn 2, so the next delta is incremental.
-        // If the bug is present, turn_start_message_count stays at 2 (from turn 1).
+        // KEY ASSERTION: even though GC failed, the manager must retain the
+        // canonical 4-message state from turn 2, so the next delta is incremental.
         let t3 = vec![
             user_msg("q1"),
             assistant_msg("a1"),
@@ -977,10 +1142,10 @@ mod tests {
         );
     }
 
-    // ── I1: load() should set turn_start_message_count ──────────────────
+    // ── I1: load() should set canonical prompt state ────────────────────
 
     #[tokio::test]
-    async fn load_sets_turn_start_message_count() {
+    async fn load_sets_canonical_prompt_state() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
 
@@ -1004,7 +1169,7 @@ mod tests {
         assert_eq!(mat.messages.len(), 4);
 
         // Persist turn 3 WITHOUT calling mark_turn_start — load() should have
-        // set turn_start_message_count to 4 so the delta is only the 2 new messages.
+        // restored the canonical 4-message state so the delta is only the 2 new messages.
         let t3 = vec![
             user_msg("q1"),
             assistant_msg("a1"),
@@ -1027,10 +1192,10 @@ mod tests {
         );
     }
 
-    // ── Test gap: persist_turn with fewer messages than turn_start ──────
+    // ── Test gap: persist_turn with non-prefix canonical history ────────
 
     #[tokio::test]
-    async fn persist_turn_fewer_messages_than_start_produces_empty_delta() {
+    async fn persist_turn_non_prefix_history_replaces_state_with_snapshot() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
         let mut mgr = CslManager::new(
@@ -1049,28 +1214,16 @@ mod tests {
         ];
         mgr.persist_turn(1, &t1, &default_state()).await.unwrap();
 
-        // Turn 2: only 2 messages (compaction removed older ones).
-        // turn_start_message_count is 4, but messages.len() is 2.
+        // Turn 2: only 2 messages remain. A TurnDelta cannot express removals,
+        // so the manager must write a new canonical snapshot.
         let t2 = vec![user_msg("compacted"), assistant_msg("summary")];
         mgr.persist_turn(2, &t2, &default_state()).await.unwrap();
 
-        // The delta should have empty appended (no panic from slice).
         let entries = store.load_after("fewer-msgs", 0).await.unwrap();
-        assert_eq!(entries.len(), 2); // snapshot + delta
-        if let CslEntry::TurnDelta { appended, .. } = &entries[1] {
-            assert!(
-                appended.is_empty(),
-                "appended should be empty after compaction"
-            );
-        } else {
-            panic!("expected TurnDelta");
-        }
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_snapshot());
+        assert!(entries[1].is_snapshot());
 
-        // Reload: only the snapshot messages + empty delta = 4 msgs (from snapshot).
-        // Actually, the delta appends nothing, so messages stay as snapshot (4).
-        // But the *persisted* messages for turn 2 were only 2 — this is a
-        // limitation since the delta can't remove messages. The next snapshot
-        // will capture the compacted state.
         let mut mgr2 = CslManager::new(
             Arc::clone(&store),
             "fewer-msgs".into(),
@@ -1078,8 +1231,34 @@ mod tests {
         )
         .unwrap();
         let mat = mgr2.load().await.unwrap().unwrap();
-        // Messages from snapshot (turn 1) + empty delta = still 4.
-        assert_eq!(mat.messages.len(), 4);
+        assert_eq!(mat.messages, t2);
+    }
+
+    #[tokio::test]
+    async fn manager_keeps_only_prompt_message_hashes_between_persists() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = test_manager(&tmp);
+        let large_assistant_text = "x".repeat(256 * 1024);
+        let messages = vec![
+            user_msg("q1"),
+            assistant_msg(&large_assistant_text),
+            assistant_msg("a1"),
+        ];
+
+        mgr.persist_turn(1, &messages, &default_state())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mgr.last_prompt_message_hashes.len(),
+            messages.len(),
+            "manager should retain one fixed-size hash per prompt-facing message"
+        );
+        assert_eq!(
+            std::mem::size_of_val(mgr.last_prompt_message_hashes.as_slice()),
+            messages.len() * std::mem::size_of::<PromptMessageHash>(),
+            "manager state must scale with message count, not message payload bytes"
+        );
     }
 
     // ── Test gap: fork at turn 0 ───────────────────────────────────────

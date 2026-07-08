@@ -68,8 +68,6 @@ async fn persist_turn_csl_snapshot(
         .map(|manager| manager.last_session_state().clone())
         .unwrap_or_default();
     let session_state = build_full_session_state_compact(state, csl_checkpoint_fields, &prev_state);
-    let final_messages =
-        astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(final_messages);
     if let Some(manager) = state.csl_manager.as_mut()
         && let Err(error) = manager
             .persist_turn(turn, &final_messages, &session_state)

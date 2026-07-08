@@ -16,7 +16,8 @@ use astra_runtime::{
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, ControlToolRecovery, HostTurnResult,
-        TurnInteractionMode, interaction_scoped_tool_restrictions,
+        SkillAutoRouteDecision, SkillAutoRouteJudgeContext, TurnInteractionMode,
+        interaction_scoped_tool_restrictions,
     },
 };
 use astra_turn_core::{
@@ -42,6 +43,85 @@ use crate::cli::chat_stream::sse_loop::refresh_root_permission_context;
 use astra_runtime::tool_sandbox::SandboxPolicy;
 
 const AGENT_FANOUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+struct CliServerProxySummaryClient {
+    api: astra_thin_client::ThinClient,
+    token: String,
+    model: Option<String>,
+}
+
+#[async_trait]
+impl astra_turn_core::cloud_summary::SummaryLlmClient for CliServerProxySummaryClient {
+    async fn summarize(
+        &self,
+        messages: &[Value],
+    ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
+        let mut body = serde_json::json!({
+            "messages": messages,
+            "max_tokens": 256,
+            "temperature": 0.0,
+        });
+        if let Some(model) = self.model.as_deref() {
+            body["model"] = serde_json::json!(model);
+        }
+        let response = self
+            .api
+            .post_completions(&self.token, &body)
+            .await
+            .map_err(|error| error.to_string())?;
+        let text = response["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| format!("missing completion content in response: {response}"))?
+            .to_string();
+        Ok(astra_turn_core::cloud_summary::SummaryResponse {
+            text,
+            is_ptl_error: false,
+        })
+    }
+}
+
+struct CliSummaryClientSkillAutoRouteJudge {
+    client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+}
+
+#[async_trait]
+impl astra_services::SkillAutoRouteJudge for CliSummaryClientSkillAutoRouteJudge {
+    async fn judge(
+        &self,
+        ctx: &astra_services::SkillAutoRouteJudgeContext,
+    ) -> Result<Option<String>, astra_services::SkillAutoRouteJudgeError> {
+        let messages = astra_services::skill_auto_route_judge_messages(ctx)?;
+        let allowed = ctx
+            .visible_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>();
+        let response = self
+            .client
+            .summarize(&messages)
+            .await
+            .map_err(astra_services::SkillAutoRouteJudgeError::Transport)?;
+        astra_services::parse_skill_auto_route_response(response.text.as_str(), &allowed)
+    }
+}
+
+fn cli_skill_auto_route_service_context(
+    ctx: SkillAutoRouteJudgeContext<'_>,
+) -> astra_services::SkillAutoRouteJudgeContext {
+    astra_services::SkillAutoRouteJudgeContext {
+        query: ctx.query.to_string(),
+        visible_skills: ctx
+            .visible_skills
+            .iter()
+            .map(|skill| astra_services::SkillAutoRouteCandidate {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                when_to_use: skill.when_to_use.clone(),
+                aliases: skill.aliases.clone(),
+            })
+            .collect(),
+    }
+}
 
 fn control_tool_recovery_fields(outcome: &str) -> serde_json::Map<String, Value> {
     serde_json::Map::from_iter([(
@@ -140,6 +220,9 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub term_width: usize,
     pub render_policy: RenderPolicy,
     pub message: &'a str,
+    pub user_intent: &'a str,
+    pub input_runtime_required_texts: &'a [String],
+    pub input_runtime_volatile_texts: &'a [String],
     pub semantic_query_override: Option<&'a str>,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
@@ -500,6 +583,12 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .into_iter()
             .map(|injection| injection.content)
             .filter(|content| !content.trim().is_empty())
+            .chain(
+                self.input_runtime_volatile_texts
+                    .iter()
+                    .map(|content| content.trim().to_string())
+                    .filter(|content| !content.is_empty()),
+            )
             .collect::<Vec<_>>();
 
         let interaction_mode = self.turn_interaction_mode_inherent();
@@ -575,6 +664,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             term_width: self.term_width,
             render_policy: self.render_policy,
             message: self.message,
+            user_intent: self.user_intent,
             semantic_query_override: self.semantic_query_override,
             history: self.history,
             recent_tools: self.recent_tools,
@@ -582,6 +672,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             executor: Arc::clone(&self.executor),
             registry: &self.registry,
             messages: state.messages.as_slice(),
+            runtime_required_texts: self.input_runtime_required_texts,
             runtime_volatile_texts: &runtime_volatile_texts,
             ephemeral_prefix: state.skills.listing_message.as_ref(),
             current_session_id: state.current_session_id.as_deref(),
@@ -735,6 +826,41 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             edge_tool_round: turn_result.edge_tool_round,
             error_kind,
         })
+    }
+
+    async fn judge_skill_auto_route(
+        &mut self,
+        state: &AgenticLoopState,
+        ctx: SkillAutoRouteJudgeContext<'_>,
+    ) -> Option<SkillAutoRouteDecision> {
+        if ctx.query.trim().is_empty() || ctx.visible_skills.is_empty() {
+            return None;
+        }
+        let service_ctx = cli_skill_auto_route_service_context(ctx);
+        let client = CliServerProxySummaryClient {
+            api: self.api.clone(),
+            token: self.token.clone(),
+            model: state
+                .skills
+                .model_override
+                .clone()
+                .or_else(|| self.model.map(str::to_string)),
+        };
+        let judge = CliSummaryClientSkillAutoRouteJudge {
+            client: Box::new(client),
+        };
+        match astra_services::SkillAutoRouteJudge::judge(&judge, &service_ctx).await {
+            Ok(Some(skill_name)) => Some(SkillAutoRouteDecision { skill_name }),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::debug!(
+                    target: "astra_cli::skill_auto_route_judge",
+                    error = %error,
+                    "skill auto-route judge failed; continuing without pre-route"
+                );
+                None
+            }
+        }
     }
 
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
@@ -1233,16 +1359,57 @@ fn looks_plan_shaped(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        deferred_input_status_line, derive_turn_interaction_mode,
-        failed_control_tool_recovery_result, permission_mode_change_audit_event,
-        plan_mode_missed_exit_reminder, plan_mode_restriction_names,
-        request_allowlist_restriction_names,
+        CliSummaryClientSkillAutoRouteJudge, deferred_input_status_line,
+        derive_turn_interaction_mode, failed_control_tool_recovery_result,
+        permission_mode_change_audit_event, plan_mode_missed_exit_reminder,
+        plan_mode_restriction_names, request_allowlist_restriction_names,
     };
     use crate::cli::permission_manager::PermissionMode;
     use astra_runtime::turn::agentic_loop::host::TurnInteractionMode;
     use astra_services::session_journal::JournalEventType;
     use serde_json::json;
     use std::collections::HashSet;
+
+    struct ScriptedSummaryClient {
+        text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl astra_turn_core::cloud_summary::SummaryLlmClient for ScriptedSummaryClient {
+        async fn summarize(
+            &self,
+            _messages: &[serde_json::Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
+            Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                text: self.text.clone(),
+                is_ptl_error: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_skill_auto_route_judge_uses_llm_response_parser() {
+        let judge = CliSummaryClientSkillAutoRouteJudge {
+            client: Box::new(ScriptedSummaryClient {
+                text: r#"{"skill_name":"review-changes"}"#.to_string(),
+            }),
+        };
+        let ctx = astra_services::SkillAutoRouteJudgeContext {
+            query: "review local changes".to_string(),
+            visible_skills: vec![astra_services::SkillAutoRouteCandidate {
+                name: "review-changes".to_string(),
+                description: "Review changed files".to_string(),
+                when_to_use: Some("Use when the user asks for code review".to_string()),
+                aliases: vec!["review".to_string()],
+            }],
+        };
+
+        let selected = astra_services::SkillAutoRouteJudge::judge(&judge, &ctx)
+            .await
+            .expect("judge response should parse");
+
+        assert_eq!(selected, Some("review-changes".to_string()));
+    }
 
     #[test]
     fn failed_control_tool_recovery_result_is_explicitly_marked_as_recovery_failure() {

@@ -36,6 +36,43 @@ const SESSION_MEMORY_ADVISORY: &str = "\
 - Never resume, advance, test, commit, or mutate work solely from this memory; require the latest real user message or live tool result to authorize action.\n";
 
 const SESSION_MEMORY_SECTIONS_OMITTED_FROM_INJECTION: &[&str] = &["Completed", "Worklog"];
+pub(crate) const REQUIRED_RUNTIME_PREAMBLE_MARKER: &str = "__astra_required_runtime_context";
+
+pub(crate) fn required_runtime_preamble_message(text: &str) -> Option<Value> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut message = serde_json::json!({
+        "role": "system",
+        "content": text,
+    });
+    message[REQUIRED_RUNTIME_PREAMBLE_MARKER] = Value::Bool(true);
+    Some(message)
+}
+
+pub(crate) fn is_required_runtime_preamble(message: &Value) -> bool {
+    message
+        .get(REQUIRED_RUNTIME_PREAMBLE_MARKER)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub(crate) fn strip_required_runtime_preamble_marker(message: &mut Value) {
+    if let Some(object) = message.as_object_mut() {
+        object.remove(REQUIRED_RUNTIME_PREAMBLE_MARKER);
+    }
+}
+
+pub(crate) fn system_reminder_wrapped_text(text: &str) -> String {
+    const SYSTEM_REMINDER_PREFIX: &str = "<system-reminder>";
+    const SYSTEM_REMINDER_SUFFIX: &str = "</system-reminder>";
+    if text.starts_with(SYSTEM_REMINDER_PREFIX) && text.ends_with(SYSTEM_REMINDER_SUFFIX) {
+        text.to_string()
+    } else {
+        format!("{SYSTEM_REMINDER_PREFIX}\n{text}{SYSTEM_REMINDER_SUFFIX}")
+    }
+}
 
 pub(crate) fn session_memory_entry_for_pipeline(
     content: Option<&str>,
@@ -464,11 +501,10 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
     // `state.messages[]` for volatile content, so `messages[]` stays byte-
     // stable across rounds — the property Anthropic / DeepSeek prompt
     // caches rely on.
-    let mut volatile_preamble = if suppress_volatile {
-        Vec::new()
-    } else {
-        volatile_preamble
-    };
+    let mut volatile_preamble = volatile_preamble
+        .into_iter()
+        .filter(|message| !suppress_volatile || is_required_runtime_preamble(message))
+        .collect::<Vec<_>>();
     if !suppress_volatile {
         volatile_preamble.extend(render_drained_volatile_messages(&drained_volatile));
     }
@@ -487,9 +523,10 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
         }));
     }
 
-    // Attach volatile content only at the true tail. Rewriting a historical
-    // user message while assistant/tool messages trail it mutates mid-history
-    // bytes and can zero prefix-cache hits on multi-round tool loops.
+    // Attach runtime content only at the true tail. Required runtime control
+    // travels as a system-role frame and never mutates the latest user message.
+    // Legacy user-role volatile content still uses the old tail-user path until
+    // those producers are migrated to structured system/control lanes.
     let mut synthetic_tail_start: Option<usize> = None;
     let mut synthetic_tail_end: Option<usize> = None;
     let mut tail_user_cache_boundary_applied = false;
@@ -524,12 +561,8 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
             }
         }
 
-        let volatile_text = system_parts
-            .into_iter()
-            .chain(user_parts)
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if !volatile_text.is_empty() {
+        let user_volatile_text = user_parts.join("\n\n");
+        if !user_volatile_text.is_empty() {
             let tail_role = llm_messages
                 .last()
                 .and_then(|m| m.get("role").and_then(Value::as_str));
@@ -537,7 +570,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
                 if let Some(tail) = llm_messages.last_mut() {
                     tail_user_cache_boundary_applied = append_volatile_to_tail_user_message(
                         tail,
-                        &volatile_text,
+                        &user_volatile_text,
                         cache_cfg.should_annotate(),
                     );
                 }
@@ -549,15 +582,26 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
                 }));
                 llm_messages.push(serde_json::json!({
                     "role": "user",
-                    "content": volatile_text,
+                    "content": user_volatile_text,
                 }));
                 synthetic_tail_end = Some(llm_messages.len());
             } else {
                 synthetic_tail_start = Some(llm_messages.len());
                 llm_messages.push(serde_json::json!({
                     "role": "user",
-                    "content": volatile_text,
+                    "content": user_volatile_text,
                 }));
+                synthetic_tail_end = Some(llm_messages.len());
+            }
+        }
+
+        let system_runtime_text = system_parts.join("\n\n");
+        if !system_runtime_text.is_empty() {
+            if synthetic_tail_start.is_none() {
+                synthetic_tail_start = Some(llm_messages.len());
+            }
+            if let Some(mut message) = required_runtime_preamble_message(&system_runtime_text) {
+                llm_messages.push(std::mem::take(&mut message));
                 synthetic_tail_end = Some(llm_messages.len());
             }
         }
@@ -1586,7 +1630,44 @@ mod tests {
     }
 
     #[test]
-    fn self_status_volatile_appends_after_real_user_intent() {
+    fn required_runtime_context_uses_system_tail_not_user_content() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let required =
+            required_runtime_preamble_message("required resume context").expect("required message");
+        let compacted = vec![json!({"role": "user", "content": "hi"})];
+
+        let msgs = assemble_llm_messages_with_cache_capability(
+            system,
+            vec![required],
+            Vec::new(),
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+            &cache_cfg(),
+        );
+
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["role"], "system");
+        assert_eq!(msgs[2]["content"], "required resume context");
+        assert!(is_required_runtime_preamble(&msgs[2]));
+        let user_text = msgs
+            .iter()
+            .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("user"))
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!user_text.contains("required resume context"));
+        assert!(!user_text.contains("<system-reminder>"));
+    }
+
+    #[test]
+    fn self_status_volatile_uses_system_tail_not_user_content() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
             kind: crate::turn::agentic_loop::host::VolatileKind::SelfStatus,
@@ -1615,24 +1696,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(user_text.contains("相关的测试够硬核吗"));
+        assert!(!user_text.contains("Self-Status"));
+        assert_eq!(msgs[2]["role"], "system");
         assert!(
-            user_text.contains("Self-Status"),
-            "runtime telemetry must remain visible after the real user intent: {user_text}"
-        );
-        let system_text = msgs
-            .iter()
-            .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
-            .map(message_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !system_text.contains("Self-Status"),
-            "volatile runtime telemetry must not be smuggled into a post-history system lane"
+            message_text(&msgs[2]).contains("Self-Status"),
+            "runtime telemetry must remain visible in the runtime system frame: {msgs:#?}"
         );
     }
 
     #[test]
-    fn active_turn_frame_anchors_latest_user_goal_in_tail_user_content() {
+    fn active_turn_frame_anchors_latest_user_goal_without_mutating_user_content() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
             kind: crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
@@ -1662,21 +1735,14 @@ mod tests {
         assert_eq!(msgs[2]["content"], "148 files");
         assert_eq!(msgs[3]["role"], "user");
         let tail_user = message_text(&msgs[3]);
-        assert!(
-            tail_user.starts_with("相关的测试够硬核吗？"),
-            "latest real user goal must remain first in the tail user message: {tail_user}"
-        );
-        assert!(tail_user.contains("[active-turn-frame:v1]"));
+        assert_eq!(tail_user, "相关的测试够硬核吗？");
+        assert_eq!(msgs[4]["role"], "system");
+        let runtime_system = message_text(&msgs[4]);
+        assert!(runtime_system.contains("[active-turn-frame:v1]"));
         assert!(tail_user.contains("相关的测试够硬核吗"));
         assert!(
-            tail_user.contains("active_goal"),
-            "active goal frame must stay explicit after tool rounds"
-        );
-        assert!(
-            msgs.iter()
-                .skip(1)
-                .all(|msg| msg.get("role").and_then(Value::as_str) != Some("system")),
-            "active-turn runtime context must not require a post-history system role"
+            runtime_system.contains("active_goal"),
+            "active goal frame must stay explicit in the runtime system frame"
         );
     }
 
@@ -1897,6 +1963,39 @@ mod tests {
             }),
             "CurrentUserOnly providers must drop all volatile wire content"
         );
+    }
+
+    #[test]
+    fn current_user_only_models_keep_required_runtime_preamble() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let required =
+            required_runtime_preamble_message("required resume context").expect("required message");
+        let preamble = vec![
+            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
+            required,
+        ];
+        let compacted = vec![json!({"role": "user", "content": "hi"})];
+
+        let msgs = assemble_llm_messages_with_cache_capability(
+            system,
+            preamble,
+            Vec::new(),
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "deepseek-v4-flash",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+            &cache_cfg(),
+        );
+
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["role"], "system");
+        assert_eq!(msgs[2]["content"], "required resume context");
+        assert!(is_required_runtime_preamble(&msgs[2]));
     }
 
     // ── consolidate_mid_history_volatile_injections regressions ─────────

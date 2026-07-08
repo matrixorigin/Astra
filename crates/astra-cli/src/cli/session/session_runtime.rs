@@ -1038,10 +1038,7 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
         if event.event_type != session_journal::JournalEventType::Turn {
             continue;
         }
-        let user_input = restored_turn_user_input(&event);
-        restored
-            .history
-            .push((user_input, event.assistant_output.unwrap_or_default()));
+        restored.history.extend(restored_turn_history_pairs(&event));
         restored.turn = restored
             .turn
             .max(event.turn.unwrap_or(restored.turn.saturating_add(1)));
@@ -1061,43 +1058,55 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
     })
 }
 
-fn restored_turn_user_input(event: &session_journal::JournalEvent) -> String {
+fn restored_turn_history_pairs(event: &session_journal::JournalEvent) -> Vec<(String, String)> {
     let base = event.user_input.clone().unwrap_or_default();
+    let assistant = event.assistant_output.clone().unwrap_or_default();
     let deferred = deferred_user_inputs_from_turn_metadata(event.metadata.as_ref());
-    if deferred.is_empty() {
-        return base;
+
+    let mut inputs = Vec::with_capacity(1 + deferred.len());
+    if !base.trim().is_empty() {
+        inputs.push(base);
+    }
+    inputs.extend(deferred);
+
+    if inputs.is_empty() {
+        return vec![(String::new(), assistant)];
     }
 
-    let mut parts = Vec::new();
-    if !base.trim().is_empty() {
-        parts.push(base.clone());
+    let mut pairs = Vec::with_capacity(inputs.len());
+    let last_idx = inputs.len() - 1;
+    for (idx, input) in inputs.into_iter().enumerate() {
+        let output = if idx == last_idx {
+            assistant.clone()
+        } else {
+            String::new()
+        };
+        pairs.push((input, output));
     }
-    let base_sections = base
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<std::collections::HashSet<_>>();
-    for content in deferred {
-        let trimmed = content.trim();
-        if trimmed.is_empty() || base_sections.contains(trimmed) {
-            continue;
-        }
-        parts.push(trimmed.to_string());
-    }
-    parts.join("\n\n")
+    pairs
 }
 
 fn deferred_user_inputs_from_turn_metadata(metadata: Option<&serde_json::Value>) -> Vec<String> {
-    metadata
+    let mut inputs = metadata
         .and_then(|metadata| metadata.get("deferred_user_inputs"))
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|entry| entry.get("content").and_then(serde_json::Value::as_str))
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
-        .map(ToString::to_string)
-        .collect()
+        .filter_map(|entry| {
+            let content = entry.get("content").and_then(serde_json::Value::as_str)?;
+            let content = content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let event_index = entry
+                .get("event_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX);
+            Some((event_index, content.to_string()))
+        })
+        .collect::<Vec<_>>();
+    inputs.sort_by_key(|(event_index, _)| *event_index);
+    inputs.into_iter().map(|(_, content)| content).collect()
 }
 
 pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
@@ -1725,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_history_includes_structured_deferred_user_inputs() {
+    fn restore_history_preserves_deferred_user_inputs_as_ordered_events() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-restore-deferred-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
@@ -1748,9 +1757,12 @@ mod tests {
             .unwrap();
 
         let history = restore_history_from_journal(&sid).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].0, "1\n\n2");
-        assert_eq!(history[0].1, "handled latest input");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0], ("1".to_string(), String::new()));
+        assert_eq!(
+            history[1],
+            ("2".to_string(), "handled latest input".to_string())
+        );
     }
 
     #[test]

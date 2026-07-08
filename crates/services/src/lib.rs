@@ -54,6 +54,7 @@ pub(crate) mod session_lifecycle;
 pub mod session_reaper;
 pub mod session_restore;
 pub mod session_workspace;
+pub mod skill_auto_route_judge;
 pub mod skill_config;
 pub mod skills;
 pub mod snapshot_sql;
@@ -293,6 +294,11 @@ pub use session_artifact_store::{
     local_session_artifact_store,
 };
 pub use session_fork::{ForkSessionOptions, ForkSessionResult, fork_local_session};
+pub use skill_auto_route_judge::{
+    SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
+    SkillAutoRouteJudgeError, build_skill_auto_route_prompt, parse_skill_auto_route_response,
+    skill_auto_route_judge_messages,
+};
 pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
 };

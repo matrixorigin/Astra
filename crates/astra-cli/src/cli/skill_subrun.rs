@@ -203,8 +203,10 @@ impl AgenticLoopHost for SubRunHost {
             .restricted_tools
             .extend(interaction_scoped_restrictions.iter().cloned());
 
+        let runtime_decision_user_intent = state.runtime_decision_user_intent();
         let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: messages_slice,
+            user_intent: Some(runtime_decision_user_intent.as_str()),
             session_id: state.current_session_id.as_deref(),
             agent_id: Some(self.agent_id.as_str()),
             model: effective_model,
@@ -699,8 +701,10 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 ),
             ),
             message: task_context.to_string(),
+            user_intent: task_context.to_string(),
             recent_tools: Vec::new(),
             has_prior_assistant_turn: false,
+            turn_intent: None,
             task_profile: infer_task_execution_profile(task_context),
             last_turn_policy: TurnInteractionPolicy::default(),
             api: self.api.clone(),

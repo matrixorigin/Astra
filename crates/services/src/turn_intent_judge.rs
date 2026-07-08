@@ -32,7 +32,9 @@
 //! The judge is the only component that may classify natural-language turn
 //! intent. Runtime fallbacks must use structural facts, not keyword lists.
 
-use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
+use astra_config::user_profile::{
+    Scenario, TurnContinuationMode, TurnIntent, WorkspaceMutationIntent,
+};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -108,7 +110,9 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
             \"requested_scenario\": <scenario | null>,\n  \
             \"prohibited_scenarios\": [<scenario>, ...],   // may be empty\n  \
             \"continuation_mode\": \"continue_current_objective\" | \"new_objective\" | \"unknown\",\n  \
-            \"reanchors_current_objective\": <boolean>\n\
+            \"reanchors_current_objective\": <boolean>,\n  \
+            \"workspace_mutation\": \"read_only\" | \"may_mutate\" | \"must_mutate\" | \"unknown\",\n  \
+            \"browser_verification_required\": <boolean>\n\
          }\n\
          \n\
          scenario must be one of:\n\
@@ -123,23 +127,35 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
              * \"new_objective\" when starting an unrelated task.\n  \
              * \"unknown\" for status/progress/why/what-remains questions unless the user also explicitly asks to execute more work.\n\
          - reanchors_current_objective: true only when the user corrects, redirects, or supersedes the current approach/objective; false for ordinary continuation.\n\
+         - workspace_mutation:\n  \
+             * \"must_mutate\" only when the user explicitly requests editing, creating, deleting, applying, refactoring, fixing, or otherwise changing files/workspace state in this turn.\n  \
+             * \"read_only\" when the user asks for analysis, explanation, diagnosis, review, lookup, or an answer without asking to change files.\n  \
+             * \"may_mutate\" when investigation could lead to edits but the user has not required edits yet.\n  \
+             * \"unknown\" when the current message is too ambiguous to decide.\n\
+         - browser_verification_required: true only when the user explicitly asks for browser/UI verification, browser testing, screenshots, DOM/canvas/page inspection, or equivalent browser-capable validation.\n\
          - Return ONLY the JSON. No prose, no markdown fences.\n\
          \n\
          Examples:\n\
          User: \"please inspect the current changes\"\n\
-         {\"requested_scenario\":\"code_review\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false}\n\
+         {\"requested_scenario\":\"code_review\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
          \n\
          User: \"fix it\" (after assistant proposed an implementation)\n\
-         {\"requested_scenario\":null,\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":false}\n\
+         {\"requested_scenario\":null,\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
          \n\
          User: \"还有什么？\" (after assistant was working on a task)\n\
-         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false}\n\
+         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
+         \n\
+         User: \"当前的实现，能够想起来吗？\"\n\
+         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
          \n\
          User: \"不对，我要的是系统性修复，不是临时补丁\"\n\
-         {\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":true}\n\
+         {\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":true,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
          \n\
          User: \"don't review this, just continue the implementation\"\n\
-         {\"requested_scenario\":\"implementation\",\"prohibited_scenarios\":[\"code_review\"],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":false}\n\
+         {\"requested_scenario\":\"implementation\",\"prohibited_scenarios\":[\"code_review\"],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
+         \n\
+         User: \"test the game in a browser and verify the canvas works\"\n\
+         {\"requested_scenario\":\"testing\",\"prohibited_scenarios\":[],\"continuation_mode\":\"unknown\",\"reanchors_current_objective\":false,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":true}\n\
          \n",
     );
 
@@ -292,6 +308,35 @@ pub fn parse_turn_intent_response(raw: &str) -> Result<TurnIntent, TurnIntentJud
                 })?;
     }
 
+    // workspace_mutation: optional, defaults to Unknown when absent. Unknown
+    // is fail-closed for strong runtime execution control.
+    if let Some(mutation) = value.get("workspace_mutation")
+        && !mutation.is_null()
+    {
+        let s = mutation
+            .as_str()
+            .ok_or_else(|| TurnIntentJudgeError::Malformed {
+                raw: format!("workspace_mutation not a string: {mutation}"),
+            })?;
+        intent.workspace_mutation =
+            parse_workspace_mutation_intent(s).ok_or_else(|| TurnIntentJudgeError::Malformed {
+                raw: format!("unknown workspace_mutation: '{s}'"),
+            })?;
+    }
+
+    // browser_verification_required: optional, defaults to false. Missing is
+    // fail-closed because a browser retry is a strong control-plane action.
+    if let Some(required) = value.get("browser_verification_required")
+        && !required.is_null()
+    {
+        intent.browser_verification_required =
+            required
+                .as_bool()
+                .ok_or_else(|| TurnIntentJudgeError::Malformed {
+                    raw: format!("browser_verification_required not a boolean: {required}"),
+                })?;
+    }
+
     Ok(intent)
 }
 
@@ -319,6 +364,18 @@ fn parse_continuation_mode(s: &str) -> Option<TurnContinuationMode> {
         }
         "new_objective" | "new" => Some(TurnContinuationMode::NewObjective),
         "unknown" => Some(TurnContinuationMode::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_workspace_mutation_intent(s: &str) -> Option<WorkspaceMutationIntent> {
+    match s.trim().to_lowercase().as_str() {
+        "unknown" => Some(WorkspaceMutationIntent::Unknown),
+        "read_only" | "readonly" | "read-only" => Some(WorkspaceMutationIntent::ReadOnly),
+        "may_mutate" | "may-mutate" | "optional" => Some(WorkspaceMutationIntent::MayMutate),
+        "must_mutate" | "must-mutate" | "mutating" | "required" => {
+            Some(WorkspaceMutationIntent::MustMutate)
+        }
         _ => None,
     }
 }
@@ -353,7 +410,10 @@ mod tests {
         assert!(prompt.contains("Has prior assistant turn: yes"));
         assert!(prompt.contains("read_file, bash"));
         assert!(prompt.contains("\"reanchors_current_objective\": <boolean>"));
+        assert!(prompt.contains("\"workspace_mutation\""));
+        assert!(prompt.contains("\"browser_verification_required\": <boolean>"));
         assert!(prompt.contains("false for ordinary continuation"));
+        assert!(prompt.contains("当前的实现，能够想起来吗？"));
     }
 
     #[test]
@@ -414,6 +474,12 @@ mod tests {
             TurnContinuationMode::ContinueCurrentObjective
         );
         assert!(!intent.reanchors_current_objective());
+        assert_eq!(
+            intent.workspace_mutation,
+            WorkspaceMutationIntent::Unknown,
+            "missing workspace_mutation must fail closed"
+        );
+        assert!(!intent.browser_verification_required);
     }
 
     #[test]
@@ -506,6 +572,36 @@ mod tests {
     #[test]
     fn non_boolean_reanchor_returns_malformed() {
         let raw = r#"{"requested_scenario":null,"prohibited_scenarios":[],"continuation_mode":"unknown","reanchors_current_objective":"true"}"#;
+        let err = parse_turn_intent_response(raw).unwrap_err();
+        assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
+    }
+
+    #[test]
+    fn parses_workspace_mutation_and_browser_requirement() {
+        let raw = r#"{
+          "requested_scenario": "testing",
+          "prohibited_scenarios": [],
+          "continuation_mode": "unknown",
+          "reanchors_current_objective": false,
+          "workspace_mutation": "read_only",
+          "browser_verification_required": true
+        }"#;
+        let intent = parse_turn_intent_response(raw).unwrap();
+        assert_eq!(intent.requested_scenario, Some(Scenario::Testing));
+        assert_eq!(intent.workspace_mutation, WorkspaceMutationIntent::ReadOnly);
+        assert!(intent.browser_verification_required);
+    }
+
+    #[test]
+    fn unknown_workspace_mutation_returns_malformed() {
+        let raw = r#"{"workspace_mutation":"sometimes"}"#;
+        let err = parse_turn_intent_response(raw).unwrap_err();
+        assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
+    }
+
+    #[test]
+    fn non_boolean_browser_requirement_returns_malformed() {
+        let raw = r#"{"browser_verification_required":"yes"}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }

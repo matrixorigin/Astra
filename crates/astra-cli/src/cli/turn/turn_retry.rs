@@ -20,6 +20,9 @@ pub(crate) async fn settle_turn_attempt(
         Option<&'a str>,
         &'a str,
         &'a str,
+        &'a str,
+        &'a [String],
+        &'a [String],
         Option<&'a str>,
         Option<&'a str>,
     ) -> std::pin::Pin<
@@ -59,6 +62,9 @@ async fn try_retry_after_session_not_found(
         Option<&'a str>,
         &'a str,
         &'a str,
+        &'a str,
+        &'a [String],
+        &'a [String],
         Option<&'a str>,
         Option<&'a str>,
     ) -> std::pin::Pin<
@@ -80,6 +86,9 @@ async fn try_retry_after_session_not_found(
         dispatch.ctx.profile,
         dispatch.token,
         dispatch.effective_line,
+        dispatch.user_intent,
+        dispatch.input_runtime_required_texts,
+        dispatch.input_runtime_volatile_texts,
         None,
         dispatch.semantic_query_override,
     )
@@ -98,6 +107,9 @@ async fn try_retry_after_auth_refresh(
         Option<&'a str>,
         &'a str,
         &'a str,
+        &'a str,
+        &'a [String],
+        &'a [String],
         Option<&'a str>,
         Option<&'a str>,
     ) -> std::pin::Pin<
@@ -117,6 +129,9 @@ async fn try_retry_after_auth_refresh(
         dispatch.ctx.profile,
         &new_token,
         dispatch.effective_line,
+        dispatch.user_intent,
+        dispatch.input_runtime_required_texts,
+        dispatch.input_runtime_volatile_texts,
         dispatch.session_id,
         dispatch.semantic_query_override,
     )
@@ -164,6 +179,9 @@ mod tests {
             ctx: &ctx,
             line: "continue",
             effective_line: "continue",
+            user_intent: "continue",
+            input_runtime_required_texts: &[],
+            input_runtime_volatile_texts: &[],
             token: "token",
             session_id: Some("sess-stale"),
             semantic_query_override: None,
@@ -175,11 +193,18 @@ mod tests {
             partial: crate::PartialTurnData::default(),
         })));
 
-        settle_turn_attempt(&mut state, &mut dispatch, attempt, |_, _, _, _, _, _, _| {
-            Box::pin(async move {
-                TurnAttempt::Completed(Box::new(Ok(crate::tests::stub_stream_result("Recovered"))))
-            })
-        })
+        settle_turn_attempt(
+            &mut state,
+            &mut dispatch,
+            attempt,
+            |_, _, _, _, _, _, _, _, _, _| {
+                Box::pin(async move {
+                    TurnAttempt::Completed(Box::new(Ok(crate::tests::stub_stream_result(
+                        "Recovered",
+                    ))))
+                })
+            },
+        )
         .await
         .unwrap();
 

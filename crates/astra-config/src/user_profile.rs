@@ -369,6 +369,25 @@ pub enum Scenario {
     QuickAnswer,
 }
 
+/// Structured workspace-mutation intent for the current user turn.
+///
+/// This is a control-plane field, not a natural-language heuristic. Strong
+/// runtime behaviors such as execution retry may only use this structured
+/// value (or concrete tool evidence), never ad hoc keyword matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMutationIntent {
+    /// The judge could not determine whether mutation is requested.
+    #[default]
+    Unknown,
+    /// The user is asking for read-only analysis, explanation, or review.
+    ReadOnly,
+    /// The task may lead to edits, but the current turn does not require them.
+    MayMutate,
+    /// The user explicitly wants files/workspace state changed in this turn.
+    MustMutate,
+}
+
 /// Semantic turn intent produced by an upstream judge/classifier.
 ///
 /// This type is deliberately structural: the runtime policy consumes the
@@ -393,6 +412,15 @@ pub struct TurnIntent {
     /// state that belongs to the previous failed attempt.
     #[serde(default)]
     pub reanchors_current_objective: bool,
+    /// Whether the current turn requires, permits, or forbids workspace
+    /// mutation. Defaults to `Unknown` so judge failures fail closed.
+    #[serde(default)]
+    pub workspace_mutation: WorkspaceMutationIntent,
+    /// Whether the user explicitly requires browser-capable verification for
+    /// this turn. Strong browser-verification retry consumes only this
+    /// structured field plus tool evidence.
+    #[serde(default)]
+    pub browser_verification_required: bool,
 }
 
 impl TurnIntent {
@@ -411,6 +439,18 @@ impl TurnIntent {
     #[must_use]
     pub fn with_reanchors_current_objective(mut self, reanchors: bool) -> Self {
         self.reanchors_current_objective = reanchors;
+        self
+    }
+
+    #[must_use]
+    pub fn with_workspace_mutation(mut self, mutation: WorkspaceMutationIntent) -> Self {
+        self.workspace_mutation = mutation;
+        self
+    }
+
+    #[must_use]
+    pub fn with_browser_verification_required(mut self, required: bool) -> Self {
+        self.browser_verification_required = required;
         self
     }
 
@@ -435,6 +475,11 @@ impl TurnIntent {
     #[must_use]
     pub fn reanchors_current_objective(&self) -> bool {
         self.reanchors_current_objective
+    }
+
+    #[must_use]
+    pub fn requires_workspace_mutation(&self) -> bool {
+        self.workspace_mutation == WorkspaceMutationIntent::MustMutate
     }
 }
 
@@ -1098,6 +1143,19 @@ mod tests {
         let reanchored = TurnIntent::default().with_reanchors_current_objective(true);
         assert!(reanchored.reanchors_current_objective());
         assert!(!reanchored.continues_current_objective());
+    }
+
+    #[test]
+    fn turn_intent_workspace_mutation_defaults_fail_closed() {
+        assert_eq!(
+            TurnIntent::default().workspace_mutation,
+            WorkspaceMutationIntent::Unknown
+        );
+        assert!(!TurnIntent::default().requires_workspace_mutation());
+
+        let mutating =
+            TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::MustMutate);
+        assert!(mutating.requires_workspace_mutation());
     }
 
     #[test]

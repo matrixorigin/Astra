@@ -143,6 +143,9 @@ async fn run_chat_turn(
     profile: Option<&str>,
     token: &str,
     message: &str,
+    user_intent: &str,
+    input_runtime_required_texts: &[String],
+    input_runtime_volatile_texts: &[String],
     session_id: Option<&str>,
     semantic_query_override: Option<&str>,
 ) -> TurnAttempt {
@@ -161,6 +164,9 @@ async fn run_chat_turn(
         profile,
         token,
         message,
+        user_intent,
+        input_runtime_required_texts,
+        input_runtime_volatile_texts,
         session_id,
         semantic_query_override,
     )
@@ -217,6 +223,9 @@ fn run_chat_turn_boxed<'a>(
     profile: Option<&'a str>,
     token: &'a str,
     message: &'a str,
+    user_intent: &'a str,
+    input_runtime_required_texts: &'a [String],
+    input_runtime_volatile_texts: &'a [String],
     session_id: Option<&'a str>,
     semantic_query_override: Option<&'a str>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnAttempt> + 'a>> {
@@ -226,6 +235,9 @@ fn run_chat_turn_boxed<'a>(
         profile,
         token,
         message,
+        user_intent,
+        input_runtime_required_texts,
+        input_runtime_volatile_texts,
         session_id,
         semantic_query_override,
     ))
@@ -315,8 +327,9 @@ pub(crate) async fn handle_chat_input_with_ui(
     }
 
     let resume_guidance = state.resume_guidance.take();
-    let effective_line = finalize_effective_line(
+    let finalized_input = finalize_effective_line(
         build_effective_line(&line, state, ui),
+        line.clone(),
         resume_guidance,
         state,
     )
@@ -328,7 +341,10 @@ pub(crate) async fn handle_chat_input_with_ui(
         ctx.api,
         ctx.profile,
         token,
-        &effective_line,
+        &finalized_input.user_message,
+        &finalized_input.user_intent,
+        &finalized_input.runtime_required_texts,
+        &finalized_input.runtime_volatile_texts,
         session_id.as_deref(),
         None,
     )
@@ -336,7 +352,10 @@ pub(crate) async fn handle_chat_input_with_ui(
     let mut dispatch = TurnDispatch {
         ctx: &ctx,
         line: &line,
-        effective_line: &effective_line,
+        effective_line: &finalized_input.user_message,
+        user_intent: &finalized_input.user_intent,
+        input_runtime_required_texts: &finalized_input.runtime_required_texts,
+        input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
         token,
         session_id: session_id.as_deref(),
         semantic_query_override: None,

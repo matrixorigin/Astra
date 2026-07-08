@@ -9,14 +9,14 @@ use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::{CompactionEngine, TokenBudget};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, RunControlStatus,
-    try_write_heavy_checkpoint,
+    SkillAutoRouteJudgeContext, try_write_heavy_checkpoint,
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
 use crate::orchestration::{
     AgentToolRecordActionKind, project_agent_tool_budget_record,
     render_agent_tool_budget_unfinished_detail, summarize_agent_tool_budget_result,
 };
-use astra_config::user_profile::TurnIntent;
+use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
 use astra_services::SessionArtifactStore;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interruption::{
@@ -67,33 +67,6 @@ pub(crate) fn completed_tool_calls(state: &AgenticLoopState) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
-fn is_explicit_parallel_skill_request(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    let normalized = lower
-        .chars()
-        .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_')
-        .collect::<String>();
-    [
-        "parallelreview",
-        "differentanglesinparallel",
-        "multiagent",
-        "multipleagents",
-        "parallelfanout",
-        "多agents",
-        "多agent",
-        "多个agent",
-        "并行review",
-        // Chinese review phrasings — normalized form keeps CJK as-is
-        // (whitespace/dash/underscore are stripped before matching).
-        "并行审查",
-        "多角度审查",
-        "多视角审查",
-        "同时审查",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
 fn apply_judged_turn_intent_to_observability_session(
     state: &AgenticLoopState,
     intent: &TurnIntent,
@@ -117,6 +90,89 @@ fn apply_judged_turn_intent_to_observability_session(
     }
 }
 
+fn allowed_requested_scenario(intent: &TurnIntent) -> Option<Scenario> {
+    intent
+        .requested_scenario
+        .filter(|scenario| intent.allows_scenario(*scenario))
+}
+
+fn task_profile_from_judged_turn_intent(
+    intent: &TurnIntent,
+) -> Option<astra_turn_core::chat_turn_heuristics::TaskExecutionProfile> {
+    let scenario = allowed_requested_scenario(intent);
+    let has_control_signal = scenario.is_some()
+        || intent.workspace_mutation != WorkspaceMutationIntent::Unknown
+        || intent.browser_verification_required;
+    if !has_control_signal {
+        return None;
+    }
+
+    let mutates_workspace = intent.requires_workspace_mutation();
+    let exploratory_task = matches!(
+        scenario,
+        Some(
+            Scenario::CodeReview | Scenario::Debugging | Scenario::Exploration | Scenario::Testing
+        )
+    );
+    let complexity = if matches!(scenario, Some(Scenario::Refactoring | Scenario::DevOps)) {
+        astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex
+    } else {
+        astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard
+    };
+    let allow_factual_retry = mutates_workspace
+        || exploratory_task
+        || matches!(
+            scenario,
+            Some(
+                Scenario::CodeReview
+                    | Scenario::Debugging
+                    | Scenario::Exploration
+                    | Scenario::Implementation
+                    | Scenario::Refactoring
+                    | Scenario::Testing
+                    | Scenario::Documentation
+                    | Scenario::DevOps
+            )
+        )
+        || intent.browser_verification_required;
+
+    Some(
+        astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+            mutates_workspace,
+            exploratory_task,
+            complexity,
+            allow_factual_retry,
+        ),
+    )
+}
+
+fn apply_judged_turn_intent_to_runtime_profile(state: &mut AgenticLoopState, intent: &TurnIntent) {
+    state.turn_intent = Some(intent.clone());
+    let Some(profile) = task_profile_from_judged_turn_intent(intent) else {
+        return;
+    };
+    let previous_profile = state.task_profile;
+    let previous_budget = state.agentic_turn_budget;
+    let budget_followed_previous_profile = previous_budget == previous_profile.agentic_turn_budget;
+    state.task_profile = profile;
+    if budget_followed_previous_profile {
+        state.agentic_turn_budget = profile.agentic_turn_budget;
+        if state.max_turns == previous_budget.initial_turns {
+            let new_initial = profile.agentic_turn_budget.initial_turns;
+            if new_initial >= previous_budget.initial_turns {
+                let extra = new_initial - previous_budget.initial_turns;
+                state.max_turns = new_initial;
+                state.remaining_turns = state.remaining_turns.saturating_add(extra);
+            } else {
+                let reduction = previous_budget.initial_turns - new_initial;
+                state.max_turns = new_initial;
+                state.remaining_turns = state.remaining_turns.saturating_sub(reduction);
+            }
+        }
+    }
+    state.turn_guard.set_task_profile(profile);
+}
+
 fn auto_route_tool_call_id(skill_name: &str) -> String {
     let mut normalized = String::with_capacity(skill_name.len());
     let mut last_was_dash = true;
@@ -137,7 +193,12 @@ fn auto_route_tool_call_id(skill_name: &str) -> String {
     }
 }
 
-async fn maybe_pre_route_skill(state: &mut AgenticLoopState) {
+#[cfg(test)]
+fn pure_user_intent_for_runtime_decision(message: &str) -> String {
+    astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(message)
+}
+
+async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
     if state.llm_rounds_completed > 0
         || !state.tool_results.is_empty()
         || !state.skills.invoked.is_empty()
@@ -145,8 +206,8 @@ async fn maybe_pre_route_skill(state: &mut AgenticLoopState) {
         return;
     }
 
-    let query = state.message.trim().to_string();
-    if query.is_empty() || is_explicit_parallel_skill_request(&query) {
+    let query = state.runtime_decision_user_intent();
+    if query.is_empty() {
         return;
     }
 
@@ -161,13 +222,26 @@ async fn maybe_pre_route_skill(state: &mut AgenticLoopState) {
 
     let visible =
         crate::turn::skill_tool::visible_skills_for_host_turn(&full, &state.skills.invoked);
-    let Some(skill_name) = crate::turn::skill_tool::select_auto_routed_skill_with_config(
-        &query,
-        &visible,
-        state.skills.auto_routing,
-    ) else {
+    let Some(decision) = host
+        .judge_skill_auto_route(
+            state,
+            SkillAutoRouteJudgeContext {
+                query: &query,
+                visible_skills: &visible,
+            },
+        )
+        .await
+    else {
         return;
     };
+    let skill_name = decision.skill_name.trim().to_string();
+    if skill_name.is_empty() || !visible.iter().any(|skill| skill.name == skill_name) {
+        tracing::warn!(
+            skill_name,
+            "skill auto-route judge returned a skill outside the visible catalog"
+        );
+        return;
+    }
 
     let composition_ctx = crate::skills::composition::CompositionContext::root();
     let skill_ctx = crate::turn::agentic::tool_interception::build_skill_context(state);
@@ -229,6 +303,7 @@ async fn maybe_pre_route_skill(state: &mut AgenticLoopState) {
         );
     state.messages.push(tool_msg);
     state.tool_results.push(tool_result);
+    state.telemetry.all_selected_skills.push(skill_name.clone());
     state.skills.invoked.insert(
         skill_name.clone(),
         crate::turn::skill_tool::InvokedSkill {
@@ -623,87 +698,11 @@ fn recent_activity_supports_budget_extension(state: &AgenticLoopState) -> bool {
 
 const TASK_BOARD_START_GATE_MESSAGE: &str = "[task-board:start] This is broad multi-step or delegated work. Before broad analysis, file exploration, or spawning agents, create 3-7 concrete leaf tasks with task_board(action='create'), then mark exactly one first task in_progress with task_board(action='update', new_status='in_progress'). Keep the task board current as tasks complete, fail, pause, or are no longer needed.";
 
-fn message_contains_any(message: &str, terms: &[&str]) -> bool {
-    terms.iter().any(|term| message.contains(term))
-}
-
-fn message_contains_ascii_word(message: &str, word: &str) -> bool {
-    message
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .any(|token| token == word)
-}
-
-fn should_require_task_board_for_message(
-    message: &str,
+fn should_require_task_board_for_profile(
     profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
 ) -> bool {
-    let lower = message.to_lowercase();
-    let delegated_or_parallel = ["agent", "agents", "subagent", "spawn"]
-        .into_iter()
-        .any(|word| message_contains_ascii_word(&lower, word))
-        || message_contains_any(
-            &lower,
-            &[
-                "sub-agent",
-                "agent_fanout",
-                "fanout",
-                "multi-agent",
-                "多角度",
-                "并行",
-                "子任务",
-            ],
-        );
-    let codebase_scope = message_contains_any(
-        &lower,
-        &[
-            "branch",
-            "changes",
-            "diff",
-            "commit",
-            "repo",
-            "codebase",
-            "分支",
-            "改动",
-            "变更",
-            "代码库",
-            "当前分支",
-        ],
-    );
-    let broad_work = message_contains_any(
-        &lower,
-        &[
-            "systematic",
-            "first principles",
-            "end-to-end",
-            "all issues",
-            "everything",
-            "review again",
-            "cleanup",
-            "clean up",
-            "第一性原则",
-            "系统性",
-            "全部",
-            "所有",
-            "清理",
-            "优化",
-            "修复",
-            "重构",
-        ],
-    );
-    let review_or_repair = message_contains_any(
-        &lower,
-        &[
-            "review", "fix", "repair", "optimize", "refactor", "analyze", "审查", "评审", "分析",
-            "修复", "优化", "重构",
-        ],
-    );
-    let profile_requires_coordination = profile.mutates_workspace
-        || profile.exploratory_task
-        || profile.complexity == astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex;
-
-    delegated_or_parallel
-        || (review_or_repair && codebase_scope && broad_work)
-        || (profile_requires_coordination && broad_work)
+    profile.complexity == astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex
+        || (profile.mutates_workspace && profile.exploratory_task)
 }
 
 async fn maybe_inject_task_board_start_gate<H: AgenticLoopHost>(
@@ -719,16 +718,7 @@ async fn maybe_inject_task_board_start_gate<H: AgenticLoopHost>(
         return false;
     }
 
-    let active_message =
-        astra_turn_core::chat_turn_heuristics::active_user_task_text(&state.message);
-    let inferred_profile =
-        astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&active_message);
-    let profile = if state.task_profile == Default::default() {
-        inferred_profile
-    } else {
-        state.task_profile
-    };
-    if !should_require_task_board_for_message(&active_message, profile) {
+    if !should_require_task_board_for_profile(state.task_profile) {
         return false;
     }
 
@@ -971,8 +961,6 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
-    maybe_inject_task_board_start_gate(host, state).await;
-
     if state
         .skills
         .session_event_hooks
@@ -1469,15 +1457,16 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);
     }
+    state.turn_intent = None;
     let judged_turn_intent = host.judge_turn_intent(state).await;
     if let Some(intent) = judged_turn_intent.as_ref() {
         apply_judged_turn_intent_to_observability_session(state, intent);
+        apply_judged_turn_intent_to_runtime_profile(state, intent);
         if intent.reanchors_current_objective() {
             apply_structured_user_reanchor(state);
         }
     }
-    // Turn intent not yet wired to adaptive execution profiles — observation
-    // plane records scenario signals without mutating runtime config.
+    maybe_inject_task_board_start_gate(host, state).await;
 
     if (state.telemetry.observability_session.is_some() || state.skills.resolver.is_some())
         && state.telemetry.turn_trace_collector.is_none()
@@ -1651,7 +1640,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             })
         };
     }
-    maybe_pre_route_skill(state).await;
+    maybe_pre_route_skill(host, state).await;
 
     if turn_index > 0 {
         // Inventory snapshots go through the structured volatile lane so
@@ -1915,7 +1904,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 mod tests {
     use std::sync::Arc;
 
-    use astra_config::user_profile::{Scenario, TurnIntent};
+    use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
     use astra_services::session_journal::ToolCallRecord;
     use astra_skills::hooks::SkillHooks;
     use astra_skills::manifest::{ExecutionContext, SkillSourceKind, TrustTier};
@@ -1931,15 +1920,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_parallel_skill_request_ignores_spacing() {
-        assert!(is_explicit_parallel_skill_request("并行 review 当前分支"));
-        assert!(is_explicit_parallel_skill_request("并行review 当前分支"));
-        assert!(is_explicit_parallel_skill_request("multi-agent review"));
-        assert!(is_explicit_parallel_skill_request("multi agent review"));
-        assert!(is_explicit_parallel_skill_request("parallel fanout review"));
-        assert!(!is_explicit_parallel_skill_request(
-            "implement a fanout pattern"
-        ));
+    fn runtime_decision_intent_strips_runtime_scaffolding_without_heuristics() {
+        let message = "review changes on current branch\n\n<system-reminder>\n[session-resume:v1]\nResume interrupted work. Mention prompt optimization here.\n</system-reminder>";
+
+        assert_eq!(
+            pure_user_intent_for_runtime_decision(message),
+            "review changes on current branch"
+        );
     }
 
     fn agent_record(
@@ -2106,13 +2093,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preamble_requires_task_board_before_broad_agent_review() {
-        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["task_board", "agent_fanout"]);
+    async fn prepare_requires_task_board_for_structured_complex_work() {
+        let intent = TurnIntent::default()
+            .with_requested_scenario(Scenario::Refactoring)
+            .with_workspace_mutation(WorkspaceMutationIntent::MustMutate);
+        let mut host = MockHost::new(Vec::new())
+            .with_valid_tools(&["task_board", "agent_fanout"])
+            .with_turn_intent(intent);
         let mut state = make_state();
         state.message = "3 agents review这个分支的changes. 第一性原则，不考虑兼容".to_string();
+        state.user_intent = state.message.clone();
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
 
-        run_loop_preamble(&mut host, &mut state).await;
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
 
         let gate = state
             .volatile_pending
@@ -2129,10 +2125,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preamble_does_not_require_new_task_board_when_one_is_active() {
-        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["task_board", "agent_fanout"]);
+    async fn prepare_does_not_require_new_task_board_when_one_is_active() {
+        let intent = TurnIntent::default()
+            .with_requested_scenario(Scenario::Refactoring)
+            .with_workspace_mutation(WorkspaceMutationIntent::MustMutate);
+        let mut host = MockHost::new(Vec::new())
+            .with_valid_tools(&["task_board", "agent_fanout"])
+            .with_turn_intent(intent);
         let mut state = make_state();
         state.message = "multi-agent review current branch changes from first principles".into();
+        state.user_intent = state.message.clone();
         state.hooks.task_board_snapshot = TaskBoardSnapshot {
             tracked_count: 1,
             pending_count: 1,
@@ -2144,7 +2146,10 @@ mod tests {
             active_tasks: vec!["task-1 Review branch [pending]".into()],
         };
 
-        run_loop_preamble(&mut host, &mut state).await;
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
 
         assert!(
             !state
@@ -2157,14 +2162,19 @@ mod tests {
     }
 
     #[test]
-    fn task_board_start_gate_does_not_treat_agentic_as_agent_delegation() {
-        let profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-            "explain the agentic loop at a high level",
-        );
-        assert!(!should_require_task_board_for_message(
-            "explain the agentic loop at a high level",
-            profile
-        ));
+    fn task_board_start_gate_uses_structured_profile_not_message_text() {
+        let default_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default();
+        assert!(!should_require_task_board_for_profile(default_profile));
+
+        let complex_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                false,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
+                true,
+            );
+        assert!(should_require_task_board_for_profile(complex_profile));
     }
 
     #[test]
@@ -2715,10 +2725,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_turn_iteration_pre_routes_unambiguous_skill_requests() {
-        let mut host = MockHost::new(Vec::new());
+    async fn prepare_turn_iteration_pre_routes_judged_skill_requests() {
+        let mut host = MockHost::new(Vec::new()).with_skill_auto_route_decision("review-changes");
         let mut state = make_state();
         state.message = "review changes on current branch".into();
+        state.user_intent = state.message.clone();
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
         state.skills.resolver = Some(Arc::new(AutoRouteResolver));
         state.skills.request_constraints.allowed_tools =
@@ -2756,6 +2767,10 @@ mod tests {
             }),
             Some(crate::turn::skill_tool::SKILL_TOOL_NAME)
         );
+        assert_eq!(
+            state.telemetry.all_selected_skills,
+            vec!["review-changes".to_string()]
+        );
         assert!(
             state.tool_results[0]["result"]
                 .as_str()
@@ -2782,8 +2797,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_turn_iteration_pre_routes_structured_user_intent_not_prompt_scaffolding() {
+        let mut host = MockHost::new(Vec::new()).with_skill_auto_route_decision("review-changes");
+        let mut state = make_state();
+        state.message = "<project-instructions>\nMention prompt optimization here.\n</project-instructions>\n\nreview changes on current branch".into();
+        state.user_intent = "review changes on current branch".into();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+        state.skills.resolver = Some(Arc::new(AutoRouteResolver));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert!(state.skills.invoked.contains_key("review-changes"));
+        assert_eq!(
+            host.skill_auto_route_queries,
+            vec!["review changes on current branch".to_string()]
+        );
+
+        let arguments = state
+            .messages
+            .iter()
+            .find_map(|msg| {
+                msg.get("tool_calls")?
+                    .as_array()?
+                    .first()?
+                    .get("function")?
+                    .get("arguments")?
+                    .as_str()
+            })
+            .expect("skill auto-route tool call arguments");
+        let parsed: serde_json::Value = serde_json::from_str(arguments).unwrap();
+        assert_eq!(parsed["task"], "review changes on current branch");
+        assert!(
+            !parsed["task"]
+                .as_str()
+                .unwrap()
+                .contains("<project-instructions>")
+        );
+        assert!(
+            !parsed["task"]
+                .as_str()
+                .unwrap()
+                .contains("prompt optimization")
+        );
+    }
+
+    #[tokio::test]
     async fn prepare_turn_iteration_applies_host_judged_turn_intent() {
-        let intent = TurnIntent::default().with_requested_scenario(Scenario::CodeReview);
+        let intent = TurnIntent::default()
+            .with_requested_scenario(Scenario::CodeReview)
+            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
         let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
         let hub = make_hub();
         let session = make_session();
@@ -2791,6 +2856,7 @@ mod tests {
         state.telemetry.observability_hub = Some(hub);
         state.telemetry.observability_session = Some(session.clone());
         state.message = "please inspect the current changes".into();
+        state.user_intent = state.message.clone();
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
 
         let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
@@ -2800,6 +2866,63 @@ mod tests {
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         assert_eq!(guard.profile.current_scenario, Some(Scenario::CodeReview));
+        assert!(!state.task_profile.mutates_workspace);
+        assert!(state.task_profile.exploratory_task);
+        assert_eq!(
+            state
+                .turn_intent
+                .as_ref()
+                .map(|intent| intent.workspace_mutation),
+            Some(WorkspaceMutationIntent::ReadOnly)
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_applies_must_mutate_intent_to_runtime_profile() {
+        let intent = TurnIntent::default()
+            .with_requested_scenario(Scenario::Implementation)
+            .with_workspace_mutation(WorkspaceMutationIntent::MustMutate);
+        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert!(state.task_profile.mutates_workspace);
+        assert!(state.task_profile.verification_required);
+        assert!(state.task_profile.allow_factual_retry);
+        assert_eq!(
+            state
+                .turn_intent
+                .as_ref()
+                .map(|intent| intent.workspace_mutation),
+            Some(WorkspaceMutationIntent::MustMutate)
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_does_not_mutate_for_read_only_question_about_implementation() {
+        let intent = TurnIntent::default()
+            .with_requested_scenario(Scenario::QuickAnswer)
+            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
+        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
+        let mut state = make_state();
+        state.message = "当前的实现，能够想起来吗？".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert!(!state.task_profile.mutates_workspace);
+        assert!(!state.task_profile.verification_required);
     }
 
     #[tokio::test]
@@ -2811,6 +2934,7 @@ mod tests {
         state.telemetry.observability_hub = Some(hub);
         state.telemetry.observability_session = Some(session.clone());
         state.message = "please inspect the current changes".into();
+        state.user_intent = state.message.clone();
         state.task_profile =
             astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
@@ -2833,6 +2957,7 @@ mod tests {
         state.telemetry.observability_hub = Some(hub);
         state.telemetry.observability_session = Some(session.clone());
         state.message = "where is the auth flow defined?".into();
+        state.user_intent = state.message.clone();
         state.task_profile =
             astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
@@ -2856,10 +2981,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_turn_iteration_skips_parallel_skill_requests() {
+    async fn prepare_turn_iteration_does_not_pre_route_without_judge_decision() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
-        state.message = "parallel review changes on current branch".into();
+        state.message = "review changes on current branch".into();
+        state.user_intent = state.message.clone();
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
         state.skills.resolver = Some(Arc::new(AutoRouteResolver));
 
@@ -2868,6 +2994,32 @@ mod tests {
             .expect("turn should prepare");
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert_eq!(
+            host.skill_auto_route_queries,
+            vec!["review changes on current branch".to_string()]
+        );
+        assert!(state.tool_results.is_empty());
+        assert!(state.skills.invoked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_rejects_judged_skill_outside_visible_catalog() {
+        let mut host = MockHost::new(Vec::new()).with_skill_auto_route_decision("missing-skill");
+        let mut state = make_state();
+        state.message = "review changes on current branch".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+        state.skills.resolver = Some(Arc::new(AutoRouteResolver));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert_eq!(
+            host.skill_auto_route_queries,
+            vec!["review changes on current branch".to_string()]
+        );
         assert!(state.tool_results.is_empty());
         assert!(state.skills.invoked.is_empty());
     }
@@ -2877,7 +3029,9 @@ mod tests {
     #[test]
     fn no_unsafe_set_var_in_production() {
         let source = include_str!("lifecycle.rs");
-        let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
+        let test_start = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .unwrap_or(source.len());
         let prod_code = &source[..test_start];
         assert!(
             !prod_code.contains("std::env::set_var"),
@@ -3549,6 +3703,7 @@ mod tests {
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
         state.message = "不是修修补补，我要的是第一性原则系统性修复。".into();
+        state.user_intent = state.message.clone();
 
         state.turn_guard.nudge_count = 4;
         state.turn_guard.record_tool_calls(&[
@@ -3600,6 +3755,7 @@ mod tests {
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         ));
         state.message = "不是修修补补，我要的是第一性原则系统性修复。".into();
+        state.user_intent = state.message.clone();
         state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
 
         state.turn_guard.nudge_count = 2;

@@ -144,6 +144,21 @@ pub struct FactualRetryFallbackJudgeContext<'a> {
     pub retry_text: &'a str,
 }
 
+/// Structured skill pre-route decision supplied by a host-side semantic judge.
+///
+/// Runtime code must not infer this from natural-language keyword, alias, or
+/// description matches. Absence means the normal LLM turn decides whether to
+/// call `skill`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillAutoRouteDecision {
+    pub skill_name: String,
+}
+
+pub struct SkillAutoRouteJudgeContext<'a> {
+    pub query: &'a str,
+    pub visible_skills: &'a [crate::turn::skill_tool::SkillToolInfo],
+}
+
 pub enum ControlToolRecovery {
     Unsupported,
     Missing,
@@ -191,6 +206,19 @@ pub trait AgenticLoopHost: Send {
     /// runtime defaults must not infer natural-language intent from keyword
     /// lists.
     async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
+        None
+    }
+
+    /// Optional semantic judge for pre-routing directly into one skill.
+    ///
+    /// Hosts may override this only when they have an explicit structured
+    /// decision, typically from an LLM judge. Runtime defaults must not infer
+    /// skill intent from local text relevance.
+    async fn judge_skill_auto_route(
+        &mut self,
+        _state: &AgenticLoopState,
+        _ctx: SkillAutoRouteJudgeContext<'_>,
+    ) -> Option<SkillAutoRouteDecision> {
         None
     }
 
@@ -797,8 +825,6 @@ pub struct SkillState {
     pub pinned: std::collections::HashSet<String>,
     /// Canonical skill names surfaced via `discover_skills` this session.
     pub discovered: HashSet<String>,
-    /// Scoring thresholds for deterministic pre-turn skill auto-routing.
-    pub auto_routing: crate::turn::skill_tool::AutoRoutingConfig,
     /// Skill listing message (available skill names + descriptions).
     /// Stored here instead of in `messages` so hosts can inject it ephemerally
     /// into each LLM request without bloating the persistent conversation history.
@@ -831,7 +857,6 @@ impl Default for SkillState {
             improvement_tracker: Default::default(),
             pinned: HashSet::new(),
             discovered: HashSet::new(),
-            auto_routing: Default::default(),
             listing_message: None,
             invoked: HashMap::new(),
             tool_event_hooks: Default::default(),
@@ -1805,11 +1830,20 @@ pub struct AgenticLoopState {
 
     /// ── Host-provided context (read-only by runtime) ──
     pub message: String,
+    /// Raw user intent captured before host-side prompt wrapping or runtime
+    /// scaffolding. Runtime decision judges must read this field via
+    /// [`AgenticLoopState::runtime_decision_user_intent`] instead of inspecting
+    /// prompt-facing `message`.
+    pub user_intent: String,
     pub recent_tools: Vec<String>,
     /// True when the prior (immediately preceding) turn produced assistant
     /// output (text or tool calls). Set by the agentic loop on every turn
     /// boundary (`has_any_usage` from the just-completed ingest).
     pub has_prior_assistant_turn: bool,
+    /// Structured intent for the current user turn, produced by the LLM judge.
+    /// Strong runtime controls consume this field instead of keyword matching
+    /// against prompt-facing user text.
+    pub turn_intent: Option<TurnIntent>,
     pub task_profile: TaskExecutionProfile,
     pub last_turn_policy: TurnInteractionPolicy,
 
@@ -2118,6 +2152,16 @@ impl AgenticLoopState {
         self.total_prompt
             .saturating_add(self.total_cache_read)
             .saturating_add(self.total_cache_creation)
+    }
+
+    #[must_use]
+    pub fn runtime_decision_user_intent(&self) -> String {
+        let input = if self.user_intent.trim().is_empty() {
+            self.message.as_str()
+        } else {
+            self.user_intent.as_str()
+        };
+        astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(input)
     }
 
     /// Refresh the cached active task-board snapshot from the shared
@@ -3043,8 +3087,10 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
             astra_turn_core::pipeline_config::PipelineConfig::default(),
         )),
         message: "test query".to_string(),
+        user_intent: "test query".to_string(),
         has_prior_assistant_turn: false,
         recent_tools: Vec::new(),
+        turn_intent: None,
         task_profile: TaskExecutionProfile::default(),
         last_turn_policy: TurnInteractionPolicy::default(),
         api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
@@ -3166,6 +3212,19 @@ pub(crate) mod tests {
         }
     }
 
+    fn structured_task_profile(
+        mutates_workspace: bool,
+        exploratory_task: bool,
+        complexity: astra_turn_core::chat_turn_heuristics::TaskComplexity,
+    ) -> astra_turn_core::chat_turn_heuristics::TaskExecutionProfile {
+        astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+            mutates_workspace,
+            exploratory_task,
+            complexity,
+            true,
+        )
+    }
+
     // ── Flexible mock host for multi-turn scenarios ─────────────────────────
 
     pub(crate) struct MockHost {
@@ -3179,6 +3238,8 @@ pub(crate) mod tests {
         pub(crate) rendered_final_text: Vec<String>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
         pub(crate) turn_intent: Option<TurnIntent>,
+        pub(crate) skill_auto_route_decision: Option<String>,
+        pub(crate) skill_auto_route_queries: Vec<String>,
         pub(crate) turn_completed_run_ids: Vec<Option<String>>,
         pub(crate) cancelled_agent_ids: Vec<String>,
         cancel_child_agents_delay: Option<std::time::Duration>,
@@ -3199,6 +3260,8 @@ pub(crate) mod tests {
                 rendered_final_text: Vec::new(),
                 executed_messages: Vec::new(),
                 turn_intent: None,
+                skill_auto_route_decision: None,
+                skill_auto_route_queries: Vec::new(),
                 turn_completed_run_ids: Vec::new(),
                 cancelled_agent_ids: Vec::new(),
                 cancel_child_agents_delay: None,
@@ -3219,6 +3282,11 @@ pub(crate) mod tests {
 
         pub(crate) fn with_turn_intent(mut self, intent: TurnIntent) -> Self {
             self.turn_intent = Some(intent);
+            self
+        }
+
+        pub(crate) fn with_skill_auto_route_decision(mut self, skill_name: &str) -> Self {
+            self.skill_auto_route_decision = Some(skill_name.to_string());
             self
         }
 
@@ -3262,6 +3330,19 @@ pub(crate) mod tests {
 
         async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
             self.turn_intent.clone()
+        }
+
+        async fn judge_skill_auto_route(
+            &mut self,
+            _state: &AgenticLoopState,
+            ctx: SkillAutoRouteJudgeContext<'_>,
+        ) -> Option<SkillAutoRouteDecision> {
+            self.skill_auto_route_queries.push(ctx.query.to_string());
+            self.skill_auto_route_decision
+                .as_ref()
+                .map(|skill_name| SkillAutoRouteDecision {
+                    skill_name: skill_name.clone(),
+                })
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -3557,8 +3638,10 @@ pub(crate) mod tests {
             error_recovery: Default::default(),
             pipeline_session: None,
             message: "test query".to_string(),
+            user_intent: "test query".to_string(),
             has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
+            turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
             textless_stop_retries: 0,
             last_finish_reason: None,
@@ -4087,6 +4170,7 @@ pub(crate) mod tests {
         ]);
         let mut state = make_state();
         state.message = "有哪些子目录".to_string();
+        state.user_intent = state.message.clone();
         state
             .messages
             .push(json!({"role": "user", "content": state.message.clone()}));
@@ -4331,8 +4415,10 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["read_file", "write_file"]);
         let mut state = make_state();
-        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-            "systematically refactor and implement a complex subsystem",
+        state.task_profile = structured_task_profile(
+            true,
+            false,
+            astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
@@ -4369,8 +4455,10 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["read_file"]);
         let mut state = make_state();
-        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-            "explore the codebase and investigate the root cause",
+        state.task_profile = structured_task_profile(
+            false,
+            true,
+            astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
@@ -4414,8 +4502,10 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["read_file", "write_file"]);
         let mut state = make_state();
-        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-            "systematically refactor and implement a complex subsystem",
+        state.task_profile = structured_task_profile(
+            true,
+            false,
+            astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
@@ -4487,8 +4577,10 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["read_file", "glob"]);
         let mut state = make_state();
-        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-            "explore the codebase and investigate the root cause",
+        state.task_profile = structured_task_profile(
+            false,
+            true,
+            astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
@@ -4541,8 +4633,10 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["read_file", "write_file"]);
         let mut state = make_state();
-        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-            "systematically refactor and implement a complex subsystem",
+        state.task_profile = structured_task_profile(
+            true,
+            false,
+            astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
         );
         state.agentic_turn_budget = astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
             initial_turns: 2,
@@ -5044,6 +5138,7 @@ pub(crate) mod tests {
             json!({"role": "user", "content": "之前我们聊过什么？"}),
         ];
         state.message = "之前我们聊过什么？".to_string();
+        state.user_intent = state.message.clone();
         let expected_before = state.messages.len();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -7461,6 +7556,7 @@ pub(crate) mod tests {
         state.skills.session_event_hooks = hooks;
         state.current_session_id = Some("test-session-123".to_string());
         state.message = "hello".to_string();
+        state.user_intent = state.message.clone();
         state
             .messages
             .push(json!({"role": "user", "content": "hello"}));
@@ -7661,6 +7757,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let mut state = make_state();
         state.skills.session_event_hooks = hooks;
         state.message = "analyze my code".to_string();
+        state.user_intent = state.message.clone();
         state
             .messages
             .push(json!({"role": "user", "content": "analyze my code"}));
@@ -7791,6 +7888,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.total_prompt = 40_000;
         state.total_completion = 20_000;
         state.message = "thanks, looks good".into();
+        state.user_intent = state.message.clone();
         state
             .messages
             .push(serde_json::json!({"role": "assistant", "content": "done"}));
@@ -9479,6 +9577,7 @@ mod parallel_execution_tests {
             let mut state = make_state();
             state.current_session_id = Some("e2e-test".into());
             state.message = "test query".into();
+            state.user_intent = state.message.clone();
             state
                 .messages
                 .push(json!({"role": "user", "content": "test query"}));
@@ -9603,6 +9702,7 @@ mod parallel_execution_tests {
             let mut state = make_state();
             state.current_session_id = Some("observe-test".into());
             state.message = "hello".into();
+            state.user_intent = state.message.clone();
             state
                 .messages
                 .push(json!({"role": "user", "content": "hello"}));
@@ -9682,6 +9782,7 @@ mod parallel_execution_tests {
             let mut state = make_state();
             state.current_session_id = Some("pause-test".into());
             state.message = "test query".into();
+            state.user_intent = state.message.clone();
             state
                 .messages
                 .push(json!({"role": "user", "content": "test query"}));

@@ -1511,6 +1511,7 @@ mod tests {
             let mut host = MockHost::new(vec![text_result(&scripted_output, 77, 33, Some(6))]);
             let mut state = make_state();
             state.message = config.task.clone();
+            state.user_intent = state.message.clone();
 
             let outcome = run_agentic_loop_with_host(&mut host, &mut state)
                 .await
@@ -1559,6 +1560,7 @@ mod tests {
             .with_valid_tools(&["bash"]);
             let mut state = make_state();
             state.message = config.task.clone();
+            state.user_intent = state.message.clone();
 
             let outcome = run_agentic_loop_with_host(&mut host, &mut state)
                 .await

@@ -475,6 +475,7 @@ pub enum RuntimeProfileRequest {
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
+    pub user_intent: Option<String>,
     pub parts: Vec<serde_json::Value>,
     pub attachments: Vec<serde_json::Value>,
     pub runtime_system_prompt: Option<String>,
@@ -534,6 +535,7 @@ impl std::fmt::Debug for ChatRequestData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatRequestData")
             .field("message", &self.message)
+            .field("user_intent", &self.user_intent)
             .field("parts", &self.parts)
             .field("attachments", &self.attachments)
             .field("runtime_system_prompt", &self.runtime_system_prompt)
@@ -6789,6 +6791,7 @@ mod tests {
 
         let request = ChatRequestData {
             message: "hi".to_string(),
+            user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
             runtime_system_prompt: None,
@@ -6850,6 +6853,7 @@ mod tests {
     fn chat_request_data_debug_redacts_runtime_auth_value() {
         let request = ChatRequestData {
             message: "hi".to_string(),
+            user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
             runtime_system_prompt: None,
@@ -6936,6 +6940,7 @@ mod tests {
                 "u1".to_string(),
                 ChatRequestData {
                     message: "hi".to_string(),
+                    user_intent: None,
                     parts: Vec::new(),
                     attachments: Vec::new(),
                     runtime_system_prompt: None,

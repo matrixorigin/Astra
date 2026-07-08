@@ -478,8 +478,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 ),
             ),
             message: task_context.to_string(),
+            user_intent: task_context.to_string(),
             recent_tools: Vec::new(),
             has_prior_assistant_turn: false,
+            turn_intent: None,
             task_profile: infer_task_execution_profile(task_context),
             last_turn_policy: TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
