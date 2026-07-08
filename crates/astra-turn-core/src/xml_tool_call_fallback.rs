@@ -433,7 +433,48 @@ pub fn parse_degraded_tool_calls(text: &str) -> Option<Vec<Value>> {
 pub fn strip_degraded_tool_calls(text: &str) -> String {
     let after_invoke = strip_parsed_invocations(text);
     let after_tool_call = strip_parsed_tool_call_tags(&after_invoke);
-    strip_residual_xml_fragments(&after_tool_call)
+    let after_truncated_tail = strip_truncated_degraded_tool_call_tail(&after_tool_call);
+    strip_residual_xml_fragments(&after_truncated_tail)
+}
+
+fn strip_truncated_degraded_tool_call_tail(text: &str) -> String {
+    let Some(start) = truncated_degraded_tool_call_tail_start(text) else {
+        return text.to_string();
+    };
+    text[..start].trim_end().to_string()
+}
+
+fn truncated_degraded_tool_call_tail_start(text: &str) -> Option<usize> {
+    ["<invoke", "<tool_call"]
+        .into_iter()
+        .filter_map(|marker| text.rfind(marker).map(|pos| (marker, pos)))
+        .filter(|(marker, pos)| {
+            let tail = &text[*pos..];
+            let closing = if *marker == "<invoke" {
+                "</invoke>"
+            } else {
+                "</tool_call>"
+            };
+            !tail.contains(closing)
+                && tag_starts_tool_block_line(text, *pos)
+                && tail_looks_like_tool_block(tail)
+        })
+        .map(|(_, pos)| pos)
+        .min()
+}
+
+fn tag_starts_tool_block_line(text: &str, pos: usize) -> bool {
+    text[..pos]
+        .rsplit_once('\n')
+        .map(|(_, line)| line.trim().is_empty())
+        .unwrap_or_else(|| text[..pos].trim().is_empty())
+}
+
+fn tail_looks_like_tool_block(tail: &str) -> bool {
+    let first_line = tail.lines().next().unwrap_or(tail).trim_start();
+    (first_line.starts_with("<invoke")
+        && (first_line.contains("name=") || tail.contains("<parameter")))
+        || (first_line.starts_with("<tool_call") && tail.contains("<function"))
 }
 
 /// Strip bare `<parameter=…>` and `<function=…>` fragments that aren't
@@ -913,6 +954,24 @@ Done."#;
             !stripped.contains("<invoke"),
             "invoke block must be stripped from output text, got: {stripped:?}"
         );
+    }
+
+    #[test]
+    fn truncated_invoke_tail_is_stripped_from_tool_turn_text() {
+        let text = "I will inspect the repository.\n\n\
+<invoke name=\"bash\">\n\
+<parameter name=\"command\">pwd</parameter>";
+        let stripped = strip_degraded_tool_calls(text);
+        assert_eq!(stripped, "I will inspect the repository.");
+        assert!(!stripped.contains("<invoke"));
+        assert!(!stripped.contains("<parameter"));
+        assert!(!stripped.contains("pwd"));
+    }
+
+    #[test]
+    fn inline_invoke_mentions_are_not_stripped_as_truncated_tool_blocks() {
+        let text = "The literal <invoke name=\"bash\"> tag appears in this review.";
+        assert_eq!(strip_degraded_tool_calls(text), text);
     }
 
     #[test]

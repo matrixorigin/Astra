@@ -6415,16 +6415,7 @@ pub(crate) async fn consume_turn_sse(
         edge_tool_round,
         refreshed_token,
     };
-    streaming_md::strip_xml_tags_inplace(&mut result.full_text);
-    // When the model emits both native tool calls AND <invoke> XML text in the
-    // same turn (degraded mixed output), strip the XML from full_text. We only
-    // do this when tool calls are present — if there are no tool calls, the text
-    // might legitimately discuss <invoke> (e.g. code reviews).
-    if result.has_tool_calls || !result.edge_tool_round.is_empty() {
-        result.full_text =
-            astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&result.full_text);
-    }
-    streaming_md::strip_leading_narration(&mut result.full_text);
+    sanitize_final_stream_text(&mut result);
 
     if render_policy.suppress_text() {
         // Silent / FinalOnly / PlanDecompose: text rendering is deferred to the
@@ -6442,7 +6433,7 @@ pub(crate) async fn consume_turn_sse(
     //
     // Tool turns: discard any rendered state (thinking spinners, etc.)
     // Non-tool turns: nothing to discard — text was buffered, not rendered.
-    let has_any_tool_work = result.has_tool_calls || !result.edge_tool_round.is_empty();
+    let has_any_tool_work = turn_has_tool_work(&result);
     if has_any_tool_work {
         // Tool turn — discard any incremental rendering state
         if let Some(md) = &mut md_renderer {
@@ -6501,6 +6492,22 @@ fn merge_edge_tool_rounds(
     }
 
     merged
+}
+
+fn turn_has_tool_work(result: &TurnResult) -> bool {
+    result.has_tool_calls || !result.edge_tool_round.is_empty()
+}
+
+fn sanitize_final_stream_text(result: &mut TurnResult) {
+    streaming_md::strip_xml_tags_inplace(&mut result.full_text);
+    // When the model emits both native tool calls AND <invoke> XML text in the
+    // same turn (degraded mixed output), strip the XML from full_text. Only do
+    // this for tool turns; ordinary answers may legitimately discuss <invoke>.
+    if turn_has_tool_work(result) {
+        result.full_text =
+            astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&result.full_text);
+    }
+    streaming_md::strip_leading_narration(&mut result.full_text);
 }
 
 /// Append `<skill-loaded name="..."/>` to a successful skill result.
@@ -6565,9 +6572,9 @@ mod tests {
         edge_tool_is_cacheable_read, edge_tool_outcome_status, execute_with_metadata_responsive,
         extract_cli_diff_block, format_tool_display_from_preview, is_edge_auth_failure,
         merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
-        reusable_speculative_output, style_tool_description, sync_incremental_accum_state,
-        sync_incremental_tool_result_state, task_preview_from_args, theme, tool_completion_icon,
-        tool_dedup_signature,
+        reusable_speculative_output, sanitize_final_stream_text, style_tool_description,
+        sync_incremental_accum_state, sync_incremental_tool_result_state, task_preview_from_args,
+        theme, tool_completion_icon, tool_dedup_signature, turn_has_tool_work,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -8796,6 +8803,42 @@ mod tests {
         assert!(!result.core.has_tool_calls);
         assert!(result.edge_tool_round.is_empty());
         assert_eq!(result.core.full_text, "The answer is 42.");
+    }
+
+    #[test]
+    fn final_stream_text_cleanup_removes_unclosed_thinking_without_tool_work() {
+        let mut result = TurnResult::new();
+        result.core.full_text = "Final answer\n<think>hidden partial".to_string();
+
+        sanitize_final_stream_text(&mut result);
+
+        assert!(!turn_has_tool_work(&result));
+        assert_eq!(result.core.full_text.trim(), "Final answer");
+        assert!(!result.core.full_text.contains("hidden partial"));
+    }
+
+    #[test]
+    fn final_stream_text_cleanup_strips_degraded_tool_xml_only_for_tool_turns() {
+        let mut explanation = TurnResult::new();
+        explanation.core.full_text =
+            "The literal <invoke name=\"bash\"> tag appears in this review.".to_string();
+        sanitize_final_stream_text(&mut explanation);
+        assert!(
+            explanation
+                .core
+                .full_text
+                .contains("<invoke name=\"bash\">"),
+            "non-tool answers may legitimately discuss XML-like tool tags"
+        );
+
+        let mut tool_turn = TurnResult::new();
+        tool_turn.core.has_tool_calls = true;
+        tool_turn.core.full_text = "I will call a tool.\n<invoke name=\"bash\">\n<parameter name=\"command\">pwd</parameter>".to_string();
+        sanitize_final_stream_text(&mut tool_turn);
+        assert!(turn_has_tool_work(&tool_turn));
+        assert!(!tool_turn.core.full_text.contains("<invoke"));
+        assert!(!tool_turn.core.full_text.contains("<parameter"));
+        assert!(!tool_turn.core.full_text.contains("pwd</parameter>"));
     }
 
     // ── Edge-path skill dedup tests ─────────────────────────────────────

@@ -9342,6 +9342,12 @@ mod tests {
                 .is_some_and(|(stable, runtime)| stable < runtime),
             "stable system block must precede runtime block: {body:#?}"
         );
+        assert!(
+            !body
+                .to_string()
+                .contains(crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER),
+            "internal runtime marker must never reach the provider request body: {body:#?}"
+        );
     }
 
     #[test]
