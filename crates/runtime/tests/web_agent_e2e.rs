@@ -49,8 +49,77 @@ const SECRET: &str = "web-agent-e2e-secret";
 const TOKEN: &str = "Bearer web-agent-e2e-token";
 const USER_ID: &str = "web-agent-e2e-user";
 const DEFAULT_SELECTED_MODEL: &str = "test-model";
+const DEFAULT_TEST_EDGE_AGENT_ID: &str = "web-agent-e2e-edge";
+const DEFAULT_TOOL_RESULT_SESSION_ID: &str = "web-agent-e2e-session";
+const DEFAULT_TOOL_RESULT_RUN_ID: &str = "web-agent-e2e-run";
+const DEFAULT_TOOL_RESULT_TURN_CHAIN_ID: &str = "web-agent-e2e-turn-chain";
 
 static SECRET_INIT: OnceLock<()> = OnceLock::new();
+static TOOL_REQUEST_IDENTITY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Vec<(u128, ToolResultIdentity)>>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct ToolResultIdentity {
+    session_id: String,
+    run_id: String,
+    turn_chain_id: String,
+}
+
+fn tool_request_identity_cache() -> &'static tokio::sync::Mutex<HashMap<String, Vec<(u128, ToolResultIdentity)>>> {
+    TOOL_REQUEST_IDENTITY_CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+fn tool_request_identity_from_event(event: &Value) -> Option<(String, ToolResultIdentity)> {
+    let request_id = event.get("request_id")?.as_str()?.to_string();
+    let session_id = event.get("session_id")?.as_str()?.to_string();
+    let run_id = event.get("run_id")?.as_str()?.to_string();
+    let turn_chain_id = event.get("turn_chain_id")?.as_str()?.to_string();
+    if request_id.is_empty()
+        || session_id.is_empty()
+        || run_id.is_empty()
+        || turn_chain_id.is_empty()
+    {
+        return None;
+    }
+    Some((
+        request_id,
+        ToolResultIdentity {
+            session_id,
+            run_id,
+            turn_chain_id,
+        },
+    ))
+}
+
+async fn record_tool_request_identity(event: &Value) {
+    let Some((request_id, identity)) = tool_request_identity_from_event(event) else {
+        return;
+    };
+    let mut cache = tool_request_identity_cache().lock().await;
+    let entry = cache.entry(request_id).or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    entry.push((now, identity));
+}
+
+async fn consume_tool_request_identity(request_id: &str) -> ToolResultIdentity {
+    let mut cache = tool_request_identity_cache().lock().await;
+    if let Some(entries) = cache.get_mut(request_id) {
+        if let Some((_, identity)) = entries.pop() {
+            if entries.is_empty() {
+                cache.remove(request_id);
+            }
+            return identity;
+        }
+    }
+    ToolResultIdentity {
+        session_id: DEFAULT_TOOL_RESULT_SESSION_ID.to_string(),
+        run_id: DEFAULT_TOOL_RESULT_RUN_ID.to_string(),
+        turn_chain_id: DEFAULT_TOOL_RESULT_TURN_CHAIN_ID.to_string(),
+    }
+}
 
 fn init_env() {
     SECRET_INIT.get_or_init(|| unsafe {
@@ -665,13 +734,18 @@ async fn post_tool_result(
     output: &str,
     status: &str,
 ) -> StatusCode {
-    let body = json!({
-        "request_id": request_id,
-        "status": status,
-        "output": output,
-        "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(request_id, output),
-        "duration_ms": 10,
-    });
+    let identity = consume_tool_request_identity(request_id).await;
+    let body = astra_thin_client::ToolResultRequest::new_with_hash(
+        identity.session_id,
+        identity.run_id,
+        identity.turn_chain_id,
+        request_id.to_string(),
+        DEFAULT_TEST_EDGE_AGENT_ID.to_string(),
+        status.to_string(),
+        output.to_string(),
+        10,
+    );
+    let body: Value = serde_json::to_value(body).unwrap();
     let req = Request::builder()
         .method("POST")
         .uri("/tools/result")
@@ -1044,6 +1118,7 @@ async fn wait_for_sse(
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(event)) => {
+                record_tool_request_identity(&event).await;
                 if event.get("type").and_then(Value::as_str) == Some(event_type) {
                     return event;
                 }
