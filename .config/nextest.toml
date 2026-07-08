@@ -19,12 +19,10 @@ slow-timeout = { period = "15s", terminate-after = 1 }
 # because the live MatrixOne database is a shared external bottleneck.
 test-threads = 2
 
-# All profiles share a uniform 15s per-test-case hard budget. TIMEOUT = FAIL;
-# no per-test/per-binary carve-outs. 15s is deliberately lax so flake from
-# known contention (e.g. the `session_sync_log` prune hot path tracked in
-# `plans/session-sync-log-prune-hotpath-2026-05-01.md`) doesn't block work,
-# but any genuinely runaway test still fails loudly. Tighten later when the
-# prune contention is fixed — ideally back toward 1–2s per case.
+# CI and strict profiles use a 30s per-test-case hard budget. TIMEOUT = FAIL;
+# no per-test/per-binary carve-outs. The default local profile stays at 15s.
+# Tighten later when known contention such as the `session_sync_log` prune hot
+# path is fixed — ideally back toward 1–2s per case.
 [profile.ci]
 fail-fast = false
 slow-timeout = { period = "30s", terminate-after = 1 }
@@ -59,14 +57,13 @@ test-threads = 2
 # ── Parallelism caps for heavy integration suites ────────────────────────
 # Group membership is set via `[[profile.X.overrides]]` below. These test
 # groups cap how many members run in parallel — they exist to stop DB / mock
-# LLM contention, not to affect the slow-timeout budget (the budget is 15s
-# for everyone, uniformly).
+# LLM contention, not to affect each profile's slow-timeout budget.
 [test-groups]
 integration_e2e = { max-threads = 2 }
 cli_agent_e2e = { max-threads = 1 }
 db_scoped_trim = { max-threads = 1 }
 # Tests that create tempfiles/dirs heavily; inotify-sensitive on
-# default-kernel boxes (max_user_instances=128). Cap at 4 so these
+# default-kernel boxes (max_user_instances=128). Cap at 2 so these
 # packages never exhaust inotify even when the rest runs at num-cpus.
 fs_heavy = { max-threads = 2 }
 
@@ -105,7 +102,7 @@ filter = "package(astra-cli) and (test(/stream_chat_sse_/) or test(/spawn_plan_e
 test-group = "cli_agent_e2e"
 
 # Packages that create tempfiles/dirs — inotify-sensitive on default
-# kernels (max_user_instances=128). Cap their parallelism to 4 so
+# kernels (max_user_instances=128). Cap their parallelism to 2 so
 # the rest of the workspace can still run at full speed.
 [[profile.strict.overrides]]
 filter = """

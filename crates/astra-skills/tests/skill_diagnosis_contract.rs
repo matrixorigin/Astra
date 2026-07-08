@@ -16,7 +16,11 @@
 //!   • blocks with malformed JSON (→ None)
 //!   • oversized fields (→ truncated to caps, parser still returns Some)
 
+use std::collections::BTreeSet;
+use std::path::Path;
+
 use astra_skills::auto_invoke::{SKILL_DIAGNOSIS_SCHEMA_VERSION, SkillDiagnosis};
+use astra_skills::loader::parse_skill_md;
 
 // ─── Happy path ────────────────────────────────────────────────────────────
 
@@ -295,6 +299,57 @@ fn review_changes_skill_requires_parallel_fallback_and_self_critique_gate() {
         text.contains("Self-critique gate") && text.contains("git diff --check"),
         "review_changes must run a self-critique lint gate before the final report"
     );
+}
+
+#[test]
+fn project_claude_and_agent_skill_bodies_stay_in_sync() {
+    let agent_root = astra_core::test_paths::workspace_path(".agent/skills");
+    let claude_root = astra_core::test_paths::workspace_path(".claude/skills");
+
+    let agent_names = skill_dir_names(&agent_root);
+    let claude_names = skill_dir_names(&claude_root);
+    assert_eq!(
+        claude_names, agent_names,
+        ".claude/skills and .agent/skills must expose the same project skill set"
+    );
+
+    for skill_name in agent_names {
+        let agent_body = parsed_skill_body(&agent_root, &skill_name);
+        let claude_body = parsed_skill_body(&claude_root, &skill_name);
+        assert_eq!(
+            claude_body, agent_body,
+            "{skill_name}: .claude and .agent skill instruction bodies drifted"
+        );
+    }
+}
+
+fn skill_dir_names(root: &Path) -> BTreeSet<String> {
+    std::fs::read_dir(root)
+        .unwrap_or_else(|e| panic!("read skill root {}: {e}", root.display()))
+        .filter_map(|entry| {
+            let entry = entry.unwrap_or_else(|e| panic!("read skill dir entry: {e}"));
+            let file_type = entry
+                .file_type()
+                .unwrap_or_else(|e| panic!("read file type for {}: {e}", entry.path().display()));
+            if !file_type.is_dir() {
+                return None;
+            }
+            let skill_md = entry.path().join("SKILL.md");
+            if !skill_md.is_file() {
+                return None;
+            }
+            Some(entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+fn parsed_skill_body(root: &Path, skill_name: &str) -> String {
+    let path = root.join(skill_name).join("SKILL.md");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let (_, body) =
+        parse_skill_md(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+    body
 }
 
 #[test]

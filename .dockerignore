@@ -26,10 +26,11 @@ coverage
 dist
 build
 target
-target
-rust/.rustc_info.json
-Cargo.lock.patch
-rust/*.patch
+rust/
+tmp/
+*.patch
 .runtime
 *.egg-info
 memoria/data/
+deployment/all-in-one/data/
+web/.next-dev

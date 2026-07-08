@@ -50,15 +50,15 @@ Stable schema: `schema_version = "astra-journal-digest-v1"` from
 
 Use these fields directly. Do not invent numbers.
 
-| Field | Use |
-| --- | --- |
-| `aggregates` | Turn count, tokens, duration, tool counts, failures, stalls, compactions |
-| `turns[]` | Per-turn tokens, latency, TTFT, context time, visible/used/activated tools, selected skills, budget pressure |
-| `failed_tool_calls[]` | Failed call category, tool name, args preview, error preview |
-| `compaction_events[]` | When context was compacted and what signal triggered it |
-| `stalls[]` | Stall/circuit-breaker evidence |
-| `turn_errors[]`, `other_errors[]` | Error cascade and failure boundaries |
-| `journal_lines_malformed` | Whether digest skipped corrupted journal lines |
+| Field                             | Use                                                                                                          |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `aggregates`                      | Turn count, tokens, duration, tool counts, failures, stalls, compactions                                     |
+| `turns[]`                         | Per-turn tokens, latency, TTFT, context time, visible/used/activated tools, selected skills, budget pressure |
+| `failed_tool_calls[]`             | Failed call category, tool name, args preview, error preview                                                 |
+| `compaction_events[]`             | When context was compacted and what signal triggered it                                                      |
+| `stalls[]`                        | Stall/circuit-breaker evidence                                                                               |
+| `turn_errors[]`, `other_errors[]` | Error cascade and failure boundaries                                                                         |
+| `journal_lines_malformed`         | Whether digest skipped corrupted journal lines                                                               |
 
 If `schema_version` differs, report the mismatch and still use fields that exist.
 
@@ -95,14 +95,14 @@ Flow:
 
 Use only when the digest does not answer the question.
 
-| Evidence | Path |
-| --- | --- |
-| Heavy prompt checkpoint | `~/.astra/sessions/<id>/step_checkpoints/*-heavy.json` |
-| Debug full turn dump | `/tmp/debug-*-turn*-full.json` |
-| Local journal | `~/.astra/sessions/<id>.jsonl` |
-| Session journal implementation | `crates/services/src/session_journal.rs` |
-| Stall/guard implementation | `crates/runtime/src/turn/` |
-| Tool surface implementation | `crates/runtime/src/tool_registry/`, `crates/runtime/src/capabilities.rs` |
+| Evidence                       | Path                                                                                |
+| ------------------------------ | ----------------------------------------------------------------------------------- |
+| Heavy prompt checkpoint        | `~/.astra/sessions/<id>/step_checkpoints/*-heavy.json`                              |
+| Debug full turn dump           | `/tmp/debug-*-turn*-full.json`                                                      |
+| Local journal                  | `~/.astra/sessions/<id>.jsonl`                                                      |
+| Session journal implementation | `crates/services/src/session_journal.rs`                                       |
+| Stall/guard implementation     | `crates/runtime/src/turn/`                                                     |
+| Tool surface implementation    | `crates/runtime/src/tool_registry/`, `crates/runtime/src/capabilities.rs` |
 
 ## Output Contract
 
@@ -122,4 +122,25 @@ Recommended fix:
 
 Unknowns:
 - <only if evidence is missing>
+```
+
+```skill-diagnosis
+{
+  "schema_version": 2,
+  "skill": "analyze_session",
+  "cause": "session_stalls",
+  "headline": "agent stalled on repeated tool calls with no new progress",
+  "findings": ["turn 4-7 repeated identical grep with no new matches"],
+  "recommended_action": "narrow scope to src/ or switch to rg",
+  "success_criteria": [
+    {
+      "metric": "session_stalls_delta",
+      "operator": "lte",
+      "threshold": 0.0,
+      "window_turns": 3,
+      "description": "session stalls stop increasing"
+    }
+  ],
+  "source": "real_skill"
+}
 ```

@@ -8,21 +8,21 @@ A second file at `.claude/CLAUDE.md` is also loaded — it carries the MANDATORY
 
 `astra-engine` — a Rust-first agent platform for auditable chat runs, session history, replay, skills, admin operations, and MatrixOne-backed state. The flagship binary is `astra-server` (Axum HTTP API); the operator-facing surfaces are the `astra` CLI (interactive TUI + scripting + admin operations), and a Next.js admin dashboard under `web/`.
 
-## ⚠ Cargo Workspace Lives Under `rust/`
+## Cargo Workspace Lives At Repo Root
 
-The Rust workspace `Cargo.toml` is at `Cargo.toml`, NOT at the repo root. All raw `cargo` commands must run from `rust/` or pass `--manifest-path Cargo.toml`:
+The Rust workspace `Cargo.toml` is at the repository root. Run raw `cargo`
+commands from the repo root, or pass `--manifest-path Cargo.toml` when invoking
+Cargo from another directory:
 
 ```bash
-# ✗ WRONG — no Cargo.toml at repo root
+# ✓ repo root
 cargo build -p astra-runtime
 
-# ✓ RIGHT
-cargo build -p astra-runtime
-# or
+# ✓ any directory
 cargo build --manifest-path Cargo.toml -p astra-runtime
 ```
 
-Prefer `make <target>` from the repo root — those already cd correctly.
+Prefer `make <target>` from the repo root for common workflows.
 
 ## Build & Test
 
@@ -48,7 +48,6 @@ make audit              # cargo-audit (needs: cargo install cargo-audit)
 Run a single Rust test:
 
 ```bash
-cd rust
 cargo nextest run -p astra-runtime --test http_contract
 cargo nextest run -p astra-runtime some_test_name           # filter by name
 cargo test --manifest-path Cargo.toml -p astra-runtime --test http_contract -- --nocapture

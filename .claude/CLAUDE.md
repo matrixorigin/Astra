@@ -26,19 +26,21 @@ make dev-stop           # Stop all
 - `.agent/skills/` — curated Agent Skills for Agent-compatible runtimes and Astra local discovery
 - `web/` — Next.js admin dashboard
 
-## ⚠ Cargo workspace lives under `rust/`
+## Cargo Workspace
 
-`Cargo.toml` is at `Cargo.toml`, NOT at repo root. All `cargo` commands must run from the `rust/` subdirectory, not from the project root.
+`Cargo.toml` is at the repository root. Run `cargo` commands from the project
+root, or pass `--manifest-path Cargo.toml` when invoking Cargo from another
+directory.
 
 ```bash
-# ✗ WRONG — no Cargo.toml at repo root, cargo errors out
+# ✓ repo root
 cd /home/xupeng/github/astra && cargo build -p astra-runtime
 
-# ✓ RIGHT — cd into rust/ first
-cd /home/xupeng/github/astra/rust && cargo build -p astra-runtime
+# ✓ any directory
+cargo build --manifest-path /home/xupeng/github/astra/Cargo.toml -p astra-runtime
 ```
 
-Prefer `make <target>` from the repo root when possible — those already cd correctly.
+Prefer `make <target>` from the repo root when possible.
 
 ## Rust Conventions
 
