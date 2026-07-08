@@ -1,5 +1,4 @@
 use super::*;
-use axum::extract::rejection::JsonRejection;
 
 #[derive(serde::Serialize)]
 pub(super) struct AgentBindingCreateResponse {
@@ -56,24 +55,19 @@ pub(super) async fn create_agent_binding_handler(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    request: Result<Json<astra_services::AgentBindingCreateRequestData>, JsonRejection>,
+    body: Bytes,
 ) -> Result<Json<AgentBindingCreateResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let Json(request) = request.map_err(agent_binding_json_rejection_to_error)?;
     let _principal = state
         .auth_service
         .current_principal_for_request(
             &headers,
-            external_request_descriptor(&method, &uri, &headers, "/agent-bindings"),
+            external_request_descriptor(&method, &uri, &headers, "/agent-bindings", &body),
         )
         .await?;
+    let request = serde_json::from_slice::<astra_services::AgentBindingCreateRequestData>(&body)
+        .map_err(|error| agent_binding_json_error_from_body_text(&error.to_string()))?;
     let record = state.agent_binding_service.create_binding(request).await?;
     Ok(Json((&record).into()))
-}
-
-fn agent_binding_json_rejection_to_error(
-    rejection: JsonRejection,
-) -> (StatusCode, Json<ErrorResponse>) {
-    agent_binding_json_error_from_body_text(&rejection.body_text())
 }
 
 fn agent_binding_json_error_from_body_text(detail: &str) -> (StatusCode, Json<ErrorResponse>) {

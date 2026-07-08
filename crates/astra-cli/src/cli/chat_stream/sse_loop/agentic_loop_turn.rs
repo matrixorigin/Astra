@@ -3032,6 +3032,7 @@ mod tests {
         let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(2);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let message = "修复 timeout handling";
+        let user_intent = "review timeout handling and propose a fix";
         let messages = vec![json!({"role": "user", "content": message})];
         let history = vec![(
             "review timeout handling".to_string(),
@@ -3068,7 +3069,7 @@ mod tests {
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message,
-            user_intent: message,
+            user_intent,
             semantic_query_override: Some(semantic_query_override),
             history: &history,
             recent_tools: &recent_tools,
@@ -3116,6 +3117,11 @@ mod tests {
         .await;
 
         let trace = trace_collector.finalize();
+        assert_eq!(
+            payload["user_intent"].as_str(),
+            Some(user_intent),
+            "edge payload must preserve structured user_intent separately from prompt-facing message"
+        );
         assert_eq!(trace.memory.query, semantic_query_override);
         let edge_tool_names: Vec<String> = payload["edge_tools"]
             .as_array()

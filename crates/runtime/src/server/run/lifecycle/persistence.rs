@@ -819,7 +819,7 @@ pub(crate) fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
             }));
         }
     }
-    astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(messages)
+    messages
 }
 
 pub(crate) fn server_loop_causal_chain_id(kind: &str) -> String {
@@ -2480,7 +2480,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_for_csl_persist_keeps_only_prompt_facing_history() {
+    fn messages_for_csl_persist_keeps_raw_canonical_history() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.messages = vec![
             json!({"role": "user", "content": "old review"}),
@@ -2494,26 +2494,16 @@ mod tests {
 
         let messages = messages_for_csl_persist(&state);
 
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["content"], "不要review啊！");
-        assert_eq!(messages[2]["content"], "ok");
-        assert!(
-            messages
-                .iter()
-                .all(|msg| msg["role"] != "tool" && msg.get("reasoning_content").is_none())
+        assert_eq!(messages.len(), 7);
+        assert_eq!(messages[0]["content"], "old review");
+        assert_eq!(messages[2]["content"], "不要review啊！");
+        assert_eq!(messages[3]["reasoning_content"], "trace");
+        assert_eq!(
+            messages[4]["content"],
+            "[Session runtime recap]\nRecent tools: stale"
         );
-        assert!(
-            messages
-                .iter()
-                .all(|msg| !msg["content"].as_str().unwrap_or("").contains("old review"))
-        );
-        assert!(messages.iter().all(|msg| {
-            !msg["content"]
-                .as_str()
-                .unwrap_or("")
-                .contains("runtime recap")
-        }));
+        assert_eq!(messages[5]["role"], "tool");
+        assert_eq!(messages[6]["content"], "ok");
     }
 
     #[test]

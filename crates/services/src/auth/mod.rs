@@ -11,6 +11,8 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bcrypt::{hash as bcrypt_hash, verify as bcrypt_verify};
 use hmac::{Hmac, Mac};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Resolve bcrypt cost from `ASTRA_BCRYPT_COST`, falling back to `bcrypt::DEFAULT_COST` (12).
 /// Tests set a low cost (e.g. `4`) to avoid multi-hundred-millisecond hashing in debug builds;
@@ -66,12 +68,20 @@ type ExternalRequestAuthHeaders = Option<(String, String, String)>;
 type ParsedTokenSession = (String, String, Option<String>);
 type HmacSha256 = Hmac<Sha256>;
 const PROVIDER_REQUEST_TOKEN_PREFIX: &str = "moi-provider-v1";
+const PROVIDER_REQUEST_MAX_TTL_SECONDS: i64 = 300;
+const PROVIDER_REQUEST_CLOCK_SKEW_SECONDS: i64 = 60;
 
 #[derive(Debug, Deserialize)]
 struct ProviderRequestClaims {
     sub: String,
     scope: String,
     provider: String,
+    method: String,
+    path: String,
+    route: String,
+    request_id: String,
+    body_digest: String,
+    nonce: String,
     iat: i64,
     exp: i64,
 }
@@ -80,6 +90,7 @@ fn verify_provider_request_hmac_token(
     expected_provider: &str,
     key: &str,
     bearer_token: &str,
+    request: &ProviderRequestDescriptor,
 ) -> Result<ProviderAuthorizedRequest, AuthHttpError> {
     if key.is_empty() || key.trim() != key {
         return Err(provider_request_auth_error(
@@ -129,23 +140,34 @@ fn verify_provider_request_hmac_token(
         .map_err(|_| provider_request_auth_error("Provider request token claims are malformed"))?;
     let claims: ProviderRequestClaims = serde_json::from_slice(&claims_bytes)
         .map_err(|_| provider_request_auth_error("Provider request token claims are malformed"))?;
-    validate_provider_request_claims(expected_provider, &claims)?;
+    validate_provider_request_claims(expected_provider, &claims, request)?;
     Ok(ProviderAuthorizedRequest {
         provider_id: expected_provider.to_string(),
         external_subject: claims.sub,
         provider_scope_id: claims.scope,
-        request_authorization_id: format!("{PROVIDER_REQUEST_TOKEN_PREFIX}:{encoded_signature}"),
+        request_authorization_id: format!(
+            "{PROVIDER_REQUEST_TOKEN_PREFIX}:{}:{}:{}",
+            claims.provider, claims.request_id, claims.nonce
+        ),
+        expires_at_unix: claims.exp,
     })
 }
 
 fn validate_provider_request_claims(
     expected_provider: &str,
     claims: &ProviderRequestClaims,
+    request: &ProviderRequestDescriptor,
 ) -> Result<(), AuthHttpError> {
     for (field, value) in [
         ("sub", claims.sub.as_str()),
         ("scope", claims.scope.as_str()),
         ("provider", claims.provider.as_str()),
+        ("method", claims.method.as_str()),
+        ("path", claims.path.as_str()),
+        ("route", claims.route.as_str()),
+        ("request_id", claims.request_id.as_str()),
+        ("body_digest", claims.body_digest.as_str()),
+        ("nonce", claims.nonce.as_str()),
     ] {
         if value.is_empty() || value.trim() != value {
             return Err(provider_request_auth_error(format!(
@@ -158,12 +180,60 @@ fn validate_provider_request_claims(
             "Provider request token provider does not match request provider",
         ));
     }
+    if claims.method != request.method {
+        return Err(provider_request_auth_error(
+            "Provider request token method does not match request method",
+        ));
+    }
+    if claims.path != request.path {
+        return Err(provider_request_auth_error(
+            "Provider request token path does not match request path",
+        ));
+    }
+    if request
+        .route
+        .as_deref()
+        .is_none_or(|route| route != claims.route)
+    {
+        return Err(provider_request_auth_error(
+            "Provider request token route does not match request descriptor",
+        ));
+    }
+    if request
+        .request_id
+        .as_deref()
+        .is_none_or(|request_id| request_id != claims.request_id)
+    {
+        return Err(provider_request_auth_error(
+            "Provider request token request_id does not match request descriptor",
+        ));
+    }
+    if request
+        .body_digest
+        .as_deref()
+        .is_none_or(|body_digest| body_digest != claims.body_digest)
+    {
+        return Err(provider_request_auth_error(
+            "Provider request token body_digest does not match request body",
+        ));
+    }
     if claims.iat <= 0 || claims.exp <= 0 || claims.exp <= claims.iat {
         return Err(provider_request_auth_error(
             "Provider request token time claims are invalid",
         ));
     }
-    if Utc::now().timestamp() >= claims.exp {
+    if claims.exp - claims.iat > PROVIDER_REQUEST_MAX_TTL_SECONDS {
+        return Err(provider_request_auth_error(
+            "Provider request token TTL exceeds the maximum allowed window",
+        ));
+    }
+    let now = Utc::now().timestamp();
+    if claims.iat > now + PROVIDER_REQUEST_CLOCK_SKEW_SECONDS {
+        return Err(provider_request_auth_error(
+            "Provider request token was issued in the future",
+        ));
+    }
+    if now >= claims.exp {
         return Err(provider_request_auth_error(
             "Provider request token has expired",
         ));
@@ -295,6 +365,15 @@ impl AuthPrincipal {
             AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
         )
     }
+
+    pub fn provider_authorized_request_context(
+        &self,
+    ) -> Option<&AuthProviderAuthorizedRequestContext> {
+        match &self.origin {
+            AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => Some(context),
+            AuthPrincipalOrigin::Internal => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -309,6 +388,7 @@ pub struct AuthProviderAuthorizedRequestContext {
     pub external_subject: String,
     pub provider_scope_id: String,
     pub request_authorization_id: String,
+    pub allowed_capability_descriptors: Vec<astra_core::ProviderCapabilityDescriptorConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,6 +406,7 @@ pub struct DatabaseAuthService {
     jwt: JwtSettings,
     encryptor: Option<FernetTokenEncryptor>,
     provider_request_auth: Vec<ProviderRequestAuthConfig>,
+    provider_request_replay_cache: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -388,6 +469,7 @@ impl DatabaseAuthService {
             pool: None,
             encryptor: None,
             provider_request_auth: Vec::new(),
+            provider_request_replay_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -577,6 +659,25 @@ impl DatabaseAuthService {
                     "provider_unknown",
                 )
             })
+    }
+
+    fn record_provider_request_authorization(
+        &self,
+        authorization_id: &str,
+        expires_at_unix: i64,
+    ) -> Result<(), AuthHttpError> {
+        let now = Utc::now().timestamp();
+        let mut guard = self.provider_request_replay_cache.lock().map_err(|_| {
+            provider_request_auth_error("Provider request replay cache is unavailable")
+        })?;
+        guard.retain(|_, expiry| *expiry > now);
+        if guard.contains_key(authorization_id) {
+            return Err(provider_request_auth_error(
+                "Provider request token has already been used",
+            ));
+        }
+        guard.insert(authorization_id.to_string(), expires_at_unix);
+        Ok(())
     }
 
     fn external_request_auth_headers(
@@ -1103,7 +1204,7 @@ impl AuthService for DatabaseAuthService {
     async fn current_principal_for_request(
         &self,
         headers: &HeaderMap,
-        _request: ProviderRequestDescriptor,
+        request: ProviderRequestDescriptor,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         let Some((provider_id, _action, token)) = Self::external_request_auth_headers(headers)?
         else {
@@ -1115,8 +1216,16 @@ impl AuthService for DatabaseAuthService {
                 "Provider request auth configuration is unsupported",
             ));
         }
-        let authorized =
-            verify_provider_request_hmac_token(&provider.provider, &provider.key, &token)?;
+        let authorized = verify_provider_request_hmac_token(
+            &provider.provider,
+            &provider.key,
+            &token,
+            &request,
+        )?;
+        self.record_provider_request_authorization(
+            &authorized.request_authorization_id,
+            authorized.expires_at_unix,
+        )?;
         let user_id = format!(
             "provider_authorized:{}:{}",
             authorized.provider_id, authorized.external_subject
@@ -1135,6 +1244,7 @@ impl AuthService for DatabaseAuthService {
                     external_subject: authorized.external_subject,
                     provider_scope_id: authorized.provider_scope_id,
                     request_authorization_id: authorized.request_authorization_id,
+                    allowed_capability_descriptors: provider.allowed_capability_descriptors.clone(),
                 },
             ),
         })
@@ -1260,6 +1370,8 @@ mod tests {
         subject: &str,
         scope: &str,
         provider: &str,
+        request: &ProviderRequestDescriptor,
+        nonce: &str,
         iat: i64,
         exp: i64,
     ) -> String {
@@ -1267,6 +1379,12 @@ mod tests {
             "sub": subject,
             "scope": scope,
             "provider": provider,
+            "method": request.method.as_str(),
+            "path": request.path.as_str(),
+            "route": request.route.as_deref().expect("route"),
+            "request_id": request.request_id.as_deref().expect("request_id"),
+            "body_digest": request.body_digest.as_deref().expect("body_digest"),
+            "nonce": nonce,
             "iat": iat,
             "exp": exp,
         });
@@ -1291,6 +1409,7 @@ mod tests {
             provider: "moi".to_string(),
             auth_type: "hmac".to_string(),
             key: TEST_PROVIDER_HMAC_KEY.to_string(),
+            allowed_capability_descriptors: Vec::new(),
         }])
     }
 
@@ -1341,20 +1460,26 @@ mod tests {
             method: "POST".to_string(),
             path: "/chat/stream".to_string(),
             route: Some("/chat/stream".to_string()),
-            request_id: None,
-            body_digest: None,
+            request_id: Some("request-1".to_string()),
+            body_digest: Some("sha256-body".to_string()),
         }
     }
 
     #[tokio::test]
     async fn current_principal_for_request_verifies_provider_hmac_token() {
         let now = Utc::now().timestamp();
-        let token = hmac_provider_token("user_1", "workspace_1", "moi", now, now + 300);
+        let descriptor = chat_stream_descriptor();
+        let token = hmac_provider_token(
+            "user_1",
+            "workspace_1",
+            "moi",
+            &descriptor,
+            "nonce-1",
+            now,
+            now + 300,
+        );
         let principal = hmac_provider_service()
-            .current_principal_for_request(
-                &provider_headers(&token, "moi"),
-                chat_stream_descriptor(),
-            )
+            .current_principal_for_request(&provider_headers(&token, "moi"), descriptor)
             .await
             .expect("hmac provider request should resolve");
 
@@ -1379,21 +1504,32 @@ mod tests {
     async fn current_principal_for_request_preserves_hmac_subjects_per_user() {
         let now = Utc::now().timestamp();
         let service = hmac_provider_service();
-        let first = hmac_provider_token("user_1", "workspace_1", "moi", now, now + 300);
-        let second = hmac_provider_token("user_2", "workspace_1", "moi", now, now + 300);
+        let descriptor = chat_stream_descriptor();
+        let first = hmac_provider_token(
+            "user_1",
+            "workspace_1",
+            "moi",
+            &descriptor,
+            "nonce-1",
+            now,
+            now + 300,
+        );
+        let second = hmac_provider_token(
+            "user_2",
+            "workspace_1",
+            "moi",
+            &descriptor,
+            "nonce-2",
+            now,
+            now + 300,
+        );
 
         let first_principal = service
-            .current_principal_for_request(
-                &provider_headers(&first, "moi"),
-                chat_stream_descriptor(),
-            )
+            .current_principal_for_request(&provider_headers(&first, "moi"), descriptor.clone())
             .await
             .expect("first hmac provider request should resolve");
         let second_principal = service
-            .current_principal_for_request(
-                &provider_headers(&second, "moi"),
-                chat_stream_descriptor(),
-            )
+            .current_principal_for_request(&provider_headers(&second, "moi"), descriptor)
             .await
             .expect("second hmac provider request should resolve");
 
@@ -1411,12 +1547,18 @@ mod tests {
     #[tokio::test]
     async fn current_principal_for_request_rejects_expired_hmac_token() {
         let now = Utc::now().timestamp();
-        let token = hmac_provider_token("user_1", "workspace_1", "moi", now - 600, now - 300);
+        let descriptor = chat_stream_descriptor();
+        let token = hmac_provider_token(
+            "user_1",
+            "workspace_1",
+            "moi",
+            &descriptor,
+            "nonce-1",
+            now - 600,
+            now - 300,
+        );
         let (status, body) = hmac_provider_service()
-            .current_principal_for_request(
-                &provider_headers(&token, "moi"),
-                chat_stream_descriptor(),
-            )
+            .current_principal_for_request(&provider_headers(&token, "moi"), descriptor)
             .await
             .expect_err("expired hmac provider request should be rejected");
 
@@ -1431,14 +1573,20 @@ mod tests {
     #[tokio::test]
     async fn current_principal_for_request_rejects_bad_hmac_signature() {
         let now = Utc::now().timestamp();
-        let token = hmac_provider_token("user_1", "workspace_1", "moi", now, now + 300);
+        let descriptor = chat_stream_descriptor();
+        let token = hmac_provider_token(
+            "user_1",
+            "workspace_1",
+            "moi",
+            &descriptor,
+            "nonce-1",
+            now,
+            now + 300,
+        );
         let replacement = if token.ends_with('x') { "y" } else { "x" };
         let tampered = format!("{}{}", &token[..token.len() - 1], replacement);
         let (status, body) = hmac_provider_service()
-            .current_principal_for_request(
-                &provider_headers(&tampered, "moi"),
-                chat_stream_descriptor(),
-            )
+            .current_principal_for_request(&provider_headers(&tampered, "moi"), descriptor)
             .await
             .expect_err("tampered hmac provider request should be rejected");
 
@@ -1453,12 +1601,18 @@ mod tests {
     #[tokio::test]
     async fn current_principal_for_request_rejects_provider_mismatch() {
         let now = Utc::now().timestamp();
-        let token = hmac_provider_token("user_1", "workspace_1", "other", now, now + 300);
+        let descriptor = chat_stream_descriptor();
+        let token = hmac_provider_token(
+            "user_1",
+            "workspace_1",
+            "other",
+            &descriptor,
+            "nonce-1",
+            now,
+            now + 300,
+        );
         let (status, body) = hmac_provider_service()
-            .current_principal_for_request(
-                &provider_headers(&token, "moi"),
-                chat_stream_descriptor(),
-            )
+            .current_principal_for_request(&provider_headers(&token, "moi"), descriptor)
             .await
             .expect_err("mismatched hmac provider request should be rejected");
 
@@ -1468,6 +1622,82 @@ mod tests {
             Some("provider_request_auth_invalid")
         );
         assert!(body.0.detail.contains("provider"));
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_body_digest_mismatch() {
+        let now = Utc::now().timestamp();
+        let descriptor = chat_stream_descriptor();
+        let token = hmac_provider_token(
+            "user_1",
+            "workspace_1",
+            "moi",
+            &descriptor,
+            "nonce-1",
+            now,
+            now + 300,
+        );
+        let mut tampered_descriptor = descriptor;
+        tampered_descriptor.body_digest = Some("sha256:tampered".to_string());
+
+        let (status, body) = hmac_provider_service()
+            .current_principal_for_request(&provider_headers(&token, "moi"), tampered_descriptor)
+            .await
+            .expect_err("token must be bound to the body digest");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.0.detail.contains("body_digest"));
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_replayed_hmac_token() {
+        let now = Utc::now().timestamp();
+        let descriptor = chat_stream_descriptor();
+        let token = hmac_provider_token(
+            "user_1",
+            "workspace_1",
+            "moi",
+            &descriptor,
+            "nonce-1",
+            now,
+            now + 300,
+        );
+        let service = hmac_provider_service();
+
+        service
+            .current_principal_for_request(&provider_headers(&token, "moi"), descriptor.clone())
+            .await
+            .expect("first use should succeed");
+        let (status, body) = service
+            .current_principal_for_request(&provider_headers(&token, "moi"), descriptor)
+            .await
+            .expect_err("second use of same request token must be rejected");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.0.detail.contains("already been used"));
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_hmac_token_ttl_above_maximum() {
+        let now = Utc::now().timestamp();
+        let descriptor = chat_stream_descriptor();
+        let token = hmac_provider_token(
+            "user_1",
+            "workspace_1",
+            "moi",
+            &descriptor,
+            "nonce-1",
+            now,
+            now + PROVIDER_REQUEST_MAX_TTL_SECONDS + 1,
+        );
+
+        let (status, body) = hmac_provider_service()
+            .current_principal_for_request(&provider_headers(&token, "moi"), descriptor)
+            .await
+            .expect_err("long-lived provider request token must be rejected");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.0.detail.contains("TTL"));
     }
 
     #[test]

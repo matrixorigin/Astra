@@ -2567,9 +2567,30 @@ impl AgenticRunLifecycleService {
     fn prepare_chat_request(
         mut request: ChatRequestData,
     ) -> Result<ChatRequestData, (StatusCode, Json<ErrorResponse>)> {
+        Self::validate_effective_user_input(&request)?;
         let selected_model = Self::validate_selected_model_shape(request.selected_model.as_ref())?;
         request.model = Some(selected_model.model.clone());
         Ok(request)
+    }
+
+    fn validate_effective_user_input(
+        request: &ChatRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if !request.message.trim().is_empty() {
+            return Ok(());
+        }
+        if request
+            .user_intent
+            .as_deref()
+            .is_some_and(|intent| !intent.trim().is_empty())
+        {
+            return Ok(());
+        }
+        Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "message or user_intent must contain the user's current request",
+            "chat_input_empty",
+        ))
     }
 
     fn validate_selected_model_shape(

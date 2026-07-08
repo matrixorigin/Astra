@@ -7,12 +7,8 @@ use crate::server::{
     },
     run::handlers::transform_stream_run_events_for_client,
 };
-use axum::extract::rejection::JsonRejection;
 
-fn chat_request_json_rejection_to_error(
-    rejection: JsonRejection,
-) -> (StatusCode, Json<ErrorResponse>) {
-    let detail = rejection.body_text();
+fn chat_request_json_error_from_body_text(detail: String) -> (StatusCode, Json<ErrorResponse>) {
     if detail.contains("selected_model") || detail.contains("SelectedModelRequest") {
         return astra_core::error_response_coded(
             StatusCode::BAD_REQUEST,
@@ -21,6 +17,11 @@ fn chat_request_json_rejection_to_error(
         );
     }
     error_response(StatusCode::BAD_REQUEST, detail)
+}
+
+fn parse_chat_request_body(body: &Bytes) -> Result<ChatRequest, (StatusCode, Json<ErrorResponse>)> {
+    serde_json::from_slice(body)
+        .map_err(|error| chat_request_json_error_from_body_text(error.to_string()))
 }
 
 /// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
@@ -144,16 +145,16 @@ pub(super) async fn chat_handler(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    request: Result<Json<ChatRequest>, JsonRejection>,
+    body: Bytes,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let Json(request) = request.map_err(chat_request_json_rejection_to_error)?;
     let principal = state
         .auth_service
         .current_principal_for_request(
             &headers,
-            external_request_descriptor(&method, &uri, &headers, "/chat"),
+            external_request_descriptor(&method, &uri, &headers, "/chat", &body),
         )
         .await?;
+    let request = parse_chat_request_body(&body)?;
     let user = principal.user.clone();
     let mut chat_data = chat_request_into_data(request);
     chat_data.forward_headers = collect_forward_headers(&headers);
@@ -181,25 +182,24 @@ pub(super) async fn chat_stream_handler(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    request: Result<Json<ChatRequest>, JsonRejection>,
+    body: Bytes,
 ) -> Response {
-    let request = match request {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
-            let (status, error) = chat_request_json_rejection_to_error(rejection);
-            return sse_error_response_from_error(status, error.0);
-        }
-    };
     let principal = match state
         .auth_service
         .current_principal_for_request(
             &headers,
-            external_request_descriptor(&method, &uri, &headers, "/chat/stream"),
+            external_request_descriptor(&method, &uri, &headers, "/chat/stream", &body),
         )
         .await
     {
         Ok(principal) => principal,
         Err((status, error)) => return sse_error_response_from_error(status, error.0),
+    };
+    let request = match parse_chat_request_body(&body) {
+        Ok(request) => request,
+        Err((status, error)) => {
+            return sse_error_response_from_error(status, error.0);
+        }
     };
     let user = principal.user.clone();
 
@@ -266,7 +266,7 @@ pub(super) async fn chat_turn_handler(
         .auth_service
         .current_principal_for_request(
             &headers,
-            external_request_descriptor(&method, &uri, &headers, "/chat/turn"),
+            external_request_descriptor(&method, &uri, &headers, "/chat/turn", &body),
         )
         .await
     {

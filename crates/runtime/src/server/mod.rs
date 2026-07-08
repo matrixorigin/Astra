@@ -13,6 +13,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
@@ -87,6 +88,7 @@ fn external_request_descriptor(
     uri: &Uri,
     headers: &HeaderMap,
     route: &'static str,
+    body: &Bytes,
 ) -> astra_services::ProviderRequestDescriptor {
     astra_services::ProviderRequestDescriptor {
         method: method.as_str().to_string(),
@@ -96,8 +98,12 @@ fn external_request_descriptor(
             .get("x-request-id")
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned),
-        body_digest: None,
+        body_digest: Some(format!("sha256:{}", hex_sha256(body))),
     }
+}
+
+fn hex_sha256(body: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(body))
 }
 pub(crate) mod tool_plan_gate;
 pub(crate) mod tool_route_boundary;

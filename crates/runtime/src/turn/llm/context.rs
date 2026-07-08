@@ -828,6 +828,15 @@ pub(crate) fn assemble_context_pipeline(
         input.provider,
         input.model_name,
     );
+    if state.pipeline_session.is_none() {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            format!(
+                "pipeline_session missing during context assembly for session {}",
+                input.session_id
+            ),
+        ));
+    }
 
     let mut external = build_external_sources(
         input.runtime_signals.edge_profile,
@@ -908,16 +917,10 @@ pub(crate) fn assemble_context_pipeline(
     };
 
     let pipeline_result = {
-        let pipeline_sess = state.pipeline_session.get_or_insert_with(|| {
-            tracing::warn!(
-                session_id = input.session_id,
-                "pipeline_session missing during context assembly; creating a fresh session"
-            );
-            astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
-                astra_turn_core::pipeline_config::PipelineConfig::default(),
-                session_current_date.clone(),
-            )
-        });
+        let pipeline_sess = state
+            .pipeline_session
+            .as_mut()
+            .expect("pipeline_session checked before context assembly");
         if let Some(session_id) = state.current_session_id.as_deref()
             && let Ok(session_dir) =
                 astra_services::local_session_artifact_store().session_dir(session_id)
@@ -1732,7 +1735,7 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn assemble_context_pipeline_initializes_missing_pipeline_session() {
+    fn assemble_context_pipeline_rejects_missing_pipeline_session() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.pipeline_session = None;
         state
@@ -1746,7 +1749,7 @@ mod context_cache_contract_tests {
             is_anthropic: false,
         };
 
-        let output = assemble_context_pipeline(LlmContextAssemblyInput {
+        let err = match assemble_context_pipeline(LlmContextAssemblyInput {
             state: &mut state,
             session_id: "sid-missing-pipeline",
             tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
@@ -1758,16 +1761,15 @@ mod context_cache_contract_tests {
             cache_capability: None,
             user_content: "hello",
             query_source: "test",
-        })
-        .expect("missing pipeline session should degrade to a fresh session");
+        }) {
+            Ok(_) => panic!("missing pipeline session must be a lifecycle error"),
+            Err(err) => err,
+        };
 
+        assert_eq!(err.kind, astra_core::ErrorKind::InvalidRequest);
         assert!(
-            state.pipeline_session.is_some(),
-            "context assembly must repair missing pipeline state for subsequent turns"
-        );
-        assert!(
-            !output.system_messages.is_empty(),
-            "fresh pipeline fallback should still produce context"
+            err.message.contains("pipeline_session missing"),
+            "error must identify the lifecycle invariant, got {err}"
         );
     }
 

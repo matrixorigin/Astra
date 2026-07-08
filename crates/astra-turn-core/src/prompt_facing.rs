@@ -2,8 +2,9 @@
 //!
 //! Runtime state may contain provider tool-call frames, tool outputs, cache
 //! markers, reasoning-only assistant frames, and compaction boundaries. Those
-//! are execution trace, not stable cross-turn chat history. Use this module at
-//! session restore and CSL prompt-materialization boundaries.
+//! are execution trace, not stable prompt input. Use this module only at
+//! prompt/session-display projection boundaries; canonical stores such as CSL
+//! must retain raw runtime history.
 
 use crate::conversation_log::SessionStateCompact;
 use serde_json::{Value, json};

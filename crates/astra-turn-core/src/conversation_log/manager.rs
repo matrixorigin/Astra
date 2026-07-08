@@ -1,6 +1,10 @@
 //! Unified CSL manager — encapsulates store + seq tracking + snapshot + GC.
 //!
 //! Used identically by CLI (FileCslStore) and server (DbCslStore).
+//!
+//! The manager stores canonical runtime history. Prompt-facing projections are
+//! derived by callers at wire/session-display boundaries; they are never used
+//! as the persisted source of truth.
 
 use std::sync::Arc;
 
@@ -32,7 +36,7 @@ pub struct CslManager {
     config: CslManagerConfig,
     last_seq: u64,
     last_turn: u32,
-    last_prompt_message_hashes: Vec<PromptMessageHash>,
+    last_canonical_message_hashes: Vec<CanonicalMessageHash>,
     trace_id: Option<String>,
     last_session_state: SessionStateCompact,
 }
@@ -50,7 +54,7 @@ impl CslManager {
             config,
             last_seq: 0,
             last_turn: 0,
-            last_prompt_message_hashes: Vec::new(),
+            last_canonical_message_hashes: Vec::new(),
             trace_id: None,
             last_session_state: SessionStateCompact::default(),
         })
@@ -89,11 +93,10 @@ impl CslManager {
         if entries.is_empty() {
             return Ok(None);
         }
-        let mut mat = materialize(&entries)?;
-        mat.messages = crate::prompt_facing::sanitize_prompt_facing_messages(mat.messages);
+        let mat = materialize(&entries)?;
         self.last_seq = mat.last_seq;
         self.last_turn = mat.last_turn;
-        self.last_prompt_message_hashes = prompt_message_hashes(&mat.messages);
+        self.last_canonical_message_hashes = canonical_message_hashes(&mat.messages);
         self.last_session_state = mat.session_state.clone();
         Ok(Some(mat))
     }
@@ -101,8 +104,8 @@ impl CslManager {
     /// Record the message count at the start of the current turn.
     ///
     /// This remains available to callers that track turn boundaries, but
-    /// `persist_turn` computes CSL deltas from the last canonical prompt-facing
-    /// message sequence instead of trusting a caller-provided count.
+    /// `persist_turn` computes CSL deltas from the last canonical message
+    /// sequence instead of trusting a caller-provided count.
     pub fn mark_turn_start(&mut self, _message_count: usize) {}
 
     /// Persist the outcome of the current turn.
@@ -115,20 +118,19 @@ impl CslManager {
         messages: &[serde_json::Value],
         session_state: &SessionStateCompact,
     ) -> Result<(), CslStoreError> {
-        let prompt_messages =
-            crate::prompt_facing::sanitize_prompt_facing_messages(messages.to_vec());
-        let prompt_message_count = prompt_messages.len();
+        let canonical_messages = messages.to_vec();
+        let canonical_message_count = canonical_messages.len();
         let meta = AppendMeta {
             trace_id: self.trace_id.clone(),
-            message_count: Some(prompt_message_count as u32),
+            message_count: Some(canonical_message_count as u32),
         };
 
         if self.last_seq == 0 {
-            let prompt_message_hashes = prompt_message_hashes(&prompt_messages);
+            let canonical_message_hashes = canonical_message_hashes(&canonical_messages);
             let snapshot = CslEntry::Snapshot {
                 seq: 1,
                 turn,
-                messages: prompt_messages.clone(),
+                messages: canonical_messages.clone(),
                 session_state: session_state.clone(),
             };
             self.store
@@ -136,20 +138,22 @@ impl CslManager {
                 .await?;
             self.last_seq = 1;
             self.last_turn = turn;
-            self.last_prompt_message_hashes = prompt_message_hashes;
+            self.last_canonical_message_hashes = canonical_message_hashes;
             self.last_session_state = session_state.clone();
             return Ok(());
         }
 
-        let prompt_message_hashes = prompt_message_hashes(&prompt_messages);
-        let common_prefix_len =
-            common_prompt_prefix_len(&self.last_prompt_message_hashes, &prompt_message_hashes);
-        if common_prefix_len < self.last_prompt_message_hashes.len() {
+        let canonical_message_hashes = canonical_message_hashes(&canonical_messages);
+        let common_prefix_len = common_canonical_prefix_len(
+            &self.last_canonical_message_hashes,
+            &canonical_message_hashes,
+        );
+        if common_prefix_len < self.last_canonical_message_hashes.len() {
             let next_seq = self.last_seq + 1;
             let snapshot = CslEntry::Snapshot {
                 seq: next_seq,
                 turn,
-                messages: prompt_messages.clone(),
+                messages: canonical_messages.clone(),
                 session_state: session_state.clone(),
             };
             self.store
@@ -157,13 +161,13 @@ impl CslManager {
                 .await?;
             self.last_seq = next_seq;
             self.last_turn = turn;
-            self.last_prompt_message_hashes = prompt_message_hashes;
+            self.last_canonical_message_hashes = canonical_message_hashes;
             self.last_session_state = session_state.clone();
             self.gc().await?;
             return Ok(());
         }
 
-        let appended = prompt_messages[common_prefix_len..].to_vec();
+        let appended = canonical_messages[common_prefix_len..].to_vec();
 
         let next_seq = self.last_seq + 1;
         let delta = CslEntry::TurnDelta {
@@ -175,7 +179,7 @@ impl CslManager {
         self.store.append(&self.session_id, &delta, &meta).await?;
         self.last_seq = next_seq;
         self.last_turn = turn;
-        self.last_prompt_message_hashes = prompt_message_hashes.clone();
+        self.last_canonical_message_hashes = canonical_message_hashes.clone();
         self.last_session_state = session_state.clone();
 
         // Periodic snapshot + GC.
@@ -187,14 +191,14 @@ impl CslManager {
             let snapshot = CslEntry::Snapshot {
                 seq: snap_seq,
                 turn,
-                messages: prompt_messages.clone(),
+                messages: canonical_messages.clone(),
                 session_state: session_state.clone(),
             };
             self.store
                 .append(&self.session_id, &snapshot, &meta)
                 .await?;
             self.last_seq = snap_seq;
-            self.last_prompt_message_hashes = prompt_message_hashes;
+            self.last_canonical_message_hashes = canonical_message_hashes;
 
             self.gc().await?;
         }
@@ -234,7 +238,7 @@ impl CslManager {
             .await?;
         self.last_seq = 0;
         self.last_turn = 0;
-        self.last_prompt_message_hashes.clear();
+        self.last_canonical_message_hashes.clear();
         self.last_session_state = SessionStateCompact::default();
         Ok(())
     }
@@ -260,18 +264,21 @@ impl CslManager {
     }
 }
 
-type PromptMessageHash = [u8; 32];
+type CanonicalMessageHash = [u8; 32];
 
-fn prompt_message_hashes(messages: &[serde_json::Value]) -> Vec<PromptMessageHash> {
-    messages.iter().map(prompt_message_hash).collect()
+fn canonical_message_hashes(messages: &[serde_json::Value]) -> Vec<CanonicalMessageHash> {
+    messages.iter().map(canonical_message_hash).collect()
 }
 
-fn prompt_message_hash(message: &serde_json::Value) -> PromptMessageHash {
+fn canonical_message_hash(message: &serde_json::Value) -> CanonicalMessageHash {
     let bytes = serde_json::to_vec(message).unwrap_or_else(|_| format!("{message:?}").into_bytes());
     Sha256::digest(bytes).into()
 }
 
-fn common_prompt_prefix_len(left: &[PromptMessageHash], right: &[PromptMessageHash]) -> usize {
+fn common_canonical_prefix_len(
+    left: &[CanonicalMessageHash],
+    right: &[CanonicalMessageHash],
+) -> usize {
     left.iter()
         .zip(right.iter())
         .take_while(|(left, right)| left == right)
@@ -738,7 +745,7 @@ mod tests {
         assert_eq!(mat.messages[0]["content"], "fresh");
     }
 
-    // ── Review fix: persist_turn auto-advances canonical prompt state ───
+    // ── Review fix: persist_turn auto-advances canonical state ───
 
     #[tokio::test]
     async fn persist_turn_auto_advances_turn_start_so_deltas_are_incremental() {
@@ -782,12 +789,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_turn_sanitizes_prompt_facing_history_at_manager_boundary() {
+    async fn concurrent_stale_managers_allow_only_one_canonical_append() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        let session_id = "test-concurrent-stale";
+        let mut seed = CslManager::new(
+            Arc::clone(&store),
+            session_id.into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+        let t1 = vec![user_msg("q1"), assistant_msg("a1")];
+        seed.persist_turn(1, &t1, &default_state()).await.unwrap();
+
+        let mut left = CslManager::new(
+            Arc::clone(&store),
+            session_id.into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+        let mut right = CslManager::new(
+            Arc::clone(&store),
+            session_id.into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+        left.load().await.unwrap().unwrap();
+        right.load().await.unwrap().unwrap();
+
+        let left_messages = vec![
+            user_msg("q1"),
+            assistant_msg("a1"),
+            user_msg("left"),
+            assistant_msg("left done"),
+        ];
+        let right_messages = vec![
+            user_msg("q1"),
+            assistant_msg("a1"),
+            user_msg("right"),
+            assistant_msg("right done"),
+        ];
+
+        let (left_result, right_result) = tokio::join!(
+            left.persist_turn(2, &left_messages, &default_state()),
+            right.persist_turn(2, &right_messages, &default_state())
+        );
+
+        let success_count = usize::from(left_result.is_ok()) + usize::from(right_result.is_ok());
+        assert_eq!(
+            success_count, 1,
+            "stale concurrent managers must not both append turn 2: left={left_result:?}, right={right_result:?}"
+        );
+        let stale_error = left_result
+            .as_ref()
+            .err()
+            .or_else(|| right_result.as_ref().err())
+            .expect("one writer should lose the stale append race");
+        assert!(
+            stale_error
+                .to_string()
+                .contains("stale conversation log append"),
+            "unexpected stale append error: {stale_error}"
+        );
+
+        let entries = store.load_after(session_id, 0).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        let materialized = materialize(&entries).unwrap();
+        assert_eq!(materialized.messages.len(), 4);
+        let winner = materialized.messages[2]["content"].as_str().unwrap();
+        assert!(
+            winner == "left" || winner == "right",
+            "unexpected winning canonical delta: {materialized:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_turn_preserves_raw_canonical_history_at_manager_boundary() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
         let mut mgr = CslManager::new(
             Arc::clone(&store),
-            "manager-sanitizes".into(),
+            "manager-canonical".into(),
             CslManagerConfig::default(),
         )
         .unwrap();
@@ -814,47 +896,47 @@ mod tests {
         ];
         mgr.persist_turn(2, &t2, &default_state()).await.unwrap();
 
-        let entries = store.load_after("manager-sanitizes", 0).await.unwrap();
+        let entries = store.load_after("manager-canonical", 0).await.unwrap();
         assert_eq!(entries.len(), 2);
         if let CslEntry::TurnDelta { appended, .. } = &entries[1] {
-            assert_eq!(
-                appended,
-                &vec![user_msg("next step"), assistant_msg("next done")]
+            assert_eq!(appended.len(), 4);
+            assert_eq!(appended[0]["role"], "user");
+            assert!(
+                appended[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("<system-reminder>")
             );
+            assert!(appended[1].get("tool_calls").is_some());
+            assert_eq!(appended[2]["role"], "tool");
+            assert_eq!(appended[2]["content"], "raw command output");
+            assert_eq!(appended[3]["content"], "next done");
         } else {
             panic!("entry[1] should be TurnDelta");
         }
 
         let mut loader = CslManager::new(
             Arc::clone(&store),
-            "manager-sanitizes".into(),
+            "manager-canonical".into(),
             CslManagerConfig::default(),
         )
         .unwrap();
         let mat = loader.load().await.unwrap().unwrap();
-        assert_eq!(
-            mat.messages,
-            vec![
-                user_msg("review changes"),
-                assistant_msg("reviewed"),
-                user_msg("next step"),
-                assistant_msg("next done"),
-            ]
-        );
+        assert_eq!(mat.messages.len(), 8);
         let joined = mat
             .messages
             .iter()
             .filter_map(|msg| msg["content"].as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!joined.contains("<system-reminder>"));
-        assert!(!joined.contains("[session-resume:v1]"));
-        assert!(!joined.contains("<skill-loaded"));
-        assert!(mat.messages.iter().all(|msg| msg["role"] != "tool"));
+        assert!(joined.contains("<system-reminder>"));
+        assert!(joined.contains("[session-resume:v1]"));
+        assert!(joined.contains("<skill-loaded"));
+        assert!(mat.messages.iter().any(|msg| msg["role"] == "tool"));
         assert!(
             mat.messages
                 .iter()
-                .all(|msg| msg.get("tool_calls").is_none())
+                .any(|msg| msg.get("tool_calls").is_some())
         );
     }
 
@@ -1032,7 +1114,7 @@ mod tests {
         assert_eq!(mat.messages[5]["content"], "a3");
     }
 
-    // ── R1: GC failure must not leave canonical prompt state stale ──────
+    // ── R1: GC failure must not leave canonical state stale ──────
 
     /// Store wrapper that delegates to an inner store but fails `truncate_before`.
     struct FailingGcStore {
@@ -1104,7 +1186,7 @@ mod tests {
         mgr.persist_turn(1, &t1, &default_state()).await.unwrap();
 
         // Turn 2 triggers snapshot+GC. GC will fail — but persist_turn should
-        // still update the canonical prompt state so the NEXT turn's delta is correct.
+        // still update the canonical state so the NEXT turn's delta is correct.
         let t2 = vec![
             user_msg("q1"),
             assistant_msg("a1"),
@@ -1142,7 +1224,7 @@ mod tests {
         );
     }
 
-    // ── I1: load() should set canonical prompt state ────────────────────
+    // ── I1: load() should set canonical state ────────────────────
 
     #[tokio::test]
     async fn load_sets_canonical_prompt_state() {
@@ -1235,7 +1317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_keeps_only_prompt_message_hashes_between_persists() {
+    async fn manager_keeps_only_canonical_message_hashes_between_persists() {
         let tmp = TempDir::new().unwrap();
         let mut mgr = test_manager(&tmp);
         let large_assistant_text = "x".repeat(256 * 1024);
@@ -1250,13 +1332,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            mgr.last_prompt_message_hashes.len(),
+            mgr.last_canonical_message_hashes.len(),
             messages.len(),
-            "manager should retain one fixed-size hash per prompt-facing message"
+            "manager should retain one fixed-size hash per canonical message"
         );
         assert_eq!(
-            std::mem::size_of_val(mgr.last_prompt_message_hashes.as_slice()),
-            messages.len() * std::mem::size_of::<PromptMessageHash>(),
+            std::mem::size_of_val(mgr.last_canonical_message_hashes.as_slice()),
+            messages.len() * std::mem::size_of::<CanonicalMessageHash>(),
             "manager state must scale with message count, not message payload bytes"
         );
     }

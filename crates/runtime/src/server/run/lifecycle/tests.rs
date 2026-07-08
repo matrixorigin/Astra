@@ -4136,6 +4136,31 @@ async fn validate_request_constraints_requires_selected_model() {
     );
 }
 
+#[test]
+fn prepare_chat_request_rejects_empty_effective_user_input() {
+    let request = test_request("   ");
+    let err = AgenticRunLifecycleService::prepare_chat_request(request)
+        .expect_err("empty message and missing user_intent must be rejected");
+
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert_eq!(err.1.0.error_code.as_deref(), Some("chat_input_empty"));
+}
+
+#[test]
+fn prepare_chat_request_accepts_structured_user_intent_when_prompt_message_is_empty() {
+    let mut request = test_request("   ");
+    request.user_intent = Some("continue the approved plan".to_string());
+
+    let prepared = AgenticRunLifecycleService::prepare_chat_request(request)
+        .expect("non-empty user_intent is valid effective input");
+
+    assert_eq!(prepared.model.as_deref(), Some("test-model"));
+    assert_eq!(
+        prepared.user_intent.as_deref(),
+        Some("continue the approved plan")
+    );
+}
+
 #[tokio::test]
 async fn validate_request_constraints_allows_native_model_without_gateway_auth() {
     let service = test_service();
