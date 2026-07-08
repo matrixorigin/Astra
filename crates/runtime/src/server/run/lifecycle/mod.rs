@@ -3243,7 +3243,7 @@ impl AgenticRunLifecycleService {
         let binding_section = agent_binding_context
             .map(|context| Self::agent_binding_prompt_section(&context.binding));
         let turn_context_section = agent_binding_context
-            .and_then(|_| request_context)
+            .and(request_context)
             .and_then(Self::agent_binding_turn_context_section);
         let runtime_section = runtime_system_prompt
             .filter(|prompt| !prompt.is_empty())
