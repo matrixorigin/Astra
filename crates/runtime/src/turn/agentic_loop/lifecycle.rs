@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::{CompactionEngine, TokenBudget};
@@ -193,6 +194,30 @@ fn auto_route_tool_call_id(skill_name: &str) -> String {
     }
 }
 
+fn skill_auto_route_attempt_key(query: &str, skill_name: &str) -> String {
+    let mut normalized_skill = String::with_capacity(skill_name.len());
+    let mut last_was_dash = true;
+    for ch in skill_name.trim().chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            normalized_skill.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            normalized_skill.push('-');
+            last_was_dash = true;
+        }
+    }
+    let normalized_skill = normalized_skill.trim_matches('-');
+    let normalized_skill = if normalized_skill.is_empty() {
+        "unknown"
+    } else {
+        normalized_skill
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(query.trim().as_bytes());
+    let query_hash = hasher.finalize();
+    format!("{normalized_skill}:{query_hash:x}")
+}
+
 #[cfg(test)]
 fn pure_user_intent_for_runtime_decision(message: &str) -> String {
     astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(message)
@@ -235,7 +260,16 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         return;
     };
     let skill_name = decision.skill_name.trim().to_string();
+    let attempt_key = skill_auto_route_attempt_key(&query, &skill_name);
+    if state.skills.auto_route_attempts.contains(&attempt_key) {
+        tracing::debug!(
+            skill_name,
+            "skill auto-route skipped repeated decision for same user intent"
+        );
+        return;
+    }
     if skill_name.is_empty() || !visible.iter().any(|skill| skill.name == skill_name) {
+        state.skills.auto_route_attempts.insert(attempt_key);
         tracing::warn!(
             skill_name,
             "skill auto-route judge returned a skill outside the visible catalog"
@@ -260,6 +294,7 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         .map(|outcome| outcome.all_required_passed)
         .unwrap_or(true);
     if !result.success || !verified {
+        state.skills.auto_route_attempts.insert(attempt_key);
         return;
     }
 
@@ -304,6 +339,7 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
     state.messages.push(tool_msg);
     state.tool_results.push(tool_result);
     state.telemetry.all_selected_skills.push(skill_name.clone());
+    state.skills.auto_route_attempts.insert(attempt_key);
     state.skills.invoked.insert(
         skill_name.clone(),
         crate::turn::skill_tool::InvokedSkill {
@@ -2092,6 +2128,25 @@ mod tests {
         }
     }
 
+    struct FailingAutoRouteResolver;
+
+    impl SkillResolver for FailingAutoRouteResolver {
+        fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+            Err(crate::skills::SkillError::LoadFailed(format!(
+                "cannot load {name}"
+            )))
+        }
+
+        fn available_skills(&self) -> Vec<SkillToolInfo> {
+            vec![SkillToolInfo {
+                name: "review-changes".into(),
+                description: "Review the current branch diff.".into(),
+                aliases: vec!["review changes".into()],
+                ..Default::default()
+            }]
+        }
+    }
+
     #[tokio::test]
     async fn prepare_requires_task_board_for_structured_complex_work() {
         let intent = TurnIntent::default()
@@ -3022,6 +3077,46 @@ mod tests {
         );
         assert!(state.tool_results.is_empty());
         assert!(state.skills.invoked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_does_not_retry_failed_auto_route_for_same_intent() {
+        let mut host = MockHost::new(Vec::new()).with_skill_auto_route_decision("review-changes");
+        let mut state = make_state();
+        state.message = "review changes on current branch".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+        state.skills.resolver = Some(Arc::new(FailingAutoRouteResolver));
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("first turn should prepare despite failed auto-route");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert_eq!(state.skills.auto_route_attempts.len(), 1);
+        assert!(state.tool_results.is_empty());
+        assert!(state.skills.invoked.is_empty());
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("second turn should prepare without retrying failed auto-route");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert_eq!(
+            state.skills.auto_route_attempts.len(),
+            1,
+            "same intent+skill failure should not create repeated auto-route attempts"
+        );
+        assert!(state.tool_results.is_empty());
+        assert!(state.skills.invoked.is_empty());
+        assert_eq!(
+            host.skill_auto_route_queries,
+            vec![
+                "review changes on current branch".to_string(),
+                "review changes on current branch".to_string()
+            ],
+            "the semantic judge may be consulted again, but the repeated failed decision must not execute"
+        );
     }
 
     /// P1-D: Production code must not use unsafe set_var.

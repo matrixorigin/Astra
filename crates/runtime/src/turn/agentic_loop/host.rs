@@ -833,6 +833,11 @@ pub struct SkillState {
     /// Skills invoked during this session, keyed by canonical name.
     /// Used for same-session dedup and post-compaction re-injection.
     pub invoked: std::collections::HashMap<String, crate::turn::skill_tool::InvokedSkill>,
+    /// Auto-route attempt ledger keyed by `(normalized skill, user-intent hash)`.
+    /// Success is already represented by `invoked`; this ledger exists for
+    /// invalid or failed auto-route decisions so the same hidden pre-route does
+    /// not retry every turn and create a "stuck before first LLM round" UX.
+    pub auto_route_attempts: HashSet<String>,
     /// Tool event hooks (PreToolUse/PostToolUse) for intercepting tool calls.
     /// Loaded from `.astra/hooks.json` or skill frontmatter.
     pub tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
@@ -859,6 +864,7 @@ impl Default for SkillState {
             discovered: HashSet::new(),
             listing_message: None,
             invoked: HashMap::new(),
+            auto_route_attempts: HashSet::new(),
             tool_event_hooks: Default::default(),
             session_event_hooks: Default::default(),
         }
