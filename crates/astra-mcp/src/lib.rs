@@ -16,7 +16,7 @@ pub use error::McpError;
 pub use manager::{McpClientManager, McpToolCollision, McpToolCollisionSource};
 pub use rmcp::model::Tool as McpTool;
 pub use tools::{
-    MAX_DESCRIPTION_LENGTH, MAX_RESULT_CONTENT_LENGTH, extract_result_text,
+    MAX_DESCRIPTION_LENGTH, MAX_RESULT_CONTENT_LENGTH, McpToolCallResult, extract_result_text,
     extract_result_text_with_limit, is_dangerous_env_var, mcp_tool_schema_from_parts,
     mcp_tool_to_schema, sanitize_tool_name, tools_to_schemas_checked,
 };

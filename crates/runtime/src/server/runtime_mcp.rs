@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use astra_core::{ErrorResponse, error_response_coded};
 use astra_mcp::{
-    MAX_RESULT_CONTENT_LENGTH, McpClientManager, McpServerConfig, McpTool, Transport,
-    mcp_tool_schema_from_parts, sanitize_tool_name, tools_to_schemas_checked,
+    MAX_RESULT_CONTENT_LENGTH, McpClientManager, McpServerConfig, McpTool, McpToolCallResult,
+    Transport, mcp_tool_schema_from_parts, sanitize_tool_name, tools_to_schemas_checked,
 };
 use astra_services::{
     McpDiscoveredToolData, McpRegisterRequestData, mcp_binding_tool_namespace, mcp_schema_hash,
@@ -699,8 +699,9 @@ fn agent_binding_tool_call_arguments(args: &Value) -> Value {
 
 fn extract_agent_binding_mcp_tool_result(
     result: &Value,
-) -> Result<String, AgentBindingMcpRpcError> {
+) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
     let mut parts = Vec::new();
+    let structured_content = result.get("structuredContent").cloned();
     if let Some(content) = result.get("content").and_then(Value::as_array) {
         for item in content {
             if item.get("type").and_then(Value::as_str) == Some("text")
@@ -711,7 +712,7 @@ fn extract_agent_binding_mcp_tool_result(
             }
             parts.push(item.to_string());
         }
-    } else if let Some(structured) = result.get("structuredContent") {
+    } else if let Some(structured) = structured_content.as_ref() {
         parts.push(structured.to_string());
     } else if !result.is_null() {
         parts.push(result.to_string());
@@ -740,7 +741,10 @@ fn extract_agent_binding_mcp_tool_result(
         }));
     }
 
-    Ok(text)
+    Ok(McpToolCallResult {
+        output: text,
+        structured_content,
+    })
 }
 
 impl AgentBindingMcpRuntime {
@@ -766,7 +770,7 @@ impl AgentBindingMcpRuntime {
         &self,
         public_name: &str,
         args: &Value,
-    ) -> Result<String, String> {
+    ) -> Result<McpToolCallResult, String> {
         let tool_name = self
             .tool_names_by_public_name
             .get(public_name)
@@ -1081,7 +1085,14 @@ mod tests {
                                 "content": [{
                                     "type": "text",
                                     "text": "query-result"
-                                }]
+                                }],
+                                "structuredContent": {
+                                    "artifacts": [{
+                                        "artifact_id": "artifact_file_1",
+                                        "type": "file",
+                                        "data": {"file_id": "file_1"}
+                                    }]
+                                }
                             }
                         }),
                         other => json!({
@@ -1119,7 +1130,16 @@ mod tests {
             .call_tool_by_mcp_name("mcp__tools__query", &json!({"q": "hello"}))
             .await
             .expect("tool call should succeed");
-        assert_eq!(output, "query-result");
+        assert_eq!(output.output, "query-result");
+        assert_eq!(
+            output
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("artifacts"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
 
         let calls = calls
             .lock()

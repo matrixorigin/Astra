@@ -25,6 +25,7 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use astra_core::SharedPool;
+use astra_mcp::McpToolCallResult;
 use astra_runtime_env::WorkspaceRecord;
 use astra_tools::executor::DefaultToolExecutor;
 use astra_tools::task_mgmt::{
@@ -736,7 +737,7 @@ impl RuntimeToolExecutor {
     async fn execute_mcp_tool(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
             return match agent_binding_mcp.call_tool_by_mcp_name(name, args).await {
-                Ok(content) => astra_tools::ToolResult::text(content),
+                Ok(result) => tool_result_from_mcp_tool_call_result(result),
                 Err(error) => astra_tools::ToolResult::error(
                     super::runtime_mcp::redact_mcp_error_text(&format!(
                         "Agent Binding MCP tool '{name}' failed on server '{}': {error}",
@@ -756,7 +757,7 @@ impl RuntimeToolExecutor {
             .call_tool_by_mcp_name(name, args.clone())
             .await
         {
-            Ok(content) => astra_tools::ToolResult::text(content),
+            Ok(result) => tool_result_from_mcp_tool_call_result(result),
             Err(e) => astra_tools::ToolResult::error(super::runtime_mcp::redact_mcp_error_text(
                 &format!("MCP tool '{name}' failed: {e}"),
             )),
@@ -1837,6 +1838,22 @@ impl ToolExecutor for RuntimeToolExecutor {
     }
 }
 
+fn tool_result_from_mcp_tool_call_result(result: McpToolCallResult) -> astra_tools::ToolResult {
+    let mut tool_result = astra_tools::ToolResult::text(result.output);
+    let Some(structured_content) = result.structured_content else {
+        return tool_result;
+    };
+    let metadata = tool_result.metadata.get_or_insert_with(Map::new);
+    if let Some(artifacts) = structured_content.get("artifacts") {
+        metadata.insert("artifacts".to_string(), artifacts.clone());
+    }
+    if let Some(artifact) = structured_content.get("artifact") {
+        metadata.insert("artifact".to_string(), artifact.clone());
+    }
+    metadata.insert("structuredContent".to_string(), structured_content);
+    tool_result
+}
+
 #[cfg(test)]
 #[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
@@ -1913,6 +1930,36 @@ mod tests {
                 budget_result: Default::default(),
             })
         }
+    }
+
+    #[test]
+    fn mcp_tool_call_result_conversion_preserves_structured_artifact_metadata() {
+        let structured_content = json!({
+            "artifact": {
+                "artifact_id": "artifact_file_1",
+                "type": "file",
+                "data": {"file_id": "file_1"}
+            },
+            "artifacts": [{
+                "artifact_id": "artifact_file_1",
+                "type": "file",
+                "data": {"file_id": "file_1"}
+            }]
+        });
+
+        let result = tool_result_from_mcp_tool_call_result(McpToolCallResult {
+            output: "created file".to_string(),
+            structured_content: Some(structured_content.clone()),
+        });
+
+        assert_eq!(result.output, "created file");
+        let metadata = result.metadata.as_ref().expect("mcp result metadata");
+        assert_eq!(metadata.get("structuredContent"), Some(&structured_content));
+        assert_eq!(metadata.get("artifact"), structured_content.get("artifact"));
+        assert_eq!(
+            metadata.get("artifacts"),
+            structured_content.get("artifacts")
+        );
     }
 
     #[test]

@@ -868,6 +868,58 @@ fn route_boundary_builds_events_and_attaches_binding_metadata() {
 }
 
 #[test]
+fn route_boundary_tool_call_end_includes_structured_artifact_result_metadata() {
+    let service = ToolExecutionService::new_for_test();
+    let mut request = request_scoped_mcp_request("mcp__moi__write_file");
+    request.args = serde_json::json!({
+        "_tool_call_id": "call-1",
+        "_run_id": "run-1",
+        "path": "main.go"
+    });
+    let boundary = service.route_boundary(request);
+
+    let mut result = astra_tools::ToolResult::text("created main.go".to_string());
+    result.metadata = Some(serde_json::Map::from_iter([
+        (
+            "structuredContent".to_string(),
+            serde_json::json!({
+                "artifacts": [{
+                    "artifact_id": "artifact_file_1",
+                    "type": "file",
+                    "data": {"file_id": "file_1"}
+                }]
+            }),
+        ),
+        (
+            "artifacts".to_string(),
+            serde_json::json!([{
+                "artifact_id": "artifact_file_1",
+                "type": "file",
+                "data": {"file_id": "file_1"}
+            }]),
+        ),
+    ]));
+
+    let transport_event = boundary
+        .transport_finished_event(&result, 17)
+        .expect("tool transport completed event");
+    assert_eq!(transport_event["type"], "tool_transport_completed");
+    assert!(transport_event.get("structuredContent").is_none());
+    assert!(transport_event.get("artifacts").is_none());
+
+    let end_event = boundary
+        .tool_call_end_event(&result, 17)
+        .expect("tool call end event");
+    assert_eq!(end_event["type"], "tool_call_end");
+    assert_eq!(end_event["result"], "created main.go");
+    assert_eq!(
+        end_event["structuredContent"]["artifacts"][0]["artifact_id"],
+        "artifact_file_1"
+    );
+    assert_eq!(end_event["artifacts"][0]["artifact_id"], "artifact_file_1");
+}
+
+#[test]
 fn route_boundary_preserves_skipped_terminal_status_from_tool_metadata() {
     let service = ToolExecutionService::new_for_test();
     let mut request = request(

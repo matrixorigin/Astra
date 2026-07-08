@@ -11,6 +11,13 @@ pub const MAX_RESULT_CONTENT_LENGTH: usize = 100_000;
 
 const TRUNCATION_MARKER: &str = "… [truncated]";
 
+/// Tool call result fields that must survive beyond model-facing text output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpToolCallResult {
+    pub output: String,
+    pub structured_content: Option<Value>,
+}
+
 fn truncate_with_marker(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         return s.to_string();
@@ -87,11 +94,25 @@ pub fn tools_to_schemas_checked(server_name: &str, tools: &[Tool]) -> Result<Vec
 
 /// Extract tool call result content as string, with default truncation limit.
 pub fn extract_result_text(result: &CallToolResult) -> String {
-    extract_result_text_with_limit(result, MAX_RESULT_CONTENT_LENGTH)
+    extract_tool_call_result(result).output
 }
 
 /// Extract tool call result content as string, truncated to `max_len` chars.
 pub fn extract_result_text_with_limit(result: &CallToolResult, max_len: usize) -> String {
+    extract_tool_call_result_with_limit(result, max_len).output
+}
+
+/// Extract model-facing text while preserving structured MCP result content.
+pub fn extract_tool_call_result(result: &CallToolResult) -> McpToolCallResult {
+    extract_tool_call_result_with_limit(result, MAX_RESULT_CONTENT_LENGTH)
+}
+
+/// Extract model-facing text while preserving structured MCP result content,
+/// truncating only the text channel.
+pub fn extract_tool_call_result_with_limit(
+    result: &CallToolResult,
+    max_len: usize,
+) -> McpToolCallResult {
     use rmcp::model::RawContent;
 
     let mut parts = Vec::new();
@@ -116,7 +137,7 @@ pub fn extract_result_text_with_limit(result: &CallToolResult, max_len: usize) -
     }
 
     let joined = parts.join("\n");
-    if total_len >= max_len {
+    let output = if total_len >= max_len {
         tracing::warn!(
             "MCP tool result truncated: {total_len} chars exceeded {max_len} char limit"
         );
@@ -126,6 +147,10 @@ pub fn extract_result_text_with_limit(result: &CallToolResult, max_len: usize) -
         )
     } else {
         joined
+    };
+    McpToolCallResult {
+        output,
+        structured_content: result.structured_content.clone(),
     }
 }
 
@@ -233,6 +258,26 @@ mod tests {
         let result = CallToolResult::success(vec![Content::new(RawContent::text(&big_text), None)]);
         let text = extract_result_text_with_limit(&result, 100);
         assert!(text.contains("[OUTPUT TRUNCATED"));
+    }
+
+    #[test]
+    fn extract_tool_call_result_preserves_structured_content() {
+        use rmcp::model::{Content, RawContent};
+
+        let structured = serde_json::json!({
+            "artifacts": [{
+                "artifact_id": "artifact_file_1",
+                "type": "file",
+                "data": {"file_id": "file_1"}
+            }]
+        });
+        let mut result =
+            CallToolResult::success(vec![Content::new(RawContent::text("created file"), None)]);
+        result.structured_content = Some(structured.clone());
+
+        let extracted = extract_tool_call_result(&result);
+        assert_eq!(extracted.output, "created file");
+        assert_eq!(extracted.structured_content, Some(structured));
     }
 
     #[test]

@@ -245,6 +245,7 @@ pub(crate) fn tool_call_end_event(
         "duration_ms".to_string(),
         Value::Number(serde_json::Number::from(duration_ms)),
     );
+    copy_result_structured_output_metadata(&mut event, result);
     copy_result_routing_metadata(&mut event, result);
     Some(event)
 }
@@ -297,6 +298,25 @@ pub(crate) fn copy_result_routing_metadata(
         return;
     };
     for key in RESULT_ROUTING_METADATA_FIELDS {
+        if let Some(value) = metadata.get(*key) {
+            event
+                .entry((*key).to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
+}
+
+const RESULT_STRUCTURED_OUTPUT_METADATA_FIELDS: &[&str] =
+    &["structuredContent", "artifacts", "artifact"];
+
+fn copy_result_structured_output_metadata(
+    event: &mut Map<String, Value>,
+    result: &astra_tools::ToolResult,
+) {
+    let Some(metadata) = result.metadata.as_ref() else {
+        return;
+    };
+    for key in RESULT_STRUCTURED_OUTPUT_METADATA_FIELDS {
         if let Some(value) = metadata.get(*key) {
             event
                 .entry((*key).to_string())

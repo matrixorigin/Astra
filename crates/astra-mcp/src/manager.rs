@@ -13,7 +13,9 @@ use tokio::sync::RwLock;
 
 use crate::connection::{self, McpConnection};
 use crate::error::McpError;
-use crate::tools::{extract_result_text, mcp_tool_to_schema, sanitize_tool_name};
+use crate::tools::{
+    McpToolCallResult, extract_tool_call_result, mcp_tool_to_schema, sanitize_tool_name,
+};
 use crate::types::{ConnectionState, McpServerConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,12 +217,13 @@ impl McpClientManager {
     }
 
     /// Call a tool by its MCP-prefixed public name (e.g. "mcp__moi__query_sql").
-    /// Resolves the server + original name, executes, and returns text result.
+    /// Resolves the server + original name, executes, and returns text plus
+    /// structured result fields.
     pub async fn call_tool_by_mcp_name(
         &self,
         mcp_name: &str,
         arguments: Value,
-    ) -> Result<String, McpError> {
+    ) -> Result<McpToolCallResult, McpError> {
         let (server_name, original_name) = self
             .find_tool_by_mcp_name(mcp_name)
             .ok_or_else(|| McpError::ToolNotFound(mcp_name.to_string()))?;
@@ -235,7 +238,7 @@ impl McpClientManager {
             .await
             .map_err(McpError::Service)?;
 
-        Ok(extract_result_text(&result))
+        Ok(extract_tool_call_result(&result))
     }
 
     /// Number of active connections.
