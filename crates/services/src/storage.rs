@@ -1050,6 +1050,22 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS auth_provider_request_replay (
+            provider VARCHAR(64) NOT NULL,
+            request_authorization_id VARCHAR(512) NOT NULL,
+            external_subject VARCHAR(255) NOT NULL,
+            request_id VARCHAR(255) NOT NULL,
+            expires_at_unix BIGINT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (provider, request_authorization_id),
+            INDEX idx_auth_provider_request_replay_expires (expires_at_unix, provider, request_authorization_id),
+            INDEX idx_auth_provider_request_replay_request (provider, request_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS auth_audit_logs (
             log_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
@@ -5084,6 +5100,7 @@ pub async fn cleanup_expired_data(
 ) -> Result<Vec<CleanupResult>, String> {
     const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const AUTH_TOKEN_BATCH_LIMIT: u32 = 1000;
+    const AUTH_PROVIDER_REQUEST_REPLAY_BATCH_LIMIT: u32 = 1000;
     const TASK_LEASE_BATCH_LIMIT: u32 = 1000;
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
     const PROMPT_REQUEST_BATCH_LIMIT: u32 = 1000;
@@ -5131,7 +5148,26 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 3. Expired task leases
+    // 3. Expired provider request replay guards. These are replay-prevention
+    // facts, not audit facts: after the capability token expiry passes, the
+    // row only consumes index space and can no longer authorize anything.
+    let deleted = sqlx::query(
+        "DELETE FROM auth_provider_request_replay \
+         WHERE expires_at_unix < UNIX_TIMESTAMP() \
+         ORDER BY expires_at_unix ASC, provider ASC, request_authorization_id ASC \
+         LIMIT ?",
+    )
+    .bind(AUTH_PROVIDER_REQUEST_REPLAY_BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| format!("cleanup auth_provider_request_replay: {e}"))?;
+    results.push(CleanupResult {
+        table: "auth_provider_request_replay",
+        rows_deleted: deleted,
+    });
+
+    // 4. Expired task leases
     let deleted = sqlx::query(
         "DELETE FROM task_leases \
          WHERE expires_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
@@ -5149,7 +5185,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 4. Old audit logs
+    // 5. Old audit logs
     let deleted = sqlx::query(
         "DELETE FROM auth_audit_logs \
          WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
@@ -5167,7 +5203,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 5. Old prompt observability rows. Select parent request records first so
+    // 6. Old prompt observability rows. Select parent request records first so
     // child prompt_deltas and parent prompt_request_records are pruned together.
     let prompt_request_retention_select_sql = format!(
         "SELECT p.user_id, p.session_id, p.request_id
@@ -5965,6 +6001,35 @@ mod tests {
     }
 
     #[test]
+    fn provider_request_replay_schema_is_shared_atomic_and_expiring() {
+        let source = include_str!("storage.rs");
+        let replay = source
+            .split("CREATE TABLE IF NOT EXISTS auth_provider_request_replay")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("auth_provider_request_replay DDL");
+        assert!(
+            replay.contains("PRIMARY KEY (provider, request_authorization_id)"),
+            "provider request replay identity must be shared and provider-scoped"
+        );
+        assert!(
+            replay.contains("request_authorization_id VARCHAR(512) NOT NULL"),
+            "provider request replay identity must fit the full signed request nonce"
+        );
+        assert!(
+            replay.contains("expires_at_unix BIGINT NOT NULL")
+                && replay.contains(
+                    "idx_auth_provider_request_replay_expires (expires_at_unix, provider, request_authorization_id)"
+                ),
+            "provider request replay rows must have an indexed TTL boundary"
+        );
+        assert!(
+            !replay.contains("id BIGINT AUTO_INCREMENT"),
+            "provider request replay must not reintroduce ownerless surrogate identity"
+        );
+    }
+
+    #[test]
     fn mcp_registry_tables_use_owner_bound_string_identity() {
         let source = include_str!("storage.rs");
         let servers = source
@@ -6235,6 +6300,7 @@ mod tests {
         for constant in [
             "AUTH_REFRESH_TOKEN_BATCH_LIMIT",
             "AUTH_TOKEN_BATCH_LIMIT",
+            "AUTH_PROVIDER_REQUEST_REPLAY_BATCH_LIMIT",
             "TASK_LEASE_BATCH_LIMIT",
             "AUTH_AUDIT_LOG_BATCH_LIMIT",
             "PROMPT_REQUEST_BATCH_LIMIT",
@@ -6248,6 +6314,7 @@ mod tests {
         }
         for ordering in [
             "ORDER BY created_at ASC, token_id ASC",
+            "ORDER BY expires_at_unix ASC, provider ASC, request_authorization_id ASC",
             "ORDER BY expires_at ASC, user_id ASC, task_id ASC",
             "ORDER BY created_at ASC, log_id ASC",
             "ORDER BY p.created_at_unix_ms ASC, p.user_id ASC, p.request_id ASC",
@@ -6340,6 +6407,11 @@ mod tests {
                 "global age-based cleanup must not directly delete replay/tool-output facts: {table}"
             );
         }
+        assert!(
+            body.contains("DELETE FROM auth_provider_request_replay")
+                && body.contains("WHERE expires_at_unix < UNIX_TIMESTAMP()"),
+            "provider request replay guards are nonce TTL facts and must expire by their signed token boundary, not generic retention age"
+        );
     }
 
     #[test]

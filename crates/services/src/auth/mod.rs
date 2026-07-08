@@ -661,7 +661,59 @@ impl DatabaseAuthService {
             })
     }
 
-    fn record_provider_request_authorization(
+    async fn record_provider_request_authorization(
+        &self,
+        authorized: &ProviderAuthorizedRequest,
+        request_id: &str,
+    ) -> Result<(), AuthHttpError> {
+        if let Some(pool) = self.pool.as_ref() {
+            return self
+                .record_provider_request_authorization_durable(pool, authorized, request_id)
+                .await;
+        }
+        self.record_provider_request_authorization_in_memory(
+            &authorized.request_authorization_id,
+            authorized.expires_at_unix,
+        )
+    }
+
+    async fn record_provider_request_authorization_durable(
+        &self,
+        pool: &SharedPool,
+        authorized: &ProviderAuthorizedRequest,
+        request_id: &str,
+    ) -> Result<(), AuthHttpError> {
+        let result = query(
+            "INSERT INTO auth_provider_request_replay \
+             (provider, request_authorization_id, external_subject, request_id, expires_at_unix) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&authorized.provider_id)
+        .bind(&authorized.request_authorization_id)
+        .bind(&authorized.external_subject)
+        .bind(request_id)
+        .bind(authorized.expires_at_unix)
+        .execute(pool.get())
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if is_duplicate_key_error(&error) => Err(provider_request_auth_error(
+                "Provider request token has already been used",
+            )),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    provider = %authorized.provider_id,
+                    "provider request replay guard failed closed"
+                );
+                Err(provider_request_auth_error(
+                    "Provider request replay guard is unavailable",
+                ))
+            }
+        }
+    }
+
+    fn record_provider_request_authorization_in_memory(
         &self,
         authorization_id: &str,
         expires_at_unix: i64,
@@ -1222,10 +1274,9 @@ impl AuthService for DatabaseAuthService {
             &token,
             &request,
         )?;
-        self.record_provider_request_authorization(
-            &authorized.request_authorization_id,
-            authorized.expires_at_unix,
-        )?;
+        let request_id = request.request_id.as_deref().unwrap_or_default();
+        self.record_provider_request_authorization(&authorized, request_id)
+            .await?;
         let user_id = format!(
             "provider_authorized:{}:{}",
             authorized.provider_id, authorized.external_subject
@@ -1675,6 +1726,44 @@ mod tests {
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(body.0.detail.contains("already been used"));
+    }
+
+    #[test]
+    fn provider_request_replay_guard_is_shared_when_pool_is_configured() {
+        let source = include_str!("mod.rs");
+        let dispatcher = source
+            .split("async fn record_provider_request_authorization(")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn record_provider_request_authorization_durable(")
+                    .next()
+            })
+            .expect("record_provider_request_authorization dispatcher");
+        assert!(
+            dispatcher.contains("if let Some(pool) = self.pool.as_ref()")
+                && dispatcher.contains("record_provider_request_authorization_durable")
+                && dispatcher.contains("record_provider_request_authorization_in_memory"),
+            "provider request replay must use the shared durable guard whenever the auth service has a pool"
+        );
+
+        let durable = source
+            .split("async fn record_provider_request_authorization_durable(")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("fn record_provider_request_authorization_in_memory(")
+                    .next()
+            })
+            .expect("durable provider request replay guard");
+        assert!(
+            durable.contains("INSERT INTO auth_provider_request_replay")
+                && durable.contains("is_duplicate_key_error")
+                && durable.contains("Provider request replay guard is unavailable"),
+            "durable provider replay guard must be atomic, duplicate-aware, and fail closed"
+        );
+        assert!(
+            !durable.contains("provider_request_replay_cache"),
+            "durable provider replay guard must not consult process-local cache state"
+        );
     }
 
     #[tokio::test]
