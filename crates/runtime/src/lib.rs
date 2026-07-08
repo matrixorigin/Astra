@@ -188,9 +188,9 @@ pub use astra_services::{
     },
     multi_agent::{
         DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,
-        EdgeDispatchRow, EdgeDispatchService, EdgeRegistryService, TaskLeaseHoldCache,
-        TaskLeaseService, UnconfiguredEdgeDispatchService, UnconfiguredEdgeRegistryService,
-        UnconfiguredTaskLeaseService,
+        EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService, EdgeRegistryService,
+        TaskLeaseHoldCache, TaskLeaseService, UnconfiguredEdgeDispatchService,
+        UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
     },
     reflect::{DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService},
     replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService},

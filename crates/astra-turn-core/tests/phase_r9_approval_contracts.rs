@@ -10,6 +10,7 @@
 //! This file covers the public-surface pins accessible from an
 //! integration test.
 
+use astra_services::multi_agent::EdgeDispatchIdentity;
 use astra_turn_core::approval_fingerprint::{
     ApprovalFingerprint, DenialAction, DenialLimits, DenialTracker,
 };
@@ -19,6 +20,8 @@ use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key};
 /// `"{user}:approval:{session}:{run}:{req}"`.
 #[test]
 fn approval_callback_key_is_session_and_run_scoped() {
+    let tool_identity =
+        EdgeDispatchIdentity::new("user-42", "sess-9", "run-7", "chain-3", "req-abc");
     assert_eq!(
         approval_callback_key("user-42", "sess-9", "run-7", "req-abc"),
         "user-42:approval:sess-9:run-7:req-abc"
@@ -26,12 +29,12 @@ fn approval_callback_key_is_session_and_run_scoped() {
     assert_eq!(approval_callback_key("", "", "", ""), ":approval:::");
     // Crossed with tool_callback_key to double-check namespace separator.
     assert_eq!(
-        tool_callback_key("user-42", "req-abc"),
-        "user-42:tool:req-abc"
+        tool_callback_key(&tool_identity),
+        "user-42:tool:sess-9:run-7:chain-3:req-abc"
     );
     assert_ne!(
         approval_callback_key("user-42", "sess-9", "run-7", "req-abc"),
-        tool_callback_key("user-42", "req-abc"),
+        tool_callback_key(&tool_identity),
         "approval and tool ledger namespaces must never collide"
     );
 }

@@ -103,6 +103,9 @@ pub struct EdgeApprovalRequest {
 #[derive(Debug, Clone)]
 pub enum ChatTurnEdgePending {
     ToolRequest {
+        session_id: String,
+        run_id: String,
+        turn_chain_id: String,
         request_id: String,
         tool: String,
         args: Value,
@@ -340,6 +343,21 @@ fn apply_one_event(
                 && !request_id.is_empty()
             {
                 edge_pending.push(ChatTurnEdgePending::ToolRequest {
+                    session_id: event
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    run_id: event
+                        .get("run_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    turn_chain_id: event
+                        .get("turn_chain_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     request_id,
                     tool,
                     args,
@@ -1009,6 +1027,7 @@ mod tests {
                 request_id,
                 tool,
                 args,
+                ..
             } => {
                 assert_eq!(request_id, "tr-1");
                 assert_eq!(tool, "bash");

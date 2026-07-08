@@ -1,5 +1,6 @@
 use serde_json::{Map, Value};
 
+use astra_services::multi_agent::EdgeDispatchIdentity;
 use astra_thin_client::ApprovalKind;
 
 use crate::tool::args::repair::try_repair_tool_args;
@@ -344,14 +345,12 @@ pub fn build_approval_batch_required_event(
     ])
 }
 
-/// §5.5 thin-client `tool_request` — `request_id` matches `POST /tools/result` and ledger keys.
-pub fn build_tool_request_event(tool_call: &Map<String, Value>) -> Map<String, Value> {
+/// §5.5 thin-client `tool_request` — identity matches `POST /tools/result` and ledger keys.
+pub fn build_tool_request_event(
+    tool_call: &Map<String, Value>,
+    identity: &EdgeDispatchIdentity,
+) -> Map<String, Value> {
     let edge = build_edge_tool_call_event(tool_call);
-    let request_id = tool_call
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
     let tool = edge
         .get("name")
         .cloned()
@@ -362,7 +361,19 @@ pub fn build_tool_request_event(tool_call: &Map<String, Value>) -> Map<String, V
             "type".to_string(),
             Value::String("tool_request".to_string()),
         ),
-        ("request_id".to_string(), Value::String(request_id)),
+        (
+            "session_id".to_string(),
+            Value::String(identity.session_id.clone()),
+        ),
+        ("run_id".to_string(), Value::String(identity.run_id.clone())),
+        (
+            "turn_chain_id".to_string(),
+            Value::String(identity.turn_chain_id.clone()),
+        ),
+        (
+            "request_id".to_string(),
+            Value::String(identity.request_id.clone()),
+        ),
         ("tool".to_string(), tool),
         ("args".to_string(), args),
     ])
@@ -530,8 +541,15 @@ mod tests {
                 json!({"name": "bash", "arguments": "{\"cmd\": \"ls\"}"}),
             ),
         ]);
-        let ev = build_tool_request_event(&tc);
+        let identity = EdgeDispatchIdentity::new("u1", "s1", "r1", "chain1", "call_abc");
+        let ev = build_tool_request_event(&tc, &identity);
         assert_eq!(ev.get("type").and_then(Value::as_str), Some("tool_request"));
+        assert_eq!(ev.get("session_id").and_then(Value::as_str), Some("s1"));
+        assert_eq!(ev.get("run_id").and_then(Value::as_str), Some("r1"));
+        assert_eq!(
+            ev.get("turn_chain_id").and_then(Value::as_str),
+            Some("chain1")
+        );
         assert_eq!(
             ev.get("request_id").and_then(Value::as_str),
             Some("call_abc")
@@ -857,7 +875,11 @@ mod tests {
             "function".to_string(),
             json!({"name": "read_file", "arguments": "{}"}),
         )]);
-        let ev = build_tool_request_event(&tc);
-        assert_eq!(ev.get("request_id").and_then(Value::as_str), Some(""));
+        let identity = EdgeDispatchIdentity::new("u1", "s1", "r1", "chain1", "call_missing");
+        let ev = build_tool_request_event(&tc, &identity);
+        assert_eq!(
+            ev.get("request_id").and_then(Value::as_str),
+            Some("call_missing")
+        );
     }
 }

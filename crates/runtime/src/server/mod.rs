@@ -550,7 +550,7 @@ mod tests {
     use astra_services::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
         RunListRecord, RunStatusRecord,
-        multi_agent::{EdgeDispatchRow, EdgeDispatchService},
+        multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService},
     };
     use async_trait::async_trait;
     use axum::{Json, http::StatusCode};
@@ -565,9 +565,8 @@ mod tests {
     impl EdgeDispatchService for RecordingEdgeDispatchService {
         async fn insert_dispatch(
             &self,
-            _user_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _request_id: &str,
             _payload_json: &str,
         ) -> Result<(), String> {
             unreachable!("insert_dispatch is not used in cleanup tests")
@@ -583,8 +582,7 @@ mod tests {
 
         async fn deliver_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
         ) -> Result<bool, String> {
@@ -593,8 +591,7 @@ mod tests {
 
         async fn fail_dispatch(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _reason: &str,
         ) -> Result<bool, String> {
             unreachable!("fail_dispatch is not used in cleanup tests")
@@ -602,8 +599,7 @@ mod tests {
 
         async fn wait_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
             unreachable!("wait_result is not used in cleanup tests")

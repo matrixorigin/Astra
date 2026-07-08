@@ -12,6 +12,13 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 
 const CAUSAL_EDGE_KIND: &str = "causal";
+const EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS: &[&str] = &[
+    "user_id",
+    "session_id",
+    "run_id",
+    "turn_chain_id",
+    "request_id",
+];
 
 /// Standard column width for `agent_id` across all tables.
 /// All `agent_id`, `edge_agent_id`, `holder_agent_id`, and `parent_agent_id`
@@ -3451,6 +3458,9 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (
             user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            run_id VARCHAR(128) NOT NULL,
+            turn_chain_id VARCHAR(128) NOT NULL,
             edge_agent_id VARCHAR(255) NOT NULL,
             request_id VARCHAR(128) NOT NULL,
             payload_json JSON NOT NULL,
@@ -3460,8 +3470,8 @@ pub async fn ensure_core_schema(
             dispatched_at DATETIME(6) NULL,
             completed_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, request_id),
-            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, request_id),
+            PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, request_id),
+            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, session_id, run_id, turn_chain_id, request_id),
             INDEX idx_edge_dispatch_created (created_at)
         )",
     )
@@ -3471,7 +3481,7 @@ pub async fn ensure_core_schema(
         &pool,
         &settings.database,
         "edge_pending_dispatch",
-        &["user_id", "request_id"],
+        EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
         &["dispatch_id"],
         &["uq_edge_dispatch_owner_request"],
     )
@@ -3487,8 +3497,8 @@ pub async fn ensure_core_schema(
         &pool,
         &settings.database,
         "edge_pending_dispatch",
-        &["user_id", "request_id"],
-        "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, request_id)",
+        EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
+        "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, request_id)",
     )
     .await?;
     ensure_index_shape(
@@ -3496,8 +3506,17 @@ pub async fn ensure_core_schema(
         &settings.database,
         "edge_pending_dispatch",
         "idx_edge_dispatch_user_status",
-        &["user_id", "edge_agent_id", "status", "created_at", "request_id"],
-        "ALTER TABLE edge_pending_dispatch ADD INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, request_id)",
+        &[
+            "user_id",
+            "edge_agent_id",
+            "status",
+            "created_at",
+            "session_id",
+            "run_id",
+            "turn_chain_id",
+            "request_id",
+        ],
+        "ALTER TABLE edge_pending_dispatch ADD INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, session_id, run_id, turn_chain_id, request_id)",
     )
     .await?;
 
@@ -5817,27 +5836,22 @@ mod tests {
     }
 
     #[test]
-    fn edge_pending_dispatch_identity_is_owner_request_bound() {
+    fn edge_pending_dispatch_identity_is_turn_scoped() {
         let source = include_str!("storage.rs");
-        let ddl = source
-            .split("CREATE TABLE IF NOT EXISTS edge_pending_dispatch")
-            .nth(1)
-            .and_then(|rest| rest.split(")\"").next())
-            .expect("edge_pending_dispatch DDL");
-
-        assert!(
-            ddl.contains("PRIMARY KEY (user_id, request_id)"),
-            "edge_pending_dispatch must use the owner/request product identity"
+        assert_eq!(
+            EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
+            &[
+                "user_id",
+                "session_id",
+                "run_id",
+                "turn_chain_id",
+                "request_id"
+            ],
+            "edge_pending_dispatch identity must be scoped to the owning turn"
         );
         assert!(
-            !ddl.contains("dispatch_id BIGINT AUTO_INCREMENT"),
+            !source.contains("dispatch_id BIGINT AUTO_INCREMENT"),
             "edge_pending_dispatch must not reintroduce a global AUTO_INCREMENT surrogate"
-        );
-        assert!(
-            source.contains(
-                "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, request_id)"
-            ),
-            "schema bootstrap must verify the owner/request primary key"
         );
         assert!(
             source.contains("&[\"dispatch_id\"]"),

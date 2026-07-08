@@ -3076,6 +3076,8 @@ impl ServerAgenticLoopHost {
     /// for results delivered by another pod.
     async fn deliver_edge_bound_tools_via_ledger(
         &mut self,
+        run_id: &str,
+        turn_chain_id: &str,
         tool_calls: &[Value],
     ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
         if self.event_tx.is_none() || tool_calls.is_empty() {
@@ -3085,7 +3087,7 @@ impl ServerAgenticLoopHost {
         if edge_bound_tool_calls.is_empty() {
             return Vec::new();
         }
-        self.deliver_edge_tools_via_ledger(&edge_bound_tool_calls)
+        self.deliver_edge_tools_via_ledger(run_id, turn_chain_id, &edge_bound_tool_calls)
             .await
     }
 
@@ -3132,8 +3134,26 @@ impl ServerAgenticLoopHost {
                 !self.edge_executor_offline_blocks_tool(&tool_name)
             })
             .collect::<Vec<_>>();
+        let Some(run_id) = state
+            .current_run_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            tracing::warn!(
+                session_id = %self.session_id,
+                user_id = %self.user_id,
+                tool_call_count = ledger_tool_calls.len(),
+                "skip browser edge-tool ledger because current run id is missing"
+            );
+            return results;
+        };
+        let turn_chain_id = state
+            .bridge_turn_chain_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(run_id);
         results.extend(
-            self.deliver_edge_bound_tools_via_ledger(&ledger_tool_calls)
+            self.deliver_edge_bound_tools_via_ledger(run_id, turn_chain_id, &ledger_tool_calls)
                 .await,
         );
         results
@@ -3169,6 +3189,8 @@ impl ServerAgenticLoopHost {
 
     async fn deliver_edge_tools_via_ledger(
         &mut self,
+        run_id: &str,
+        turn_chain_id: &str,
         tool_calls: &[Value],
     ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
         use astra_turn_core::cloud_tool_delivery::{
@@ -3324,7 +3346,15 @@ impl ServerAgenticLoopHost {
             }
 
             for tc in &executable_calls {
-                for m in sse_maps_through_tool_request(tc) {
+                let request_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+                    &self.user_id,
+                    &self.session_id,
+                    run_id,
+                    turn_chain_id,
+                    request_id,
+                );
+                for m in sse_maps_through_tool_request(tc, &identity) {
                     // L1094 (execute_mock_turn mock-LLM-response path) is the
                     // SINGLE owner of `tool_call` events per skill invocation.
                     // `sse_maps_through_tool_request` re-wraps the same tc as
@@ -3349,6 +3379,13 @@ impl ServerAgenticLoopHost {
                     continue;
                 }
                 let (id, tool_name, args) = parse_flat_tool_call_event(tc);
+                let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+                    &self.user_id,
+                    &self.session_id,
+                    run_id,
+                    turn_chain_id,
+                    &id,
+                );
 
                 // ── Dedup read-only tool invocations within a short window ──
                 // Only applies when the tool is parallelizable (args-aware);
@@ -3391,7 +3428,7 @@ impl ServerAgenticLoopHost {
                     )
                 } else {
                     let delivery = self
-                        .wait_tool_result_with_dispatch_fallback(tc, &id, ledger_wait)
+                        .wait_tool_result_with_dispatch_fallback(tc, &identity, ledger_wait)
                         .await;
 
                     let duration_ms = started.elapsed().as_millis() as u64;
@@ -3478,19 +3515,15 @@ impl ServerAgenticLoopHost {
     async fn wait_tool_result_with_dispatch_fallback(
         &self,
         tc: &Value,
-        request_id: &str,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
         ledger_wait: Duration,
     ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
         use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool;
         use astra_turn_core::edge_ledger::tool_callback_key;
 
-        let delivery = wait_tool_result_ledger_for_tool(
-            &self.edge_callback_ledger,
-            &self.user_id,
-            tc,
-            ledger_wait,
-        )
-        .await;
+        let delivery =
+            wait_tool_result_ledger_for_tool(&self.edge_callback_ledger, identity, tc, ledger_wait)
+                .await;
         if !edge_tool_delivery_timed_out(&delivery) {
             return delivery;
         }
@@ -3499,7 +3532,7 @@ impl ServerAgenticLoopHost {
             return delivery;
         };
         let result_json = match dispatch_service
-            .wait_result(&self.user_id, request_id, Duration::from_millis(0))
+            .wait_result(identity, Duration::from_millis(0))
             .await
         {
             Ok(Some(result_json)) => result_json,
@@ -3509,7 +3542,9 @@ impl ServerAgenticLoopHost {
                     target: "astra_runtime::server_loop_host",
                     user_id = %self.user_id,
                     session_id = %self.session_id,
-                    request_id = %request_id,
+                    run_id = %identity.run_id,
+                    turn_chain_id = %identity.turn_chain_id,
+                    request_id = %identity.request_id,
                     error = %error,
                     "edge tool ledger timed out and dispatch fallback failed"
                 );
@@ -3519,13 +3554,16 @@ impl ServerAgenticLoopHost {
 
         let body =
             serde_json::from_str::<Value>(&result_json).unwrap_or(Value::String(result_json));
-        let key = tool_callback_key(&self.user_id, request_id);
+        let key = tool_callback_key(identity);
         {
             let mut ledger = self.edge_callback_ledger.lock().await;
             ledger.entry(key).or_insert_with(|| {
                 json!({
                     "kind": "tool_result",
                     "user_id": self.user_id.as_str(),
+                    "session_id": self.session_id.as_str(),
+                    "run_id": identity.run_id.as_str(),
+                    "turn_chain_id": identity.turn_chain_id.as_str(),
                     "body": body,
                 })
             });
@@ -3533,7 +3571,7 @@ impl ServerAgenticLoopHost {
 
         wait_tool_result_ledger_for_tool(
             &self.edge_callback_ledger,
-            &self.user_id,
+            identity,
             tc,
             Duration::from_millis(0),
         )
@@ -3555,6 +3593,7 @@ impl ServerAgenticLoopHost {
                 let request = ToolExecutionRequest {
                     user_id: self.user_id.clone(),
                     run_id: String::new(),
+                    turn_chain_id: String::new(),
                     session_id: self.session_id.clone(),
                     tool_call_id: tool_call_id.to_string(),
                     tool_name: tool_name.to_string(),
@@ -5940,7 +5979,7 @@ mod tests {
     #[cfg(feature = "bridge-e2e-hooks")]
     use astra_services::SessionArtifactStore;
     use astra_turn_core::cloud_summary::SummaryLlmClient;
-    use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key};
+    use astra_turn_core::edge_ledger::approval_callback_key;
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
     use std::ffi::OsString;
 
@@ -5981,6 +6020,25 @@ mod tests {
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
         // Use a valid Fernet key for testing
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
+    }
+
+    fn test_dispatch_identity(
+        user_id: &str,
+        request_id: &str,
+    ) -> astra_services::multi_agent::EdgeDispatchIdentity {
+        astra_services::multi_agent::EdgeDispatchIdentity::new(
+            user_id,
+            "test-session",
+            "test-run",
+            "test-chain",
+            request_id,
+        )
+    }
+
+    fn tool_callback_key(user_id: &str, request_id: &str) -> String {
+        astra_turn_core::edge_ledger::tool_callback_key(&test_dispatch_identity(
+            user_id, request_id,
+        ))
     }
 
     struct NoopAuxiliaryEventWriter;
@@ -6038,9 +6096,8 @@ mod tests {
     impl EdgeDispatchService for StaticWaitResultEdgeDispatch {
         async fn insert_dispatch(
             &self,
-            _user_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _request_id: &str,
             _payload_json: &str,
         ) -> Result<(), String> {
             Err("not used".to_string())
@@ -6056,8 +6113,7 @@ mod tests {
 
         async fn deliver_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
         ) -> Result<bool, String> {
@@ -6066,8 +6122,7 @@ mod tests {
 
         async fn fail_dispatch(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _reason: &str,
         ) -> Result<bool, String> {
             Err("not used".to_string())
@@ -6075,8 +6130,7 @@ mod tests {
 
         async fn wait_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _timeout: Duration,
         ) -> Result<Option<String>, String> {
             Ok(self.result_json.clone())
@@ -8786,7 +8840,9 @@ mod tests {
             );
         });
 
-        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+        let results = host
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .await;
 
         assert!(
             host.emitted_events
@@ -8827,9 +8883,19 @@ mod tests {
 
     #[tokio::test]
     async fn wait_tool_result_dispatch_fallback_uses_db_result_after_ledger_timeout() {
+        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            "u-dispatch",
+            "s-dispatch",
+            "test-run",
+            "test-chain",
+            "r1",
+        );
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            identity.session_id.clone(),
+            identity.run_id.clone(),
+            identity.turn_chain_id.clone(),
             "r1".to_string(),
-            Some("edge-1".to_string()),
+            "edge-1".to_string(),
             "completed".to_string(),
             "from dispatch".to_string(),
             17,
@@ -8852,7 +8918,11 @@ mod tests {
         });
 
         let delivery = host
-            .wait_tool_result_with_dispatch_fallback(&tool_call, "r1", Duration::from_millis(1))
+            .wait_tool_result_with_dispatch_fallback(
+                &tool_call,
+                &identity,
+                Duration::from_millis(1),
+            )
             .await;
 
         let tool_message = delivery
@@ -8923,7 +8993,9 @@ mod tests {
             "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
         })];
 
-        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+        let results = host
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, "ok");
@@ -9029,7 +9101,9 @@ mod tests {
             );
         });
 
-        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+        let results = host
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .await;
 
         let request_ids: Vec<_> = host
             .emitted_events

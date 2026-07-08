@@ -294,6 +294,7 @@ mod tests {
         ToolExecutionRequest {
             user_id: "user-1".to_string(),
             run_id: "run-1".to_string(),
+            turn_chain_id: "chain-1".to_string(),
             session_id: "session-1".to_string(),
             tool_call_id: "call-1".to_string(),
             tool_name: "bash".to_string(),

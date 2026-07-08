@@ -238,10 +238,11 @@ pub use models::{
 };
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,
-    EdgeAgentRecord, EdgeDispatchRow, EdgeDispatchService, EdgeRegistryService, LeaseClaimResult,
-    LeaseRenewalConfig, LeaseRenewalTask, NextClaimableLeaseClaimResult, TaskLeaseHoldCache,
-    TaskLeaseService, TaskLeaseView, TasksPackPushResult, UnconfiguredEdgeDispatchService,
-    UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
+    EdgeAgentRecord, EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService,
+    EdgeRegistryService, LeaseClaimResult, LeaseRenewalConfig, LeaseRenewalTask,
+    NextClaimableLeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView,
+    TasksPackPushResult, UnconfiguredEdgeDispatchService, UnconfiguredEdgeRegistryService,
+    UnconfiguredTaskLeaseService,
 };
 pub use pagination::{
     MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, clamp_admin_audit_limit,

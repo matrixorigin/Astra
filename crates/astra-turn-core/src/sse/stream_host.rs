@@ -108,6 +108,9 @@ pub struct EdgeApprovalResult {
 /// A tool request bundled for batch execution.
 #[derive(Debug, Clone)]
 pub struct ToolBatchRequest {
+    pub session_id: String,
+    pub run_id: String,
+    pub turn_chain_id: String,
     pub request_id: String,
     pub tool: String,
     pub args: Value,
@@ -641,14 +644,25 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     for item in items {
         match item {
             ChatTurnEdgePending::ToolRequest {
+                session_id,
+                run_id,
+                turn_chain_id,
                 request_id,
                 tool,
                 args,
             } => {
-                if request_id.is_empty() || tool.is_empty() {
+                if session_id.is_empty()
+                    || run_id.is_empty()
+                    || turn_chain_id.is_empty()
+                    || request_id.is_empty()
+                    || tool.is_empty()
+                {
                     continue;
                 }
                 tool_batch.push(ToolBatchRequest {
+                    session_id,
+                    run_id,
+                    turn_chain_id,
                     request_id,
                     tool,
                     args,
@@ -1532,7 +1546,7 @@ mod tests {
             "{}{}{}",
             sse_event(
                 "tool_request",
-                ",\"request_id\":\"t1\",\"tool\":\"read_file\",\"args\":{\"path\":\"x\"}"
+                ",\"session_id\":\"s1\",\"run_id\":\"r1\",\"turn_chain_id\":\"c1\",\"request_id\":\"t1\",\"tool\":\"read_file\",\"args\":{\"path\":\"x\"}"
             ),
             sse_event("text_delta", ",\"content\":\"Based on the file, \""),
             sse_event("text_delta", ",\"content\":\"here is my analysis.\""),
@@ -1559,6 +1573,9 @@ mod tests {
 
     fn make_tool_pending(tool: &str) -> ChatTurnEdgePending {
         ChatTurnEdgePending::ToolRequest {
+            session_id: "s1".to_string(),
+            run_id: "r1".to_string(),
+            turn_chain_id: "c1".to_string(),
             request_id: format!("req-{tool}"),
             tool: tool.to_string(),
             args: serde_json::json!({}),

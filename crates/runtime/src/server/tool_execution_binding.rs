@@ -204,6 +204,7 @@ pub struct ToolPolicySnapshot {
 pub struct ToolExecutionRequest {
     pub user_id: String,
     pub run_id: String,
+    pub turn_chain_id: String,
     pub session_id: String,
     pub tool_call_id: String,
     pub tool_name: String,
@@ -373,6 +374,9 @@ impl ExecutionBindingState {
         ToolExecutionRequest {
             user_id: user_id.to_string(),
             run_id: string_arg(args, "_run_id").unwrap_or_default().to_string(),
+            turn_chain_id: string_arg(args, "_turn_chain_id")
+                .unwrap_or_default()
+                .to_string(),
             session_id: session_id.to_string(),
             tool_call_id: tool_call_id(args).unwrap_or_default().to_string(),
             tool_name: name.to_string(),
@@ -407,6 +411,7 @@ pub(crate) fn transport_tool_arguments(args: &Value) -> Value {
     let mut public = map.clone();
     public.remove("_tool_call_id");
     public.remove("_run_id");
+    public.remove("_turn_chain_id");
     Value::Object(public)
 }
 

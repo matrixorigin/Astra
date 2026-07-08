@@ -19,12 +19,82 @@ use crate::interaction_contract::{InteractionStatus, edge_dispatch_status};
 #[derive(Debug)]
 pub struct EdgeDispatchRow {
     pub user_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub turn_chain_id: String,
     pub edge_agent_id: String,
     pub request_id: String,
     pub payload_json: String,
     pub result_json: Option<String>,
     pub status: String,
     pub pending_wait_us: u64,
+}
+
+impl EdgeDispatchRow {
+    pub fn identity(&self) -> EdgeDispatchIdentity {
+        EdgeDispatchIdentity::new(
+            self.user_id.clone(),
+            self.session_id.clone(),
+            self.run_id.clone(),
+            self.turn_chain_id.clone(),
+            self.request_id.clone(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EdgeDispatchIdentity {
+    pub user_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub turn_chain_id: String,
+    pub request_id: String,
+}
+
+impl EdgeDispatchIdentity {
+    pub fn new(
+        user_id: impl Into<String>,
+        session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        turn_chain_id: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            user_id: user_id.into(),
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+            turn_chain_id: turn_chain_id.into(),
+            request_id: request_id.into(),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        !self.user_id.trim().is_empty()
+            && !self.session_id.trim().is_empty()
+            && !self.run_id.trim().is_empty()
+            && !self.turn_chain_id.trim().is_empty()
+            && !self.request_id.trim().is_empty()
+    }
+
+    pub fn for_request_id(&self, request_id: impl Into<String>) -> Self {
+        Self {
+            user_id: self.user_id.clone(),
+            session_id: self.session_id.clone(),
+            run_id: self.run_id.clone(),
+            turn_chain_id: self.turn_chain_id.clone(),
+            request_id: request_id.into(),
+        }
+    }
+
+    fn request_id_json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "run_id": self.run_id,
+            "turn_chain_id": self.turn_chain_id,
+            "request_id": self.request_id,
+        })
+    }
 }
 
 async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'static str) {
@@ -35,12 +105,11 @@ async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'
 
 #[async_trait]
 pub trait EdgeDispatchService: Send + Sync {
-    /// Insert a new pending dispatch idempotently inside the owner/request boundary.
+    /// Insert a new pending dispatch idempotently inside the full turn boundary.
     async fn insert_dispatch(
         &self,
-        user_id: &str,
+        identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        request_id: &str,
         payload_json: &str,
     ) -> Result<(), String>;
 
@@ -53,12 +122,11 @@ pub trait EdgeDispatchService: Send + Sync {
     ) -> Result<Vec<EdgeDispatchRow>, String>;
 
     /// Deliver a tool result (from HTTP callback or WS) — updates status to 'completed'.
-    /// `user_id` and `edge_agent_id` must match the dispatch record to prevent
-    /// cross-owner or cross-agent injection.
+    /// The full dispatch identity and `edge_agent_id` must match the dispatch
+    /// record to prevent cross-owner, cross-run, or cross-agent injection.
     async fn deliver_result(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
     ) -> Result<bool, String>;
@@ -66,16 +134,14 @@ pub trait EdgeDispatchService: Send + Sync {
     /// Move an in-flight dispatch to a failed terminal state.
     async fn fail_dispatch(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         reason: &str,
     ) -> Result<bool, String>;
 
     /// Poll for a specific request's result. Returns Some(result_json) when completed.
     async fn wait_result(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<String>, String>;
 
@@ -118,6 +184,15 @@ fn decode_claimed_dispatch_row(row: &impl EdgeDispatchDbRow) -> Result<EdgeDispa
         user_id: row
             .string_column("user_id")
             .map_err(|e| edge_dispatch_decode_error("poll row", "user_id", e))?,
+        session_id: row
+            .string_column("session_id")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "session_id", e))?,
+        run_id: row
+            .string_column("run_id")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "run_id", e))?,
+        turn_chain_id: row
+            .string_column("turn_chain_id")
+            .map_err(|e| edge_dispatch_decode_error("poll row", "turn_chain_id", e))?,
         edge_agent_id: row
             .string_column("edge_agent_id")
             .map_err(|e| edge_dispatch_decode_error("poll row", "edge_agent_id", e))?,
@@ -261,25 +336,30 @@ fn validate_claimed_dispatch_update_count(expected: usize, actual: u64) -> Resul
 
 #[async_trait]
 impl EdgeDispatchService for DatabaseEdgeDispatchService {
-    #[tracing::instrument(skip(self, payload_json), fields(user_id = %user_id, edge_agent_id = %edge_agent_id, request_id = %request_id))]
+    #[tracing::instrument(skip(self, identity, payload_json), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, edge_agent_id = %edge_agent_id, request_id = %identity.request_id))]
     async fn insert_dispatch(
         &self,
-        user_id: &str,
+        identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        request_id: &str,
         payload_json: &str,
     ) -> Result<(), String> {
-        // Idempotent insert inside an owner boundary: the same request_id is
-        // reusable by another user, and duplicate calls for the same user are
-        // harmless retries.
+        if !identity.is_complete() {
+            return Err("edge_dispatch insert: incomplete dispatch identity".to_string());
+        }
+        // Idempotent insert inside a full turn boundary: duplicate calls for
+        // the same dispatched tool are harmless retries, while same request_id
+        // values in other runs/chains remain isolated.
         match sqlx::query(
             "INSERT IGNORE INTO edge_pending_dispatch \
-             (user_id, edge_agent_id, request_id, payload_json, status) \
-             VALUES (?, ?, ?, ?, 'pending')",
+             (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, payload_json, status) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
         )
-        .bind(user_id)
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
         .bind(edge_agent_id)
-        .bind(request_id)
+        .bind(&identity.request_id)
         .bind(payload_json)
         .execute(&self.pool)
         .await
@@ -312,7 +392,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .map_err(|e| format!("edge_dispatch poll begin tx: {e}"))?;
 
         let rows = match sqlx::query(
-            "SELECT user_id, edge_agent_id, request_id, \
+            "SELECT user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
              CAST(payload_json AS CHAR) AS payload_json, \
              CAST(result_json AS CHAR) AS result_json, \
              status, \
@@ -370,6 +450,12 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             update
                 .push("(user_id = ")
                 .push_bind(&row.user_id)
+                .push(" AND session_id = ")
+                .push_bind(&row.session_id)
+                .push(" AND run_id = ")
+                .push_bind(&row.run_id)
+                .push(" AND turn_chain_id = ")
+                .push_bind(&row.turn_chain_id)
                 .push(" AND request_id = ")
                 .push_bind(&row.request_id)
                 .push(")");
@@ -406,11 +492,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         Ok(claimed_rows)
     }
 
-    #[tracing::instrument(skip(self, result_json), fields(request_id = %request_id, edge_agent_id = %edge_agent_id))]
+    #[tracing::instrument(skip(self, identity, result_json), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, edge_agent_id = %edge_agent_id))]
     async fn deliver_result(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
     ) -> Result<bool, String> {
@@ -418,11 +503,15 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let n = sqlx::query(
             "UPDATE edge_pending_dispatch \
              SET status = 'completed', result_json = ?, completed_at = NOW(6) \
-             WHERE user_id = ? AND request_id = ? AND edge_agent_id = ? AND status IN ('pending', 'dispatched')",
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+               AND request_id = ? AND edge_agent_id = ? AND status IN ('pending', 'dispatched')",
         )
         .bind(result_json)
-        .bind(user_id)
-        .bind(request_id)
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
         .bind(edge_agent_id)
         .execute(&self.pool)
         .await
@@ -442,23 +531,27 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         Ok(affected)
     }
 
-    #[tracing::instrument(skip(self), fields(request_id = %request_id, reason = %reason))]
+    #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, reason = %reason))]
     async fn fail_dispatch(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         reason: &str,
     ) -> Result<bool, String> {
         let output = format!("edge dispatch {reason}");
-        let result_json = edge_dispatch_failed_result_json(serde_json::json!(request_id), output);
+        let result_json =
+            edge_dispatch_failed_result_json(identity.request_id_json_value(), output);
         let n = sqlx::query(
             "UPDATE edge_pending_dispatch \
              SET status = 'failed', result_json = ?, completed_at = NOW(6) \
-             WHERE user_id = ? AND request_id = ? AND status IN ('pending', 'dispatched')",
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+               AND request_id = ? AND status IN ('pending', 'dispatched')",
         )
         .bind(result_json)
-        .bind(user_id)
-        .bind(request_id)
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("edge_dispatch fail_dispatch: {e}"))?;
@@ -470,21 +563,24 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         Ok(affected)
     }
 
-    #[tracing::instrument(skip(self), fields(request_id = %request_id, timeout_ms = timeout.as_millis()))]
+    #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, timeout_ms = timeout.as_millis()))]
     async fn wait_result(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut iterations: u32 = 0;
         loop {
             let row = sqlx::query(
-                "SELECT CAST(result_json AS CHAR) AS result_json, status FROM edge_pending_dispatch WHERE user_id = ? AND request_id = ?",
+                "SELECT CAST(result_json AS CHAR) AS result_json, status FROM edge_pending_dispatch \
+                 WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?",
             )
-            .bind(user_id)
-            .bind(request_id)
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(&identity.request_id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| format!("edge_dispatch wait_result: {e}"))?;
@@ -579,9 +675,8 @@ pub struct UnconfiguredEdgeDispatchService;
 impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
     async fn insert_dispatch(
         &self,
-        _user_id: &str,
+        _identity: &EdgeDispatchIdentity,
         _edge_agent_id: &str,
-        _request_id: &str,
         _payload_json: &str,
     ) -> Result<(), String> {
         Err("edge dispatch service not configured".to_string())
@@ -595,8 +690,7 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
     }
     async fn deliver_result(
         &self,
-        _user_id: &str,
-        _request_id: &str,
+        _identity: &EdgeDispatchIdentity,
         _edge_agent_id: &str,
         _result_json: &str,
     ) -> Result<bool, String> {
@@ -604,16 +698,14 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
     }
     async fn fail_dispatch(
         &self,
-        _user_id: &str,
-        _request_id: &str,
+        _identity: &EdgeDispatchIdentity,
         _reason: &str,
     ) -> Result<bool, String> {
         Err("edge dispatch service not configured".to_string())
     }
     async fn wait_result(
         &self,
-        _user_id: &str,
-        _request_id: &str,
+        _identity: &EdgeDispatchIdentity,
         _timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
         Err("edge dispatch service not configured".to_string())
@@ -936,6 +1028,20 @@ mod tests {
         let edge_agent_id = format!("edge-agent-{}", Uuid::new_v4());
         let other_edge_agent_id = format!("edge-other-agent-{}", Uuid::new_v4());
         let request_id = format!("edge-req-{}", Uuid::new_v4());
+        let identity = EdgeDispatchIdentity::new(
+            &user_id,
+            format!("session-{request_id}"),
+            format!("run-{request_id}"),
+            format!("chain-{request_id}"),
+            &request_id,
+        );
+        let other_identity = EdgeDispatchIdentity::new(
+            &other_user_id,
+            identity.session_id.clone(),
+            identity.run_id.clone(),
+            identity.turn_chain_id.clone(),
+            &request_id,
+        );
         cleanup_edge_dispatch_fixture(&pool, &user_id, &request_id).await;
         cleanup_edge_dispatch_fixture(&pool, &other_user_id, &request_id).await;
 
@@ -946,11 +1052,11 @@ mod tests {
         })
         .to_string();
         pod_a
-            .insert_dispatch(&user_id, &edge_agent_id, &request_id, &payload)
+            .insert_dispatch(&identity, &edge_agent_id, &payload)
             .await
             .expect("insert pending dispatch");
         pod_a
-            .insert_dispatch(&user_id, &edge_agent_id, &request_id, &payload)
+            .insert_dispatch(&identity, &edge_agent_id, &payload)
             .await
             .expect("duplicate insert should be idempotent");
 
@@ -963,8 +1069,7 @@ mod tests {
         assert!(
             !pod_c
                 .deliver_result(
-                    &other_user_id,
-                    &request_id,
+                    &other_identity,
                     &edge_agent_id,
                     r#"{"status":"completed","output":"wrong-user"}"#,
                 )
@@ -974,8 +1079,7 @@ mod tests {
         assert!(
             !pod_c
                 .deliver_result(
-                    &user_id,
-                    &request_id,
+                    &identity,
                     &other_edge_agent_id,
                     r#"{"status":"completed","output":"wrong-agent"}"#,
                 )
@@ -1005,15 +1109,10 @@ mod tests {
             "claimed dispatch must not be re-claimed by another pod"
         );
 
-        let wait_user_id = user_id.clone();
-        let wait_request_id = request_id.clone();
+        let wait_identity = identity.clone();
         let wait = tokio::spawn(async move {
             pod_a
-                .wait_result(
-                    &wait_user_id,
-                    &wait_request_id,
-                    std::time::Duration::from_secs(5),
-                )
+                .wait_result(&wait_identity, std::time::Duration::from_secs(5))
                 .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1027,7 +1126,7 @@ mod tests {
         .to_string();
         assert!(
             pod_c
-                .deliver_result(&user_id, &request_id, &edge_agent_id, &result_json)
+                .deliver_result(&identity, &edge_agent_id, &result_json)
                 .await
                 .expect("cross-pod deliver result")
         );
@@ -1044,8 +1143,7 @@ mod tests {
         assert!(
             !pod_c
                 .deliver_result(
-                    &user_id,
-                    &request_id,
+                    &identity,
                     &edge_agent_id,
                     r#"{"status":"completed","output":"duplicate"}"#,
                 )

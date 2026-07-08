@@ -261,16 +261,15 @@ async fn handle_edge_connection(
                                     }
                                 };
                                 let inflight = InflightEdgeDispatch {
-                                    user_id: row.user_id.clone(),
+                                    identity: row.identity(),
                                     edge_agent_id: row.edge_agent_id.clone(),
-                                    request_id: row.request_id.clone(),
                                 };
                                 if let Err(inflight) = dispatch_inflight.track(inflight).await {
                                     tracing::warn!(
                                         target: "astra_runtime::edge_ws",
-                                        user_id = %inflight.user_id,
+                                        user_id = %inflight.identity.user_id,
                                         edge_agent_id = %inflight.edge_agent_id,
-                                        request_id = %inflight.request_id,
+                                        request_id = %inflight.identity.request_id,
                                         "Edge dispatch relay rejected claimed dispatch because websocket cleanup is closing"
                                     );
                                     fail_inflight_edge_dispatches(
@@ -353,6 +352,7 @@ async fn handle_edge_connection(
                                     duration_ms,
                                     tool_result_fields,
                                 }) => {
+                                    let inflight = read_inflight.remove(&request_id).await;
                                     state.edge_connection_pool.deliver_tool_result(
                                         &user_id,
                                         &edge_agent_id,
@@ -367,6 +367,16 @@ async fn handle_edge_connection(
 
                                     // Cross-pod: also deliver result via dispatch table
                                     // so other pods' turn bridges waiting on wait_result() can see it.
+                                    let Some(inflight) = inflight else {
+                                        tracing::warn!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user.user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge WS: unmatched tool result did not match an inflight dispatch"
+                                        );
+                                        continue;
+                                    };
                                     let dispatch_svc = &state.execution.edge_dispatch_service;
                                     let status = if is_error {
                                         "failed".to_string()
@@ -375,8 +385,11 @@ async fn handle_edge_connection(
                                     };
                                     let duration = duration_ms.unwrap_or(0);
                                     let tool_result = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
-                                        request_id.clone(),
-                                        Some(edge_agent_id.clone()),
+                                        inflight.identity.session_id.clone(),
+                                        inflight.identity.run_id.clone(),
+                                        inflight.identity.turn_chain_id.clone(),
+                                        inflight.identity.request_id.clone(),
+                                        edge_agent_id.clone(),
                                         status,
                                         output,
                                         duration,
@@ -394,16 +407,21 @@ async fn handle_edge_connection(
                                             );
                                             // Fallback: use serde_json to build valid JSON safely.
                                             serde_json::to_string(&serde_json::json!({
+                                                "session_id": inflight.identity.session_id.clone(),
+                                                "run_id": inflight.identity.run_id.clone(),
+                                                "turn_chain_id": inflight.identity.turn_chain_id.clone(),
                                                 "request_id": request_id,
                                                 "status": "failed",
+                                                "edge_agent_id": edge_agent_id.clone(),
                                                 "output": "serialization failed",
                                                 "duration_ms": 0,
+                                                "result_hash": "serialization-failed",
                                             }))
                                             .unwrap_or_else(|_| r#"{"status":"failed","output":"serialization failed"}"#.to_string())
                                         }
                                     };
                                     if let Err(e) = dispatch_svc
-                                        .deliver_result(&user.user_id, &request_id, &edge_agent_id, &result_json)
+                                        .deliver_result(&inflight.identity, &edge_agent_id, &result_json)
                                         .await
                                     {
                                         tracing::warn!(
@@ -413,8 +431,6 @@ async fn handle_edge_connection(
                                             error = %e,
                                             "Edge WS: failed to deliver tool result for cross-pod"
                                         );
-                                    } else {
-                                        read_inflight.remove(&request_id).await;
                                     }
                                 }
                                 Ok(EdgeClientMessage::Ping) => {
@@ -491,9 +507,8 @@ async fn handle_edge_connection(
 
 #[derive(Debug)]
 struct InflightEdgeDispatch {
-    user_id: String,
+    identity: astra_services::multi_agent::EdgeDispatchIdentity,
     edge_agent_id: String,
-    request_id: String,
 }
 
 #[derive(Clone)]
@@ -523,7 +538,7 @@ impl InflightEdgeDispatchTracker {
         }
         state
             .dispatches
-            .insert(dispatch.request_id.clone(), dispatch);
+            .insert(dispatch.identity.request_id.clone(), dispatch);
         Ok(())
     }
 
@@ -567,17 +582,14 @@ async fn fail_inflight_edge_dispatches(
 ) -> usize {
     let mut failed = 0;
     for row in rows {
-        match dispatch
-            .fail_dispatch(&row.user_id, &row.request_id, reason)
-            .await
-        {
+        match dispatch.fail_dispatch(&row.identity, reason).await {
             Ok(true) => failed += 1,
             Ok(false) => {
                 tracing::debug!(
                     target: "astra_runtime::edge_ws",
-                    user_id = %row.user_id,
+                    user_id = %row.identity.user_id,
                     edge_agent_id = %row.edge_agent_id,
-                    request_id = %row.request_id,
+                    request_id = %row.identity.request_id,
                     reason,
                     "Edge dispatch was already terminal before disconnect cleanup"
                 );
@@ -585,9 +597,9 @@ async fn fail_inflight_edge_dispatches(
             Err(error) => {
                 tracing::warn!(
                     target: "astra_runtime::edge_ws",
-                    user_id = %row.user_id,
+                    user_id = %row.identity.user_id,
                     edge_agent_id = %row.edge_agent_id,
-                    request_id = %row.request_id,
+                    request_id = %row.identity.request_id,
                     reason,
                     error = %error,
                     "Edge dispatch disconnect cleanup failed"
@@ -604,9 +616,14 @@ mod inflight_dispatch_tracker_tests {
 
     fn dispatch(request_id: &str) -> InflightEdgeDispatch {
         InflightEdgeDispatch {
-            user_id: "user-a".to_string(),
+            identity: astra_services::multi_agent::EdgeDispatchIdentity::new(
+                "user-a",
+                "session-a",
+                "run-a",
+                "chain-a",
+                request_id,
+            ),
             edge_agent_id: "edge-a".to_string(),
-            request_id: request_id.to_string(),
         }
     }
 
@@ -618,11 +635,11 @@ mod inflight_dispatch_tracker_tests {
         tracker.close_to_new_dispatches().await;
 
         let rejected = tracker.track(dispatch("req-2")).await.unwrap_err();
-        assert_eq!(rejected.request_id, "req-2");
+        assert_eq!(rejected.identity.request_id, "req-2");
 
         let drained = tracker.drain().await;
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].request_id, "req-1");
+        assert_eq!(drained[0].identity.request_id, "req-1");
         assert!(tracker.drain().await.is_empty());
     }
 
@@ -635,7 +652,7 @@ mod inflight_dispatch_tracker_tests {
             tracker
                 .remove("req-1")
                 .await
-                .map(|dispatch| dispatch.request_id),
+                .map(|dispatch| dispatch.identity.request_id),
             Some("req-1".to_string())
         );
         assert!(tracker.remove("req-1").await.is_none());
@@ -650,10 +667,7 @@ async fn fail_claimed_edge_dispatch(
     row: &astra_services::multi_agent::EdgeDispatchRow,
     reason: &'static str,
 ) -> bool {
-    match dispatch
-        .fail_dispatch(&row.user_id, &row.request_id, reason)
-        .await
-    {
+    match dispatch.fail_dispatch(&row.identity(), reason).await {
         Ok(true) => true,
         Ok(false) => {
             tracing::warn!(
@@ -800,7 +814,7 @@ fn validate_edge_capabilities(
 mod tests {
     use super::*;
     use astra_runtime_env::{RuntimeEnvironmentAdvertisement, ToolUnavailableReason};
-    use astra_services::multi_agent::{EdgeDispatchRow, EdgeDispatchService};
+    use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -812,9 +826,8 @@ mod tests {
     impl EdgeDispatchService for RecordingEdgeDispatch {
         async fn insert_dispatch(
             &self,
-            _user_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _request_id: &str,
             _payload_json: &str,
         ) -> Result<(), String> {
             Err("not used".to_string())
@@ -830,8 +843,7 @@ mod tests {
 
         async fn deliver_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
         ) -> Result<bool, String> {
@@ -840,13 +852,12 @@ mod tests {
 
         async fn fail_dispatch(
             &self,
-            user_id: &str,
-            request_id: &str,
+            identity: &EdgeDispatchIdentity,
             reason: &str,
         ) -> Result<bool, String> {
             self.failed.lock().unwrap().push((
-                user_id.to_string(),
-                request_id.to_string(),
+                identity.user_id.clone(),
+                identity.request_id.clone(),
                 reason.to_string(),
             ));
             Ok(true)
@@ -854,8 +865,7 @@ mod tests {
 
         async fn wait_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
             Err("not used".to_string())
@@ -869,6 +879,9 @@ mod tests {
     fn dispatch_row(request_id: &str) -> EdgeDispatchRow {
         EdgeDispatchRow {
             user_id: "user-1".to_string(),
+            session_id: "session-1".to_string(),
+            run_id: "run-1".to_string(),
+            turn_chain_id: "chain-1".to_string(),
             edge_agent_id: "edge-1".to_string(),
             request_id: request_id.to_string(),
             payload_json: "{}".to_string(),
@@ -993,9 +1006,14 @@ mod tests {
 
     fn inflight_dispatch(request_id: &str) -> InflightEdgeDispatch {
         InflightEdgeDispatch {
-            user_id: "user-1".to_string(),
+            identity: astra_services::multi_agent::EdgeDispatchIdentity::new(
+                "user-1",
+                "session-1",
+                "run-1",
+                "chain-1",
+                request_id,
+            ),
             edge_agent_id: "edge-1".to_string(),
-            request_id: request_id.to_string(),
         }
     }
 
@@ -1033,7 +1051,7 @@ mod tests {
         assert!(tracker.track(inflight_dispatch("orphaned")).await.is_ok());
         let drained = tracker.drain().await;
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].request_id, "orphaned");
+        assert_eq!(drained[0].identity.request_id, "orphaned");
         assert!(
             tracker.drain().await.is_empty(),
             "disconnect cleanup must consume orphaned dispatches exactly once"
@@ -1066,7 +1084,7 @@ mod tests {
         let consumed_count = usize::from(removed.is_some())
             + drained
                 .iter()
-                .filter(|dispatch| dispatch.request_id == "race")
+                .filter(|dispatch| dispatch.identity.request_id == "race")
                 .count();
 
         assert_eq!(

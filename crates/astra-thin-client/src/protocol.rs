@@ -129,36 +129,43 @@ pub struct RunInputResponse {
     pub duplicate: bool,
 }
 
-/// `POST /tools/result` (§5.5 — forward-compatible).
+/// `POST /tools/result` (§5.5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolResultRequest {
+    pub session_id: String,
+    pub run_id: String,
+    pub turn_chain_id: String,
     pub request_id: String,
     pub status: String,
     /// The edge agent ID that produced this result.
-    /// Required for cross-pod delivery — matches the dispatch table's edge_agent_id.
-    /// `None` for non-edge clients; server-side validation rejects `None`.
-    #[serde(default)]
-    pub edge_agent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
+    /// Required for cross-pod delivery and must match the dispatch row.
+    pub edge_agent_id: String,
+    pub output: String,
+    pub duration_ms: u64,
     /// Hash of the tool result content for idempotent deduplication.
-    /// Cloud can reject duplicate submissions (same request_id + result_hash)
-    /// and return 200 OK — the edge treats this as success.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_hash: Option<String>,
+    /// Computed from the full callback identity plus output.
+    pub result_hash: String,
     /// Structured tool-result metadata forwarded through the cloud ledger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_fields: Option<Map<String, Value>>,
 }
 
 impl ToolResultRequest {
-    /// Compute a content-based hash of the tool result (request_id + output).
-    /// Used for idempotent deduplication: cloud can detect and reject duplicate
-    /// submissions with the same request_id + hash without re-processing.
-    pub fn compute_result_hash(request_id: &str, output: &str) -> String {
+    /// Compute a content-based hash of the scoped tool result identity + output.
+    pub fn compute_result_hash(
+        session_id: &str,
+        run_id: &str,
+        turn_chain_id: &str,
+        request_id: &str,
+        output: &str,
+    ) -> String {
         let mut hasher = Sha256::new();
+        hasher.update(session_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(run_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(turn_chain_id.as_bytes());
+        hasher.update(b":");
         hasher.update(request_id.as_bytes());
         hasher.update(b":");
         hasher.update(output.as_bytes());
@@ -169,31 +176,51 @@ impl ToolResultRequest {
     /// Every call site that posts a tool result should use this to guarantee
     /// the hash is always present — no more scattered `compute_result_hash` calls.
     pub fn new_with_hash(
+        session_id: String,
+        run_id: String,
+        turn_chain_id: String,
         request_id: String,
-        edge_agent_id: Option<String>,
+        edge_agent_id: String,
         status: String,
         output: String,
         duration_ms: u64,
     ) -> Self {
-        Self::new_with_hash_and_fields(request_id, edge_agent_id, status, output, duration_ms, None)
+        Self::new_with_hash_and_fields(
+            session_id,
+            run_id,
+            turn_chain_id,
+            request_id,
+            edge_agent_id,
+            status,
+            output,
+            duration_ms,
+            None,
+        )
     }
 
     pub fn new_with_hash_and_fields(
+        session_id: String,
+        run_id: String,
+        turn_chain_id: String,
         request_id: String,
-        edge_agent_id: Option<String>,
+        edge_agent_id: String,
         status: String,
         output: String,
         duration_ms: u64,
         tool_result_fields: Option<Map<String, Value>>,
     ) -> Self {
-        let result_hash = Self::compute_result_hash(&request_id, &output);
+        let result_hash =
+            Self::compute_result_hash(&session_id, &run_id, &turn_chain_id, &request_id, &output);
         Self {
+            session_id,
+            run_id,
+            turn_chain_id,
             request_id,
             edge_agent_id,
             status,
-            output: Some(output),
-            duration_ms: Some(duration_ms),
-            result_hash: Some(result_hash),
+            output,
+            duration_ms,
+            result_hash,
             tool_result_fields,
         }
     }
@@ -332,6 +359,9 @@ pub enum StreamEvent {
     },
     /// §5.5 — cloud asks edge to run a tool (forward-compatible).
     ToolRequest {
+        session_id: String,
+        run_id: String,
+        turn_chain_id: String,
         request_id: String,
         tool: String,
         args: Value,
@@ -510,6 +540,9 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             result: obj.get("result").cloned().unwrap_or(Value::Null),
         },
         "tool_request" => StreamEvent::ToolRequest {
+            session_id: get_str(&obj, "session_id"),
+            run_id: get_str(&obj, "run_id"),
+            turn_chain_id: get_str(&obj, "turn_chain_id"),
             request_id: get_str(&obj, "request_id"),
             tool: get_str(&obj, "tool"),
             args: obj
@@ -823,16 +856,25 @@ mod tests {
     fn classify_tool_request_design_shape() {
         let v = serde_json::json!({
             "type": "tool_request",
+            "session_id": "s1",
+            "run_id": "r1",
+            "turn_chain_id": "chain1",
             "request_id": "tr-1",
             "tool": "bash",
             "args": {"command": "ls"}
         });
         match classify_stream_event(v).unwrap() {
             StreamEvent::ToolRequest {
+                session_id,
+                run_id,
+                turn_chain_id,
                 request_id,
                 tool,
                 args,
             } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(run_id, "r1");
+                assert_eq!(turn_chain_id, "chain1");
                 assert_eq!(request_id, "tr-1");
                 assert_eq!(tool, "bash");
                 assert_eq!(args["command"], "ls");
@@ -1283,16 +1325,22 @@ mod tests {
     #[test]
     fn tool_result_new_with_hash_includes_edge_agent_id() {
         let req = ToolResultRequest::new_with_hash(
+            "sess-1".into(),
+            "run-1".into(),
+            "chain-1".into(),
             "req-1".into(),
-            Some("agent-1".into()),
+            "agent-1".into(),
             "success".into(),
             "done".into(),
             100,
         );
+        assert_eq!(req.session_id, "sess-1");
+        assert_eq!(req.run_id, "run-1");
+        assert_eq!(req.turn_chain_id, "chain-1");
         assert_eq!(req.request_id, "req-1");
-        assert_eq!(req.edge_agent_id.as_deref(), Some("agent-1"));
-        assert_eq!(req.output.as_deref(), Some("done"));
-        assert!(req.result_hash.is_some());
+        assert_eq!(req.edge_agent_id, "agent-1");
+        assert_eq!(req.output, "done");
+        assert!(!req.result_hash.is_empty());
     }
 
     #[test]
@@ -1302,8 +1350,11 @@ mod tests {
             serde_json::json!({"schema_version": 1}),
         )]);
         let req = ToolResultRequest::new_with_hash_and_fields(
+            "sess-1".into(),
+            "run-1".into(),
+            "chain-1".into(),
             "req-1".into(),
-            Some("agent-1".into()),
+            "agent-1".into(),
             "success".into(),
             "done".into(),
             100,
@@ -1321,35 +1372,30 @@ mod tests {
 
     #[test]
     fn tool_result_serde_roundtrip_preserves_edge_agent_id() {
-        let req = ToolResultRequest {
-            request_id: "r1".into(),
-            edge_agent_id: Some("ea-1".into()),
-            status: "success".into(),
-            output: Some("ok".into()),
-            duration_ms: Some(10),
-            result_hash: Some("abc123".into()),
-            tool_result_fields: None,
-        };
+        let req = ToolResultRequest::new_with_hash(
+            "sess-1".into(),
+            "run-1".into(),
+            "chain-1".into(),
+            "r1".into(),
+            "ea-1".into(),
+            "success".into(),
+            "ok".into(),
+            10,
+        );
         let json = serde_json::to_string(&req).unwrap();
         let back: ToolResultRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }
 
-    /// Edge clients that lack edge_agent_id (pre-multi-agent or non-edge)
-    /// must not crash deserialization — the field is optional.
     #[test]
-    fn tool_result_deser_missing_edge_agent_id_yields_none() {
-        let json = r#"{"request_id":"r1","status":"success","output":"ok","duration_ms":10}"#;
-        let req: ToolResultRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.request_id, "r1");
-        assert_eq!(req.edge_agent_id, None);
+    fn tool_result_deser_missing_identity_is_rejected() {
+        let json = r#"{"request_id":"r1","edge_agent_id":"ea-1","status":"success","output":"ok","duration_ms":10,"result_hash":"h"}"#;
+        assert!(serde_json::from_str::<ToolResultRequest>(json).is_err());
     }
 
-    /// edge_agent_id=None in validation must be rejected by the server.
     #[test]
-    fn tool_result_deser_null_edge_agent_id() {
-        let json = r#"{"request_id":"r1","edge_agent_id":null,"status":"success","output":"ok"}"#;
-        let req: ToolResultRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.edge_agent_id, None);
+    fn tool_result_deser_null_edge_agent_id_is_rejected() {
+        let json = r#"{"session_id":"s1","run_id":"r1","turn_chain_id":"c1","request_id":"req1","edge_agent_id":null,"status":"success","output":"ok","duration_ms":10,"result_hash":"h"}"#;
+        assert!(serde_json::from_str::<ToolResultRequest>(json).is_err());
     }
 }

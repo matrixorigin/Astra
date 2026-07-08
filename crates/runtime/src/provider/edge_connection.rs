@@ -143,6 +143,7 @@ impl CapabilityProvider for EdgeConnectionProvider {
         let exec_request = ToolExecutionRequest {
             user_id: request.user_id.clone(),
             run_id: request.run_id.clone(),
+            turn_chain_id: request.run_id.clone(),
             session_id: request.session_id.clone(),
             tool_name: request.tool_name.clone(),
             tool_call_id: request.tool_call_id.clone(),
@@ -334,7 +335,9 @@ mod tests {
     #[tokio::test]
     async fn health_check_ok_with_transport() {
         use astra_server_types::edge_connection_pool::EdgeConnectionPool;
-        use astra_services::multi_agent::{EdgeDispatchService, EdgeRegistryService};
+        use astra_services::multi_agent::{
+            EdgeDispatchIdentity, EdgeDispatchService, EdgeRegistryService,
+        };
         use std::sync::Arc;
 
         let pool = EdgeConnectionPool::new();
@@ -347,9 +350,8 @@ mod tests {
         impl EdgeDispatchService for MockDispatch {
             async fn insert_dispatch(
                 &self,
-                _user_id: &str,
+                _identity: &EdgeDispatchIdentity,
                 _edge_agent_id: &str,
-                _request_id: &str,
                 _payload_json: &str,
             ) -> Result<(), String> {
                 Err("mock".into())
@@ -363,8 +365,7 @@ mod tests {
             }
             async fn deliver_result(
                 &self,
-                _user_id: &str,
-                _request_id: &str,
+                _identity: &EdgeDispatchIdentity,
                 _edge_agent_id: &str,
                 _result_json: &str,
             ) -> Result<bool, String> {
@@ -372,16 +373,14 @@ mod tests {
             }
             async fn fail_dispatch(
                 &self,
-                _user_id: &str,
-                _request_id: &str,
+                _identity: &EdgeDispatchIdentity,
                 _reason: &str,
             ) -> Result<bool, String> {
                 Ok(false)
             }
             async fn wait_result(
                 &self,
-                _user_id: &str,
-                _request_id: &str,
+                _identity: &EdgeDispatchIdentity,
                 _timeout: std::time::Duration,
             ) -> Result<Option<String>, String> {
                 Ok(None)

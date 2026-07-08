@@ -129,17 +129,29 @@ pub(crate) fn insert_approval_ledger_entry(
 fn validate_tool_result_request(
     body: &astra_thin_client::ToolResultRequest,
 ) -> Result<(), &'static str> {
-    let output = body
-        .output
-        .as_deref()
-        .ok_or("tool result output is required")?;
-    let result_hash = body
-        .result_hash
-        .as_deref()
-        .ok_or("tool result result_hash is required")?;
-    let expected_hash =
-        astra_thin_client::ToolResultRequest::compute_result_hash(&body.request_id, output);
-    if result_hash != expected_hash {
+    if body.session_id.trim().is_empty() {
+        return Err("tool result session_id is required");
+    }
+    if body.run_id.trim().is_empty() {
+        return Err("tool result run_id is required");
+    }
+    if body.turn_chain_id.trim().is_empty() {
+        return Err("tool result turn_chain_id is required");
+    }
+    if body.request_id.trim().is_empty() {
+        return Err("tool result request_id is required");
+    }
+    if body.edge_agent_id.trim().is_empty() {
+        return Err("tool result edge_agent_id is required");
+    }
+    let expected_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
+        &body.session_id,
+        &body.run_id,
+        &body.turn_chain_id,
+        &body.request_id,
+        &body.output,
+    );
+    if body.result_hash != expected_hash {
         return Err("tool result result_hash does not match payload");
     }
     Ok(())
@@ -155,10 +167,20 @@ pub(crate) async fn post_tool_result_handler(
     let edge_id = edge_id_from_headers(&headers);
     validate_tool_result_request(&body)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-    let key = tool_callback_key(&user.user_id, &body.request_id);
+    let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+        &user.user_id,
+        &body.session_id,
+        &body.run_id,
+        &body.turn_chain_id,
+        &body.request_id,
+    );
+    let key = tool_callback_key(&identity);
     let ledger_value = serde_json::json!({
         "kind": "tool_result",
         "user_id": user.user_id,
+        "session_id": body.session_id.as_str(),
+        "run_id": body.run_id.as_str(),
+        "turn_chain_id": body.turn_chain_id.as_str(),
         "edge_id": edge_id,
         "body": serde_json::to_value(&body).map_err(|e| {
             error_response(
@@ -191,22 +213,13 @@ pub(crate) async fn post_tool_result_handler(
             format!("failed to serialize tool_result for cross-pod delivery: {e}"),
         )
     })?;
-    let edge_agent_id = body.edge_agent_id.as_deref().unwrap_or("");
+    let edge_agent_id = body.edge_agent_id.as_str();
     let dispatch_delivered = match dispatch_svc
-        .deliver_result(&user.user_id, &body.request_id, edge_agent_id, &result_json)
+        .deliver_result(&identity, edge_agent_id, &result_json)
         .await
     {
         Ok(true) => true,
-        Ok(false) => {
-            tracing::warn!(
-                target: "astra_runtime::edge_callback",
-                user_id = %user.user_id,
-                request_id = %body.request_id,
-                edge_agent_id = %edge_agent_id,
-                "Edge: cross-pod tool result did not match an active dispatch row"
-            );
-            false
-        }
+        Ok(false) => false,
         Err(e) => {
             tracing::warn!(
                 target: "astra_runtime::edge_callback",
@@ -220,7 +233,25 @@ pub(crate) async fn post_tool_result_handler(
         }
     };
 
+    let delivery_route = if dispatch_delivered {
+        "durable_dispatch"
+    } else if ledger_enqueued {
+        "same_pod_ledger"
+    } else {
+        "none"
+    };
+
     if ledger_capacity_exceeded && !dispatch_delivered {
+        tracing::warn!(
+            target: "astra_runtime::edge_callback",
+            user_id = %user.user_id,
+            session_id = %body.session_id,
+            run_id = %body.run_id,
+            turn_chain_id = %body.turn_chain_id,
+            request_id = %body.request_id,
+            edge_agent_id = %edge_agent_id,
+            "Edge: tool result could not be delivered through same-pod ledger or durable dispatch"
+        );
         return Err(ledger_insert_error_response(
             &key,
             LedgerInsertError::CapacityExceeded,
@@ -241,6 +272,7 @@ pub(crate) async fn post_tool_result_handler(
         "request_id": body.request_id,
         "ledger_enqueued": ledger_enqueued,
         "dispatch_delivered": dispatch_delivered,
+        "delivery_route": delivery_route,
     })))
 }
 
@@ -606,7 +638,8 @@ mod edge_callback_insert_tests {
     use crate::{AppState, HealthChecker, ServiceInfo};
     use astra_services::{
         AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
-        AuthTokenRecord, AuthUserRecord, EdgeDispatchRow, EdgeDispatchService,
+        AuthTokenRecord, AuthUserRecord, EdgeDispatchIdentity, EdgeDispatchRow,
+        EdgeDispatchService,
     };
     use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
     use async_trait::async_trait;
@@ -685,9 +718,8 @@ mod edge_callback_insert_tests {
     impl EdgeDispatchService for RecordingEdgeDispatch {
         async fn insert_dispatch(
             &self,
-            _user_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _request_id: &str,
             _payload_json: &str,
         ) -> Result<(), String> {
             Ok(())
@@ -703,14 +735,13 @@ mod edge_callback_insert_tests {
 
         async fn deliver_result(
             &self,
-            user_id: &str,
-            request_id: &str,
+            identity: &EdgeDispatchIdentity,
             edge_agent_id: &str,
             result_json: &str,
         ) -> Result<bool, String> {
             self.delivered.lock().unwrap().push((
-                user_id.to_string(),
-                request_id.to_string(),
+                identity.user_id.clone(),
+                identity.request_id.clone(),
                 edge_agent_id.to_string(),
                 result_json.to_string(),
             ));
@@ -719,8 +750,7 @@ mod edge_callback_insert_tests {
 
         async fn fail_dispatch(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _reason: &str,
         ) -> Result<bool, String> {
             Ok(false)
@@ -728,8 +758,7 @@ mod edge_callback_insert_tests {
 
         async fn wait_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
             Ok(None)
@@ -1050,6 +1079,13 @@ mod edge_callback_insert_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn tool_result_handler_uses_dispatch_when_local_ledger_is_full() {
+        let identity = EdgeDispatchIdentity::new(
+            "u-approval",
+            "sess-tool-dispatch",
+            "run-tool-dispatch",
+            "chain-tool-dispatch",
+            "req-tool-dispatch",
+        );
         let dispatch = Arc::new(RecordingEdgeDispatch {
             deliver_result: true,
             delivered: Mutex::new(Vec::new()),
@@ -1071,8 +1107,11 @@ mod edge_callback_insert_tests {
             State(state.clone()),
             HeaderMap::new(),
             Json(astra_thin_client::ToolResultRequest::new_with_hash(
+                identity.session_id.clone(),
+                identity.run_id.clone(),
+                identity.turn_chain_id.clone(),
                 "req-tool-dispatch".into(),
-                Some("edge-a".into()),
+                "edge-a".into(),
                 "completed".into(),
                 "tool output".into(),
                 12,
@@ -1084,14 +1123,12 @@ mod edge_callback_insert_tests {
         assert_eq!(response.0["ok"], true);
         assert_eq!(response.0["ledger_enqueued"], false);
         assert_eq!(response.0["dispatch_delivered"], true);
+        assert_eq!(response.0["delivery_route"], "durable_dispatch");
 
         let ledger = state.edge_callback_ledger.lock().await;
         assert_eq!(ledger.len(), LEDGER_MAX_ENTRIES);
         assert!(
-            !ledger.contains_key(&astra_turn_core::edge_ledger::tool_callback_key(
-                "u-approval",
-                "req-tool-dispatch"
-            )),
+            !ledger.contains_key(&astra_turn_core::edge_ledger::tool_callback_key(&identity)),
             "full local ledger should not be required when dispatch delivery succeeds"
         );
         drop(ledger);
@@ -1138,12 +1175,15 @@ mod edge_callback_insert_tests {
     #[test]
     fn tool_result_hash_mismatch_is_rejected() {
         let body = astra_thin_client::ToolResultRequest {
+            session_id: "sess-1".to_string(),
+            run_id: "run-1".to_string(),
+            turn_chain_id: "chain-1".to_string(),
             request_id: "req-1".to_string(),
-            edge_agent_id: Some("test-agent".to_string()),
+            edge_agent_id: "test-agent".to_string(),
             status: "completed".to_string(),
-            output: Some("actual".to_string()),
-            duration_ms: Some(1),
-            result_hash: Some("wrong".to_string()),
+            output: "actual".to_string(),
+            duration_ms: 1,
+            result_hash: "wrong".to_string(),
             tool_result_fields: None,
         };
         assert_eq!(
@@ -1155,8 +1195,11 @@ mod edge_callback_insert_tests {
     #[test]
     fn tool_result_hash_matching_payload_is_accepted() {
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            "sess-1".to_string(),
+            "run-1".to_string(),
+            "chain-1".to_string(),
             "req-1".to_string(),
-            Some("test-agent".to_string()),
+            "test-agent".to_string(),
             "completed".to_string(),
             "actual".to_string(),
             1,

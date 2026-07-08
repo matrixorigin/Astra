@@ -36,13 +36,12 @@ use astra_turn_core::trace_event::TraceContext;
 /// rejecting the request without echoing the value. Bytes (not chars)
 /// because the limit is really about prompt-injection / log-bloat budget.
 const MAX_AGENT_ID_BYTES: usize = 256;
-/// Per-slot result byte limit in aggregate `get_results`. Individual
-/// `get_result` calls are unbounded; this only caps the combined response.
-const MAX_FANOUT_SLOT_RESULT_BYTES: usize = 30_000;
 /// Total aggregate byte limit for the combined `results[]` array in
 /// `get_results`/start-that-completed. If exceeded, per-slot limits
 /// are proportionally reduced until the total fits.
 const MAX_FANOUT_AGGREGATE_BYTES: usize = 60_000;
+const FANOUT_RESULT_DEFAULT_MAX_BYTES: usize = 8_192;
+const FANOUT_RESULT_MAX_BYTES: usize = 65_536;
 const FANOUT_CODE_REVIEW_MIN_TURNS: u32 = 30;
 static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// Static prose for the `Unknown` outcome. Must NOT interpolate the
@@ -343,8 +342,13 @@ pub async fn recover_agent_fanout_tool_result(
             .iter()
             .find(|group| group.group_id == group_id)
     {
-        return render_agent_fanout_results(ctx, &group.group_id, tool_call_id.map(str::to_string))
-            .await;
+        return render_agent_fanout_results(
+            ctx,
+            &group.group_id,
+            tool_call_id.map(str::to_string),
+            FanoutResultReadOptions::default(),
+        )
+        .await;
     }
     if requested_group_id.is_some() {
         return render_agent_tool_error(
@@ -361,13 +365,23 @@ pub async fn recover_agent_fanout_tool_result(
             .iter()
             .find(|group| group.created_by_tool_use_id.as_deref() == Some(tool_call_id))
     {
-        return render_agent_fanout_results(ctx, &group.group_id, Some(tool_call_id.to_string()))
-            .await;
+        return render_agent_fanout_results(
+            ctx,
+            &group.group_id,
+            Some(tool_call_id.to_string()),
+            FanoutResultReadOptions::default(),
+        )
+        .await;
     }
     if parent_groups.len() == 1 {
         let group = parent_groups[0];
-        return render_agent_fanout_results(ctx, &group.group_id, tool_call_id.map(str::to_string))
-            .await;
+        return render_agent_fanout_results(
+            ctx,
+            &group.group_id,
+            tool_call_id.map(str::to_string),
+            FanoutResultReadOptions::default(),
+        )
+        .await;
     }
     if parent_groups.len() > 1 {
         let group_ids: Vec<_> = parent_groups
@@ -464,6 +478,12 @@ struct AgentFanoutGroupInput {
     #[serde(default, rename = "_tool_call_id")]
     _tool_call_id: Option<String>,
     group_id: String,
+    #[serde(default)]
+    slot_index: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -507,11 +527,17 @@ const FANOUT_SLOT_FIELDS: &[&str] = &[
     "isolated",
     "allowed_tools",
 ];
-const FANOUT_GET_RESULTS_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
+const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
+    "action",
+    "_tool_call_id",
+    "group_id",
+    "slot_index",
+    "offset",
+    "max_bytes",
+];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
 const FANOUT_START_SHAPE: &str = "Use canonical shape: agent_fanout(action='start', target_count=N, slots=[{id:'api', description:'Short UI label', prompt:'Full child task prompt'}], defaults={agent_type:'...', model:'...'}). Put work instructions in each slots[i].prompt; there is no top-level brief or agents payload. Runtime config (agent_type, model, max_turns, etc.) belongs in `defaults`, not at top level. Backgrounding is user-controlled with Ctrl+B; do not pass run_in_background.";
-const FANOUT_GET_RESULTS_SHAPE: &str =
-    "Use canonical shape: agent_fanout(action='get_results', group_id='<returned group_id>').";
+const FANOUT_GET_RESULTS_SHAPE: &str = "Use canonical shape: agent_fanout(action='get_results', group_id='<returned group_id>'). For large results, read one slot window with agent_fanout(action='get_results', group_id='<returned group_id>', slot_index=0, offset=0, max_bytes=8192).";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use canonical shape: agent_fanout(action='stop_slot', group_id='<returned group_id>', slot_index=0).";
 
 fn reject_unknown_fields_for_shape(
@@ -965,7 +991,13 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
 
     // All agents completed synchronously — return the full results directly.
     // No separate "agents[]" field: results[] already contains status per slot.
-    let mut results = render_agent_fanout_results(ctx, &group_id, tool_call_id).await;
+    let mut results = render_agent_fanout_results(
+        ctx,
+        &group_id,
+        tool_call_id,
+        FanoutResultReadOptions::default(),
+    )
+    .await;
     if let Some(notice) = &budget_notice {
         if let Ok(mut value) = serde_json::from_str::<Value>(&results) {
             if let Some(obj) = value.as_object_mut() {
@@ -1010,22 +1042,79 @@ async fn handle_agent_fanout_get_results_action(
     if group_id.is_empty() {
         return render_agent_tool_error(None, "Invalid input: group_id must be non-empty");
     }
-    render_agent_fanout_results(ctx, group_id, input._tool_call_id).await
+    let read_options = match FanoutResultReadOptions::from_group_input(&input) {
+        Ok(read_options) => read_options,
+        Err(error) => return render_agent_tool_error(None, &format!("Invalid input: {error}")),
+    };
+    render_agent_fanout_results(ctx, group_id, input._tool_call_id, read_options).await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FanoutResultReadOptions {
+    slot_index: Option<usize>,
+    offset: usize,
+    max_bytes: usize,
+}
+
+impl Default for FanoutResultReadOptions {
+    fn default() -> Self {
+        Self {
+            slot_index: None,
+            offset: 0,
+            max_bytes: FANOUT_RESULT_DEFAULT_MAX_BYTES,
+        }
+    }
+}
+
+impl FanoutResultReadOptions {
+    fn from_group_input(input: &AgentFanoutGroupInput) -> Result<Self, String> {
+        if input.offset.unwrap_or(0) > 0 && input.slot_index.is_none() {
+            return Err(
+                "`offset` requires `slot_index`; aggregate fanout summaries are not byte-paged. \
+                 Use `slot_index` to read a specific slot result window."
+                    .to_string(),
+            );
+        }
+        let requested_max = input.max_bytes.unwrap_or(FANOUT_RESULT_DEFAULT_MAX_BYTES);
+        Ok(Self {
+            slot_index: input.slot_index,
+            offset: input.offset.unwrap_or(0),
+            max_bytes: requested_max.clamp(1, FANOUT_RESULT_MAX_BYTES),
+        })
+    }
 }
 
 async fn render_agent_fanout_results(
     ctx: &AgentToolContext,
     group_id: &str,
     tool_call_id: Option<String>,
+    read_options: FanoutResultReadOptions,
 ) -> String {
     let Some(group) = find_fanout_group(ctx, group_id).await else {
         return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
     };
+    if let Some(slot_index) = read_options.slot_index
+        && !group.slots.iter().any(|slot| slot.slot_index == slot_index)
+    {
+        return render_agent_tool_error(
+            None,
+            &format!(
+                "Invalid input: slot_index {slot_index} is outside target_count {}",
+                group.target_count
+            ),
+        );
+    }
 
     let mut results: Vec<Value> = Vec::with_capacity(group.slots.len());
     let mut futs: Vec<_> = Vec::new();
 
     for slot in &group.slots {
+        if read_options
+            .slot_index
+            .is_some_and(|slot_index| slot.slot_index != slot_index)
+        {
+            continue;
+        }
         let Some(agent_id) = slot.agent_id.as_deref() else {
             results.push(json!({
                 "slot_index": slot.slot_index,
@@ -1039,6 +1128,7 @@ async fn render_agent_fanout_results(
         let slot_index = slot.slot_index;
         let slot_id = slot.slot_id.clone();
         let tool_call_id = tool_call_id.clone();
+        let group_id = group_id.to_string();
         let mut get_args = json!({ "agent_id": agent_id });
         if let Some(tool_call_id) = tool_call_id {
             get_args
@@ -1050,25 +1140,30 @@ async fn render_agent_fanout_results(
             let rendered = handle_agent_get_result_action(&get_args, Some(ctx)).await;
             let mut value = serde_json::from_str::<Value>(&rendered)
                 .unwrap_or_else(|_| json!({ "status": "failed", "error": rendered }));
-            // Truncate oversized results in the aggregate response.
-            if let Some(result_field) = value.get("result").and_then(Value::as_str) {
-                if result_field.len() > MAX_FANOUT_SLOT_RESULT_BYTES {
-                    let truncated =
-                        truncate_str_at_char_boundary(result_field, MAX_FANOUT_SLOT_RESULT_BYTES);
-                    value["result"] = json!(format!(
-                        "{}\n\n[truncated — {} bytes total; use agent(action='get_result', agent_id='{}') for full output]",
-                        truncated,
-                        result_field.len(),
-                        agent_id,
-                    ));
-                }
-            }
-            json!({
+            let window = window_fanout_agent_result(
+                &mut value,
+                &group_id,
+                slot_index,
+                read_options.offset,
+                read_options.max_bytes,
+            );
+            let mut item = json!({
                 "slot_index": slot_index,
                 "id": slot_id,
                 "agent_id": agent_id,
                 "result": value,
-            })
+            });
+            if let Some(window) = window {
+                let object = item.as_object_mut().expect("slot result item object");
+                object.insert("result_bytes".into(), json!(window.total_bytes));
+                object.insert("result_start_offset".into(), json!(window.start));
+                object.insert("result_end_offset".into(), json!(window.end));
+                object.insert("result_truncated".into(), json!(window.truncated));
+                if let Some(next_call) = window.next_call {
+                    object.insert("next_call".into(), json!(next_call));
+                }
+            }
+            item
         }));
     }
 
@@ -1087,16 +1182,14 @@ async fn render_agent_fanout_results(
             if let Some(result_obj) = item.get("result") {
                 let result_str = result_obj.to_string();
                 if result_str.len() > per_slot_budget {
-                    let agent_id = item
-                        .get("agent_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
                     let truncated = truncate_str_at_char_boundary(&result_str, per_slot_budget);
                     item["result"] = json!(format!(
-                        "{}\n\n[truncated — {} bytes total; use agent(action='get_result', agent_id='{}') for full output]",
+                        "{}\n\n[truncated — {} bytes total; use agent_fanout(action='get_results', group_id='{}', slot_index={}, offset=0, max_bytes={}) for a bounded slot window]",
                         truncated,
                         result_str.len(),
-                        agent_id,
+                        group_id,
+                        item.get("slot_index").and_then(Value::as_u64).unwrap_or(0),
+                        FANOUT_RESULT_MAX_BYTES,
                     ));
                 }
             }
@@ -1110,7 +1203,13 @@ async fn render_agent_fanout_results(
         "group_id": group_id,
         "title": updated.title,
         "target_count": updated.target_count,
-        "delivery_contract": "Results are in results[].result. If this output is persisted, use the Tool result id or artifact://session/tool-result/... handle from the persisted-output wrapper through runtime artifact recovery. Do not search for or copy physical filesystem paths.",
+        "delivery_contract": "Results are bounded for prompt safety. Use results[].next_call, or agent_fanout(action='get_results', group_id=..., slot_index=N, offset=BYTE_OFFSET, max_bytes=BYTES), to read additional slot output. Do not search for or copy physical filesystem paths or runtime-owned tool-result artifacts.",
+        "result_read": {
+            "slot_index": read_options.slot_index,
+            "offset": read_options.offset,
+            "max_bytes": read_options.max_bytes,
+        },
+        "fanout": fanout_group_to_json(&updated),
         "results": results,
     });
     let obj = response.as_object_mut().unwrap();
@@ -1623,6 +1722,56 @@ fn truncate_str_at_char_boundary(s: &str, max_bytes: usize) -> &str {
         .unwrap_or("")
 }
 
+#[derive(Debug, Clone)]
+struct FanoutResultWindow {
+    total_bytes: usize,
+    start: usize,
+    end: usize,
+    truncated: bool,
+    next_call: Option<String>,
+}
+
+fn floor_char_boundary(s: &str, mut index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    while index > 0 && !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn window_fanout_agent_result(
+    value: &mut Value,
+    group_id: &str,
+    slot_index: usize,
+    offset: usize,
+    max_bytes: usize,
+) -> Option<FanoutResultWindow> {
+    let result_text = value.get("result").and_then(Value::as_str)?.to_string();
+    let total_bytes = result_text.len();
+    let start = floor_char_boundary(&result_text, offset.min(total_bytes));
+    let end = floor_char_boundary(&result_text, (start + max_bytes).min(total_bytes));
+    let truncated = start > 0 || end < total_bytes;
+    if truncated {
+        value["result"] = json!(result_text[start..end].to_string());
+    }
+    let next_call = if end < total_bytes {
+        Some(format!(
+            "agent_fanout(action='get_results', group_id='{group_id}', slot_index={slot_index}, offset={end}, max_bytes={max_bytes})"
+        ))
+    } else {
+        None
+    };
+    Some(FanoutResultWindow {
+        total_bytes,
+        start,
+        end,
+        truncated,
+        next_call,
+    })
+}
+
 /// Normalize raw `agent(action='spawn', ...)` arguments into
 /// [`SpawnAgentInput`] wire shape.
 ///
@@ -2057,6 +2206,32 @@ mod tests {
                 finish_reason: "normal".into(),
                 cancelled_by_user: None,
                 output: Some("ok".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    struct FixedOutputExecutor {
+        output: String,
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for FixedOutputExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                finish_reason: "normal".into(),
+                cancelled_by_user: None,
+                output: Some(self.output.clone()),
                 error: None,
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -2864,19 +3039,129 @@ mod tests {
         assert!(
             value["delivery_contract"]
                 .as_str()
-                .is_some_and(|text| text.contains("results[].result")),
+                .is_some_and(|text| text.contains("results[].next_call")),
             "{result}"
         );
         assert!(
             value["delivery_contract"].as_str().is_some_and(|text| {
-                text.contains("artifact://session/tool-result")
+                text.contains("slot_index=N")
                     && text.contains("Do not search for or copy physical filesystem paths")
             }),
             "{result}"
         );
+        assert_eq!(
+            value["result_read"]["max_bytes"],
+            FANOUT_RESULT_DEFAULT_MAX_BYTES
+        );
+        assert_eq!(value["fanout"]["slots"].as_array().unwrap().len(), 1);
         assert!(
             result.contains('\n'),
             "fanout aggregate results must be readable when persisted: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_get_results_returns_bounded_slot_windows_for_large_outputs() {
+        let output = format!("{}{}", "A".repeat(9000), "B".repeat(9000));
+        let spawner = test_spawner(Arc::new(FixedOutputExecutor { output }));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-large",
+                "target_count": 1,
+                "slots": [
+                    {"id": "large", "description": "Review large", "prompt": "Return long output"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let start_value: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start_value["status"], "completed");
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "get_results",
+                "group_id": "review-large"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+        let slot = &value["results"][0];
+        let preview = slot["result"]["result"].as_str().unwrap();
+
+        assert_eq!(value["status"], "completed");
+        assert_eq!(slot["result_start_offset"], 0);
+        assert_eq!(slot["result_end_offset"], FANOUT_RESULT_DEFAULT_MAX_BYTES);
+        assert_eq!(slot["result_bytes"], 18_000);
+        assert_eq!(slot["result_truncated"], true);
+        assert_eq!(preview.len(), FANOUT_RESULT_DEFAULT_MAX_BYTES);
+        assert!(
+            slot["next_call"]
+                .as_str()
+                .is_some_and(|call| call.contains("slot_index=0")
+                    && call.contains("offset=8192")
+                    && call.contains("max_bytes=8192")),
+            "{result}"
+        );
+        assert!(
+            !result.contains("artifact://session/tool-result"),
+            "fanout recovery must point at the owning tool window API, not internal artifacts: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_get_results_reads_requested_slot_window() {
+        let output = format!("{}{}", "A".repeat(9000), "B".repeat(9000));
+        let spawner = test_spawner(Arc::new(FixedOutputExecutor { output }));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let start = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-window",
+                "target_count": 1,
+                "slots": [
+                    {"id": "large", "description": "Review large", "prompt": "Return long output"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let start_value: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start_value["status"], "completed");
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "get_results",
+                "group_id": "review-window",
+                "slot_index": 0,
+                "offset": 8192,
+                "max_bytes": 4096
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+        let slot = &value["results"][0];
+        let chunk = slot["result"]["result"].as_str().unwrap();
+
+        assert_eq!(value["results"].as_array().unwrap().len(), 1);
+        assert_eq!(value["result_read"]["slot_index"], 0);
+        assert_eq!(value["result_read"]["offset"], 8192);
+        assert_eq!(value["result_read"]["max_bytes"], 4096);
+        assert_eq!(slot["result_start_offset"], 8192);
+        assert_eq!(slot["result_end_offset"], 12288);
+        assert_eq!(slot["result_bytes"], 18_000);
+        assert_eq!(chunk.len(), 4096);
+        assert!(chunk.starts_with('A'), "{chunk}");
+        assert!(chunk.contains('B'), "{chunk}");
+        assert!(
+            slot["next_call"].as_str().is_some_and(
+                |call| call.contains("offset=12288") && call.contains("max_bytes=4096")
+            ),
+            "{result}"
         );
     }
 

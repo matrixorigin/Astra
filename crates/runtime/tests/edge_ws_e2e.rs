@@ -14,7 +14,7 @@ use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
 };
-use astra_services::multi_agent::EdgeDispatchService;
+use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService};
 use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::{SinkExt, StreamExt};
@@ -82,9 +82,8 @@ impl AuthService for StubAuthService {
 
 #[derive(Clone, Debug)]
 struct TestDispatchRow {
-    user_id: String,
+    identity: EdgeDispatchIdentity,
     edge_agent_id: String,
-    request_id: String,
     payload_json: String,
     result_json: Option<String>,
     status: String,
@@ -93,7 +92,7 @@ struct TestDispatchRow {
 
 #[derive(Default)]
 struct TestEdgeDispatch {
-    rows: Mutex<HashMap<(String, String), TestDispatchRow>>,
+    rows: Mutex<HashMap<EdgeDispatchIdentity, TestDispatchRow>>,
     terminal: tokio::sync::Notify,
 }
 
@@ -108,8 +107,9 @@ impl TestEdgeDispatch {
         loop {
             {
                 let rows = self.rows.lock().expect("test edge dispatch rows");
-                if let Some(row) = rows.get(&(user_id.to_string(), request_id.to_string()))
-                    && row.status == expected
+                if let Some(row) = rows.values().find(|row| {
+                    row.identity.user_id == user_id && row.identity.request_id == request_id
+                }) && row.status == expected
                 {
                     return row.clone();
                 }
@@ -118,7 +118,10 @@ impl TestEdgeDispatch {
                 _ = self.terminal.notified() => {}
                 _ = tokio::time::sleep_until(deadline) => {
                     let rows = self.rows.lock().expect("test edge dispatch rows");
-                    panic!("timed out waiting for dispatch {request_id} to become {expected}: {:?}", rows.get(&(user_id.to_string(), request_id.to_string())));
+                    let row = rows.values().find(|row| {
+                        row.identity.user_id == user_id && row.identity.request_id == request_id
+                    });
+                    panic!("timed out waiting for dispatch {request_id} to become {expected}: {row:?}");
                 }
             }
         }
@@ -129,17 +132,15 @@ impl TestEdgeDispatch {
 impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
     async fn insert_dispatch(
         &self,
-        user_id: &str,
+        identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        request_id: &str,
         payload_json: &str,
     ) -> Result<(), String> {
         self.rows.lock().expect("test edge dispatch rows").insert(
-            (user_id.to_string(), request_id.to_string()),
+            identity.clone(),
             TestDispatchRow {
-                user_id: user_id.to_string(),
+                identity: identity.clone(),
                 edge_agent_id: edge_agent_id.to_string(),
-                request_id: request_id.to_string(),
                 payload_json: payload_json.to_string(),
                 result_json: None,
                 status: "pending".to_string(),
@@ -153,19 +154,22 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         &self,
         user_id: &str,
         edge_agent_id: &str,
-    ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+    ) -> Result<Vec<EdgeDispatchRow>, String> {
         let mut rows = self.rows.lock().expect("test edge dispatch rows");
         let mut claimed = Vec::new();
         for row in rows.values_mut() {
-            if row.user_id == user_id
+            if row.identity.user_id == user_id
                 && row.edge_agent_id == edge_agent_id
                 && row.status == "pending"
             {
                 row.status = "dispatched".to_string();
-                claimed.push(astra_services::multi_agent::EdgeDispatchRow {
-                    user_id: row.user_id.clone(),
+                claimed.push(EdgeDispatchRow {
+                    user_id: row.identity.user_id.clone(),
+                    session_id: row.identity.session_id.clone(),
+                    run_id: row.identity.run_id.clone(),
+                    turn_chain_id: row.identity.turn_chain_id.clone(),
                     edge_agent_id: row.edge_agent_id.clone(),
-                    request_id: row.request_id.clone(),
+                    request_id: row.identity.request_id.clone(),
                     payload_json: row.payload_json.clone(),
                     result_json: row.result_json.clone(),
                     status: row.status.clone(),
@@ -178,13 +182,12 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
 
     async fn deliver_result(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
     ) -> Result<bool, String> {
         let mut rows = self.rows.lock().expect("test edge dispatch rows");
-        let Some(row) = rows.get_mut(&(user_id.to_string(), request_id.to_string())) else {
+        let Some(row) = rows.get_mut(identity) else {
             return Ok(false);
         };
         if row.edge_agent_id != edge_agent_id {
@@ -199,24 +202,28 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
 
     async fn fail_dispatch(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         reason: &str,
     ) -> Result<bool, String> {
         let mut rows = self.rows.lock().expect("test edge dispatch rows");
-        let Some(row) = rows.get_mut(&(user_id.to_string(), request_id.to_string())) else {
+        let Some(row) = rows.get_mut(identity) else {
             return Ok(false);
         };
         row.status = "failed".to_string();
         row.failure_reason = Some(reason.to_string());
+        let output = format!("edge dispatch {reason}");
         row.result_json = Some(
-            json!({
-                "request_id": request_id,
-                "status": "failed",
-                "output": format!("edge dispatch {reason}"),
-                "duration_ms": 0,
-            })
-            .to_string(),
+            serde_json::to_string(&astra_thin_client::ToolResultRequest::new_with_hash(
+                identity.session_id.clone(),
+                identity.run_id.clone(),
+                identity.turn_chain_id.clone(),
+                identity.request_id.clone(),
+                row.edge_agent_id.clone(),
+                "failed".to_string(),
+                output,
+                0,
+            ))
+            .map_err(|error| error.to_string())?,
         );
         drop(rows);
         self.terminal.notify_waiters();
@@ -225,15 +232,14 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
 
     async fn wait_result(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             {
                 let rows = self.rows.lock().expect("test edge dispatch rows");
-                let Some(row) = rows.get(&(user_id.to_string(), request_id.to_string())) else {
+                let Some(row) = rows.get(identity) else {
                     return Ok(None);
                 };
                 if matches!(row.status.as_str(), "completed" | "failed") {
@@ -450,6 +456,13 @@ async fn edge_ws_disconnect_fails_inflight_dispatch_without_waiting_for_timeout(
     let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
 
     let request_id = "dispatch-disconnect-1";
+    let identity = EdgeDispatchIdentity::new(
+        "test-user-1",
+        "disconnect-session",
+        "disconnect-run",
+        "disconnect-chain",
+        request_id,
+    );
     let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
         request_id: request_id.to_string(),
         tool: "bash".to_string(),
@@ -458,9 +471,8 @@ async fn edge_ws_disconnect_fails_inflight_dispatch_without_waiting_for_timeout(
     };
     dispatch
         .insert_dispatch(
-            "test-user-1",
+            &identity,
             "edge-disconnect",
-            request_id,
             &serde_json::to_string(&payload).expect("payload json"),
         )
         .await

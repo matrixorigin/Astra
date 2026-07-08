@@ -651,6 +651,8 @@ struct CliSseStreamHost<'a> {
     /// When a `tool_request` arrives with one of these IDs, the local permission
     /// check is skipped — the user has already approved the operation.
     cloud_pre_approved: std::collections::HashSet<String>,
+    /// Scoped identity for tool results observed in this SSE stream.
+    tool_result_identities: std::collections::HashMap<String, ToolResultIdentity>,
     /// Turn-scoped rollback checkpoints when the whole turn opts into rollback-on-failure.
     active_turn_rollback: Option<ActiveTurnRollback>,
     /// True once the current turn has emitted an execution-boundary-opened event.
@@ -683,6 +685,25 @@ struct CliSseStreamHost<'a> {
     /// Incremental turn snapshot mirrored live from SSE/tool events.
     incremental_state:
         Option<std::sync::Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
+}
+
+#[derive(Clone, Debug)]
+struct ToolResultIdentity {
+    session_id: String,
+    run_id: String,
+    turn_chain_id: String,
+    request_id: String,
+}
+
+impl ToolResultIdentity {
+    fn from_batch_request(req: &ToolBatchRequest) -> Self {
+        Self {
+            session_id: req.session_id.clone(),
+            run_id: req.run_id.clone(),
+            turn_chain_id: req.turn_chain_id.clone(),
+            request_id: req.request_id.clone(),
+        }
+    }
 }
 
 const EDGE_AUTH_FAILURE_MESSAGE: &str =
@@ -916,6 +937,7 @@ impl<'a> CliSseStreamHost<'a> {
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
             cloud_pre_approved: std::collections::HashSet::new(),
+            tool_result_identities: std::collections::HashMap::new(),
             active_turn_rollback,
             turn_rollback_boundary_emitted: false,
             turn_rollback_fired: None,
@@ -1184,6 +1206,34 @@ impl<'a> CliSseStreamHost<'a> {
         fields
     }
 
+    fn tool_result_identity(&self, request_id: &str) -> Option<ToolResultIdentity> {
+        self.tool_result_identities.get(request_id).cloned()
+    }
+
+    fn tool_result_request(
+        &self,
+        request_id: &str,
+        status: String,
+        output: String,
+        duration_ms: u64,
+        tool_result_fields: Option<Map<String, Value>>,
+    ) -> Option<astra_thin_client::ToolResultRequest> {
+        let identity = self.tool_result_identity(request_id)?;
+        Some(
+            astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
+                identity.session_id,
+                identity.run_id,
+                identity.turn_chain_id,
+                identity.request_id,
+                self.edge_agent_id.clone(),
+                status,
+                output,
+                duration_ms,
+                tool_result_fields,
+            ),
+        )
+    }
+
     /// Build an `EdgeToolExecResult` and post it to the cloud API.
     /// Used for cache-hit and dedup-limit early returns inside `execute_tool`.
     async fn finish_edge_tool(
@@ -1258,17 +1308,22 @@ impl<'a> CliSseStreamHost<'a> {
         };
         self.edge_tool_round.push(result.clone());
 
-        let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
-            request_id.to_string(),
-            Some(self.edge_agent_id.clone()),
+        if let Some(body) = self.tool_result_request(
+            request_id,
             status,
             output,
             duration_ms,
             Some(tool_result_fields),
-        );
-        // ── Reconnection dedup: only record when server acked the result ──
-        if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
-            crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+        ) {
+            // ── Reconnection dedup: only record when server acked the result ──
+            if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+                crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+            }
+        } else {
+            tracing::error!(
+                request_id,
+                "cannot post edge tool result without scoped tool_request identity"
+            );
         }
         result
     }
@@ -1998,17 +2053,22 @@ impl<'a> CliSseStreamHost<'a> {
         };
         self.edge_tool_round.push(result.clone());
 
-        let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
-            req.request_id.clone(),
-            Some(self.edge_agent_id.clone()),
+        if let Some(body) = self.tool_result_request(
+            &req.request_id,
             status.to_string(),
             output,
             duration_ms,
             Some(tool_result_fields),
-        );
-        // ── Reconnection dedup: only record when server acked the result ──
-        if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
-            crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
+        ) {
+            // ── Reconnection dedup: only record when server acked the result ──
+            if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+                crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
+            }
+        } else {
+            tracing::error!(
+                request_id = %req.request_id,
+                "cannot post synthetic edge tool result without scoped tool_request identity"
+            );
         }
 
         result
@@ -3660,17 +3720,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             status: status.clone(),
             duration_ms,
         });
-        let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
-            request_id.to_string(),
-            Some(self.edge_agent_id.clone()),
+        if let Some(body) = self.tool_result_request(
+            request_id,
             status.clone(),
             output,
             duration_ms,
             Some(tool_result_fields),
-        );
-        // ── Reconnection dedup: only record when server acked the result ──
-        if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
-            crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+        ) {
+            // ── Reconnection dedup: only record when server acked the result ──
+            if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+                crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+            }
+        } else {
+            tracing::error!(
+                request_id,
+                "cannot post edge tool result without scoped tool_request identity"
+            );
         }
         self.edge_tool_round
             .last()
@@ -3845,6 +3910,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         requests: Vec<ToolBatchRequest>,
     ) -> Vec<EdgeToolExecResult> {
         self.sync_permission_manager_session_id();
+        for req in &requests {
+            self.tool_result_identities.insert(
+                req.request_id.clone(),
+                ToolResultIdentity::from_batch_request(req),
+            );
+        }
 
         let n = requests.len();
 
@@ -4454,27 +4525,32 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             results[orig_idx] = Some(result);
 
             // Post tool result to cloud API.
-            let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
-                req.request_id.clone(),
-                Some(self.edge_agent_id.clone()),
+            if let Some(body) = self.tool_result_request(
+                &req.request_id,
                 status.to_string(),
                 output,
                 duration_ms,
                 Some(tool_result_fields),
-            );
-            // ── Reconnection dedup: only record when server acked the result ──
-            if !terminal_post_failure {
-                match self.post_tool_result_with_auth_retry(&body).await {
-                    Ok(()) => {
-                        crate::cli::edge_lifecycle::record_completed_request(
-                            req.request_id.clone(),
-                        );
+            ) {
+                // ── Reconnection dedup: only record when server acked the result ──
+                if !terminal_post_failure {
+                    match self.post_tool_result_with_auth_retry(&body).await {
+                        Ok(()) => {
+                            crate::cli::edge_lifecycle::record_completed_request(
+                                req.request_id.clone(),
+                            );
+                        }
+                        Err(err) if err.is_terminal_auth() => {
+                            terminal_post_failure = true;
+                        }
+                        Err(_) => {}
                     }
-                    Err(err) if err.is_terminal_auth() => {
-                        terminal_post_failure = true;
-                    }
-                    Err(_) => {}
                 }
+            } else {
+                tracing::error!(
+                    request_id = %req.request_id,
+                    "cannot post parallel edge tool result without scoped tool_request identity"
+                );
             }
         }
 
@@ -7231,11 +7307,17 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "pf-1".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({"path": first.to_string_lossy()}),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "pf-2".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({"path": second.to_string_lossy()}),
@@ -7661,15 +7743,16 @@ mod tests {
             incremental_state: None,
         };
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
-        let body = astra_thin_client::ToolResultRequest {
-            request_id: "req-1".to_string(),
-            edge_agent_id: Some("test-agent".to_string()),
-            status: "completed".to_string(),
-            output: Some("done".to_string()),
-            duration_ms: Some(1),
-            result_hash: None,
-            tool_result_fields: None,
-        };
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            "test-session".to_string(),
+            "test-run".to_string(),
+            "test-chain".to_string(),
+            "req-1".to_string(),
+            "test-agent".to_string(),
+            "completed".to_string(),
+            "done".to_string(),
+            1,
+        );
 
         let posted = host.post_tool_result_with_auth_retry(&body).await.is_ok();
 
@@ -7739,15 +7822,16 @@ mod tests {
             incremental_state: None,
         };
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
-        let body = astra_thin_client::ToolResultRequest {
-            request_id: "req-1".to_string(),
-            edge_agent_id: Some("test-agent".to_string()),
-            status: "completed".to_string(),
-            output: Some("done".to_string()),
-            duration_ms: Some(1),
-            result_hash: None,
-            tool_result_fields: None,
-        };
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            "test-session".to_string(),
+            "test-run".to_string(),
+            "test-chain".to_string(),
+            "req-1".to_string(),
+            "test-agent".to_string(),
+            "completed".to_string(),
+            "done".to_string(),
+            1,
+        );
 
         let err = host
             .post_tool_result_with_auth_retry(&body)
@@ -7924,7 +8008,7 @@ mod tests {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
+        let block = "data: {\"type\":\"tool_request\",\"session_id\":\"test-session\",\"run_id\":\"test-run\",\"turn_chain_id\":\"test-chain\",\"request_id\":\"tr-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
         dispatch_turn_event_block(block, &mut r, &mut s, RenderPolicy::Silent, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
@@ -7932,6 +8016,7 @@ mod tests {
                 request_id,
                 tool,
                 args,
+                ..
             } => {
                 assert_eq!(request_id, "tr-1");
                 assert_eq!(tool, "bash");
@@ -8913,6 +8998,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -8923,6 +9011,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -9009,6 +9100,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -9019,6 +9113,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -9103,6 +9200,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
                     tool: "notebook_edit".to_string(),
                     args: serde_json::json!({
@@ -9115,6 +9215,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -9199,6 +9302,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
                     tool: "git".to_string(),
                     args: serde_json::json!({
@@ -9210,6 +9316,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -9289,6 +9398,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
                     tool: "git".to_string(),
                     args: serde_json::json!({
@@ -9299,6 +9411,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -9377,6 +9492,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -9387,6 +9505,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -9396,6 +9517,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-3".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -9473,6 +9597,9 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                session_id: "test-session".to_string(),
+                run_id: "test-run".to_string(),
+                turn_chain_id: "test-chain".to_string(),
                 request_id: "tx-boundary-1".to_string(),
                 tool: "write_file".to_string(),
                 args: serde_json::json!({
@@ -9556,6 +9683,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-boundary-1".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -9566,6 +9696,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-boundary-2".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -9658,6 +9791,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-1".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -9666,6 +9802,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-2".to_string(),
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -9752,6 +9891,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-1".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -9760,6 +9902,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-2".to_string(),
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -9767,6 +9912,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-3".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -10342,6 +10490,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-0".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -10350,6 +10501,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-1".to_string(),
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -10357,6 +10511,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-2".to_string(),
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -10618,6 +10775,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-1".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -10626,6 +10786,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-2".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -10633,6 +10796,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-3".to_string(),
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -10713,6 +10879,9 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                session_id: "test-session".to_string(),
+                run_id: "test-run".to_string(),
+                turn_chain_id: "test-chain".to_string(),
                 request_id: "turn-boundary-1".to_string(),
                 tool: "read_file".to_string(),
                 args: serde_json::json!({
@@ -10793,6 +10962,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-boundary-1".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -10801,6 +10973,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-boundary-2".to_string(),
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -10890,6 +11065,9 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-bash-1".to_string(),
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -10900,6 +11078,9 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-bash-2".to_string(),
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -10980,6 +11161,9 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                session_id: "test-session".to_string(),
+                run_id: "test-run".to_string(),
+                turn_chain_id: "test-chain".to_string(),
                 request_id: "tx-bash-ro".to_string(),
                 tool: "bash".to_string(),
                 args: serde_json::json!({

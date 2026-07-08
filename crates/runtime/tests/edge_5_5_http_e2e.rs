@@ -15,6 +15,7 @@ use astra_runtime::{
         LEDGER_MAX_ENTRIES, approval_callback_key, take_ledger_entry, tool_callback_key,
     },
 };
+use astra_services::multi_agent::EdgeDispatchIdentity;
 use astra_services::session_journal::{
     JournalDirGuard, JournalEventType, find_latest_approval_decision_for_run, read_journal,
 };
@@ -174,23 +175,62 @@ fn write_tool_call(id: &str) -> serde_json::Value {
     })
 }
 
+fn scoped_tool_identity(
+    session_id: &str,
+    run_id: &str,
+    turn_chain_id: &str,
+    request_id: &str,
+) -> EdgeDispatchIdentity {
+    EdgeDispatchIdentity::new("e2e-user", session_id, run_id, turn_chain_id, request_id)
+}
+
+fn scoped_tool_key(
+    session_id: &str,
+    run_id: &str,
+    turn_chain_id: &str,
+    request_id: &str,
+) -> String {
+    tool_callback_key(&scoped_tool_identity(
+        session_id,
+        run_id,
+        turn_chain_id,
+        request_id,
+    ))
+}
+
+fn tool_result_payload(
+    session_id: &str,
+    run_id: &str,
+    turn_chain_id: &str,
+    request_id: &str,
+    output: &str,
+) -> serde_json::Value {
+    serde_json::to_value(astra_thin_client::ToolResultRequest::new_with_hash(
+        session_id.to_string(),
+        run_id.to_string(),
+        turn_chain_id.to_string(),
+        request_id.to_string(),
+        "edge-e2e".to_string(),
+        "completed".to_string(),
+        output.to_string(),
+        0,
+    ))
+    .expect("tool result payload serializes")
+}
+
 #[tokio::test]
 async fn post_tools_result_populates_ledger_then_take_consumes() {
     let (app, ledger) = e2e_app();
-    let key = tool_callback_key("e2e-user", "tc-1");
+    let key = scoped_tool_key("sess-tool", "run-tool", "chain-tool", "tc-1");
     let (st, j) = post_json(
         app.clone(),
         "/tools/result",
-        json!({
-            "request_id": "tc-1",
-            "status": "completed",
-            "output": "out",
-            "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash("tc-1", "out"),
-        }),
+        tool_result_payload("sess-tool", "run-tool", "chain-tool", "tc-1", "out"),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(j["ok"], true);
+    assert_eq!(j["delivery_route"], "same_pod_ledger");
     assert!(ledger.lock().await.contains_key(&key));
     let got = take_ledger_entry(&ledger, &key, Duration::from_millis(200))
         .await
@@ -507,16 +547,22 @@ async fn post_tool_result_rejects_when_ledger_is_full() {
         }
     }
 
-    let key = tool_callback_key("e2e-user", "tc-overflow");
+    let key = scoped_tool_key(
+        "sess-overflow",
+        "run-overflow",
+        "chain-overflow",
+        "tc-overflow",
+    );
     let (st, _) = post_json(
         app.clone(),
         "/tools/result",
-        json!({
-            "request_id": "tc-overflow",
-            "status": "completed",
-            "output": "out",
-            "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash("tc-overflow", "out"),
-        }),
+        tool_result_payload(
+            "sess-overflow",
+            "run-overflow",
+            "chain-overflow",
+            "tc-overflow",
+            "out",
+        ),
     )
     .await;
     assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
@@ -549,7 +595,7 @@ async fn http_handler_payload_matches_delivery_parser() {
         async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
             ledger.lock().await.insert(
-                tool_callback_key("e2e-user", "w-chain"),
+                scoped_tool_key("sess-chain", "run-chain", "chain-chain", "w-chain"),
                 json!({"body": {"request_id": "w-chain", "status": "completed", "output": "ok"}}),
             );
         }
@@ -558,6 +604,9 @@ async fn http_handler_payload_matches_delivery_parser() {
     let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(
         &ledger,
         "e2e-user",
+        "sess-chain",
+        "run-chain",
+        "chain-chain",
         &[tc],
         Duration::from_secs(2),
         Some(&audit),
@@ -608,11 +657,11 @@ async fn http_handler_payload_supports_batched_approval_delivery() {
             tokio::time::sleep(Duration::from_millis(20)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
-                tool_callback_key("e2e-user", "w-batch-1"),
+                scoped_tool_key("sess-batch", "run-batch", "chain-batch", "w-batch-1"),
                 json!({"body": {"request_id": "w-batch-1", "status": "completed", "output": "ok-1"}}),
             );
             guard.insert(
-                tool_callback_key("e2e-user", "w-batch-2"),
+                scoped_tool_key("sess-batch", "run-batch", "chain-batch", "w-batch-2"),
                 json!({"body": {"request_id": "w-batch-2", "status": "completed", "output": "ok-2"}}),
             );
         }
@@ -633,6 +682,9 @@ async fn http_handler_payload_supports_batched_approval_delivery() {
     let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(
         &ledger,
         "e2e-user",
+        "sess-batch",
+        "run-batch",
+        "chain-batch",
         &tcs,
         Duration::from_secs(2),
         Some(&audit),

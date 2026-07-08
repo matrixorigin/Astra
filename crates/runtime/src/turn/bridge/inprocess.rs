@@ -4163,7 +4163,17 @@ impl InProcessChatTurnBridge {
 
                             // Emit tool_request so the CLI executes the tool
                             // locally and populates edge_tool_round.
-                            let req_event = astra_turn_core::stream_events::build_tool_request_event(tc_map);
+                            let request_id =
+                                tc_map.get("id").and_then(Value::as_str).unwrap_or("");
+                            let identity =
+                                astra_services::multi_agent::EdgeDispatchIdentity::new(
+                                    &user_id,
+                                    &session_id,
+                                    &turn_chain_id,
+                                    &turn_chain_id,
+                                    request_id,
+                                );
+                            let req_event = astra_turn_core::stream_events::build_tool_request_event(tc_map, &identity);
                             yield render_sse_map(&req_event);
                         }
                     }

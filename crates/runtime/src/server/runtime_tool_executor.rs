@@ -1776,6 +1776,12 @@ fn server_local_tool_arguments(request: &ToolExecutionRequest) -> Value {
     if !request.run_id.is_empty() {
         args.insert("_run_id".to_string(), Value::String(request.run_id.clone()));
     }
+    if !request.turn_chain_id.is_empty() {
+        args.insert(
+            "_turn_chain_id".to_string(),
+            Value::String(request.turn_chain_id.clone()),
+        );
+    }
     if !request.tool_call_id.is_empty() {
         args.insert(
             "_tool_call_id".to_string(),
@@ -4008,9 +4014,8 @@ esac
     impl astra_services::multi_agent::EdgeDispatchService for PanicEdgeDispatch {
         async fn insert_dispatch(
             &self,
-            _user_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _request_id: &str,
             _payload_json: &str,
         ) -> Result<(), String> {
             Err("MCP tools must not be routed through edge dispatch".to_string())
@@ -4026,8 +4031,7 @@ esac
 
         async fn deliver_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
         ) -> Result<bool, String> {
@@ -4036,8 +4040,7 @@ esac
 
         async fn fail_dispatch(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _reason: &str,
         ) -> Result<bool, String> {
             Err("MCP tools must not fail edge dispatch results".to_string())
@@ -4045,8 +4048,7 @@ esac
 
         async fn wait_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
             Err("MCP tools must not wait for edge dispatch results".to_string())
@@ -4100,9 +4102,8 @@ esac
     impl astra_services::multi_agent::EdgeDispatchService for NoResultEdgeDispatch {
         async fn insert_dispatch(
             &self,
-            _user_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _request_id: &str,
             _payload_json: &str,
         ) -> Result<(), String> {
             Ok(())
@@ -4118,8 +4119,7 @@ esac
 
         async fn deliver_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
         ) -> Result<bool, String> {
@@ -4128,8 +4128,7 @@ esac
 
         async fn fail_dispatch(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _reason: &str,
         ) -> Result<bool, String> {
             Ok(true)
@@ -4137,8 +4136,7 @@ esac
 
         async fn wait_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
             Ok(None)
@@ -4158,9 +4156,8 @@ esac
     impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
         async fn insert_dispatch(
             &self,
-            _user_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _request_id: &str,
             _payload_json: &str,
         ) -> Result<(), String> {
             Ok(())
@@ -4176,8 +4173,7 @@ esac
 
         async fn deliver_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
         ) -> Result<bool, String> {
@@ -4186,8 +4182,7 @@ esac
 
         async fn fail_dispatch(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             reason: &str,
         ) -> Result<bool, String> {
             self.failed_reasons
@@ -4199,8 +4194,7 @@ esac
 
         async fn wait_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
             if let Some(sender) = self.wait_started.lock().expect("wait started lock").take() {
