@@ -1302,6 +1302,60 @@ pub(crate) fn apply_bridge_message_cache_metadata(
     }
 }
 
+pub(crate) struct BridgeRetryWireRebuildInput<'a> {
+    pub previous_messages: &'a [Value],
+    pub compacted_messages: Vec<Value>,
+    pub boundary_present: bool,
+    pub required_runtime_text: Option<String>,
+    pub provider: &'a str,
+    pub model_name: &'a str,
+    pub thinking: &'a astra_turn_core::thinking_config::ThinkingConfig,
+    pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    pub cache_cfg: &'a PromptCacheConfig,
+    pub session_id: &'a str,
+}
+
+pub(crate) fn bridge_retry_compaction_history(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|message| !crate::turn::wire_assembly::is_required_runtime_preamble(message))
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn rebuild_bridge_retry_wire_messages(
+    input: BridgeRetryWireRebuildInput<'_>,
+) -> Vec<Value> {
+    let system_prefix_count = input
+        .previous_messages
+        .iter()
+        .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .count();
+    let mut messages = input.previous_messages[..system_prefix_count].to_vec();
+    let mut compacted_messages = input.compacted_messages;
+    crate::turn::wire_assembly::maybe_append_continuation_prompt(
+        &mut compacted_messages,
+        input.boundary_present,
+    );
+    messages.extend(compacted_messages);
+    let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
+        &mut messages,
+        None,
+        input.required_runtime_text,
+        input.provider,
+        input.model_name,
+        input.thinking,
+        input.cache_capability,
+    );
+    apply_bridge_message_cache_metadata(
+        &mut messages,
+        synthetic_tail_prefix_end,
+        input.cache_cfg,
+        input.session_id,
+    );
+    messages
+}
+
 /// Finalize bridge wire messages after bridge-specific compaction and context
 /// release have run.
 ///
@@ -2165,6 +2219,73 @@ mod context_cache_contract_tests {
         assert!(
             !astra_turn_core::context_serializer::message_has_cache_control(&messages[5]),
             "synthetic reminder tail must remain unannotated",
+        );
+    }
+
+    #[test]
+    fn bridge_retry_compaction_history_excludes_required_runtime_tail() {
+        let required_tail =
+            crate::turn::wire_assembly::required_runtime_preamble_message("required runtime")
+                .expect("required runtime tail");
+        let messages = vec![
+            json!({"role": "user", "content": "keep"}),
+            required_tail,
+            json!({"role": "assistant", "content": "keep too"}),
+        ];
+
+        let history = bridge_retry_compaction_history(&messages);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["content"], "keep");
+        assert_eq!(history[1]["content"], "keep too");
+        assert!(
+            history
+                .iter()
+                .all(|message| !crate::turn::wire_assembly::is_required_runtime_preamble(message)),
+            "retry compaction input must not preserve the prior synthetic runtime tail"
+        );
+    }
+
+    #[test]
+    fn rebuild_bridge_retry_wire_messages_reapplies_runtime_tail_and_cache_metadata() {
+        let previous_messages = vec![
+            json!({"role": "system", "content": [{"type": "text", "text": "stable"}]}),
+            json!({"role": "user", "content": "oversized history"}),
+            crate::turn::wire_assembly::required_runtime_preamble_message("old runtime")
+                .expect("old runtime tail"),
+        ];
+        let cache_cfg = crate::turn::prompt_cache::PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+
+        let messages = rebuild_bridge_retry_wire_messages(BridgeRetryWireRebuildInput {
+            previous_messages: &previous_messages,
+            compacted_messages: vec![json!({"role": "user", "content": "compacted retry"})],
+            boundary_present: false,
+            required_runtime_text: Some("required retry runtime".to_string()),
+            provider: "bedrock",
+            model_name: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            cache_capability: None,
+            cache_cfg: &cache_cfg,
+            session_id: "sess",
+        });
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["content"][0]["text"], "compacted retry");
+        assert_eq!(messages[2]["content"], "required retry runtime");
+        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
+            &messages[2]
+        ));
+        assert!(
+            astra_turn_core::context_serializer::message_has_cache_control(&messages[1]),
+            "retry wire rebuild must reapply cache metadata after replacing the compacted tail"
+        );
+        assert!(
+            !astra_turn_core::context_serializer::message_has_cache_control(&messages[2]),
+            "synthetic runtime tail must stay outside the cache-marked prefix"
         );
     }
 

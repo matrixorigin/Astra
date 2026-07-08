@@ -3230,19 +3230,35 @@ impl InProcessChatTurnBridge {
                                 })
                                 .count();
                             let (system_prefix, original_msgs) = llm_messages.split_at(sys_count);
+                            let retry_compaction_history =
+                                crate::turn::llm::context::bridge_retry_compaction_history(
+                                    original_msgs,
+                                );
                             let compact_result = aggressive_ctx
                                 .compact_with_overrides(
-                                    original_msgs,
+                                    &retry_compaction_history,
                                     system_prefix,
                                     &round_edge_tools,
                                     overrides,
                                 )
                                 .await;
 
-                            // Rebuild llm_messages: unchanged system prefix +
-                            // fresh compacted tail from Memoria.
-                            llm_messages.truncate(sys_count);
-                            llm_messages.extend(compact_result.messages);
+                            let rebuilt_retry_messages =
+                                crate::turn::llm::context::rebuild_bridge_retry_wire_messages(
+                                    crate::turn::llm::context::BridgeRetryWireRebuildInput {
+                                        previous_messages: &llm_messages,
+                                        compacted_messages: compact_result.messages,
+                                        boundary_present: compact_result.boundary.is_some(),
+                                        required_runtime_text: required_runtime_text.clone(),
+                                        provider: &provider,
+                                        model_name: &model_name,
+                                        thinking: &thinking_config,
+                                        cache_capability,
+                                        cache_cfg: &cache_cfg,
+                                        session_id: &session_id,
+                                    },
+                                );
+                            llm_messages = rebuilt_retry_messages;
 
                             // Also prune tool schemas more aggressively
                             pruned_tools = prune_tool_schemas(
