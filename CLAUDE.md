@@ -104,21 +104,20 @@ After `make build`, binaries live at `target/release/` (or `debug/`): `astra-ser
 Top-level layout:
 
 ```
-rust/             # Cargo workspace (24+ crates)
-  crates/core/         astra-core: shared types, config, DB name resolution
-  crates/services/     sessions, journals, durable tasks, cloud sync
-  crates/runtime/      Axum HTTP server (astra-server bin), contract tests in tests/
-  crates/astra-cli/    astra TUI + scripting CLI
-  crates/astra-cli/    astra CLI (includes admin subcommands under src/admin_cli/)
-  crates/astra-edge/   edge runtime (5/5 HTTP, WS, edge-cloud sync)
-  crates/astra-plan/   plan executor
-  crates/astra-skills/ skill loading + execution
-  crates/astra-tools/  built-in tools (server allowlist, executor allowlist, schemas)
-  crates/astra-turn-core/, astra-turn-types/  chat turn primitives
-  crates/astra-prompts/, astra-pipeline/, astra-sandbox/, astra-messaging/
-  crates/astra-config/, astra-credentials/, astra-logging/
-  crates/astra-test-harness/, astra-harness/  declarative test/run harness
-  crates/astra-thin-client/  stateless HTTP+SSE client for thin-client protocol
+Cargo.toml        # Cargo workspace root
+crates/core/      astra-core: shared types, config, DB name resolution
+crates/services/  sessions, journals, durable tasks, cloud sync
+crates/runtime/   Axum HTTP server (astra-server bin), contract tests in tests/
+crates/astra-cli/ astra TUI + scripting CLI, including admin subcommands
+crates/astra-edge/   edge runtime (HTTP, WS, edge-cloud sync)
+crates/astra-plan/   plan executor
+crates/astra-skills/ skill loading + execution
+crates/astra-tools/  built-in tools (server allowlist, executor allowlist, schemas)
+crates/astra-turn-core/, astra-turn-types/  chat turn primitives
+crates/astra-prompts/, astra-pipeline/, astra-sandbox/, astra-messaging/
+crates/astra-config/, astra-credentials/, astra-logging/
+crates/astra-test-harness/, astra-harness/  declarative test/run harness
+crates/astra-thin-client/  stateless HTTP+SSE client for thin-client protocol
 packages/sdk/     @astra/sdk (TypeScript) — Mode A in-process, Mode B remote E2E
 web/              Next.js admin dashboard
 .claude/skills/   Agent Skills for Claude-compatible agents

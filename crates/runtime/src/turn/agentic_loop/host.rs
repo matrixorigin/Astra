@@ -3705,6 +3705,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(feature = "harness")]
     #[test]
     fn invalid_harness_recovery_threshold_resets_streak_instead_of_overriding() {
         let mut state = make_state();
@@ -3725,6 +3726,7 @@ pub(crate) mod tests {
         assert_eq!(state.stall.circuit_breaker.consecutive_read_only(), 0);
     }
 
+    #[cfg(feature = "harness")]
     #[test]
     fn valid_harness_recovery_threshold_tightens_breaker() {
         let mut state = make_state();

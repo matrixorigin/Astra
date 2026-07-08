@@ -1,6 +1,6 @@
 ---
 name: astra-dev
-description: "Programmatic Astra engineering workflow for non-trivial code changes. Use when touching Rust crates under rust/, runtime/server lifecycle, turn/tool/prompt behavior, skills, delegation, session journal, MatrixOne state, CLI, deployment scripts, or when debugging Astra tests."
+description: "Programmatic Astra engineering workflow for non-trivial code changes. Use when touching Rust crates under crates/, runtime/server lifecycle, turn/tool/prompt behavior, skills, delegation, session journal, MatrixOne state, CLI, deployment scripts, or when debugging Astra tests."
 user_invocable: true
 when_to_use: "When developing, debugging, or refactoring Astra code; especially Rust workspace changes, runtime/server lifecycle work, tool or prompt behavior, skill discovery, session journal/debugging, cloud sync, delegation, CLI behavior, deployment scripts, or test failures."
 arguments:
@@ -144,7 +144,7 @@ Use the first matching row before widening the search.
 
 ## Phase 5: Verification Gates
 
-Run from repo root for `make` targets and from `rust/` for raw cargo.
+Run `make` targets and raw cargo commands from the repository root.
 
 | Change | Gate |
 | --- | --- |
@@ -199,7 +199,7 @@ End with:
 
 | Domain | Rule |
 | --- | --- |
-| Cargo | Workspace lives under `rust/`; raw cargo commands run there or use `--manifest-path Cargo.toml`. |
+| Cargo | Workspace lives at the repository root; raw cargo commands run from there. |
 | Errors | Library code uses `thiserror`; include operation, entity ID, and source context. Log at HTTP/CLI boundaries. |
 | Persistent state | State transitions are explicit status fields and traceable through session/run/event IDs. |
 | MatrixOne | Use `astra_core::resolve_database_name`; avoid hardcoded DB names and JSON-column WHERE filters. |

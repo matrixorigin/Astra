@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use astra_runtime::pipeline::evaluation::build_turn_evaluation_annotated_text;
 use astra_turn_core::conversation_log::manager::CslManager;
 
 use super::turn_commit::TurnCommitOutcome;
@@ -230,7 +231,7 @@ fn apply_turn_success_sync(
     state: &mut SessionState,
     profile: Option<&str>,
     line: &str,
-    result: StreamResult,
+    mut result: StreamResult,
     turn_start: Instant,
 ) -> TurnCommitOutcome {
     // Capture before session/turn mutation. If the primary turn event cannot
@@ -259,7 +260,6 @@ fn apply_turn_success_sync(
         &state.cached_pricing,
     );
     state.total_session_cost += turn_cost;
-    state.last_response = Some(result.full_text.clone());
     let effective_user_input = result.effective_user_input(line);
     let latest_user_input = result.latest_user_input(line);
     state.continuation_anchor = build_continuation_anchor(state, &latest_user_input, &result);
@@ -267,11 +267,16 @@ fn apply_turn_success_sync(
         crate::cli::followup_suggestion::suggest_followup(&latest_user_input, state, &result);
 
     state.redo_stack.clear();
+    let recent_tools = recent_tools_after_successful_turn(&state.recent_tools, &result);
+    let learning_snap =
+        analyze_chat_turn_learning(&latest_user_input, state.turn, &recent_tools, &result);
+    result.full_text = build_turn_evaluation_annotated_text(&result.full_text, &learning_snap.eval);
+    state.last_response = Some(result.full_text.clone());
     state.history.push((
         effective_user_input.clone(),
         build_history_text(&result.full_text, &result.tool_call_records),
     ));
-    state.recent_tools = recent_tools_after_successful_turn(&state.recent_tools, &result);
+    state.recent_tools = recent_tools;
     state.resume_restricted_tools = result
         .interruption
         .as_ref()
@@ -283,11 +288,8 @@ fn apply_turn_success_sync(
         state.tool_health_entries = result.tool_health_export.clone();
     }
 
-    let learning_snap =
-        analyze_chat_turn_learning(&latest_user_input, state.turn, &state.recent_tools, &result);
     state.latest_turn_quality_feedback =
         turn_quality_feedback_from_eval(state.turn, &learning_snap.eval);
-    let mut result = result;
     let routing_domain = learning_snap
         .routing
         .domain_hint
@@ -412,6 +414,50 @@ mod tests {
         apply_turn_success(&mut state, None, "apply the fix", result, Instant::now());
 
         assert_eq!(state.recent_tools, vec!["str_replace".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_persists_incomplete_evaluation_notice() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let mut state = SessionState::default();
+        let mut result = crate::tests::stub_stream_result_with_records(
+            "Done.",
+            vec![session_journal::ToolCallRecord {
+                name: "read_file".to_string(),
+                ok: false,
+                error: Some("PATH_RESOLUTION_FAILED: requested path does not exist".to_string()),
+                file_path: Some("obsolete/workspace/src/lib.rs".to_string()),
+                ..Default::default()
+            }],
+        );
+        result.llm_rounds = Some(40);
+        result.prompt_tokens = 94_900;
+
+        apply_turn_success(
+            &mut state,
+            None,
+            "fix the broken build",
+            result,
+            Instant::now(),
+        );
+
+        let last_response = state.last_response.as_deref().unwrap_or_default();
+        assert!(last_response.contains("[Turn evaluation: incomplete."));
+        assert!(last_response.contains("tool error rate is high"));
+        assert!(!last_response.contains("obsolete/workspace/src/lib.rs"));
+
+        let history_text = state
+            .history
+            .last()
+            .map(|(_, assistant)| assistant.as_str())
+            .unwrap_or_default();
+        assert!(history_text.contains("[Turn evaluation: incomplete."));
+        assert!(history_text.contains("failed: read_file"));
+        assert!(
+            !history_text.contains("obsolete/workspace/src/lib.rs"),
+            "failed paths must not be promoted into prompt-facing history: {history_text}"
+        );
     }
 
     #[test]

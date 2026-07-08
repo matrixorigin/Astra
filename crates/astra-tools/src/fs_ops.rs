@@ -231,6 +231,17 @@ pub fn check_anchor_vs_replacement_size(
     ))
 }
 
+fn validate_str_replace_anchor(edit_label: &str, old_str: &str) -> Result<(), String> {
+    if old_str.trim().is_empty() {
+        return Err(str_replace_fail(
+            &format!("{edit_label} rejected: old_str is empty or whitespace-only."),
+            "An empty anchor matches every byte boundary in the file, so the target location is undefined.",
+            "Re-read the target file and provide the exact current bytes around the intended edit as old_str.",
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     path.components()
         .fold(PathBuf::new(), |mut acc, component| {
@@ -375,6 +386,159 @@ pub fn resolve_path_sandboxed(
     ))
 }
 
+fn path_resolution_failed(
+    tool_name: &str,
+    path_str: &str,
+    what: &str,
+    candidates: Vec<String>,
+) -> ToolResult {
+    let mut message = format!(
+        "PATH_RESOLUTION_FAILED: {tool_name} target {what}: `{path_str}`.\nNo file operation was performed."
+    );
+    if !candidates.is_empty() {
+        message.push_str("\ncanonical_candidates:");
+        for candidate in candidates {
+            message.push_str("\n- ");
+            message.push_str(&candidate);
+        }
+    }
+    message.push_str(
+        "\nNEXT: Choose one canonical candidate explicitly, or inspect the workspace with glob/list_dir. Do not retry the stale path.",
+    );
+    ToolResult::error(message)
+}
+
+fn resolve_existing_path_for_tool(
+    workspace_root: &Path,
+    path_str: &str,
+    tool_name: &str,
+) -> Result<PathBuf, ToolResult> {
+    let path = resolve_path(workspace_root, path_str).map_err(ToolResult::error)?;
+    if path.exists() {
+        return Ok(path);
+    }
+    Err(path_resolution_failed(
+        tool_name,
+        path_str,
+        "does not exist",
+        workspace_file_identity_candidates(workspace_root, path_str),
+    ))
+}
+
+fn resolve_write_target_path(
+    workspace_root: &Path,
+    path_str: &str,
+    tool_name: &str,
+) -> Result<PathBuf, ToolResult> {
+    let path = resolve_path(workspace_root, path_str).map_err(ToolResult::error)?;
+    let Some(parent) = path.parent() else {
+        return Ok(path);
+    };
+    if parent.exists() {
+        return Ok(path);
+    }
+    Err(path_resolution_failed(
+        tool_name,
+        path_str,
+        "has a missing parent directory",
+        workspace_file_identity_candidates(workspace_root, path_str),
+    ))
+}
+
+fn workspace_file_identity_candidates(workspace_root: &Path, requested: &str) -> Vec<String> {
+    let requested_path = Path::new(requested);
+    if requested_path.is_absolute() {
+        return Vec::new();
+    }
+    let requested_components = path_identity_components(requested_path);
+    if requested_components.is_empty() {
+        return Vec::new();
+    }
+
+    let mut best_suffix_len = 0usize;
+    let mut candidates = Vec::new();
+    for repo_path in collect_workspace_file_paths(workspace_root, 20_000) {
+        let components = path_identity_components(&repo_path);
+        let max_len = requested_components.len().min(components.len());
+        let Some(matched_len) = (1..=max_len)
+            .rev()
+            .find(|len| path_components_suffix_eq(&components, &requested_components, *len))
+        else {
+            continue;
+        };
+        if matched_len < best_suffix_len {
+            continue;
+        }
+        if matched_len > best_suffix_len {
+            best_suffix_len = matched_len;
+            candidates.clear();
+        }
+        candidates.push(repo_path.to_string_lossy().to_string());
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates.truncate(8);
+    candidates
+}
+
+fn path_identity_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => {
+                value.to_str().map(std::string::ToString::to_string)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn path_components_suffix_eq(path_components: &[String], requested: &[String], len: usize) -> bool {
+    if len == 0 || len > path_components.len() || len > requested.len() {
+        return false;
+    }
+    path_components[path_components.len() - len..] == requested[requested.len() - len..]
+}
+
+fn collect_workspace_file_paths(workspace_root: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![workspace_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if should_skip_path_identity_dir(&path) {
+                    continue;
+                }
+                stack.push(path);
+            } else if file_type.is_file() {
+                if let Ok(relative) = path.strip_prefix(workspace_root) {
+                    out.push(relative.to_path_buf());
+                    if out.len() >= limit {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn should_skip_path_identity_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            ".git" | ".astra" | ".direnv" | ".next" | "node_modules" | "target" | "dist" | "build"
+        )
+    )
+}
+
 pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     let args = convert_read_file_args(args);
     if let Err(error) = validate_read_file_args(&args) {
@@ -394,9 +558,9 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
     {
         return ToolResult::error(error);
     }
-    let path = match resolve_path(workspace_root, path_str) {
+    let path = match resolve_existing_path_for_tool(workspace_root, path_str, "read_file") {
         Ok(p) => p,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return e,
     };
     let start_line = args
         .get("start_line")
@@ -925,9 +1089,9 @@ pub fn prepare_write_file(
             ));
         }
     };
-    let path = match resolve_path(workspace_root, path_str) {
+    let path = match resolve_write_target_path(workspace_root, path_str, "write_file") {
         Ok(p) => p,
-        Err(e) => return Err(ToolResult::error(e)),
+        Err(e) => return Err(e),
     };
     let content = normalize_content_before_write(&path, content);
 
@@ -1025,6 +1189,7 @@ pub fn prepare_str_replace(
             ));
         }
     };
+    validate_str_replace_anchor("str_replace", old_str).map_err(ToolResult::error)?;
     if old_str == new_str {
         return Err(ToolResult::error(str_replace_fail(
             "old_str and new_str are identical — no change needed.",
@@ -1050,9 +1215,9 @@ pub fn prepare_str_replace(
         return Err(ToolResult::error(err));
     }
 
-    let path = match resolve_path(workspace_root, path_str) {
+    let path = match resolve_existing_path_for_tool(workspace_root, path_str, "str_replace") {
         Ok(p) => p,
-        Err(e) => return Err(ToolResult::error(e)),
+        Err(e) => return Err(e),
     };
 
     let content = match std::fs::read_to_string(&path) {
@@ -1267,9 +1432,9 @@ pub fn prepare_multi_edit(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let path = match resolve_path(workspace_root, path_str) {
+    let path = match resolve_existing_path_for_tool(workspace_root, path_str, "multi_edit") {
         Ok(p) => p,
-        Err(e) => return Err(ToolResult::error(e)),
+        Err(e) => return Err(e),
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -1295,6 +1460,7 @@ pub fn prepare_multi_edit(
                 )));
             }
         };
+        validate_str_replace_anchor(&format!("edit[{i}]"), old_str).map_err(ToolResult::error)?;
         if old_str == new_str {
             return Err(ToolResult::error(str_replace_fail(
                 &format!("edit[{i}] is a no-op."),
@@ -1394,9 +1560,9 @@ pub fn prepare_delete_file(
         Some(p) => p,
         None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
     };
-    let path = match resolve_path(workspace_root, path_str) {
+    let path = match resolve_existing_path_for_tool(workspace_root, path_str, "delete_file") {
         Ok(p) => p,
-        Err(e) => return Err(ToolResult::error(e)),
+        Err(e) => return Err(e),
     };
 
     if !path.exists() {
@@ -1429,9 +1595,9 @@ pub fn delete_file(workspace_root: &Path, args: &Value) -> ToolResult {
         Some(p) => p,
         None => return ToolResult::error("Error: Missing 'path' parameter".into()),
     };
-    let path = match resolve_path(workspace_root, path_str) {
+    let path = match resolve_existing_path_for_tool(workspace_root, path_str, "delete_file") {
         Ok(p) => p,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return e,
     };
 
     if !path.exists() {
@@ -2622,6 +2788,39 @@ mod tests {
     }
 
     #[test]
+    fn read_file_missing_path_returns_structured_canonical_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let current = tmp.path().join("crates/runtime/src/server");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(current.join("header_utils.rs"), "pub fn header() {}\n").unwrap();
+
+        let result = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": "old/workspace/src/server/header_utils.rs"}),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("PATH_RESOLUTION_FAILED"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("No file operation was performed"));
+        assert!(
+            result
+                .output
+                .contains("crates/runtime/src/server/header_utils.rs"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Cannot read file"),
+            "missing path should fail before OS read: {}",
+            result.output
+        );
+    }
+
+    #[test]
     fn read_file_with_range() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("test.txt"), "a\nb\nc\nd").unwrap();
@@ -3128,6 +3327,88 @@ mod tests {
     }
 
     #[test]
+    fn write_file_rejects_missing_parent_instead_of_creating_stale_path_tree() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("crates/runtime/src/server")).unwrap();
+        std::fs::write(
+            tmp.path().join("crates/runtime/src/server/header_utils.rs"),
+            "current",
+        )
+        .unwrap();
+
+        let result = write_file(
+            tmp.path(),
+            &serde_json::json!({
+                "path": "old/workspace/src/server/header_utils.rs",
+                "content": "stale"
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("PATH_RESOLUTION_FAILED"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("crates/runtime/src/server/header_utils.rs"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !tmp.path().join("old").exists(),
+            "write_file must not create a missing parent tree for stale paths"
+        );
+    }
+
+    #[test]
+    fn str_replace_missing_path_reports_own_tool_name() {
+        let tmp = TempDir::new().unwrap();
+        let result = str_replace(
+            tmp.path(),
+            &serde_json::json!({
+                "path": "missing/file.txt",
+                "old_str": "alpha",
+                "new_str": "beta"
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("PATH_RESOLUTION_FAILED: str_replace target"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn multi_edit_missing_path_reports_own_tool_name() {
+        let tmp = TempDir::new().unwrap();
+        let result = multi_edit(
+            tmp.path(),
+            &serde_json::json!({
+                "path": "missing/file.txt",
+                "edits": [
+                    {"old_str": "alpha", "new_str": "beta"}
+                ]
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("PATH_RESOLUTION_FAILED: multi_edit target"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
     fn str_replace_basic() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join("f.txt"), "foo bar baz").unwrap();
@@ -3563,6 +3844,62 @@ mod tests {
         );
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert_eq!(content, "same\n");
+    }
+
+    #[test]
+    fn str_replace_rejects_empty_anchor_before_scanning_file() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "alpha beta\n").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "old_str": "",
+            "new_str": "replacement"
+        });
+
+        let result = str_replace(tmp.path(), &args);
+
+        assert!(result.is_error);
+        assert!(result.output.contains("STR_REPLACE FAILED"));
+        assert!(
+            result.output.contains("old_str is empty"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("found ") && !result.output.contains("times"),
+            "empty anchor should be rejected before match counting: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "alpha beta\n");
+    }
+
+    #[test]
+    fn multi_edit_rejects_empty_anchor_before_noop_check() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "alpha beta\n").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "edits": [
+                {"old_str": "", "new_str": ""}
+            ]
+        });
+
+        let result = multi_edit(tmp.path(), &args);
+
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("old_str is empty"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("no-op"),
+            "empty anchor should report an invalid anchor, not a no-op: {}",
+            result.output
+        );
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "alpha beta\n");
     }
 
     #[test]

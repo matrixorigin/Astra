@@ -367,6 +367,10 @@ pub enum Scenario {
     /// exploration. This scenario is preferred over `Exploration` when the query
     /// is short and interrogative AND the workspace doesn't need to be mutated.
     QuickAnswer,
+    /// Benchmark or artifact comparison that needs more tool-preview budget for
+    /// side-by-side evidence inspection. This is intentionally judge-driven and
+    /// has no keyword fallback.
+    BenchmarkComparison,
 }
 
 /// Structured workspace-mutation intent for the current user turn.
@@ -511,6 +515,7 @@ impl Scenario {
             Scenario::DevOps => vec!["bash", "read_file", "str_replace", "write_file"],
             Scenario::Learning => vec!["read_file", "grep", "web_search"],
             Scenario::QuickAnswer => vec!["read_file", "grep"],
+            Scenario::BenchmarkComparison => Vec::new(),
         }
     }
 
@@ -596,6 +601,13 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: Some(5),
                 verification_strictness: None,
+            },
+            Scenario::BenchmarkComparison => ScenarioStrategy {
+                max_tools_per_turn: 80,
+                prefer_read_only: true,
+                detail_level: Verbosity::Verbose,
+                memory_top_k: None,
+                verification_strictness: Some(0.6),
             },
         }
     }
@@ -688,6 +700,7 @@ impl ScenarioDetector {
             Scenario::DevOps,
             Scenario::Learning,
             Scenario::QuickAnswer,
+            Scenario::BenchmarkComparison,
         ];
 
         scenarios
@@ -862,6 +875,7 @@ fn scenario_keywords(scenario: Scenario) -> Vec<&'static str> {
             "哪里",
             "哪个",
         ],
+        Scenario::BenchmarkComparison => Vec::new(),
     }
 }
 
@@ -1214,6 +1228,11 @@ mod tests {
 
         let keywords = scenario_keywords(Scenario::Testing);
         assert!(keywords.contains(&"test"));
+
+        assert!(
+            scenario_keywords(Scenario::BenchmarkComparison).is_empty(),
+            "benchmark comparison must be supplied by structured turn intent, not keyword fallback"
+        );
     }
 
     #[test]

@@ -1092,7 +1092,8 @@ fn deferred_user_inputs_from_turn_metadata(metadata: Option<&serde_json::Value>)
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|entry| {
+        .enumerate()
+        .filter_map(|(idx, entry)| {
             let content = entry.get("content").and_then(serde_json::Value::as_str)?;
             let content = content.trim();
             if content.is_empty() {
@@ -1102,11 +1103,11 @@ fn deferred_user_inputs_from_turn_metadata(metadata: Option<&serde_json::Value>)
                 .get("event_index")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(u64::MAX);
-            Some((event_index, content.to_string()))
+            Some((event_index, idx, content.to_string()))
         })
         .collect::<Vec<_>>();
-    inputs.sort_by_key(|(event_index, _)| *event_index);
-    inputs.into_iter().map(|(_, content)| content).collect()
+    inputs.sort_by_key(|(event_index, idx, _)| (*event_index, *idx));
+    inputs.into_iter().map(|(_, _, content)| content).collect()
 }
 
 pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
@@ -1469,9 +1470,10 @@ mod tests {
         access_token_needs_refresh, banner_session_display, banner_welcome_text,
         context_window_for_model_from_models_response, current_access_token, current_git_root,
         default_model_from_models_response, default_model_selection_from_models_response,
-        ensure_state_default_model, fresh_access_token, initialize_session_state,
-        pending_recovery_status_line, resolve_server_model_context_window,
-        restore_history_from_journal, restore_session_state_from_journal, restored_journal_state,
+        deferred_user_inputs_from_turn_metadata, ensure_state_default_model, fresh_access_token,
+        initialize_session_state, pending_recovery_status_line,
+        resolve_server_model_context_window, restore_history_from_journal,
+        restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error,
     };
     use crate::cli::cli_config::cli_utils::{
@@ -1762,6 +1764,59 @@ mod tests {
         assert_eq!(
             history[1],
             ("2".to_string(), "handled latest input".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_history_preserves_duplicate_deferred_user_events() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("test-restore-deferred-dup-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+
+        writer
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(&sid),
+                    1,
+                    None,
+                    "retry",
+                    "handled retry",
+                    0,
+                    10,
+                    5,
+                    100,
+                )
+                .with_deferred_user_inputs([(2, "retry"), (3, "retry")]),
+            )
+            .unwrap();
+
+        let history = restore_history_from_journal(&sid).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0], ("retry".to_string(), String::new()));
+        assert_eq!(history[1], ("retry".to_string(), String::new()));
+        assert_eq!(
+            history[2],
+            ("retry".to_string(), "handled retry".to_string())
+        );
+    }
+
+    #[test]
+    fn deferred_user_inputs_without_event_index_keep_array_order_after_indexed_inputs() {
+        let metadata = serde_json::json!({
+            "deferred_user_inputs": [
+                {"content": "missing-a"},
+                {"event_index": 2, "content": "indexed"},
+                {"content": "missing-b"}
+            ]
+        });
+
+        assert_eq!(
+            deferred_user_inputs_from_turn_metadata(Some(&metadata)),
+            vec![
+                "indexed".to_string(),
+                "missing-a".to_string(),
+                "missing-b".to_string()
+            ]
         );
     }
 

@@ -89,6 +89,11 @@ pub(crate) fn report_turn_failure(
         state.last_turn_event = Some(err_event);
     }
 
+    // A final failed settlement still consumed a user-visible turn. Keep the
+    // local turn cursor aligned with the turn_error written above so the next
+    // bridge request cannot reuse a stale explicit session_turn.
+    state.turn += 1;
+
     if !failure.partial.partial_text.is_empty() {
         let partial_with_note = format!(
             "[Interrupted: {}]\n\n{}",
@@ -170,10 +175,15 @@ mod tests {
 
         let event = state.last_turn_event.as_ref().expect("turn_error event");
         assert_eq!(event.tool_count, Some(1));
+        assert_eq!(event.turn, Some(1));
         assert_eq!(event.tools_used, Some(vec!["read_file".into()]));
         assert_eq!(event.tokens_in, Some(13));
         assert_eq!(event.tokens_out, Some(7));
         assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
+        assert_eq!(
+            state.turn, 1,
+            "failed turn settlement must advance the local turn cursor"
+        );
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.last_response.as_deref(), Some("Partial analysis"));
 
@@ -285,6 +295,10 @@ mod tests {
             Some(serde_json::json!({"previous": true}))
         );
         assert_eq!(
+            state.turn, 1,
+            "transport failures without journal persistence still consume a local turn"
+        );
+        assert_eq!(
             state.runtime_compaction_state,
             Some(serde_json::json!({"attempt_count": 2}))
         );
@@ -332,6 +346,10 @@ mod tests {
             "journal should bootstrap from partial sid"
         );
         assert_eq!(state.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(
+            state.turn, 1,
+            "bootstrapped turn_error must advance the local turn cursor"
+        );
         let events = session_journal::read_journal(&sid).unwrap();
         assert!(
             events

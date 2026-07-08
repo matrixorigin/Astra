@@ -271,8 +271,34 @@ fn canonical_message_hashes(messages: &[serde_json::Value]) -> Vec<CanonicalMess
 }
 
 fn canonical_message_hash(message: &serde_json::Value) -> CanonicalMessageHash {
-    let bytes = serde_json::to_vec(message).unwrap_or_else(|_| format!("{message:?}").into_bytes());
+    // serde_json::Value object order can come from insertion order when the
+    // preserve_order feature is enabled, so sort recursively before hashing.
+    let canonical = sort_json_object_keys(message);
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_else(|_| {
+        // Serializing a serde_json::Value should be infallible; keep a stable
+        // fallback so a representation error cannot crash CSL diffing.
+        canonical.to_string().into_bytes()
+    });
     Sha256::digest(bytes).into()
+}
+
+/// Recursively sort all object keys in a JSON value to guarantee
+/// deterministic serialization regardless of insertion order.
+fn sort_json_object_keys(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: Vec<_> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), sort_json_object_keys(v)))
+                .collect();
+            sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(sort_json_object_keys).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 fn common_canonical_prefix_len(
@@ -1342,6 +1368,69 @@ mod tests {
             std::mem::size_of_val(mgr.last_canonical_message_hashes.as_slice()),
             messages.len() * std::mem::size_of::<CanonicalMessageHash>(),
             "manager state must scale with message count, not message payload bytes"
+        );
+    }
+
+    #[test]
+    fn canonical_message_hash_is_independent_of_object_insertion_order() {
+        fn object(fields: Vec<(&str, serde_json::Value)>) -> serde_json::Value {
+            let mut map = serde_json::Map::new();
+            for (key, value) in fields {
+                map.insert(key.to_string(), value);
+            }
+            serde_json::Value::Object(map)
+        }
+
+        let left = object(vec![
+            ("role", json!("assistant")),
+            (
+                "content",
+                json!([
+                    {"b": 2, "a": {"z": 0, "y": 1}},
+                    {"tool": {"name": "read_file", "args": {"path": "README.md", "limit": 20}}}
+                ]),
+            ),
+            (
+                "metadata",
+                object(vec![("beta", json!(2)), ("alpha", json!(1))]),
+            ),
+        ]);
+        let right = object(vec![
+            (
+                "metadata",
+                object(vec![("alpha", json!(1)), ("beta", json!(2))]),
+            ),
+            (
+                "content",
+                json!([
+                    {"a": {"y": 1, "z": 0}, "b": 2},
+                    {"tool": {"args": {"limit": 20, "path": "README.md"}, "name": "read_file"}}
+                ]),
+            ),
+            ("role", json!("assistant")),
+        ]);
+        let changed = object(vec![
+            (
+                "metadata",
+                object(vec![("alpha", json!(1)), ("beta", json!(3))]),
+            ),
+            (
+                "content",
+                json!([
+                    {"a": {"y": 1, "z": 0}, "b": 2},
+                    {"tool": {"args": {"limit": 20, "path": "README.md"}, "name": "read_file"}}
+                ]),
+            ),
+            ("role", json!("assistant")),
+        ]);
+
+        assert_eq!(
+            canonical_message_hash(&left),
+            canonical_message_hash(&right)
+        );
+        assert_ne!(
+            canonical_message_hash(&left),
+            canonical_message_hash(&changed)
         );
     }
 

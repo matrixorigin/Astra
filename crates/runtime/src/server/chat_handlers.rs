@@ -271,11 +271,11 @@ pub(super) async fn chat_turn_handler(
         .await
     {
         Ok(principal) => principal,
-        Err((status, error)) => return sse_error_response(status, error.0.detail),
+        Err((status, error)) => return sse_error_response_from_error(status, error.0),
     };
     let body = match inject_effective_runtime_context_body(&state, &principal, body).await {
         Ok(body) => body,
-        Err((status, error)) => return sse_error_response(status, error.0.detail),
+        Err((status, error)) => return sse_error_response_from_error(status, error.0),
     };
     dispatch_chat_turn_bridge(&state, &principal.user, &headers, body).await
 }
@@ -319,7 +319,7 @@ pub(super) async fn dispatch_chat_turn_bridge(
 
     let prepared = match prepare_chat_turn_bridge_body(state, user, body, None).await {
         Ok(result) => result,
-        Err((status, error)) => return sse_error_response(status, error.0.detail),
+        Err((status, error)) => return sse_error_response_from_error(status, error.0),
     };
     if let Some(trusted_session_id) = prepared.trusted_session_id.as_deref() {
         bridge_headers.insert(

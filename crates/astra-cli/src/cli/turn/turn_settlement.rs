@@ -158,5 +158,9 @@ mod tests {
         settle_failed_turn(&mut state, &mut dispatch, &failure);
 
         assert!(state.resume_restricted_tools.is_empty());
+        assert_eq!(
+            state.turn, 1,
+            "failed settlement must advance the local turn cursor"
+        );
     }
 }

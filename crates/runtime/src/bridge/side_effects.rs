@@ -48,6 +48,83 @@ fn record_persist_ok() {
     PERSIST_OK_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Recover the global side-effect queue from a poisoned mutex.
+///
+/// When a prior holder panicked while holding the lock, the queue state
+/// may be partially mutated. We log the poisoning event so operators can
+/// correlate it with any session-level corruption. Drain leases repair
+/// per-session `running` state when a worker panics outside the lock.
+fn recover_poisoned_side_effect_mutex(
+    poisoned: std::sync::PoisonError<std::sync::MutexGuard<'static, OrderedSideEffectQueues>>,
+) -> std::sync::MutexGuard<'static, OrderedSideEffectQueues> {
+    tracing::error!(
+        "global side-effect queue mutex poisoned — a session task panicked while draining"
+    );
+    poisoned.into_inner()
+}
+
+struct SideEffectDrainLease {
+    key: Option<String>,
+}
+
+impl SideEffectDrainLease {
+    fn new(key: String) -> Self {
+        Self { key: Some(key) }
+    }
+
+    fn disarm(&mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for SideEffectDrainLease {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        tracing::error!(
+            session_key = %key,
+            "side-effect drain exited unexpectedly; repairing queue lease"
+        );
+        if !release_side_effect_drain_lease_after_panic(&key) {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let _ = handle.spawn(drain_bridge_hook_side_effect_queue(key));
+            }
+            Err(error) => {
+                let mut queues = ORDERED_SIDE_EFFECT_QUEUES
+                    .lock()
+                    .unwrap_or_else(recover_poisoned_side_effect_mutex);
+                queues.running.remove(&key);
+                tracing::error!(
+                    session_key = %key,
+                    error = %error,
+                    "side-effect queue still has pending jobs but no Tokio runtime is available"
+                );
+            }
+        }
+    }
+}
+
+fn release_side_effect_drain_lease_after_panic(key: &str) -> bool {
+    let mut queues = ORDERED_SIDE_EFFECT_QUEUES
+        .lock()
+        .unwrap_or_else(recover_poisoned_side_effect_mutex);
+    queues.running.remove(key);
+    if queues
+        .queues
+        .get(key)
+        .is_some_and(|queue| !queue.is_empty())
+    {
+        queues.running.insert(key.to_string());
+        true
+    } else {
+        false
+    }
+}
+
 pub fn run_bridge_hook_side_effects(
     payload: Option<serde_json::Value>,
     turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
@@ -72,7 +149,7 @@ fn enqueue_bridge_hook_side_effects(job: BridgeHookSideEffectJob) {
     let should_spawn = {
         let mut queues = ORDERED_SIDE_EFFECT_QUEUES
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(recover_poisoned_side_effect_mutex);
         queues.queues.entry(key.clone()).or_default().push_back(job);
         queues.running.insert(key.clone())
     };
@@ -82,8 +159,10 @@ fn enqueue_bridge_hook_side_effects(job: BridgeHookSideEffectJob) {
 }
 
 async fn drain_bridge_hook_side_effect_queue(key: String) {
+    let mut lease = SideEffectDrainLease::new(key.clone());
     loop {
         let Some(job) = pop_bridge_hook_side_effect_job(&key) else {
+            lease.disarm();
             return;
         };
         execute_bridge_hook_side_effects(job).await;
@@ -93,7 +172,7 @@ async fn drain_bridge_hook_side_effect_queue(key: String) {
 fn pop_bridge_hook_side_effect_job(key: &str) -> Option<BridgeHookSideEffectJob> {
     let mut queues = ORDERED_SIDE_EFFECT_QUEUES
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(recover_poisoned_side_effect_mutex);
     let Some(queue) = queues.queues.get_mut(key) else {
         queues.running.remove(key);
         return None;
@@ -621,7 +700,10 @@ mod inprocess_hook_contract_tests {
         TurnReflectionStateStore, build_turn_hook_args,
     };
 
-    use super::{run_bridge_hook_side_effects, truncate_text};
+    use super::{
+        ORDERED_SIDE_EFFECT_QUEUES, release_side_effect_drain_lease_after_panic,
+        run_bridge_hook_side_effects, truncate_text,
+    };
 
     #[derive(Clone, Default)]
     struct RecordingHookDbWriter {
@@ -700,6 +782,64 @@ mod inprocess_hook_contract_tests {
             self.requests.lock().await.push(request);
             Ok(())
         }
+    }
+
+    fn queued_test_job(session_id: &str) -> super::BridgeHookSideEffectJob {
+        super::BridgeHookSideEffectJob {
+            payload: json!({"session_id": session_id}),
+            turn_hook_db_writer: Arc::new(RecordingHookDbWriter::default()),
+            turn_reflection_state_store: Arc::new(RecordingReflectionStateStore::default()),
+            turn_reflection_lesson_writer: Arc::new(RecordingReflectionLessonWriter::default()),
+            turn_observer_worker: Arc::new(RecordingObserverWorker::default()),
+        }
+    }
+
+    #[test]
+    fn drain_lease_release_reserves_restart_when_queue_still_has_jobs() {
+        let key = format!("orphaned-side-effects-{}", uuid::Uuid::now_v7());
+        {
+            let mut queues = ORDERED_SIDE_EFFECT_QUEUES
+                .lock()
+                .unwrap_or_else(super::recover_poisoned_side_effect_mutex);
+            queues
+                .queues
+                .entry(key.clone())
+                .or_default()
+                .push_back(queued_test_job(&key));
+            queues.running.insert(key.clone());
+        }
+
+        let should_restart = release_side_effect_drain_lease_after_panic(&key);
+
+        assert!(should_restart);
+        let mut queues = ORDERED_SIDE_EFFECT_QUEUES
+            .lock()
+            .unwrap_or_else(super::recover_poisoned_side_effect_mutex);
+        assert!(queues.running.contains(&key));
+        assert_eq!(queues.queues.get(&key).map(|queue| queue.len()), Some(1));
+        queues.queues.remove(&key);
+        queues.running.remove(&key);
+    }
+
+    #[test]
+    fn drain_lease_release_cleans_running_state_when_queue_is_empty() {
+        let key = format!("empty-side-effects-{}", uuid::Uuid::now_v7());
+        {
+            let mut queues = ORDERED_SIDE_EFFECT_QUEUES
+                .lock()
+                .unwrap_or_else(super::recover_poisoned_side_effect_mutex);
+            queues.queues.remove(&key);
+            queues.running.insert(key.clone());
+        }
+
+        let should_restart = release_side_effect_drain_lease_after_panic(&key);
+
+        assert!(!should_restart);
+        let mut queues = ORDERED_SIDE_EFFECT_QUEUES
+            .lock()
+            .unwrap_or_else(super::recover_poisoned_side_effect_mutex);
+        assert!(!queues.running.contains(&key));
+        queues.queues.remove(&key);
     }
 
     fn build_hook_payload_with_tool_call() -> Value {

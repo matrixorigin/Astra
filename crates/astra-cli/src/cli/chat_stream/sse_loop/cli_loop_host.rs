@@ -21,8 +21,9 @@ use astra_runtime::{
     },
 };
 use astra_turn_core::{
-    compaction_types::CompactionEvent, orchestration::agent_result_wire::render_agent_tool_error,
-    sse_stream_host::EdgeToolExecResult, tool_result_semantics::cloud_tool_result_status_label,
+    chat_turn_sse_dispatch::ChatTurnSseAccum, compaction_types::CompactionEvent,
+    orchestration::agent_result_wire::render_agent_tool_error, sse_stream_host::EdgeToolExecResult,
+    tool_result_semantics::cloud_tool_result_status_label,
 };
 use async_trait::async_trait;
 use crossterm::style::Stylize;
@@ -148,6 +149,33 @@ fn render_control_tool_recovery_error(message: &str) -> String {
         );
     }
     value.to_string()
+}
+
+const BRIDGE_SESSION_TURN_STALE_ERROR_CODE: &str = "bridge_session_turn_stale";
+
+fn bridge_session_turn_stale_expected_turn(
+    accum: &ChatTurnSseAccum,
+    current_turn: u32,
+) -> Option<u32> {
+    if accum.error_message.is_none()
+        || accum.error_code.as_deref() != Some(BRIDGE_SESSION_TURN_STALE_ERROR_CODE)
+    {
+        return None;
+    }
+    let metadata = accum.error_metadata.as_ref()?;
+    let actual = metadata
+        .get("actual_session_turn")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())?;
+    let expected = metadata
+        .get("expected_session_turn")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())?;
+    if actual == current_turn && expected > current_turn {
+        Some(expected)
+    } else {
+        None
+    }
 }
 
 fn failed_control_tool_recovery_result(
@@ -651,83 +679,108 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         let task_hint = self.executor.build_task_context_hint().await;
         let append_system_prompt = self.append_system_prompt.as_deref();
 
-        let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
-            api: self.api,
-            token: self.token.as_str(),
-            auth_profile: self.auth_profile,
-            model_id: effective_model_id,
-            model: effective_model,
-            context_window_tokens: self.context_window_tokens,
-            effective_input_budget_tokens: state.max_turn_input_tokens,
-            explain: self.explain,
-            render_md: self.render_md,
-            term_width: self.term_width,
-            render_policy: self.render_policy,
-            message: self.message,
-            user_intent: self.user_intent,
-            semantic_query_override: self.semantic_query_override,
-            history: self.history,
-            recent_tools: self.recent_tools,
-            project_root: self.project_root.as_path(),
-            executor: Arc::clone(&self.executor),
-            registry: &self.registry,
-            messages: state.messages.as_slice(),
-            runtime_required_texts: self.input_runtime_required_texts,
-            runtime_volatile_texts: &runtime_volatile_texts,
-            ephemeral_prefix: state.skills.listing_message.as_ref(),
-            current_session_id: state.current_session_id.as_deref(),
-            tool_results: state.tool_results.as_slice(),
-            all_schemas: &self.all_schemas,
-            valid_tool_names: &mut self.valid_tool_names,
-            turn_guard: &state.turn_guard,
-            restricted_tools: &mut state.restricted_tools,
-            widen_selection_pending: &mut state.widen_selection_pending,
-            step_recorder: &mut state.step_recorder,
-            file_context: &self.file_context,
-            assembly_start,
-            telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut state.telemetry.first_memoria_ms,
-                first_selection_report: &mut state.telemetry.first_selection_report,
-                first_budget_pressure: &mut state.telemetry.first_budget_pressure,
-                first_context_assembly_ms: &mut state.telemetry.first_context_assembly_ms,
-                all_selected_skills: &mut state.telemetry.all_selected_skills,
-                trace_collector: state.telemetry.turn_trace_collector.as_ref(),
-            },
-            perm_manager: self.perm_manager,
-            pre_clear_lines: pre_clear,
-            is_plan_subtask: self.is_plan_subtask,
-            plan_subtask_id: self.plan_subtask_id,
-            cancel_token: state.cancellation.token.as_deref(),
-            plan_assemble_line_release: self.plan_assemble_line_release.clone(),
-            stream_event_tx: self.stream_event_tx.clone(),
-            approval_request_tx: self.approval_request_tx.clone(),
-            ask_user_request_tx: self.ask_user_request_tx.clone(),
-            skill_resolver: state.skills.resolver.clone(),
-            skill_effort: state.skills.effort.as_ref().map(|e| e.to_string()),
-            skill_agent_type: state.skills.agent_type.clone(),
-            interaction_mode,
-            turn_policy: &mut state.last_turn_policy,
-            skill_allowed_tools: state
-                .skills
-                .allowed_tools
-                .as_ref()
-                .map(|s| s.iter().cloned().collect::<Vec<_>>()),
-            skill_continuation: state.skill_produced_output,
-            tool_cache: &mut self.tool_cache,
-            previous_confidence_fallback: state
-                .last_confidence_diagnosis
-                .as_ref()
-                .map(|d| d.fallback.clone()),
-            round_index: state.current_round_index,
-            session_turn: state.session_turn,
-            turn_chain_id: state.bridge_turn_chain_id.as_deref(),
-            user_query_event_id: state.bridge_user_query_event_id.as_deref(),
-            observability_hub: state.telemetry.observability_hub.as_ref(),
-            incremental_state: self.incremental_state.clone(),
-            append_system_prompt,
-            plan_resume_hint: task_hint.as_deref(),
-        })
-        .await;
+        macro_rules! fetch_turn_sse {
+            () => {
+                fetch_chat_turn_sse(ChatTurnSseFetchRequest {
+                    api: self.api,
+                    token: self.token.as_str(),
+                    auth_profile: self.auth_profile,
+                    model_id: effective_model_id,
+                    model: effective_model,
+                    context_window_tokens: self.context_window_tokens,
+                    effective_input_budget_tokens: state.max_turn_input_tokens,
+                    explain: self.explain,
+                    render_md: self.render_md,
+                    term_width: self.term_width,
+                    render_policy: self.render_policy,
+                    message: self.message,
+                    user_intent: self.user_intent,
+                    semantic_query_override: self.semantic_query_override,
+                    history: self.history,
+                    recent_tools: self.recent_tools,
+                    project_root: self.project_root.as_path(),
+                    executor: Arc::clone(&self.executor),
+                    registry: &self.registry,
+                    messages: state.messages.as_slice(),
+                    runtime_required_texts: self.input_runtime_required_texts,
+                    runtime_volatile_texts: &runtime_volatile_texts,
+                    ephemeral_prefix: state.skills.listing_message.as_ref(),
+                    current_session_id: state.current_session_id.as_deref(),
+                    tool_results: state.tool_results.as_slice(),
+                    all_schemas: &self.all_schemas,
+                    valid_tool_names: &mut self.valid_tool_names,
+                    turn_guard: &state.turn_guard,
+                    restricted_tools: &mut state.restricted_tools,
+                    widen_selection_pending: &mut state.widen_selection_pending,
+                    step_recorder: &mut state.step_recorder,
+                    file_context: &self.file_context,
+                    assembly_start,
+                    telem: PrepareTurnTelemetry {
+                        first_memoria_ms: &mut state.telemetry.first_memoria_ms,
+                        first_selection_report: &mut state.telemetry.first_selection_report,
+                        first_budget_pressure: &mut state.telemetry.first_budget_pressure,
+                        first_context_assembly_ms: &mut state.telemetry.first_context_assembly_ms,
+                        all_selected_skills: &mut state.telemetry.all_selected_skills,
+                        trace_collector: state.telemetry.turn_trace_collector.as_ref(),
+                    },
+                    perm_manager: self.perm_manager,
+                    pre_clear_lines: pre_clear,
+                    is_plan_subtask: self.is_plan_subtask,
+                    plan_subtask_id: self.plan_subtask_id,
+                    cancel_token: state.cancellation.token.as_deref(),
+                    plan_assemble_line_release: self.plan_assemble_line_release.clone(),
+                    stream_event_tx: self.stream_event_tx.clone(),
+                    approval_request_tx: self.approval_request_tx.clone(),
+                    ask_user_request_tx: self.ask_user_request_tx.clone(),
+                    skill_resolver: state.skills.resolver.clone(),
+                    skill_effort: state.skills.effort.as_ref().map(|e| e.to_string()),
+                    skill_agent_type: state.skills.agent_type.clone(),
+                    interaction_mode,
+                    turn_policy: &mut state.last_turn_policy,
+                    skill_allowed_tools: state
+                        .skills
+                        .allowed_tools
+                        .as_ref()
+                        .map(|s| s.iter().cloned().collect::<Vec<_>>()),
+                    skill_continuation: state.skill_produced_output,
+                    tool_cache: &mut self.tool_cache,
+                    previous_confidence_fallback: state
+                        .last_confidence_diagnosis
+                        .as_ref()
+                        .map(|d| d.fallback.clone()),
+                    round_index: state.current_round_index,
+                    session_turn: state.session_turn,
+                    turn_chain_id: state.bridge_turn_chain_id.as_deref(),
+                    user_query_event_id: state.bridge_user_query_event_id.as_deref(),
+                    observability_hub: state.telemetry.observability_hub.as_ref(),
+                    incremental_state: self.incremental_state.clone(),
+                    append_system_prompt,
+                    plan_resume_hint: task_hint.as_deref(),
+                })
+                .await
+            };
+        }
+
+        let mut turn_result = fetch_turn_sse!();
+        let stale_expected_turn = turn_result.as_ref().ok().and_then(|result| {
+            bridge_session_turn_stale_expected_turn(&result.core, state.session_turn)
+        });
+        if let Some(expected_turn) = stale_expected_turn {
+            let previous_turn = state.session_turn;
+            tracing::warn!(
+                target: "astra_cli::chat_stream",
+                previous_turn,
+                expected_turn,
+                session_id = state.current_session_id.as_deref().unwrap_or(""),
+                "bridge session_turn stale conflict; resynchronizing local turn cursor and retrying once"
+            );
+            state.session_turn = expected_turn;
+            self.chat_turn_index = expected_turn;
+            if let Some(ref collector) = state.telemetry.turn_trace_collector {
+                collector.set_turn_id(format!("turn-{expected_turn}"));
+            }
+            turn_result = fetch_turn_sse!();
+        }
 
         for name in &interaction_scoped_restrictions {
             state.restricted_tools.remove(name);

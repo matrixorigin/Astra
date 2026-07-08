@@ -873,17 +873,35 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
             "/chat/turn",
             post({
                 let state = state.clone();
-                move || {
+                move |axum::Json(request): axum::Json<serde_json::Value>| {
                     let state = state.clone();
                     async move {
                         let n = state
                             .call_count
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let body = if n == 0 {
-                            "data: {\"type\":\"session_info\",\"session_id\":\"sess-tx-e2e\",\"run_id\":\"run-sess-tx-e2e\"}\n\n\
-                             data: {\"type\":\"tool_request\",\"request_id\":\"tr-tx-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo hi\",\"transaction_id\":\"tx-e2e\",\"rollback_on_failure\":true}}\n\n\
-                             data: [DONE]\n\n"
-                                .to_string()
+                            let turn_chain_id = request
+                                .get("turn_chain_id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("chain-tx-e2e");
+                            format!(
+                                "data: {{\"type\":\"session_info\",\"session_id\":\"sess-tx-e2e\",\"run_id\":\"run-sess-tx-e2e\"}}\n\n\
+                                 data: {}\n\n\
+                                 data: [DONE]\n\n",
+                                serde_json::json!({
+                                    "type": "tool_request",
+                                    "session_id": "sess-tx-e2e",
+                                    "run_id": "run-sess-tx-e2e",
+                                    "turn_chain_id": turn_chain_id,
+                                    "request_id": "tr-tx-1",
+                                    "tool": "bash",
+                                    "args": {
+                                        "command": "echo hi",
+                                        "transaction_id": "tx-e2e",
+                                        "rollback_on_failure": true
+                                    }
+                                })
+                            )
                         } else {
                             sse_text_response("Done!", "sess-tx-e2e")
                         };
@@ -1057,15 +1075,30 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
                 move |axum::Json(body): axum::Json<serde_json::Value>| {
                     let state = state.clone();
                     async move {
+                        let turn_chain_id = body
+                            .get("turn_chain_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("chain-turn-identity")
+                            .to_string();
                         state.turn_payloads.lock().await.push(body);
                         let n = state
                             .call_count
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let response = if n == 0 {
-                            "data: {\"type\":\"session_info\",\"session_id\":\"sess-turn-identity\",\"run_id\":\"run-sess-turn-identity\"}\n\n\
-                             data: {\"type\":\"tool_request\",\"request_id\":\"tr-turn-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo hi\"}}\n\n\
-                             data: [DONE]\n\n"
-                                .to_string()
+                            format!(
+                                "data: {{\"type\":\"session_info\",\"session_id\":\"sess-turn-identity\",\"run_id\":\"run-sess-turn-identity\"}}\n\n\
+                                 data: {}\n\n\
+                                 data: [DONE]\n\n",
+                                serde_json::json!({
+                                    "type": "tool_request",
+                                    "session_id": "sess-turn-identity",
+                                    "run_id": "run-sess-turn-identity",
+                                    "turn_chain_id": turn_chain_id,
+                                    "request_id": "tr-turn-1",
+                                    "tool": "bash",
+                                    "args": {"command": "echo hi"}
+                                })
+                            )
                         } else {
                             sse_text_response("Done!", "sess-turn-identity")
                         };
@@ -1177,6 +1210,150 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
     assert_eq!(payloads.len(), 2, "expected two /chat/turn payloads");
     assert_eq!(payloads[0]["session_turn"], serde_json::json!(1));
     assert_eq!(payloads[1]["session_turn"], serde_json::json!(1));
+    assert_eq!(payloads[0]["turn_chain_id"], payloads[1]["turn_chain_id"]);
+    assert_eq!(
+        payloads[0]["user_query_event_id"],
+        payloads[1]["user_query_event_id"]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
+    #[derive(Clone)]
+    struct StreamingMockState {
+        call_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        turn_payloads: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    let state = StreamingMockState {
+        call_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        turn_payloads: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+    };
+    let app = Router::new().route(
+        "/chat/turn",
+        post({
+            let state = state.clone();
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let state = state.clone();
+                async move {
+                    state.turn_payloads.lock().await.push(body);
+                    let n = state
+                        .call_count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = if n == 0 {
+                        format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            serde_json::json!({
+                                "type": "error",
+                                "message": "explicit bridge session_turn 1 is stale for session sess-stale; expected at least 2",
+                                "error_code": "bridge_session_turn_stale",
+                                "metadata": {
+                                    "session_id": "sess-stale",
+                                    "actual_session_turn": 1,
+                                    "expected_session_turn": 2,
+                                    "turn_chain_id": "root-chain",
+                                    "user_query_event_id": "root-query"
+                                }
+                            })
+                        )
+                    } else {
+                        sse_text_response("Recovered!", "sess-stale")
+                    };
+                    ([("content-type", "text/event-stream")], response)
+                }
+            }
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
+    let mut pm = PermissionManager::new(true);
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+    let result = stream_chat_sse(ChatTurnParams {
+        api: &api,
+        token: "fake-token",
+        auth_profile: None,
+        message: "continue after interrupted turn",
+        user_intent: "continue after interrupted turn",
+        input_runtime_required_texts: &[],
+        input_runtime_volatile_texts: &[],
+        semantic_query_override: None,
+        session_id: Some("sess-stale"),
+        model_id: None,
+        model: Some("test-model"),
+        provider: None,
+        explain: ExplainMode::Off,
+        render_md: false,
+        history: &[],
+        perm_manager: &mut pm,
+        verbose_mode: false,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
+        cli_context: None,
+        recent_tools: &[],
+        activated_deferred_tool_names: None,
+        resume_restricted_tools: &[],
+        tool_health_entries: &[],
+        session_lessons: &[],
+        latest_skill_diagnosis: None,
+        latest_turn_quality_feedback: None,
+        unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
+        is_plan_subtask: false,
+        plan_subtask_id: None,
+        delegation_engine: None,
+        cancel_token: None,
+        run_control: None,
+        incremental_state: None,
+        plan_assemble_line_release: None,
+        stream_event_tx: None,
+        agent_live_event_sink: None,
+        approval_request_tx: None,
+        ask_user_request_tx: None,
+        plan_review_request_tx: None,
+        mcp_manager: None,
+        skill_quality_tracker: &mut skill_qt,
+        discovered_skills: None,
+        messaging_metrics: None,
+        agent_spawner: None,
+        root_agent_id: None,
+        root_mailbox_slot: None,
+        observability_hub: None,
+        observability_session: None,
+        file_journal: None,
+        file_state: None,
+        database_snapshot_journal: None,
+        git_stash_journal: None,
+        git_commit_journal: None,
+        git_worktree_journal: None,
+        session_state_journal: None,
+        task_manager: None,
+        task_notify_tx: None,
+        bg_task_commands: None,
+        bg_task_list_cache: None,
+        bash_detach_slot: None,
+        turn_index: DEFAULT_TURN_INDEX,
+        pipeline_state: None,
+        compaction_state: None,
+        consecutive_context_window_errors: 0,
+        idempotency_cache: None,
+        pre_loaded_messages: None,
+        append_system_prompt: None,
+        session_memory_extractor: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
+        #[cfg(feature = "harness")]
+        benchmark_profile: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.full_text, "Recovered!");
+
+    let payloads = state.turn_payloads.lock().await;
+    assert_eq!(payloads.len(), 2, "expected stale conflict plus one retry");
+    assert_eq!(payloads[0]["session_turn"], serde_json::json!(1));
+    assert_eq!(payloads[1]["session_turn"], serde_json::json!(2));
     assert_eq!(payloads[0]["turn_chain_id"], payloads[1]["turn_chain_id"]);
     assert_eq!(
         payloads[0]["user_query_event_id"],

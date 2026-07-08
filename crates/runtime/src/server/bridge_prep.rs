@@ -618,12 +618,20 @@ async fn prepare_chat_turn_bridge_identifiers(
                 .unwrap_or(inferred_session_turn)
         };
         if identity.session_turn < minimum_session_turn {
-            return Err(error_response(
+            return Err(astra_core::error_response_coded_with_metadata(
                 StatusCode::CONFLICT,
                 format!(
                     "explicit bridge session_turn {} is stale for session {}; expected at least {}",
                     identity.session_turn, session_id, minimum_session_turn
                 ),
+                "bridge_session_turn_stale",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "actual_session_turn": identity.session_turn,
+                    "expected_session_turn": minimum_session_turn,
+                    "turn_chain_id": identity.turn_chain_id.as_str(),
+                    "user_query_event_id": identity.user_query_event_id.as_str(),
+                }),
             ));
         }
         updated_entry.insert(
@@ -1498,6 +1506,18 @@ mod tests {
             "{}",
             body.0.detail
         );
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("bridge_session_turn_stale")
+        );
+        let metadata = body
+            .0
+            .metadata
+            .as_ref()
+            .expect("stale turn conflict should carry reconciliation metadata");
+        assert_eq!(metadata["actual_session_turn"], json!(1));
+        assert_eq!(metadata["expected_session_turn"], json!(2));
+        assert_eq!(metadata["session_id"], json!("bound-session"));
     }
 
     #[tokio::test]

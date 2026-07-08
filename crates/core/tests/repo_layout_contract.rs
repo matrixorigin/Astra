@@ -91,11 +91,19 @@ fn developer_guidance_uses_repo_root_workspace() {
     for relative in [
         "CLAUDE.md",
         ".claude/CLAUDE.md",
+        ".agent/skills/astra-dev/SKILL.md",
+        ".agent/skills/verify_task/SKILL.md",
+        ".claude/skills/astra-dev/SKILL.md",
+        ".claude/skills/verify_task/SKILL.md",
         "docs/testing/system-e2e-matrix.md",
     ] {
         let text = read_workspace_file(relative);
         for forbidden in [
             "cd rust",
+            "crates under rust/",
+            "from `rust/`",
+            "under `rust/`",
+            "rust/             # Cargo workspace",
             "Cargo Workspace Lives Under `rust/`",
             "Cargo workspace lives under `rust/`",
             "no Cargo.toml at repo root",

@@ -742,6 +742,45 @@ fn settlement_interruption_summary(
     interruption_state_summary(state, error_detail)
 }
 
+fn terminal_turn_evaluation(
+    state: &AgenticLoopState,
+) -> astra_turn_core::evaluation::TurnEvaluation {
+    let verdict_warning =
+        crate::server::run::lifecycle::has_turn_verdict_warning(&state.stall.verdict_events);
+    let mut eval =
+        crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds_and_telemetry(
+            &state.message,
+            &state.recent_tools,
+            &state.stall.tool_call_records,
+            state.stall.events.len(),
+            verdict_warning,
+            state.telemetry.first_budget_pressure,
+            crate::pipeline::evaluation::current_evaluation_thresholds(),
+            astra_turn_core::evaluation::TurnEvaluationTelemetry {
+                llm_rounds: Some(state.llm_rounds_completed),
+                prompt_tokens: Some(state.total_prompt),
+                first_round_prompt_tokens: None,
+                max_round_prompt_tokens: state.last_measured_prompt_tokens,
+            },
+        );
+    crate::pipeline::evaluation::apply_final_answer_relevance(
+        &mut eval,
+        &state.message,
+        &state.final_text,
+    );
+    eval
+}
+
+fn append_terminal_turn_evaluation_notice_if_needed(state: &mut AgenticLoopState) {
+    let eval = terminal_turn_evaluation(state);
+    let annotated =
+        astra_turn_core::evaluation::build_turn_evaluation_annotated_text(&state.final_text, &eval);
+    if annotated != state.final_text {
+        state.final_text = annotated;
+        state.final_text_streamed = false;
+    }
+}
+
 fn ensure_terminal_text(state: &mut AgenticLoopState) {
     if state
         .hooks
@@ -796,6 +835,8 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         }
     }
     if !state.final_text.trim().is_empty() {
+        append_terminal_turn_evaluation_notice_if_needed(state);
+
         // ── Truncation marker: finish_reason == "length" ─────────────
         // The model produced output but the API cut it off at max_tokens.
         // Append a visible marker so the user sees the text is incomplete.
@@ -1166,6 +1207,56 @@ mod tests {
                 astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
             ),
         );
+    }
+
+    #[test]
+    fn terminal_text_marks_failed_structural_evaluation_incomplete() {
+        let mut state = make_state();
+        state.message = "fix the broken build".to_string();
+        state.user_intent = state.message.clone();
+        state.final_text = "Done.".to_string();
+        state.final_text_streamed = true;
+        state.llm_rounds_completed = 40;
+        state.total_prompt = 94_900;
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "read_file".to_string(),
+                ok: false,
+                error: Some("PATH_RESOLUTION_FAILED: requested path does not exist".to_string()),
+                file_path: Some("obsolete/workspace/src/lib.rs".to_string()),
+                ..Default::default()
+            });
+
+        ensure_terminal_text(&mut state);
+
+        assert!(state.final_text.starts_with("Done."));
+        assert!(state.final_text.contains("[Turn evaluation: incomplete."));
+        assert!(state.final_text.contains("tool error rate is high"));
+        assert!(
+            !state.final_text.contains("obsolete/workspace/src/lib.rs"),
+            "terminal evaluation notice must not promote failed file paths: {}",
+            state.final_text
+        );
+        assert!(
+            !state.final_text_streamed,
+            "rendering must replay the amended terminal text"
+        );
+    }
+
+    #[test]
+    fn terminal_text_leaves_healthy_text_completion_unchanged() {
+        let mut state = make_state();
+        state.message = "explain the code style".to_string();
+        state.user_intent = state.message.clone();
+        state.final_text = "The code style is consistent.".to_string();
+        state.final_text_streamed = true;
+
+        ensure_terminal_text(&mut state);
+
+        assert_eq!(state.final_text, "The code style is consistent.");
+        assert!(state.final_text_streamed);
     }
 
     struct SessionDirGuard(std::path::PathBuf);

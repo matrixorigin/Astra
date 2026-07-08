@@ -14,6 +14,7 @@ pub const RECENT_TAIL_BLOCKER_FLOOR: u32 = 1_600;
 pub const BENCHMARK_TOOL_PREVIEW_BUDGET: u32 = 2_500;
 pub const RECENT_TAIL_BENCHMARK_FLOOR: u32 = 1_600;
 pub const SYSTEM_TOOL_SCHEMAS_MAX: u32 = 3_400;
+pub const TURN_INTENT_BENCHMARK_COMPARISON: &str = "benchmark_comparison";
 pub const DELEGATION_MAX_RENDERED_CHILDREN: usize =
     (DELEGATION_ZONE_CAP / DELEGATION_CHILD_FLOOR) as usize;
 pub const SESSION_ARTIFACT_STATUS_EXPIRED: &str = "expired";
@@ -208,7 +209,7 @@ pub struct TurnIntentBudgetAllocation {
 
 pub fn budget_for_turn_intent(turn_intent: Option<&str>) -> TurnIntentBudgetAllocation {
     let mut budget = BudgetV1_8k::standard();
-    if turn_intent == Some("benchmark_comparison") {
+    if turn_intent == Some(TURN_INTENT_BENCHMARK_COMPARISON) {
         let borrowed = budget
             .recent_tail
             .saturating_sub(RECENT_TAIL_BENCHMARK_FLOOR);

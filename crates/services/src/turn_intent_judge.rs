@@ -117,7 +117,8 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
          \n\
          scenario must be one of:\n\
            code_review, debugging, exploration, planning, implementation,\n\
-           refactoring, testing, documentation, dev_ops, learning, quick_answer\n\
+           refactoring, testing, documentation, dev_ops, learning, quick_answer,\n\
+           benchmark_comparison\n\
          \n\
          Rules:\n\
          - requested_scenario: pick the BEST single scenario the user is asking for, or null when ambiguous.\n\
@@ -353,6 +354,9 @@ fn parse_scenario(s: &str) -> Option<Scenario> {
         "dev_ops" | "devops" => Some(Scenario::DevOps),
         "learning" | "learn" => Some(Scenario::Learning),
         "quick_answer" | "quickanswer" | "quick" => Some(Scenario::QuickAnswer),
+        "benchmark_comparison" | "benchmarkcomparison" | "benchmark" => {
+            Some(Scenario::BenchmarkComparison)
+        }
         _ => None,
     }
 }
@@ -414,6 +418,7 @@ mod tests {
         assert!(prompt.contains("\"browser_verification_required\": <boolean>"));
         assert!(prompt.contains("false for ordinary continuation"));
         assert!(prompt.contains("当前的实现，能够想起来吗？"));
+        assert!(prompt.contains("benchmark_comparison"));
     }
 
     #[test]
@@ -480,6 +485,16 @@ mod tests {
             "missing workspace_mutation must fail closed"
         );
         assert!(!intent.browser_verification_required);
+    }
+
+    #[test]
+    fn parses_benchmark_comparison_scenario() {
+        let raw = r#"{"requested_scenario":"benchmark_comparison","prohibited_scenarios":[],"continuation_mode":"unknown"}"#;
+        let intent = parse_turn_intent_response(raw).unwrap();
+        assert_eq!(
+            intent.requested_scenario,
+            Some(Scenario::BenchmarkComparison)
+        );
     }
 
     #[test]
@@ -622,6 +637,7 @@ mod tests {
             ("devops", Scenario::DevOps),
             ("learn", Scenario::Learning),
             ("quick", Scenario::QuickAnswer),
+            ("benchmark", Scenario::BenchmarkComparison),
         ];
         for (alias, expected) in cases {
             let raw = format!(

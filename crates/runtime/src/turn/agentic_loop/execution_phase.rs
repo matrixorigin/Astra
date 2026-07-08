@@ -10,6 +10,7 @@ use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
     interruption_state_summary, session_turn_number, tool_record_is_workspace_mutation,
 };
+use astra_config::user_profile::Scenario;
 use astra_core::render_compact_status;
 use astra_services::{ContextManifestWrite, DatabaseContextManifestStore};
 use astra_turn_core::agentic_turn_ingest::{
@@ -383,16 +384,37 @@ fn manifest_reason_for_llm_call(state: &AgenticLoopState) -> &'static str {
     }
 }
 
-fn infer_turn_intent_for_llm_call(
-    state: &AgenticLoopState,
-    _pre_llm_messages: &[serde_json::Value],
-) -> String {
+fn infer_turn_intent_for_llm_call(state: &AgenticLoopState) -> String {
+    if let Some(intent) = state.turn_intent.as_ref()
+        && let Some(scenario) = intent
+            .requested_scenario
+            .filter(|scenario| intent.allows_scenario(*scenario))
+    {
+        return scenario_context_manifest_label(scenario).to_string();
+    }
     if state.task_profile.mutates_workspace {
         "implementation".to_string()
     } else if state.task_profile.exploratory_task {
         "exploration".to_string()
     } else {
         "normal".to_string()
+    }
+}
+
+fn scenario_context_manifest_label(scenario: Scenario) -> &'static str {
+    match scenario {
+        Scenario::CodeReview => "code_review",
+        Scenario::Debugging => "debugging",
+        Scenario::Exploration => "exploration",
+        Scenario::Planning => "planning",
+        Scenario::Implementation => "implementation",
+        Scenario::Refactoring => "refactoring",
+        Scenario::Testing => "testing",
+        Scenario::Documentation => "documentation",
+        Scenario::DevOps => "dev_ops",
+        Scenario::Learning => "learning",
+        Scenario::QuickAnswer => "quick_answer",
+        Scenario::BenchmarkComparison => astra_services::TURN_INTENT_BENCHMARK_COMPARISON,
     }
 }
 
@@ -417,7 +439,7 @@ async fn persist_context_manifest_for_llm_call(
     ) else {
         return;
     };
-    let turn_intent = infer_turn_intent_for_llm_call(state, pre_llm_messages);
+    let turn_intent = infer_turn_intent_for_llm_call(state);
     let schema_tokens = state.pinned_tool_schema_tokens.min(u64::from(u32::MAX)) as u32;
     let result_prompt_tokens = turn_result
         .map(|result| {
@@ -3426,6 +3448,69 @@ mod tests {
             alert_dispatch_session_id(Some("  session-123  ")).as_deref(),
             Some("session-123")
         );
+    }
+
+    #[test]
+    fn context_manifest_turn_intent_ignores_prompt_facing_benchmark_marker() {
+        let mut state = make_state();
+        state.message = "please compare these results [TASK_ID:bnh]".into();
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": state.message}));
+
+        assert_eq!(
+            infer_turn_intent_for_llm_call(&state),
+            "normal",
+            "prompt-facing marker text must not become control-plane turn intent"
+        );
+    }
+
+    #[test]
+    fn context_manifest_turn_intent_uses_structured_benchmark_scenario() {
+        let mut state = make_state();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_requested_scenario(Scenario::BenchmarkComparison),
+        );
+
+        assert_eq!(
+            infer_turn_intent_for_llm_call(&state),
+            astra_services::TURN_INTENT_BENCHMARK_COMPARISON
+        );
+    }
+
+    #[test]
+    fn spill_summary_does_not_promote_read_paths_into_prompt_facing_memory() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"rust/astra/src/bridge/mod.rs\"}"
+                    }
+                },
+                {
+                    "function": {
+                        "name": "str_replace",
+                        "arguments": "{\"path\":\"crates/runtime/src/bridge/mod.rs\",\"old_str\":\"a\",\"new_str\":\"b\"}"
+                    }
+                }
+            ]
+        })];
+
+        let summary = build_spill_summary(&messages);
+
+        assert!(
+            !summary.contains("rust/astra"),
+            "read-only paths must not become prompt-facing memory: {summary}"
+        );
+        assert!(
+            summary.contains("crates/runtime/src/bridge/mod.rs"),
+            "mutated files should remain visible: {summary}"
+        );
+        assert!(summary.contains("- read_file"), "{summary}");
+        assert!(summary.contains("- str_replace"), "{summary}");
     }
 
     struct SnapshotClearingHost {
@@ -6865,7 +6950,10 @@ fn build_spill_summary(messages: &[serde_json::Value]) -> String {
         None
     };
 
-    // Record a tool invocation, extracting a `path` arg when present.
+    // Record a tool invocation. Paths from read/search tools are deliberately
+    // not persisted into the prompt-facing spill summary: failed exploratory
+    // reads often contain stale or deleted paths, and promoting those into a
+    // system summary makes the next turn treat them as current workspace facts.
     let mut record_tool = |name: &str, args: &serde_json::Value| {
         let path = args.get("path").and_then(|p| p.as_str());
         if let Some(p) = path {
@@ -6875,10 +6963,8 @@ fn build_spill_summary(messages: &[serde_json::Value]) -> String {
                     files_modified.push(ps);
                 }
             }
-            tools_used.push(format!("{name}({p})"));
-        } else {
-            tools_used.push(name.to_string());
         }
+        tools_used.push(name.to_string());
     };
 
     for msg in messages {
