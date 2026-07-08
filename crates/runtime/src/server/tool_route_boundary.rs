@@ -245,6 +245,9 @@ pub(crate) fn tool_call_end_event(
         "duration_ms".to_string(),
         Value::Number(serde_json::Number::from(duration_ms)),
     );
+    if result.is_error {
+        event.insert("error".to_string(), Value::String(result.output.clone()));
+    }
     copy_result_structured_output_metadata(&mut event, result);
     copy_result_routing_metadata(&mut event, result);
     Some(event)
@@ -322,6 +325,11 @@ fn copy_result_structured_output_metadata(
                 .entry((*key).to_string())
                 .or_insert_with(|| value.clone());
         }
+    }
+    if let Some(value) = metadata.get("structuredContent") {
+        event
+            .entry("output".to_string())
+            .or_insert_with(|| value.clone());
     }
 }
 

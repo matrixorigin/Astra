@@ -913,10 +913,36 @@ fn route_boundary_tool_call_end_includes_structured_artifact_result_metadata() {
     assert_eq!(end_event["type"], "tool_call_end");
     assert_eq!(end_event["result"], "created main.go");
     assert_eq!(
+        end_event["output"]["artifacts"][0]["artifact_id"],
+        "artifact_file_1"
+    );
+    assert_eq!(
         end_event["structuredContent"]["artifacts"][0]["artifact_id"],
         "artifact_file_1"
     );
     assert_eq!(end_event["artifacts"][0]["artifact_id"], "artifact_file_1");
+}
+
+#[test]
+fn route_boundary_tool_call_end_includes_error_for_failed_result() {
+    let service = ToolExecutionService::new_for_test();
+    let mut request = request_scoped_mcp_request("mcp__moi__write_file");
+    request.args = serde_json::json!({
+        "_tool_call_id": "call-err",
+        "_run_id": "run-1",
+        "path": "main.go"
+    });
+    let boundary = service.route_boundary(request);
+
+    let result = astra_tools::ToolResult::error("permission denied".to_string());
+
+    let end_event = boundary
+        .tool_call_end_event(&result, 17)
+        .expect("tool call end event");
+    assert_eq!(end_event["type"], "tool_call_end");
+    assert_eq!(end_event["result"], "permission denied");
+    assert_eq!(end_event["success"], false);
+    assert_eq!(end_event["error"], "permission denied");
 }
 
 #[test]
