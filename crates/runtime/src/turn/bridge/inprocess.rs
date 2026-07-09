@@ -4129,7 +4129,8 @@ impl InProcessChatTurnBridge {
                             current_turn,
                             capture_model,
                             &feedback,
-                        );
+                        )
+                        .with_api_calls_total(bridge_pipeline_baseline.stats.api_calls);
                     if let Ok(payload) = serde_json::to_value(&feedback_evt) {
                         buf.record(
                             astra_services::session_journal::JournalEvent::pipeline_feedback(

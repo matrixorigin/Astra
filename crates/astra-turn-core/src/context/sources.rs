@@ -64,6 +64,11 @@ pub struct ContextChannelPolicy {
     pub suppressed: std::collections::HashSet<&'static str>,
     /// Minimum turn index before any channel activates (global gate).
     pub min_turn: Option<u32>,
+    /// Skip the stable/dynamic cache-scope partition: every section is
+    /// returned in provider-registration (arrival) order through the dynamic
+    /// lane. Sections keep their declared scope and bucket. Ablation arm for
+    /// ordering experiments; `false` in production.
+    pub arrival_order: bool,
 }
 
 impl ContextChannelPolicy {
@@ -103,7 +108,9 @@ impl ChannelAssembler {
 
     /// Collect sections from all allowed providers.
     ///
-    /// Returns `(stable_sections, dynamic_sections)` partitioned by cache scope.
+    /// Returns `(stable_sections, dynamic_sections)` partitioned by cache
+    /// scope. When the policy sets `arrival_order`, the partition is skipped:
+    /// all sections come back in the dynamic lane in registration order.
     #[must_use]
     pub fn assemble(&self, turn_index: u32) -> (Vec<PromptSection>, Vec<PromptSection>) {
         let mut stable = Vec::new();
@@ -116,6 +123,10 @@ impl ChannelAssembler {
                 // Provider declares scope; override section's scope + bucket
                 section.scope = provider.cache_scope();
                 section.token_bucket = provider.token_bucket();
+                if self.policy.arrival_order {
+                    dynamic.push(section);
+                    continue;
+                }
                 match provider.cache_scope() {
                     CacheScope::Global | CacheScope::Session => stable.push(section),
                     CacheScope::None => dynamic.push(section),

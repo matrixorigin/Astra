@@ -10,13 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction_types::CompactionTier;
 use crate::context_binder::bind_all;
-use crate::context_optimizer::{ContextOptimized, optimize_with_spill};
-use crate::context_planner::{ContextPlan, PlanInput, plan_turn};
+use crate::context_optimizer::{ContextOptimized, SkippedOptimization, optimize_with_spill};
+use crate::context_planner::{ContextPlan, PlanInput, plan_turn_with_policy};
 use crate::context_pressure::ContextPressure;
 use crate::context_serializer::{SerializedProviderRequest, serialize_provider_request};
 use crate::context_sources::ContextSources;
 use crate::optimize_limits::OptimizeLimits;
-use crate::pipeline_config::PipelineConfig;
+use crate::pipeline_config::{AssemblerMode, PipelineConfig};
 use crate::recovery_state::RecoveryState;
 use crate::session_latches::SessionLatches;
 use crate::spill_backend::SpillBackend;
@@ -99,7 +99,7 @@ impl ContextPipeline {
             model_id: input.model_id,
             query_source: input.query_source,
         };
-        let plan = plan_turn(&plan_input);
+        let plan = plan_turn_with_policy(&plan_input, &self.config.plan_policy);
         timings.push(PipelinePhaseTiming::elapsed("plan", started));
 
         let started = Instant::now();
@@ -109,15 +109,36 @@ impl ContextPipeline {
         let started = Instant::now();
         let spill_backend: Option<&dyn SpillBackend> =
             input.sources.external.spill_backend.as_deref();
-        let optimized = optimize_with_spill(
+        // Flat baseline: every gate forced closed regardless of caller limits,
+        // so sections keep bind order and no transformation runs.
+        let flat_mode = self.config.assembler_mode == AssemblerMode::Flat;
+        let flat_limits = OptimizeLimits::all_closed();
+        let effective_limits = if flat_mode {
+            &flat_limits
+        } else {
+            input.optimize_limits
+        };
+        let mut optimized = optimize_with_spill(
             &plan,
             bound,
             input.latches,
             provider_policy,
-            input.optimize_limits,
+            effective_limits,
             input.sources.turn.turn_index,
             spill_backend,
         );
+        if flat_mode {
+            // A naive assembler emits no cache markers; record the suppression
+            // so the trace shows what the structured path would have placed.
+            let suppressed = optimized.cache_markers.len();
+            optimized.cache_markers.clear();
+            optimized.stats.skipped.push(SkippedOptimization {
+                step: "assembler_mode".into(),
+                reason: format!(
+                    "flat mode: gates forced closed, {suppressed} cache marker(s) suppressed"
+                ),
+            });
+        }
         timings.push(PipelinePhaseTiming::elapsed("optimize", started));
 
         let started = Instant::now();
@@ -130,6 +151,7 @@ impl ContextPipeline {
             pressure: plan.pressure,
             compact_tier: plan.compact_tier,
             skipped_optimizations: optimized.stats.skipped.len() as u32,
+            ptl_errors_total: input.sources.stats.ptl_errors_total,
         };
 
         Ok(PipelineRunOutput {
@@ -168,6 +190,9 @@ pub struct PipelineExplain {
     pub pressure: ContextPressure,
     pub compact_tier: CompactionTier,
     pub skipped_optimizations: u32,
+    /// Cumulative prompt-too-long errors for the session as of this turn.
+    #[serde(default)]
+    pub ptl_errors_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +224,13 @@ pub struct PipelineRunMetrics {
     pub cache_markers: u32,
     pub tokens_cleared: u32,
     pub avg_cache_hit_ratio: f64,
+    /// Sections spilled to the spill backend this turn.
+    #[serde(default)]
+    pub spilled: u32,
+    /// Cumulative API responses recorded before this turn (explicit call
+    /// counter — no longer inferred from capture files).
+    #[serde(default)]
+    pub api_calls_total: u64,
 }
 
 impl PipelineRunMetrics {
@@ -220,6 +252,8 @@ impl PipelineRunMetrics {
             cache_markers: optimized.cache_markers.len() as u32,
             tokens_cleared: optimized.stats.tokens_cleared,
             avg_cache_hit_ratio: input.sources.stats.avg_cache_hit_ratio,
+            spilled: optimized.spilled.len() as u32,
+            api_calls_total: input.sources.stats.api_calls,
         }
     }
 }

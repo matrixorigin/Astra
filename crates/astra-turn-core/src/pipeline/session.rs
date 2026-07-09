@@ -219,6 +219,10 @@ impl PipelineSession {
             metrics,
         } = self.pipeline.run(run_input)?;
 
+        // Track predictive pressure across turns for spike detection
+        // (feeds the `pressure_spike` alert rule).
+        self.stats.record_plan_pressure(plan.pressure.value);
+
         let output = TurnOutput {
             plan,
             optimized,
@@ -316,6 +320,10 @@ impl PipelineSession {
         }
 
         self.stats.record(model_id, query_source, feedback);
+        // Sync emergent-context cap evictions so the `emergent_overflow`
+        // alert rule sees the per-turn delta.
+        self.stats
+            .note_emergent_evictions(self.emergent.cap_evictions_total);
         self.recovery.process_feedback(feedback.was_truncated);
 
         if feedback.was_truncated
@@ -350,6 +358,7 @@ impl PipelineSession {
     /// Record a prompt-too-long error (no successful response).
     pub fn record_ptl_error(&mut self) {
         self.recovery.record_ptl_error();
+        self.stats.record_ptl_error();
     }
 
     /// Record that a reactive compaction was attempted.
@@ -393,9 +402,21 @@ impl PipelineSession {
 
     /// Build optimize limits that respond to compaction cascade detection.
     /// When a cascade is active, suppress tool_result_clearing to break the loop.
+    ///
+    /// Precedence: flat assembler mode forces `all_closed()`; an explicit
+    /// `limits_override` in the config replaces the tier-derived limits;
+    /// otherwise limits derive from the current pressure tier. Cascade
+    /// suppression applies on top of override/tier limits.
     #[must_use]
     pub fn cascade_aware_limits(&self, model_limit: u32) -> OptimizeLimits {
-        let mut limits = OptimizeLimits::for_tier(self.current_pressure_tier(), model_limit);
+        let config = self.pipeline.config();
+        if config.assembler_mode == crate::pipeline_config::AssemblerMode::Flat {
+            return OptimizeLimits::all_closed();
+        }
+        let mut limits = match &config.limits_override {
+            Some(overridden) => overridden.clone(),
+            None => OptimizeLimits::for_tier(self.current_pressure_tier(), model_limit),
+        };
         if self.stats.has_compaction_cascade() {
             limits.allow_tool_result_clearing = false;
         }
@@ -750,6 +771,151 @@ mod tests {
         let output = sess.run_turn(input).expect("should not abort");
         assert_eq!(output.metrics.turn_index, 1);
         assert!(output.explain.phase_timings.len() == 4);
+    }
+
+    #[test]
+    fn flat_mode_forces_gates_closed_and_suppresses_markers() {
+        use crate::pipeline_config::AssemblerMode;
+
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context(); // anthropic policy → markers
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+
+        let run = |sess: &mut PipelineSession| {
+            let turn = test_turn_state(1);
+            let input = TurnInput {
+                statics: &statics,
+                agent: &agent,
+                session: &session,
+                turn: &turn,
+                external: &external,
+                optimize_limits: &limits,
+                model_id: "claude-sonnet-4-6",
+                query_source: "repl",
+            };
+            sess.run_turn(input).expect("should not abort")
+        };
+
+        let mut structured = PipelineSession::new(PipelineConfig::default());
+        let structured_out = run(&mut structured);
+        assert!(
+            !structured_out.optimized.cache_markers.is_empty(),
+            "anthropic policy should place markers on the structured path"
+        );
+
+        let mut flat = PipelineSession::new(PipelineConfig {
+            assembler_mode: AssemblerMode::Flat,
+            ..Default::default()
+        });
+        let flat_out = run(&mut flat);
+        assert!(
+            flat_out.optimized.cache_markers.is_empty(),
+            "flat mode must emit no cache markers"
+        );
+        assert_eq!(flat_out.metrics.cache_markers, 0);
+        assert!(
+            flat_out
+                .optimized
+                .stats
+                .skipped
+                .iter()
+                .any(|s| s.step == "assembler_mode"),
+            "marker suppression must be visible in the skipped-optimization trace"
+        );
+        // cascade_aware_limits (the adaptive entry's limit source) collapses
+        // to all_closed under flat mode.
+        assert!(!flat.cascade_aware_limits(200_000).any_open());
+    }
+
+    #[test]
+    fn ptl_counter_is_cumulative_across_recovery_resets() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        sess.record_ptl_error();
+
+        // Successful feedback clears consecutive errors but not the total.
+        let mut feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
+        sess.record_feedback("model", "repl", &mut feedback, None);
+        assert_eq!(sess.recovery.consecutive_ptl_errors, 0);
+
+        sess.record_ptl_error();
+        assert_eq!(sess.recovery.consecutive_ptl_errors, 1);
+        assert_eq!(sess.stats.ptl_errors_total, 2);
+
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let turn = test_turn_state(2);
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+        let input = TurnInput {
+            statics: &statics,
+            agent: &agent,
+            session: &session,
+            turn: &turn,
+            external: &external,
+            optimize_limits: &limits,
+            model_id: "claude-sonnet-4-6",
+            query_source: "repl",
+        };
+        let output = sess.run_turn(input).expect("should not abort");
+        assert_eq!(
+            output.explain.ptl_errors_total, 2,
+            "explain must carry the cumulative PTL counter"
+        );
+    }
+
+    #[test]
+    fn api_call_counter_increments_and_flows_to_metrics() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        for _ in 0..2 {
+            let mut feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
+            sess.record_feedback("model", "repl", &mut feedback, None);
+        }
+        assert_eq!(sess.stats.api_calls, 2);
+
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let session = test_session_context();
+        let turn = test_turn_state(3);
+        let external = test_external();
+        let limits = OptimizeLimits::default();
+        let input = TurnInput {
+            statics: &statics,
+            agent: &agent,
+            session: &session,
+            turn: &turn,
+            external: &external,
+            optimize_limits: &limits,
+            model_id: "claude-sonnet-4-6",
+            query_source: "repl",
+        };
+        let output = sess.run_turn(input).expect("should not abort");
+        assert_eq!(
+            output.metrics.api_calls_total, 2,
+            "metrics must expose the explicit call counter"
+        );
+    }
+
+    #[test]
+    fn limits_override_replaces_tier_limits() {
+        let custom = OptimizeLimits {
+            allow_reorder: true,
+            max_reorder_moves: 7,
+            ..OptimizeLimits::all_closed()
+        };
+        let sess = PipelineSession::new(PipelineConfig {
+            limits_override: Some(custom),
+            ..Default::default()
+        });
+        let limits = sess.cascade_aware_limits(200_000);
+        assert!(limits.allow_reorder);
+        assert_eq!(limits.max_reorder_moves, 7);
+        assert!(
+            !limits.allow_spill,
+            "override taken verbatim, not tier-derived"
+        );
     }
 
     #[test]

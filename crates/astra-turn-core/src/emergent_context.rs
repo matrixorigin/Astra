@@ -36,6 +36,10 @@ pub struct EmergentContext {
     pub tool_summaries: Vec<EmergentItem<ToolUseSummary>>,
     /// Attachment-style context from tool execution side-effects. Cap: 16.
     pub attachments: Vec<EmergentItem<Attachment>>,
+    /// Cumulative items dropped because a list was at capacity. Feeds the
+    /// `emergent_overflow` alert rule via `PipelineStats`.
+    #[serde(default)]
+    pub cap_evictions_total: u64,
 }
 
 const SKILL_CAP: usize = 4;
@@ -45,19 +49,23 @@ const ATTACHMENT_CAP: usize = 16;
 
 impl EmergentContext {
     pub fn push_skill(&mut self, item: EmergentItem<DiscoveredSkill>) {
-        push_with_dedup_and_cap(&mut self.discovered_skills, item, SKILL_CAP);
+        let evicted = push_with_dedup_and_cap(&mut self.discovered_skills, item, SKILL_CAP);
+        self.cap_evictions_total = self.cap_evictions_total.saturating_add(evicted);
     }
 
     pub fn push_memory(&mut self, item: EmergentItem<PrefetchedMemory>) {
-        push_with_dedup_and_cap(&mut self.prefetched_memory, item, MEMORY_CAP);
+        let evicted = push_with_dedup_and_cap(&mut self.prefetched_memory, item, MEMORY_CAP);
+        self.cap_evictions_total = self.cap_evictions_total.saturating_add(evicted);
     }
 
     pub fn push_summary(&mut self, item: EmergentItem<ToolUseSummary>) {
-        push_with_dedup_and_cap(&mut self.tool_summaries, item, SUMMARY_CAP);
+        let evicted = push_with_dedup_and_cap(&mut self.tool_summaries, item, SUMMARY_CAP);
+        self.cap_evictions_total = self.cap_evictions_total.saturating_add(evicted);
     }
 
     pub fn push_attachment(&mut self, item: EmergentItem<Attachment>) {
-        push_with_dedup_and_cap(&mut self.attachments, item, ATTACHMENT_CAP);
+        let evicted = push_with_dedup_and_cap(&mut self.attachments, item, ATTACHMENT_CAP);
+        self.cap_evictions_total = self.cap_evictions_total.saturating_add(evicted);
     }
 
     /// Drain items within TTL, clearing consumed items from this context.
@@ -71,6 +79,9 @@ impl EmergentContext {
             prefetched_memory: drain_live_items(&mut self.prefetched_memory, current_turn, max_age),
             tool_summaries: drain_live_items(&mut self.tool_summaries, current_turn, max_age),
             attachments: drain_live_items(&mut self.attachments, current_turn, max_age),
+            // Session-cumulative; stays on `self` and rides along in the
+            // returned snapshot for observability.
+            cap_evictions_total: self.cap_evictions_total,
         }
     }
 
@@ -84,20 +95,29 @@ impl EmergentContext {
     }
 }
 
-fn push_with_dedup_and_cap<T>(list: &mut Vec<EmergentItem<T>>, item: EmergentItem<T>, cap: usize) {
+/// Push with dedup + cap enforcement. Returns the number of items evicted
+/// to make room (0 when the item was deduped or the list had capacity).
+fn push_with_dedup_and_cap<T>(
+    list: &mut Vec<EmergentItem<T>>,
+    item: EmergentItem<T>,
+    cap: usize,
+) -> u64 {
     // Dedup: reject if same hash already exists
     if list
         .iter()
         .any(|existing| existing.content_hash == item.content_hash)
     {
-        return;
+        return 0;
     }
     // Cap: drop oldest if at capacity. Caps are deliberately tiny (<=16), so
     // Vec::remove(0) keeps the API simple without material runtime cost.
+    let mut evicted = 0u64;
     while list.len() >= cap {
         list.remove(0);
+        evicted += 1;
     }
     list.push(item);
+    evicted
 }
 
 fn drain_live_items<T: Clone>(
@@ -179,6 +199,32 @@ mod tests {
         // Oldest (skill_0) should have been dropped
         assert_eq!(ctx.discovered_skills[0].value.skill_name, "skill_1");
         assert_eq!(ctx.discovered_skills[3].value.skill_name, "skill_4");
+    }
+
+    #[test]
+    fn cap_evictions_are_counted_and_dedup_is_not() {
+        let mut ctx = EmergentContext::default();
+        for i in 0..5 {
+            ctx.push_skill(make_skill(&format!("skill_{i}"), 1, i as u64));
+        }
+        assert_eq!(ctx.cap_evictions_total, 1, "one item over the cap of 4");
+
+        // Duplicate hash is rejected without counting as an eviction.
+        ctx.push_skill(make_skill("dup", 1, 4));
+        assert_eq!(ctx.cap_evictions_total, 1);
+
+        // Summary cap is 1, so every additional summary evicts.
+        for i in 0..3 {
+            ctx.push_summary(make_item(
+                ToolUseSummary {
+                    summary: format!("s{i}"),
+                    tool_calls_covered: 1,
+                },
+                1,
+                100 + i as u64,
+            ));
+        }
+        assert_eq!(ctx.cap_evictions_total, 3);
     }
 
     #[test]

@@ -17,6 +17,30 @@ pub const PRESSURE_COMPACT_HISTORY: f64 = 0.75;
 /// Pressure threshold above which aggressive pruning engages.
 pub const PRESSURE_AGGRESSIVE_PRUNE: f64 = 0.90;
 
+/// Pressure thresholds at which each compaction tier activates.
+///
+/// Defaults to the shared constants (`PRESSURE_TRIM_SCHEMAS`,
+/// `PRESSURE_COMPACT_HISTORY`, `PRESSURE_AGGRESSIVE_PRUNE`). Configurable
+/// through `PipelineConfig::plan_policy` so threshold-policy experiments can
+/// shift the ladder without touching the selection logic.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TierThresholds {
+    pub trim_schemas: f64,
+    pub compact_history: f64,
+    pub aggressive_prune: f64,
+}
+
+impl Default for TierThresholds {
+    fn default() -> Self {
+        Self {
+            trim_schemas: PRESSURE_TRIM_SCHEMAS,
+            compact_history: PRESSURE_COMPACT_HISTORY,
+            aggressive_prune: PRESSURE_AGGRESSIVE_PRUNE,
+        }
+    }
+}
+
 /// Select the compaction tier from a raw or predictive pressure value.
 ///
 /// Thresholds are defined as constants (`PRESSURE_TRIM_SCHEMAS`,
@@ -24,11 +48,17 @@ pub const PRESSURE_AGGRESSIVE_PRUNE: f64 = 0.90;
 /// the microcompact layer to eliminate comment-only alignment.
 #[must_use]
 pub fn select_compaction_tier(pressure: f64) -> CompactionTier {
-    if pressure >= PRESSURE_AGGRESSIVE_PRUNE {
+    select_compaction_tier_with(&TierThresholds::default(), pressure)
+}
+
+/// Tier selection against an explicit threshold ladder.
+#[must_use]
+pub fn select_compaction_tier_with(thresholds: &TierThresholds, pressure: f64) -> CompactionTier {
+    if pressure >= thresholds.aggressive_prune {
         CompactionTier::AggressivePrune
-    } else if pressure >= PRESSURE_COMPACT_HISTORY {
+    } else if pressure >= thresholds.compact_history {
         CompactionTier::CompactHistory
-    } else if pressure >= PRESSURE_TRIM_SCHEMAS {
+    } else if pressure >= thresholds.trim_schemas {
         CompactionTier::TrimSchemas
     } else {
         CompactionTier::Normal
@@ -40,8 +70,22 @@ pub fn select_compaction_tier(pressure: f64) -> CompactionTier {
 /// a temporarily inflated reserve estimate from under-compacting.
 #[must_use]
 pub fn select_tier_gated(raw_pressure: f64, predictive_pressure: f64) -> CompactionTier {
-    let raw_tier = select_compaction_tier(raw_pressure);
-    let predictive_tier = select_compaction_tier(predictive_pressure);
+    select_tier_gated_with(
+        &TierThresholds::default(),
+        raw_pressure,
+        predictive_pressure,
+    )
+}
+
+/// Gated tier selection against an explicit threshold ladder.
+#[must_use]
+pub fn select_tier_gated_with(
+    thresholds: &TierThresholds,
+    raw_pressure: f64,
+    predictive_pressure: f64,
+) -> CompactionTier {
+    let raw_tier = select_compaction_tier_with(thresholds, raw_pressure);
+    let predictive_tier = select_compaction_tier_with(thresholds, predictive_pressure);
     raw_tier.max(predictive_tier)
 }
 
@@ -205,6 +249,40 @@ mod tests {
         // Gated should escalate to CompactHistory
         let tier2 = select_tier_gated(0.55, 0.80);
         assert_eq!(tier2, CompactionTier::CompactHistory);
+    }
+
+    #[test]
+    fn custom_thresholds_shift_the_ladder() {
+        let shifted = TierThresholds {
+            trim_schemas: 0.50,
+            compact_history: 0.65,
+            aggressive_prune: 0.80,
+        };
+        // 0.55 is Normal on the default ladder but TrimSchemas on the shifted one.
+        assert_eq!(select_compaction_tier(0.55), CompactionTier::Normal);
+        assert_eq!(
+            select_compaction_tier_with(&shifted, 0.55),
+            CompactionTier::TrimSchemas
+        );
+        // 0.82 is CompactHistory by default, AggressivePrune when shifted.
+        assert_eq!(select_compaction_tier(0.82), CompactionTier::CompactHistory);
+        assert_eq!(
+            select_compaction_tier_with(&shifted, 0.82),
+            CompactionTier::AggressivePrune
+        );
+        // Gated variant honors the same ladder and never de-escalates.
+        assert_eq!(
+            select_tier_gated_with(&shifted, 0.55, 0.40),
+            CompactionTier::TrimSchemas
+        );
+    }
+
+    #[test]
+    fn default_thresholds_match_shared_constants() {
+        let t = TierThresholds::default();
+        assert_eq!(t.trim_schemas, PRESSURE_TRIM_SCHEMAS);
+        assert_eq!(t.compact_history, PRESSURE_COMPACT_HISTORY);
+        assert_eq!(t.aggressive_prune, PRESSURE_AGGRESSIVE_PRUNE);
     }
 
     #[test]

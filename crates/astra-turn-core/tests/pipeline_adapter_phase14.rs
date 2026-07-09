@@ -143,6 +143,7 @@ fn pipeline_output_flattened_matches_concatenation_of_blocks() {
 
     let mut sess = PipelineSession::new(PipelineConfig {
         provider_policy: ProviderCachePolicy::anthropic(),
+        ..Default::default()
     });
 
     let input = TurnInput {
@@ -184,6 +185,7 @@ fn pipeline_to_anthropic_message_format() {
 
     let mut sess = PipelineSession::new(PipelineConfig {
         provider_policy: ProviderCachePolicy::anthropic(),
+        ..Default::default()
     });
 
     let input = TurnInput {
