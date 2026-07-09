@@ -76,6 +76,7 @@ fn make_turn_state(turn_index: u32, message_count: usize) -> TurnState {
 fn ten_turn_session_lifecycle() {
     let config = PipelineConfig {
         provider_policy: ProviderCachePolicy::anthropic(),
+        ..Default::default()
     };
     let mut sess = PipelineSession::new(config);
     let statics = StaticSections::test_default();
@@ -133,6 +134,7 @@ fn ten_turn_session_lifecycle() {
 fn warm_start_from_serialized_stats() {
     let config = PipelineConfig {
         provider_policy: ProviderCachePolicy::anthropic(),
+        ..Default::default()
     };
 
     let mut first_session = PipelineSession::new(config.clone());
@@ -193,6 +195,7 @@ fn ptl_error_recovery_and_abort() {
 fn shadow_mode_produces_deterministic_output() {
     let config = PipelineConfig {
         provider_policy: ProviderCachePolicy::anthropic(),
+        ..Default::default()
     };
     let mut sess = PipelineSession::new(config);
     let statics = StaticSections::test_default();
@@ -270,6 +273,7 @@ fn full_lifecycle_with_emergent_and_latches() {
 
     let config = PipelineConfig {
         provider_policy: ProviderCachePolicy::anthropic(),
+        ..Default::default()
     };
     let mut sess = PipelineSession::new(config);
 

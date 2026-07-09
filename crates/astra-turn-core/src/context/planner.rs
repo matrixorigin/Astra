@@ -8,10 +8,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compaction_types::CompactionTier;
-use crate::context_budget::{TokenBudget, select_tier_gated};
+use crate::context_budget::{TokenBudget, select_compaction_tier_with, select_tier_gated_with};
 use crate::context_pressure::{ContextPressure, ContextReserves};
 use crate::microcompact::PromptCacheProtocol;
-use crate::pipeline_config::ProviderCachePolicy;
+use crate::pipeline_config::{PlanPolicy, PressureMode, ProviderCachePolicy};
 use crate::pipeline_stats::PipelineStats;
 use crate::recovery_state::RecoveryState;
 use crate::section_types::{
@@ -59,14 +59,26 @@ pub struct PlanInput<'a> {
 /// Plan a turn: compute pressure, select tier, allocate budgets, choose cache strategy.
 ///
 /// This is a pure function with no I/O. It produces a `ContextPlan` that
-/// the Bind and Optimize phases will execute.
+/// the Bind and Optimize phases will execute. Uses the default
+/// [`PlanPolicy`] (predictive pressure, production thresholds/percentiles).
 #[must_use]
 pub fn plan_turn(input: &PlanInput<'_>) -> ContextPlan {
+    plan_turn_with_policy(input, &PlanPolicy::default())
+}
+
+/// Plan a turn under an explicit decision policy.
+///
+/// The policy carries the deterministic knobs (pressure mode, tier
+/// thresholds, reserve percentiles); the input carries the observed state.
+/// `plan_turn(input)` is equivalent to passing `PlanPolicy::default()`.
+#[must_use]
+pub fn plan_turn_with_policy(input: &PlanInput<'_>, policy: &PlanPolicy) -> ContextPlan {
     // 1. Compute reserves from historical response data
-    let reserves = input.stats.response_token_estimates.reserve_for(
+    let reserves = input.stats.response_token_estimates.reserve_for_with(
         input.model_id,
         input.query_source,
         input.recovery,
+        policy.reserve_percentiles,
     );
 
     // 2. Compute raw and predictive pressure
@@ -76,9 +88,18 @@ pub fn plan_turn(input: &PlanInput<'_>) -> ContextPlan {
         reserves,
     );
 
-    // 3. Select compaction tier (gated: predictive can escalate, not de-escalate)
-    let tier =
-        select_tier_gated(pressure.raw, pressure.value).escalate_for_recovery(input.recovery);
+    // 3. Select compaction tier. Predictive mode gates on max(raw, predictive)
+    //    so prediction can escalate but never de-escalate; reactive mode reads
+    //    raw pressure only (predictive is still computed and traced).
+    let ungated = match policy.pressure_mode {
+        PressureMode::Predictive => {
+            select_tier_gated_with(&policy.tier_thresholds, pressure.raw, pressure.value)
+        }
+        PressureMode::Reactive => {
+            select_compaction_tier_with(&policy.tier_thresholds, pressure.raw)
+        }
+    };
+    let tier = ungated.escalate_for_recovery(input.recovery);
 
     // 4. Allocate token budgets per section
     let section_history = input.stats.section_token_history();
@@ -298,6 +319,73 @@ mod tests {
         let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
         let plan = plan_turn(&input);
         assert!(plan.compact_tier >= CompactionTier::CompactHistory);
+    }
+
+    #[test]
+    fn reactive_mode_ignores_predictive_escalation() {
+        use crate::context_feedback::ContextFeedback;
+        use crate::pipeline_config::PlanPolicy;
+
+        // Large observed completions make the reserve estimate big enough
+        // that predictive pressure crosses TrimSchemas while raw stays Normal.
+        let (mut tokens, recovery, latches, mut stats, policy) = default_input();
+        for _ in 0..10 {
+            let fb = ContextFeedback::from_usage(1_000, 0, 0, 30_000, false);
+            stats
+                .response_token_estimates
+                .record("test-model", "repl", &fb);
+        }
+        tokens.prompt = 55_000; // raw = 0.55 (Normal)
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+
+        let predictive_plan = plan_turn(&input); // default policy = Predictive
+        assert!(
+            predictive_plan.pressure.value >= 0.60,
+            "test setup must push predictive pressure over the TrimSchemas threshold, got {}",
+            predictive_plan.pressure.value
+        );
+        assert!(
+            predictive_plan.compact_tier > CompactionTier::Normal,
+            "predictive mode should escalate on predicted pressure"
+        );
+
+        let reactive = PlanPolicy {
+            pressure_mode: PressureMode::Reactive,
+            ..PlanPolicy::default()
+        };
+        let reactive_plan = plan_turn_with_policy(&input, &reactive);
+        assert_eq!(
+            reactive_plan.compact_tier,
+            CompactionTier::Normal,
+            "reactive mode must select the tier from raw pressure only"
+        );
+        // Predictive pressure is still computed for the trace.
+        assert!(reactive_plan.pressure.value >= 0.60);
+        assert_eq!(reactive_plan.pressure.raw, predictive_plan.pressure.raw);
+    }
+
+    #[test]
+    fn plan_policy_custom_thresholds_apply() {
+        use crate::context_budget::TierThresholds;
+        use crate::pipeline_config::PlanPolicy;
+
+        let (mut tokens, recovery, latches, stats, policy) = default_input();
+        tokens.prompt = 55_000; // raw = 0.55: Normal by default ladder
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+
+        let shifted = PlanPolicy {
+            tier_thresholds: TierThresholds {
+                trim_schemas: 0.50,
+                compact_history: 0.65,
+                aggressive_prune: 0.80,
+            },
+            ..PlanPolicy::default()
+        };
+        let plan = plan_turn_with_policy(&input, &shifted);
+        assert!(
+            plan.compact_tier >= CompactionTier::TrimSchemas,
+            "shifted ladder should activate TrimSchemas at 0.55 raw pressure"
+        );
     }
 
     #[test]

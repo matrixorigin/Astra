@@ -130,8 +130,45 @@ pub fn evaluate_alerts(
         }
     }
 
+    // Rule 7: Pressure spike — predictive pressure jumped >= 0.20 in one turn.
+    // A single turn adding a fifth of the window usually means an oversized
+    // tool result or attachment slipped in; worth surfacing before the
+    // compaction ladder has to absorb it.
+    if let Some((previous, current)) = stats.pressure_delta_pair() {
+        let delta = current - previous;
+        if delta >= PRESSURE_SPIKE_DELTA {
+            alerts.push(TraceAlert {
+                severity: AlertSeverity::Warning,
+                rule: "pressure_spike".into(),
+                message: format!(
+                    "Predictive pressure jumped {:.2} -> {:.2} (+{:.2}) in one turn.",
+                    previous, current, delta,
+                ),
+                turn,
+            });
+        }
+    }
+
+    // Rule 8: Emergent overflow — the TTL+dedup+cap guardrails evicted items
+    // since the last feedback cycle, i.e. Execute produced more emergent
+    // context than the caps admit; the next Bind silently lost candidates.
+    if stats.emergent_evictions_last_turn > 0 {
+        alerts.push(TraceAlert {
+            severity: AlertSeverity::Warning,
+            rule: "emergent_overflow".into(),
+            message: format!(
+                "{} emergent item(s) evicted at list cap since the previous turn.",
+                stats.emergent_evictions_last_turn,
+            ),
+            turn,
+        });
+    }
+
     alerts
 }
+
+/// One-turn predictive-pressure jump that fires the `pressure_spike` rule.
+pub const PRESSURE_SPIKE_DELTA: f64 = 0.20;
 
 #[cfg(test)]
 mod tests {
@@ -277,5 +314,64 @@ mod tests {
         let recovery = RecoveryState::default();
         let alerts = evaluate_alerts(4, "model-a", &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "predictive_miss"));
+    }
+
+    #[test]
+    fn pressure_spike_alert_on_one_turn_jump() {
+        let f = make_feedback(800, 200);
+        let mut stats = PipelineStats {
+            turns_executed: 5,
+            avg_cache_hit_ratio: 0.75,
+            ..Default::default()
+        };
+        stats.record_plan_pressure(0.45);
+        stats.record_plan_pressure(0.70); // +0.25 in one turn
+        let alerts = evaluate_alerts(6, &f, &stats, &RecoveryState::default());
+        assert!(alerts.iter().any(|a| a.rule == "pressure_spike"));
+    }
+
+    #[test]
+    fn no_pressure_spike_on_gradual_growth() {
+        let f = make_feedback(800, 200);
+        let mut stats = PipelineStats {
+            turns_executed: 5,
+            avg_cache_hit_ratio: 0.75,
+            ..Default::default()
+        };
+        stats.record_plan_pressure(0.45);
+        stats.record_plan_pressure(0.55); // +0.10 — below the spike delta
+        let alerts = evaluate_alerts(6, &f, &stats, &RecoveryState::default());
+        assert!(!alerts.iter().any(|a| a.rule == "pressure_spike"));
+    }
+
+    #[test]
+    fn no_pressure_spike_with_fewer_than_two_samples() {
+        let f = make_feedback(800, 200);
+        let mut stats = PipelineStats {
+            turns_executed: 1,
+            avg_cache_hit_ratio: 0.75,
+            ..Default::default()
+        };
+        stats.record_plan_pressure(0.90);
+        let alerts = evaluate_alerts(1, &f, &stats, &RecoveryState::default());
+        assert!(!alerts.iter().any(|a| a.rule == "pressure_spike"));
+    }
+
+    #[test]
+    fn emergent_overflow_alert_on_cap_evictions() {
+        let f = make_feedback(800, 200);
+        let mut stats = PipelineStats {
+            turns_executed: 5,
+            avg_cache_hit_ratio: 0.75,
+            ..Default::default()
+        };
+        stats.note_emergent_evictions(3); // 3 new evictions since last sync
+        let alerts = evaluate_alerts(6, &f, &stats, &RecoveryState::default());
+        assert!(alerts.iter().any(|a| a.rule == "emergent_overflow"));
+
+        // Next cycle with no new evictions must not re-alert.
+        stats.note_emergent_evictions(3);
+        let alerts = evaluate_alerts(7, &f, &stats, &RecoveryState::default());
+        assert!(!alerts.iter().any(|a| a.rule == "emergent_overflow"));
     }
 }

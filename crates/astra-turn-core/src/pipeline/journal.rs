@@ -33,6 +33,11 @@ pub struct PipelineJournalEvent {
     pub cache_hit_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u64>,
+    /// Prompt tokens not served from cache (`prompt - cache_read`), the
+    /// "fresh/miss" quantity used in billed-cost decomposition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub fresh_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,6 +48,10 @@ pub struct PipelineJournalEvent {
     pub model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_break_reason: Option<String>,
+    /// Cumulative API responses recorded for this session (explicit counter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub api_calls_total: Option<u64>,
 
     // Alert fields
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,6 +79,12 @@ impl PipelineJournalEvent {
             turn,
             cache_hit_ratio: Some(feedback.cache_hit_ratio),
             prompt_tokens: Some(feedback.tokens.prompt),
+            fresh_tokens: Some(
+                feedback
+                    .tokens
+                    .prompt
+                    .saturating_sub(feedback.tokens.cache_read),
+            ),
             cache_read_tokens: Some(feedback.tokens.cache_read),
             cache_creation_tokens: Some(feedback.tokens.cache_creation),
             completion_tokens: Some(feedback.tokens.completion),
@@ -78,6 +93,7 @@ impl PipelineJournalEvent {
                 .cache_break_detected
                 .as_ref()
                 .map(ToString::to_string),
+            api_calls_total: None,
             alert_rule: None,
             alert_severity: None,
             alert_message: None,
@@ -85,6 +101,13 @@ impl PipelineJournalEvent {
             items_affected: None,
             tokens_freed: None,
         }
+    }
+
+    /// Attach the session's cumulative API-call counter to a feedback event.
+    #[must_use]
+    pub fn with_api_calls_total(mut self, api_calls_total: u64) -> Self {
+        self.api_calls_total = Some(api_calls_total);
+        self
     }
 
     /// Create an alert event from a trace alert.
@@ -95,11 +118,13 @@ impl PipelineJournalEvent {
             turn: alert.turn,
             cache_hit_ratio: None,
             prompt_tokens: None,
+            fresh_tokens: None,
             cache_read_tokens: None,
             cache_creation_tokens: None,
             completion_tokens: None,
             model_id: None,
             cache_break_reason: None,
+            api_calls_total: None,
             alert_rule: Some(alert.rule.clone()),
             alert_severity: Some(format!("{:?}", alert.severity)),
             alert_message: Some(alert.message.clone()),
@@ -122,11 +147,13 @@ impl PipelineJournalEvent {
             turn,
             cache_hit_ratio: None,
             prompt_tokens: None,
+            fresh_tokens: None,
             cache_read_tokens: None,
             cache_creation_tokens: None,
             completion_tokens: None,
             model_id: None,
             cache_break_reason: None,
+            api_calls_total: None,
             alert_rule: None,
             alert_severity: None,
             alert_message: None,
@@ -152,6 +179,19 @@ mod tests {
         assert_eq!(evt.cache_creation_tokens, Some(200));
         assert_eq!(evt.completion_tokens, Some(500));
         assert_eq!(evt.model_id.as_deref(), Some("claude"));
+        assert_eq!(
+            evt.fresh_tokens,
+            Some(200),
+            "fresh = prompt(1000) - cache_read(800)"
+        );
+        assert_eq!(evt.api_calls_total, None);
+    }
+
+    #[test]
+    fn feedback_event_carries_api_call_counter() {
+        let fb = ContextFeedback::from_usage(1000, 800, 200, 500, false);
+        let evt = PipelineJournalEvent::from_feedback(3, "claude", &fb).with_api_calls_total(42);
+        assert_eq!(evt.api_calls_total, Some(42));
     }
 
     #[test]

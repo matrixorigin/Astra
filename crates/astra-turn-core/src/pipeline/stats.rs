@@ -114,6 +114,27 @@ mod estimator_buckets_serde {
     }
 }
 
+/// Percentiles the reserve estimator reads in steady state vs. recovery.
+///
+/// Defaults to p75 steady / p95 recovery. Configurable through
+/// `PipelineConfig::plan_policy` so reserve-percentile sweeps can vary the
+/// policy without touching estimator state.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReservePercentiles {
+    pub steady: f64,
+    pub recovery: f64,
+}
+
+impl Default for ReservePercentiles {
+    fn default() -> Self {
+        Self {
+            steady: 0.75,
+            recovery: 0.95,
+        }
+    }
+}
+
 impl ResponseTokenEstimator {
     /// Create with a default floor reserve.
     #[must_use]
@@ -143,14 +164,26 @@ impl ResponseTokenEstimator {
         source: &str,
         recovery: &RecoveryState,
     ) -> ContextReserves {
+        self.reserve_for_with(model, source, recovery, ReservePercentiles::default())
+    }
+
+    /// Compute reserves for the next turn against an explicit percentile policy.
+    #[must_use]
+    pub fn reserve_for_with(
+        &self,
+        model: &str,
+        source: &str,
+        recovery: &RecoveryState,
+        percentiles: ReservePercentiles,
+    ) -> ContextReserves {
         let key = EstimatorKey {
             model_id: model.to_string(),
             query_source: source.to_string(),
         };
         let p = if recovery.is_in_recovery() {
-            0.95
+            percentiles.recovery
         } else {
-            0.75
+            percentiles.steady
         };
         let output_tokens = self
             .buckets
@@ -224,6 +257,21 @@ pub struct PipelineStats {
     /// Count of observed content changes per section kind.
     #[serde(with = "section_churn_serde")]
     pub section_churns: HashMap<crate::section_types::SectionKind, u32>,
+    /// Cumulative API responses recorded (one per `record()` call). Unlike
+    /// `turns_executed` this is an explicit call counter for cost accounting,
+    /// not a pressure-tier denominator.
+    pub api_calls: u64,
+    /// Cumulative prompt-too-long errors across the session (never reset,
+    /// unlike `RecoveryState::consecutive_ptl_errors`).
+    pub ptl_errors_total: u64,
+    /// Predictive pressure of recent turns (ring, newest last). Feeds the
+    /// `pressure_spike` alert rule.
+    pub recent_pressures: Vec<f64>,
+    /// Emergent-context cap evictions observed as of the last feedback sync.
+    pub emergent_evictions_seen: u64,
+    /// Emergent-context cap evictions that occurred since the previous
+    /// feedback sync. Feeds the `emergent_overflow` alert rule.
+    pub emergent_evictions_last_turn: u64,
 }
 
 mod section_ema_serde {
@@ -329,7 +377,49 @@ impl Default for PipelineStats {
             section_usage_ema: HashMap::new(),
             section_fingerprints: HashMap::new(),
             section_churns: HashMap::new(),
+            api_calls: 0,
+            ptl_errors_total: 0,
+            recent_pressures: Vec::new(),
+            emergent_evictions_seen: 0,
+            emergent_evictions_last_turn: 0,
         }
+    }
+}
+
+impl PipelineStats {
+    /// Maximum retained recent pressure samples (spike detection needs 2).
+    const MAX_RECENT_PRESSURES: usize = 8;
+
+    /// Record the predictive pressure the planner computed for this turn.
+    /// Called once per `run_turn`, before feedback arrives.
+    pub fn record_plan_pressure(&mut self, predictive: f64) {
+        if self.recent_pressures.len() >= Self::MAX_RECENT_PRESSURES {
+            self.recent_pressures.remove(0);
+        }
+        self.recent_pressures.push(predictive);
+    }
+
+    /// The two most recent predictive pressures as (previous, current),
+    /// if at least two turns have been planned.
+    #[must_use]
+    pub fn pressure_delta_pair(&self) -> Option<(f64, f64)> {
+        let n = self.recent_pressures.len();
+        if n < 2 {
+            return None;
+        }
+        Some((self.recent_pressures[n - 2], self.recent_pressures[n - 1]))
+    }
+
+    /// Record a prompt-too-long error (cumulative; never reset).
+    pub fn record_ptl_error(&mut self) {
+        self.ptl_errors_total = self.ptl_errors_total.saturating_add(1);
+    }
+
+    /// Sync the emergent-context cap-eviction counter, computing the delta
+    /// since the previous sync. Called once per feedback cycle.
+    pub fn note_emergent_evictions(&mut self, total: u64) {
+        self.emergent_evictions_last_turn = total.saturating_sub(self.emergent_evictions_seen);
+        self.emergent_evictions_seen = total;
     }
 }
 
@@ -337,6 +427,7 @@ impl PipelineStats {
     /// Record feedback from a completed turn.
     pub fn record(&mut self, model: &str, source: &str, feedback: &ContextFeedback) {
         self.turns_executed += 1;
+        self.api_calls = self.api_calls.saturating_add(1);
 
         // Exponential moving average for cache hit ratio
         let alpha = if self.turns_executed <= 1 { 1.0 } else { 0.1 };

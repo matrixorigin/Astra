@@ -1256,6 +1256,7 @@ mod tests {
 
         let mut sess = PipelineSession::new(PipelineConfig {
             provider_policy: ci.session.provider_policy.clone(),
+            ..Default::default()
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
@@ -1307,6 +1308,7 @@ mod tests {
 
         let mut sess = PipelineSession::new(PipelineConfig {
             provider_policy: ci.session.provider_policy.clone(),
+            ..Default::default()
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
@@ -1355,6 +1357,7 @@ mod tests {
 
         let mut sess = PipelineSession::new(PipelineConfig {
             provider_policy: ci.session.provider_policy.clone(),
+            ..Default::default()
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
@@ -1397,6 +1400,7 @@ mod tests {
 
         let mut sess = PipelineSession::new(PipelineConfig {
             provider_policy: ci.session.provider_policy.clone(),
+            ..Default::default()
         });
         let output = sess
             .run_turn_adaptive(AdaptiveTurnInput {
@@ -1470,6 +1474,7 @@ mod tests {
         let ci = build_composite_inputs(&state, &ep_with, "anthropic", "claude-sonnet-4-6", "hi");
         let mut sess = PipelineSession::new(PipelineConfig {
             provider_policy: ci.session.provider_policy.clone(),
+            ..Default::default()
         });
         let out_with = sess
             .run_turn_adaptive(AdaptiveTurnInput {
@@ -1496,6 +1501,7 @@ mod tests {
             build_composite_inputs(&state, &ep_without, "anthropic", "claude-sonnet-4-6", "hi");
         let mut sess2 = PipelineSession::new(PipelineConfig {
             provider_policy: ci2.session.provider_policy.clone(),
+            ..Default::default()
         });
         let out_without = sess2
             .run_turn_adaptive(AdaptiveTurnInput {
@@ -1994,6 +2000,36 @@ mod tests {
             2,
             "turn_budget + active_skill_names → 2 dynamic"
         );
+    }
+
+    #[test]
+    fn assembler_arrival_order_skips_partition_and_preserves_registration_order() {
+        // Same mixed-scope providers as the partitioning test, interleaved
+        // Session/None so ordering is observable.
+        let providers: Vec<Box<dyn astra_turn_core::context_sources::ContextChannelProvider>> = vec![
+            Box::new(super::SkillListingProvider {
+                content: "skills".into(),
+            }), // Session
+            Box::new(super::TurnBudgetProvider {
+                remaining_turns: 5,
+                max_turns: 10,
+            }), // None
+            Box::new(super::CacheStrategyProvider), // Session
+        ];
+        let policy = ContextChannelPolicy {
+            arrival_order: true,
+            ..ContextChannelPolicy::default()
+        };
+        let assembler = ChannelAssembler::new(providers, policy);
+        let (stable, dynamic) = assembler.assemble(0);
+        assert!(stable.is_empty(), "arrival order bypasses the stable lane");
+        assert_eq!(dynamic.len(), 3, "all sections flow through dynamic");
+        assert!(dynamic[0].text.contains("skills"));
+        assert!(dynamic[1].text.contains("5"), "turn budget second");
+        assert!(dynamic[2].text.contains("Execution Strategy"));
+        // Scope declarations survive even though the partition is skipped.
+        assert_eq!(dynamic[0].scope, CacheScope::Session);
+        assert_eq!(dynamic[1].scope, CacheScope::None);
     }
 
     #[test]

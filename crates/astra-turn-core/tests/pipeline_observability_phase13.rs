@@ -29,6 +29,7 @@ fn pipeline_explain_serializes_to_trace_compatible_json() {
         },
         compact_tier: CompactionTier::TrimSchemas,
         skipped_optimizations: 2,
+        ptl_errors_total: 0,
     };
 
     let json = serde_json::to_value(&explain).unwrap();

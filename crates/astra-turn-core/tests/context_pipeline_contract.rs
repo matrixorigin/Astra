@@ -129,6 +129,7 @@ fn context_pipeline_serializes_provider_request_and_metrics() {
     };
     let pipeline = ContextPipeline::new(PipelineConfig {
         provider_policy: session.provider_policy.clone(),
+        ..Default::default()
     });
     let run = pipeline
         .run(PipelineRunInput {
@@ -327,6 +328,7 @@ fn pipeline_aborts_on_consecutive_ptl_errors() {
     };
     let pipeline = ContextPipeline::new(PipelineConfig {
         provider_policy: session.provider_policy.clone(),
+        ..Default::default()
     });
     let result = pipeline.run(PipelineRunInput {
         sources: &sources,
@@ -364,6 +366,7 @@ fn serialized_output_format_system_blocks_are_well_structured() {
     };
     let pipeline = ContextPipeline::new(PipelineConfig {
         provider_policy: session.provider_policy.clone(),
+        ..Default::default()
     });
     let run = pipeline
         .run(PipelineRunInput {

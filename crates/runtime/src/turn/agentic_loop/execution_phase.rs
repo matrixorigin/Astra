@@ -1274,8 +1274,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 // Per-turn feedback event
                 let feedback_evt =
                     astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
-                        turn, model_id, &feedback,
-                    );
+                        turn, &model_id, &feedback,
+                    )
+                    .with_api_calls_total(pipeline_sess.stats.api_calls);
                 if let Ok(payload) = serde_json::to_value(&feedback_evt) {
                     buf.record(
                         astra_services::session_journal::JournalEvent::pipeline_feedback(

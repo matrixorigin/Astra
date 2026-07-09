@@ -225,6 +225,7 @@ pub use pipeline::metrics as pipeline_metrics;
 pub use pipeline::session as pipeline_session;
 pub use pipeline::session_serde as pipeline_session_serde;
 pub use pipeline::stats as pipeline_stats;
+pub use pipeline::trace_export as pipeline_trace_export;
 
 // Re-exports: fork_* → fork::*
 pub use fork::cache_event as fork_cache_event;
