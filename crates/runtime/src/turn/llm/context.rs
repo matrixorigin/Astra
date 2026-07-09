@@ -66,27 +66,36 @@ pub(crate) fn cache_capability_from_model_metadata(
 }
 
 fn estimate_json_tokens(value: &Value) -> u32 {
-    (estimate_json_chars(value) as u32 / 4).saturating_add(1)
+    estimate_json_tokens_u64(value).min(u32::MAX as u64) as u32
 }
 
-fn estimate_json_chars(value: &Value) -> usize {
+fn estimate_json_tokens_u64(value: &Value) -> u64 {
     match value {
-        Value::Null => 4,
-        Value::Bool(true) => 4,
-        Value::Bool(false) => 5,
-        Value::Number(number) => number.to_string().len(),
-        Value::String(text) => text.len().saturating_add(2),
+        Value::Null => 1,
+        Value::Bool(_) => 1,
+        Value::Number(number) => u64::from(
+            astra_turn_core::section_types::estimate_text_tokens(&number.to_string()).max(1),
+        ),
+        Value::String(text) => {
+            u64::from(astra_turn_core::section_types::estimate_text_tokens(text).saturating_add(1))
+        }
         Value::Array(items) => {
-            let commas = items.len().saturating_sub(1);
-            2 + commas + items.iter().map(estimate_json_chars).sum::<usize>()
+            let structural_tokens = 1_u64;
+            items
+                .iter()
+                .map(estimate_json_tokens_u64)
+                .fold(structural_tokens, u64::saturating_add)
         }
         Value::Object(map) => {
-            let commas = map.len().saturating_sub(1);
-            2 + commas
-                + map
-                    .iter()
-                    .map(|(key, value)| key.len().saturating_add(3) + estimate_json_chars(value))
-                    .sum::<usize>()
+            let structural_tokens = 1_u64;
+            map.iter()
+                .map(|(key, value)| {
+                    u64::from(
+                        astra_turn_core::section_types::estimate_text_tokens(key).saturating_add(1),
+                    )
+                    .saturating_add(estimate_json_tokens_u64(value))
+                })
+                .fold(structural_tokens, u64::saturating_add)
         }
     }
 }
@@ -105,7 +114,7 @@ fn session_memory_injection(
     Some(astra_turn_core::context_assembly_trace::MemoryInjection {
         memory_id: "session-memory".into(),
         memory_type: source.clone(),
-        tokens: (entry.content.chars().count() as u32 / 4).saturating_add(1),
+        tokens: astra_turn_core::section_types::estimate_text_tokens(&entry.content).max(1),
         relevance_score: session_memory_relevance_score(&source),
         content_preview: astra_turn_core::context_assembly_trace::preview_snippet(
             &entry.content,
@@ -1346,6 +1355,7 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
         input.model_name,
         input.thinking,
         input.cache_capability,
+        input.cache_cfg,
     );
     apply_bridge_message_cache_metadata(
         &mut messages,
@@ -1361,8 +1371,8 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
 ///
 /// The bridge currently compacts and mutates its message vector inline. This
 /// helper centralizes the cache-sensitive tail rule shared with
-/// [`assemble_wire_messages`]: runtime control text must live on a structured
-/// runtime system tail, not be spliced into user turns.
+/// [`assemble_wire_messages`]: runtime control text must stay out of
+/// post-prefix system messages and ride the provider-valid tail suffix.
 pub(crate) fn finalize_bridge_wire_messages(
     llm_messages: &mut Vec<Value>,
     volatile_text: Option<String>,
@@ -1371,6 +1381,7 @@ pub(crate) fn finalize_bridge_wire_messages(
     model_name: &str,
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    cache_cfg: &PromptCacheConfig,
 ) -> Option<usize> {
     let reasoning_policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
         llm_messages,
@@ -1407,24 +1418,35 @@ pub(crate) fn finalize_bridge_wire_messages(
     }
     let text = runtime_parts.join("\n\n");
     if !text.is_empty() {
-        if let Some(runtime_message) =
-            crate::turn::wire_assembly::required_runtime_preamble_message(&text)
-        {
-            let tail_role = llm_messages
-                .last()
-                .and_then(|m| m.get("role").and_then(Value::as_str));
-            if tail_role == Some("tool") {
-                synthetic_tail_prefix_end = Some(llm_messages.len());
-                llm_messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": "Understood.",
-                }));
-            } else {
-                synthetic_tail_prefix_end = Some(llm_messages.len());
+        let tail_role = llm_messages
+            .last()
+            .and_then(|m| m.get("role").and_then(Value::as_str));
+        if tail_role == Some("user") {
+            let tail_index = llm_messages.len().saturating_sub(1);
+            if let Some(tail) = llm_messages.last_mut() {
+                crate::turn::wire_assembly::append_volatile_to_tail_user_message(
+                    tail,
+                    &text,
+                    cache_cfg.should_annotate(),
+                );
             }
-            llm_messages.push(runtime_message);
+            synthetic_tail_prefix_end = Some(tail_index);
+        } else if tail_role == Some("tool") {
+            synthetic_tail_prefix_end = Some(llm_messages.len());
+            llm_messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": "Understood.",
+            }));
+            llm_messages.push(serde_json::json!({
+                "role": "user",
+                "content": text,
+            }));
         } else {
-            synthetic_tail_prefix_end = None;
+            synthetic_tail_prefix_end = Some(llm_messages.len());
+            llm_messages.push(serde_json::json!({
+                "role": "user",
+                "content": text,
+            }));
         }
     }
     synthetic_tail_prefix_end
@@ -1460,11 +1482,16 @@ pub(crate) fn augment_manifest_trace_with_wire(
             })
         })
         .collect();
-    let estimated_message_tokens = messages.iter().map(estimate_json_tokens).sum::<u32>();
-    let estimated_conversation_tokens = conversation_messages
+    let estimated_message_tokens: u64 = messages
         .iter()
         .map(estimate_json_tokens)
-        .sum::<u32>();
+        .map(u64::from)
+        .sum();
+    let estimated_conversation_tokens: u64 = conversation_messages
+        .iter()
+        .map(estimate_json_tokens)
+        .map(u64::from)
+        .sum();
 
     if let Some(trace_obj) = trace.as_object_mut() {
         trace_obj.insert(
@@ -1522,6 +1549,37 @@ mod context_cache_contract_tests {
             .iter()
             .filter_map(|tool| tool_name(tool).map(str::to_string))
             .collect()
+    }
+
+    #[test]
+    fn estimate_json_tokens_does_not_discount_dense_unicode_text() {
+        let message = json!({
+            "role": "user",
+            "content": "你好世界🚀🔥💻"
+        });
+
+        let estimate = estimate_json_tokens(&message);
+        let content_floor = astra_turn_core::section_types::estimate_text_tokens("你好世界🚀🔥💻");
+
+        assert!(
+            estimate >= content_floor,
+            "json estimate must preserve the shared text-token floor: estimate={estimate}, floor={content_floor}"
+        );
+    }
+
+    #[test]
+    fn session_memory_injection_uses_shared_unicode_token_estimate() {
+        let entry = astra_turn_core::context_sources::MemoryEntry::new("你好世界🚀🔥💻")
+            .with_source("session_memory.reanchor");
+
+        let injection =
+            session_memory_injection(Some(&entry)).expect("non-empty memory entry should inject");
+
+        assert_eq!(
+            injection.tokens,
+            astra_turn_core::section_types::estimate_text_tokens(&entry.content).max(1)
+        );
+        assert_eq!(injection.relevance_score, 1.0);
     }
 
     #[test]
@@ -1864,17 +1922,25 @@ mod context_cache_contract_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(user_text.contains("相关的测试够硬核吗"));
-        assert!(!user_text.contains("[active-turn-frame:v1]"));
         assert_eq!(messages[3]["role"], "user");
-        assert_eq!(messages[3]["content"], "相关的测试够硬核吗？");
-        assert_eq!(messages[4]["role"], "system");
-        let runtime_system = message_text(&messages[4]);
+        let tail_user = message_text(&messages[3]);
         assert!(
-            runtime_system.contains("[active-turn-frame:v1]"),
-            "runtime goal frame must be visible in the runtime system frame"
+            tail_user.starts_with("相关的测试够硬核吗？"),
+            "real user content must remain first: {tail_user}"
         );
-        assert!(runtime_system.contains("\"turn_id\":7"));
-        assert!(runtime_system.contains("\"round_id\":3"));
+        assert!(
+            tail_user.contains("[active-turn-frame:v1]"),
+            "runtime goal frame must be visible in the protocol-valid tail suffix"
+        );
+        assert!(tail_user.contains("\"turn_id\":7"));
+        assert!(tail_user.contains("\"round_id\":3"));
+        assert!(
+            messages
+                .iter()
+                .skip(1)
+                .all(|message| message.get("role").and_then(Value::as_str) != Some("system")),
+            "wire messages must not introduce post-prefix system messages: {messages:#?}"
+        );
         let system_text = messages
             .iter()
             .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
@@ -1882,8 +1948,8 @@ mod context_cache_contract_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            system_text.contains("[active-turn-frame:v1]"),
-            "active-turn runtime context must use the system control lane"
+            !system_text.contains("[active-turn-frame:v1]"),
+            "active-turn runtime context must not mutate the stable system lane"
         );
         assert!(
             state.volatile_pending.is_empty(),
@@ -2165,16 +2231,14 @@ mod context_cache_contract_tests {
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
+            &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
         assert_eq!(messages[0]["content"], "original user");
         assert_eq!(messages[3]["role"], "assistant");
         assert_eq!(messages[3]["content"], "Understood.");
-        assert_eq!(messages[4]["role"], "system");
+        assert_eq!(messages[4]["role"], "user");
         assert_eq!(messages[4]["content"], "volatile");
-        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
-            &messages[4]
-        ));
     }
 
     #[test]
@@ -2203,6 +2267,7 @@ mod context_cache_contract_tests {
             "us.anthropic.claude-haiku-4-5-20251001-v1:0",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
+            &cache_cfg,
         );
         apply_bridge_message_cache_metadata(
             &mut messages,
@@ -2272,25 +2337,24 @@ mod context_cache_contract_tests {
             session_id: "sess",
         });
 
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["content"][0]["text"], "compacted retry");
-        assert_eq!(messages[2]["content"], "required retry runtime");
-        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
-            &messages[2]
-        ));
+        assert_eq!(messages[1]["role"], "user");
+        let content_blocks = messages[1]["content"].as_array().expect("content blocks");
+        assert_eq!(content_blocks[0]["text"], "compacted retry");
+        assert_eq!(content_blocks[1]["text"], "required retry runtime");
         assert!(
-            astra_turn_core::context_serializer::message_has_cache_control(&messages[1]),
-            "retry wire rebuild must reapply cache metadata after replacing the compacted tail"
+            content_blocks[0].get("cache_control").is_some(),
+            "retry wire rebuild must mark the real user text before the runtime suffix"
         );
         assert!(
-            !astra_turn_core::context_serializer::message_has_cache_control(&messages[2]),
-            "synthetic runtime tail must stay outside the cache-marked prefix"
+            content_blocks[1].get("cache_control").is_none(),
+            "runtime suffix must stay outside the cache-marked block"
         );
     }
 
     #[test]
-    fn finalize_bridge_wire_messages_appends_runtime_system_tail_when_user_available() {
+    fn finalize_bridge_wire_messages_appends_runtime_suffix_when_user_available() {
         let mut messages = vec![json!({"role": "user", "content": "original user"})];
 
         let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
@@ -2301,21 +2365,19 @@ mod context_cache_contract_tests {
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
+            &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
-        assert_eq!(synthetic_tail_prefix_end, Some(1));
-        assert_eq!(messages.len(), 2);
+        assert_eq!(synthetic_tail_prefix_end, Some(0));
+        assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
-        assert_eq!(messages[0]["content"], "original user");
-        assert_eq!(messages[1]["role"], "system");
-        assert_eq!(messages[1]["content"], "volatile");
-        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
-            &messages[1]
-        ));
+        let tail_text = message_text(&messages[0]);
+        assert!(tail_text.starts_with("original user"));
+        assert!(tail_text.contains("volatile"));
     }
 
     #[test]
-    fn finalize_bridge_wire_messages_keeps_runtime_wrapper_out_of_user_content() {
+    fn finalize_bridge_wire_messages_keeps_runtime_wrapper_after_user_content() {
         let mut messages = vec![json!({"role": "user", "content": "original user"})];
 
         finalize_bridge_wire_messages(
@@ -2326,15 +2388,13 @@ mod context_cache_contract_tests {
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
+            &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["content"], "original user");
-        assert_eq!(messages[1]["role"], "system");
-        assert_eq!(
-            messages[1]["content"],
-            "<system-reminder>\nvolatile</system-reminder>"
-        );
+        assert_eq!(messages.len(), 1);
+        let tail_text = message_text(&messages[0]);
+        assert!(tail_text.starts_with("original user"));
+        assert!(tail_text.contains("<system-reminder>\nvolatile</system-reminder>"));
     }
 
     #[test]
@@ -2349,6 +2409,7 @@ mod context_cache_contract_tests {
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
+            &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
         assert!(synthetic_tail_prefix_end.is_none());
@@ -2370,6 +2431,7 @@ mod context_cache_contract_tests {
             "deepseek-v4-flash",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
+            &PromptCacheConfig::latch("openai", "deepseek-v4-flash"),
         );
 
         assert!(synthetic_tail_prefix_end.is_none());
@@ -2389,17 +2451,16 @@ mod context_cache_contract_tests {
             "deepseek-v4-flash",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
+            &PromptCacheConfig::latch("openai", "deepseek-v4-flash"),
         );
 
-        assert_eq!(synthetic_tail_prefix_end, Some(1));
-        assert_eq!(messages.len(), 2);
+        assert_eq!(synthetic_tail_prefix_end, Some(0));
+        assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
-        assert_eq!(messages[0]["content"], "original user");
-        assert_eq!(messages[1]["role"], "system");
-        assert_eq!(messages[1]["content"], "required resume context");
-        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
-            &messages[1]
-        ));
+        let tail_text = message_text(&messages[0]);
+        assert!(tail_text.starts_with("original user"));
+        assert!(tail_text.contains("required resume context"));
+        assert!(!tail_text.contains("best effort volatile"));
     }
 
     #[test]
@@ -2420,6 +2481,7 @@ mod context_cache_contract_tests {
             "gpt-4o",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             Some(explicit),
+            &PromptCacheConfig::latch("openai", "gpt-4o"),
         );
 
         assert!(synthetic_tail_prefix_end.is_none());

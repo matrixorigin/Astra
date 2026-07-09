@@ -355,12 +355,11 @@ fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
 }
 
 fn estimate_tool_schema_tokens(tools: &[Value]) -> u64 {
-    // Provider tokenizers differ, but UTF-8 bytes / 4 is the same coarse
-    // estimator used elsewhere in the manifest path. The important invariant
-    // is not exact accounting; it is that each LLM call's manifest records a
-    // non-zero, queryable tool-schema budget when tools were actually exposed.
+    // Provider tokenizers differ; the important invariant is not exact
+    // accounting, it is that each LLM call's manifest records a non-zero,
+    // queryable tool-schema budget when tools were actually exposed.
     serde_json::to_string(tools)
-        .map(|value| value.len().div_ceil(4) as u64)
+        .map(|value| u64::from(astra_turn_core::section_types::estimate_text_tokens(&value)))
         .unwrap_or(0)
 }
 
@@ -4261,7 +4260,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     async fn judge_turn_intent(
         &mut self,
         state: &AgenticLoopState,
-    ) -> Option<astra_config::user_profile::TurnIntent> {
+    ) -> crate::turn::agentic_loop::host::TurnIntentJudgeOutcome {
         let has_prior_assistant_turn = state
             .messages
             .iter()
@@ -4273,14 +4272,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let user_intent = state.runtime_decision_user_intent();
 
         if let Some(judge) = self.turn_intent_judge.as_ref() {
-            return crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
-                judge.as_ref(),
-                &user_intent,
-                turn_count,
-                &state.recent_tools,
-                has_prior_assistant_turn,
-            )
-            .await;
+            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(
+                crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
+                    judge.as_ref(),
+                    &user_intent,
+                    turn_count,
+                    &state.recent_tools,
+                    has_prior_assistant_turn,
+                )
+                .await,
+            );
         }
 
         if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
@@ -4290,19 +4291,23 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 reason,
                 "turn intent judge skipped by capacity policy"
             );
-            return None;
+            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable;
         }
 
-        let client = self.turn_intent_summary_client(state).await?;
+        let Some(client) = self.turn_intent_summary_client(state).await else {
+            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable;
+        };
         let judge = SummaryClientTurnIntentJudge { client };
-        crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
-            &judge,
-            &user_intent,
-            turn_count,
-            &state.recent_tools,
-            has_prior_assistant_turn,
+        crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(
+            crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
+                &judge,
+                &user_intent,
+                turn_count,
+                &state.recent_tools,
+                has_prior_assistant_turn,
+            )
+            .await,
         )
-        .await
     }
 
     async fn judge_skill_auto_route(
@@ -6024,20 +6029,21 @@ mod tests {
 
     fn test_dispatch_identity(
         user_id: &str,
+        session_id: &str,
         request_id: &str,
     ) -> astra_services::multi_agent::EdgeDispatchIdentity {
         astra_services::multi_agent::EdgeDispatchIdentity::new(
             user_id,
-            "test-session",
+            session_id,
             "test-run",
             "test-chain",
             request_id,
         )
     }
 
-    fn tool_callback_key(user_id: &str, request_id: &str) -> String {
+    fn tool_callback_key(user_id: &str, session_id: &str, request_id: &str) -> String {
         astra_turn_core::edge_ledger::tool_callback_key(&test_dispatch_identity(
-            user_id, request_id,
+            user_id, session_id, request_id,
         ))
     }
 
@@ -6053,14 +6059,14 @@ mod tests {
         }
     }
 
-    fn approval_allow_entry(request_id: &str) -> Value {
+    fn approval_allow_entry(session_id: &str, request_id: &str) -> Value {
         json!({
             "kind": "approval_respond",
             "body": astra_thin_client::ApprovalRespondRequest {
                 request_id: request_id.to_string(),
                 decision: astra_thin_client::ApprovalDecision::Allow,
                 reason: None,
-                session_id: "test-session".to_string(),
+                session_id: session_id.to_string(),
                 run_id: "test-run".to_string(),
                 tool_name: None,
                 approval_kind: None,
@@ -6068,16 +6074,17 @@ mod tests {
         })
     }
 
-    fn test_approval_key(user_id: &str, request_id: &str) -> String {
-        approval_callback_key(user_id, "test-session", "test-run", request_id)
+    fn test_approval_key(user_id: &str, session_id: &str, request_id: &str) -> String {
+        approval_callback_key(user_id, session_id, "test-run", request_id)
     }
 
     fn test_approval_audit_context(
         user_id: &str,
+        session_id: &str,
     ) -> astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
         astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
             user_id: user_id.to_string(),
-            session_id: "test-session".to_string(),
+            session_id: session_id.to_string(),
             run_id: "test-run".to_string(),
             turn: 1,
             agent_id: None,
@@ -8791,7 +8798,7 @@ mod tests {
         )
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
-        host.set_approval_audit_context(test_approval_audit_context("u-batch"));
+        host.set_approval_audit_context(test_approval_audit_context("u-batch", "s-batch"));
         // Register write_file as a valid tool so the edge ledger delivery path admits it.
         host.install_runtime_tool_schemas(vec![json!({
             "type": "function",
@@ -8819,23 +8826,23 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
-                test_approval_key("u-batch", "w1"),
-                approval_allow_entry("w1"),
+                test_approval_key("u-batch", "s-batch", "w1"),
+                approval_allow_entry("s-batch", "w1"),
             );
             guard.insert(
-                test_approval_key("u-batch", "w2"),
-                approval_allow_entry("w2"),
+                test_approval_key("u-batch", "s-batch", "w2"),
+                approval_allow_entry("s-batch", "w2"),
             );
             drop(guard);
 
             tokio::time::sleep(Duration::from_millis(10)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
-                tool_callback_key("u-batch", "w1"),
+                tool_callback_key("u-batch", "s-batch", "w1"),
                 json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-a"}}),
             );
             guard.insert(
-                tool_callback_key("u-batch", "w2"),
+                tool_callback_key("u-batch", "s-batch", "w2"),
                 json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-b"}}),
             );
         });
@@ -8891,14 +8898,17 @@ mod tests {
             "r1",
         );
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
-            identity.session_id.clone(),
-            identity.run_id.clone(),
-            identity.turn_chain_id.clone(),
-            "r1".to_string(),
-            "edge-1".to_string(),
-            "completed".to_string(),
-            "from dispatch".to_string(),
-            17,
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                request_id: "r1".to_string(),
+                edge_agent_id: "edge-1".to_string(),
+                status: "completed".to_string(),
+                output: "from dispatch".to_string(),
+                duration_ms: 17,
+                tool_result_fields: None,
+            },
         );
         let result_json = serde_json::to_string(&body).expect("serialize tool result");
         let host = ServerAgenticLoopHostBuilder::new(
@@ -8984,7 +8994,7 @@ mod tests {
             "transport": "edge_ws",
         }));
         host.edge_callback_ledger.lock().await.insert(
-            tool_callback_key("u-edge-meta", "r1"),
+            tool_callback_key("u-edge-meta", "s-edge-meta", "r1"),
             json!({"body": {"request_id": "r1", "status": "ok", "output": "read-a"}}),
         );
         let tool_calls = vec![json!({
@@ -9043,7 +9053,7 @@ mod tests {
                 }
             }),
         ]);
-        host.set_approval_audit_context(test_approval_audit_context("u-mixed"));
+        host.set_approval_audit_context(test_approval_audit_context("u-mixed", "s-mixed"));
         let ledger = host.edge_callback_ledger.clone();
         let tool_calls = vec![
             json!({
@@ -9071,32 +9081,32 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                tool_callback_key("u-mixed", "r1"),
+                tool_callback_key("u-mixed", "s-mixed", "r1"),
                 json!({"body": {"request_id": "r1", "status": "ok", "output": "read-a"}}),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                test_approval_key("u-mixed", "w1"),
-                approval_allow_entry("w1"),
+                test_approval_key("u-mixed", "s-mixed", "w1"),
+                approval_allow_entry("s-mixed", "w1"),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                tool_callback_key("u-mixed", "w1"),
+                tool_callback_key("u-mixed", "s-mixed", "w1"),
                 json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-b"}}),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                tool_callback_key("u-mixed", "r2"),
+                tool_callback_key("u-mixed", "s-mixed", "r2"),
                 json!({"body": {"request_id": "r2", "status": "ok", "output": "read-c"}}),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                test_approval_key("u-mixed", "w2"),
-                approval_allow_entry("w2"),
+                test_approval_key("u-mixed", "s-mixed", "w2"),
+                approval_allow_entry("s-mixed", "w2"),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                tool_callback_key("u-mixed", "w2"),
+                tool_callback_key("u-mixed", "s-mixed", "w2"),
                 json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-d"}}),
             );
         });
@@ -10612,9 +10622,23 @@ mod tests {
             llm_events[1].get("type").and_then(Value::as_str),
             Some("llm_response_full")
         );
+        let captured_request_messages = llm_events[0]["metadata"]["request"]["messages"]
+            .as_array()
+            .expect("captured request messages");
+        let captured_summary_roles = llm_events[0]["metadata"]["request_summary"]["message_roles"]
+            .as_array()
+            .expect("captured summary roles");
         assert_eq!(
             llm_events[0]["metadata"]["request_summary"]["message_count"].as_u64(),
-            Some(2)
+            Some(captured_request_messages.len() as u64)
+        );
+        assert_eq!(
+            captured_summary_roles.len(),
+            captured_request_messages.len()
+        );
+        assert!(
+            captured_request_messages.len() >= 2,
+            "expected at least system + user messages"
         );
         assert!(
             llm_events[0]["metadata"]["prompt_request_id"]
@@ -12602,7 +12626,10 @@ mod tests {
             state.llm_rounds_completed = 4;
 
             let intent = host.judge_turn_intent(&state).await;
-            assert_eq!(intent, Some(llm_intent));
+            assert_eq!(
+                intent,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(llm_intent)
+            );
 
             let calls = judge.calls();
             assert_eq!(calls.len(), 1, "judge must be called exactly once");
@@ -12620,7 +12647,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn judge_turn_intent_returns_none_when_judge_errors() {
+        async fn judge_turn_intent_returns_unavailable_when_judge_errors() {
             let judge = ScriptedJudge::err(TurnIntentJudgeError::Transport(
                 "connection reset".to_string(),
             ));
@@ -12630,11 +12657,14 @@ mod tests {
             state.message = "please inspect the current changes".to_string();
             state.user_intent = state.message.clone();
 
-            assert_eq!(host.judge_turn_intent(&state).await, None);
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
+            );
         }
 
         #[tokio::test]
-        async fn judge_turn_intent_returns_none_when_no_judge_set() {
+        async fn judge_turn_intent_returns_unavailable_when_no_judge_set() {
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
                 mock_encryptor(),
@@ -12647,7 +12677,10 @@ mod tests {
             state.message = "please inspect the current changes".to_string();
             state.user_intent = state.message.clone();
 
-            assert_eq!(host.judge_turn_intent(&state).await, None);
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
+            );
         }
 
         #[tokio::test]
@@ -12806,10 +12839,11 @@ mod tests {
                 .forward_headers
                 .insert("x-workspace-id".to_string(), "ws-judge".to_string());
 
-            let intent = host
-                .judge_turn_intent(&state)
-                .await
-                .expect("gateway judge should return intent");
+            let crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(intent) =
+                host.judge_turn_intent(&state).await
+            else {
+                panic!("gateway judge should return intent");
+            };
 
             assert_eq!(intent.requested_scenario, Some(Scenario::Refactoring));
             assert_eq!(
@@ -12915,7 +12949,10 @@ mod tests {
             state.message = "继续，但要系统性一点".to_string();
             state.user_intent = state.message.clone();
 
-            assert_eq!(host.judge_turn_intent(&state).await, None);
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
+            );
             assert_eq!(
                 request_count.load(AtomicOrdering::SeqCst),
                 0,

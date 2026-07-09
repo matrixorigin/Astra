@@ -16,12 +16,15 @@ pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult
             .as_ref()
             .and_then(|value| value.get("error"))
             .is_some();
-    let mut result =
-        if output.starts_with("Error:") || output.starts_with("SANDBOX_DENIED:") || json_error {
-            astra_tools::ToolResult::error(output)
-        } else {
-            astra_tools::ToolResult::text(output)
-        };
+    let mut result = if output.starts_with("Error:")
+        || output.starts_with("SANDBOX_DENIED:")
+        || output.starts_with("PATH_RESOLUTION_FAILED:")
+        || json_error
+    {
+        astra_tools::ToolResult::error(output)
+    } else {
+        astra_tools::ToolResult::text(output)
+    };
     if let Some(error_kind) = parsed
         .as_ref()
         .and_then(|value| value.get("error_kind"))

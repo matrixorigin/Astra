@@ -70,7 +70,7 @@ pub struct ToolMeta {
     /// executor for `requires`. This is for validation-only action shapes,
     /// not for executing capability-gated work.
     pub binding_validation: RuntimeBindingValidation,
-    /// Estimated token cost of the full JSON schema (~JSON bytes / 4)
+    /// Estimated token cost of the full JSON schema.
     pub schema_tokens: u32,
 }
 

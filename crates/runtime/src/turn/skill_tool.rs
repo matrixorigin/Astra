@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use astra_turn_core::section_types::estimate_text_tokens;
 use serde_json::Value;
 
 use crate::server::header_utils::CONNECTION_HEADER_TOKENS_KEY;
@@ -970,7 +971,7 @@ pub async fn partition_and_execute_skills(
                         .unwrap_or(skill_success);
                     tracker.record_outcome(&crate::skills::quality::SkillOutcome {
                         skill_name: skill_name.to_string(),
-                        tokens_used: (skill_output.len() as u32) / 4, // rough estimate
+                        tokens_used: estimate_text_tokens(&skill_output),
                         duration_ms,
                         all_required_passed: success,
                         partial: false,
@@ -1843,7 +1844,7 @@ fn execute_skill<'a>(
                                 ..Default::default()
                             },
                             instructions,
-                            instruction_tokens: (skill.instructions.len() as u32) / 4,
+                            instruction_tokens: estimate_text_tokens(&skill.instructions),
                             resources: None,
                             skill_dir: skill.skill_dir.as_ref().map(std::path::PathBuf::from),
                         };

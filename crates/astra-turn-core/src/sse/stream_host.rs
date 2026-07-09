@@ -632,8 +632,8 @@ fn prioritize_skill_tools(items: &mut Vec<ChatTurnEdgePending>) {
 async fn flush_pending_via_host<H: SseStreamHost>(
     pending: &mut Vec<ChatTurnEdgePending>,
     host: &mut H,
-    session_id: Option<&str>,
-    run_id: Option<&str>,
+    fallback_session_id: Option<&str>,
+    fallback_run_id: Option<&str>,
     tool_results: &mut Vec<EdgeToolExecResult>,
     approval_results: &mut Vec<EdgeApprovalResult>,
 ) {
@@ -651,14 +651,19 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 tool,
                 args,
             } => {
-                if session_id.is_empty()
-                    || run_id.is_empty()
-                    || turn_chain_id.is_empty()
-                    || request_id.is_empty()
-                    || tool.is_empty()
-                {
+                if request_id.is_empty() || tool.is_empty() {
                     continue;
                 }
+                let session_id = if session_id.is_empty() {
+                    fallback_session_id.unwrap_or("").to_string()
+                } else {
+                    session_id
+                };
+                let run_id = if run_id.is_empty() {
+                    fallback_run_id.unwrap_or("").to_string()
+                } else {
+                    run_id
+                };
                 tool_batch.push(ToolBatchRequest {
                     session_id,
                     run_id,
@@ -701,7 +706,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     // execute the edit BEFORE the user / ledger granted permission.
     if approval_requests.len() > 1 {
         approval_results.extend(
-            host.resolve_approvals_batch(&approval_requests, session_id, run_id)
+            host.resolve_approvals_batch(&approval_requests, fallback_session_id, fallback_run_id)
                 .await,
         );
     } else if let Some(request) = approval_requests.into_iter().next() {
@@ -710,8 +715,8 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 &request.request_id,
                 &request.tool,
                 request.approval_kind,
-                session_id,
-                run_id,
+                fallback_session_id,
+                fallback_run_id,
                 request.detail.as_deref(),
                 request.display_label.as_deref(),
             )

@@ -513,16 +513,18 @@ async fn reexecute_pending_requests(
             "completed"
         };
 
-        let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
-            session_id,
-            run_id,
-            turn_chain_id,
-            request_id.clone(),
-            executor_id.to_string(),
-            status.to_string(),
-            output,
-            0, // reconnection re-execution doesn't track timing
-            tool_result_fields,
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id,
+                run_id,
+                turn_chain_id,
+                request_id: request_id.clone(),
+                edge_agent_id: executor_id.to_string(),
+                status: status.to_string(),
+                output,
+                duration_ms: 0, // reconnection re-execution doesn't track timing
+                tool_result_fields,
+            },
         );
 
         match post_replayed_tool_result(api, profile, &mut replay_token, executor_id, &body).await {

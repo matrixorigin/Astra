@@ -595,7 +595,8 @@ async fn persist_server_loop_projection_state(
                     "summary": preview,
                     "source": "server_agentic_loop_final_text",
                 }),
-                token_estimate: ((final_text.len() / 4) as u32).clamp(20, 240),
+                token_estimate: astra_turn_core::section_types::estimate_text_tokens(final_text)
+                    .clamp(20, 240),
                 mutation: "insert".to_string(),
             })
             .await;

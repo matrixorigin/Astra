@@ -105,7 +105,7 @@ pub struct MultiAgentMetrics {
     pub dispatch_claimed_total: AtomicU64,
     /// Total result deliveries that updated a pending/dispatched row.
     pub dispatch_deliver_hits_total: AtomicU64,
-    /// Total result deliveries that missed owner/request/agent/status.
+    /// Total result deliveries that missed full turn identity, agent, or status.
     pub dispatch_deliver_misses_total: AtomicU64,
     /// Total dispatches explicitly failed by runtime.
     pub dispatch_failed_total: AtomicU64,

@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use super::harness::{
     E2E_PASSWORD, bootstrap, build_e2e_access_token, cleanup_task_rows, get_json,
-    grant_astra_admin_role, post_empty, post_json, post_json_with_headers, put_json,
-    revoke_astra_admin_role, seeded_model_name, selected_model,
+    grant_astra_admin_role, maybe_tool_result_payload_from_sse, post_empty, post_json,
+    post_json_with_headers, put_json, revoke_astra_admin_role, seeded_model_name, selected_model,
 };
 use super::journey_saas_platform_matrix::{
     cleanup_resource_limits, cleanup_seeded_run, limits_payload, seed_capacity_holding_run,
@@ -753,24 +753,20 @@ pub async fn run_saas_edge_tool_result_success_path() {
         let chunk = chunk.expect("sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !posted_result && s.contains("tc-saas-tool-ok") {
-            let (st_tool, tool_j) = post_json(
-                app,
-                "/tools/result",
-                Some(auth.as_str()),
-                json!({
-                    "request_id": "tc-saas-tool-ok",
-                    "status": "completed",
-                    "output": tool_output,
-                    "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
-                        "tc-saas-tool-ok",
-                        tool_output,
-                    ),
-                }),
-            )
-            .await;
-            assert_eq!(st_tool, StatusCode::OK, "valid /tools/result: {tool_j}");
-            posted_result = true;
+        if !posted_result {
+            if let Some(payload) = maybe_tool_result_payload_from_sse(
+                s.as_ref(),
+                "tc-saas-tool-ok",
+                &ctx.edge_agent_id,
+                "completed",
+                tool_output,
+                0,
+            ) {
+                let (st_tool, tool_j) =
+                    post_json(app, "/tools/result", Some(auth.as_str()), payload).await;
+                assert_eq!(st_tool, StatusCode::OK, "valid /tools/result: {tool_j}");
+                posted_result = true;
+            }
         }
         if s.contains("\"type\":\"turn_complete\"") {
             break;

@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use super::turn_retry::settle_turn_attempt;
 use super::turn_settlement::TurnDispatch;
-use super::turn_stream_runner::{TurnAttempt, execute_stream_turn};
+use super::turn_stream_runner::{
+    TurnAttempt, TurnExecutionInput, TurnExecutionRequest, execute_stream_turn,
+};
 use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_turn_adaptation};
 use crate::cli::session::session_input::{
     build_effective_line, clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
@@ -137,40 +139,18 @@ pub(crate) struct TurnContext<'a> {
     pub(crate) profile: Option<&'a str>,
 }
 
-async fn run_chat_turn(
-    state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    token: &str,
-    message: &str,
-    user_intent: &str,
-    input_runtime_required_texts: &[String],
-    input_runtime_volatile_texts: &[String],
-    session_id: Option<&str>,
-    semantic_query_override: Option<&str>,
-) -> TurnAttempt {
-    ensure_default_turn_model(state, api, token).await;
+async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
+    let TurnExecutionRequest { state, input } = request;
+    ensure_default_turn_model(state, input.api, input.token).await;
     if let Some(failure) = model_selection_preflight_failure(
         state.model.as_deref(),
-        session_id,
+        input.session_id,
         state.turn.saturating_add(1),
     ) {
         return TurnAttempt::Completed(Box::new(Err(failure)));
     }
-    prepare_turn_adaptation(state, api, token, message).await;
-    let attempt = execute_stream_turn(
-        state,
-        api,
-        profile,
-        token,
-        message,
-        user_intent,
-        input_runtime_required_texts,
-        input_runtime_volatile_texts,
-        session_id,
-        semantic_query_override,
-    )
-    .await;
+    prepare_turn_adaptation(state, input.api, input.token, input.message).await;
+    let attempt = execute_stream_turn(TurnExecutionRequest { state, input }).await;
     finalize_turn_adaptation(state, matches!(attempt, TurnAttempt::Interrupted(_))).await;
     attempt
 }
@@ -218,29 +198,9 @@ fn model_selection_preflight_failure(
 }
 
 fn run_chat_turn_boxed<'a>(
-    state: &'a mut SessionState,
-    api: &'a astra_thin_client::ThinClient,
-    profile: Option<&'a str>,
-    token: &'a str,
-    message: &'a str,
-    user_intent: &'a str,
-    input_runtime_required_texts: &'a [String],
-    input_runtime_volatile_texts: &'a [String],
-    session_id: Option<&'a str>,
-    semantic_query_override: Option<&'a str>,
+    request: TurnExecutionRequest<'a>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TurnAttempt> + 'a>> {
-    Box::pin(run_chat_turn(
-        state,
-        api,
-        profile,
-        token,
-        message,
-        user_intent,
-        input_runtime_required_texts,
-        input_runtime_volatile_texts,
-        session_id,
-        semantic_query_override,
-    ))
+    Box::pin(run_chat_turn(request))
 }
 
 pub(crate) async fn handle_chat_input(
@@ -336,18 +296,20 @@ pub(crate) async fn handle_chat_input_with_ui(
     .await;
     let turn_start = Instant::now();
     let session_id = state.session_id.clone();
-    let attempt = run_chat_turn(
+    let attempt = run_chat_turn(TurnExecutionRequest {
         state,
-        ctx.api,
-        ctx.profile,
-        token,
-        &finalized_input.user_message,
-        &finalized_input.user_intent,
-        &finalized_input.runtime_required_texts,
-        &finalized_input.runtime_volatile_texts,
-        session_id.as_deref(),
-        None,
-    )
+        input: TurnExecutionInput {
+            api: ctx.api,
+            profile: ctx.profile,
+            token,
+            message: &finalized_input.user_message,
+            user_intent: &finalized_input.user_intent,
+            input_runtime_required_texts: &finalized_input.runtime_required_texts,
+            input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
+            session_id: session_id.as_deref(),
+            semantic_query_override: None,
+        },
+    })
     .await;
     let mut dispatch = TurnDispatch {
         ctx: &ctx,

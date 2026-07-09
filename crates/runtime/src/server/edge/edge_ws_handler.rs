@@ -384,17 +384,23 @@ async fn handle_edge_connection(
                                         "completed".to_string()
                                     };
                                     let duration = duration_ms.unwrap_or(0);
-                                    let tool_result = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
-                                        inflight.identity.session_id.clone(),
-                                        inflight.identity.run_id.clone(),
-                                        inflight.identity.turn_chain_id.clone(),
-                                        inflight.identity.request_id.clone(),
-                                        edge_agent_id.clone(),
-                                        status,
-                                        output,
-                                        duration,
-                                        tool_result_fields,
-                                    );
+                                    let tool_result =
+                                        astra_thin_client::ToolResultRequest::new_with_hash(
+                                            astra_thin_client::ToolResultRequestParts {
+                                                session_id: inflight.identity.session_id.clone(),
+                                                run_id: inflight.identity.run_id.clone(),
+                                                turn_chain_id: inflight
+                                                    .identity
+                                                    .turn_chain_id
+                                                    .clone(),
+                                                request_id: inflight.identity.request_id.clone(),
+                                                edge_agent_id: edge_agent_id.clone(),
+                                                status,
+                                                output,
+                                                duration_ms: duration,
+                                                tool_result_fields,
+                                            },
+                                        );
                                     let result_json = match serde_json::to_string(&tool_result) {
                                         Ok(json) => json,
                                         Err(e) => {

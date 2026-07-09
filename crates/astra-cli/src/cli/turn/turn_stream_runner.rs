@@ -20,6 +20,24 @@ struct PreparedTurnStreamState {
     append_system_prompt: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TurnExecutionInput<'a> {
+    pub(crate) api: &'a astra_thin_client::ThinClient,
+    pub(crate) profile: Option<&'a str>,
+    pub(crate) token: &'a str,
+    pub(crate) message: &'a str,
+    pub(crate) user_intent: &'a str,
+    pub(crate) input_runtime_required_texts: &'a [String],
+    pub(crate) input_runtime_volatile_texts: &'a [String],
+    pub(crate) session_id: Option<&'a str>,
+    pub(crate) semantic_query_override: Option<&'a str>,
+}
+
+pub(crate) struct TurnExecutionRequest<'a> {
+    pub(crate) state: &'a mut SessionState,
+    pub(crate) input: TurnExecutionInput<'a>,
+}
+
 pub(crate) enum TurnAttempt {
     Completed(Box<Result<StreamResult, crate::TurnFailure>>),
     /// User-cancelled (Ctrl+C / TUI cancel) but the stream was awaited to
@@ -30,36 +48,14 @@ pub(crate) enum TurnAttempt {
     Interrupted(Box<Result<StreamResult, crate::TurnFailure>>),
 }
 
-pub(crate) async fn execute_stream_turn(
-    state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    token: &str,
-    message: &str,
-    user_intent: &str,
-    input_runtime_required_texts: &[String],
-    input_runtime_volatile_texts: &[String],
-    session_id: Option<&str>,
-    semantic_query_override: Option<&str>,
-) -> TurnAttempt {
+pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
+    let TurnExecutionRequest { state, input } = request;
     let prepared = prepare_turn_stream_state(state).await;
     *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
         Some(prepared.run_control.clone());
-    let params = build_turn_stream_params(
-        state,
-        api,
-        profile,
-        token,
-        message,
-        user_intent,
-        input_runtime_required_texts,
-        input_runtime_volatile_texts,
-        session_id,
-        semantic_query_override,
-        &prepared,
-    );
+    let params = build_turn_stream_params(state, input, &prepared);
     let (result, was_user_cancel) =
-        await_stream_with_interrupts(params, &prepared, api, token).await;
+        await_stream_with_interrupts(params, &prepared, input.api, input.token).await;
     *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) = None;
 
     if was_user_cancel {
@@ -90,30 +86,21 @@ async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamSt
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_turn_stream_params<'a>(
     state: &'a mut SessionState,
-    api: &'a astra_thin_client::ThinClient,
-    profile: Option<&'a str>,
-    token: &'a str,
-    message: &'a str,
-    user_intent: &'a str,
-    input_runtime_required_texts: &'a [String],
-    input_runtime_volatile_texts: &'a [String],
-    session_id: Option<&'a str>,
-    semantic_query_override: Option<&'a str>,
+    input: TurnExecutionInput<'a>,
     prepared: &'a PreparedTurnStreamState,
 ) -> ChatTurnParams<'a> {
     ChatTurnParams {
-        api,
-        token,
-        auth_profile: profile,
-        message,
-        user_intent,
-        input_runtime_required_texts,
-        input_runtime_volatile_texts,
-        semantic_query_override,
-        session_id,
+        api: input.api,
+        token: input.token,
+        auth_profile: input.profile,
+        message: input.message,
+        user_intent: input.user_intent,
+        input_runtime_required_texts: input.input_runtime_required_texts,
+        input_runtime_volatile_texts: input.input_runtime_volatile_texts,
+        semantic_query_override: input.semantic_query_override,
+        session_id: input.session_id,
         model_id: crate::cli::slash::slash_config::active_model_id_for_request(),
         model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
         provider: None,
@@ -283,7 +270,10 @@ fn notify_server_to_cancel_run(
 
 #[cfg(test)]
 mod tests {
-    use super::{PreparedTurnStreamState, build_turn_stream_params, prepare_turn_stream_state};
+    use super::{
+        PreparedTurnStreamState, TurnExecutionInput, build_turn_stream_params,
+        prepare_turn_stream_state,
+    };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
     use std::sync::Arc;
@@ -406,15 +396,17 @@ mod tests {
 
         let params = build_turn_stream_params(
             &mut state,
-            &api,
-            Some("profile"),
-            "token",
-            "continue",
-            "continue",
-            &[],
-            &[],
-            Some("sess-1"),
-            None,
+            TurnExecutionInput {
+                api: &api,
+                profile: Some("profile"),
+                token: "token",
+                message: "continue",
+                user_intent: "continue",
+                input_runtime_required_texts: &[],
+                input_runtime_volatile_texts: &[],
+                session_id: Some("sess-1"),
+                semantic_query_override: None,
+            },
             &prepared,
         );
 

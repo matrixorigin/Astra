@@ -6338,7 +6338,7 @@ esac
         let result = exec
             .execute("read_file", &json!({"path": "nonexistent.txt"}))
             .await;
-        assert!(result.starts_with("Error:"));
+        assert!(result.contains("PATH_RESOLUTION_FAILED"));
     }
 
     #[tokio::test]
@@ -6495,7 +6495,7 @@ esac
         let result = exec
             .execute("write_file", &json!({"path": "ghost.txt", "delete": true}))
             .await;
-        assert!(result.contains("File not found"));
+        assert!(result.contains("PATH_RESOLUTION_FAILED"));
     }
 
     #[tokio::test]

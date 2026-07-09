@@ -10,7 +10,7 @@ use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::{CompactionEngine, TokenBudget};
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, RunControlStatus,
-    SkillAutoRouteJudgeContext, try_write_heavy_checkpoint,
+    SkillAutoRouteJudgeContext, TurnIntentJudgeOutcome, try_write_heavy_checkpoint,
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
 use crate::orchestration::{
@@ -257,6 +257,11 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         )
         .await
     else {
+        tracing::warn!(
+            query_length = query.len(),
+            visible_skill_count = visible.len(),
+            "skill auto-route judge failed; skipping auto-route for this turn"
+        );
         return;
     };
     let skill_name = decision.skill_name.trim().to_string();
@@ -1493,13 +1498,16 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);
     }
-    state.turn_intent = None;
-    let judged_turn_intent = host.judge_turn_intent(state).await;
-    if let Some(intent) = judged_turn_intent.as_ref() {
-        apply_judged_turn_intent_to_observability_session(state, intent);
-        apply_judged_turn_intent_to_runtime_profile(state, intent);
-        if intent.reanchors_current_objective() {
-            apply_structured_user_reanchor(state);
+    match host.judge_turn_intent(state).await {
+        TurnIntentJudgeOutcome::Intent(intent) => {
+            apply_judged_turn_intent_to_observability_session(state, &intent);
+            apply_judged_turn_intent_to_runtime_profile(state, &intent);
+            if intent.reanchors_current_objective() {
+                apply_structured_user_reanchor(state);
+            }
+        }
+        TurnIntentJudgeOutcome::Unavailable => {
+            tracing::debug!("turn intent judge unavailable; preserving current runtime profile");
         }
     }
     maybe_inject_task_board_start_gate(host, state).await;
@@ -2951,6 +2959,51 @@ mod tests {
         assert!(state.task_profile.mutates_workspace);
         assert!(state.task_profile.verification_required);
         assert!(state.task_profile.allow_factual_retry);
+        assert_eq!(
+            state
+                .turn_intent
+                .as_ref()
+                .map(|intent| intent.workspace_mutation),
+            Some(WorkspaceMutationIntent::MustMutate)
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_preserves_profile_when_judge_unavailable() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.message = "continue the implementation".into();
+        state.user_intent = state.message.clone();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+        let existing_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                true,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
+                true,
+            );
+        state.task_profile = existing_profile;
+        state.agentic_turn_budget = existing_profile.agentic_turn_budget;
+        state.turn_guard.set_task_profile(existing_profile);
+        state.turn_intent = Some(
+            TurnIntent::default()
+                .with_requested_scenario(Scenario::Refactoring)
+                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate),
+        );
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        assert_eq!(
+            state.task_profile, existing_profile,
+            "unavailable judge must not downgrade a current structured runtime profile"
+        );
+        assert_eq!(
+            state.agentic_turn_budget, existing_profile.agentic_turn_budget,
+            "budget must remain coupled to the preserved profile"
+        );
         assert_eq!(
             state
                 .turn_intent

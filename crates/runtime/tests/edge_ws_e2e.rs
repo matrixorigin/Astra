@@ -214,14 +214,17 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         let output = format!("edge dispatch {reason}");
         row.result_json = Some(
             serde_json::to_string(&astra_thin_client::ToolResultRequest::new_with_hash(
-                identity.session_id.clone(),
-                identity.run_id.clone(),
-                identity.turn_chain_id.clone(),
-                identity.request_id.clone(),
-                row.edge_agent_id.clone(),
-                "failed".to_string(),
-                output,
-                0,
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: identity.session_id.clone(),
+                    run_id: identity.run_id.clone(),
+                    turn_chain_id: identity.turn_chain_id.clone(),
+                    request_id: identity.request_id.clone(),
+                    edge_agent_id: row.edge_agent_id.clone(),
+                    status: "failed".to_string(),
+                    output,
+                    duration_ms: 0,
+                    tool_result_fields: None,
+                },
             ))
             .map_err(|error| error.to_string())?,
         );

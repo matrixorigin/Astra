@@ -1050,6 +1050,8 @@ impl ToolCallRecord {
 
         result_preview.starts_with("Skipped:")
             || (self.error.is_none() && result_preview.starts_with("Deferred:"))
+            || (self.name == "delegate"
+                && result_preview.starts_with("Invalid delegation request:"))
             || (self.name == "skill"
                 && result_preview.starts_with("Skill '")
                 && result_preview.contains(" was already loaded (turn "))
@@ -7848,6 +7850,22 @@ mod tests {
                 result_preview: Some("Skill 'debug' was already loaded (turn 2). Follow those instructions directly.".into()),
                 file_path: None, surgically_removed: None, original_tool_name: None, ..Default::default()
             };
+            let invalid_delegate = ToolCallRecord {
+                name: "delegate".into(),
+                ok: false,
+                ms: 0,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: Some(
+                    "Invalid delegation request: agents must be a non-empty array.".into(),
+                ),
+                file_path: None,
+                surgically_removed: None,
+                original_tool_name: None,
+                ..Default::default()
+            };
             let actual_failure = ToolCallRecord {
                 name: "skill".into(),
                 ok: false,
@@ -7865,6 +7883,7 @@ mod tests {
             assert!(skipped.is_synthetic_placeholder());
             assert!(deferred.is_synthetic_placeholder());
             assert!(dedup.is_synthetic_placeholder());
+            assert!(invalid_delegate.is_synthetic_placeholder());
             assert!(!actual_failure.is_synthetic_placeholder());
         }
 

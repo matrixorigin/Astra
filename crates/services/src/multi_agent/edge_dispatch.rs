@@ -435,7 +435,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
 
         // Mark claimed rows as dispatched within the same transaction.
         // MatrixOne rejects row-value `IN ((?, ?), ...)`, so spell the identity
-        // set as disjunctions over the owner/request primary key.
+        // set as disjunctions over the full turn-scoped primary key.
         let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "UPDATE edge_pending_dispatch \
              SET status = 'dispatched', dispatched_at = NOW(6) \
@@ -748,15 +748,20 @@ mod tests {
 
     async fn cleanup_edge_dispatch_fixture(
         pool: &astra_core::SharedPool,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
     ) {
-        sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ? AND request_id = ?")
-            .bind(user_id)
-            .bind(request_id)
-            .execute(pool.get())
-            .await
-            .expect("cleanup edge dispatch fixture");
+        sqlx::query(
+            "DELETE FROM edge_pending_dispatch \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
+        .execute(pool.get())
+        .await
+        .expect("cleanup edge dispatch fixture");
     }
 
     struct FakeEdgeDispatchRow {
@@ -808,6 +813,9 @@ mod tests {
             }
             Ok(match column {
                 "user_id" => "user-1",
+                "session_id" => "session-1",
+                "run_id" => "run-1",
+                "turn_chain_id" => "turn-chain-1",
                 "edge_agent_id" => "edge-1",
                 "request_id" => "request-1",
                 "payload_json" => r#"{"tool":"agent_fanout"}"#,
@@ -832,6 +840,9 @@ mod tests {
         let row = decode_claimed_dispatch_row(&FakeEdgeDispatchRow::complete()).unwrap();
 
         assert_eq!(row.user_id, "user-1");
+        assert_eq!(row.session_id, "session-1");
+        assert_eq!(row.run_id, "run-1");
+        assert_eq!(row.turn_chain_id, "turn-chain-1");
         assert_eq!(row.edge_agent_id, "edge-1");
         assert_eq!(row.request_id, "request-1");
         assert_eq!(row.payload_json, r#"{"tool":"agent_fanout"}"#);
@@ -856,6 +867,9 @@ mod tests {
     fn claimed_dispatch_row_decode_fails_loudly_on_any_column_error() {
         for column in [
             "user_id",
+            "session_id",
+            "run_id",
+            "turn_chain_id",
             "edge_agent_id",
             "request_id",
             "payload_json",
@@ -1003,15 +1017,20 @@ mod tests {
             })
             .expect("poll_pending body");
         assert!(
-            !poll_body.contains("(user_id, request_id) IN"),
+            !poll_body.contains("(user_id, request_id) IN")
+                && !poll_body
+                    .contains("(user_id, session_id, run_id, turn_chain_id, request_id) IN"),
             "MatrixOne rejects row-value IN predicates with bound tuple parameters"
         );
         assert!(
             poll_body.contains("WHERE status = 'pending' AND (")
                 && poll_body.contains("(user_id = ")
+                && poll_body.contains(" AND session_id = ")
+                && poll_body.contains(" AND run_id = ")
+                && poll_body.contains(" AND turn_chain_id = ")
                 && poll_body.contains(" AND request_id = ")
                 && poll_body.contains(" OR "),
-            "poll claim update must use explicit owner/request predicates"
+            "poll claim update must use explicit turn-scoped identity predicates"
         );
     }
 
@@ -1042,8 +1061,8 @@ mod tests {
             identity.turn_chain_id.clone(),
             &request_id,
         );
-        cleanup_edge_dispatch_fixture(&pool, &user_id, &request_id).await;
-        cleanup_edge_dispatch_fixture(&pool, &other_user_id, &request_id).await;
+        cleanup_edge_dispatch_fixture(&pool, &identity).await;
+        cleanup_edge_dispatch_fixture(&pool, &other_identity).await;
 
         let payload = json!({
             "request_id": request_id,
@@ -1155,10 +1174,13 @@ mod tests {
         let row = sqlx::query(
             "SELECT status, CAST(result_json AS CHAR) AS result_json
              FROM edge_pending_dispatch
-             WHERE user_id = ? AND request_id = ?",
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?",
         )
-        .bind(&user_id)
-        .bind(&request_id)
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
         .fetch_one(pool.get())
         .await
         .expect("load terminal dispatch row");
@@ -1173,7 +1195,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&result_json).expect("result should be JSON")
         );
 
-        cleanup_edge_dispatch_fixture(&pool, &user_id, &request_id).await;
-        cleanup_edge_dispatch_fixture(&pool, &other_user_id, &request_id).await;
+        cleanup_edge_dispatch_fixture(&pool, &identity).await;
+        cleanup_edge_dispatch_fixture(&pool, &other_identity).await;
     }
 }

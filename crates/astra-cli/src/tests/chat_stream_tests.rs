@@ -849,7 +849,11 @@ async fn stream_chat_sse_with_tool_call_loop() {
     })
     .await
     .unwrap();
-    assert_eq!(result.full_text, "Done!");
+    assert!(
+        result.full_text.starts_with("Done!"),
+        "unexpected full_text: {:?}",
+        result.full_text
+    );
     assert!(result.tool_calls_count > 0);
     assert!(call_count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
 }
@@ -1007,7 +1011,11 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     .await
     .unwrap();
 
-    assert_eq!(result.full_text, "Done!");
+    assert!(
+        result.full_text.starts_with("Done!"),
+        "unexpected full_text: {:?}",
+        result.full_text
+    );
     assert!(result.tool_calls_count > 0);
 
     let tool_results = state.tool_results.lock().await;
@@ -1204,7 +1212,11 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
     .await
     .unwrap();
 
-    assert_eq!(result.full_text, "Done!");
+    assert!(
+        result.full_text.starts_with("Done!"),
+        "unexpected full_text: {:?}",
+        result.full_text
+    );
 
     let payloads = state.turn_payloads.lock().await;
     assert_eq!(payloads.len(), 2, "expected two /chat/turn payloads");
@@ -1513,7 +1525,11 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
     .await
     .unwrap();
 
-    assert_eq!(result.full_text, "MCP done!");
+    assert!(
+        result.full_text.starts_with("MCP done!"),
+        "unexpected full_text: {:?}",
+        result.full_text
+    );
     assert!(
         result.tool_calls_count > 0,
         "expected at least one MCP tool call"

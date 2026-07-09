@@ -295,7 +295,7 @@ mod tests {
     fn measured_cost_uses_real_schema_size() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas.clone());
-        // The real cost should be based on JSON bytes/4, not the static catalog estimate
+        // The real cost should be based on the serialized schema, not the static catalog estimate.
         let bash_cost = registry.token_cost("bash");
         let bash_json = serde_json::to_string(
             schemas
@@ -304,10 +304,29 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let expected = (bash_json.len() / 4) as u32;
+        let expected = astra_turn_core::section_types::estimate_text_tokens(&bash_json);
         assert_eq!(
             bash_cost, expected,
-            "measured cost should equal JSON bytes / 4"
+            "measured cost should use the shared text token estimator"
+        );
+    }
+
+    #[test]
+    fn measured_cost_uses_shared_estimator_for_unicode_schema() {
+        let schema = json!({
+            "type": "function",
+            "function": {
+                "name": "unicode_tool",
+                "description": "你好世界🚀🔥💻",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        let registry = ToolRegistry::new(vec![schema.clone()]);
+        let schema_json = serde_json::to_string(&schema).unwrap();
+
+        assert_eq!(
+            registry.token_cost("unicode_tool"),
+            astra_turn_core::section_types::estimate_text_tokens(&schema_json)
         );
     }
 

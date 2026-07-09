@@ -106,16 +106,34 @@ async fn record_tool_request_identity(event: &Value) {
     entry.push((now, identity));
 }
 
-async fn consume_tool_request_identity(request_id: &str) -> ToolResultIdentity {
+async fn take_tool_request_identity(request_id: &str) -> Option<ToolResultIdentity> {
     let mut cache = tool_request_identity_cache().lock().await;
     if let Some(entries) = cache.get_mut(request_id) {
         if let Some((_, identity)) = entries.pop() {
             if entries.is_empty() {
                 cache.remove(request_id);
             }
-            return identity;
+            return Some(identity);
         }
     }
+    None
+}
+
+async fn wait_for_tool_request_identity(request_id: &str) -> ToolResultIdentity {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(identity) = take_tool_request_identity(request_id).await {
+            return identity;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "missing tool_request identity for request_id {request_id}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn unmatched_tool_result_identity() -> ToolResultIdentity {
     ToolResultIdentity {
         session_id: DEFAULT_TOOL_RESULT_SESSION_ID.to_string(),
         run_id: DEFAULT_TOOL_RESULT_RUN_ID.to_string(),
@@ -736,16 +754,56 @@ async fn post_tool_result(
     output: &str,
     status: &str,
 ) -> StatusCode {
-    let identity = consume_tool_request_identity(request_id).await;
+    let identity = wait_for_tool_request_identity(request_id).await;
+    post_tool_result_with_identity(app, request_id, output, status, identity).await
+}
+
+async fn post_unmatched_tool_result(
+    app: &Router,
+    request_id: &str,
+    output: &str,
+    status: &str,
+) -> StatusCode {
+    post_tool_result_with_identity(
+        app,
+        request_id,
+        output,
+        status,
+        unmatched_tool_result_identity(),
+    )
+    .await
+}
+
+async fn post_tool_result_from_event(
+    app: &Router,
+    event: &Value,
+    output: &str,
+    status: &str,
+) -> StatusCode {
+    let (request_id, identity) =
+        tool_request_identity_from_event(event).expect("tool_request event must carry identity");
+    post_tool_result_with_identity(app, &request_id, output, status, identity).await
+}
+
+async fn post_tool_result_with_identity(
+    app: &Router,
+    request_id: &str,
+    output: &str,
+    status: &str,
+    identity: ToolResultIdentity,
+) -> StatusCode {
     let body = astra_thin_client::ToolResultRequest::new_with_hash(
-        identity.session_id,
-        identity.run_id,
-        identity.turn_chain_id,
-        request_id.to_string(),
-        DEFAULT_TEST_EDGE_AGENT_ID.to_string(),
-        status.to_string(),
-        output.to_string(),
-        10,
+        astra_thin_client::ToolResultRequestParts {
+            session_id: identity.session_id,
+            run_id: identity.run_id,
+            turn_chain_id: identity.turn_chain_id,
+            request_id: request_id.to_string(),
+            edge_agent_id: DEFAULT_TEST_EDGE_AGENT_ID.to_string(),
+            status: status.to_string(),
+            output: output.to_string(),
+            duration_ms: 10,
+            tool_result_fields: None,
+        },
     );
     let body: Value = serde_json::to_value(body).unwrap();
     let req = Request::builder()
@@ -1098,6 +1156,7 @@ async fn spawn_sse_reader(body: Body) -> (mpsc::UnboundedReceiver<Value>, JoinHa
                 buf = buf[idx + 2..].to_string();
                 if let Some(data) = event_str.strip_prefix("data: ") {
                     if let Ok(v) = serde_json::from_str::<Value>(data) {
+                        record_tool_request_identity(&v).await;
                         let _ = tx.send(v.clone());
                         events.push(v);
                     }
@@ -1120,7 +1179,6 @@ async fn wait_for_sse(
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(event)) => {
-                record_tool_request_identity(&event).await;
                 if event.get("type").and_then(Value::as_str) == Some(event_type) {
                     return event;
                 }
@@ -2925,7 +2983,7 @@ async fn cancel_mid_stream_stops_further_rounds() {
                         run_id = v.get("run_id").and_then(Value::as_str).map(String::from);
                     }
 
-                    collected_events.push(v);
+                    collected_events.push(v.clone());
 
                     // After seeing tool_request, cancel the run, then post result to unblock.
                     if event_type == "tool_request" && !cancelled {
@@ -2935,7 +2993,7 @@ async fn cancel_mid_stream_stops_further_rounds() {
                             cancelled = true;
 
                             // Post tool result to unblock the ledger wait.
-                            post_tool_result(&app, "tc-cancel-1", "file contents", "ok").await;
+                            post_tool_result_from_event(&app, &v, "file contents", "ok").await;
                         }
                     }
                 }
@@ -3037,12 +3095,13 @@ async fn invalid_auth_token_returns_unauthorized() {
 }
 
 #[tokio::test]
-async fn empty_message_still_completes() {
+async fn empty_message_with_user_intent_still_completes() {
     init_env();
     let (app, _) = build_test_app();
 
     let payload = json!({
         "message": "",
+        "user_intent": "respond to the explicit empty-message test intent",
         "context": {
             "test_llm_rounds": [
                 { "full_text": "You sent an empty message." }
@@ -3152,7 +3211,7 @@ async fn tool_result_for_unknown_request_id_does_not_crash() {
     let (app, _) = build_test_app();
 
     // Post a tool result with an ID that no stream is waiting for.
-    let st = post_tool_result(&app, "nonexistent-id-12345", "output", "ok").await;
+    let st = post_unmatched_tool_result(&app, "nonexistent-id-12345", "output", "ok").await;
     // Should succeed (ledger accepts it even if nobody consumes it).
     assert_eq!(st, 200);
 }

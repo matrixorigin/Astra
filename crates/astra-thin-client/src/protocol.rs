@@ -150,6 +150,19 @@ pub struct ToolResultRequest {
     pub tool_result_fields: Option<Map<String, Value>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResultRequestParts {
+    pub session_id: String,
+    pub run_id: String,
+    pub turn_chain_id: String,
+    pub request_id: String,
+    pub edge_agent_id: String,
+    pub status: String,
+    pub output: String,
+    pub duration_ms: u64,
+    pub tool_result_fields: Option<Map<String, Value>>,
+}
+
 impl ToolResultRequest {
     /// Compute a content-based hash of the scoped tool result identity + output.
     pub fn compute_result_hash(
@@ -175,17 +188,8 @@ impl ToolResultRequest {
     /// Factory: build a `ToolResultRequest` with the result hash pre-computed.
     /// Every call site that posts a tool result should use this to guarantee
     /// the hash is always present — no more scattered `compute_result_hash` calls.
-    pub fn new_with_hash(
-        session_id: String,
-        run_id: String,
-        turn_chain_id: String,
-        request_id: String,
-        edge_agent_id: String,
-        status: String,
-        output: String,
-        duration_ms: u64,
-    ) -> Self {
-        Self::new_with_hash_and_fields(
+    pub fn new_with_hash(parts: ToolResultRequestParts) -> Self {
+        let ToolResultRequestParts {
             session_id,
             run_id,
             turn_chain_id,
@@ -194,21 +198,8 @@ impl ToolResultRequest {
             status,
             output,
             duration_ms,
-            None,
-        )
-    }
-
-    pub fn new_with_hash_and_fields(
-        session_id: String,
-        run_id: String,
-        turn_chain_id: String,
-        request_id: String,
-        edge_agent_id: String,
-        status: String,
-        output: String,
-        duration_ms: u64,
-        tool_result_fields: Option<Map<String, Value>>,
-    ) -> Self {
+            tool_result_fields,
+        } = parts;
         let result_hash =
             Self::compute_result_hash(&session_id, &run_id, &turn_chain_id, &request_id, &output);
         Self {
@@ -1324,16 +1315,17 @@ mod tests {
 
     #[test]
     fn tool_result_new_with_hash_includes_edge_agent_id() {
-        let req = ToolResultRequest::new_with_hash(
-            "sess-1".into(),
-            "run-1".into(),
-            "chain-1".into(),
-            "req-1".into(),
-            "agent-1".into(),
-            "success".into(),
-            "done".into(),
-            100,
-        );
+        let req = ToolResultRequest::new_with_hash(ToolResultRequestParts {
+            session_id: "sess-1".into(),
+            run_id: "run-1".into(),
+            turn_chain_id: "chain-1".into(),
+            request_id: "req-1".into(),
+            edge_agent_id: "agent-1".into(),
+            status: "success".into(),
+            output: "done".into(),
+            duration_ms: 100,
+            tool_result_fields: None,
+        });
         assert_eq!(req.session_id, "sess-1");
         assert_eq!(req.run_id, "run-1");
         assert_eq!(req.turn_chain_id, "chain-1");
@@ -1349,17 +1341,17 @@ mod tests {
             "runtime_environment_advertisement".to_string(),
             serde_json::json!({"schema_version": 1}),
         )]);
-        let req = ToolResultRequest::new_with_hash_and_fields(
-            "sess-1".into(),
-            "run-1".into(),
-            "chain-1".into(),
-            "req-1".into(),
-            "agent-1".into(),
-            "success".into(),
-            "done".into(),
-            100,
-            Some(fields),
-        );
+        let req = ToolResultRequest::new_with_hash(ToolResultRequestParts {
+            session_id: "sess-1".into(),
+            run_id: "run-1".into(),
+            turn_chain_id: "chain-1".into(),
+            request_id: "req-1".into(),
+            edge_agent_id: "agent-1".into(),
+            status: "success".into(),
+            output: "done".into(),
+            duration_ms: 100,
+            tool_result_fields: Some(fields),
+        });
         assert_eq!(
             req.tool_result_fields
                 .as_ref()
@@ -1372,16 +1364,17 @@ mod tests {
 
     #[test]
     fn tool_result_serde_roundtrip_preserves_edge_agent_id() {
-        let req = ToolResultRequest::new_with_hash(
-            "sess-1".into(),
-            "run-1".into(),
-            "chain-1".into(),
-            "r1".into(),
-            "ea-1".into(),
-            "success".into(),
-            "ok".into(),
-            10,
-        );
+        let req = ToolResultRequest::new_with_hash(ToolResultRequestParts {
+            session_id: "sess-1".into(),
+            run_id: "run-1".into(),
+            turn_chain_id: "chain-1".into(),
+            request_id: "r1".into(),
+            edge_agent_id: "ea-1".into(),
+            status: "success".into(),
+            output: "ok".into(),
+            duration_ms: 10,
+            tool_result_fields: None,
+        });
         let json = serde_json::to_string(&req).unwrap();
         let back: ToolResultRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);

@@ -564,7 +564,7 @@ TABLE_METADATA: dict[str, TableMetadata] = {
     "edge_pending_dispatch": TableMetadata(
         semantic_owner="astra_services::multi_agent::edge_dispatch",
         state_class="coordination dispatch fact",
-        primary_query="owner/request dispatch lookup by user_id and request_id; edge poll by user_id, edge_agent_id, status, created_at",
+        primary_query="turn-scoped dispatch lookup by user_id, session_id, run_id, turn_chain_id, and request_id; edge poll by user_id, edge_agent_id, status, created_at",
         retention_policy="expire pending/dispatched rows via cleanup_stale and prune terminal rows after the same stale window",
         rebuildability="not rebuildable while a tool dispatch may still complete",
         merge_guidance="keep separate from in-memory edge callback ledger; this is the cross-pod durable coordination queue",
@@ -1325,7 +1325,7 @@ def repository_root() -> Path:
 
 def discover_production_ddl_source_paths(root: Path | None = None) -> list[str]:
     root = root or REPO_ROOT
-    crates_dir = root / "rust" / "crates"
+    crates_dir = root / "crates"
     discovered: list[str] = []
     for path in sorted(crates_dir.glob("*/src/**/*.rs")):
         text = production_source(path.read_text(encoding="utf-8"), stop_at_cfg_test=True)

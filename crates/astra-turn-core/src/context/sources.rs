@@ -17,7 +17,7 @@ use crate::microcompact::ProviderCacheStrategy;
 use crate::pipeline_config::ProviderCachePolicy;
 use crate::pipeline_stats::PipelineStats;
 use crate::recovery_state::RecoveryState;
-use crate::section_types::{CacheScope, PromptSection, PromptTokenBucket};
+use crate::section_types::{CacheScope, PromptSection, PromptTokenBucket, estimate_text_tokens};
 use crate::session_latches::SessionLatches;
 use crate::token_accounting::TokenAccounting;
 use crate::working_memory::WorkingMemoryState;
@@ -357,7 +357,7 @@ impl StaticSections {
     pub fn total_tokens_estimate(&self) -> u32 {
         self.as_vec()
             .iter()
-            .map(|s| (s.text.len() / 4) as u32)
+            .map(|s| estimate_text_tokens(&s.text))
             .sum()
     }
 }
@@ -404,6 +404,24 @@ mod tests {
     fn static_sections_total_tokens_nonzero() {
         let s = StaticSections::test_default();
         assert!(s.total_tokens_estimate() > 0);
+    }
+
+    #[test]
+    fn static_sections_total_tokens_uses_shared_unicode_estimator() {
+        let mut s = StaticSections::test_default();
+        s.core_rules.text = "你好世界".into();
+        s.safety.text.clear();
+        s.planning_protocol.text.clear();
+        s.coding_discipline.text.clear();
+        s.turn_discipline.text.clear();
+        s.plan_execution.text.clear();
+        s.output_format.text.clear();
+        s.tool_error_recovery.text.clear();
+
+        assert_eq!(
+            s.total_tokens_estimate(),
+            crate::section_types::estimate_text_tokens("你好世界")
+        );
     }
 
     #[test]

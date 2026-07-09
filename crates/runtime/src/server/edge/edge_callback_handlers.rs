@@ -1107,14 +1107,17 @@ mod edge_callback_insert_tests {
             State(state.clone()),
             HeaderMap::new(),
             Json(astra_thin_client::ToolResultRequest::new_with_hash(
-                identity.session_id.clone(),
-                identity.run_id.clone(),
-                identity.turn_chain_id.clone(),
-                "req-tool-dispatch".into(),
-                "edge-a".into(),
-                "completed".into(),
-                "tool output".into(),
-                12,
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: identity.session_id.clone(),
+                    run_id: identity.run_id.clone(),
+                    turn_chain_id: identity.turn_chain_id.clone(),
+                    request_id: "req-tool-dispatch".into(),
+                    edge_agent_id: "edge-a".into(),
+                    status: "completed".into(),
+                    output: "tool output".into(),
+                    duration_ms: 12,
+                    tool_result_fields: None,
+                },
             )),
         )
         .await
@@ -1195,14 +1198,17 @@ mod edge_callback_insert_tests {
     #[test]
     fn tool_result_hash_matching_payload_is_accepted() {
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
-            "sess-1".to_string(),
-            "run-1".to_string(),
-            "chain-1".to_string(),
-            "req-1".to_string(),
-            "test-agent".to_string(),
-            "completed".to_string(),
-            "actual".to_string(),
-            1,
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "sess-1".to_string(),
+                run_id: "run-1".to_string(),
+                turn_chain_id: "chain-1".to_string(),
+                request_id: "req-1".to_string(),
+                edge_agent_id: "test-agent".to_string(),
+                status: "completed".to_string(),
+                output: "actual".to_string(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
         );
         assert_eq!(super::validate_tool_result_request(&body), Ok(()));
     }

@@ -433,18 +433,21 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
             return Ok(None);
         }
         let result = astra_thin_client::ToolResultRequest::new_with_hash(
-            identity.session_id.clone(),
-            identity.run_id.clone(),
-            identity.turn_chain_id.clone(),
-            identity.request_id.clone(),
-            "edge-selected".to_string(),
-            self.result_status.to_string(),
-            if self.result_status == "completed" {
-                "ledger-result".to_string()
-            } else {
-                "edge dispatch expired".to_string()
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                request_id: identity.request_id.clone(),
+                edge_agent_id: "edge-selected".to_string(),
+                status: self.result_status.to_string(),
+                output: if self.result_status == "completed" {
+                    "ledger-result".to_string()
+                } else {
+                    "edge dispatch expired".to_string()
+                },
+                duration_ms: 12,
+                tool_result_fields: None,
             },
-            12,
         );
         serde_json::to_string(&result)
             .map(Some)
@@ -2699,14 +2702,17 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
     );
 
     let tool_result = astra_thin_client::ToolResultRequest::new_with_hash(
-        claimed_identity.session_id.clone(),
-        claimed_identity.run_id.clone(),
-        claimed_identity.turn_chain_id.clone(),
-        claimed_identity.request_id.clone(),
-        "edge-selected".to_string(),
-        "completed".to_string(),
-        "no-sticky-result".to_string(),
-        9,
+        astra_thin_client::ToolResultRequestParts {
+            session_id: claimed_identity.session_id.clone(),
+            run_id: claimed_identity.run_id.clone(),
+            turn_chain_id: claimed_identity.turn_chain_id.clone(),
+            request_id: claimed_identity.request_id.clone(),
+            edge_agent_id: "edge-selected".to_string(),
+            status: "completed".to_string(),
+            output: "no-sticky-result".to_string(),
+            duration_ms: 9,
+            tool_result_fields: None,
+        },
     );
     let result_json =
         serde_json::to_string(&tool_result).expect("tool result should serialize for callback pod");

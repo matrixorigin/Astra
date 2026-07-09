@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
+use crate::section_types::estimate_text_tokens;
+
 // ─── Top-Level Trace ─────────────────────────────────────────────────────────
 
 /// Complete trace of context assembly for one turn.
@@ -652,15 +654,13 @@ pub fn build_memory_trace_from_retrieval(
         .filter(|(content, _)| !content.trim().is_empty())
         .filter(|(content, _)| seen.insert(memory_trace_dedup_key(content)))
         .enumerate()
-        .map(|(idx, (content, score))| {
-            MemorySelection {
-                memory_id: format!("mem-{}", idx),
-                memory_type: "semantic".to_string(),
-                content_preview: preview_snippet(content, 100),
-                relevance_score: *score,
-                tokens: (content.len() / 4) as u32, // Rough estimate
-                source: MemorySource::Session,
-            }
+        .map(|(idx, (content, score))| MemorySelection {
+            memory_id: format!("mem-{}", idx),
+            memory_type: "semantic".to_string(),
+            content_preview: preview_snippet(content, 100),
+            relevance_score: *score,
+            tokens: estimate_text_tokens(content),
+            source: MemorySource::Session,
         })
         .collect();
 
@@ -730,6 +730,19 @@ mod tests {
                 .map(|m| m.tokens)
                 .sum::<u32>()
         );
+    }
+
+    #[test]
+    fn memory_trace_uses_shared_unicode_token_estimate() {
+        let content = "你好世界🚀🔥💻".to_string();
+        let trace = build_memory_trace_from_retrieval("memory", 1, &[(content.clone(), 0.9)], 12);
+
+        assert_eq!(trace.memories_selected.len(), 1);
+        assert_eq!(
+            trace.memories_selected[0].tokens,
+            crate::section_types::estimate_text_tokens(&content)
+        );
+        assert_eq!(trace.total_tokens, trace.memories_selected[0].tokens);
     }
 
     #[test]

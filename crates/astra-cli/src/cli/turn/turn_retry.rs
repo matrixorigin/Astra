@@ -7,7 +7,7 @@ use super::turn_session_retry::{
 use super::turn_settlement::{
     TurnDispatch, settle_failed_turn, settle_interrupted_turn, settle_successful_turn,
 };
-use super::turn_stream_runner::TurnAttempt;
+use super::turn_stream_runner::{TurnAttempt, TurnExecutionInput, TurnExecutionRequest};
 use crate::cli::session::session_state::SessionState;
 
 pub(crate) async fn settle_turn_attempt(
@@ -15,16 +15,7 @@ pub(crate) async fn settle_turn_attempt(
     dispatch: &mut TurnDispatch<'_, '_>,
     attempt: TurnAttempt,
     run_chat_turn: impl for<'a> Fn(
-        &'a mut SessionState,
-        &'a astra_thin_client::ThinClient,
-        Option<&'a str>,
-        &'a str,
-        &'a str,
-        &'a str,
-        &'a [String],
-        &'a [String],
-        Option<&'a str>,
-        Option<&'a str>,
+        TurnExecutionRequest<'a>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = TurnAttempt> + 'a>,
     >,
@@ -57,16 +48,7 @@ async fn try_retry_after_session_not_found(
     dispatch: &mut TurnDispatch<'_, '_>,
     failure: &crate::TurnFailure,
     run_chat_turn: &impl for<'a> Fn(
-        &'a mut SessionState,
-        &'a astra_thin_client::ThinClient,
-        Option<&'a str>,
-        &'a str,
-        &'a str,
-        &'a str,
-        &'a [String],
-        &'a [String],
-        Option<&'a str>,
-        Option<&'a str>,
+        TurnExecutionRequest<'a>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = TurnAttempt> + 'a>,
     >,
@@ -80,18 +62,20 @@ async fn try_retry_after_session_not_found(
         .ui
         .show_warning("  Session not found. Creating a new session…");
 
-    let retry = run_chat_turn(
+    let retry = run_chat_turn(TurnExecutionRequest {
         state,
-        dispatch.ctx.api,
-        dispatch.ctx.profile,
-        dispatch.token,
-        dispatch.effective_line,
-        dispatch.user_intent,
-        dispatch.input_runtime_required_texts,
-        dispatch.input_runtime_volatile_texts,
-        None,
-        dispatch.semantic_query_override,
-    )
+        input: TurnExecutionInput {
+            api: dispatch.ctx.api,
+            profile: dispatch.ctx.profile,
+            token: dispatch.token,
+            message: dispatch.effective_line,
+            user_intent: dispatch.user_intent,
+            input_runtime_required_texts: dispatch.input_runtime_required_texts,
+            input_runtime_volatile_texts: dispatch.input_runtime_volatile_texts,
+            session_id: None,
+            semantic_query_override: dispatch.semantic_query_override,
+        },
+    })
     .await;
     settle_retry_attempt(state, dispatch, retry).await;
     true
@@ -102,16 +86,7 @@ async fn try_retry_after_auth_refresh(
     dispatch: &mut TurnDispatch<'_, '_>,
     failure: &crate::TurnFailure,
     run_chat_turn: &impl for<'a> Fn(
-        &'a mut SessionState,
-        &'a astra_thin_client::ThinClient,
-        Option<&'a str>,
-        &'a str,
-        &'a str,
-        &'a str,
-        &'a [String],
-        &'a [String],
-        Option<&'a str>,
-        Option<&'a str>,
+        TurnExecutionRequest<'a>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = TurnAttempt> + 'a>,
     >,
@@ -123,18 +98,20 @@ async fn try_retry_after_auth_refresh(
         return false;
     };
 
-    let retry = run_chat_turn(
+    let retry = run_chat_turn(TurnExecutionRequest {
         state,
-        dispatch.ctx.api,
-        dispatch.ctx.profile,
-        &new_token,
-        dispatch.effective_line,
-        dispatch.user_intent,
-        dispatch.input_runtime_required_texts,
-        dispatch.input_runtime_volatile_texts,
-        dispatch.session_id,
-        dispatch.semantic_query_override,
-    )
+        input: TurnExecutionInput {
+            api: dispatch.ctx.api,
+            profile: dispatch.ctx.profile,
+            token: &new_token,
+            message: dispatch.effective_line,
+            user_intent: dispatch.user_intent,
+            input_runtime_required_texts: dispatch.input_runtime_required_texts,
+            input_runtime_volatile_texts: dispatch.input_runtime_volatile_texts,
+            session_id: dispatch.session_id,
+            semantic_query_override: dispatch.semantic_query_override,
+        },
+    })
     .await;
     settle_retry_attempt(state, dispatch, retry).await;
     true
@@ -193,18 +170,11 @@ mod tests {
             partial: crate::PartialTurnData::default(),
         })));
 
-        settle_turn_attempt(
-            &mut state,
-            &mut dispatch,
-            attempt,
-            |_, _, _, _, _, _, _, _, _, _| {
-                Box::pin(async move {
-                    TurnAttempt::Completed(Box::new(Ok(crate::tests::stub_stream_result(
-                        "Recovered",
-                    ))))
-                })
-            },
-        )
+        settle_turn_attempt(&mut state, &mut dispatch, attempt, |_| {
+            Box::pin(async move {
+                TurnAttempt::Completed(Box::new(Ok(crate::tests::stub_stream_result("Recovered"))))
+            })
+        })
         .await
         .unwrap();
 

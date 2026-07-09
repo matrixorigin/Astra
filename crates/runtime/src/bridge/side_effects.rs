@@ -91,7 +91,7 @@ impl Drop for SideEffectDrainLease {
         }
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                let _ = handle.spawn(drain_bridge_hook_side_effect_queue(key));
+                std::mem::drop(handle.spawn(drain_bridge_hook_side_effect_queue(key)));
             }
             Err(error) => {
                 let mut queues = ORDERED_SIDE_EFFECT_QUEUES

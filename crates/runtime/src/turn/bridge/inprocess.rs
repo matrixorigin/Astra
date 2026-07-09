@@ -2668,6 +2668,7 @@ impl InProcessChatTurnBridge {
                 &model_name,
                 &thinking_config,
                 cache_capability,
+                &cache_cfg,
             );
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
@@ -5583,6 +5584,7 @@ mod tests {
                 "claude-sonnet-4",
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
                 None,
+                &cache_cfg,
             );
         crate::turn::llm::context::apply_bridge_message_cache_metadata(
             &mut llm_messages,

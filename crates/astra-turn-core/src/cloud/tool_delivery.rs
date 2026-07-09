@@ -267,6 +267,18 @@ pub struct ApprovalAuditContext {
     pub auxiliary_event_writer: Arc<dyn crate::contracts::TurnAuxiliaryEventWriter>,
 }
 
+#[derive(Clone, Copy)]
+pub struct EdgeToolDeliveryRequest<'a> {
+    pub ledger: &'a Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    pub user_id: &'a str,
+    pub session_id: &'a str,
+    pub run_id: &'a str,
+    pub turn_chain_id: &'a str,
+    pub tool_calls: &'a [Value],
+    pub ledger_wait: Duration,
+    pub approval_audit: Option<&'a ApprovalAuditContext>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalOutcomeSource {
     Ledger,
@@ -956,7 +968,7 @@ pub async fn deliver_tool_calls_through_edge_ledger(
     tool_calls: &[Value],
     ledger_wait: Duration,
 ) -> EdgeToolRoundDelivery {
-    deliver_tool_calls_through_edge_ledger_with_approval_audit(
+    deliver_tool_calls_through_edge_ledger_with_approval_audit(EdgeToolDeliveryRequest {
         ledger,
         user_id,
         session_id,
@@ -964,23 +976,22 @@ pub async fn deliver_tool_calls_through_edge_ledger(
         turn_chain_id,
         tool_calls,
         ledger_wait,
-        None,
-    )
+        approval_audit: None,
+    })
     .await
 }
 
 pub async fn deliver_tool_calls_through_edge_ledger_with_approval_audit(
-    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    turn_chain_id: &str,
-    tool_calls: &[Value],
-    ledger_wait: Duration,
-    approval_audit: Option<&ApprovalAuditContext>,
+    request: EdgeToolDeliveryRequest<'_>,
 ) -> EdgeToolRoundDelivery {
-    let tool_calls = crate::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
-    let scope = EdgeDispatchIdentity::new(user_id, session_id, run_id, turn_chain_id, "");
+    let tool_calls = crate::headless_tool_assembly::ensure_tool_call_ids(request.tool_calls);
+    let scope = EdgeDispatchIdentity::new(
+        request.user_id,
+        request.session_id,
+        request.run_id,
+        request.turn_chain_id,
+        "",
+    );
     let mut out = EdgeToolRoundDelivery::default();
     append_approval_batch_events(&mut out, &collect_approval_batches(&tool_calls));
 
@@ -996,9 +1007,16 @@ pub async fn deliver_tool_calls_through_edge_ledger_with_approval_audit(
 
         let block = &tool_calls[block_start..block_end];
         let part = if approval_required {
-            deliver_approval_block(ledger, &scope, block, ledger_wait, approval_audit).await
+            deliver_approval_block(
+                request.ledger,
+                &scope,
+                block,
+                request.ledger_wait,
+                request.approval_audit,
+            )
+            .await
         } else {
-            deliver_read_only_block(ledger, &scope, block, ledger_wait).await
+            deliver_read_only_block(request.ledger, &scope, block, request.ledger_wait).await
         };
         extend_delivery(&mut out, part);
         block_start = block_end;
@@ -1025,7 +1043,7 @@ pub async fn deliver_tool_calls_concurrent(
     tool_calls: &[Value],
     ledger_wait: Duration,
 ) -> EdgeToolRoundDelivery {
-    deliver_tool_calls_concurrent_with_approval_audit(
+    deliver_tool_calls_concurrent_with_approval_audit(EdgeToolDeliveryRequest {
         ledger,
         user_id,
         session_id,
@@ -1033,24 +1051,23 @@ pub async fn deliver_tool_calls_concurrent(
         turn_chain_id,
         tool_calls,
         ledger_wait,
-        None,
-    )
+        approval_audit: None,
+    })
     .await
 }
 
 #[cfg(test)]
 pub async fn deliver_tool_calls_concurrent_with_approval_audit(
-    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    turn_chain_id: &str,
-    tool_calls: &[Value],
-    ledger_wait: Duration,
-    approval_audit: Option<&ApprovalAuditContext>,
+    request: EdgeToolDeliveryRequest<'_>,
 ) -> EdgeToolRoundDelivery {
-    let tool_calls = crate::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
-    let scope = EdgeDispatchIdentity::new(user_id, session_id, run_id, turn_chain_id, "");
+    let tool_calls = crate::headless_tool_assembly::ensure_tool_call_ids(request.tool_calls);
+    let scope = EdgeDispatchIdentity::new(
+        request.user_id,
+        request.session_id,
+        request.run_id,
+        request.turn_chain_id,
+        "",
+    );
     let mut out = EdgeToolRoundDelivery::default();
     append_approval_batch_events(&mut out, &collect_approval_batches(&tool_calls));
 
@@ -1066,10 +1083,17 @@ pub async fn deliver_tool_calls_concurrent_with_approval_audit(
 
         let block = &tool_calls[block_start..block_end];
         let part = if approval_required {
-            deliver_approval_block_concurrent(ledger, &scope, block, ledger_wait, approval_audit)
-                .await
+            deliver_approval_block_concurrent(
+                request.ledger,
+                &scope,
+                block,
+                request.ledger_wait,
+                request.approval_audit,
+            )
+            .await
         } else {
-            deliver_read_only_block_concurrent(ledger, &scope, block, ledger_wait).await
+            deliver_read_only_block_concurrent(request.ledger, &scope, block, request.ledger_wait)
+                .await
         };
         extend_delivery(&mut out, part);
         block_start = block_end;
@@ -1145,16 +1169,16 @@ mod tests {
         ledger_wait: Duration,
         approval_audit: Option<&ApprovalAuditContext>,
     ) -> EdgeToolRoundDelivery {
-        super::deliver_tool_calls_through_edge_ledger_with_approval_audit(
+        super::deliver_tool_calls_through_edge_ledger_with_approval_audit(EdgeToolDeliveryRequest {
             ledger,
             user_id,
-            TEST_SESSION_ID,
-            TEST_RUN_ID,
-            TEST_TURN_CHAIN_ID,
+            session_id: TEST_SESSION_ID,
+            run_id: TEST_RUN_ID,
+            turn_chain_id: TEST_TURN_CHAIN_ID,
             tool_calls,
             ledger_wait,
             approval_audit,
-        )
+        })
         .await
     }
 
@@ -1183,16 +1207,16 @@ mod tests {
         ledger_wait: Duration,
         approval_audit: Option<&ApprovalAuditContext>,
     ) -> EdgeToolRoundDelivery {
-        super::deliver_tool_calls_concurrent_with_approval_audit(
+        super::deliver_tool_calls_concurrent_with_approval_audit(EdgeToolDeliveryRequest {
             ledger,
             user_id,
-            TEST_SESSION_ID,
-            TEST_RUN_ID,
-            TEST_TURN_CHAIN_ID,
+            session_id: TEST_SESSION_ID,
+            run_id: TEST_RUN_ID,
+            turn_chain_id: TEST_TURN_CHAIN_ID,
             tool_calls,
             ledger_wait,
             approval_audit,
-        )
+        })
         .await
     }
 

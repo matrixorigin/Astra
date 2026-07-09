@@ -6871,7 +6871,9 @@ fn spill_old_messages_to_disk(
             return 0;
         }
     };
-    let tokens_freed = (spill_json.len() / 4) as u64;
+    let tokens_freed = u64::from(astra_turn_core::section_types::estimate_text_tokens(
+        &spill_json,
+    ));
 
     // Write full transcript to session dir.
     let spill_dir = astra_services::session_journal::local_sessions_dir().join(session_id);

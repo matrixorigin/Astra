@@ -25,6 +25,7 @@ use astra_skills::manifest::{
     ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind, TrustTier,
 };
 use astra_skills::traits::{SkillError, SkillProvider};
+use astra_turn_core::section_types::estimate_text_tokens;
 use astra_turn_core::tool::schema::tool_schema_name;
 
 use crate::skills::{BundledSkillProvider, LocalSkillProvider, UnifiedSkillRegistry};
@@ -431,7 +432,7 @@ pub fn loaded_skill_from_record(record: SkillRecord) -> Result<LoadedSkill, Skil
             ))
         })?
         .to_string();
-    let instruction_tokens = (instructions.len() as u32) / 4;
+    let instruction_tokens = estimate_text_tokens(&instructions);
     let version = record.version.parse().unwrap_or_default();
 
     let execution_context = match metadata_obj

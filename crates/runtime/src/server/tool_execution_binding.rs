@@ -371,12 +371,14 @@ impl ExecutionBindingState {
         name: &str,
         args: &Value,
     ) -> ToolExecutionRequest {
+        let run_id = string_arg(args, "_run_id").unwrap_or_default().to_string();
+        let turn_chain_id = string_arg(args, "_turn_chain_id")
+            .map(str::to_string)
+            .unwrap_or_else(|| run_id.clone());
         ToolExecutionRequest {
             user_id: user_id.to_string(),
-            run_id: string_arg(args, "_run_id").unwrap_or_default().to_string(),
-            turn_chain_id: string_arg(args, "_turn_chain_id")
-                .unwrap_or_default()
-                .to_string(),
+            run_id,
+            turn_chain_id,
             session_id: session_id.to_string(),
             tool_call_id: tool_call_id(args).unwrap_or_default().to_string(),
             tool_name: name.to_string(),
@@ -464,6 +466,7 @@ mod tests {
         assert_eq!(request.user_id, "user-1");
         assert_eq!(request.session_id, "session-1");
         assert_eq!(request.run_id, "run-1");
+        assert_eq!(request.turn_chain_id, "run-1");
         assert_eq!(request.tool_call_id, "call-1");
         assert_eq!(request.tool_name, "bash");
         assert_eq!(request.args["command"], "pwd");

@@ -5,6 +5,7 @@ use serde_json::Value;
 use astra_config::ToolSurfaceConfig;
 
 use super::DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS;
+use astra_turn_core::section_types::estimate_text_tokens;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, ToolMeta};
 use astra_turn_core::tool_registry_report::ToolSelectionReport;
@@ -89,7 +90,7 @@ fn is_pure_conversational_query(query: &str) -> bool {
 pub struct ToolRegistry {
     all_schemas: Vec<Value>,
     schema_budget_tokens: u32,
-    /// Real token costs measured from actual schemas (schema JSON bytes / 4).
+    /// Real token costs measured from actual schema JSON.
     /// Maps tool name → measured token cost.
     measured_costs: std::collections::HashMap<String, u32>,
     /// O(1) lookup: tool name → index into all_schemas.
@@ -168,16 +169,20 @@ impl ToolRegistry {
     }
 
     /// Measure actual token cost of each tool schema from real JSON.
-    /// Uses JSON bytes / 4 as the token approximation.
     fn measure_all_schemas(schemas: &[Value]) -> std::collections::HashMap<String, u32> {
         let mut costs = std::collections::HashMap::new();
         for schema in schemas {
             if let Some(name) = tool_schema_name(schema) {
-                let json_bytes = serde_json::to_string(schema).map(|s| s.len()).unwrap_or(0);
-                costs.insert(name.to_string(), (json_bytes / 4) as u32);
+                costs.insert(name.to_string(), Self::measure_schema_tokens(schema));
             }
         }
         costs
+    }
+
+    fn measure_schema_tokens(schema: &Value) -> u32 {
+        serde_json::to_string(schema)
+            .map(|json| estimate_text_tokens(&json))
+            .unwrap_or(0)
     }
 
     /// Build name → index map for O(1) schema lookup.
@@ -425,9 +430,8 @@ impl ToolRegistry {
             }
             let name_owned = name.to_string();
             let idx = self.all_schemas.len();
-            let json_bytes = serde_json::to_string(&schema).map(|s| s.len()).unwrap_or(0);
             self.measured_costs
-                .insert(name_owned.clone(), (json_bytes / 4) as u32);
+                .insert(name_owned.clone(), Self::measure_schema_tokens(&schema));
             self.schema_index.insert(name_owned.clone(), idx);
             if always_load {
                 self.always_load_schemas.push((name_owned, schema.clone()));
@@ -443,9 +447,8 @@ impl ToolRegistry {
             return;
         };
 
-        let json_bytes = serde_json::to_string(&schema).map(|s| s.len()).unwrap_or(0);
         self.measured_costs
-            .insert(name.clone(), (json_bytes / 4) as u32);
+            .insert(name.clone(), Self::measure_schema_tokens(&schema));
 
         if let Some(&idx) = self.schema_index.get(&name) {
             self.all_schemas[idx] = schema.clone();

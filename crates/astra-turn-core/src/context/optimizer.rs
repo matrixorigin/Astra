@@ -14,7 +14,9 @@ use crate::context_planner::ContextPlan;
 use crate::microcompact::{CompactStrategy, PromptCacheProtocol};
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::ProviderCachePolicy;
-use crate::section_types::{BoundSection, CacheScope, SectionArtifact, SectionKind};
+use crate::section_types::{
+    BoundSection, CacheScope, SectionArtifact, SectionKind, estimate_text_tokens,
+};
 use crate::session_latches::SessionLatches;
 use crate::spill_backend::SpillBackend;
 
@@ -298,7 +300,7 @@ fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
         .map(|&idx| &messages[idx])
         .map(|m| {
             let content = m.get("content").and_then(Value::as_str).unwrap_or("");
-            (content.len() as u32) / 4 // rough token estimate
+            estimate_text_tokens(content)
         })
         .sum();
 
@@ -1077,6 +1079,27 @@ mod tests {
         assert!(dropped > 0);
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "stable system");
+    }
+
+    #[test]
+    fn round_dropping_reports_dense_unicode_tokens_with_shared_estimator() {
+        let content = "你好世界";
+        let mut messages: Vec<Value> = (0..12)
+            .map(|i| {
+                if i % 2 == 0 {
+                    serde_json::json!({"role": "assistant", "content": content})
+                } else {
+                    serde_json::json!({"role": "user", "content": content})
+                }
+            })
+            .collect();
+
+        let dropped = drop_oldest_rounds(&mut messages, 1.0);
+
+        assert_eq!(
+            dropped,
+            crate::section_types::estimate_text_tokens(content) * 2
+        );
     }
 
     #[test]

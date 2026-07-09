@@ -10,8 +10,9 @@ use tower::util::ServiceExt;
 
 use super::harness::{
     MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data, delete_json, delete_no_content,
-    get_json, post_empty, post_json, post_json_with_headers, put_json, row_get_opt_i64,
-    row_get_opt_str, row_get_str, seeded_selected_model, wait_for_agent_event_types,
+    get_json, maybe_tool_result_payload_from_sse, post_empty, post_json, post_json_with_headers,
+    put_json, row_get_opt_i64, row_get_opt_str, row_get_str, seeded_selected_model,
+    tool_result_payload, wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -86,31 +87,24 @@ async fn run_tool_backed_chat_turn(
         let chunk = chunk.expect("tool-backed sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !posted_result
-            && s.contains("\"type\":\"tool_request\"")
-            && s.contains("ctx-trace-tool-1")
-        {
-            let (st_result, result_body) = post_json(
-                app,
-                "/tools/result",
-                Some(auth_header),
-                json!({
-                    "request_id": "ctx-trace-tool-1",
-                    "status": "ok",
-                    "output": "# README\nfrom tool-backed matrix e2e\n",
-                    "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
-                        "ctx-trace-tool-1",
-                        "# README\nfrom tool-backed matrix e2e\n",
-                    ),
-                }),
-            )
-            .await;
-            assert_eq!(
-                st_result,
-                StatusCode::OK,
-                "POST /tools/result for ctx-trace-tool-1: {result_body}"
-            );
-            posted_result = true;
+        if !posted_result {
+            if let Some(payload) = maybe_tool_result_payload_from_sse(
+                s.as_ref(),
+                "ctx-trace-tool-1",
+                &ctx.edge_agent_id,
+                "ok",
+                "# README\nfrom tool-backed matrix e2e\n",
+                0,
+            ) {
+                let (st_result, result_body) =
+                    post_json(app, "/tools/result", Some(auth_header), payload).await;
+                assert_eq!(
+                    st_result,
+                    StatusCode::OK,
+                    "POST /tools/result for ctx-trace-tool-1: {result_body}"
+                );
+                posted_result = true;
+            }
         }
         if s.contains("turn_complete") {
             saw_turn_complete = true;
@@ -786,15 +780,16 @@ pub async fn run_product_matrix_full_journey(
         app,
         "/tools/result",
         Some(auth_header.as_str()),
-        json!({
-            "request_id": "matrix-tool-req-1",
-            "status": "ok",
-            "output": "done",
-            "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
-                "matrix-tool-req-1",
-                "done",
-            ),
-            "duration_ms": 12
+        tool_result_payload(astra_thin_client::ToolResultRequestParts {
+            session_id: session_id.clone(),
+            run_id: format!("matrix-tool-run-{suffix}"),
+            turn_chain_id: format!("matrix-tool-chain-{suffix}"),
+            request_id: "matrix-tool-req-1".to_string(),
+            edge_agent_id: edge_agent_id.clone(),
+            status: "ok".to_string(),
+            output: "done".to_string(),
+            duration_ms: 12,
+            tool_result_fields: None,
         }),
     )
     .await;

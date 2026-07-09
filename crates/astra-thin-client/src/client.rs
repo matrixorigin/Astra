@@ -2136,16 +2136,17 @@ mod tests {
             .await;
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
-        let body = ToolResultRequest::new_with_hash(
-            "sess-1".into(),
-            "run-1".into(),
-            "chain-1".into(),
-            "tr-1".into(),
-            "edge-abc".into(),
-            "completed".into(),
-            "out".into(),
-            12,
-        );
+        let body = ToolResultRequest::new_with_hash(crate::protocol::ToolResultRequestParts {
+            session_id: "sess-1".into(),
+            run_id: "run-1".into(),
+            turn_chain_id: "chain-1".into(),
+            request_id: "tr-1".into(),
+            edge_agent_id: "edge-abc".into(),
+            status: "completed".into(),
+            output: "out".into(),
+            duration_ms: 12,
+            tool_result_fields: None,
+        });
         let v = client
             .post_tool_result(Some("tok"), Some("edge-abc"), &body)
             .await

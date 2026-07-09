@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use super::harness::{
     E2E_PASSWORD, bootstrap, collect_sse_body_text, delete_json, delete_no_content, get_json,
-    grant_astra_admin_role, post_empty, post_json, put_json, seeded_selected_model,
+    grant_astra_admin_role, maybe_tool_result_payload_from_sse, post_empty, post_json, put_json,
+    seeded_selected_model, tool_result_payload,
 };
 use astra_services::session_journal::{JournalEventType, read_journal};
 use axum::{body::Body, http::Request};
@@ -287,14 +288,16 @@ pub async fn run_edge_callback_http_boundary_failures() {
         app,
         "/tools/result",
         None,
-        json!({
-            "request_id": format!("tool-unauth-{}", ctx.suffix),
-            "status": "ok",
-            "output": "ignored",
-            "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
-                &format!("tool-unauth-{}", ctx.suffix),
-                "ignored",
-            )
+        tool_result_payload(astra_thin_client::ToolResultRequestParts {
+            session_id: ctx.session_id.clone(),
+            run_id: format!("run-tool-unauth-{}", ctx.suffix),
+            turn_chain_id: format!("chain-tool-unauth-{}", ctx.suffix),
+            request_id: format!("tool-unauth-{}", ctx.suffix),
+            edge_agent_id: ctx.edge_agent_id.clone(),
+            status: "ok".to_string(),
+            output: "ignored".to_string(),
+            duration_ms: 0,
+            tool_result_fields: None,
         }),
     )
     .await;
@@ -428,29 +431,27 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
         let chunk = chunk.expect("duplicate tool result sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !posted_duplicates
-            && s.contains("\"type\":\"tool_request\"")
-            && s.contains("tc-dup-tool-1")
-        {
-            for _ in 0..2 {
-                let (status, body) = post_json(
-                    &ctx.app,
-                    "/tools/result",
-                    Some(b.auth_header.as_str()),
-                    json!({
-                        "request_id": "tc-dup-tool-1",
-                        "status": "ok",
-                        "output": tool_output,
-                        "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
-                            "tc-dup-tool-1",
-                            tool_output,
-                        ),
-                    }),
-                )
-                .await;
-                assert_eq!(status, StatusCode::OK, "duplicate /tools/result: {body}");
+        if !posted_duplicates {
+            if let Some(payload) = maybe_tool_result_payload_from_sse(
+                s.as_ref(),
+                "tc-dup-tool-1",
+                &ctx.edge_agent_id,
+                "ok",
+                tool_output,
+                0,
+            ) {
+                for _ in 0..2 {
+                    let (status, body) = post_json(
+                        &ctx.app,
+                        "/tools/result",
+                        Some(b.auth_header.as_str()),
+                        payload.clone(),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK, "duplicate /tools/result: {body}");
+                }
+                posted_duplicates = true;
             }
-            posted_duplicates = true;
         }
         if s.contains("\"type\":\"turn_complete\"") {
             saw_turn_complete = true;
@@ -614,51 +615,53 @@ pub async fn run_chat_turn_partial_batch_failure() {
         let chunk = chunk.expect("partial batch sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !posted_first && s.contains("\"type\":\"tool_request\"") && s.contains("tc-partial-1") {
-            let (status, body) = post_json(
-                &ctx.app,
-                "/tools/result",
-                Some(b.auth_header.as_str()),
-                json!({
-                    "request_id": "tc-partial-1",
-                    "status": "ok",
-                    "output": ok_output,
-                    "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
-                        "tc-partial-1",
-                        ok_output,
-                    ),
-                }),
-            )
-            .await;
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "first partial /tools/result: {body}"
-            );
-            posted_first = true;
+        if !posted_first {
+            if let Some(payload) = maybe_tool_result_payload_from_sse(
+                s.as_ref(),
+                "tc-partial-1",
+                &ctx.edge_agent_id,
+                "ok",
+                ok_output,
+                0,
+            ) {
+                let (status, body) = post_json(
+                    &ctx.app,
+                    "/tools/result",
+                    Some(b.auth_header.as_str()),
+                    payload,
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "first partial /tools/result: {body}"
+                );
+                posted_first = true;
+            }
         }
-        if !posted_second && s.contains("\"type\":\"tool_request\"") && s.contains("tc-partial-2") {
-            let (status, body) = post_json(
-                &ctx.app,
-                "/tools/result",
-                Some(b.auth_header.as_str()),
-                json!({
-                    "request_id": "tc-partial-2",
-                    "status": "error",
-                    "output": err_output,
-                    "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
-                        "tc-partial-2",
-                        err_output,
-                    ),
-                }),
-            )
-            .await;
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "second partial /tools/result: {body}"
-            );
-            posted_second = true;
+        if !posted_second {
+            if let Some(payload) = maybe_tool_result_payload_from_sse(
+                s.as_ref(),
+                "tc-partial-2",
+                &ctx.edge_agent_id,
+                "error",
+                err_output,
+                0,
+            ) {
+                let (status, body) = post_json(
+                    &ctx.app,
+                    "/tools/result",
+                    Some(b.auth_header.as_str()),
+                    payload,
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "second partial /tools/result: {body}"
+                );
+                posted_second = true;
+            }
         }
         if s.contains("\"type\":\"turn_complete\"") {
             saw_turn_complete = true;
@@ -780,25 +783,33 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
         let chunk = chunk.expect("out-of-order sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !posted_out_of_order
-            && s.contains("\"type\":\"tool_request\"")
-            && s.contains("tc-race-1")
-            && s.contains("tc-race-2")
-        {
+        if !posted_out_of_order {
+            let second_payload = maybe_tool_result_payload_from_sse(
+                s.as_ref(),
+                "tc-race-2",
+                &ctx.edge_agent_id,
+                "ok",
+                second_output,
+                0,
+            );
+            let first_payload = maybe_tool_result_payload_from_sse(
+                s.as_ref(),
+                "tc-race-1",
+                &ctx.edge_agent_id,
+                "ok",
+                first_output,
+                0,
+            );
+            let (Some(second_payload), Some(first_payload)) = (second_payload, first_payload)
+            else {
+                continue;
+            };
             let (second, first) = tokio::join!(
                 post_json(
                     &ctx.app,
                     "/tools/result",
                     Some(b.auth_header.as_str()),
-                    json!({
-                        "request_id": "tc-race-2",
-                        "status": "ok",
-                        "output": second_output,
-                        "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
-                            "tc-race-2",
-                            second_output,
-                        ),
-                    }),
+                    second_payload,
                 ),
                 async {
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -806,15 +817,7 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
                         &ctx.app,
                         "/tools/result",
                         Some(b.auth_header.as_str()),
-                        json!({
-                            "request_id": "tc-race-1",
-                            "status": "ok",
-                            "output": first_output,
-                            "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
-                                "tc-race-1",
-                                first_output,
-                            ),
-                        }),
+                        first_payload,
                     )
                     .await
                 }
@@ -1114,48 +1117,46 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
         let chunk = chunk.expect("waiting overlap primary sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
-        if !ran_overlap_turn
-            && s.contains("\"type\":\"tool_request\"")
-            && s.contains("tc-overlap-wait-1")
-        {
-            overlap_raw = collect_turn(
-                ctx.app.clone(),
-                b.auth_header.clone(),
-                json!({
-                    "agent_id": "system-matrix-overlap-agent",
-                    "session_id": ctx.session_id,
-                    "messages": [{ "role": "user", "content": "waiting overlap plain turn" }],
-                    "selected_model": seeded_selected_model(ctx),
-                    "test_llm_rounds": [{
-                        "full_text": "Waiting overlap plain turn finished."
-                    }]
-                }),
-                test_secret.clone(),
-            )
-            .await;
-            ran_overlap_turn = true;
+        if !ran_overlap_turn {
+            if let Some(payload) = maybe_tool_result_payload_from_sse(
+                s.as_ref(),
+                "tc-overlap-wait-1",
+                &ctx.edge_agent_id,
+                "ok",
+                tool_output,
+                0,
+            ) {
+                overlap_raw = collect_turn(
+                    ctx.app.clone(),
+                    b.auth_header.clone(),
+                    json!({
+                        "agent_id": "system-matrix-overlap-agent",
+                        "session_id": ctx.session_id,
+                        "messages": [{ "role": "user", "content": "waiting overlap plain turn" }],
+                        "selected_model": seeded_selected_model(ctx),
+                        "test_llm_rounds": [{
+                            "full_text": "Waiting overlap plain turn finished."
+                        }]
+                    }),
+                    test_secret.clone(),
+                )
+                .await;
+                ran_overlap_turn = true;
 
-            let (status, body) = post_json(
-                &ctx.app,
-                "/tools/result",
-                Some(b.auth_header.as_str()),
-                json!({
-                    "request_id": "tc-overlap-wait-1",
-                    "status": "ok",
-                    "output": tool_output,
-                    "result_hash": astra_thin_client::ToolResultRequest::compute_result_hash(
-                        "tc-overlap-wait-1",
-                        tool_output,
-                    ),
-                }),
-            )
-            .await;
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "waiting overlap tool result: {body}"
-            );
-            posted_tool_result = true;
+                let (status, body) = post_json(
+                    &ctx.app,
+                    "/tools/result",
+                    Some(b.auth_header.as_str()),
+                    payload,
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "waiting overlap tool result: {body}"
+                );
+                posted_tool_result = true;
+            }
         }
         if s.contains("\"type\":\"turn_complete\"") {
             saw_turn_complete = true;

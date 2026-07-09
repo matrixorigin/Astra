@@ -141,9 +141,12 @@ impl TaskExecutionProfile {
     }
 }
 
-#[must_use]
-pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
-    let _ = active_user_task_text(input);
+/// Fallback profile for callers that don't yet have a structured intent.
+///
+/// Always returns `TaskExecutionProfile::default()` (standard analysis).
+/// Prefer [`TaskExecutionProfile::from_structured_intent`] for semantic
+/// classification; this exists only for call sites that haven't migrated.
+pub fn infer_task_execution_profile(_input: &str) -> TaskExecutionProfile {
     TaskExecutionProfile::default()
 }
 

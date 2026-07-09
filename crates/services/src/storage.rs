@@ -5874,6 +5874,7 @@ mod tests {
     #[test]
     fn edge_pending_dispatch_identity_is_turn_scoped() {
         let source = include_str!("storage.rs");
+        let production_source = source.split("#[cfg(test)]").next().unwrap_or(source);
         assert_eq!(
             EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
             &[
@@ -5886,11 +5887,11 @@ mod tests {
             "edge_pending_dispatch identity must be scoped to the owning turn"
         );
         assert!(
-            !source.contains("dispatch_id BIGINT AUTO_INCREMENT"),
+            !production_source.contains("dispatch_id BIGINT AUTO_INCREMENT"),
             "edge_pending_dispatch must not reintroduce a global AUTO_INCREMENT surrogate"
         );
         assert!(
-            source.contains("&[\"dispatch_id\"]"),
+            production_source.contains("&[\"dispatch_id\"]"),
             "legacy dispatch_id schemas must fail startup instead of silently preserving the old hot surrogate"
         );
     }

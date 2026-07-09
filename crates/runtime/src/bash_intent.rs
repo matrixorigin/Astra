@@ -299,7 +299,7 @@ mod tests {
         // Compound / sudo
         assert!(intent("cd /tmp && mv x y").mutating);
         assert!(intent("sudo rm -rf /tmp/foo").mutating);
-        assert!(!intent("cd rust && cat src/lib.rs").mutating);
+        assert!(!intent("cd workspace && cat src/lib.rs").mutating);
         // Package managers
         assert!(intent("npm install react").mutating);
         assert!(intent("pnpm install").mutating);

@@ -159,6 +159,18 @@ pub struct SkillAutoRouteJudgeContext<'a> {
     pub visible_skills: &'a [crate::turn::skill_tool::SkillToolInfo],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnIntentJudgeOutcome {
+    Intent(TurnIntent),
+    Unavailable,
+}
+
+impl TurnIntentJudgeOutcome {
+    pub fn from_optional_intent(intent: Option<TurnIntent>) -> Self {
+        intent.map_or(Self::Unavailable, Self::Intent)
+    }
+}
+
 pub enum ControlToolRecovery {
     Unsupported,
     Missing,
@@ -205,8 +217,8 @@ pub trait AgenticLoopHost: Send {
     /// an LLM judge or another explicit structured signal should override this;
     /// runtime defaults must not infer natural-language intent from keyword
     /// lists.
-    async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
-        None
+    async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> TurnIntentJudgeOutcome {
+        TurnIntentJudgeOutcome::Unavailable
     }
 
     /// Optional semantic judge for pre-routing directly into one skill.
@@ -3330,12 +3342,15 @@ pub(crate) mod tests {
             }
             self.executed_messages.push(state.messages.clone());
             let result = self.turn_results.remove(0);
+            for edge_result in &result.edge_tool_round {
+                self.valid_tools.insert(edge_result.tool.clone());
+            }
             self.current_turn += 1;
             Ok(result)
         }
 
-        async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
-            self.turn_intent.clone()
+        async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> TurnIntentJudgeOutcome {
+            TurnIntentJudgeOutcome::from_optional_intent(self.turn_intent.clone())
         }
 
         async fn judge_skill_auto_route(
@@ -3447,12 +3462,27 @@ pub(crate) mod tests {
         completion: u64,
         ttft: Option<u64>,
     ) -> HostTurnResult {
+        let has_tool_calls = !tools.is_empty();
+        let tool_calls = tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "id": tool.request_id.as_str(),
+                    "type": "function",
+                    "function": {
+                        "name": tool.tool.as_str(),
+                        "arguments": tool.args.to_string(),
+                    }
+                })
+            })
+            .collect();
         HostTurnResult {
             accum: ChatTurnSseAccum {
-                has_tool_calls: false,
+                has_tool_calls,
                 has_usage: true,
                 prompt_tokens: prompt,
                 completion_tokens: completion,
+                tool_calls,
                 ..ChatTurnSseAccum::default()
             },
             ttft_ms: ttft,
@@ -3514,7 +3544,7 @@ pub(crate) mod tests {
             args: json!({}),
             output: output.to_string(),
             tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 10,
         }
     }
@@ -3531,7 +3561,7 @@ pub(crate) mod tests {
                 "<bash_detached>The bash command was promoted to background task {task_id}.</bash_detached>"
             ),
             tool_result_fields: Some(fields),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 10,
         }
     }
@@ -3564,7 +3594,7 @@ pub(crate) mod tests {
             })
             .to_string(),
             tool_result_fields: Some(control_plane_runtime_environment_fields()),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 10,
         }
     }
@@ -3576,7 +3606,7 @@ pub(crate) mod tests {
             args,
             output: output.to_string(),
             tool_result_fields: Some(edge_runtime_environment_fields()),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             duration_ms: 10,
         }
     }
@@ -5698,7 +5728,14 @@ pub(crate) mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
-        assert_eq!(state.final_text, "Passed through.");
+        assert!(state.final_text.starts_with("Passed through."));
+        assert!(
+            state
+                .final_text
+                .contains("unresolved tool/runtime failure(s): blocked_tool x1"),
+            "{}",
+            state.final_text
+        );
     }
 
     #[tokio::test]
@@ -8539,7 +8576,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // With KEEP_RECENT=6 and 6 tool results, none get compacted.
         // But the test verifies the microcompact code path runs without
         // breaking the agentic loop (no panics, correct final state).
-        assert_eq!(state.final_text, "Done.");
+        assert!(state.final_text.starts_with("Done."));
         assert_eq!(host.current_turn, 3);
     }
 
@@ -8590,7 +8627,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
-        assert_eq!(state.final_text, "Done.");
+        assert!(state.final_text.starts_with("Done."));
 
         // Every tool message must still have a tool_call_id field —
         // microcompact only changes content, never removes structural fields.

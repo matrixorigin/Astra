@@ -1219,19 +1219,19 @@ impl<'a> CliSseStreamHost<'a> {
         tool_result_fields: Option<Map<String, Value>>,
     ) -> Option<astra_thin_client::ToolResultRequest> {
         let identity = self.tool_result_identity(request_id)?;
-        Some(
-            astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
-                identity.session_id,
-                identity.run_id,
-                identity.turn_chain_id,
-                identity.request_id,
-                self.edge_agent_id.clone(),
+        Some(astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id,
+                run_id: identity.run_id,
+                turn_chain_id: identity.turn_chain_id,
+                request_id: identity.request_id,
+                edge_agent_id: self.edge_agent_id.clone(),
                 status,
                 output,
                 duration_ms,
                 tool_result_fields,
-            ),
-        )
+            },
+        ))
     }
 
     /// Build an `EdgeToolExecResult` and post it to the cloud API.
@@ -6887,7 +6887,7 @@ mod tests {
 
         let ctx = approval_scope_context_for_tool(
             "bash",
-            &serde_json::json!({"command": "cd /home/xupeng/github/astra/rust && cargo build -p astra-turn-core -p astra-cli"}),
+            &serde_json::json!({"command": "cd /home/xupeng/github/astra && cargo build -p astra-turn-core -p astra-cli"}),
             false,
             false,
         );
@@ -6905,7 +6905,7 @@ mod tests {
 
         let ctx = approval_scope_context_for_tool(
             "bash",
-            &serde_json::json!({"command": "cd /home/xupeng/github/astra/rust && cargo test -p astra-turn-core --lib cloud_approval_policy -- --nocapture"}),
+            &serde_json::json!({"command": "cd /home/xupeng/github/astra && cargo test -p astra-turn-core --lib cloud_approval_policy -- --nocapture"}),
             false,
             false,
         );
@@ -7751,14 +7751,17 @@ mod tests {
         };
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
-            "test-session".to_string(),
-            "test-run".to_string(),
-            "test-chain".to_string(),
-            "req-1".to_string(),
-            "test-agent".to_string(),
-            "completed".to_string(),
-            "done".to_string(),
-            1,
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "test-session".to_string(),
+                run_id: "test-run".to_string(),
+                turn_chain_id: "test-chain".to_string(),
+                request_id: "req-1".to_string(),
+                edge_agent_id: "test-agent".to_string(),
+                status: "completed".to_string(),
+                output: "done".to_string(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
         );
 
         let posted = host.post_tool_result_with_auth_retry(&body).await.is_ok();
@@ -7830,14 +7833,17 @@ mod tests {
         };
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
-            "test-session".to_string(),
-            "test-run".to_string(),
-            "test-chain".to_string(),
-            "req-1".to_string(),
-            "test-agent".to_string(),
-            "completed".to_string(),
-            "done".to_string(),
-            1,
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "test-session".to_string(),
+                run_id: "test-run".to_string(),
+                turn_chain_id: "test-chain".to_string(),
+                request_id: "req-1".to_string(),
+                edge_agent_id: "test-agent".to_string(),
+                status: "completed".to_string(),
+                output: "done".to_string(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
         );
 
         let err = host

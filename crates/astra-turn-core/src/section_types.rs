@@ -495,11 +495,29 @@ impl BoundSection {
 
 pub const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
-/// Estimate token count from raw text length (≈4 bytes/token).
-/// Saturates at `u32::MAX` instead of truncating on extremely large inputs.
+/// Estimate token count from raw text.
+///
+/// ASCII-heavy English/code keeps the long-standing ≈4 bytes/token estimate.
+/// Non-ASCII text is counted by Unicode scalar value so dense UTF-8 scripts
+/// such as CJK and emoji do not get discounted just because their byte length
+/// is later divided by the ASCII ratio. This remains a coarse, conservative
+/// budget estimate rather than a provider-specific tokenizer.
 #[must_use]
 pub fn estimate_text_tokens(text: &str) -> u32 {
-    (text.len() / BYTES_PER_TOKEN_ESTIMATE).min(u32::MAX as usize) as u32
+    let mut ascii_bytes = 0usize;
+    let mut non_ascii_chars = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii_bytes = ascii_bytes.saturating_add(ch.len_utf8());
+        } else {
+            non_ascii_chars = non_ascii_chars.saturating_add(1);
+        }
+    }
+    ascii_bytes
+        .checked_div(BYTES_PER_TOKEN_ESTIMATE)
+        .unwrap_or(0)
+        .saturating_add(non_ascii_chars)
+        .min(u32::MAX as usize) as u32
 }
 
 #[cfg(test)]
@@ -615,6 +633,17 @@ mod tests {
         // Also verify normal path still works
         let normal = "hello world"; // 11 bytes => 2 tokens
         assert_eq!(estimate_text_tokens(normal), 2);
+    }
+
+    #[test]
+    fn estimate_text_tokens_counts_dense_non_ascii_by_character() {
+        assert_eq!(estimate_text_tokens("你好世界"), 4);
+        assert_eq!(estimate_text_tokens("🚀🔥💻"), 3);
+        assert_eq!(
+            estimate_text_tokens("abcd你好"),
+            3,
+            "ASCII keeps bytes/4 estimate while non-ASCII chars are not discounted"
+        );
     }
 
     // ── rehydrate (Phase 12: on-demand spill resolution) ───────────────

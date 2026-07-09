@@ -437,11 +437,15 @@ fn resolve_write_target_path(
     if parent.exists() {
         return Ok(path);
     }
+    let candidates = workspace_file_identity_candidates(workspace_root, path_str);
+    if candidates.is_empty() {
+        return Ok(path);
+    }
     Err(path_resolution_failed(
         tool_name,
         path_str,
         "has a missing parent directory",
-        workspace_file_identity_candidates(workspace_root, path_str),
+        candidates,
     ))
 }
 
@@ -517,12 +521,12 @@ fn collect_workspace_file_paths(workspace_root: &Path, limit: usize) -> Vec<Path
                     continue;
                 }
                 stack.push(path);
-            } else if file_type.is_file() {
-                if let Ok(relative) = path.strip_prefix(workspace_root) {
-                    out.push(relative.to_path_buf());
-                    if out.len() >= limit {
-                        return out;
-                    }
+            } else if file_type.is_file()
+                && let Ok(relative) = path.strip_prefix(workspace_root)
+            {
+                out.push(relative.to_path_buf());
+                if out.len() >= limit {
+                    return out;
                 }
             }
         }
@@ -1089,10 +1093,7 @@ pub fn prepare_write_file(
             ));
         }
     };
-    let path = match resolve_write_target_path(workspace_root, path_str, "write_file") {
-        Ok(p) => p,
-        Err(e) => return Err(e),
-    };
+    let path = resolve_write_target_path(workspace_root, path_str, "write_file")?;
     let content = normalize_content_before_write(&path, content);
 
     let original_content_hash = sha256_digest_of_existing_file(&path);
@@ -1215,10 +1216,7 @@ pub fn prepare_str_replace(
         return Err(ToolResult::error(err));
     }
 
-    let path = match resolve_existing_path_for_tool(workspace_root, path_str, "str_replace") {
-        Ok(p) => p,
-        Err(e) => return Err(e),
-    };
+    let path = resolve_existing_path_for_tool(workspace_root, path_str, "str_replace")?;
 
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -1432,10 +1430,7 @@ pub fn prepare_multi_edit(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let path = match resolve_existing_path_for_tool(workspace_root, path_str, "multi_edit") {
-        Ok(p) => p,
-        Err(e) => return Err(e),
-    };
+    let path = resolve_existing_path_for_tool(workspace_root, path_str, "multi_edit")?;
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => return Err(ToolResult::error(format!("Error: Cannot read file: {e}"))),
@@ -1560,10 +1555,7 @@ pub fn prepare_delete_file(
         Some(p) => p,
         None => return Err(ToolResult::error("Error: Missing 'path' parameter".into())),
     };
-    let path = match resolve_existing_path_for_tool(workspace_root, path_str, "delete_file") {
-        Ok(p) => p,
-        Err(e) => return Err(e),
-    };
+    let path = resolve_existing_path_for_tool(workspace_root, path_str, "delete_file")?;
 
     if !path.exists() {
         return Err(ToolResult::error(format!(

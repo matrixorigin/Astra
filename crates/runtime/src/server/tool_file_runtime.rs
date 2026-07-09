@@ -1250,7 +1250,7 @@ mod tests {
 
         let failed =
             execute_server_delete_file(dir.path(), &json!({"path": "missing.txt"}), 6, &journal);
-        assert!(failed.contains("File not found"));
+        assert!(failed.contains("PATH_RESOLUTION_FAILED"));
         assert_eq!(journal.lock().expect("journal").summary().len(), 1);
     }
 

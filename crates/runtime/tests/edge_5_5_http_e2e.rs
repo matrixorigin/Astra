@@ -8,8 +8,8 @@ use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
     turn::cloud_tool_delivery::{
-        ApprovalAuditContext, deliver_tool_calls_through_edge_ledger_with_approval_audit,
-        wait_approval_ledger_for_tool,
+        ApprovalAuditContext, EdgeToolDeliveryRequest,
+        deliver_tool_calls_through_edge_ledger_with_approval_audit, wait_approval_ledger_for_tool,
     },
     turn::edge_ledger::{
         LEDGER_MAX_ENTRIES, approval_callback_key, take_ledger_entry, tool_callback_key,
@@ -206,14 +206,17 @@ fn tool_result_payload(
     output: &str,
 ) -> serde_json::Value {
     serde_json::to_value(astra_thin_client::ToolResultRequest::new_with_hash(
-        session_id.to_string(),
-        run_id.to_string(),
-        turn_chain_id.to_string(),
-        request_id.to_string(),
-        "edge-e2e".to_string(),
-        "completed".to_string(),
-        output.to_string(),
-        0,
+        astra_thin_client::ToolResultRequestParts {
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            turn_chain_id: turn_chain_id.to_string(),
+            request_id: request_id.to_string(),
+            edge_agent_id: "edge-e2e".to_string(),
+            status: "completed".to_string(),
+            output: output.to_string(),
+            duration_ms: 0,
+            tool_result_fields: None,
+        },
     ))
     .expect("tool result payload serializes")
 }
@@ -601,16 +604,16 @@ async fn http_handler_payload_matches_delivery_parser() {
         }
     });
     let audit = approval_audit("sess-chain", "run-chain");
-    let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(
-        &ledger,
-        "e2e-user",
-        "sess-chain",
-        "run-chain",
-        "chain-chain",
-        &[tc],
-        Duration::from_secs(2),
-        Some(&audit),
-    )
+    let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(EdgeToolDeliveryRequest {
+        ledger: &ledger,
+        user_id: "e2e-user",
+        session_id: "sess-chain",
+        run_id: "run-chain",
+        turn_chain_id: "chain-chain",
+        tool_calls: &[tc],
+        ledger_wait: Duration::from_secs(2),
+        approval_audit: Some(&audit),
+    })
     .await;
     let approval = d
         .sse_maps
@@ -679,16 +682,16 @@ async fn http_handler_payload_supports_batched_approval_delivery() {
         }),
     ];
     let audit = approval_audit("sess-batch", "run-batch");
-    let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(
-        &ledger,
-        "e2e-user",
-        "sess-batch",
-        "run-batch",
-        "chain-batch",
-        &tcs,
-        Duration::from_secs(2),
-        Some(&audit),
-    )
+    let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(EdgeToolDeliveryRequest {
+        ledger: &ledger,
+        user_id: "e2e-user",
+        session_id: "sess-batch",
+        run_id: "run-batch",
+        turn_chain_id: "chain-batch",
+        tool_calls: &tcs,
+        ledger_wait: Duration::from_secs(2),
+        approval_audit: Some(&audit),
+    })
     .await;
 
     assert!(
