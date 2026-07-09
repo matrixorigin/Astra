@@ -505,23 +505,11 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
         .into_iter()
         .filter(|message| !suppress_volatile || is_required_runtime_preamble(message))
         .collect::<Vec<_>>();
-    if !suppress_volatile {
-        volatile_preamble.extend(render_drained_volatile_messages(&drained_volatile));
-    }
-
-    // Belt-and-suspenders: legacy callers still push mid-history volatile
-    // into messages[] directly (there are ~30 such sites being migrated
-    // piecemeal). Until that migration completes,
-    // `consolidate_mid_history_volatile_injections` still picks up stragglers.
-    // Once zero producers call `state.messages.push(...)` with runtime
-    // content, this pass becomes a no-op and can be removed.
-    let harvested = consolidate_mid_history_volatile_injections(&mut llm_messages);
-    if !suppress_volatile && !harvested.is_empty() {
-        volatile_preamble.push(serde_json::json!({
-            "role": "user",
-            "content": harvested,
-        }));
-    }
+    volatile_preamble.extend(
+        render_drained_volatile_messages(&drained_volatile)
+            .into_iter()
+            .filter(|message| !suppress_volatile || is_required_runtime_preamble(message)),
+    );
 
     // Attach runtime content only at the true tail. Required runtime/control
     // frames are structured before this point, but provider chat protocols do
@@ -712,179 +700,30 @@ pub(crate) fn append_volatile_to_tail_user_message(
     }
 }
 
-/// Render the structured volatile lane drained from
-/// `AgenticLoopState.volatile_pending` into a single concatenated
-/// preamble string. Producers (stall nudges, working-set snapshots,
-/// tool-health warnings, …) call `state.push_volatile(kind, content)`
-/// and the wire layer renders them all together here so the LLM sees
-/// one coherent blob of per-round runtime signal.
-///
-/// Dedup policy: the producer is responsible for ensuring that each
-/// CATEGORY of signal appears at most once in a given drain (e.g. the
-/// turn-guard only emits one tool-health warning per turn). This
-/// function preserves insertion order so if multiple kinds were queued
-/// they come out in the order they were produced.
-pub(crate) fn render_drained_volatile(
-    drained: &[crate::turn::agentic_loop::host::VolatileInjection],
-) -> String {
-    let mut out = String::new();
-    for inj in drained {
-        if !inj.kind.render_in_user_tail() {
-            continue;
-        }
-        let text = inj.content.trim();
-        if text.is_empty() {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(text);
-    }
-    out
-}
-
 fn render_drained_volatile_messages(
     drained: &[crate::turn::agentic_loop::host::VolatileInjection],
 ) -> Vec<Value> {
     let mut out = Vec::new();
-    let user_text = render_drained_volatile(drained);
-    if !user_text.is_empty() {
-        out.push(serde_json::json!({
-            "role": "user",
-            "content": user_text,
-        }));
-    }
     for inj in drained {
-        if inj.kind.render_in_user_tail() {
-            continue;
-        }
-        let text = inj.content.trim();
-        if text.is_empty() {
-            continue;
-        }
-        out.push(serde_json::json!({
-            "role": inj.kind.default_role(),
-            "content": text,
-        }));
-    }
-    out
-}
-
-/// Remove mid-history volatile-style injections from `messages` and return
-/// the consolidated text so the caller can fold it into `volatile_preamble`.
-///
-/// Context: during a tool-loop turn the runtime scatters nudges into the
-/// message history — TurnGuard's "⚠ tools have failed …" warnings
-/// (once every 2-3 rounds), the `[working-set:v1]` and
-/// `## Already Fetched` system blocks (appended at turn boundaries),
-/// parallel-batching-force / execution-escalation user corrective
-/// messages, the "✓ 2 tools executed in parallel" coaching pings.
-///
-/// Each of those injections looks volatile to the provider's prefix
-/// cache: its CONTENT evolves across rounds (avoid_tools list grows,
-/// working_set recent_tools adds entries), and its POSITION in history
-/// shifts as tool-result pairs get appended ahead of it. DeepSeek's
-/// `/anthropic` endpoint treats every such mid-history byte delta as
-/// "new payload" and restarts warm-up, which caps cache_read at the
-/// system-prefix size (~2432 in session 05e63cac).
-///
-/// We keep only the FINAL occurrence of each known pattern (the most
-/// recent round's state is always the authoritative one) and return
-/// their concatenated text so [`assemble_llm_messages_with_cache_capability`]
-/// can render it as adjacent runtime context without mutating the latest real
-/// user message. Stripping them out of history removes the mid-history byte
-/// churn; the agent still sees the same up-to-date nudges in the tail.
-///
-/// This is strictly a wire-layer pass. Session persistence (the
-/// `conversation_log` snapshot, event journal) is untouched.
-pub(crate) fn consolidate_mid_history_volatile_injections(messages: &mut Vec<Value>) -> String {
-    // Classifier: given a message (role + content), return Some(kind) if
-    // it's a known volatile injection we want to consolidate, None otherwise.
-    fn classify(msg: &Value) -> Option<&'static str> {
-        let role = msg.get("role").and_then(Value::as_str)?;
-        let content = msg.get("content").and_then(Value::as_str)?;
-        match role {
-            "user" => {
-                if content.starts_with("⚠ The following tools have failed") {
-                    Some("tool_health_warning")
-                } else if content.starts_with("⚠ You have been") {
-                    Some("stall_nudge")
-                } else if content.contains("consecutive single-tool rounds")
-                    && content.contains("parallel")
-                {
-                    Some("parallel_batching_force")
-                } else if content.contains("accumulated")
-                    && content.contains("read-only tool calls")
-                {
-                    Some("execution_escalation")
-                } else {
-                    None
-                }
-            }
-            "system" => {
-                if content.starts_with("[working-set:v1]") {
-                    Some("working_set")
-                } else if content.starts_with("## Already Fetched") {
-                    Some("already_fetched")
-                } else if content.starts_with("✓ ") {
-                    Some("tool_batch_coaching")
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    // Walk backwards: remember the first (most recent) occurrence of each
-    // kind, mark the rest for removal. The index of the FINAL occurrence
-    // of each kind survives — we also strip that one from history and
-    // keep only the text for the preamble.
-    use std::collections::HashMap;
-    let mut kept_kinds: HashMap<&'static str, String> = HashMap::new();
-    let mut to_remove: Vec<usize> = Vec::new();
-    for (idx, msg) in messages.iter().enumerate().rev() {
-        let Some(kind) = classify(msg) else {
+        let edge_injection = astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+            kind: inj.kind.wire_kind(),
+            delivery_class: inj.kind.delivery_class(),
+            payload: inj.payload.clone(),
+            round_index: inj.round_index,
+        };
+        let Some(text) = edge_injection.render_for_prompt() else {
             continue;
         };
-        if kept_kinds.contains_key(kind) {
-            // Older duplicate — drop unconditionally.
-            to_remove.push(idx);
-            continue;
+        let mut message = serde_json::json!({
+            "role": "system",
+            "content": text,
+        });
+        if inj.kind.delivery_class()
+            == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+        {
+            message[REQUIRED_RUNTIME_PREAMBLE_MARKER] = Value::Bool(true);
         }
-        // First (most recent) occurrence — capture text, then strip.
-        if let Some(text) = msg.get("content").and_then(Value::as_str) {
-            kept_kinds.insert(kind, text.to_string());
-        }
-        to_remove.push(idx);
-    }
-
-    // Remove in descending order so indices stay valid.
-    to_remove.sort_unstable_by(|a, b| b.cmp(a));
-    for idx in to_remove {
-        messages.remove(idx);
-    }
-
-    // Assemble preamble in stable order so the text is byte-deterministic
-    // across calls with the same inputs.
-    const ORDER: &[&str] = &[
-        "tool_health_warning",
-        "stall_nudge",
-        "parallel_batching_force",
-        "execution_escalation",
-        "tool_batch_coaching",
-        "working_set",
-        "already_fetched",
-    ];
-    let mut out = String::new();
-    for kind in ORDER {
-        if let Some(text) = kept_kinds.remove(kind) {
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str(&text);
-        }
+        out.push(message);
     }
     out
 }
@@ -1656,11 +1495,11 @@ mod tests {
     }
 
     #[test]
-    fn self_status_volatile_uses_protocol_valid_tail_suffix() {
+    fn self_status_telemetry_does_not_enter_prompt() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
             kind: crate::turn::agentic_loop::host::VolatileKind::SelfStatus,
-            content: "## ⚡ Self-Status\nTurn 9/299 | Cache: 86%".to_string(),
+            payload: json!("## ⚡ Self-Status\nTurn 9/299 | Cache: 86%"),
             round_index: 9,
         }];
         let compacted = vec![json!({"role": "user", "content": "相关的测试够硬核吗？"})];
@@ -1681,12 +1520,58 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         let user_text = message_text(&msgs[1]);
         assert!(user_text.contains("相关的测试够硬核吗"));
-        assert!(user_text.contains("Self-Status"));
+        assert!(!user_text.contains("Self-Status"));
+    }
+
+    #[test]
+    fn policy_advisory_volatile_reaches_tail_without_overriding_user_intent() {
+        let system = vec![json!({"role": "system", "content": "sys"})];
+        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::PolicyAdvisory,
+            payload: json!({
+                "schema": "policy_advisory.v1",
+                "advisories": [{
+                    "kind": "stall",
+                    "severity": "warning",
+                    "recommendation": "consider changing approach"
+                }]
+            }),
+            round_index: 2,
+        }];
+        let compacted = vec![json!({"role": "user", "content": "fix the failing tests"})];
+        let msgs = assemble_llm_messages_with_cache_capability(
+            system,
+            Vec::new(),
+            drained,
+            compacted,
+            &PostCompactAttachments::default(),
+            "sid",
+            "openai",
+            "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+            &cache_cfg(),
+        );
+
+        assert_eq!(msgs.len(), 2);
+        let user_text = message_text(&msgs[1]);
+        assert!(
+            user_text.starts_with("fix the failing tests"),
+            "policy advisory must not replace the real user goal: {user_text}"
+        );
+        assert!(user_text.contains("policy_advisory.v1"));
+        assert!(user_text.contains("consider changing approach"));
+        assert!(user_text.contains("<runtime-advisory-evidence>"));
+        assert!(user_text.contains("\"kind\":\"policy_advisory\""));
+        assert!(
+            !user_text.contains("Do NOT call"),
+            "soft policy advisory must not become a hard tool prohibition: {user_text}"
+        );
         assert!(
             msgs.iter()
                 .skip(1)
                 .all(|msg| msg.get("role").and_then(Value::as_str) != Some("system")),
-            "runtime telemetry must not become a post-prefix system frame: {msgs:#?}"
+            "runtime advisory must not introduce provider-invalid post-prefix system frames: {msgs:#?}"
         );
     }
 
@@ -1695,7 +1580,10 @@ mod tests {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
             kind: crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
-            content: "[active-turn-frame:v1]\n{\"latest_user_message\":\"相关的测试够硬核吗？\",\"active_goal\":\"相关的测试够硬核吗？\"}\n[/active-turn-frame]".to_string(),
+            payload: json!({
+                "latest_user_message": "相关的测试够硬核吗？",
+                "active_goal": "相关的测试够硬核吗？"
+            }),
             round_index: 3,
         }];
         let compacted = vec![
@@ -1725,7 +1613,8 @@ mod tests {
             tail_user.starts_with("相关的测试够硬核吗？"),
             "real user content must remain first: {tail_user}"
         );
-        assert!(tail_user.contains("[active-turn-frame:v1]"));
+        assert!(tail_user.contains("<runtime-required-context>"));
+        assert!(tail_user.contains("\"kind\":\"active_turn_frame\""));
         assert!(
             tail_user.contains("active_goal"),
             "active goal frame must stay explicit in the runtime tail suffix"
@@ -1907,14 +1796,13 @@ mod tests {
         ];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
             kind: crate::turn::agentic_loop::host::VolatileKind::AlreadyFetched,
-            content: "## Already Fetched (do NOT re-read/re-grep these)\nFiles: foo.rs".into(),
+            payload: json!("## Already Fetched (do NOT re-read/re-grep these)\nFiles: foo.rs"),
             round_index: 1,
         }];
         let compacted = vec![
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": ""}),
             json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
-            json!({"role": "system", "content": "✓ 2 tools executed in parallel — excellent. Keep batching independent operations."}),
         ];
         let msgs = assemble_llm_messages_with_cache_capability(
             system,
@@ -1958,20 +1846,21 @@ mod tests {
     }
 
     #[test]
-    fn current_user_only_models_keep_required_runtime_preamble() {
+    fn current_user_only_models_keep_required_typed_runtime_injection() {
         let system = vec![json!({"role": "system", "content": "sys"})];
-        let required =
-            required_runtime_preamble_message("required resume context").expect("required message");
-        let preamble = vec![
-            json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
-            required,
-        ];
+        let preamble =
+            vec![json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"})];
+        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
+            payload: json!({"latest_user_goal": "latest user goal"}),
+            round_index: 1,
+        }];
         let compacted = vec![json!({"role": "user", "content": "hi"})];
 
         let msgs = assemble_llm_messages_with_cache_capability(
             system,
             preamble,
-            Vec::new(),
+            drained,
             compacted,
             &PostCompactAttachments::default(),
             "sid",
@@ -1989,7 +1878,9 @@ mod tests {
             user_text.starts_with("hi"),
             "real user intent must stay first: {user_text}"
         );
-        assert!(user_text.contains("required resume context"));
+        assert!(user_text.contains("<runtime-required-context>"));
+        assert!(user_text.contains("\"kind\":\"active_turn_frame\""));
+        assert!(user_text.contains("latest user goal"));
         assert!(!user_text.contains("<system-reminder>volatile</system-reminder>"));
         assert!(
             msgs.iter()
@@ -1997,161 +1888,5 @@ mod tests {
                 .all(|msg| msg.get("role").and_then(Value::as_str) != Some("system")),
             "required runtime must not create post-prefix system messages: {msgs:#?}"
         );
-    }
-
-    // ── consolidate_mid_history_volatile_injections regressions ─────────
-    //
-    // Session 05e63cac t5 had 12 `tool_health_warning` user msgs scattered
-    // mid-history every 2-3 rounds, plus `[working-set:v1]` and
-    // `## Already Fetched` trailing system msgs, plus a "✓ 2 tools executed
-    // in parallel" coaching ping. DeepSeek's /anthropic cache plateaued at
-    // 2432 tokens (system-only) instead of the probe-measured 88% upper
-    // bound because every round rewrote those mid-history bytes.
-
-    #[test]
-    fn consolidate_strips_duplicate_tool_health_warnings_keeping_final() {
-        let mut msgs = vec![
-            json!({"role": "system", "content": "stable sys"}),
-            json!({"role": "user", "content": "q1"}),
-            json!({"role": "assistant", "content": "a1"}),
-            json!({"role": "user", "content": "⚠ The following tools have failed 3 or more times consecutively: [str_replace]. [iteration 1]"}),
-            json!({"role": "assistant", "content": "a2"}),
-            json!({"role": "user", "content": "⚠ The following tools have failed 3 or more times consecutively: [str_replace, read_file]. [iteration 2]"}),
-            json!({"role": "assistant", "content": "a3"}),
-            json!({"role": "user", "content": "⚠ The following tools have failed 3 or more times consecutively: [str_replace, read_file, grep]. [iteration 3]"}),
-            json!({"role": "user", "content": "latest user turn"}),
-        ];
-        let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
-        // Only the FINAL iteration should survive in preamble.
-        assert!(
-            preamble.contains("[iteration 3]"),
-            "final warning must be preserved: preamble={preamble:?}",
-        );
-        assert!(
-            !preamble.contains("[iteration 1]") && !preamble.contains("[iteration 2]"),
-            "older iterations must be dropped: preamble={preamble:?}",
-        );
-        // Mid-history user-warning slots all stripped; only real conversational
-        // turns remain.
-        assert_eq!(msgs.len(), 6); // system + q1/a1/a2/a3 + latest user
-        for m in &msgs {
-            let Some(c) = m.get("content").and_then(Value::as_str) else {
-                continue;
-            };
-            assert!(
-                !c.starts_with("⚠ The following tools have failed"),
-                "no tool_health_warning msg may remain in-place: {c}",
-            );
-        }
-    }
-
-    #[test]
-    fn consolidate_strips_working_set_and_already_fetched_trailing_system() {
-        let mut msgs = vec![
-            json!({"role": "system", "content": "stable sys"}),
-            json!({"role": "user", "content": "q1"}),
-            json!({"role": "assistant", "content": "a1"}),
-            json!({"role": "user", "content": "q2"}),
-            // trailing system msgs injected by runtime
-            json!({"role": "system", "content": "[working-set:v1]\ngoal: ship it\nrecent_tools:\n- git [ok t3]"}),
-            json!({"role": "system", "content": "## Already Fetched (do NOT re-read/re-grep these)\nsrc/main.rs"}),
-        ];
-        let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
-        assert!(
-            preamble.contains("[working-set:v1]"),
-            "working-set preserved"
-        );
-        assert!(
-            preamble.contains("## Already Fetched"),
-            "already-fetched preserved"
-        );
-        // Trailing system msgs gone.
-        assert_eq!(msgs.len(), 4);
-        for m in &msgs {
-            let Some(c) = m.get("content").and_then(Value::as_str) else {
-                continue;
-            };
-            assert!(
-                !c.starts_with("[working-set:v1]") && !c.starts_with("## Already Fetched"),
-                "runtime-injected system msgs must be stripped: {c}",
-            );
-        }
-    }
-
-    #[test]
-    fn consolidate_strips_coaching_ping_and_nudge_patterns() {
-        let mut msgs = vec![
-            json!({"role": "user", "content": "q"}),
-            json!({"role": "system", "content": "✓ 2 tools executed in parallel — excellent. Keep batching."}),
-            json!({"role": "user", "content": "⚠ You have been exploring for multiple rounds. STOP."}),
-            json!({"role": "user", "content": "next"}),
-        ];
-        let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
-        assert!(
-            preamble.contains("✓ 2 tools executed"),
-            "coaching preserved"
-        );
-        assert!(
-            preamble.contains("⚠ You have been"),
-            "stall nudge preserved"
-        );
-        assert_eq!(msgs.len(), 2); // q + next
-    }
-
-    #[test]
-    fn consolidate_keeps_real_conversation_user_msgs_intact() {
-        // Ordinary user messages (not runtime injections) must survive.
-        let mut msgs = vec![
-            json!({"role": "user", "content": "write me some code"}),
-            json!({"role": "assistant", "content": "ok"}),
-            json!({"role": "user", "content": "review the uncommitted changes"}),
-            json!({"role": "assistant", "content": "done"}),
-            json!({"role": "user", "content": "double check"}),
-        ];
-        let preamble = consolidate_mid_history_volatile_injections(&mut msgs);
-        assert!(
-            preamble.is_empty(),
-            "no volatile injections → empty preamble"
-        );
-        assert_eq!(msgs.len(), 5, "real conversation msgs preserved verbatim");
-    }
-
-    /// End-to-end regression: two synthetic rounds where only the tail
-    /// grows (one tool-result pair appended), with runtime injections
-    /// added each round. After consolidation, the prefix up to the added
-    /// pair must be byte-identical across both rounds.
-    #[test]
-    fn consolidate_makes_history_byte_stable_across_rounds() {
-        let round_1 = vec![
-            json!({"role": "user", "content": "q1"}),
-            json!({"role": "user", "content": "⚠ The following tools have failed 3 or more times consecutively: [str_replace]."}),
-            json!({"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]}),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "result1"}),
-            json!({"role": "system", "content": "[working-set:v1]\ngoal: fix\nrecent_tools:\n- bash [ok t1]"}),
-        ];
-        let round_2 = vec![
-            json!({"role": "user", "content": "q1"}),
-            json!({"role": "user", "content": "⚠ The following tools have failed 3 or more times consecutively: [str_replace, read_file]."}),
-            json!({"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "bash"}}]}),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "result1"}),
-            json!({"role": "assistant", "tool_calls": [{"id": "c2", "function": {"name": "bash"}}]}),
-            json!({"role": "tool", "tool_call_id": "c2", "content": "result2"}),
-            json!({"role": "system", "content": "[working-set:v1]\ngoal: fix\nrecent_tools:\n- bash [ok t1]\n- bash [ok t2]"}),
-        ];
-        let mut m1 = round_1;
-        let mut m2 = round_2;
-        let _ = consolidate_mid_history_volatile_injections(&mut m1);
-        let _ = consolidate_mid_history_volatile_injections(&mut m2);
-        // Round 1: [user q1, assistant_tc, tool] = 3 msgs (warning + working-set stripped).
-        // Round 2: Round 1 + [assistant_tc2, tool2]  = 5 msgs.
-        assert_eq!(m1.len(), 3, "round 1 post-consolidate: {:#?}", m1);
-        assert_eq!(m2.len(), 5, "round 2 post-consolidate: {:#?}", m2);
-        // All 3 msgs of round 1 must appear verbatim as the first 3 of round 2.
-        for i in 0..m1.len() {
-            assert_eq!(
-                m1[i], m2[i],
-                "msg[{i}] must be byte-identical across rounds after consolidation",
-            );
-        }
     }
 }

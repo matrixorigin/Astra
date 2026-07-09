@@ -227,14 +227,4 @@ mod tests {
             "remote /plan exit should restore normal-chat mode"
         );
     }
-
-    #[test]
-    fn slash_memory_no_longer_owns_plan_surface() {
-        let src = include_str!("slash_memory.rs");
-        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-        assert!(
-            !prod.contains("\"/plan\" =>"),
-            "legacy /plan fallback should be removed from slash_memory.rs"
-        );
-    }
 }

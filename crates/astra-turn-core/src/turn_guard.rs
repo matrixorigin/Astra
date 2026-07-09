@@ -2,7 +2,7 @@
 //!
 //! Combines stall detection, divergence detection, tool health, and error
 //! recovery into a single per-turn evaluation. The caller feeds in turn
-//! signals; the guard emits actionable `TurnVerdict` decisions.
+//! signals; the guard emits advisory `TurnVerdict` evidence.
 //!
 //! This is the **integration point** for all non-happy-path components.
 //! Individual components (stall.rs, tool_health.rs, error_recovery.rs)
@@ -20,7 +20,7 @@ use crate::stall::{self, DivergenceStatus, StallReflection};
 use crate::tool::args::shape::tool_call_name;
 use crate::tool::health::ToolHealthTracker;
 
-/// Actionable verdict for the current turn.
+/// Advisory verdict for the current turn.
 #[derive(Debug, Clone)]
 pub struct TurnVerdict {
     /// Messages to inject into the conversation before the next LLM call.
@@ -29,8 +29,11 @@ pub struct TurnVerdict {
     pub avoid_tools: Vec<String>,
     /// Overall severity level of the verdict.
     pub severity: VerdictSeverity,
-    /// Whether the session should be force-terminated.
-    pub force_stop: bool,
+    /// Whether a configured behavioral threshold was reached.
+    ///
+    /// This is evidence strength, not termination authority. Callers must not
+    /// convert it into retries, tool restrictions, or a failed turn.
+    pub advisory_threshold_reached: bool,
     /// Whether an exact-repetition stall was detected this round.
     pub stall_detected: bool,
     /// Whether divergence (exploration-only loop) was detected this round.
@@ -100,8 +103,8 @@ pub struct TurnGuard {
     pub errors: SessionErrorSummary,
     /// The last stall reflection sent (for nudge-ignore detection).
     last_reflection: Option<StallReflection>,
-    /// Consecutive turns at Critical escalation. Progressive degradation:
-    /// 1st Critical → strong recovery guidance, 2nd → force stop.
+    /// Consecutive turns at Critical escalation. The first emits recovery
+    /// guidance; later turns raise evidence strength without stopping.
     critical_turns: usize,
     /// Consecutive calm turns (severity <= Info) since the last Critical.
     critical_recovery_turns: usize,
@@ -123,8 +126,8 @@ pub struct TurnGuard {
     pub correction_history: Vec<CorrectionOutcome>,
     /// Adaptive thresholds tuned by correction effectiveness.
     adaptive_thresholds: stall::AdaptiveStallThresholds,
-    /// Drift nudge count (persists across turns, fed from StallTrackingState).
-    /// When >= 3, TurnGuard escalates to force-stop.
+    /// Drift observation count (persists across turns, fed from StallTrackingState).
+    /// When >= 3, TurnGuard raises advisory evidence strength.
     pub drift_nudge_count: usize,
     /// Monotonic session-local epoch for observations whose result depends on
     /// workspace state. Successful workspace mutations advance the epoch.
@@ -482,21 +485,34 @@ impl TurnGuard {
         quality: ResultQuality,
         latency_ms: u64,
         result_str: &str,
+        source_error_kind: Option<astra_core::ErrorKind>,
     ) {
-        let (success, category) = match quality {
-            ResultQuality::Error => (false, None),
-            ResultQuality::Empty => (
+        let outcome = match quality {
+            ResultQuality::Error => crate::tool::health::ToolOutcome::with_classification(
+                false,
+                latency_ms,
+                result_str,
+                crate::action_compensation::ExecutionOutcomeInput {
+                    result_text: result_str,
+                    is_error: true,
+                    duration_ms: latency_ms,
+                    was_rejected: false,
+                    error_kind: source_error_kind,
+                    result_class: None,
+                    exit_semantics: None,
+                },
+            ),
+            ResultQuality::Empty => crate::tool::health::ToolOutcome::with_category(
                 true,
+                latency_ms,
+                result_str,
                 Some(crate::action_compensation::FailureCategory::NonProgress),
             ),
-            ResultQuality::Success | ResultQuality::Truncated => (true, None),
+            ResultQuality::Success | ResultQuality::Truncated => {
+                crate::tool::health::ToolOutcome::with_category(true, latency_ms, result_str, None)
+            }
         };
-        self.health.record_outcome(
-            sig,
-            crate::tool::health::ToolOutcome::with_category(
-                success, latency_ms, result_str, category,
-            ),
-        );
+        self.health.record_outcome(sig, outcome);
     }
 
     /// Record that remaining tools were aborted due to step-level timeout.
@@ -533,9 +549,10 @@ impl TurnGuard {
     ///
     /// ## Critical state
     ///
-    /// First Critical turn injects strong recovery guidance but does NOT
-    /// force-stop. Second consecutive Critical turn force-stops. A prior
-    /// Critical is cleared only after **two consecutive calm turns**
+    /// The first Critical turn adds strong recovery evidence. Later
+    /// consecutive Critical turns mark the advisory threshold as reached but
+    /// do not terminate execution. A prior Critical is cleared only after
+    /// **two consecutive calm turns**
     /// (severity ≤ Info), giving the agent a grace period to demonstrate
     /// sustained recovery rather than a single lucky turn.
     ///
@@ -778,10 +795,9 @@ impl TurnGuard {
             };
         }
 
-        // Force stop uses progressive degradation instead of immediate termination.
-        // First Critical: inject strong warning/avoid guidance, but continue.
-        // Second Critical: force stop — the agent had a chance and didn't recover.
-        let force_stop = if escalation == EscalationLevel::Critical {
+        // Repeated critical observations increase advisory strength. They do
+        // not acquire termination authority merely because they recur.
+        let advisory_threshold_reached = if escalation == EscalationLevel::Critical {
             self.critical_turns += 1;
             self.critical_recovery_turns = 0;
             astra_core::agent_escalation!(
@@ -791,19 +807,20 @@ impl TurnGuard {
                 error_count = actionable_errors,
                 lifetime_errors = self.errors.total_errors,
                 critical_turns = self.critical_turns,
-                force_stop = (self.critical_turns >= 2)
+                advisory_threshold_reached = (self.critical_turns >= 2)
             );
             if self.critical_turns >= 2 {
-                true // second consecutive Critical → force stop
+                true
             } else {
-                // First Critical: advise the model away from high-risk write/execute tools.
+                // First Critical: include stronger evidence about the failing
+                // write/execute pattern while preserving model discretion.
                 for &t in CLOUD_APPROVAL_REQUIRED_TOOLS.iter() {
                     insert_avoid_tool(&mut avoid_tools, t);
                 }
                 injections.push(
-                    "🚨 SESSION CRITICAL: Stop repeating failing write/execute actions. \
-                     Prefer read-only inspection or answer the user with current evidence. \
-                     If the next turn also fails, the session will be terminated."
+                    "Observation: repeated write/execute attempts are failing. \
+                     Recommendation: consider read-only inspection, a different approach, \
+                     or answering from the evidence already gathered."
                         .to_string(),
                 );
                 false
@@ -899,27 +916,27 @@ impl TurnGuard {
         // Secondary = remaining tips joined into one message.
         let mut injections = consolidate_injections(injections);
 
-        // 9. Drift escalation
-        // If drift_nudge_count >= 3, agent has ignored 3+ drift corrections.
-        // Escalate to force-stop: the agent is persistently off-task.
-        const DRIFT_FORCE_STOP_THRESHOLD: usize = 3;
-        let drift_force_stop = self.drift_nudge_count >= DRIFT_FORCE_STOP_THRESHOLD;
-        if drift_force_stop {
+        // 9. Drift evidence strength
+        // Repeated drift raises the evidence severity without stopping the turn.
+        const DRIFT_ADVISORY_THRESHOLD: usize = 3;
+        let drift_advisory_threshold_reached = self.drift_nudge_count >= DRIFT_ADVISORY_THRESHOLD;
+        if drift_advisory_threshold_reached {
             injections.push(format!(
-                "🛑 CRITICAL: You have been corrected {} times for intent drift but continue to drift. \
-                 Session will be force-stopped. Please refocus on the user's original request.",
+                "Observation: intent drift has been detected {} times. \
+                 Recommendation: re-check the user's original request before choosing the next action.",
                 self.drift_nudge_count
             ));
             severity = VerdictSeverity::Critical;
         }
 
-        let force_stop = force_stop || drift_force_stop;
+        let advisory_threshold_reached =
+            advisory_threshold_reached || drift_advisory_threshold_reached;
 
         TurnVerdict {
             injections,
             avoid_tools: avoid_tools_vec,
             severity,
-            force_stop,
+            advisory_threshold_reached,
             stall_detected,
             is_diverging,
         }
@@ -1047,7 +1064,31 @@ mod tests {
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Healthy);
         assert!(verdict.injections.is_empty());
-        assert!(!verdict.force_stop);
+        assert!(!verdict.advisory_threshold_reached);
+    }
+
+    #[test]
+    fn record_tool_outcome_uses_typed_error_kind_for_failure_category() {
+        let mut guard = TurnGuard::new();
+        let sig = r#"bash:{"command":"curl https://x"}"#;
+
+        guard.record_tool_outcome(
+            sig,
+            crate::result_quality::ResultQuality::Error,
+            3_000,
+            "opaque transport failure",
+            Some(astra_core::ErrorKind::Network),
+        );
+
+        let recent = guard
+            .health
+            .recent_outcome(sig)
+            .expect("typed outcome should be recorded");
+        assert!(!recent.success);
+        assert_eq!(
+            recent.failure_category,
+            Some(crate::action_compensation::FailureCategory::NetworkError)
+        );
     }
 
     #[test]
@@ -1357,7 +1398,7 @@ mod tests {
         }
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Healthy);
-        assert!(!verdict.force_stop);
+        assert!(!verdict.advisory_threshold_reached);
     }
 
     #[test]
@@ -1408,7 +1449,7 @@ mod tests {
             VerdictSeverity::Warning,
             "8 actionable errors plus 8 recent timeouts should still warn"
         );
-        assert!(!verdict.force_stop);
+        assert!(!verdict.advisory_threshold_reached);
     }
 
     /// Normal code exploration (grep→read_file→grep→grep) should never
@@ -1458,7 +1499,7 @@ mod tests {
         assert_eq!(v.severity, VerdictSeverity::Healthy);
         assert!(!v.stall_detected);
         assert!(!v.is_diverging);
-        assert!(!v.force_stop);
+        assert!(!v.advisory_threshold_reached);
     }
 
     #[test]
@@ -1540,33 +1581,33 @@ mod tests {
         );
     }
 
-    /// force_stop requires Critical escalation. With coupled nudge+error
+    /// A strong advisory requires Critical escalation. With coupled nudge+error
     /// thresholds, pure nudges without errors → Warning, not Critical.
     #[test]
-    fn force_stop_requires_nudges_plus_errors() {
+    fn advisory_threshold_reached_requires_nudges_plus_errors() {
         let mut guard = TurnGuard::new();
         // 2 nudges, 0 errors → Normal (below Warning threshold of 3)
         guard.nudge_count = 2;
         let v = guard.evaluate();
-        assert!(!v.force_stop);
+        assert!(!v.advisory_threshold_reached);
 
         // 3 nudges, 0 errors → Warning (not Critical without errors)
         guard.nudge_count = 3;
         let v = guard.evaluate();
         assert!(
-            !v.force_stop,
-            "pure stalls without errors should not force_stop"
+            !v.advisory_threshold_reached,
+            "pure stalls without errors should not reach the strong-advisory threshold"
         );
 
-        // 4 nudges + 3 errors → first Critical → avoid guidance, NOT force_stop
+        // 4 nudges + 3 errors → first Critical → guidance, below strong threshold
         guard.nudge_count = 4;
         for _ in 0..3 {
             guard.record_tool_result("test_tool", "Error: something failed");
         }
         let v = guard.evaluate();
         assert!(
-            !v.force_stop,
-            "first Critical should inject recovery guidance, not force_stop"
+            !v.advisory_threshold_reached,
+            "first Critical should inject recovery guidance below the strong threshold"
         );
         assert_eq!(v.severity, VerdictSeverity::Critical);
         // Should advise against every canonical cloud-gated write/execute tool.
@@ -1577,27 +1618,30 @@ mod tests {
             );
         }
 
-        // Next round also goes critical → force_stop
+        // Next round also goes critical → stronger advisory evidence
         for _ in 0..3 {
             guard.record_tool_result("test_tool", "Error: something failed");
         }
         let v2 = guard.evaluate();
         assert!(
-            v2.force_stop,
-            "second consecutive Critical should force_stop"
+            v2.advisory_threshold_reached,
+            "second consecutive Critical should reach the strong-advisory threshold"
         );
     }
 
     #[test]
     fn stale_nudge_pressure_alone_is_cleared_on_calm_evaluate() {
-        // Regression test: previously 3 nudges alone triggered Critical + force_stop.
+        // Regression test: previously 3 nudges alone triggered a terminal signal.
         // Sessions 62fee584 and 2c701822 showed this was too aggressive — exploration
-        // patterns (grep→read→grep) with zero errors got force-stopped.
+        // patterns (grep→read→grep) with zero errors were over-escalated.
         // Stale nudge pressure without a current stall/error signal is cleared.
         let mut guard = TurnGuard::new();
         guard.nudge_count = 5; // many nudges
         let v = guard.evaluate();
-        assert!(!v.force_stop, "5 nudges + 0 errors must NOT force_stop");
+        assert!(
+            !v.advisory_threshold_reached,
+            "5 nudges + 0 errors must not reach the strong-advisory threshold"
+        );
         assert_eq!(v.severity, VerdictSeverity::Healthy);
         assert_eq!(guard.nudge_count, 0);
     }
@@ -1634,7 +1678,7 @@ mod tests {
             "2 errors (single-counted) should not trigger Warning; severity: {:?}",
             verdict.severity
         );
-        assert!(!verdict.force_stop);
+        assert!(!verdict.advisory_threshold_reached);
     }
 
     #[test]
@@ -1669,8 +1713,8 @@ mod tests {
             "repeated mutating tool errors should trigger Warning"
         );
         assert!(
-            !verdict.force_stop,
-            "mutating tool errors without nudges should not force_stop"
+            !verdict.advisory_threshold_reached,
+            "mutating tool errors without nudges should remain below the strong-advisory threshold"
         );
     }
 
@@ -1698,8 +1742,8 @@ mod tests {
 
         let verdict = guard.evaluate();
         assert!(
-            !verdict.force_stop,
-            "should NOT force_stop with 2 errors and 4 successes"
+            !verdict.advisory_threshold_reached,
+            "2 errors and 4 successes should remain below the strong-advisory threshold"
         );
         assert!(
             verdict.severity < VerdictSeverity::Critical,
@@ -1806,33 +1850,33 @@ mod tests {
     }
 
     #[test]
-    fn drift_escalation_triggers_force_stop_at_threshold() {
+    fn drift_escalation_triggers_advisory_threshold_reached_at_threshold() {
         let mut guard = TurnGuard::new();
         guard.drift_nudge_count = 3;
 
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
-        assert!(verdict.force_stop);
+        assert!(verdict.advisory_threshold_reached);
         assert!(
             verdict
                 .injections
                 .iter()
-                .any(|m| m.contains("CRITICAL") && m.contains("drift"))
+                .any(|m| m.contains("intent drift") && m.contains("Recommendation"))
         );
     }
 
     #[test]
-    fn drift_escalation_below_threshold_no_force_stop() {
+    fn drift_escalation_below_threshold_no_advisory_threshold_reached() {
         let mut guard = TurnGuard::new();
         guard.drift_nudge_count = 2;
 
         let verdict = guard.evaluate();
-        assert!(!verdict.force_stop);
+        assert!(!verdict.advisory_threshold_reached);
         assert!(
             !verdict
                 .injections
                 .iter()
-                .any(|m| m.contains("CRITICAL") && m.contains("drift"))
+                .any(|m| m.contains("intent drift") && m.contains("Recommendation"))
         );
     }
 
@@ -1842,11 +1886,11 @@ mod tests {
         guard.drift_nudge_count = 3;
 
         let v1 = guard.evaluate();
-        assert!(v1.force_stop);
+        assert!(v1.advisory_threshold_reached);
 
         // drift_nudge_count should not be cleared by evaluate
         let v2 = guard.evaluate();
-        assert!(v2.force_stop);
+        assert!(v2.advisory_threshold_reached);
     }
 
     #[test]
@@ -1916,11 +1960,11 @@ mod tests {
             guard.nudge_count, 0,
             "cache guidance must not accumulate stall/escalation pressure"
         );
-        assert!(!verdict.force_stop);
+        assert!(!verdict.advisory_threshold_reached);
     }
 
     #[test]
-    fn repeated_cache_hits_do_not_accumulate_nudge_pressure_or_force_stop() {
+    fn repeated_cache_hits_do_not_accumulate_nudge_pressure_or_advisory_threshold_reached() {
         let mut guard = TurnGuard::new();
 
         for _ in 0..16 {
@@ -1929,8 +1973,8 @@ mod tests {
                 .record_cache_hit_for_signature("read_file", "read_file:path=a.txt");
             let verdict = guard.evaluate();
             assert!(
-                !verdict.force_stop,
-                "cache-only sessions must not force-stop"
+                !verdict.advisory_threshold_reached,
+                "cache-only sessions must not reach the strong-advisory threshold"
             );
             assert!(
                 verdict.severity <= VerdictSeverity::Info,
@@ -1955,20 +1999,20 @@ mod tests {
 
         let first = guard.evaluate();
         assert_eq!(first.severity, VerdictSeverity::Critical);
-        assert!(!first.force_stop);
+        assert!(!first.advisory_threshold_reached);
 
         // The next evaluate has no new stall/error signal. The previous
         // critical episode must not keep poisoning the session.
         let second = guard.evaluate();
         assert_eq!(second.severity, VerdictSeverity::Healthy);
-        assert!(!second.force_stop);
+        assert!(!second.advisory_threshold_reached);
         assert_eq!(guard.critical_turns, 0);
         assert_eq!(guard.nudge_count, 0);
         assert_eq!(guard.errors.recent_error_pressure(), 0);
 
         let third = guard.evaluate();
         assert_eq!(third.severity, VerdictSeverity::Healthy);
-        assert!(!third.force_stop);
+        assert!(!third.advisory_threshold_reached);
     }
 
     /// Regression test for resource-limit overwrite bug.
@@ -2009,11 +2053,11 @@ mod tests {
         // resource_limit_recorded is true.
     }
 
-    // ── Force stop on error-path Critical (Fix) ──
+    // ── Strong advisory on error-path Critical ──
 
     #[test]
-    fn force_stop_on_error_path_critical() {
-        // Critical from errors (10+) with zero nudges should still force_stop
+    fn advisory_threshold_reached_on_error_path_critical() {
+        // Critical from errors can still reach the strong-advisory threshold.
         let mut guard = TurnGuard::new();
         // Simulate 10+ errors across various tools
         for i in 0..10 {
@@ -2030,16 +2074,16 @@ mod tests {
         let verdict = guard.evaluate();
         // First Critical → progressive degradation (guided, not stopped)
         assert!(
-            !verdict.force_stop,
-            "first Critical should NOT force_stop (progressive degradation)"
+            !verdict.advisory_threshold_reached,
+            "first Critical should remain below the strong-advisory threshold"
         );
         assert_eq!(verdict.severity, super::VerdictSeverity::Critical);
 
-        // Second evaluate → force_stop
+        // Second evaluate → stronger advisory evidence
         let verdict2 = guard.evaluate();
         assert!(
-            verdict2.force_stop,
-            "second consecutive Critical must force_stop"
+            verdict2.advisory_threshold_reached,
+            "second consecutive Critical must reach the strong-advisory threshold"
         );
     }
 
@@ -2379,9 +2423,9 @@ mod tests {
     ///   2. Structured reflection built with avoid_tools
     ///   3. Nudge injected into verdict
     ///   4. Continued stalling → escalation to Warning → Critical
-    ///   5. Second Critical → force_stop
+    ///   5. Second Critical → stronger advisory evidence
     #[test]
-    fn stall_pipeline_detection_through_force_stop() {
+    fn stall_pipeline_detection_through_advisory_threshold_reached() {
         let mut guard = TurnGuard::new();
         let identical_call =
             vec![serde_json::json!({"name": "bash", "arguments": "{\"command\": \"ls\"}"})];
@@ -2389,7 +2433,7 @@ mod tests {
         let mut first_stall_turn = None;
         let mut first_warning_turn = None;
         let mut first_critical_turn = None;
-        let mut force_stop_turn = None;
+        let mut advisory_threshold_reached_turn = None;
 
         for turn in 0..30 {
             guard.record_tool_calls(&identical_call);
@@ -2405,8 +2449,8 @@ mod tests {
             if verdict.severity >= VerdictSeverity::Critical && first_critical_turn.is_none() {
                 first_critical_turn = Some(turn);
             }
-            if verdict.force_stop {
-                force_stop_turn = Some(turn);
+            if verdict.advisory_threshold_reached {
+                advisory_threshold_reached_turn = Some(turn);
                 break;
             }
         }
@@ -2423,10 +2467,11 @@ mod tests {
         let crit_turn = first_critical_turn.expect("critical must be reached");
         assert!(crit_turn > warn_turn, "critical must come after warning");
 
-        let stop_turn = force_stop_turn.expect("force_stop must be reached");
+        let strong_advisory_turn =
+            advisory_threshold_reached_turn.expect("strong-advisory threshold must be reached");
         assert!(
-            stop_turn > crit_turn,
-            "force_stop must come after first critical"
+            strong_advisory_turn > crit_turn,
+            "strong advisory must come after first critical"
         );
     }
 
@@ -2519,8 +2564,8 @@ mod tests {
         let verdict = guard.evaluate();
 
         assert!(
-            !verdict.force_stop,
-            "compliant agent must not be force-stopped"
+            !verdict.advisory_threshold_reached,
+            "compliant agent must not reach the strong-advisory threshold"
         );
 
         let effectiveness = guard.correction_effectiveness();
@@ -2551,7 +2596,7 @@ mod tests {
         guard.record_tool_calls(&grep_call);
         guard.record_tool_result("grep", "found 5 matches");
         let v = guard.evaluate();
-        assert!(!v.force_stop);
+        assert!(!v.advisory_threshold_reached);
 
         // Phase 3: Relapse — back to bash stall
         for _ in 0..4 {

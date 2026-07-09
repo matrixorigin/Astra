@@ -26,7 +26,6 @@ use crate::turn::llm::client::{
 
 pub const SESSION_MEMORY_PREFIX: &str = "[@session/active]";
 pub const SESSION_MEMORY_MEMORIA_TYPE: &str = "working";
-const LEGACY_SESSION_MEMORY_PREFIX: &str = "[@session/memory]";
 const SESSION_MEMORY_SCHEMA_VERSION: u16 = 2;
 const CURRENT_SESSION_MEMORY_RETRIEVE_TOP_K: usize = 64;
 const LOCAL_SESSION_MEMORY_METADATA_FILE: &str = "session-memory.meta.json";
@@ -503,9 +502,7 @@ pub fn encode_session_memory_entry(session_id: &str, content: &str) -> String {
 }
 
 pub fn decode_session_memory_entry(raw: &str, session_id: &str) -> Option<String> {
-    decode_session_memory_snapshot(raw, session_id)
-        .map(|snapshot| snapshot.to_markdown())
-        .or_else(|| decode_legacy_session_memory_entry(raw, session_id))
+    decode_session_memory_snapshot(raw, session_id).map(|snapshot| snapshot.to_markdown())
 }
 
 pub fn canonicalize_session_memory_markdown(
@@ -528,8 +525,6 @@ pub async fn load_current_session_memory(
     }
     let query = format!("{SESSION_MEMORY_PREFIX} {session_id} session memory");
 
-    // Phase 1: typed retrieval with the supported session-memory storage
-    // type filter (currently `working`).
     match memoria
         .retrieve_scoped_typed(
             &query,
@@ -539,35 +534,16 @@ pub async fn load_current_session_memory(
         )
         .await
     {
-        Ok(memories) => {
-            if let Some(decoded) = select_latest_session_memory(&memories, session_id) {
-                return Some(decoded);
-            }
-            // Backend supports memory_types but no session_memory entry
-            // matched — fall through to unfiltered retrieval for compat.
-        }
+        Ok(memories) => select_latest_session_memory(&memories, session_id),
         Err(e) => {
-            // Backend may not support memory_types filtering yet;
-            // fall through to unfiltered retrieval for compat.
             tracing::warn!(
                 session_id = %session_id,
                 error = %e,
-                "session_memory typed retrieval failed, falling back to unfiltered"
+                "session_memory typed retrieval failed"
             );
+            None
         }
     }
-
-    // Phase 2: unfiltered fallback (compat with pre-v2 backends).
-    let memories = memoria
-        .retrieve_ext(
-            &query,
-            Some(session_id),
-            CURRENT_SESSION_MEMORY_RETRIEVE_TOP_K,
-            true,
-        )
-        .await
-        .ok()?;
-    select_latest_session_memory(&memories, session_id)
 }
 
 pub fn load_local_session_memory_artifact(session_id: &str) -> Option<String> {
@@ -622,9 +598,6 @@ pub async fn load_current_session_memory_preferring_local(
 
 fn select_latest_session_memory(memories: &[MemoriaMemory], session_id: &str) -> Option<String> {
     let mut latest_active: Option<(u32, String)> = None;
-    // Legacy entries (pre-v2 schema) lack `updated_turn` metadata, so we
-    // take the first successfully decoded one — best-effort, not turn-aware.
-    let mut legacy_active: Option<String> = None;
     for memory in memories {
         if let Some(snapshot) = decode_session_memory_snapshot(&memory.content, session_id) {
             let markdown = snapshot.to_markdown();
@@ -634,15 +607,9 @@ fn select_latest_session_memory(memories: &[MemoriaMemory], session_id: &str) ->
             {
                 latest_active = Some((snapshot.updated_turn, markdown));
             }
-            continue;
-        }
-        if legacy_active.is_none() {
-            legacy_active = decode_legacy_session_memory_entry(&memory.content, session_id);
         }
     }
-    latest_active
-        .map(|(_, markdown)| markdown)
-        .or(legacy_active)
+    latest_active.map(|(_, markdown)| markdown)
 }
 
 pub fn decode_session_memory_overview(raw: &str, session_id: &str) -> Option<String> {
@@ -686,21 +653,6 @@ fn decode_session_memory_snapshot(raw: &str, session_id: &str) -> Option<Session
     let snapshot: SessionMemorySnapshot = serde_json::from_str(detail).ok()?;
     (snapshot.schema_version == SESSION_MEMORY_SCHEMA_VERSION && snapshot.session_id == session_id)
         .then_some(snapshot)
-}
-
-fn decode_legacy_session_memory_entry(raw: &str, session_id: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if !trimmed.starts_with(LEGACY_SESSION_MEMORY_PREFIX) {
-        return None;
-    }
-    let rest = trimmed[LEGACY_SESSION_MEMORY_PREFIX.len()..].trim_start();
-    let sid_line = rest.lines().next()?.trim();
-    let encoded_sid = sid_line.strip_prefix("session_id=")?.trim();
-    if encoded_sid != session_id {
-        return None;
-    }
-    let content = rest[sid_line.len()..].trim();
-    (!content.is_empty()).then(|| content.to_string())
 }
 
 fn extract_scalar_section(content: &str, name: &str) -> String {
@@ -1238,10 +1190,7 @@ async fn purge_prior_session_memory_entries(
 
         let to_delete: Vec<String> = memories
             .iter()
-            .filter(|memory| {
-                decode_session_memory_snapshot(&memory.content, session_id).is_some()
-                    || decode_legacy_session_memory_entry(&memory.content, session_id).is_some()
-            })
+            .filter(|memory| decode_session_memory_snapshot(&memory.content, session_id).is_some())
             .filter_map(|memory| {
                 let id = memory.memory_id.as_str();
                 if id.is_empty() {
@@ -1265,10 +1214,10 @@ async fn purge_prior_session_memory_entries(
         }
     }
     let remaining = retrieve_prior_session_memory_page(memoria, session_id, PAGE_SIZE).await?;
-    if !remaining.iter().any(|memory| {
-        decode_session_memory_snapshot(&memory.content, session_id).is_some()
-            || decode_legacy_session_memory_entry(&memory.content, session_id).is_some()
-    }) {
+    if !remaining
+        .iter()
+        .any(|memory| decode_session_memory_snapshot(&memory.content, session_id).is_some())
+    {
         return Ok(());
     }
     tracing::warn!(
@@ -1286,7 +1235,7 @@ async fn retrieve_prior_session_memory_page(
     session_id: &str,
     page_size: usize,
 ) -> Result<Vec<MemoriaMemory>, SessionMemoryExtractionErrorReason> {
-    let mut memories = memoria
+    memoria
         .retrieve_scoped_typed(
             &format!("{SESSION_MEMORY_PREFIX} {session_id} session memory"),
             session_id,
@@ -1294,28 +1243,7 @@ async fn retrieve_prior_session_memory_page(
             &[SESSION_MEMORY_MEMORIA_TYPE],
         )
         .await
-        .unwrap_or_default();
-    let fallback_memories = memoria
-        .retrieve_ext(
-            &format!("{SESSION_MEMORY_PREFIX} {session_id} session memory"),
-            Some(session_id),
-            page_size,
-            true,
-        )
-        .await
-        .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
-    memories.extend(fallback_memories);
-    let legacy_memories = memoria
-        .retrieve_ext(
-            &format!("{LEGACY_SESSION_MEMORY_PREFIX} {session_id} session memory"),
-            Some(session_id),
-            page_size,
-            true,
-        )
-        .await
-        .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)?;
-    memories.extend(legacy_memories);
-    Ok(memories)
+        .map_err(|_| SessionMemoryExtractionErrorReason::PurgeFailed)
 }
 
 fn build_rule_fallback_memory(
@@ -1477,12 +1405,53 @@ fn collect_error_lines(messages: &[Value]) -> Vec<String> {
             if is_ephemeral_message_for_session_memory(msg) {
                 return None;
             }
-            let text = message_text_or_summary(msg)?;
-            let lower = text.to_ascii_lowercase();
-            (lower.contains("error") || lower.contains("fail") || lower.contains("panic"))
-                .then(|| truncate(&text, 200).to_string())
+            structured_error_text(msg).map(|text| truncate(&text, 200).to_string())
         })
         .collect()
+}
+
+fn structured_error_text(msg: &Value) -> Option<String> {
+    if msg.get("is_error").and_then(Value::as_bool) == Some(true) {
+        return message_text_or_summary(msg).or_else(|| Some("structured error".to_string()));
+    }
+
+    if matches!(
+        msg.get("status").and_then(Value::as_str),
+        Some("error" | "failed")
+    ) {
+        return message_text_or_summary(msg)
+            .or_else(|| msg.get("error").map(compact_json_value))
+            .or_else(|| Some("structured error status".to_string()));
+    }
+
+    if let Some(error) = msg.get("error") {
+        return message_text_or_summary(msg).or_else(|| Some(compact_json_value(error)));
+    }
+
+    let blocks = msg.get("content").and_then(Value::as_array)?;
+    let mut parts = Vec::new();
+    for block in blocks {
+        let is_error_block = block.get("is_error").and_then(Value::as_bool) == Some(true)
+            || block.get("type").and_then(Value::as_str) == Some("error");
+        if !is_error_block {
+            continue;
+        }
+        if let Some(text) = block.get("text").and_then(Value::as_str) {
+            parts.push(text.trim().to_string());
+        } else if let Some(content) = block.get("content").and_then(Value::as_str) {
+            parts.push(content.trim().to_string());
+        } else {
+            parts.push(compact_json_value(block));
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn compact_json_value(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn detect_file_mentions(messages: &[Value]) -> String {
@@ -1710,14 +1679,11 @@ mod tests {
     impl MemoriaClient for OverflowingMemoria {
         async fn retrieve_ext(
             &self,
-            query: &str,
+            _query: &str,
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
         ) -> Result<Vec<MemoriaMemory>, String> {
-            if query.starts_with(LEGACY_SESSION_MEMORY_PREFIX) {
-                return Ok(Vec::new());
-            }
             let mut next_id = self.next_id.lock().unwrap();
             let memory = MemoriaMemory {
                 memory_id: format!("mem-overflow-{}", *next_id),
@@ -1756,14 +1722,11 @@ mod tests {
     impl MemoriaClient for FiniteDeleteMemoria {
         async fn retrieve_ext(
             &self,
-            query: &str,
+            _query: &str,
             _session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
         ) -> Result<Vec<MemoriaMemory>, String> {
-            if query.starts_with(LEGACY_SESSION_MEMORY_PREFIX) {
-                return Ok(Vec::new());
-            }
             let remaining = *self.remaining.lock().unwrap();
             if remaining == 0 {
                 return Ok(Vec::new());
@@ -2756,16 +2719,45 @@ mod tests {
         assert!(decode_session_memory_entry(&encoded, "other").is_none());
     }
 
+    #[test]
+    fn session_memory_error_extraction_ignores_plain_text_keywords() {
+        let messages = vec![
+            json!({"role": "user", "content": "The fail-safe design is working now."}),
+            json!({"role": "assistant", "content": "No panic remains; the error handling path is documented."}),
+        ];
+
+        assert!(collect_error_lines(&messages).is_empty());
+    }
+
+    #[test]
+    fn session_memory_error_extraction_uses_structured_error_signals() {
+        let messages = vec![
+            json!({"role": "tool", "content": "command failed with exit code 1", "is_error": true}),
+            json!({"role": "assistant", "status": "failed", "error": "timeout waiting for edge executor"}),
+            json!({"role": "user", "content": [{"type": "error", "text": "malformed stream event cursor"}]}),
+        ];
+
+        let errors = collect_error_lines(&messages);
+        assert_eq!(errors.len(), 3);
+        assert!(errors.iter().any(|line| line.contains("exit code 1")));
+        assert!(errors.iter().any(|line| line.contains("timeout")));
+        assert!(errors.iter().any(|line| line.contains("malformed stream")));
+    }
+
     #[tokio::test]
     async fn load_current_session_memory_returns_only_matching_active_entry() {
         let memoria = CapturingMemoria {
             retrieve_results: Mutex::new(vec![
                 MemoriaMemory {
                     content: encode_session_memory_entry("other", "# Session Memory\n\nignore me"),
+                    memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+                    session_id: Some("other".to_string()),
                     ..Default::default()
                 },
                 MemoriaMemory {
                     content: encode_session_memory_entry("sess-42", "# Session Memory\n\nhello"),
+                    memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+                    session_id: Some("sess-42".to_string()),
                     ..Default::default()
                 },
             ]),
@@ -2783,6 +2775,38 @@ mod tests {
                 .is_none()
         );
         assert!(load_current_session_memory(&memoria, "   ").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_current_session_memory_requires_typed_snapshot_schema() {
+        let memoria = CapturingMemoria {
+            retrieve_results: Mutex::new(vec![
+                MemoriaMemory {
+                    content: encode_session_memory_entry(
+                        "sess-42",
+                        "# Session Memory\n\nwrong type",
+                    ),
+                    memory_type: "reference".to_string(),
+                    session_id: Some("sess-42".to_string()),
+                    ..Default::default()
+                },
+                MemoriaMemory {
+                    content:
+                        "[@session/memory]\nsession_id=sess-42\n# Session Memory\n\nlegacy body"
+                            .to_string(),
+                    memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+                    session_id: Some("sess-42".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        assert!(
+            load_current_session_memory(&memoria, "sess-42")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2861,10 +2885,14 @@ mod tests {
             retrieve_results: Mutex::new(vec![
                 MemoriaMemory {
                     content: older,
+                    memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+                    session_id: Some("sess-42".to_string()),
                     ..Default::default()
                 },
                 MemoriaMemory {
                     content: newer,
+                    memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+                    session_id: Some("sess-42".to_string()),
                     ..Default::default()
                 },
             ]),

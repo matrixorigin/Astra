@@ -9,8 +9,14 @@
 //! - Repeated tool calls (retry loops)
 //! - Correction patterns in user follow-up
 
+use crate::orchestration::agent_result_wire::{
+    AGENT_RESULT_CLASS_AGENT_INCOMPLETE as RESULT_CLASS_AGENT_INCOMPLETE,
+    AGENT_RESULT_CLASS_FANOUT_INCOMPLETE as RESULT_CLASS_FANOUT_INCOMPLETE,
+    agent_fanout_result_looks_like, agent_fanout_structured_result_class,
+    agent_tool_result_looks_like, agent_tool_structured_result_class,
+};
 use astra_services::session_journal::{JournalEvent, ToolCallRecord};
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Signals detected during evaluation.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,8 +84,9 @@ pub enum EvalSignal {
     },
     /// A tool command completed at the transport/execution layer but its
     /// classified outcome still represents an unresolved task failure
-    /// (`test_failure`, `env_failure`, `execution_error`). Carries the
-    /// normalized result class and number of unresolved streams.
+    /// (`test_failure`, `env_failure`, `execution_error`, or a structured
+    /// orchestration incomplete class). Carries the normalized result class and
+    /// number of unresolved streams.
     ToolOutcomeFailure { class: String, count: usize },
     /// One or more tool calls were rejected before execution by policy or
     /// runtime admission. They are not material `tools_used`, but they are
@@ -96,46 +103,35 @@ pub enum EvalSignal {
 
 /// Default threshold for [`EvalSignal::RedundantOverlappingReads`]: minimum
 /// count of redundant read events needed before flagging the turn. Calibrated
-/// against 14k real sessions: at ≥3, the signal flags ~15% of `rounds≥8`
-/// turns and catches all confirmed-waste fixtures (c49bc4a3 t2 = 38,
-/// eafda07e t2 = 19, 8ba9d165 t2 = 19, 4178c6a7 t2 = 19, bbf46ab2 t3 = 11,
-/// bbf46ab2 t4 = 7) while leaving healthy short turns silent.
+/// against production journals: at this level the signal catches repeated
+/// context re-reads while leaving healthy short turns silent.
 pub const REDUNDANT_OVERLAPPING_READS_THRESHOLD: usize = 3;
 
 /// Default threshold for [`EvalSignal::SearchFanout`]: minimum count of
 /// grep/rg/find-like tool calls in a turn before flagging passive search
-/// fan-out. Calibrated against 15k real sessions: among 68 long turns
-/// (`llm_rounds >= 8`), threshold 8 flags 10 (14.7%), including known waste
-/// fixtures c49bc4a3 t1/t2, bbf46ab2 t3/t4, 8ba9d165 t2, 03945541 t2.
-/// False-positive risk is higher than redundant-reads because some healthy
-/// investigative turns also fan out search, so this remains post-mortem only
-/// and carries a milder quality penalty.
+/// fan-out. False-positive risk is higher than redundant reads because some
+/// healthy investigative turns also fan out search, so this remains
+/// post-mortem only and carries a milder quality penalty.
 pub const SEARCH_FANOUT_THRESHOLD: usize = 8;
 
 /// Default threshold for [`EvalSignal::RedundantValidationRetries`]:
 /// redundant retries of the SAME heavy validation prefix within a no-mutation
 /// window before flagging the turn. Carries retry count (runs after the first).
-/// Calibrated against 15k real sessions: among 68 long turns (`llm_rounds >= 8`)
-/// threshold 2 flags 2 turns (2.9%) with high precision:
-/// - 80ca74de turn 8: `npm test --prefix tmp/reimbursement-system` retried 3x
-///   with no intervening edit
-/// - 1d21375d turn 3: `cargo check -p astra-tools` retried 2x with no
-///   intervening edit
+/// Kept conservative because validation retries may be legitimate when there
+/// was an intervening mutation or configuration change.
 pub const REDUNDANT_VALIDATION_RETRIES_THRESHOLD: usize = 2;
 
 /// Default threshold for [`EvalSignal::LlmRoundChurn`]: user turns that need
 /// 8+ LLM rounds are usually in trouble unless they are doing something very
-/// deliberate. Calibrated from recent forensic sessions where healthy turns
-/// typically finish within <=4 rounds while wasteful review/investigation turns
-/// balloon to 8+.
+/// deliberate.
 pub const LLM_ROUND_CHURN_THRESHOLD: usize = 8;
 pub const EXPLORATION_FAMILY_CHURN_THRESHOLD: usize = 3;
+pub const ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE: usize = 2;
 pub const PROMPT_GROWTH_CHURN_MIN_ROUNDS: u32 = 4;
 pub const PROMPT_GROWTH_CHURN_MIN_DELTA_TOKENS: u64 = 8_000;
 pub const PROMPT_GROWTH_CHURN_MIN_RATIO_NUMERATOR: u64 = 2;
 pub const PROMPT_GROWTH_CHURN_MIN_RATIO_DENOMINATOR: u64 = 1;
 const HIGH_COST_TOOL_CALL_THRESHOLD: usize = 16;
-
 /// Post-mortem evaluation thresholds. Defaults mirror the calibrated compile-
 /// time constants above, but runtime callers may override them from config so
 /// passive eval signals can be tuned without a rebuild.
@@ -166,6 +162,75 @@ pub struct TurnEvaluationTelemetry {
     pub prompt_tokens: Option<u64>,
     pub first_round_prompt_tokens: Option<u64>,
     pub max_round_prompt_tokens: Option<u64>,
+}
+
+/// Conservative mid-loop progress policy.
+///
+/// This is intentionally narrower than post-mortem turn evaluation: it does
+/// not infer task intent from user prose, does not parse tool output text, and
+/// never hard-stops a turn. It only recommends low-risk advisory evidence when
+/// structured observations show repeated low-yield work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnlineProgressPolicy {
+    pub redundant_overlapping_reads_threshold: usize,
+    pub min_tool_calls_before_nudge: usize,
+}
+
+impl Default for OnlineProgressPolicy {
+    fn default() -> Self {
+        Self {
+            redundant_overlapping_reads_threshold: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
+            min_tool_calls_before_nudge: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OnlineProgressSignals {
+    pub tool_calls: usize,
+    pub redundant_overlapping_reads: usize,
+    pub stronger_advisory_emitted: bool,
+    pub advisory_already_emitted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnlineProgressDecision {
+    Continue,
+    ReuseKnownContext { redundant_overlapping_reads: usize },
+}
+
+impl OnlineProgressDecision {
+    const fn continue_turn() -> Self {
+        Self::Continue
+    }
+}
+
+pub fn decide_online_progress(
+    signals: OnlineProgressSignals,
+    policy: OnlineProgressPolicy,
+) -> OnlineProgressDecision {
+    if signals.stronger_advisory_emitted || signals.advisory_already_emitted {
+        return OnlineProgressDecision::continue_turn();
+    }
+
+    if signals.tool_calls < policy.min_tool_calls_before_nudge {
+        return OnlineProgressDecision::continue_turn();
+    }
+
+    if threshold_reached(
+        signals.redundant_overlapping_reads,
+        policy.redundant_overlapping_reads_threshold,
+    ) {
+        return OnlineProgressDecision::ReuseKnownContext {
+            redundant_overlapping_reads: signals.redundant_overlapping_reads,
+        };
+    }
+
+    OnlineProgressDecision::continue_turn()
+}
+
+const fn threshold_reached(count: usize, threshold: usize) -> bool {
+    threshold > 0 && count >= threshold
 }
 
 /// Result of evaluating a turn's success and quality.
@@ -785,11 +850,10 @@ fn answer_has_runtime_scaffolding_artifact(
 
 fn counts_as_noop_metric_record(record: &ToolCallRecord) -> bool {
     record.ok
-        && matches!(
-            record.error.as_deref(),
-            Some("cached_cross_turn" | "duplicate_within_turn")
-        )
         && record.is_noop_or_cached_result()
+        && record.surgically_removed != Some(true)
+        && record.skill_reentry_count.is_none()
+        && record.skill_locked_out != Some(true)
 }
 
 fn relevance_terms(text: &str) -> std::collections::HashSet<String> {
@@ -1049,7 +1113,14 @@ fn calibrate_confidence_after_quality_penalties(eval: &mut TurnEvaluation) {
 }
 
 fn result_class_is_outcome_failure(class: &str) -> bool {
-    matches!(class, "test_failure" | "env_failure" | "execution_error")
+    matches!(
+        class,
+        "test_failure"
+            | "env_failure"
+            | "execution_error"
+            | RESULT_CLASS_AGENT_INCOMPLETE
+            | RESULT_CLASS_FANOUT_INCOMPLETE
+    )
 }
 
 fn result_class_resolves_outcome_failure(class: &str) -> bool {
@@ -1065,8 +1136,8 @@ fn hash_bounded_key(value: &str) -> String {
 }
 
 fn outcome_resolution_key(record: &ToolCallRecord) -> Option<String> {
-    let class = record.result_class.as_deref()?.trim();
-    if !result_class_is_outcome_failure(class) && !result_class_resolves_outcome_failure(class) {
+    let class = effective_tool_result_class(record)?;
+    if !result_class_is_outcome_failure(&class) && !result_class_resolves_outcome_failure(&class) {
         return None;
     }
 
@@ -1096,16 +1167,16 @@ fn unresolved_tool_outcome_failure_counts(
         if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
             continue;
         }
-        let Some(class) = record.result_class.as_deref().map(str::trim) else {
+        let Some(class) = effective_tool_result_class(record) else {
             continue;
         };
         let Some(key) = outcome_resolution_key(record) else {
             continue;
         };
 
-        if result_class_is_outcome_failure(class) {
-            unresolved_by_key.insert(key, class.to_string());
-        } else if result_class_resolves_outcome_failure(class) {
+        if result_class_is_outcome_failure(&class) {
+            unresolved_by_key.insert(key, class);
+        } else if result_class_resolves_outcome_failure(&class) {
             unresolved_by_key.remove(&key);
         }
     }
@@ -1115,6 +1186,40 @@ fn unresolved_tool_outcome_failure_counts(
         *counts.entry(class.clone()).or_insert(0) += 1;
     }
     counts
+}
+
+fn effective_tool_result_class(record: &ToolCallRecord) -> Option<String> {
+    if let Some(class) = record
+        .result_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|class| !class.is_empty())
+    {
+        return Some(class.to_string());
+    }
+
+    structured_tool_result_class(record).map(str::to_string)
+}
+
+fn structured_tool_result_class(record: &ToolCallRecord) -> Option<&'static str> {
+    let value = parse_structured_tool_result(record)?;
+    if record.name == "agent_fanout" || agent_fanout_result_looks_like(&value) {
+        return agent_fanout_structured_result_class(&value);
+    }
+    if record.name == "agent" || agent_tool_result_looks_like(&value) {
+        return agent_tool_structured_result_class(&value);
+    }
+    None
+}
+
+fn parse_structured_tool_result(record: &ToolCallRecord) -> Option<Value> {
+    [
+        record.result_full.as_deref(),
+        record.result_preview.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|raw| serde_json::from_str::<Value>(raw).ok())
 }
 
 fn apply_blocked_tool_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
@@ -1571,7 +1676,7 @@ fn mutation_target_file(name: &str, args: &str) -> Option<String> {
 
 /// Count redundant overlapping reads — see `EvalSignal::RedundantOverlappingReads`.
 ///
-/// Public so the runtime can call it mid-loop for a corrective intervention,
+/// Public so the runtime can call it mid-loop for an advisory observation,
 /// not just post-mortem. The runtime uses a slightly higher threshold than
 /// the eval-signal threshold to err on the side of underkill for the
 /// behavioral intervention.
@@ -2022,6 +2127,9 @@ mod tests {
             ok: false,
             ms: 4,
             error: Some("blocked_tool: executor is unavailable: service_executor_required".into()),
+            result_class: Some(
+                astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS.to_string(),
+            ),
             ..Default::default()
         }];
 
@@ -2295,6 +2403,8 @@ mod tests {
         let mut record = journal_ok_call("read_file");
         record.error = Some("cached_cross_turn".to_string());
         record.result_preview = Some("[cached_cross_turn: reused 200 bytes]".to_string());
+        record.result_class =
+            Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string());
 
         let eval = evaluate_tool_call_records("Summarize file", &[], &[record], 0, false, 0.2);
 
@@ -2307,6 +2417,85 @@ mod tests {
             "{:?}",
             eval.signals
         );
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_ignores_noop_human_text_without_structured_signal() {
+        let mut record = journal_ok_call("read_file");
+        record.result_preview = Some("[cached_cross_turn: reused 200 bytes]".to_string());
+
+        let eval = evaluate_tool_call_records("Summarize file", &[], &[record], 0, false, 0.2);
+
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::NoOpToolResults(_))),
+            "{:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn online_progress_continues_when_signal_is_below_threshold() {
+        let decision = decide_online_progress(
+            OnlineProgressSignals {
+                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
+                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD - 1,
+                ..OnlineProgressSignals::default()
+            },
+            OnlineProgressPolicy::default(),
+        );
+
+        assert_eq!(decision, OnlineProgressDecision::Continue);
+    }
+
+    #[test]
+    fn online_progress_requires_minimum_observation_volume() {
+        let decision = decide_online_progress(
+            OnlineProgressSignals {
+                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE - 1,
+                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
+                ..OnlineProgressSignals::default()
+            },
+            OnlineProgressPolicy::default(),
+        );
+
+        assert_eq!(decision, OnlineProgressDecision::Continue);
+    }
+
+    #[test]
+    fn online_progress_nudges_on_structured_redundant_reads_only_after_threshold() {
+        let decision = decide_online_progress(
+            OnlineProgressSignals {
+                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
+                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
+                ..OnlineProgressSignals::default()
+            },
+            OnlineProgressPolicy::default(),
+        );
+
+        assert_eq!(
+            decision,
+            OnlineProgressDecision::ReuseKnownContext {
+                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD
+            }
+        );
+    }
+
+    #[test]
+    fn online_progress_does_not_stack_on_existing_intervention() {
+        let decision = decide_online_progress(
+            OnlineProgressSignals {
+                tool_calls: 100,
+                redundant_overlapping_reads: 100,
+                stronger_advisory_emitted: true,
+                ..OnlineProgressSignals::default()
+            },
+            OnlineProgressPolicy::default(),
+        );
+
+        assert_eq!(decision, OnlineProgressDecision::Continue);
     }
 
     #[test]
@@ -2340,6 +2529,237 @@ mod tests {
             json.iter()
                 .any(|signal| signal["kind"] == "tool_outcome_failure"
                     && signal["class"] == "test_failure")
+        );
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_marks_structured_agent_interruptions_unsuccessful() {
+        let mut interrupted = journal_ok_call("agent");
+        interrupted.args_full = Some(
+            serde_json::json!({"action": "get_result", "agent_id": "reviewer@abc"}).to_string(),
+        );
+        interrupted.result_full = Some(
+            serde_json::json!({
+                "status": "interrupted",
+                "agent_id": "reviewer@abc",
+                "finish_reason": "response_guard_blocked",
+                "incomplete": true,
+                "result": "partial review"
+            })
+            .to_string(),
+        );
+
+        let eval =
+            evaluate_tool_call_records("review the branch", &[], &[interrupted], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == RESULT_CLASS_AGENT_INCOMPLETE && *count == 1
+        )));
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_marks_structured_active_agent_as_incomplete() {
+        let mut active = journal_ok_call("agent");
+        active.args_full = Some(
+            serde_json::json!({"action": "get_result", "agent_id": "reviewer@abc"}).to_string(),
+        );
+        active.result_full = Some(
+            serde_json::json!({
+                "status": "still_running",
+                "agent_id": "reviewer@abc"
+            })
+            .to_string(),
+        );
+
+        let eval =
+            evaluate_tool_call_records("collect child result", &[], &[active], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == RESULT_CLASS_AGENT_INCOMPLETE && *count == 1
+        )));
+    }
+
+    #[test]
+    fn later_structured_agent_completion_resolves_prior_interruption() {
+        let args =
+            serde_json::json!({"action": "get_result", "agent_id": "reviewer@abc"}).to_string();
+        let mut interrupted = journal_ok_call("agent");
+        interrupted.args_full = Some(args.clone());
+        interrupted.result_full = Some(
+            serde_json::json!({
+                "status": "interrupted",
+                "agent_id": "reviewer@abc",
+                "incomplete": true
+            })
+            .to_string(),
+        );
+        let mut completed = journal_ok_call("agent");
+        completed.args_full = Some(args);
+        completed.result_full = Some(
+            serde_json::json!({
+                "status": "completed",
+                "agent_id": "reviewer@abc",
+                "result": "done"
+            })
+            .to_string(),
+        );
+
+        let eval = evaluate_tool_call_records(
+            "continue the child agent",
+            &[],
+            &[interrupted, completed],
+            0,
+            false,
+            0.2,
+        );
+
+        assert!(eval.success, "{eval:?}");
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::ToolOutcomeFailure { .. })),
+            "{:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_marks_structured_fanout_issues_unsuccessful() {
+        let mut fanout = journal_ok_call("agent_fanout");
+        fanout.args_full =
+            Some(serde_json::json!({"action": "get_results", "group_id": "review"}).to_string());
+        fanout.result_full = Some(
+            serde_json::json!({
+                "status": "completed_with_issues",
+                "group_id": "review",
+                "interrupted": 1,
+                "results": [{
+                    "slot_index": 0,
+                    "agent_id": "reviewer@abc",
+                    "result": {
+                        "status": "interrupted",
+                        "agent_id": "reviewer@abc",
+                        "incomplete": true
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        let eval = evaluate_tool_call_records("review the branch", &[], &[fanout], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == RESULT_CLASS_FANOUT_INCOMPLETE && *count == 1
+        )));
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_marks_structured_active_fanout_as_incomplete() {
+        let mut fanout = journal_ok_call("agent_fanout");
+        fanout.args_full =
+            Some(serde_json::json!({"action": "get_results", "group_id": "review"}).to_string());
+        fanout.result_full = Some(
+            serde_json::json!({
+                "status": "incomplete",
+                "group_id": "review",
+                "results": [{
+                    "slot_index": 0,
+                    "agent_id": "reviewer@abc",
+                    "result": {
+                        "status": "still_running",
+                        "agent_id": "reviewer@abc"
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        let eval =
+            evaluate_tool_call_records("collect fanout results", &[], &[fanout], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == RESULT_CLASS_FANOUT_INCOMPLETE && *count == 1
+        )));
+    }
+
+    #[test]
+    fn structured_fanout_journal_record_produces_actionable_incomplete_notice() {
+        let mut fanout = journal_ok_call("agent_fanout");
+        fanout.args_full =
+            Some(serde_json::json!({"action": "get_results", "group_id": "review"}).to_string());
+        fanout.result_full = Some(
+            serde_json::json!({
+                "status": "incomplete",
+                "group_id": "review",
+                "recovery": {
+                    "resume_existing_work_before_rerun": true,
+                    "rerun_policy": "resume_existing_agents_or_report_incomplete; do_not_respawn_slots"
+                },
+                "results": [{
+                    "slot_index": 0,
+                    "agent_id": "reviewer@abc",
+                    "result": {
+                        "status": "still_running",
+                        "agent_id": "reviewer@abc"
+                    },
+                    "recovery": {
+                        "resume_existing_agent_id": "reviewer@abc",
+                        "rerun_policy": "resume_existing_agent_or_report_incomplete",
+                        "do_not_spawn_replacement": true
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        let eval = evaluate_tool_call_records(
+            "collect fanout results",
+            &[],
+            std::slice::from_ref(&fanout),
+            0,
+            false,
+            0.2,
+        );
+        let event = build_turn_evaluation_journal_event(
+            Some("s1"),
+            Some(1),
+            "turn",
+            "collect fanout results",
+            &[],
+            &[fanout],
+            0,
+            false,
+            0.2,
+            &eval,
+        );
+
+        assert!(!eval.success, "{eval:?}");
+        assert_eq!(
+            turn_evaluation_status_notice(&eval).as_deref(),
+            Some(
+                "Turn finished with unresolved tool/runtime failure(s): fanout_incomplete x1. Treat the final answer as incomplete until validation passes or the provider surface changes."
+            )
+        );
+        let metadata = event.metadata.expect("turn evaluation metadata");
+        assert_eq!(metadata["success"], false);
+        assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["signals"][1]["kind"], "tool_outcome_failure");
+        assert_eq!(
+            metadata["signals"][1]["class"],
+            RESULT_CLASS_FANOUT_INCOMPLETE
         );
     }
 
@@ -2434,15 +2854,28 @@ mod tests {
         // deferred, surgically_removed). A naive counter would see
         // error_rate = 3/4 = 0.75 and quality collapse. With filtering,
         // only the real success is counted and the turn scores as healthy.
+        let mut surgical = rec(
+            SURGICAL_REMOVAL_TOOL_NAME,
+            true,
+            Some("(removed from context — skill covered this work)"),
+        );
+        surgical.surgically_removed = Some(true);
+
+        let mut skipped = rec("read_file", true, Some("Skipped: skill routed"));
+        skipped.result_class =
+            Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string());
+        skipped.skill_reentry_count = Some(1);
+
+        let mut deferred = rec("read_file", true, Some("Deferred: skill invoked"));
+        deferred.result_class =
+            Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string());
+        deferred.skill_locked_out = Some(true);
+
         let records = vec![
             rec("git", true, Some("diff contents here")),
-            rec(
-                SURGICAL_REMOVAL_TOOL_NAME,
-                true,
-                Some("(removed from context — skill covered this work)"),
-            ),
-            rec("read_file", false, Some("Skipped: skill routed")),
-            rec("read_file", false, Some("Deferred: skill invoked")),
+            surgical,
+            skipped,
+            deferred,
         ];
 
         let eval = evaluate_tool_call_records(
@@ -2728,7 +3161,7 @@ mod tests {
                 "read_file",
                 r#"{"path":"crates/runtime/src/server/run_lifecycle.rs"}"#,
             ),
-            record("grep", r#"/factual retry/ in crates/runtime/src"#),
+            record("grep", r#"/runtime context/ in crates/runtime/src"#),
             record("grep", r#"/ContinueLoop/ in crates/runtime/src"#),
             record("grep", r#"/TPM/ in crates/runtime/src"#),
             record(

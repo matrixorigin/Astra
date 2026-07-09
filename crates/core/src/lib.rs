@@ -46,8 +46,7 @@ pub fn canonical_json_string(value: &serde_json::Value) -> String {
                         out.push(',');
                     }
                     out.push_str(
-                        &serde_json::to_string(key.as_str())
-                            .unwrap_or_else(|_| "\"\"".to_string()),
+                        &serde_json::to_string(key.as_str()).unwrap_or_else(|_| "\"\"".to_string()),
                     );
                     out.push(':');
                     if let Some(item) = map.get(*key) {

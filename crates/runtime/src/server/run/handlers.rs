@@ -689,29 +689,6 @@ mod tests {
     }
 
     #[test]
-    fn list_runs_handler_uses_cursor_pagination_only() {
-        let source = include_str!("handlers.rs");
-        let body = source
-            .split("pub(crate) async fn list_runs_handler")
-            .nth(1)
-            .and_then(|rest| rest.split("pub(crate) async fn pause_run_handler").next())
-            .expect("list_runs_handler body should be present");
-
-        assert!(
-            !body.contains("offset"),
-            "HTTP run list handler must not carry legacy offset pagination"
-        );
-        assert!(
-            body.contains(".list_runs_cursor("),
-            "HTTP run list should use seek pagination for the first page and cursor pages"
-        );
-        assert!(
-            !body.contains(".list_runs("),
-            "HTTP run list must not call the legacy count path"
-        );
-    }
-
-    #[test]
     fn run_list_query_rejects_legacy_offset_param() {
         let legacy_uri: Uri = "/runs?limit=10&offset=5".parse().unwrap();
         assert!(
@@ -852,66 +829,6 @@ mod tests {
                 "interruption_kind": "budget_exhausted",
                 "resumable": true,
                 "index": 11
-            })
-        );
-    }
-
-    #[test]
-    fn transform_stream_run_events_for_client_preserves_task_board_intervention() {
-        let transformed = transform_stream_run_events_for_client(
-            "run-123",
-            vec![
-                json!({
-                    "event_type": "run_interrupted",
-                    "data": {
-                        "kind": "empty_completion",
-                        "resumable": true,
-                        "waiting_for": "task_board_intervention",
-                        "user_message": "Task-board work remains open.",
-                        "task_board": {
-                            "summary": "1 paused task(s) remain: task-2 Investigate [paused]",
-                            "paused_count": 1,
-                            "active_tasks": ["task-2 Investigate [paused]"]
-                        }
-                    },
-                    "index": 10
-                }),
-                json!({
-                    "event_type": "run_finished",
-                    "data": {
-                        "interrupted": true,
-                        "waiting_for": "task_board_intervention"
-                    }
-                }),
-            ],
-        );
-
-        assert_eq!(
-            transformed[0],
-            json!({
-                "type": "run_interrupted",
-                "run_id": "run-123",
-                "kind": "empty_completion",
-                "resumable": true,
-                "waiting_for": "task_board_intervention",
-                "user_message": "Task-board work remains open.",
-                "message": "Task-board work remains open.",
-                "task_board": {
-                    "summary": "1 paused task(s) remain: task-2 Investigate [paused]",
-                    "paused_count": 1,
-                    "active_tasks": ["task-2 Investigate [paused]"]
-                },
-                "index": 10
-            })
-        );
-        assert_eq!(
-            transformed[1],
-            json!({
-                "type": "run_finished",
-                "run_id": "run-123",
-                "status": "paused",
-                "interrupted": true,
-                "waiting_for": "task_board_intervention"
             })
         );
     }

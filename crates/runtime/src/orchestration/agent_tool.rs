@@ -19,6 +19,7 @@ use astra_tools::agent_tool_contract::{
     AgentAction, AgentFanoutAction, agent_action_from_args, agent_fanout_action_from_args,
 };
 use astra_turn_core::orchestration::agent_result_wire::{
+    agent_tool_result_needs_recovery, fanout_slot_status_is_recoverable_issue,
     render_agent_tool_error, render_agent_tool_error_with_kind, render_unknown_agent_result,
     render_wait_for_agent_status, render_wait_timeout_outcome,
 };
@@ -1147,12 +1148,29 @@ async fn render_agent_fanout_results(
                 read_options.offset,
                 read_options.max_bytes,
             );
+            let needs_recovery = agent_tool_result_needs_recovery(&value);
             let mut item = json!({
                 "slot_index": slot_index,
                 "id": slot_id,
                 "agent_id": agent_id,
                 "result": value,
             });
+            if needs_recovery {
+                let object = item.as_object_mut().expect("slot result item object");
+                let resume_existing_agent_id = object
+                    .get("agent_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                object.insert(
+                    "recovery".into(),
+                    json!({
+                        "resume_existing_agent_id": resume_existing_agent_id,
+                        "rerun_policy": "resume_existing_agent_or_report_incomplete",
+                        "do_not_spawn_replacement": true,
+                    }),
+                );
+            }
             if let Some(window) = window {
                 let object = item.as_object_mut().expect("slot result item object");
                 object.insert("result_bytes".into(), json!(window.total_bytes));
@@ -1198,12 +1216,24 @@ async fn render_agent_fanout_results(
 
     let updated = find_fanout_group(ctx, group_id).await.unwrap_or(group);
     let summary = updated.summary();
+    let incomplete_result_count = results
+        .iter()
+        .filter(|item| fanout_result_item_has_terminal_incomplete(item))
+        .count();
     let mut response = json!({
         "status": fanout_get_results_status_label(&updated),
         "group_id": group_id,
         "title": updated.title,
         "target_count": updated.target_count,
         "delivery_contract": "Results are bounded for prompt safety. Use results[].next_call, or agent_fanout(action='get_results', group_id=..., slot_index=N, offset=BYTE_OFFSET, max_bytes=BYTES), to read additional slot output. Do not search for or copy physical filesystem paths or runtime-owned tool-result artifacts.",
+        "recovery": {
+            "result_ref": format!("agent_fanout:{group_id}"),
+            "task_output_id": group_id,
+            "get_results_call": format!("agent_fanout(action='get_results', group_id='{group_id}')"),
+            "task_output_call": format!("task_output(task_id='{group_id}')"),
+            "active_task_list_empty_does_not_mean_results_missing": true,
+            "do_not_rerun_when_user_asks_for_results": true,
+        },
         "result_read": {
             "slot_index": read_options.slot_index,
             "offset": read_options.offset,
@@ -1213,6 +1243,16 @@ async fn render_agent_fanout_results(
         "results": results,
     });
     let obj = response.as_object_mut().unwrap();
+    if incomplete_result_count > 0 {
+        obj.insert("incomplete_results".into(), json!(incomplete_result_count));
+        if let Some(recovery) = obj.get_mut("recovery").and_then(Value::as_object_mut) {
+            recovery.insert("resume_existing_work_before_rerun".into(), json!(true));
+            recovery.insert(
+                "rerun_policy".into(),
+                json!("resume_existing_agents_or_report_incomplete; do_not_respawn_slots"),
+            );
+        }
+    }
     if summary.completed > 0 {
         obj.insert("completed".into(), json!(summary.completed));
     }
@@ -1633,6 +1673,15 @@ fn fanout_get_results_status_label(group: &AgentFanoutGroupProjection) -> &'stat
     } else {
         "completed"
     }
+}
+
+fn fanout_result_item_has_terminal_incomplete(item: &Value) -> bool {
+    item.get("status")
+        .and_then(Value::as_str)
+        .is_some_and(fanout_slot_status_is_recoverable_issue)
+        || item
+            .get("result")
+            .is_some_and(agent_tool_result_needs_recovery)
 }
 
 fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
@@ -3829,6 +3878,15 @@ mod tests {
         assert_eq!(
             collected_value["results"][0]["result"]["status"],
             "interrupted"
+        );
+        assert_eq!(collected_value["incomplete_results"], 1);
+        assert_eq!(
+            collected_value["recovery"]["resume_existing_work_before_rerun"],
+            true
+        );
+        assert_eq!(
+            collected_value["results"][0]["recovery"]["rerun_policy"],
+            "resume_existing_agent_or_report_incomplete"
         );
     }
 

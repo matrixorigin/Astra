@@ -168,7 +168,7 @@ pub fn verdict_event_summary_line(
     suppressed_loop_nudges: bool,
     recent_error_pressure: usize,
     health_avoidance_count: usize,
-    force_stop: bool,
+    advisory_threshold_reached: bool,
 ) -> String {
     format!(
         "T{} {} {}  mode={}{}  nudges={}  pressure={}  retry_caution={}{}",
@@ -184,7 +184,11 @@ pub fn verdict_event_summary_line(
         nudge_count,
         recent_error_pressure,
         health_avoidance_count,
-        if force_stop { "  FORCE_STOP" } else { "" },
+        if advisory_threshold_reached {
+            "  STRONG_ADVISORY"
+        } else {
+            ""
+        },
     )
 }
 
@@ -438,20 +442,20 @@ mod tests {
     // ──────────────────────────────────────────────────────────
 
     #[test]
-    fn verdict_event_summary_no_force_stop() {
+    fn verdict_event_summary_no_advisory_threshold_reached() {
         let s = verdict_event_summary_line(3, "⚠", "warning", 2, "prompt", false, 1, 0, false);
         assert!(s.contains("T3"));
         assert!(s.contains("⚠"));
         assert!(s.contains("mode=prompt"));
         assert!(s.contains("nudges=2"));
         assert!(s.contains("pressure=1"));
-        assert!(!s.contains("FORCE_STOP"));
+        assert!(!s.contains("STRONG_ADVISORY"));
     }
 
     #[test]
-    fn verdict_event_summary_with_force_stop() {
+    fn verdict_event_summary_with_advisory_threshold_reached() {
         let s = verdict_event_summary_line(1, "🛑", "critical", 0, "auto", true, 5, 2, true);
-        assert!(s.contains("FORCE_STOP"));
+        assert!(s.contains("STRONG_ADVISORY"));
         assert!(s.contains("suppress_nudges=1"));
         assert!(s.contains("retry_caution=2"));
     }

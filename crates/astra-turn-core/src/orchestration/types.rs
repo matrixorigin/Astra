@@ -7,7 +7,6 @@ use std::time::SystemTime;
 
 use super::fanout_group::{AgentFanoutSlotIdentity, AgentFanoutSlotStatus};
 use crate::interruption::InterruptionKind;
-
 pub const AGENT_FINISH_REASON_NORMAL: &str = "normal";
 
 /// Current status of a spawned agent.
@@ -119,10 +118,7 @@ pub fn agent_finish_reason_is_parent_budget(reason: &str) -> bool {
 
 pub fn project_agent_status_to_fanout_slot(status: &AgentStatus) -> AgentFanoutStatusProjection {
     let (status, terminal_reason) = match status {
-        AgentStatus::Completed {
-            result: _,
-            finish_reason,
-        } => {
+        AgentStatus::Completed { finish_reason, .. } => {
             let reason = agent_finish_reason_text(finish_reason.as_deref());
             if agent_completion_is_interrupted(Some(reason)) {
                 (AgentFanoutSlotStatus::Failed, Some(reason.to_string()))
@@ -220,6 +216,9 @@ mod tests {
         assert!(agent_completion_is_interrupted(Some("empty_completion")));
         assert!(agent_completion_is_interrupted(Some("stream_transport")));
         assert!(agent_completion_is_interrupted(Some("executor_dropped")));
+        assert!(agent_completion_is_interrupted(Some(
+            crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON
+        )));
         assert!(
             !agent_completion_is_interrupted(Some("completed_with_warnings")),
             "unknown future successful completion reasons must not be reclassified as interrupted"
@@ -290,6 +289,19 @@ mod tests {
             "future non-normal success reasons should remain completed unless they match the interruption taxonomy"
         );
         assert!(projection.terminal_reason.is_none());
+
+        let guarded = AgentStatus::Completed {
+            result: "guarded fallback text is data, not protocol".to_string(),
+            finish_reason: Some(
+                crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON.to_string(),
+            ),
+        };
+        let projection = project_agent_status_to_fanout_slot(&guarded);
+        assert_eq!(projection.status, AgentFanoutSlotStatus::Failed);
+        assert_eq!(
+            projection.terminal_reason.as_deref(),
+            Some(crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON)
+        );
     }
 
     #[test]

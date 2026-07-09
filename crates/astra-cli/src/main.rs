@@ -1842,12 +1842,10 @@ total_tokens_out: 500
     /// Without `ASTRA_API_URL`, the cloud-pull path returns
     /// `cloud_reachable: false` instead of attempting any HTTP.
     /// Verifies graceful offline degradation.
+    #[serial_test::serial]
     #[tokio::test]
     async fn try_cloud_pull_returns_unreachable_without_cloud_base() {
-        // Safety: test-only, single-threaded tokio runtime
-        unsafe {
-            std::env::remove_var("ASTRA_API_URL");
-        }
+        let _api = super::test_utils::ProcessEnvGuard::remove("ASTRA_API_URL");
         let result = cli::cloud_sync::try_cloud_pull("default").await;
         assert!(
             !result.cloud_reachable,

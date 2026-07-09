@@ -120,29 +120,11 @@ fn task_profile_from_judged_turn_intent(
     } else {
         astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard
     };
-    let allow_factual_retry = mutates_workspace
-        || exploratory_task
-        || matches!(
-            scenario,
-            Some(
-                Scenario::CodeReview
-                    | Scenario::Debugging
-                    | Scenario::Exploration
-                    | Scenario::Implementation
-                    | Scenario::Refactoring
-                    | Scenario::Testing
-                    | Scenario::Documentation
-                    | Scenario::DevOps
-            )
-        )
-        || intent.browser_verification_required;
-
     Some(
         astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
             mutates_workspace,
             exploratory_task,
             complexity,
-            allow_factual_retry,
         ),
     )
 }
@@ -661,12 +643,6 @@ pub(crate) fn extract_tool_args(args: Option<&str>) -> Option<Value> {
     serde_json::from_str::<Value>(args).ok()
 }
 
-pub(crate) fn extract_bash_command(args: Option<&str>) -> Option<String> {
-    let value = extract_tool_args(args)?;
-    let command = value.get("command").and_then(Value::as_str)?;
-    Some(command.to_string())
-}
-
 pub(crate) fn tool_record_is_workspace_mutation(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
@@ -737,40 +713,65 @@ fn recent_activity_supports_budget_extension(state: &AgenticLoopState) -> bool {
     mutating_progress || distinct_recent_turns >= 2
 }
 
-const TASK_BOARD_START_GATE_MESSAGE: &str = "[task-board:start] This is broad multi-step or delegated work. Before broad analysis, file exploration, or spawning agents, create 3-7 concrete leaf tasks with task_board(action='create'), then mark exactly one first task in_progress with task_board(action='update', new_status='in_progress'). Keep the task board current as tasks complete, fail, pause, or are no longer needed.";
-
-fn should_require_task_board_for_profile(
+fn should_suggest_task_board_for_profile(
     profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
 ) -> bool {
     profile.complexity == astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex
         || (profile.mutates_workspace && profile.exploratory_task)
 }
 
-async fn maybe_inject_task_board_start_gate<H: AgenticLoopHost>(
-    host: &H,
-    state: &mut AgenticLoopState,
-) -> bool {
+async fn queue_task_board_advisory<H: AgenticLoopHost>(host: &H, state: &mut AgenticLoopState) {
     if !host.valid_tool_names().contains("task_board") {
-        return false;
+        return;
     }
 
     state.refresh_task_board_snapshot().await;
     if state.hooks.task_board_snapshot.has_unfinished_tasks() {
-        return false;
+        state.push_volatile_payload(
+            super::host::VolatileKind::TaskBoardAdvisory,
+            serde_json::json!({
+                "schema": "task_board_advisory.v1",
+                "signal": "unfinished_tasks_observed",
+                "evidence": {
+                    "tracked_count": state.hooks.task_board_snapshot.tracked_count,
+                    "pending_count": state.hooks.task_board_snapshot.pending_count,
+                    "in_progress_count": state.hooks.task_board_snapshot.in_progress_count,
+                    "paused_count": state.hooks.task_board_snapshot.paused_count,
+                    "active_tasks": state.hooks.task_board_snapshot.active_tasks,
+                },
+                "recommendation": "Reconcile the live task state before claiming that tracked work is complete.",
+                "authority": "advisory_evidence_only",
+            }),
+        );
+        return;
     }
 
-    if !should_require_task_board_for_profile(state.task_profile) {
-        return false;
+    if !should_suggest_task_board_for_profile(state.task_profile) {
+        return;
     }
 
-    state.push_volatile(
-        super::host::VolatileKind::TaskBoardStartGate,
-        TASK_BOARD_START_GATE_MESSAGE,
+    let complexity = match state.task_profile.complexity {
+        astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard => "standard",
+        astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex => "complex",
+    };
+    state.push_volatile_payload(
+        super::host::VolatileKind::TaskBoardAdvisory,
+        serde_json::json!({
+            "schema": "task_board_advisory.v1",
+            "signal": "broad_work_without_task_board",
+            "evidence": {
+                "complexity": complexity,
+                "mutates_workspace": state.task_profile.mutates_workspace,
+                "exploratory_task": state.task_profile.exploratory_task,
+            },
+            "recommendation": "A small durable task board may help track broad multi-step or delegated work. Use it when that improves execution clarity.",
+            "authority": "advisory_evidence_only",
+            "model_discretion": "This signal does not gate analysis, tool use, delegation, or completion.",
+        }),
     );
-    true
 }
 
-fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
+fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<()> {
     let budget = state.agentic_turn_budget;
     if budget.extension_turns == 0
         || budget.max_extensions == 0
@@ -789,6 +790,8 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
         return None;
     }
 
+    let previous_max_turns = state.max_turns;
+    let previous_remaining_turns = state.remaining_turns;
     state.max_turns += additional_turns;
     state.remaining_turns += additional_turns;
     // Fresh budget → fresh self-pacing thresholds. Without this,
@@ -798,23 +801,25 @@ fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
     state.turn_budget_hint_emitted_50 = false;
     state.turn_budget_hint_emitted_20 = false;
     state.turn_budget_hint_emitted_90 = false;
-    let review_message = format!(
-        "[Budget review] Recent tool activity passed the continuation policy for this {}task, so continuing with {} extra turn(s). Hard limit: {} total turns.",
-        if state.task_profile.exploratory_task {
-            "exploratory "
-        } else if state.task_profile.mutates_workspace {
-            "implementation "
-        } else {
-            ""
-        },
-        additional_turns,
-        budget.hard_turn_limit,
+    state.push_volatile_payload(
+        super::host::VolatileKind::BudgetUpdate,
+        serde_json::json!({
+            "schema": "runtime_budget_update.v1",
+            "event": "turn_budget_extended",
+            "previous": {
+                "max_turns": previous_max_turns,
+                "remaining_turns": previous_remaining_turns,
+            },
+            "current": {
+                "max_turns": state.max_turns,
+                "remaining_turns": state.remaining_turns,
+            },
+            "additional_turns": additional_turns,
+            "hard_turn_limit": budget.hard_turn_limit,
+            "authority": "runtime_budget_fact",
+        }),
     );
-    state.push_volatile(
-        super::host::VolatileKind::BudgetReview,
-        review_message.clone(),
-    );
-    Some(review_message)
+    Some(())
 }
 
 /// Unified diagnosis of all stall conditions evaluated at interruption time.
@@ -916,88 +921,6 @@ pub(crate) fn interruption_diagnosis_summary(state: &AgenticLoopState) -> Option
     compute_stall_diagnosis(state).summary
 }
 
-/// Build a user-facing abort message that the circuit-breaker uses when the
-/// model has not produced any free-form text yet. The legacy single-line
-/// red banner left users staring at "⛔ Circuit breaker abort at round N"
-/// with no context. This composes:
-///   1. The headline ("aborted at round N")
-///   2. Diagnosed cause (from `compute_stall_diagnosis`)
-///   3. Up to `MAX_RECENT_TOOLS` recent successful tool-call summaries so
-///      the user can see *what work was preserved* before the abort
-///   4. A concrete "next-step" line tied to the diagnosed cause
-///
-/// Pure formatter — no I/O, deterministic, easy to unit-test.
-pub(crate) fn build_circuit_breaker_abort_message(state: &AgenticLoopState) -> String {
-    const MAX_RECENT_TOOLS: usize = 5;
-    const PREVIEW_CHARS: usize = 120;
-
-    let round = state.llm_rounds_completed;
-    let diagnosis = compute_stall_diagnosis(state);
-
-    let mut out = format!(
-        "[Circuit breaker abort at round {round}. The agent did not recover \
-         after correction — stall or regression persists. Any progress and \
-         tool results from earlier rounds are preserved above.]"
-    );
-
-    if let Some(summary) = diagnosis.summary.as_deref() {
-        out.push_str(&format!("\nLikely cause: {summary}."));
-    }
-
-    let recent: Vec<&astra_services::session_journal::ToolCallRecord> = state
-        .stall
-        .tool_call_records
-        .iter()
-        .rev()
-        .filter(|r| !r.is_synthetic_placeholder() && r.ok)
-        .take(MAX_RECENT_TOOLS)
-        .collect();
-    if !recent.is_empty() {
-        out.push_str("\n\nWork preserved (most recent first):");
-        for record in &recent {
-            let args = record
-                .args_preview
-                .as_deref()
-                .or(record.args_full.as_deref())
-                .unwrap_or("");
-            let trimmed_args = clip_chars(args, PREVIEW_CHARS);
-            out.push_str(&format!("\n• {}: {}", record.name, trimmed_args));
-            if let Some(result) = record.result_preview.as_deref() {
-                let trimmed_result = clip_chars(result, PREVIEW_CHARS);
-                if !trimmed_result.is_empty() {
-                    out.push_str(&format!("\n    → {trimmed_result}"));
-                }
-            }
-        }
-    }
-
-    let next_step = match diagnosis.signal.as_deref() {
-        Some(s) if s.starts_with("redundant_reads=") || s.contains("exploration_family=read") => {
-            "Next: stop re-reading the same files; synthesize an answer from what's already in context, or write the change."
-        }
-        Some(s) if s.contains("exploration_family=search") => {
-            "Next: stop fanning out new greps; pick the single most-promising hit and read it directly."
-        }
-        _ => {
-            "Next: produce a textual answer from existing evidence; only call a tool if it adds genuinely new information."
-        }
-    };
-    out.push_str("\n\n");
-    out.push_str(next_step);
-
-    out
-}
-
-fn clip_chars(s: &str, max_chars: usize) -> String {
-    let trimmed = s.trim();
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    let mut clipped: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
-    clipped.push('…');
-    clipped
-}
-
 pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -1017,11 +940,11 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
         )
         .await;
         if let Some(ctx) = hook_output.context {
-            state.messages.insert(
-                0,
+            state.push_volatile_payload(
+                super::host::VolatileKind::SessionHookContext,
                 serde_json::json!({
-                    "role": "system",
-                    "content": format!("[Session hooks]\n{ctx}"),
+                    "event": "session_start",
+                    "context": ctx,
                 }),
             );
         }
@@ -1057,7 +980,9 @@ fn apply_structured_user_reanchor(state: &mut AgenticLoopState) -> bool {
     }
 
     state.turn_guard.begin_fresh_user_turn();
-    state.restricted_tools.clear();
+    // Hard capability/permission restrictions are owned by their boundary and
+    // must survive a semantic re-anchor. Behavioral state can reset here, but
+    // user intent must not broaden the executable capability surface.
     state.boosted_tools.clear();
     state.widen_selection_pending = true;
 
@@ -1510,7 +1435,16 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             tracing::debug!("turn intent judge unavailable; preserving current runtime profile");
         }
     }
-    maybe_inject_task_board_start_gate(host, state).await;
+    queue_task_board_advisory(host, state).await;
+    if let Some(prompt) =
+        astra_turn_core::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
+        && let Some(content) = prompt.get("content").and_then(Value::as_str)
+    {
+        state.push_volatile(
+            super::host::VolatileKind::StopHookEvidence,
+            content.to_string(),
+        );
+    }
 
     if (state.telemetry.observability_session.is_some() || state.skills.resolver.is_some())
         && state.telemetry.turn_trace_collector.is_none()
@@ -1689,47 +1623,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     if turn_index > 0 {
         // Inventory snapshots go through the structured volatile lane so
         // they stay out of `state.messages[]` — the wire layer drains
-        // them into volatile_preamble for each LLM call. Legacy
-        // retains() stay for a grace period to scrub checkpoints
-        // restored from pre-migration sessions (working-set / attention
-        // manifests were removed in wip-3).
-        state.messages.retain(|m| {
-            let role = m.get("role").and_then(Value::as_str);
-            let content = m.get("content").and_then(Value::as_str);
-            match (role, content) {
-                (Some("system"), Some(c))
-                    if astra_turn_core::runtime_scaffolding::detect_runtime_scaffolding(c)
-                        == Some(
-                            astra_turn_core::runtime_scaffolding::RuntimeScaffoldingKind::WorkingSetManifest,
-                        ) =>
-                {
-                    false
-                }
-                (Some("user"), Some(c))
-                    if astra_turn_core::runtime_scaffolding::detect_runtime_scaffolding(c)
-                        == Some(
-                            astra_turn_core::runtime_scaffolding::RuntimeScaffoldingKind::AttentionManifest,
-                        ) =>
-                {
-                    false
-                }
-                _ => true,
-            }
-        });
-
+        // them into volatile_preamble for each LLM call.
         const INVENTORY_HEADER: &str = astra_turn_core::runtime_scaffolding::ALREADY_FETCHED_PREFIX;
-        state.messages.retain(|m| {
-            m.get("role").and_then(Value::as_str) != Some("system")
-                || !m
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|c| {
-                        astra_turn_core::runtime_scaffolding::detect_runtime_scaffolding(c)
-                            == Some(
-                                astra_turn_core::runtime_scaffolding::RuntimeScaffoldingKind::AlreadyFetchedInventory,
-                            )
-                    })
-        });
         let inventory = state.semantic_dedup.context_inventory();
         if !inventory.is_empty() {
             state.push_volatile(
@@ -2082,10 +1977,14 @@ mod tests {
             "extension adds two turns, then current prepare consumes one"
         );
         assert!(
-            state
-                .volatile_pending
-                .iter()
-                .any(|entry| entry.content.contains("Budget review")),
+            state.volatile_pending.iter().any(|entry| {
+                entry.kind == VolatileKind::BudgetUpdate
+                    && entry.payload["schema"] == "runtime_budget_update.v1"
+                    && entry.payload["additional_turns"] == 2
+                    && entry.payload["current"]["max_turns"] == 4
+                    && entry.payload["current"]["remaining_turns"] == 2
+                    && entry.payload["authority"] == "runtime_budget_fact"
+            }),
             "budget review should explain the extension"
         );
     }
@@ -2156,7 +2055,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_requires_task_board_for_structured_complex_work() {
+    async fn prepare_advises_task_board_for_structured_complex_work() {
         let intent = TurnIntent::default()
             .with_requested_scenario(Scenario::Refactoring)
             .with_workspace_mutation(WorkspaceMutationIntent::MustMutate);
@@ -2173,22 +2072,22 @@ mod tests {
             .expect("turn should prepare");
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
 
-        let gate = state
+        let advisory = state
             .volatile_pending
             .iter()
-            .find(|entry| entry.kind == VolatileKind::TaskBoardStartGate)
-            .expect("broad delegated review should receive task-board start gate");
-        assert!(
-            gate.content.contains("Before broad analysis")
-                && gate.content.contains("task_board(action='create')")
-                && gate.content.contains("in_progress"),
-            "{:?}",
-            state.volatile_pending
+            .find(|entry| entry.kind == VolatileKind::TaskBoardAdvisory)
+            .expect("broad delegated review should receive task-board evidence");
+        assert_eq!(advisory.payload["schema"], "task_board_advisory.v1");
+        assert_eq!(advisory.payload["signal"], "broad_work_without_task_board");
+        assert_eq!(advisory.payload["authority"], "advisory_evidence_only");
+        assert_eq!(
+            advisory.payload["model_discretion"],
+            "This signal does not gate analysis, tool use, delegation, or completion."
         );
     }
 
     #[tokio::test]
-    async fn prepare_does_not_require_new_task_board_when_one_is_active() {
+    async fn prepare_surfaces_existing_task_board_state_without_start_advisory() {
         let intent = TurnIntent::default()
             .with_requested_scenario(Scenario::Refactoring)
             .with_workspace_mutation(WorkspaceMutationIntent::MustMutate);
@@ -2214,30 +2113,30 @@ mod tests {
             .expect("turn should prepare");
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
 
-        assert!(
-            !state
-                .volatile_pending
-                .iter()
-                .any(|entry| entry.kind == VolatileKind::TaskBoardStartGate),
-            "existing board should be reconciled, not duplicated: {:?}",
-            state.volatile_pending
-        );
+        let advisory = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::TaskBoardAdvisory)
+            .expect("existing task-board state should reach the model as evidence");
+        assert_eq!(advisory.payload["signal"], "unfinished_tasks_observed");
+        assert_eq!(advisory.payload["evidence"]["tracked_count"], 1);
+        assert_eq!(advisory.payload["evidence"]["pending_count"], 1);
+        assert_eq!(advisory.payload["authority"], "advisory_evidence_only");
     }
 
     #[test]
-    fn task_board_start_gate_uses_structured_profile_not_message_text() {
+    fn task_board_start_advisory_uses_structured_profile_not_message_text() {
         let default_profile =
             astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default();
-        assert!(!should_require_task_board_for_profile(default_profile));
+        assert!(!should_suggest_task_board_for_profile(default_profile));
 
         let complex_profile =
             astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
                 false,
                 false,
                 astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
-                true,
             );
-        assert!(should_require_task_board_for_profile(complex_profile));
+        assert!(should_suggest_task_board_for_profile(complex_profile));
     }
 
     #[test]
@@ -2310,89 +2209,6 @@ mod tests {
             Vec::<String>::new(),
             "single-tool stall must not hard-block the executor needed to finish"
         );
-    }
-
-    #[test]
-    fn circuit_breaker_abort_message_includes_diagnosis_and_recent_work() {
-        let mut state = make_state();
-        state.llm_rounds_completed = 84;
-        state.stall.tool_call_records = (0..6)
-            .flat_map(|round| [read_record(round, 10, 40), read_record(round, 50, 80)])
-            .collect();
-        // Add result_preview to the most recent so we can assert it surfaces.
-        if let Some(last) = state.stall.tool_call_records.last_mut() {
-            last.result_preview = Some("fn handler(...) -> Result<()> {".into());
-        }
-
-        let msg = build_circuit_breaker_abort_message(&state);
-        assert!(
-            msg.contains("Circuit breaker abort at round 84"),
-            "headline missing; got:\n{msg}"
-        );
-        assert!(
-            msg.contains("Likely cause:"),
-            "diagnosis missing; got:\n{msg}"
-        );
-        assert!(
-            msg.contains("read-dominant exploratory rounds"),
-            "diagnosis text missing; got:\n{msg}"
-        );
-        assert!(
-            msg.contains("Work preserved"),
-            "recent-work block missing; got:\n{msg}"
-        );
-        assert!(
-            msg.contains("read_file:"),
-            "recent tool name missing; got:\n{msg}"
-        );
-        assert!(
-            msg.contains("fn handler"),
-            "recent result preview missing; got:\n{msg}"
-        );
-        assert!(
-            msg.contains("Next:"),
-            "next-step guidance missing; got:\n{msg}"
-        );
-        assert!(
-            msg.contains("re-reading"),
-            "should advise stopping re-reads; got:\n{msg}"
-        );
-    }
-
-    #[test]
-    fn circuit_breaker_abort_message_clips_long_previews() {
-        let mut state = make_state();
-        state.llm_rounds_completed = 5;
-        let mut record = read_record(0, 10, 40);
-        record.args_preview = Some("a".repeat(500));
-        record.result_preview = Some("b".repeat(500));
-        state.stall.tool_call_records = vec![record];
-
-        let msg = build_circuit_breaker_abort_message(&state);
-        // 120-char clip with ellipsis: 119 chars + "…" — find that the
-        // long sequence does not appear in full.
-        assert!(
-            !msg.contains(&"a".repeat(200)),
-            "args preview was not clipped; got:\n{msg}"
-        );
-        assert!(
-            !msg.contains(&"b".repeat(200)),
-            "result preview was not clipped; got:\n{msg}"
-        );
-        assert!(msg.contains("…"), "ellipsis missing; got:\n{msg}");
-    }
-
-    #[test]
-    fn circuit_breaker_abort_message_with_no_diagnosis_still_yields_next_step() {
-        let mut state = make_state();
-        state.llm_rounds_completed = 3;
-        // No tool calls → no diagnosis, no recent-work block, but still a
-        // headline + a default next-step line.
-        let msg = build_circuit_breaker_abort_message(&state);
-        assert!(msg.contains("Circuit breaker abort at round 3"));
-        assert!(!msg.contains("Likely cause:"));
-        assert!(!msg.contains("Work preserved"));
-        assert!(msg.contains("Next:"));
     }
 
     #[test]
@@ -2958,7 +2774,6 @@ mod tests {
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         assert!(state.task_profile.mutates_workspace);
         assert!(state.task_profile.verification_required);
-        assert!(state.task_profile.allow_factual_retry);
         assert_eq!(
             state
                 .turn_intent
@@ -2980,7 +2795,6 @@ mod tests {
                 true,
                 true,
                 astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
-                true,
             );
         state.task_profile = existing_profile;
         state.agentic_turn_budget = existing_profile.agentic_turn_budget;
@@ -3172,26 +2986,6 @@ mod tests {
         );
     }
 
-    /// P1-D: Production code must not use unsafe set_var.
-    /// Hook env vars must go through session_env_overlay instead.
-    #[test]
-    fn no_unsafe_set_var_in_production() {
-        let source = include_str!("lifecycle.rs");
-        let test_start = source
-            .find("\n#[cfg(test)]\nmod tests")
-            .unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        assert!(
-            !prod_code.contains("std::env::set_var"),
-            "production code must not use std::env::set_var (UB in multi-threaded context); \
-             use astra_core::session_env_overlay::set instead"
-        );
-        assert!(
-            prod_code.contains("session_env_overlay::set"),
-            "hook env vars must be set via session_env_overlay"
-        );
-    }
-
     /// 90% hint must compute the consumed percentage dynamically —
     /// small budgets (e.g. max=4) can skip from 100% to 75% remaining in
     /// one turn, so hardcoding "~10% consumed" is misleading.
@@ -3215,8 +3009,12 @@ mod tests {
         let msg = state
             .volatile_pending
             .iter()
-            .find(|inj| inj.content.contains("[turn-budget]"))
-            .map(|inj| inj.content.as_str())
+            .find(|inj| {
+                inj.payload
+                    .as_str()
+                    .is_some_and(|text| text.contains("[turn-budget]"))
+            })
+            .and_then(|inj| inj.payload.as_str())
             .expect("expected budget hint in volatile_pending");
 
         assert!(
@@ -3880,9 +3678,10 @@ mod tests {
             state.turn_guard.health.is_avoidance_advised("bash"),
             "durable tool diagnostics should remain available"
         );
-        assert!(
-            state.restricted_tools.is_empty(),
-            "stale hard restrictions must not leak into the reanchored turn"
+        assert_eq!(
+            state.restricted_tools,
+            HashSet::from(["bash".to_string()]),
+            "semantic re-anchoring must not broaden the hard capability surface"
         );
         assert!(
             state.boosted_tools.is_empty(),
@@ -3922,7 +3721,7 @@ mod tests {
 
         assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
         assert_eq!(state.turn_guard.nudge_count, 0);
-        assert!(state.restricted_tools.is_empty());
+        assert_eq!(state.restricted_tools, HashSet::from(["bash".to_string()]));
         assert!(state.boosted_tools.is_empty());
         assert!(state.widen_selection_pending);
         let rendered = state

@@ -3259,7 +3259,9 @@ impl ToolExecutor {
         if let Some(ref cache) = self.bg_task_list_cache {
             let cached = cache.read().await;
             if !cached.is_empty() {
-                return cached.clone();
+                return self
+                    .attach_recoverable_fanouts_to_task_list(cached.clone())
+                    .await;
             }
             // Cache not yet populated (first call before the event
             // loop has rendered). Fall through to the queue path so
@@ -3267,6 +3269,9 @@ impl ToolExecutor {
         }
         // Fallback: queue path for when no cache is available
         let Some(ref bg_commands) = self.bg_task_commands else {
+            if let Some(addendum) = self.recoverable_fanout_task_list_addendum().await {
+                return Self::empty_background_task_list_with_fanouts(&addendum);
+            }
             return format_background_task_unavailable(self.cloud_base.is_some());
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3276,7 +3281,7 @@ impl ToolExecutor {
         }
         let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
         match await_bg_task_command_reply(rx, reply_timeout).await {
-            Ok(output) => output,
+            Ok(output) => self.attach_recoverable_fanouts_to_task_list(output).await,
             Err(BgTaskReplyError::Closed) => {
                 "Error: background task registry not available".to_string()
             }
@@ -3284,6 +3289,110 @@ impl ToolExecutor {
                 format_background_task_list_registry_timeout(reply_timeout)
             }
         }
+    }
+
+    async fn attach_recoverable_fanouts_to_task_list(&self, output: String) -> String {
+        let Some(addendum) = self.recoverable_fanout_task_list_addendum().await else {
+            return output;
+        };
+        if output.trim() == "<background_tasks count=\"0\" />" {
+            return Self::empty_background_task_list_with_fanouts(&addendum);
+        }
+        if let Some(close_tag) = output.rfind("</background_tasks>") {
+            let mut merged = String::with_capacity(output.len() + addendum.len() + 2);
+            merged.push_str(&output[..close_tag]);
+            merged.push('\n');
+            merged.push_str(&addendum);
+            merged.push('\n');
+            merged.push_str(&output[close_tag..]);
+            return merged;
+        }
+        format!("{output}\n{addendum}")
+    }
+
+    fn empty_background_task_list_with_fanouts(addendum: &str) -> String {
+        format!(
+            "<background_tasks count=\"0\" active_task_semantics=\"no active shell background tasks; recoverable terminal agent_fanout results may still exist\">\n{addendum}\n</background_tasks>"
+        )
+    }
+
+    async fn recoverable_fanout_task_list_addendum(&self) -> Option<String> {
+        let ctx = self.spawn_context.as_ref()?;
+        let groups: Vec<_> = ctx
+            .spawner
+            .list_fanout_groups()
+            .await
+            .into_iter()
+            .filter(|group| {
+                let summary = group.summary();
+                group.is_terminal() || summary.active > 0
+            })
+            .collect();
+        if groups.is_empty() {
+            return None;
+        }
+
+        const MAX_GROUPS_IN_TASK_LIST: usize = 8;
+        let visible_count = groups.len().min(MAX_GROUPS_IN_TASK_LIST);
+        let mut xml = format!(
+            "<agent_fanouts count=\"{}\" visible=\"{}\" semantics=\"recoverable terminal fanout results are independent from active background shell tasks\">",
+            groups.len(),
+            visible_count,
+        );
+        for group in groups.iter().take(MAX_GROUPS_IN_TASK_LIST) {
+            let summary = group.summary();
+            let status = if group.is_terminal() {
+                if summary.failed > 0 || summary.timed_out > 0 || summary.spawn_rejected > 0 {
+                    "failed"
+                } else {
+                    "completed"
+                }
+            } else if summary.active > 0 {
+                "running"
+            } else {
+                "pending"
+            };
+            let get_results_call = format!(
+                "agent_fanout(action='get_results', group_id='{}')",
+                &group.group_id
+            );
+            let task_output_call = format!("task_output(task_id='{}')", &group.group_id);
+            let instruction = format!(
+                "Recover existing results with {get_results_call} or {task_output_call}. Do not rerun solely because background_tasks count is zero."
+            );
+            xml.push_str(&format!(
+                "<agent_fanout id=\"{}\" title=\"{}\" status=\"{}\" terminal=\"{}\" active=\"{}\" completed=\"{}\" failed=\"{}\" uncollected=\"{}\" result_ref=\"{}\" get_results_call=\"{}\" task_output_call=\"{}\" instruction=\"{}\" />",
+                Self::xml_attr(&group.group_id),
+                Self::xml_attr(&group.title),
+                status,
+                group.is_terminal(),
+                summary.active,
+                summary.completed,
+                summary.failed,
+                summary.uncollected,
+                Self::xml_attr(&format!("agent_fanout:{}", &group.group_id)),
+                Self::xml_attr(&get_results_call),
+                Self::xml_attr(&task_output_call),
+                Self::xml_attr(&instruction),
+            ));
+        }
+        if groups.len() > MAX_GROUPS_IN_TASK_LIST {
+            xml.push_str(&format!(
+                "<truncated hidden=\"{}\" />",
+                groups.len() - MAX_GROUPS_IN_TASK_LIST
+            ));
+        }
+        xml.push_str("</agent_fanouts>");
+        Some(xml)
+    }
+
+    fn xml_attr(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 
     async fn task_output(&self, args: &Value) -> String {
@@ -3488,7 +3597,15 @@ impl ToolExecutor {
             "uncollected": summary.uncollected,
             "slots": slots_json,
             "slots_truncated": if truncated { Some(total_slots) } else { None },
-            "hint": "This id belongs to an agent_fanout group, not a shell background task. Use agent_fanout(action='get_results', group_id=...) for full slot results.",
+            "recovery": {
+                "result_ref": format!("agent_fanout:{}", group.group_id),
+                "task_output_id": &group.group_id,
+                "get_results_call": format!("agent_fanout(action='get_results', group_id='{}')", group.group_id),
+                "task_output_call": format!("task_output(task_id='{}')", group.group_id),
+                "active_task_list_empty_does_not_mean_results_missing": true,
+                "do_not_rerun_when_user_asks_for_results": true,
+            },
+            "hint": "This id belongs to a recoverable agent_fanout group, not a shell background task. Use agent_fanout(action='get_results', group_id=...) for full slot results.",
         })
         .to_string();
         let start = output.floor_char_boundary((offset as usize).min(output.len()));
@@ -6354,6 +6471,55 @@ mod tests {
         assert!(
             !result.contains("Background task registry did not respond"),
             "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_bg_surfaces_recoverable_fanout_results_without_background_runner() {
+        let spawner = test_spawner();
+        let ctx = fanout_test_context(spawner);
+        let executor = test_executor().with_spawn_context(ctx);
+
+        let started = executor
+            .execute(
+                "agent_fanout",
+                &serde_json::json!({
+                    "action": "start",
+                    "group_id": "review-fanout",
+                    "target_count": 1,
+                    "slots": [{
+                        "id": "review",
+                        "description": "Review one area",
+                        "prompt": "Return a short result."
+                    }]
+                }),
+            )
+            .await;
+        let started_value: serde_json::Value = serde_json::from_str(&started).unwrap();
+        assert_eq!(started_value["status"], "completed", "{started}");
+
+        let result = executor.task_list_bg().await;
+
+        assert!(result.contains("<background_tasks count=\"0\""), "{result}");
+        assert!(result.contains("<agent_fanouts count=\"1\""), "{result}");
+        assert!(result.contains("id=\"review-fanout\""), "{result}");
+        assert!(
+            result.contains(
+                "agent_fanout(action=&apos;get_results&apos;, group_id=&apos;review-fanout&apos;)"
+            ),
+            "{result}"
+        );
+        assert!(
+            result.contains("task_output(task_id=&apos;review-fanout&apos;)"),
+            "{result}"
+        );
+        assert!(
+            result.contains("Do not rerun solely because background_tasks count is zero."),
+            "{result}"
+        );
+        assert!(
+            !result.contains("Background task unavailable"),
+            "recoverable fanout results are a valid task_list surface even without a shell background runner: {result}"
         );
     }
 

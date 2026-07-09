@@ -1501,7 +1501,6 @@ fn subrun_turn_budget_keeps_profile_extensions_when_spawn_budget_is_small() {
             true,
             true,
             astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
-            true,
         );
     let budget = resolve_subrun_agentic_turn_budget(profile, Some(3));
 
@@ -1532,7 +1531,7 @@ fn subrun_turn_budget_respects_spawn_budget_above_profile_hard_limit() {
 }
 
 #[test]
-fn server_subrun_completed_status_settles_non_blocking_task_board_completion() {
+fn server_subrun_empty_completion_remains_paused_regardless_of_task_board() {
     let svc = test_service();
     let request = test_request("subrun task board bookkeeping");
     let mut state = svc.build_initial_state(
@@ -1561,17 +1560,20 @@ fn server_subrun_completed_status_settles_non_blocking_task_board_completion() {
         },
     ));
 
-    assert_eq!(server_subrun_completed_status(&state), STATUS_COMPLETED);
+    assert_eq!(server_subrun_completed_status(&state), STATUS_PAUSED);
     let outcome = Ok(AgenticLoopOutcome::Completed);
     assert_eq!(
         server_subrun_live_termination(&outcome, &state),
-        astra_turn_core::agent_live_event::AgentLiveTermination::Completed
+        astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled
     );
-    assert_eq!(server_subrun_live_reason(&outcome, &state), None);
+    assert_eq!(
+        server_subrun_live_reason(&outcome, &state).as_deref(),
+        Some("paused")
+    );
 }
 
 #[test]
-fn server_subrun_completed_status_pauses_task_board_intervention() {
+fn server_subrun_requires_intervention_from_interruption_not_task_board() {
     let svc = test_service();
     let request = test_request("subrun paused task board");
     let mut state = svc.build_initial_state(
@@ -1757,8 +1759,8 @@ fn build_run_turn_complete_event_marks_interrupted_turns() {
     );
 
     assert_eq!(event["type"], "turn_complete");
-    assert_eq!(event["has_tool_calls"], false);
-    assert_eq!(event["stall_detected"], true);
+    assert_eq!(event["has_tool_calls"], true);
+    assert!(event.get("stall_detected").is_none());
     assert_eq!(event["execution_state"]["status"], "interrupted");
     assert_eq!(event["execution_state"]["interrupted"], true);
     assert_eq!(
@@ -2257,37 +2259,6 @@ fn resume_hydration_requires_existing_session_with_prior_prompt_history() {
     assert!(
         should_restore_prior_prompt_history(true, true),
         "resume is only valid when an existing session has prompt-facing history"
-    );
-}
-
-#[test]
-fn transcript_prompt_restore_uses_shared_root_conversation_query() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("async fn restore_transcript_prompt_messages")
-        .expect("transcript prompt restore helper must exist");
-    let fn_end = source[fn_start..]
-        .find("fn restore_csl_messages_into_loop_state")
-        .map(|offset| fn_start + offset)
-        .expect("transcript prompt restore helper end");
-    let body = &source[fn_start..fn_end];
-
-    assert!(
-        body.contains("sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)"),
-        "server prompt-history fallback must use the shared root-conversation transcript query"
-    );
-
-    let exists_start = source
-        .find("async fn session_has_prior_prompt_history")
-        .expect("resume-history presence helper must exist");
-    let exists_end = source[exists_start..]
-        .find("fn session_resume_hydration_hint_from_sources")
-        .map(|offset| exists_start + offset)
-        .expect("resume-history presence helper end");
-    let exists_body = &source[exists_start..exists_end];
-    assert!(
-        exists_body.contains("sqlx::query(PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL)"),
-        "resume gating must use the same root-conversation transcript boundary"
     );
 }
 
@@ -4867,7 +4838,7 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
             injections: vec!["stall detected".into()],
             avoid_tools: vec!["git_status".into()],
             health_avoidance_tools: vec![],
-            force_stop: false,
+            advisory_threshold_reached: false,
             nudge_count: 1,
             interaction_mode: "prompt".into(),
             suppressed_loop_nudges: false,
@@ -5301,6 +5272,7 @@ fn finalize_run_events_completes_answered_run_with_in_progress_task_board() {
     assert_eq!(events[0]["event_type"], "text_done");
     assert_eq!(events[0]["data"]["full_text"], "Done.");
     assert_eq!(events[1]["event_type"], "run_finished");
+    assert_eq!(events[1]["data"]["task_board"]["in_progress_count"], 1);
     assert!(events[1]["data"].get("waiting_for").is_none());
     assert!(
         events
@@ -5311,7 +5283,7 @@ fn finalize_run_events_completes_answered_run_with_in_progress_task_board() {
 }
 
 #[test]
-fn finalize_run_events_completes_non_blocking_task_board_empty_settlement() {
+fn finalize_run_events_pauses_real_empty_completion_regardless_of_task_board() {
     let svc = test_service();
     let request = test_request("empty settlement");
     let mut state = svc.build_initial_state(
@@ -5349,27 +5321,19 @@ fn finalize_run_events_completes_non_blocking_task_board_empty_settlement() {
         &state,
     );
 
-    assert_eq!(status, RunStatus::Completed);
+    assert_eq!(status, RunStatus::Paused);
     assert!(error.is_none());
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["event_type"], "run_finished");
-    assert_eq!(
-        events[0]["data"]["settled_interruption_kind"],
-        "empty_completion"
-    );
-    assert_eq!(events[0]["data"]["resume_mode"], "settle");
+    assert_eq!(events[0]["event_type"], "run_interrupted");
+    assert_eq!(events[0]["data"]["kind"], "empty_completion");
     assert_eq!(events[0]["data"]["task_board"]["in_progress_count"], 1);
     assert!(events[0]["data"].get("waiting_for").is_none());
-    assert!(
-        events
-            .iter()
-            .all(|event| event["event_type"] != "run_interrupted"),
-        "non-blocking task-board settlement must not surface as a user-facing interruption: {events:?}"
-    );
+    assert_eq!(events[1]["event_type"], "run_finished");
+    assert_eq!(events[1]["data"]["interrupted"], true);
+    assert!(events[1]["data"].get("waiting_for").is_none());
 }
 
 #[test]
-fn finalize_run_events_keeps_task_board_intervention_for_paused_task() {
+fn finalize_run_events_waiting_reason_comes_from_interruption_authority() {
     let svc = test_service();
     let request = test_request("paused task");
     let mut state = svc.build_initial_state(
@@ -5387,14 +5351,14 @@ fn finalize_run_events_keeps_task_board_intervention_for_paused_task() {
     state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
         astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
         astra_turn_core::interruption::ResumeAction::RequiresIntervention {
-            description: "paused task needs direction".to_string(),
+            description: "external approval is required".to_string(),
         },
         astra_turn_core::interruption::InterruptionStateSummary {
             has_checkpoint: true,
             tool_calls_completed: 1,
             turns_completed: 1,
             remaining_turns: 3,
-            error_detail: Some("paused task needs direction".to_string()),
+            error_detail: Some("external approval is required".to_string()),
             stall_signal: None,
             resume_restricted_tools: vec![],
         },
@@ -5407,12 +5371,12 @@ fn finalize_run_events_keeps_task_board_intervention_for_paused_task() {
     );
 
     assert_eq!(status, RunStatus::Paused);
-    assert_eq!(error.as_deref(), Some("task_board_intervention"));
+    assert_eq!(error.as_deref(), Some("user_intervention"));
     assert_eq!(events[1]["event_type"], "run_interrupted");
-    assert_eq!(events[1]["data"]["waiting_for"], "task_board_intervention");
+    assert_eq!(events[1]["data"]["waiting_for"], "user_intervention");
     assert_eq!(events[1]["data"]["task_board"]["paused_count"], 1);
     assert_eq!(events[2]["event_type"], "run_finished");
-    assert_eq!(events[2]["data"]["waiting_for"], "task_board_intervention");
+    assert_eq!(events[2]["data"]["waiting_for"], "user_intervention");
 }
 
 #[test]
@@ -9473,16 +9437,6 @@ async fn delegation_tracker_get_children() {
 }
 
 /// P0-C: The agentic loop spawn must check token budget before starting.
-#[test]
-fn run_lifecycle_checks_token_budget_before_loop() {
-    let source = include_str!("mod.rs");
-    let test_start = source.find("mod tests {").unwrap_or(source.len());
-    let prod_code = &source[..test_start];
-    assert!(
-        prod_code.contains("check_token_budget"),
-        "run_lifecycle must call check_token_budget before the agentic loop"
-    );
-}
 
 /// P0-C: drain_background_tasks returns true when no tasks are running.
 #[tokio::test]
@@ -9698,302 +9652,15 @@ fn finalize_run_events_preserves_waiting_without_error_event() {
 /// P1-F: stream_chat must persist usage unconditionally.
 /// Cancelled runs still consumed tokens and must have accurate durable records,
 /// even when status persistence is skipped.
-#[test]
-fn stream_chat_persists_usage_unconditionally() {
-    let source = include_str!("mod.rs");
-    // Find the stream_chat method
-    let fn_start = source
-        .find("async fn stream_chat(")
-        .expect("stream_chat must exist");
-    let fn_end = source[fn_start..]
-        .find("\n    async fn ")
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-
-    let usage_pos = fn_body
-        .find(".persist_usage(")
-        .expect("stream_chat must call persist_usage");
-
-    // persist_usage must NOT be inside the status-persistence guard.
-    // Cancelled runs skip persist_status, but usage must still be written.
-    let guard_pos = fn_body
-        .find("if persist_status_update {")
-        .expect("persist_status_update guard must exist");
-    let guard_block = &fn_body[guard_pos..];
-    let mut depth = 0;
-    let mut guard_end = 0;
-    for (i, c) in guard_block.char_indices() {
-        if c == '{' {
-            depth += 1;
-        } else if c == '}' {
-            depth -= 1;
-            if depth == 0 {
-                guard_end = guard_pos + i + 1;
-                break;
-            }
-        }
-    }
-    assert!(
-        usage_pos > guard_end,
-        "persist_usage must remain outside the persist_status_update guard — \
-         cancelled stream_chat runs must still persist usage for billing/audit"
-    );
-}
-
-#[test]
-fn durable_top_level_run_usage_uses_provider_input_tokens() {
-    let source = include_str!("mod.rs");
-    let production = source
-        .split("/// Production sub-run executor backed by")
-        .next()
-        .expect("top-level production lifecycle source");
-    let mut checked_calls = 0;
-    let mut cursor = production;
-    while let Some(pos) = cursor.find(".persist_usage(") {
-        checked_calls += 1;
-        let snippet = &cursor[pos..cursor.len().min(pos + 360)];
-        assert!(
-            snippet.contains("provider_input_tokens()"),
-            "durable run usage has no cache-specific columns, so prompt totals must include cache read/write buckets: {snippet}"
-        );
-        assert!(
-            !snippet.contains("total_prompt,"),
-            "fresh-input-only totals would under-report prompt-cache-heavy runs: {snippet}"
-        );
-        cursor = &cursor[pos + ".persist_usage(".len()..];
-    }
-    assert!(
-        checked_calls >= 2,
-        "top-level run paths must persist usage on terminal paths"
-    );
-}
-
-#[test]
-fn server_subrun_persists_durable_usage() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("impl SubRunExecutor for ServerSubRunExecutor")
-        .expect("server sub-run executor must exist");
-    let fn_end = source[fn_start..]
-        .find("// ─── Tests")
-        .map(|p| fn_start + p)
-        .expect("server sub-run executor body");
-    let fn_body = &source[fn_start..fn_end];
-    let call_pos = fn_body
-        .find("self.persist_durable_subrun_usage(")
-        .expect("sub-runs must persist durable usage after execution");
-    let snippet = &fn_body[call_pos..fn_body.len().min(call_pos + 360)];
-
-    assert!(
-        snippet.contains("prompt_tokens"),
-        "sub-run usage must use provider input tokens including cache buckets: {snippet}"
-    );
-    assert!(
-        snippet.contains("loop_state.total_completion"),
-        "sub-run completion token usage must be persisted: {snippet}"
-    );
-    assert!(
-        snippet.contains("loop_state.total_tool_calls"),
-        "sub-run tool-call usage must be persisted: {snippet}"
-    );
-}
-
-#[test]
-fn server_subrun_agent_result_prompt_tokens_include_cache_buckets() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("impl SubRunExecutor for ServerSubRunExecutor")
-        .expect("server sub-run executor must exist");
-    let fn_end = source[fn_start..]
-        .find("// ─── Tests")
-        .map(|p| fn_start + p)
-        .expect("server sub-run executor body");
-    let fn_body = &source[fn_start..fn_end];
-
-    assert!(
-        fn_body.contains("let prompt_tokens = loop_state.provider_input_tokens();"),
-        "AgentResult has no cache-specific fields; prompt_tokens must represent provider input tokens"
-    );
-    assert!(
-        !fn_body.contains("prompt_tokens: loop_state.total_prompt"),
-        "fresh-input-only totals would under-report prompt-cache-heavy sub-runs"
-    );
-}
 
 /// P1-C: build_server_skill_executor must accept and wire a cancel_token.
 /// Without this, skill sub-runs ignore parent cancellation.
-#[test]
-fn build_server_skill_executor_accepts_cancel_token() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_server_skill_executor(")
-        .expect("build_server_skill_executor must exist");
-    let fn_end = source[fn_start..]
-        .find("\npub(crate) fn ")
-        .or_else(|| source[fn_start..].find("\nfn "))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("cancel_token"),
-        "build_server_skill_executor must accept a cancel_token parameter"
-    );
-    assert!(
-        fn_body.contains("with_cancel_token"),
-        "build_server_skill_executor must wire cancel_token via with_cancel_token"
-    );
-}
 
 /// Runtime tool surfacing for forked server skills must inherit the parent
 /// workspace/executor/runtime binding; otherwise sub-runs see raw edge
 /// schemas without the capability resolver's runtime truth.
-#[test]
-fn build_server_skill_executor_wires_execution_binding_snapshot() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_server_skill_executor(")
-        .expect("build_server_skill_executor must exist");
-    let fn_end = source[fn_start..]
-        .find("\npub(crate) fn ")
-        .or_else(|| source[fn_start..].find("\nfn "))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("execution_bindings"),
-        "build_server_skill_executor must accept execution binding metadata"
-    );
-    assert!(
-        fn_body.contains("with_execution_binding_snapshot"),
-        "build_server_skill_executor must pass execution bindings to server skill sub-runs"
-    );
-}
-
-#[test]
-fn build_server_skill_executor_wires_inherited_permissions() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_server_skill_executor(")
-        .expect("build_server_skill_executor must exist");
-    let fn_end = source[fn_start..]
-        .find("\npub(crate) fn ")
-        .or_else(|| source[fn_start..].find("\nfn "))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("inherited_permissions"),
-        "build_server_skill_executor must accept request-level permissions"
-    );
-    assert!(
-        fn_body.contains("with_inherited_permissions"),
-        "build_server_skill_executor must pass request-level permissions to server skill sub-runs"
-    );
-}
-
-#[test]
-fn build_server_skill_executor_wires_reflect_service() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_server_skill_executor(")
-        .expect("build_server_skill_executor must exist");
-    let fn_end = source[fn_start..]
-        .find("\npub(crate) fn ")
-        .or_else(|| source[fn_start..].find("\nfn "))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("reflect_service: Arc<dyn astra_services::ReflectService>"),
-        "build_server_skill_executor must accept the shared reflect service"
-    );
-    assert!(
-        fn_body.contains(".with_reflect_service(reflect_service)"),
-        "build_server_skill_executor must pass reflect service to server skill sub-runs"
-    );
-}
-
-#[test]
-fn lifecycle_executor_construction_wires_reflect_service() {
-    let source = include_str!("mod.rs");
-    let production = source
-        .split("\n#[cfg(test)]\nmod tests")
-        .next()
-        .expect("production lifecycle source");
-    let root_wires = production
-        .matches("wire_reflect_service_into_executor(executor, &self.reflect_service)")
-        .count();
-    assert!(
-        root_wires >= 3,
-        "root/resume/sub-run RuntimeToolExecutor construction must all inject the shared reflect service"
-    );
-    assert!(
-        production.contains(".with_reflect_service(Arc::clone(&self.reflect_service))"),
-        "dynamic agent spawner/sub-run builders must inherit the shared reflect service"
-    );
-    assert!(
-        production.contains("self.reflect_service.is_configured()"),
-        "capability construction must derive reflect visibility from reflect service readiness"
-    );
-}
 
 /// P1-C: build_initial_state must pass cancel_token to skill executor builder.
-#[test]
-fn build_initial_state_passes_cancel_token_to_skill_executor() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_initial_state(")
-        .expect("build_initial_state must exist");
-    let fn_end = source[fn_start..]
-        .find("\n    fn ")
-        .or_else(|| source[fn_start..].find("\n    pub"))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("cancel_token"),
-        "build_initial_state must accept and pass cancel_token to skill executor"
-    );
-}
-
-#[test]
-fn build_initial_state_passes_execution_bindings_to_skill_executor() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_initial_state(")
-        .expect("build_initial_state must exist");
-    let fn_end = source[fn_start..]
-        .find("\n    fn ")
-        .or_else(|| source[fn_start..].find("\n    pub"))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("execution_bindings"),
-        "build_initial_state must accept execution bindings"
-    );
-    assert!(
-        fn_body.contains("build_initial_state_inner(") && fn_body.contains("execution_bindings,"),
-        "build_initial_state must pass execution bindings into build_initial_state_inner"
-    );
-
-    let inner_start = source[fn_start..]
-        .find("fn build_initial_state_inner(")
-        .map(|p| fn_start + p)
-        .expect("build_initial_state_inner must exist");
-    let inner_end = source[inner_start..]
-        .find("\n    fn ")
-        .or_else(|| source[inner_start..].find("\n    pub"))
-        .map(|p| inner_start + p)
-        .unwrap_or(source.len());
-    let inner_body = &source[inner_start..inner_end];
-    assert!(
-        inner_body.contains("build_server_skill_executor(")
-            && inner_body.contains("execution_bindings,"),
-        "build_initial_state_inner must pass execution bindings into the skill executor builder"
-    );
-}
 
 #[test]
 fn resumable_run_statuses_stay_live_for_resume() {

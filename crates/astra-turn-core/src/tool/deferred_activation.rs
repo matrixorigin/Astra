@@ -428,15 +428,17 @@ where
 }
 
 /// Message returned when a direct deferred call is treated as an activation
-/// intent and the runtime asks the model to retry after schema injection.
+/// intent. The message is deliberately non-immediate: the failed direct call
+/// must not become a same-batch retry loop while the schema is still absent.
 #[must_use]
 pub fn direct_deferred_call_activation_message(name: &str) -> String {
     format!(
-        "Tool '{name}' requires `tool_search` activation first. Call \
-         `tool_search(query=\"select:{name}\")` to fetch its schema, then \
-         retry `{name}` after the schema appears in `tools[]`. The direct \
-         call was not executed; retry on the next model request in this turn \
-         after the full schema is available."
+        "Tool '{name}' is deferred and is not currently present in `tools[]`. \
+         If `tool_search` is available, call `tool_search(query=\"select:{name}\")` \
+         once to request activation. The direct call was not executed and its \
+         arguments were ignored. Do not call `{name}` again in the same \
+         tool-call batch; only invoke it after a later model request shows \
+         `{name}` in `tools[]`."
     )
 }
 
@@ -818,8 +820,16 @@ mod tests {
             "message must state the args were not executed"
         );
         assert!(
-            msg.contains("next model request in this turn"),
-            "message must point to the next model request for the full schema"
+            msg.contains("arguments were ignored"),
+            "message must state direct-call args are not reused"
+        );
+        assert!(
+            msg.contains("Do not call `run_script` again in the same tool-call batch"),
+            "message must prevent same-batch retry loops"
+        );
+        assert!(
+            msg.contains("later model request"),
+            "message must require a later request with the full schema"
         );
     }
 

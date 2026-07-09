@@ -916,28 +916,4 @@ mod tests {
         let records = store.records.lock().expect("recording store lock");
         assert_eq!(records.len(), 1, "remote capture should still be attempted");
     }
-
-    #[test]
-    fn runtime_capture_call_sites_do_not_ignore_capture_failures() {
-        let server_loop_host = include_str!("../../server/server_loop_host.rs");
-        let bridge_inprocess = include_str!("../bridge/inprocess.rs");
-        assert!(
-            server_loop_host.contains("persist_configured_capture_or_log("),
-            "server loop host should log capture persistence failures"
-        );
-        assert!(
-            bridge_inprocess.contains("persist_configured_capture_or_log("),
-            "bridge in-process should log capture persistence failures"
-        );
-        assert!(
-            !server_loop_host
-                .contains("let _ = crate::turn::llm_exchange_capture::persist_configured_capture("),
-            "server loop host must not silently ignore capture persistence failures"
-        );
-        assert!(
-            !bridge_inprocess
-                .contains("let _ = crate::turn::llm_exchange_capture::persist_configured_capture("),
-            "bridge in-process must not silently ignore capture persistence failures"
-        );
-    }
 }

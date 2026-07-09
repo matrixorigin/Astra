@@ -6,17 +6,16 @@ use std::collections::{BTreeSet, HashSet};
 use serde_json::Value;
 
 use crate::stall::{
-    CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP, detect_cli_tool_sig_stall,
+    CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD, detect_cli_tool_sig_stall,
     round_tool_call_sig_and_names, trailing_identical_sig_depth,
 };
 use crate::turn_guard::TurnGuard;
 
 /// Event kind written into `stall_events` when a turn emits the same
-/// tool-call signature set on `CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP`
-/// consecutive rounds. The loop dispatcher reads this to short-circuit
-/// the turn with a clear interruption reason instead of letting token
-/// budget blow.
-pub const FORCE_STOP_CONSECUTIVE_EVENT: &str = "force_stop_consecutive";
+/// tool-call signature set on `CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD`
+/// consecutive rounds. The runtime exposes it as advisory evidence; it has no
+/// authority to terminate the turn.
+pub const REPETITION_THRESHOLD_EVENT: &str = "repetition_threshold";
 
 #[derive(Debug)]
 pub struct CliAgenticStallPreflightRequest<'a> {
@@ -52,20 +51,18 @@ pub fn apply_cli_agentic_stall_preflight(ctx: CliAgenticStallPreflightRequest<'_
         stall_events.push(("sig_stall".to_string(), turn_index));
     }
 
-    // Hard-stop escalation: soft nudges max out at 3 per turn but the LLM
-    // may still produce the same tool-call signature round after round
-    // (session 05e63cac t10 observed 4 consecutive identical `cargo
-    // clippy` calls despite nudges). Past a higher threshold, emit a
-    // `force_stop_consecutive` event so the dispatcher can terminate the
-    // turn cleanly instead of running until `token_budget_exceeded`.
-    if trailing_identical_sig_depth(turn_sigs) >= CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP {
+    // Repetition evidence: exact tool signatures may still repeat after soft
+    // nudges. Record the threshold crossing once, but leave the decision to
+    // continue or change approach to the model. Real token/round ceilings are
+    // enforced independently by the budget layer.
+    if trailing_identical_sig_depth(turn_sigs) >= CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD {
         // Dedup — we only need the event once per turn so downstream
         // reads don't see a cascade.
         let already = stall_events
             .iter()
-            .any(|(name, _)| name == FORCE_STOP_CONSECUTIVE_EVENT);
+            .any(|(name, _)| name == REPETITION_THRESHOLD_EVENT);
         if !already {
-            stall_events.push((FORCE_STOP_CONSECUTIVE_EVENT.to_string(), turn_index));
+            stall_events.push((REPETITION_THRESHOLD_EVENT.to_string(), turn_index));
         }
     }
 }
@@ -122,11 +119,10 @@ mod tests {
 
     /// Session 05e63cac t10 regression: 4 consecutive `cargo clippy`
     /// tripped only a single nudge and the LLM kept going. With the new
-    /// hard-stop threshold, 5 consecutive identical sigs must emit a
-    /// `force_stop_consecutive` event the dispatcher can consume to
-    /// terminate the turn cleanly.
+    /// advisory threshold, 5 consecutive identical signatures emit one
+    /// `repetition_threshold` evidence event.
     #[test]
-    fn force_stop_consecutive_on_five_identical_rounds() {
+    fn repetition_threshold_on_five_identical_rounds() {
         let tc = serde_json::json!({
             "name": "bash",
             "arguments": {"command": "cargo clippy"}
@@ -145,21 +141,20 @@ mod tests {
                 turn_guard: &mut turn_guard,
             });
         }
-        let force_stop_count = stall_events
+        let advisory_count = stall_events
             .iter()
-            .filter(|(name, _)| name == FORCE_STOP_CONSECUTIVE_EVENT)
+            .filter(|(name, _)| name == REPETITION_THRESHOLD_EVENT)
             .count();
         assert_eq!(
-            force_stop_count, 1,
-            "expected exactly one force_stop_consecutive event after 5 identical \
+            advisory_count, 1,
+            "expected exactly one repetition_threshold event after 5 identical \
              rounds, got {stall_events:?}",
         );
     }
 
-    /// Four consecutive identical rounds must NOT force_stop (it's the
-    /// nudge zone; only the fifth crosses the hard-block line).
+    /// Four consecutive identical rounds stay below the advisory threshold.
     #[test]
-    fn four_identical_rounds_does_not_force_stop() {
+    fn four_identical_rounds_stay_below_advisory_threshold() {
         let tc = serde_json::json!({
             "name": "bash",
             "arguments": {"command": "cargo clippy"}
@@ -181,8 +176,8 @@ mod tests {
         assert!(
             !stall_events
                 .iter()
-                .any(|(name, _)| name == FORCE_STOP_CONSECUTIVE_EVENT),
-            "4 identical rounds must stay in the nudge zone (no force_stop yet); \
+                .any(|(name, _)| name == REPETITION_THRESHOLD_EVENT),
+            "4 identical rounds must stay below the advisory threshold; \
              got {stall_events:?}",
         );
     }
@@ -190,7 +185,7 @@ mod tests {
     /// Identical sigs must be CONSECUTIVE to hit the threshold: breaking
     /// the streak with a different call resets the counter.
     #[test]
-    fn non_consecutive_identicals_do_not_force_stop() {
+    fn non_consecutive_identicals_do_not_emit_threshold_event() {
         let a = serde_json::json!({"name":"bash","arguments":{"command":"ls"}});
         let b = serde_json::json!({"name":"bash","arguments":{"command":"pwd"}});
         let mut turn_sigs = Vec::new();
@@ -211,15 +206,15 @@ mod tests {
         assert!(
             !stall_events
                 .iter()
-                .any(|(name, _)| name == FORCE_STOP_CONSECUTIVE_EVENT),
+                .any(|(name, _)| name == REPETITION_THRESHOLD_EVENT),
             "streak must reset when a different call breaks it; got {stall_events:?}",
         );
     }
 
     /// Once emitted, the event dedupes — we don't want a cascade of
-    /// force_stop_consecutive entries as the streak continues.
+    /// repetition_threshold entries as the streak continues.
     #[test]
-    fn force_stop_consecutive_event_deduped_across_extra_rounds() {
+    fn repetition_threshold_event_deduped_across_extra_rounds() {
         let tc = serde_json::json!({"name":"bash","arguments":{}});
         let mut turn_sigs = Vec::new();
         let mut turn_tool_names = Vec::new();
@@ -237,7 +232,7 @@ mod tests {
         }
         let count = stall_events
             .iter()
-            .filter(|(name, _)| name == FORCE_STOP_CONSECUTIVE_EVENT)
+            .filter(|(name, _)| name == REPETITION_THRESHOLD_EVENT)
             .count();
         assert_eq!(count, 1, "dedup expected; got {stall_events:?}");
     }

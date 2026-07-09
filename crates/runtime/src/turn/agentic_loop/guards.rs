@@ -16,12 +16,15 @@
 //!    `execute_turn_and_ingest_phase`.
 
 use super::execution_phase::{
-    cache_waste_corrective_message, cache_wasteful_tools, parallel_batching_force_message,
-    redundant_reads_corrective_message, should_force_parallel_batching,
-    should_inject_cache_waste_corrective, should_inject_redundant_reads_corrective,
+    cache_waste_advisory_message, cache_wasteful_tools, parallel_batching_advisory_message,
+    redundant_reads_advisory_message, should_emit_cache_waste_advisory,
+    should_emit_parallel_batching_advisory,
 };
 use super::host::{AgenticLoopState, VolatileKind};
-use astra_turn_core::evaluation::count_redundant_overlapping_reads;
+use astra_turn_core::evaluation::{
+    OnlineProgressDecision, OnlineProgressPolicy, OnlineProgressSignals,
+    count_redundant_overlapping_reads, decide_online_progress,
+};
 use astra_turn_core::headless::body_preview::HeadlessStderrStyle;
 
 // ── Pipeline types ─────────────────────────────────────────────────────
@@ -31,20 +34,13 @@ use astra_turn_core::headless::body_preview::HeadlessStderrStyle;
 pub(crate) enum GuardOutcome {
     /// Guard did not fire; continue to next guard.
     Pass,
-    /// Guard fired: push this message as a volatile correction, optionally
+    /// Guard fired: push this signal as volatile advisory evidence, optionally
     /// emit `hint` as a yellow stderr line.
-    Correct {
+    Advisory {
         message: String,
         kind: VolatileKind,
         hint: Option<String>,
     },
-    /// Guard triggered a loop abort; stop the turn immediately.
-    /// Used when a guard detects an unrecoverable loop pattern (e.g.
-    /// corrective streak exceeded the hard abort threshold). The pipeline
-    /// converts this into an `InterruptionKind::GuardAbort` so resume UIs
-    /// surface the reason instead of an opaque empty completion.
-    #[allow(dead_code)]
-    Abort { reason: String },
 }
 
 /// Shared configuration for all guards in a turn.
@@ -65,28 +61,31 @@ type GuardFn = fn(&mut AgenticLoopState, &GuardConfig) -> GuardOutcome;
 /// (e.g. redundant_reads defers to round_budget_phase1).
 pub(crate) fn default_guards() -> Vec<(&'static str, GuardFn)> {
     vec![
-        ("parallel_batching_force", check_parallel_batching_force),
+        (
+            "parallel_batching_advisory",
+            check_parallel_batching_advisory,
+        ),
         ("redundant_reads", check_redundant_reads),
         ("cache_waste", check_cache_waste),
     ]
 }
 
-/// Run all registered guards. Returns collected corrections (each carrying
-/// an optional stderr hint) or an abort reason.
+/// Run all registered guards. Returns collected operator-facing hints, each carrying
+/// an optional stderr hint.
 /// All guards are skipped when `cfg.suppress_nudges` is true.
 pub(crate) fn evaluate_guards(
     guards: &[(&str, GuardFn)],
     state: &mut AgenticLoopState,
     cfg: &GuardConfig,
-) -> Result<Vec<(HeadlessStderrStyle, String)>, String> {
+) -> Vec<(HeadlessStderrStyle, String)> {
     if cfg.suppress_nudges {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    let mut corrections = Vec::new();
+    let mut hints = Vec::new();
     for (name, guard_fn) in guards {
         match guard_fn(state, cfg) {
             GuardOutcome::Pass => {}
-            GuardOutcome::Correct {
+            GuardOutcome::Advisory {
                 message,
                 kind,
                 hint,
@@ -99,72 +98,87 @@ pub(crate) fn evaluate_guards(
                     "guard fired"
                 );
                 if let Some(hint_text) = hint {
-                    corrections.push((HeadlessStderrStyle::Yellow, hint_text));
+                    hints.push((HeadlessStderrStyle::Yellow, hint_text));
                 }
             }
-            GuardOutcome::Abort { reason } => return Err(reason),
         }
     }
-    Ok(corrections)
+    hints
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Individual guard implementations
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Force parallel batching when the model has produced a long streak of
+/// Surface batching evidence when the model has produced a long streak of
 /// single-tool rounds despite prompt-layer guidance. Catches the
 /// "exploratory churn" failure mode (sessions 6566d6a8, bbae8641, 6da9cf8f).
-fn check_parallel_batching_force(state: &mut AgenticLoopState, cfg: &GuardConfig) -> GuardOutcome {
-    if state.stall.forced_parallel_batching
-        || !should_force_parallel_batching(state, cfg.parallel_batching_force_streak)
+fn check_parallel_batching_advisory(
+    state: &mut AgenticLoopState,
+    cfg: &GuardConfig,
+) -> GuardOutcome {
+    if state.stall.parallel_batching_advisory_emitted
+        || !should_emit_parallel_batching_advisory(state, cfg.parallel_batching_force_streak)
     {
         return GuardOutcome::Pass;
     }
-    state.stall.forced_parallel_batching = true;
+    state.stall.parallel_batching_advisory_emitted = true;
     let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-    let msg = parallel_batching_force_message(streak, &state.message);
+    let msg = parallel_batching_advisory_message(streak, &state.message);
     tracing::warn!(
         target: "astra::loop_guard",
-        tier = "parallel_batching_force",
+        tier = "parallel_batching_advisory",
         streak,
         round = state.llm_rounds_completed,
-        "loop guard fired"
+        "behavior advisory observed"
     );
-    GuardOutcome::Correct {
+    GuardOutcome::Advisory {
         message: msg,
-        kind: VolatileKind::Corrective,
+        kind: VolatileKind::BehaviorAdvisory,
         hint: None,
     }
 }
 
 /// Detect redundant read-only tool calls (repeated `read_file`/`grep` on
-/// the same paths without intervening edits) and inject a corrective nudge.
+/// the same paths without intervening edits) and surface advisory evidence.
 ///
 /// Defers when a stronger intervention is already active for this round
 /// (budget phase-1, completion soft-stop, exploration-family phase-2) so we
-/// don't stack two correction messages on top of each other.
+/// don't stack two advisory messages on top of each other.
 fn check_redundant_reads(state: &mut AgenticLoopState, cfg: &GuardConfig) -> GuardOutcome {
-    if state.stall.hard_intervention_active()
-        || state.stall.forced_redundant_reads_corrective
-        || !should_inject_redundant_reads_corrective(state, cfg.redundant_reads_threshold)
-    {
-        return GuardOutcome::Pass;
-    }
     let count = count_redundant_overlapping_reads(&state.stall.tool_call_records);
-    state.stall.forced_redundant_reads_corrective = true;
-    let msg = redundant_reads_corrective_message(count, &state.message);
+    let decision = decide_online_progress(
+        OnlineProgressSignals {
+            tool_calls: state.stall.tool_call_records.len(),
+            redundant_overlapping_reads: count,
+            stronger_advisory_emitted: state.stall.stronger_advisory_emitted(),
+            advisory_already_emitted: state.stall.redundant_reads_advisory_emitted,
+        },
+        OnlineProgressPolicy {
+            redundant_overlapping_reads_threshold: cfg.redundant_reads_threshold,
+            ..OnlineProgressPolicy::default()
+        },
+    );
+    let OnlineProgressDecision::ReuseKnownContext {
+        redundant_overlapping_reads: count,
+    } = decision
+    else {
+        return GuardOutcome::Pass;
+    };
+
+    state.stall.redundant_reads_advisory_emitted = true;
+    let msg = redundant_reads_advisory_message(count, &state.message);
     tracing::warn!(
         target: "astra::loop_guard",
-        tier = "redundant_reads_corrective",
+        tier = "redundant_reads_advisory",
         count = count,
         threshold = cfg.redundant_reads_threshold,
         round = state.llm_rounds_completed,
-        "loop guard fired"
+        "behavior advisory observed"
     );
-    GuardOutcome::Correct {
+    GuardOutcome::Advisory {
         message: msg,
-        kind: VolatileKind::Corrective,
+        kind: VolatileKind::BehaviorAdvisory,
         hint: Some(format!(
             "↻ {count} redundant overlapping reads; nudging model to use existing context…"
         )),
@@ -172,15 +186,15 @@ fn check_redundant_reads(state: &mut AgenticLoopState, cfg: &GuardConfig) -> Gua
 }
 
 /// Detect wasteful cache reads (repeated reads hitting the stale-cache
-/// guard without follow-up writes) and inject a corrective nudge.
+/// guard without follow-up writes) and surface advisory evidence.
 ///
 /// Defers to redundant_reads when both would fire on the same round, and
 /// to the same stronger interventions as `check_redundant_reads`.
 fn check_cache_waste(state: &mut AgenticLoopState, cfg: &GuardConfig) -> GuardOutcome {
-    if state.stall.hard_intervention_active()
-        || state.stall.forced_redundant_reads_corrective
-        || state.stall.forced_cache_waste_corrective
-        || !should_inject_cache_waste_corrective(state, cfg.cache_waste_threshold)
+    if state.stall.stronger_advisory_emitted()
+        || state.stall.redundant_reads_advisory_emitted
+        || state.stall.cache_waste_advisory_emitted
+        || !should_emit_cache_waste_advisory(state, cfg.cache_waste_threshold)
     {
         return GuardOutcome::Pass;
     }
@@ -188,26 +202,26 @@ fn check_cache_waste(state: &mut AgenticLoopState, cfg: &GuardConfig) -> GuardOu
     if wasteful.is_empty() {
         return GuardOutcome::Pass;
     }
-    state.stall.forced_cache_waste_corrective = true;
-    let msg = cache_waste_corrective_message(&wasteful, &state.message);
+    state.stall.cache_waste_advisory_emitted = true;
+    let msg = cache_waste_advisory_message(&wasteful, &state.message);
     tracing::warn!(
         target: "astra::loop_guard",
-        tier = "cache_waste_corrective",
+        tier = "cache_waste_advisory",
         round = state.llm_rounds_completed,
         tools = ?wasteful,
         threshold = cfg.cache_waste_threshold,
-        "loop guard fired"
+        "behavior advisory observed"
     );
     let tool_list = wasteful
         .iter()
         .map(|(tool, count)| format!("{tool} ({count}x)"))
         .collect::<Vec<_>>()
         .join(", ");
-    GuardOutcome::Correct {
+    GuardOutcome::Advisory {
         message: msg,
-        kind: VolatileKind::Corrective,
+        kind: VolatileKind::BehaviorAdvisory,
         hint: Some(format!(
-            "↻ repeated cached tool calls on [{tool_list}]; forcing reuse corrective…"
+            "↻ repeated cached tool calls on [{tool_list}]; adding reuse advisory…"
         )),
     }
 }

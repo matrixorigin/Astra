@@ -1255,6 +1255,37 @@ fn sync_in_memory_execution_slot(
     }
 }
 
+fn reconcile_in_memory_execution_slot_for_session(
+    slots: &mut std::collections::HashMap<(String, String), String>,
+    runs: &std::collections::HashMap<String, DurableRunRecord>,
+    user_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let key = (user_id.to_string(), session_id.to_string());
+    let mut owner: Option<&str> = None;
+    for run in runs.values().filter(|run| {
+        run.user_id == user_id
+            && run.session_id == session_id
+            && run_record_owns_session_execution_slot(run)
+            && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
+    }) {
+        if let Some(existing) = owner {
+            return Err(format!(
+                "in-memory session execution invariant violated: session {session_id} has multiple blocking root runs ({existing}, {})",
+                run.run_id
+            ));
+        }
+        owner = Some(run.run_id.as_str());
+    }
+
+    if let Some(owner) = owner {
+        slots.insert(key, owner.to_string());
+    } else {
+        slots.remove(&key);
+    }
+    Ok(())
+}
+
 fn apply_in_memory_status_transition(
     slots: &mut std::collections::HashMap<(String, String), String>,
     run: &mut DurableRunRecord,
@@ -1293,51 +1324,6 @@ fn session_execution_slot_owner_reclaimable(
             | DurableRunStatusKind::Waiting
     ) && owner_lease_expired
         && slot_is_stale
-}
-
-fn in_memory_session_execution_slot_drift(
-    slots: &std::collections::HashMap<(String, String), String>,
-    runs: &std::collections::HashMap<String, DurableRunRecord>,
-    user_id: &str,
-    session_id: &str,
-) -> Option<String> {
-    let key = (user_id.to_string(), session_id.to_string());
-    let slot_owner = slots.get(&key);
-    for run in runs.values().filter(|run| {
-        run.user_id == user_id
-            && run.session_id == session_id
-            && run_record_owns_session_execution_slot(run)
-            && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
-    }) {
-        match slot_owner {
-            Some(owner) if owner == &run.run_id => {}
-            Some(owner) => {
-                return Some(format!(
-                    "in-memory session execution slot drift: slot owner {owner} conflicts with blocking run {}",
-                    run.run_id
-                ));
-            }
-            None => {
-                return Some(format!(
-                    "in-memory session execution slot drift: missing slot for blocking run {}",
-                    run.run_id
-                ));
-            }
-        }
-    }
-    if let Some(owner) = slot_owner
-        && !runs.get(owner).is_some_and(|run| {
-            run.user_id == user_id
-                && run.session_id == session_id
-                && run_record_owns_session_execution_slot(run)
-                && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
-        })
-    {
-        return Some(format!(
-            "in-memory session execution slot drift: stale slot owner {owner}"
-        ));
-    }
-    None
 }
 
 fn checkpoint_metadata(
@@ -1517,6 +1503,12 @@ impl RunStateStore for InMemoryRunStateStore {
         let mut slots = self.execution_slots.write().await;
         let mut runs = self.runs.write().await;
         let run_id = record.run_id.clone();
+        reconcile_in_memory_execution_slot_for_session(
+            &mut slots,
+            &runs,
+            &record.user_id,
+            &record.session_id,
+        )?;
         sync_in_memory_execution_slot(
             &mut slots,
             &record,
@@ -1585,6 +1577,16 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get(run_id)
+                && run.user_id == user_id
+            {
+                reconcile_in_memory_execution_slot_for_session(
+                    &mut slots,
+                    &runs,
+                    user_id,
+                    &run.session_id,
+                )?;
+            }
             if let Some(run) = runs.get_mut(run_id) {
                 if run.user_id != user_id {
                     None
@@ -1627,6 +1629,16 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get(run_id)
+                && run.user_id == user_id
+            {
+                reconcile_in_memory_execution_slot_for_session(
+                    &mut slots,
+                    &runs,
+                    user_id,
+                    &run.session_id,
+                )?;
+            }
             if let Some(run) = runs.get_mut(run_id) {
                 if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
                     None
@@ -1675,6 +1687,16 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get(run_id)
+                && run.user_id == user_id
+            {
+                reconcile_in_memory_execution_slot_for_session(
+                    &mut slots,
+                    &runs,
+                    user_id,
+                    &run.session_id,
+                )?;
+            }
             if let Some(run) = runs.get_mut(run_id) {
                 if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
                     None
@@ -1730,11 +1752,7 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
-            if let Some(error) =
-                in_memory_session_execution_slot_drift(&slots, &runs, user_id, session_id)
-            {
-                return Err(error);
-            }
+            reconcile_in_memory_execution_slot_for_session(&mut slots, &runs, user_id, session_id)?;
             let slot_key = (user_id.to_string(), session_id.to_string());
             if slots
                 .get(&slot_key)
@@ -1793,6 +1811,16 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get(run_id)
+                && run.user_id == user_id
+            {
+                reconcile_in_memory_execution_slot_for_session(
+                    &mut slots,
+                    &runs,
+                    user_id,
+                    &run.session_id,
+                )?;
+            }
             if let Some(run) = runs.get_mut(run_id) {
                 if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
                     None
@@ -2718,6 +2746,31 @@ impl DatabaseRunStateStore {
         row.map(run_record_from_row).transpose()
     }
 
+    /// Transaction-scoped variant of [`load_run_metadata_for_user`].
+    ///
+    /// Loads run metadata inside an already-open transaction so the slot
+    /// ownership check in [`sync_session_execution_slot_after_status_tx`]
+    /// sees the same `agent_id` row version that the status UPDATE acts on.
+    /// This closes the TOCTOU window where a concurrent agent_id flip could
+    /// cause the slot logic to act on stale ownership.
+    async fn load_run_metadata_for_user_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<Option<DurableRunRecord>> {
+        let sql = format!(
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ? FOR UPDATE"
+        );
+        let row = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(run_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| db_error("load_run_metadata_for_user_tx", run_id, source))?;
+        row.map(run_record_from_row).transpose()
+    }
+
     async fn load_run_projection_metadata_for_user(
         &self,
         user_id: &str,
@@ -3169,26 +3222,6 @@ impl DatabaseRunStateStore {
 
         match builder.build().execute(self.pool.get()).await {
             Ok(_) => {}
-            Err(sqlx::Error::Database(db_err)) => {
-                // MySQL error 1062 / SQLSTATE 23000 = duplicate key.
-                // INSERT IGNORE should prevent this, but if a UNIQUE constraint
-                // fires anyway (e.g. on a non-idempotency-key column), propagate.
-                if db_err.code() == Some(std::borrow::Cow::Borrowed("23000"))
-                    && db_err.message().contains("idempotency_key")
-                {
-                    tracing::warn!(
-                        target: "astra_services::runs",
-                        run_id = %run_id,
-                        "Idempotency key conflict in batch insert, skipping"
-                    );
-                } else {
-                    return Err(db_error(
-                        "insert_run_events_batch",
-                        run_id,
-                        sqlx::Error::Database(db_err),
-                    ));
-                }
-            }
             Err(source) => {
                 return Err(db_error("insert_run_events_batch", run_id, source));
             }
@@ -3453,18 +3486,24 @@ impl RunStateStore for DatabaseRunStateStore {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
-        let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(false);
-        };
         let terminal_error_code = terminal_error_code_from_message(status, error_message);
         let mut tx =
             self.pool.get().begin().await.map_err(|source| {
                 db_error("update_run_status_begin", run_id, source).to_string()
             })?;
+        // Load run metadata inside the transaction so the slot ownership
+        // check sees the same row version as the UPDATE, closing the TOCTOU
+        // window where a concurrent agent_id flip could misattribute the slot.
+        let Some(run) = self
+            .load_run_metadata_for_user_tx(&mut tx, user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            tx.rollback().await.map_err(|source| {
+                db_error("update_run_status_rollback_missing", run_id, source).to_string()
+            })?;
+            return Ok(false);
+        };
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
         query.push_bind(status);
         query.push(", waiting_for = ");
@@ -3532,16 +3571,27 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
-        let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(false);
-        };
         let mut tx = self.pool.get().begin().await.map_err(|source| {
             db_error("update_run_status_if_current_begin", run_id, source).to_string()
         })?;
+        // Load run metadata inside the transaction so the slot ownership
+        // check sees the same row version as the UPDATE, closing the TOCTOU
+        // window where a concurrent agent_id flip could misattribute the slot.
+        let Some(run) = self
+            .load_run_metadata_for_user_tx(&mut tx, user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "update_run_status_if_current_rollback_missing",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(false);
+        };
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
         query.push_bind(status);
         query.push(", waiting_for = ");
@@ -3625,13 +3675,6 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
-        let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(false);
-        };
         let terminal_error_code = terminal_error_code_from_transition(
             status,
             error_message,
@@ -3642,17 +3685,10 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("transition_run_status_with_event_begin", run_id, source).to_string()
         })?;
 
-        let Some(row) = sqlx::query(
-            "SELECT session_id, agent_id, last_event_idx
-             FROM agent_runs WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error("transition_run_status_with_event_load_run", run_id, source).to_string()
-        })?
+        let Some(run) = self
+            .load_run_metadata_for_user_tx(&mut tx, user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
         else {
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -3664,31 +3700,9 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         };
-
-        let session_id: String = row.try_get("session_id").map_err(|source| {
-            db_error(
-                "transition_run_status_with_event_decode_session",
-                run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        let agent_id: Option<String> = row.try_get("agent_id").map_err(|source| {
-            db_error(
-                "transition_run_status_with_event_decode_agent",
-                run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        let last_event_idx: i64 = row.try_get("last_event_idx").map_err(|source| {
-            db_error(
-                "transition_run_status_with_event_decode_last_event_idx",
-                run_id,
-                source,
-            )
-            .to_string()
-        })?;
+        let session_id = run.session_id.clone();
+        let agent_id = run.agent_id.clone();
+        let last_event_idx = run.last_event_idx;
         let event_idx = last_event_idx + 1;
 
         let event_row = match build_run_event_insert_row(
@@ -3856,8 +3870,9 @@ impl RunStateStore for DatabaseRunStateStore {
             .to_string()
         })?;
 
-        let load_sql =
-            format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ?");
+        let load_sql = format!(
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = ? AND run_id = ? FOR UPDATE"
+        );
         let Some(row) = sqlx::query(&load_sql)
             .bind(user_id)
             .bind(run_id)
@@ -4058,13 +4073,6 @@ impl RunStateStore for DatabaseRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
-        let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(false);
-        };
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
 
@@ -4072,17 +4080,10 @@ impl RunStateStore for DatabaseRunStateStore {
             db_error("transition_run_status_with_events_begin", run_id, source).to_string()
         })?;
 
-        let Some(row) = sqlx::query(
-            "SELECT session_id, agent_id, last_event_idx
-             FROM agent_runs WHERE user_id = ? AND run_id = ?",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|source| {
-            db_error("transition_run_status_with_events_load_run", run_id, source).to_string()
-        })?
+        let Some(run) = self
+            .load_run_metadata_for_user_tx(&mut tx, user_id, run_id)
+            .await
+            .map_err(|e| e.to_string())?
         else {
             tx.rollback().await.map_err(|source| {
                 db_error(
@@ -4094,31 +4095,9 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         };
-
-        let session_id: String = row.try_get("session_id").map_err(|source| {
-            db_error(
-                "transition_run_status_with_events_decode_session",
-                run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        let agent_id: Option<String> = row.try_get("agent_id").map_err(|source| {
-            db_error(
-                "transition_run_status_with_events_decode_agent",
-                run_id,
-                source,
-            )
-            .to_string()
-        })?;
-        let last_event_idx: i64 = row.try_get("last_event_idx").map_err(|source| {
-            db_error(
-                "transition_run_status_with_events_decode_last_event_idx",
-                run_id,
-                source,
-            )
-            .to_string()
-        })?;
+        let session_id = run.session_id.clone();
+        let agent_id = run.agent_id.clone();
+        let last_event_idx = run.last_event_idx;
 
         let mut event_rows = Vec::with_capacity(events.len());
         for (offset, event) in events.iter().enumerate() {
@@ -7165,6 +7144,48 @@ mod tests {
             .insert_run(durable_run_record("fresh-after-cas-miss"))
             .await
             .expect("CAS miss must not acquire the session slot");
+    }
+
+    #[tokio::test]
+    async fn in_memory_guarded_transition_reconciles_stale_slot_cache_from_run_truth() {
+        let store = InMemoryRunStateStore::new();
+
+        let mut paused = durable_run_record("paused-stale-slot");
+        paused.status = STATUS_PAUSED.into();
+        paused.waiting_for = None;
+        store.insert_run(paused).await.unwrap();
+        {
+            let mut slots = store.execution_slots.write().await;
+            slots.insert(
+                ("u1".to_string(), "s1".to_string()),
+                "ghost-run".to_string(),
+            );
+        }
+
+        let outcome = store
+            .update_run_status_with_event_if_current_unless_session_blocked(
+                GuardedRunStatusTransitionRequest {
+                    user_id: "u1",
+                    run_id: "paused-stale-slot",
+                    session_id: "s1",
+                    expected_statuses: &[STATUS_PAUSED],
+                    status: STATUS_RUNNING,
+                    waiting_for: None,
+                    error_message: None,
+                    event: serde_json::json!({"event_type": "run_resumed", "data": {}}),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, GuardedRunStatusTransition::Updated);
+        let slots = store.execution_slots.read().await;
+        assert_eq!(
+            slots
+                .get(&("u1".to_string(), "s1".to_string()))
+                .map(String::as_str),
+            Some("paused-stale-slot")
+        );
     }
 
     #[tokio::test]

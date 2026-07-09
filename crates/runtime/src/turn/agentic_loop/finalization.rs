@@ -42,9 +42,24 @@ fn inject_hallucination_tripwire_nudge_if_fired(state: &mut AgenticLoopState) {
         })
         .collect();
 
-    if let TripwireVerdict::Mismatch { nudge, .. } = detect(state.final_text.as_str(), observations)
+    if let TripwireVerdict::Mismatch {
+        nudge,
+        matched_phrases,
+    } = detect(state.final_text.as_str(), observations)
     {
-        state.push_volatile(VolatileKind::HallucinationTripwire, nudge);
+        state.push_volatile_payload(
+            VolatileKind::HallucinationTripwire,
+            serde_json::json!({
+                "schema": "hallucination_tripwire.v1",
+                "signal": "ungrounded_tool_outcome_claim",
+                "evidence": {
+                    "matched_phrases": matched_phrases,
+                    "tool_observation_count": state.stall.tool_call_records.len(),
+                },
+                "recommendation": nudge,
+                "authority": "advisory_evidence_only",
+            }),
+        );
     }
 }
 
@@ -289,8 +304,15 @@ mod hallucination_tripwire_integration_tests {
             state.volatile_pending[0].kind,
             VolatileKind::HallucinationTripwire
         );
-        assert!(state.volatile_pending[0].content.contains("Self-check"));
-        assert!(state.volatile_pending[0].content.contains("no tool call"));
+        let payload = &state.volatile_pending[0].payload;
+        assert_eq!(payload["schema"], "hallucination_tripwire.v1");
+        assert_eq!(payload["signal"], "ungrounded_tool_outcome_claim");
+        assert_eq!(payload["evidence"]["tool_observation_count"], 1);
+        assert_eq!(
+            payload["evidence"]["matched_phrases"],
+            serde_json::json!(["silently returned {}"])
+        );
+        assert_eq!(payload["authority"], "advisory_evidence_only");
     }
 
     #[test]
@@ -359,8 +381,8 @@ fn checkpoint_blocked_tools(restricted_tools: &std::collections::HashSet<String>
 
 /// Best-effort heavy checkpoint write.
 ///
-/// Several early-exit paths in the agentic loop (text-only responses, stop-hook
-/// injection, factual-retry nudges) skip the main post-tool-policy checkpoint.
+/// Several early-exit paths in the agentic loop (for example text-only
+/// responses and explicit stop-hook boundaries) skip the main post-tool-policy checkpoint.
 /// This helper ensures those paths still persist the accumulated messages so that
 /// `/debug` turn inspection and session recovery have accurate per-iteration state.
 pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
@@ -606,15 +628,7 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     // and debounce. See `crate::session_memory::MemoryExtractionService`.
     maybe_run_memory_extraction(state);
 
-    // Drop any execution-retry corrective messages now that the loop has
-    // finished. Keeping them in `state.messages` would pollute every
-    // subsequent user turn (the model would see a stale "you didn't apply the
-    // change" nudge that no longer applies). The marker is a stable header
-    // embedded by `execution_phase::execution_retry_message`.
-    state
-        .messages
-        .retain(|m| !super::execution_phase::is_execution_corrective_message(m));
-    reset_per_turn_corrective_state(state);
+    reset_per_turn_advisory_state(state);
     state.refresh_task_board_snapshot().await;
     ensure_terminal_text(state);
     update_working_memory_for_turn_settlement(state);
@@ -649,7 +663,7 @@ fn update_working_memory_for_turn_settlement(state: &mut AgenticLoopState) {
     let task_summary = state
         .hooks
         .task_board_snapshot
-        .requires_settlement_intervention()
+        .has_paused_or_blocked_tasks()
         .then(|| state.hooks.task_board_snapshot.short_summary());
     let interruption = state.interruption.clone();
     let Some(session) = state.pipeline_session.as_mut() else {
@@ -744,101 +758,15 @@ fn settlement_interruption_summary(
     interruption_state_summary(state, error_detail)
 }
 
-fn terminal_turn_evaluation(
-    state: &AgenticLoopState,
-) -> astra_turn_core::evaluation::TurnEvaluation {
-    let verdict_warning =
-        crate::server::run::lifecycle::has_turn_verdict_warning(&state.stall.verdict_events);
-    let mut eval =
-        crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds_and_telemetry(
-            &state.message,
-            &state.recent_tools,
-            &state.stall.tool_call_records,
-            state.stall.events.len(),
-            verdict_warning,
-            state.telemetry.first_budget_pressure,
-            crate::pipeline::evaluation::current_evaluation_thresholds(),
-            astra_turn_core::evaluation::TurnEvaluationTelemetry {
-                llm_rounds: Some(state.llm_rounds_completed),
-                prompt_tokens: Some(state.total_prompt),
-                first_round_prompt_tokens: None,
-                max_round_prompt_tokens: state.last_measured_prompt_tokens,
-            },
-        );
-    crate::pipeline::evaluation::apply_final_answer_relevance(
-        &mut eval,
-        &state.message,
-        &state.final_text,
-    );
-    eval
-}
-
-fn append_terminal_turn_evaluation_notice_if_needed(state: &mut AgenticLoopState) {
-    let eval = terminal_turn_evaluation(state);
-    let annotated =
-        astra_turn_core::evaluation::build_turn_evaluation_annotated_text(&state.final_text, &eval);
-    if annotated != state.final_text {
-        state.final_text = annotated;
-        state.final_text_streamed = false;
-    }
-}
-
 fn ensure_terminal_text(state: &mut AgenticLoopState) {
-    if state
-        .hooks
-        .task_board_snapshot
-        .has_completion_blocking_tasks()
-    {
-        let detail = format!(
-            "agentic loop reached terminal state while unfinished task-board work remained: {}",
-            state.hooks.task_board_snapshot.short_summary()
+    if state.hooks.task_board_snapshot.has_unfinished_tasks() {
+        tracing::info!(
+            target: "astra::loop_guard",
+            summary = %state.hooks.task_board_snapshot.short_summary(),
+            "unfinished task-board state retained as settlement evidence"
         );
-        let requires_intervention = state
-            .hooks
-            .task_board_snapshot
-            .requires_settlement_intervention();
-        let should_record_empty_completion = state.final_text.trim().is_empty();
-        let should_record_interruption = requires_intervention || should_record_empty_completion;
-        let task_board_interruption_created =
-            should_record_interruption && state.interruption.is_none();
-        if state.interruption.is_none() {
-            if !should_record_interruption {
-                tracing::info!(
-                    target: "astra::loop_guard",
-                    summary = %state.hooks.task_board_snapshot.short_summary(),
-                    "unfinished task-board bookkeeping left as non-blocking settlement metadata"
-                );
-            } else {
-                let resume_action = if requires_intervention {
-                    astra_turn_core::interruption::ResumeAction::RequiresIntervention {
-                        description:
-                            "unfinished task-board work remains; wait for explicit user direction before continuing"
-                                .to_string(),
-                    }
-                } else {
-                    astra_turn_core::interruption::ResumeAction::ContinueImmediately
-                };
-                state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-                    astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
-                    resume_action,
-                    settlement_interruption_summary(state, Some(detail)),
-                ));
-            }
-        }
-        if state.final_text.trim().is_empty() && task_board_interruption_created {
-            state.final_text.clear();
-            state.final_text_streamed = false;
-            tracing::info!(
-                target: "astra::loop_guard",
-                summary = %state.hooks.task_board_snapshot.short_summary(),
-                "unfinished task-board work recorded as structured run state without assistant text"
-            );
-            return;
-        }
     }
     if !state.final_text.trim().is_empty() {
-        append_terminal_turn_evaluation_notice_if_needed(state);
-
         // ── Truncation marker: finish_reason == "length" ─────────────
         // The model produced output but the API cut it off at max_tokens.
         // Append a visible marker so the user sees the text is incomplete.
@@ -863,16 +791,6 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
     // Use EmptyCompletion (semantically correct: loop ended, no final answer)
     // but provide rich context so the user sees progress, not silence.
     if state.total_tool_calls > 0 {
-        // ── Trace: textless_stop_retry was attempted but failed ──
-        if state.textless_stop_retries > 0 {
-            tracing::info!(
-                textless_stop_retries = state.textless_stop_retries,
-                total_tool_calls = state.total_tool_calls,
-                "textless_stop_retries_exhausted: model called {} tools but stopped without text after {} retry attempts",
-                state.total_tool_calls,
-                state.textless_stop_retries,
-            );
-        }
         // ── Build tool summary (include failed tools marked as such) ──
         let recent_tools: Vec<String> = state
             .stall
@@ -1014,28 +932,21 @@ fn append_interruption_detail(
     }
 }
 
-fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
-    state.stall.forced_factual_retry = false;
-    state.stall.factual_retry_fallback_text = None;
-    state.stall.forced_execution_retry = false;
-    state.stall.forced_answer_relevance_retry = false;
-    state.stall.forced_execution_escalation = false;
-    state.stall.forced_parallel_batching = false;
-    state.stall.forced_round_budget_phase1 = false;
-    state.stall.forced_round_budget_phase2 = false;
-    state.stall.forced_completion_soft_stop = false;
-    state.stall.forced_task_board_completion_gate = false;
-    state.stall.forced_redundant_reads_corrective = false;
-    state.stall.forced_cache_waste_corrective = false;
-    state.stall.forced_search_fanout_corrective = false;
-    state.stall.forced_exploration_family_corrective = false;
-    state.stall.forced_exploration_family_phase2 = false;
-    state.stall.forced_intent_drift = false;
+fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
+    state.stall.execution_escalation_advisory_emitted = false;
+    state.stall.parallel_batching_advisory_emitted = false;
+    state.stall.repetition_advisory_emitted = false;
+    state.stall.redundant_reads_advisory_emitted = false;
+    state.stall.cache_waste_advisory_emitted = false;
+    state.stall.search_fanout_advisory_emitted = false;
+    state.stall.exploration_family_advisory_emitted = false;
+    state.stall.stronger_exploration_family_advisory_emitted = false;
+    state.stall.intent_drift_advisory_emitted = false;
     // NOTE: drift_nudge_count and last_drift_correction_round persist across turns
-    state.stall.exploration_family_corrective_family = None;
-    // Clear tool restrictions injected by exploration-family correctives so
-    // they don't leak into the next user turn.
-    state.restricted_tools.clear();
+    state.stall.exploration_family_advisory_family = None;
+    // Hard tool restrictions are owned by capability/permission boundaries.
+    // Behavioral advisories no longer add entries here, so finalization must
+    // not broaden the surface by clearing the set.
     state.turn_guard.begin_fresh_user_turn();
     // Task #43 wrap-up state also belongs to the just-completed turn —
     // next user turn starts fresh. Without this reset, the lockout/abort
@@ -1045,7 +956,6 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     // which was exactly the stale-state bug the code-review called out.
     state.budget_wrapup_injected = false;
     state.budget_wrapup_ignored_rounds = 0;
-    state.textless_stop_retries = 0;
     // Defensive reset: last_finish_reason is rewritten before every LLM call
     // in execution_phase.rs, but resetting here prevents stale leakage if a
     // future early-exit path reads it before the next LLM invocation.
@@ -1202,7 +1112,6 @@ mod tests {
                 true,
                 false,
                 astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-                true,
             );
         state.turn_intent = Some(
             astra_config::user_profile::TurnIntent::default().with_workspace_mutation(
@@ -1212,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_text_marks_failed_structural_evaluation_incomplete() {
+    fn terminal_behavior_evaluation_does_not_rewrite_real_answer() {
         let mut state = make_state();
         state.message = "fix the broken build".to_string();
         state.user_intent = state.message.clone();
@@ -1233,18 +1142,8 @@ mod tests {
 
         ensure_terminal_text(&mut state);
 
-        assert!(state.final_text.starts_with("Done."));
-        assert!(state.final_text.contains("[Turn evaluation: incomplete."));
-        assert!(state.final_text.contains("tool error rate is high"));
-        assert!(
-            !state.final_text.contains("obsolete/workspace/src/lib.rs"),
-            "terminal evaluation notice must not promote failed file paths: {}",
-            state.final_text
-        );
-        assert!(
-            !state.final_text_streamed,
-            "rendering must replay the amended terminal text"
-        );
+        assert_eq!(state.final_text, "Done.");
+        assert!(state.final_text_streamed);
     }
 
     #[test]
@@ -1276,268 +1175,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
-    }
-
-    // E2E: full execution-retry guard lifecycle through the production loop.
-    // Round 1: model defers ("需要我直接执行这些修改吗？") on a mutating-profile
-    // task → guard fires, corrective user message is injected into
-    // `state.messages`, loop continues. Round 2: model finalizes with "Done.".
-    // After the loop ends, `finalize_and_render` must strip the marker so the
-    // corrective message does not leak into subsequent user turns.
-    #[tokio::test]
-    async fn execution_retry_injects_then_strips_corrective_message() {
-        let mut host = MockHost::new(vec![
-            text_result("需要我直接执行这些修改吗？", 10, 5, Some(20)),
-            text_result("Done.", 10, 5, Some(20)),
-        ]);
-        let mut state = make_state();
-        state.message = "修复这个 bug".to_string();
-        state.user_intent = state.message.clone();
-        mark_must_mutate(&mut state);
-        assert!(
-            state.task_profile.mutates_workspace,
-            "test precondition: profile must be mutating"
-        );
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "loop should complete: {:?}", outcome);
-
-        assert!(
-            host.turn_count() == 2,
-            "guard must have fired on the deferring round to force a second LLM pass"
-        );
-        assert_eq!(
-            state.final_text, "Done.",
-            "second LLM response should win after the forced retry"
-        );
-        assert!(
-            !state.stall.forced_execution_retry,
-            "completion should reset one-shot retry state so it does not leak into the next user turn"
-        );
-
-        let leftover = state
-            .messages
-            .iter()
-            .filter(|m| {
-                crate::turn::agentic_loop::execution_phase::is_execution_retry_correction(m)
-            })
-            .count();
-        assert_eq!(
-            leftover, 0,
-            "finalize_and_render must strip the corrective message; \
-             {leftover} copies still in state.messages: {:#?}",
-            state.messages
-        );
-    }
-
-    // E2E: a mutating-profile task cannot complete on the first text-only
-    // response without any concrete workspace mutation. The guard forces one
-    // corrective retry, then the one-shot flag lets the next response finish
-    // so the loop cannot spin forever.
-    #[tokio::test]
-    async fn execution_retry_forces_one_retry_on_text_only_mutating_completion() {
-        let mut host = MockHost::new(vec![
-            text_result("No workspace mutation was needed.", 10, 5, Some(20)),
-            text_result("Done.", 10, 5, Some(20)),
-        ]);
-        let mut state = make_state();
-        state.message = "fix the bug".to_string();
-        state.user_intent = state.message.clone();
-        mark_must_mutate(&mut state);
-        assert!(state.task_profile.mutates_workspace);
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-
-        assert_eq!(
-            host.turn_count(),
-            2,
-            "first text-only mutating completion must force one retry"
-        );
-        assert_eq!(state.final_text, "Done.");
-        assert!(
-            !state.stall.forced_execution_retry,
-            "completion should clear the one-shot retry flag"
-        );
-        let leftover = state
-            .messages
-            .iter()
-            .filter(|m| {
-                crate::turn::agentic_loop::execution_phase::is_execution_retry_correction(m)
-            })
-            .count();
-        assert_eq!(leftover, 0, "corrective message should be stripped");
-    }
-
-    // E2E: model defers twice in a row. The one-shot `forced_execution_retry`
-    // flag must prevent a second corrective injection, so the loop terminates
-    // after two LLM rounds instead of spinning forever.
-    #[tokio::test]
-    async fn double_defer_does_not_cause_infinite_retry() {
-        let mut host = MockHost::new(vec![
-            text_result("需要我直接执行这些修改吗？", 10, 5, Some(20)),
-            text_result("确认后我再执行。", 10, 5, Some(20)),
-        ]);
-        let mut state = make_state();
-        state.message = "修复这个 bug".to_string();
-        state.user_intent = state.message.clone();
-        mark_must_mutate(&mut state);
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok(), "loop must terminate: {:?}", outcome);
-        // Second defer becomes the final text — guard did not fire again.
-        assert_eq!(state.final_text, "确认后我再执行。");
-        assert_eq!(
-            host.turn_count(),
-            2,
-            "exactly 2 LLM rounds, no infinite loop"
-        );
-        assert!(
-            !state.stall.forced_execution_retry,
-            "completion should clear the one-shot retry flag after the turn ends"
-        );
-    }
-
-    #[tokio::test]
-    async fn finalize_and_render_strips_all_correctives_and_resets_one_shot_flags() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.final_text = "Done.".into();
-        state.messages.extend([
-            serde_json::json!({
-                "role": "user",
-                "content": format!("{}\nold retry", crate::turn::agentic_loop::execution_phase::EXECUTION_RETRY_MARKER),
-            }),
-            serde_json::json!({
-                "role": "user",
-                "content": format!("{}\nold escalation", crate::turn::agentic_loop::execution_phase::EXECUTION_ESCALATION_MARKER),
-            }),
-            serde_json::json!({
-                "role": "user",
-                "content": format!("{}\nold batching", crate::turn::agentic_loop::execution_phase::PARALLEL_BATCHING_FORCE_MARKER),
-            }),
-            serde_json::json!({
-                "role": "user",
-                "content": format!("{}\nold redundant reads", crate::turn::agentic_loop::execution_phase::REDUNDANT_READS_MARKER),
-            }),
-            serde_json::json!({
-                "role": "user",
-                "content": format!("{}\nold cache waste", crate::turn::agentic_loop::execution_phase::CACHE_WASTE_MARKER),
-            }),
-            serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "{}\nold exploration family churn",
-                    crate::turn::agentic_loop::execution_phase::EXPLORATION_FAMILY_MARKER
-                ),
-            }),
-            serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "{}\nold search fanout",
-                    crate::turn::agentic_loop::execution_phase::SEARCH_FANOUT_MARKER
-                ),
-            }),
-            serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "{}\nold exploration family lockout",
-                    crate::turn::agentic_loop::execution_phase::EXPLORATION_FAMILY_PHASE2_MARKER
-                ),
-            }),
-        ]);
-        state.stall.forced_factual_retry = true;
-        state.stall.factual_retry_fallback_text = Some("old factual retry answer".into());
-        state.stall.forced_execution_retry = true;
-        state.stall.forced_execution_escalation = true;
-        state.stall.forced_parallel_batching = true;
-        state.stall.forced_redundant_reads_corrective = true;
-        state.stall.forced_cache_waste_corrective = true;
-        state.stall.forced_search_fanout_corrective = true;
-        state.stall.forced_exploration_family_corrective = true;
-        state.stall.forced_exploration_family_phase2 = true;
-        state.stall.exploration_family_corrective_family = Some("diff".into());
-        state.restricted_tools.insert("git".into());
-        state.turn_guard.nudge_count = 5;
-        state
-            .turn_guard
-            .record_tool_calls(&[serde_json::json!({"name": "bash", "arguments": {}})]);
-        state
-            .turn_guard
-            .record_tool_result("bash", "Error: command failed");
-        state.turn_guard.pending_correction = Some(astra_turn_core::turn_guard::CorrectionRecord {
-            turn: 3,
-            correction_type: "stall_nudge".into(),
-            avoid_tools: vec!["bash".into()],
-            suggested_alternatives: Vec::new(),
-        });
-        state.turn_guard.health.record_failure("bash");
-        // Task #43 wrap-up hybrid state: must also reset across turns
-        // so the NEXT user turn doesn't see a stale "already-wrapped-up"
-        // shortcut. Code-review called this out as Important #3.
-        state.budget_wrapup_injected = true;
-        state.budget_wrapup_ignored_rounds = 2;
-
-        finalize_and_render(&mut host, &mut state).await;
-
-        assert!(
-            state.messages.iter().all(|m| {
-                !crate::turn::agentic_loop::execution_phase::is_execution_corrective_message(m)
-            }),
-            "completed turns should not retain stale runtime corrective messages: {:#?}",
-            state.messages
-        );
-        assert!(!state.stall.forced_factual_retry);
-        assert!(state.stall.factual_retry_fallback_text.is_none());
-        assert!(!state.stall.forced_execution_retry);
-        assert!(!state.stall.forced_execution_escalation);
-        assert!(!state.stall.forced_parallel_batching);
-        assert!(!state.stall.forced_redundant_reads_corrective);
-        assert!(!state.stall.forced_cache_waste_corrective);
-        assert!(!state.stall.forced_search_fanout_corrective);
-        assert!(!state.stall.forced_exploration_family_corrective);
-        assert!(!state.stall.forced_exploration_family_phase2);
-        assert!(state.stall.exploration_family_corrective_family.is_none());
-        assert!(
-            state.restricted_tools.is_empty(),
-            "restricted_tools must be cleared across turns"
-        );
-        assert_eq!(
-            state.turn_guard.nudge_count, 0,
-            "TurnGuard nudge pressure must not leak across finalized turns"
-        );
-        assert!(
-            state.turn_guard.pending_correction.is_none(),
-            "pending TurnGuard corrections must not leak across finalized turns"
-        );
-        assert!(
-            state.turn_guard.tool_sigs.is_empty(),
-            "stall signatures must reset for the next user turn"
-        );
-        assert_eq!(
-            state.turn_guard.errors.recent_error_pressure(),
-            0,
-            "recent error pressure must reset after turn finalization"
-        );
-        assert_eq!(
-            state.turn_guard.errors.total_errors, 1,
-            "lifetime diagnostics should remain available after reset"
-        );
-        assert!(
-            state.turn_guard.health.get("bash").is_some(),
-            "durable tool health should remain available after reset"
-        );
-        assert!(
-            !state.budget_wrapup_injected,
-            "budget_wrapup_injected must reset after a turn finalizes — \
-             otherwise the NEXT turn's first round short-circuits on stale state"
-        );
-        assert_eq!(
-            state.budget_wrapup_ignored_rounds, 0,
-            "budget_wrapup_ignored_rounds must reset to 0 per turn; \
-             otherwise Task #43 hybrid abort triggers too early on the \
-             next turn"
-        );
     }
 
     #[tokio::test]
@@ -1979,7 +1616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_refreshes_task_board_before_terminal_gate() {
+    async fn finalize_and_render_refreshes_task_board_before_settlement() {
         let manager = std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::in_memory());
         manager
             .create(&serde_json::json!({"title": "finish validation"}))
@@ -2046,31 +1683,23 @@ mod tests {
                 tool_calls_completed: 5,
                 turns_completed: 7,
                 remaining_turns: 0,
-                error_detail: Some(
-                    "The circuit breaker stopped the turn after the model ignored the finalization correction. Resume by synthesizing verified evidence before calling more tools.".to_string(),
-                ),
+                error_detail: Some("Infrastructure round limit reached: 240/240 rounds".into()),
                 stall_signal: Some("single_tool_streak=9".to_string()),
                 resume_restricted_tools: vec![],
             },
         ));
+        let expected = interruption_terminal_message(
+            state.interruption.as_ref().expect("budget interruption"),
+        );
 
         finalize_and_render(&mut host, &mut state).await;
 
-        assert!(
-            state
-                .final_text
-                .contains("circuit breaker stopped the turn"),
-            "terminal interruption text should include the specific budget-stop reason"
-        );
-        assert!(
-            state.final_text.contains("verified evidence"),
-            "terminal interruption text should include next-step guidance"
-        );
+        assert_eq!(state.final_text, expected);
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 
     #[tokio::test]
-    async fn finalize_and_render_records_task_board_empty_completion_without_assistant_text() {
+    async fn finalize_and_render_empty_completion_is_independent_of_task_board_state() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.final_text.clear();
@@ -2095,18 +1724,10 @@ mod tests {
 
         finalize_and_render(&mut host, &mut state).await;
 
-        assert_eq!(
-            state.final_text, "",
-            "task-board empty completion is structured run state, not assistant prose"
-        );
-        assert!(
-            host.rendered_final_text.is_empty(),
-            "empty task-board completion must not render an assistant bubble"
-        );
         let interruption = state
             .interruption
             .as_ref()
-            .expect("empty task-board completion should record interruption state");
+            .expect("empty model completion should record interruption state");
         assert_eq!(
             interruption.kind,
             astra_turn_core::interruption::InterruptionKind::EmptyCompletion
@@ -2115,6 +1736,45 @@ mod tests {
             &interruption.resume_action,
             astra_turn_core::interruption::ResumeAction::ContinueImmediately
         ));
+        assert_eq!(
+            state.final_text,
+            interruption_terminal_message(interruption)
+        );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
+    }
+
+    #[tokio::test]
+    async fn paused_task_board_does_not_override_a_real_final_answer() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.final_text = "Current evidence supports shipping the verified fix.".into();
+        state.hooks.task_board_snapshot =
+            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
+                astra_tools::task_mgmt::SessionTask {
+                    archived_at: None,
+                    id: "task-1".to_string(),
+                    title: "optional follow-up".to_string(),
+                    description: None,
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::Paused,
+                    subtasks: Vec::new(),
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                    updated_at: "2025-01-01T00:00:00Z".to_string(),
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                },
+            ]);
+
+        finalize_and_render(&mut host, &mut state).await;
+
+        assert!(state.interruption.is_none());
+        assert_eq!(
+            state.final_text,
+            "Current evidence supports shipping the verified fix."
+        );
+        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 
     #[tokio::test]
@@ -2132,6 +1792,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutating_profile_text_completion_is_preserved_without_guard_retry() {
+        let mut host = MockHost::new(vec![text_result(
+            "No workspace mutation was needed based on the evidence.",
+            10,
+            5,
+            Some(42),
+        )]);
+        let mut state = make_state();
+        state.message = "fix the bug".to_string();
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(host.turn_count(), 1);
+        assert_eq!(
+            state.final_text,
+            "No workspace mutation was needed based on the evidence."
+        );
+        assert_eq!(
+            state.messages,
+            vec![serde_json::json!({
+                "role": "assistant",
+                "content": "No workspace mutation was needed based on the evidence."
+            })],
+            "runtime behavior signals must not add synthetic control history"
+        );
+    }
+
+    #[tokio::test]
     async fn render_final_text_called_once_at_completion() {
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![make_edge_tool("grep", "results...")], 20, 10, Some(50)),
@@ -2144,35 +1835,6 @@ mod tests {
         assert_eq!(state.final_text, "Final answer");
         assert_eq!(host.rendered_final_text.len(), 1);
         assert_eq!(host.rendered_final_text[0], "Final answer");
-    }
-
-    #[test]
-    fn context_trace_workspace_persistence_pushes_remote_workspace_artifact() {
-        let source = include_str!("finalization.rs");
-        let start = source
-            .find("async fn persist_context_trace_to_workspace_if_present")
-            .expect("workspace trace persistence helper");
-        let end = source
-            .find("/// Best-effort heavy checkpoint write.")
-            .expect("workspace trace helper end marker");
-        let snippet = &source[start..end];
-        assert!(
-            snippet.contains("persist_remote_workspace"),
-            "context trace workspace persistence should publish remote workspace artifacts"
-        );
-        assert!(
-            snippet.contains("artifact_store"),
-            "context trace workspace persistence should receive an artifact store"
-        );
-    }
-
-    #[test]
-    fn composite_snapshot_index_persistence_pushes_remote_artifact() {
-        let source = include_str!("finalization.rs");
-        assert!(
-            source.contains("persist_remote_composite_snapshot_index"),
-            "composite snapshot writes should publish a remote index artifact"
-        );
     }
 
     #[tokio::test]

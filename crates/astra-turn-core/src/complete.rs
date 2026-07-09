@@ -9,16 +9,12 @@ pub fn build_turn_complete_event(
     execution_state: Option<Value>,
     assistant_text: Option<&str>,
 ) -> Map<String, Value> {
-    let force_stop = stall_detected || matches!(divergence_status, DivergenceStatus::Diverging(_));
     let mut event = Map::from_iter([
         (
             "type".to_string(),
             Value::String("turn_complete".to_string()),
         ),
-        (
-            "has_tool_calls".to_string(),
-            Value::Bool(if force_stop { false } else { has_tool_calls }),
-        ),
+        ("has_tool_calls".to_string(), Value::Bool(has_tool_calls)),
     ]);
     if stall_detected {
         event.insert("stall_detected".to_string(), Value::Bool(true));
@@ -50,7 +46,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn complete_basic_no_force_stop() {
+    fn complete_basic_preserves_observed_facts() {
         let event = build_turn_complete_event(true, false, &DivergenceStatus::Healthy, None, None);
         assert_eq!(event["type"].as_str().unwrap(), "turn_complete");
         assert!(event["has_tool_calls"].as_bool().unwrap());
@@ -59,23 +55,23 @@ mod tests {
     }
 
     #[test]
-    fn complete_stall_forces_no_tool_calls() {
+    fn complete_stall_preserves_actual_tool_call_fact() {
         let event = build_turn_complete_event(true, true, &DivergenceStatus::Healthy, None, None);
-        assert!(!event["has_tool_calls"].as_bool().unwrap());
+        assert!(event["has_tool_calls"].as_bool().unwrap());
         assert!(event["stall_detected"].as_bool().unwrap());
     }
 
     #[test]
-    fn complete_diverging_forces_no_tool_calls() {
+    fn complete_diverging_preserves_actual_tool_call_fact() {
         let event =
             build_turn_complete_event(true, false, &DivergenceStatus::Diverging(3), None, None);
-        assert!(!event["has_tool_calls"].as_bool().unwrap());
+        assert!(event["has_tool_calls"].as_bool().unwrap());
         assert!(event["divergence_detected"].as_bool().unwrap());
         assert_eq!(event["exploration_rounds"].as_u64().unwrap(), 3);
     }
 
     #[test]
-    fn complete_exploring_no_force_stop() {
+    fn complete_exploring_preserves_observed_facts() {
         let event =
             build_turn_complete_event(true, false, &DivergenceStatus::Exploring(2), None, None);
         assert!(event["has_tool_calls"].as_bool().unwrap());

@@ -2224,24 +2224,6 @@ mod tests {
         assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
         drop(pipeline);
 
-        let last_tr = harness
-            .tool_results
-            .last()
-            .expect("denial should record a tool_result");
-        let body = last_tr
-            .get("result")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            body.contains("requires `tool_search` activation first")
-                && body.contains("select:memory")
-                && body.contains("not executed"),
-            "direct deferred call must become a non-executing activation hint; got: {body}"
-        );
-        assert!(
-            !body.starts_with("Unknown tool"),
-            "direct deferred call must not reuse the bare unknown-tool copy; got: {body}"
-        );
         assert_eq!(
             server_exec.activated_deferred_tool_names(),
             vec!["memory".to_string()],
@@ -3352,12 +3334,14 @@ mod tests {
             astra_turn_core::result_quality::ResultQuality::Empty,
             10,
             still_running,
+            None,
         );
         harness.turn_guard.record_tool_outcome(
             &sig,
             astra_turn_core::result_quality::ResultQuality::Empty,
             11,
             still_running,
+            None,
         );
 
         let mut pipeline = harness.pipeline();

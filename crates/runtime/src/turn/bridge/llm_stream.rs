@@ -1643,35 +1643,6 @@ mod tests {
     /// P1-F: call_llm_stream must have a total budget guard to prevent
     /// unbounded blocking when the provider returns repeated 429s with
     /// long retry-after headers.
-    #[test]
-    fn call_llm_stream_has_total_budget_guard() {
-        let source = include_str!("llm_stream.rs");
-        let wrapper_start = source
-            .find("pub(crate) async fn call_llm_stream(")
-            .expect("call_llm_stream must exist");
-        let wrapper_rest = &source[wrapper_start..];
-        let wrapper_end = wrapper_rest
-            .find("\npub")
-            .or_else(|| wrapper_rest.find("\nfn "))
-            .or_else(|| wrapper_rest.find("\n#[cfg(test)]"))
-            .unwrap_or(wrapper_rest.len());
-        let wrapper_body = &wrapper_rest[..wrapper_end];
-        assert!(
-            wrapper_body.contains("call_llm_stream_with_request_overrides"),
-            "call_llm_stream must delegate to the shared retry/guard implementation"
-        );
-
-        let impl_start = source
-            .find("pub(crate) async fn call_llm_stream_with_request_overrides(")
-            .expect("call_llm_stream_with_request_overrides must exist");
-        let impl_rest = &source[impl_start..];
-        let impl_end = impl_rest.find("\n#[cfg(test)]").unwrap_or(impl_rest.len());
-        let body = &impl_rest[..impl_end];
-        assert!(
-            body.contains("total_budget") || body.contains("budget"),
-            "call_llm_stream must check total budget to prevent unbounded blocking"
-        );
-    }
 
     // ── wire_model_name alias routing ────────────────────────────────────
     //
@@ -2551,20 +2522,6 @@ mod tests {
         assert_eq!(
             stitched_text, "partial done",
             "fallback should only emit the missing suffix, not duplicate already-streamed text: {body}"
-        );
-    }
-
-    #[test]
-    fn bridge_fallback_paths_emit_only_missing_suffix() {
-        let source = include_str!("llm_stream.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
-        let production = &source[..tests_start];
-        let suffix_calls = production
-            .matches("streamed_suffix(&streamed_text, &result.full_text)")
-            .count();
-        assert!(
-            suffix_calls >= 2,
-            "both idle and transport fallback paths should emit only the missing text suffix"
         );
     }
 

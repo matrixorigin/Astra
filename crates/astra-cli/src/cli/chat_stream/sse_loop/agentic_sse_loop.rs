@@ -604,7 +604,9 @@ mod tests {
             ToolCallRecord {
                 name: "read_file".into(),
                 ok: false,
-                error: Some("blocked_tool: Tool 'read_file' is currently restricted and cannot be executed.".into()),
+                result_class: Some(
+                    astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS.into(),
+                ),
                 ..Default::default()
             },
             // Normal successful call — should be included
@@ -630,18 +632,17 @@ mod tests {
             "read_file".to_string(),
         ]);
         ctx.tool_call_records = vec![
-            tool_record(
-                "skill",
-                false,
-                Some(
-                    "Skill 'debug' was already loaded (turn 2). Follow those instructions directly.",
-                ),
-            ),
-            tool_record(
-                "bash",
-                false,
-                Some("Skipped: the skill already completed this work. Do NOT call `bash` again."),
-            ),
+            ToolCallRecord {
+                name: "skill".into(),
+                skill_reentry_count: Some(1),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME.into(),
+                surgically_removed: Some(true),
+                original_tool_name: Some("bash".into()),
+                ..Default::default()
+            },
             tool_record("read_file", true, Some("contents")),
         ];
 
@@ -679,7 +680,7 @@ mod tests {
                 injections: vec![],
                 avoid_tools: vec![],
                 health_avoidance_tools: vec![],
-                force_stop: false,
+                advisory_threshold_reached: false,
                 nudge_count: 0,
                 interaction_mode: "prompt".into(),
                 suppressed_loop_nudges: false,
@@ -698,7 +699,7 @@ mod tests {
                 injections: vec![],
                 avoid_tools: vec![],
                 health_avoidance_tools: vec![],
-                force_stop: false,
+                advisory_threshold_reached: false,
                 nudge_count: 0,
                 interaction_mode: "prompt".into(),
                 suppressed_loop_nudges: false,
@@ -717,7 +718,7 @@ mod tests {
                 injections: vec![],
                 avoid_tools: vec![],
                 health_avoidance_tools: vec![],
-                force_stop: false,
+                advisory_threshold_reached: false,
                 nudge_count: 0,
                 interaction_mode: "prompt".into(),
                 suppressed_loop_nudges: false,

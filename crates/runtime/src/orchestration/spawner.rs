@@ -141,10 +141,20 @@ fn spawn_run_result_to_agent_status(run_result: &SpawnRunResult) -> AgentStatus 
         SpawnRunStatusKind::Waiting => AgentStatus::Waiting {
             reason: run_result.output.clone().unwrap_or_default(),
         },
-        SpawnRunStatusKind::Completed => AgentStatus::Completed {
-            result: run_result.output.clone().unwrap_or_default(),
-            finish_reason: Some(run_result.finish_reason.clone()),
-        },
+        SpawnRunStatusKind::Completed => {
+            let result = run_result.output.clone().unwrap_or_default();
+            if agent_completion_is_interrupted(Some(run_result.finish_reason.as_str())) {
+                AgentStatus::Interrupted {
+                    partial_result: result,
+                    finish_reason: run_result.finish_reason.clone(),
+                }
+            } else {
+                AgentStatus::Completed {
+                    result,
+                    finish_reason: Some(run_result.finish_reason.clone()),
+                }
+            }
+        }
         SpawnRunStatusKind::Interrupted => AgentStatus::Interrupted {
             partial_result: run_result.output.clone().unwrap_or_default(),
             finish_reason: run_result.finish_reason.clone(),
@@ -3626,6 +3636,50 @@ mod tests {
             spawn_completion_status_from_finish_reason(Some("empty_completion")),
             "interrupted"
         );
+        assert_eq!(
+            spawn_completion_status_from_finish_reason(Some(
+                astra_turn_core::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON
+            )),
+            "interrupted"
+        );
+    }
+
+    #[test]
+    fn spawn_run_result_maps_response_guard_finish_reason_to_interrupted() {
+        let status = spawn_run_result_to_agent_status(&SpawnRunResult {
+            agent_id: "agent-1".into(),
+            run_id: "run-1".into(),
+            status: SPAWN_STATUS_COMPLETED.into(),
+            finish_reason: astra_turn_core::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON
+                .into(),
+            cancelled_by_user: None,
+            output: Some(astra_turn_core::response_guard::INTERNAL_PROTOCOL_FALLBACK.into()),
+            error: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+            permission_summary: None,
+            permission_requests: 0,
+            permission_requests_approved: 0,
+            tools_blocked: 0,
+        });
+
+        match status {
+            AgentStatus::Interrupted {
+                partial_result,
+                finish_reason,
+            } => {
+                assert_eq!(
+                    partial_result,
+                    astra_turn_core::response_guard::INTERNAL_PROTOCOL_FALLBACK
+                );
+                assert_eq!(
+                    finish_reason,
+                    astra_turn_core::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON
+                );
+            }
+            other => panic!("expected interrupted status, got {other:?}"),
+        }
     }
 
     #[test]

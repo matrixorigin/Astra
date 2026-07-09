@@ -11,6 +11,54 @@ use super::ToolExecutor;
 
 pub use astra_tools::memoria::{BoostSearchHit, parse_memory_search_hits};
 
+pub(crate) const MEMORY_BOOST_MIN_SCORE: f64 = 0.3;
+
+pub(crate) fn filter_memory_boost_hits_for_prompt(
+    hits: Vec<BoostSearchHit>,
+) -> Vec<BoostSearchHit> {
+    hits.into_iter()
+        .filter(|hit| {
+            hit.score
+                .is_some_and(|score| score.is_finite() && score >= MEMORY_BOOST_MIN_SCORE)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod memory_boost_prompt_filter_tests {
+    use super::{BoostSearchHit, filter_memory_boost_hits_for_prompt};
+
+    #[test]
+    fn memory_boost_prompt_filter_rejects_low_missing_and_nan_scores() {
+        let hits = vec![
+            BoostSearchHit {
+                memory_id: Some("low".into()),
+                content: "low relevance".into(),
+                score: Some(0.137),
+            },
+            BoostSearchHit {
+                memory_id: Some("missing".into()),
+                content: "missing score".into(),
+                score: None,
+            },
+            BoostSearchHit {
+                memory_id: Some("nan".into()),
+                content: "nan score".into(),
+                score: Some(f64::NAN),
+            },
+            BoostSearchHit {
+                memory_id: Some("ok".into()),
+                content: "high relevance".into(),
+                score: Some(0.3),
+            },
+        ];
+
+        let filtered = filter_memory_boost_hits_for_prompt(hits);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].memory_id.as_deref(), Some("ok"));
+    }
+}
+
 fn current_memoria_proxy_target() -> Result<(String, String), String> {
     let base = crate::cli::config_manager::resolve_api_url(None)?;
     let token =
@@ -388,7 +436,7 @@ impl ToolExecutor {
                 self.memoria_fail_count
                     .store(0, std::sync::atomic::Ordering::Relaxed);
                 let text = resp.text().await.unwrap_or_default();
-                parse_memory_search_hits(&text)
+                filter_memory_boost_hits_for_prompt(parse_memory_search_hits(&text))
             }
             Err(_) => {
                 self.memoria_fail_count

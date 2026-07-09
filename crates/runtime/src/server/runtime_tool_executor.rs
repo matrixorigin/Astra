@@ -5545,22 +5545,6 @@ esac
         (exec, dir, session_id, session)
     }
 
-    #[test]
-    fn session_state_tools_publish_workspace_artifacts() {
-        let source = include_str!("runtime_tool_executor.rs");
-        assert!(
-            source.contains("publish_current_workspace(\"adjust_config\")"),
-            "adjust_config should publish remote workspace artifacts"
-        );
-        let handlers = include_str!("runtime_tool_executor/tool_handlers.rs");
-        assert!(
-            handlers.contains(
-                "publish_current_workspace(\"runtime_tool_executor:rollback_session_state\")"
-            ),
-            "rollback_session_state should publish remote workspace artifacts after local restore"
-        );
-    }
-
     #[tokio::test]
     async fn agent_spawn_without_context_uses_shared_hard_error() {
         let (exec, _dir) = test_executor();

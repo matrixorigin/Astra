@@ -1,28 +1,50 @@
-//! After a headless tool round: intent-drift nudge, TurnGuard verdict, checkpoint, retry/abort decisions.
+//! After a headless tool round: record TurnGuard observations and checkpoint.
+//!
+//! First-principles rule: behavioral signals are evidence, not authority.
+//! Repeated reads, exploratory churn, or tool-shape mistakes may indicate
+//! waste, but they do not prove the model must be interrupted. This policy
+//! records verdicts for telemetry/checkpointing and leaves loop control to
+//! explicit safety/capability/budget boundaries.
 
 use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::chat_history_openai::append_openai_user_content_messages;
 use crate::guardrails::turn_guard::{TurnGuard, VerdictSeverity};
 use crate::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use crate::interaction_types::TurnInteractionMode;
-use crate::stall::{
-    CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL, CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING,
-};
 use crate::tool::args::shape::{tool_call_arguments_value, tool_call_name};
 use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::StepCheckpoint;
 use astra_pipeline::step_recorder::StepRecorder;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PolicyAdvisory {
+    pub kind: String,
+    pub severity: String,
+    pub evidence: Vec<String>,
+    pub recommendation: String,
+    pub ttl_rounds: u32,
+    pub dedupe_key: String,
+}
+
+#[must_use]
+pub fn policy_advisory_bundle_value(advisories: &[PolicyAdvisory]) -> Option<Value> {
+    if advisories.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "schema": "policy_advisory.v1",
+        "authority": "advisory_evidence_only",
+        "advisories": advisories,
+    }))
+}
+
 pub struct AgenticPostToolPolicyRequest<'a> {
     pub turn_index: u32,
-    pub message: &'a str,
     pub tool_calls_for_guard: &'a [Value],
     pub intent_tool_turns: &'a mut Vec<(Vec<String>, String)>,
     pub messages: &'a mut Vec<Value>,
-    pub stall_events: &'a mut Vec<(String, u32)>,
     pub turn_guard: &'a mut TurnGuard,
     pub verdict_events: &'a mut Vec<AgenticVerdictAuditEvent>,
     pub restricted_tools: &'a mut HashSet<String>,
@@ -31,7 +53,6 @@ pub struct AgenticPostToolPolicyRequest<'a> {
     pub current_user_id: Option<&'a String>,
     pub current_session_id: Option<&'a String>,
     pub max_turns: usize,
-    pub loop_turn: usize,
     pub recent_tools: &'a [String],
     pub last_heavy_checkpoint: &'a mut Option<StepCheckpoint>,
     pub interaction_mode: TurnInteractionMode,
@@ -39,17 +60,13 @@ pub struct AgenticPostToolPolicyRequest<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgenticPostToolPolicyOutcome {
-    ProceedEndTurn,
-    RetryLlmClearToolResults,
-    Abort(String),
+    ProceedEndTurn { advisories: Vec<PolicyAdvisory> },
 }
 
 /// Maps [`AgenticPostToolPolicyOutcome`] for host loop control (CLI maps to `AgenticLoopTurnExit`).
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgenticPostToolIterationControl {
-    ProceedEndTurn,
-    RetryLlmClearToolResults,
-    Abort(String),
+    ProceedEndTurn { advisories: Vec<PolicyAdvisory> },
 }
 
 #[must_use]
@@ -57,12 +74,8 @@ pub fn map_post_tool_policy_outcome(
     outcome: AgenticPostToolPolicyOutcome,
 ) -> AgenticPostToolIterationControl {
     match outcome {
-        AgenticPostToolPolicyOutcome::Abort(s) => AgenticPostToolIterationControl::Abort(s),
-        AgenticPostToolPolicyOutcome::RetryLlmClearToolResults => {
-            AgenticPostToolIterationControl::RetryLlmClearToolResults
-        }
-        AgenticPostToolPolicyOutcome::ProceedEndTurn => {
-            AgenticPostToolIterationControl::ProceedEndTurn
+        AgenticPostToolPolicyOutcome::ProceedEndTurn { advisories } => {
+            AgenticPostToolIterationControl::ProceedEndTurn { advisories }
         }
     }
 }
@@ -72,11 +85,9 @@ pub fn apply_agentic_post_tool_policy(
 ) -> AgenticPostToolPolicyOutcome {
     let AgenticPostToolPolicyRequest {
         turn_index,
-        message: _,
         tool_calls_for_guard,
         intent_tool_turns,
         messages,
-        stall_events: _,
         turn_guard,
         verdict_events,
         restricted_tools,
@@ -85,11 +96,11 @@ pub fn apply_agentic_post_tool_policy(
         current_user_id,
         current_session_id,
         max_turns,
-        loop_turn: _,
         recent_tools,
         last_heavy_checkpoint,
         interaction_mode,
     } = ctx;
+    let mut advisories = Vec::new();
 
     {
         let turn_names: Vec<String> = tool_calls_for_guard
@@ -133,7 +144,7 @@ pub fn apply_agentic_post_tool_policy(
                 injections: verdict.injections.clone(),
                 avoid_tools: verdict.avoid_tools.clone(),
                 health_avoidance_tools,
-                force_stop: verdict.force_stop,
+                advisory_threshold_reached: verdict.advisory_threshold_reached,
                 nudge_count: turn_guard.nudge_count,
                 interaction_mode: interaction_mode.label().to_string(),
                 suppressed_loop_nudges: interaction_mode.suppresses_loop_nudges(),
@@ -148,10 +159,9 @@ pub fn apply_agentic_post_tool_policy(
                 total_cache_hits: health_summary.total_cache_hits,
                 flaky_count: health_summary.flaky_count,
             });
-        }
-
-        if verdict.severity >= VerdictSeverity::Warning {
-            append_openai_user_content_messages(messages, &verdict.injections);
+            if let Some(advisory) = policy_advisory_from_verdict(&verdict) {
+                advisories.push(advisory);
+            }
         }
 
         // `avoid_tools` is advisory stall-recovery guidance at every severity.
@@ -159,26 +169,9 @@ pub fn apply_agentic_post_tool_policy(
         // have used the tool incorrectly, passed stale arguments, or hit a
         // transient environment issue. Do not mutate `restricted_tools` from a
         // verdict; only explicit capability/permission policy may do that.
-
-        match verdict.severity {
-            VerdictSeverity::Critical => {
-                *remaining_turns =
-                    remaining_turns.saturating_sub(CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL);
-            }
-            VerdictSeverity::Warning => {
-                // Progressive (linear) penalty: each consecutive warning adds
-                // one base penalty on top of the previous one — 1st warning
-                // costs -2, 2nd -4, 3rd -6, etc. Capped at MAX_MULT to keep
-                // the penalty bounded and prevent u32 overflow on pathological
-                // sessions; we also use saturating_mul defensively.
-                const MAX_MULT: usize = 16;
-                let multiplier = turn_guard.consecutive_warnings.clamp(1, MAX_MULT);
-                let penalty =
-                    CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING.saturating_mul(multiplier);
-                *remaining_turns = remaining_turns.saturating_sub(penalty);
-            }
-            _ => {}
-        }
+        // Likewise, do not turn verdict severity into hidden budget penalties.
+        // The model should get the configured turn budget unless an explicit
+        // budget/capability/safety boundary is reached.
 
         let severity_label = match verdict.severity {
             VerdictSeverity::Critical => "critical",
@@ -190,7 +183,7 @@ pub fn apply_agentic_post_tool_policy(
             severity_label,
             verdict.stall_detected,
             verdict.is_diverging,
-            verdict.force_stop,
+            verdict.advisory_threshold_reached,
             verdict.injections.len(),
         );
 
@@ -214,20 +207,71 @@ pub fn apply_agentic_post_tool_policy(
             *last_heavy_checkpoint = Some(cp);
         }
 
-        if verdict.force_stop {
-            step_recorder.end_turn(true);
-            return AgenticPostToolPolicyOutcome::Abort(
-                "Agent escalated to critical — too many errors and stalls. Aborting.".to_string(),
-            );
-        }
-
-        if !verdict.injections.is_empty() && verdict.severity >= VerdictSeverity::Warning {
-            step_recorder.end_turn(false);
-            return AgenticPostToolPolicyOutcome::RetryLlmClearToolResults;
-        }
+        // The threshold remains observable in verdict events and checkpoints,
+        // but does not imply failure or stopping authority.
     }
 
-    AgenticPostToolPolicyOutcome::ProceedEndTurn
+    AgenticPostToolPolicyOutcome::ProceedEndTurn { advisories }
+}
+
+fn policy_advisory_from_verdict(
+    verdict: &crate::guardrails::turn_guard::TurnVerdict,
+) -> Option<PolicyAdvisory> {
+    if verdict.severity < VerdictSeverity::Warning {
+        return None;
+    }
+    let severity = match verdict.severity {
+        VerdictSeverity::Critical => "critical",
+        VerdictSeverity::Warning => "warning",
+        VerdictSeverity::Info => "info",
+        VerdictSeverity::Healthy => "healthy",
+    };
+    let kind = if verdict.stall_detected {
+        "stall"
+    } else if verdict.is_diverging {
+        "divergence"
+    } else if !verdict.avoid_tools.is_empty() {
+        "tool_behavior"
+    } else if verdict.advisory_threshold_reached {
+        "behavior_threshold"
+    } else {
+        "policy"
+    };
+    let mut evidence = Vec::new();
+    if verdict.stall_detected {
+        evidence.push("TurnGuard detected a repeated/stalled tool-use pattern.".to_string());
+    }
+    if verdict.is_diverging {
+        evidence
+            .push("TurnGuard detected exploratory divergence from the current task.".to_string());
+    }
+    if !verdict.avoid_tools.is_empty() {
+        let mut tools = verdict.avoid_tools.clone();
+        tools.sort();
+        tools.dedup();
+        evidence.push(format!("Advisory avoid_tools: {}.", tools.join(", ")));
+    }
+    if verdict.advisory_threshold_reached {
+        evidence.push(
+            "TurnGuard recorded that a configured behavioral threshold was reached.".to_string(),
+        );
+    }
+    if evidence.is_empty() {
+        evidence.push("TurnGuard emitted a warning-or-higher behavioral verdict.".to_string());
+    }
+    let mut dedupe_parts = vec![kind.to_string(), severity.to_string()];
+    let mut tools = verdict.avoid_tools.clone();
+    tools.sort();
+    tools.dedup();
+    dedupe_parts.extend(tools);
+    Some(PolicyAdvisory {
+        kind: kind.to_string(),
+        severity: severity.to_string(),
+        evidence,
+        recommendation: "Consider this evidence before the next tool call: continue, change approach, or synthesize based on the user goal. Do not treat this advisory as a tool restriction.".to_string(),
+        ttl_rounds: 1,
+        dedupe_key: dedupe_parts.join("|"),
+    })
 }
 
 fn checkpoint_blocked_tools(restricted_tools: &HashSet<String>) -> Vec<String> {
@@ -242,11 +286,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn proceed_advisories(out: AgenticPostToolPolicyOutcome) -> Vec<PolicyAdvisory> {
+        match out {
+            AgenticPostToolPolicyOutcome::ProceedEndTurn { advisories } => advisories,
+        }
+    }
+
     #[test]
     fn healthy_guard_proceeds_end_turn() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
-        let mut stall_events = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
@@ -257,11 +306,9 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            message: "just say hi",
             tool_calls_for_guard: &tool_calls,
             intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
-            stall_events: &mut stall_events,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
             restricted_tools: &mut restricted_tools,
@@ -270,37 +317,67 @@ mod tests {
             current_user_id: None,
             current_session_id: None,
             max_turns: 8,
-            loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        assert_eq!(out, AgenticPostToolPolicyOutcome::ProceedEndTurn);
+        assert!(proceed_advisories(out).is_empty());
         assert_eq!(intent_tool_turns.len(), 1);
     }
 
     #[test]
     fn map_post_tool_outcome_round_trip_variants() {
         assert_eq!(
-            map_post_tool_policy_outcome(AgenticPostToolPolicyOutcome::ProceedEndTurn),
-            AgenticPostToolIterationControl::ProceedEndTurn
-        );
-        assert_eq!(
-            map_post_tool_policy_outcome(AgenticPostToolPolicyOutcome::RetryLlmClearToolResults),
-            AgenticPostToolIterationControl::RetryLlmClearToolResults
-        );
-        assert_eq!(
-            map_post_tool_policy_outcome(AgenticPostToolPolicyOutcome::Abort("x".into())),
-            AgenticPostToolIterationControl::Abort("x".into())
+            map_post_tool_policy_outcome(AgenticPostToolPolicyOutcome::ProceedEndTurn {
+                advisories: vec![PolicyAdvisory {
+                    kind: "stall".into(),
+                    severity: "warning".into(),
+                    evidence: vec!["evidence".into()],
+                    recommendation: "recommendation".into(),
+                    ttl_rounds: 1,
+                    dedupe_key: "stall|warning".into(),
+                }],
+            }),
+            AgenticPostToolIterationControl::ProceedEndTurn {
+                advisories: vec![PolicyAdvisory {
+                    kind: "stall".into(),
+                    severity: "warning".into(),
+                    evidence: vec!["evidence".into()],
+                    recommendation: "recommendation".into(),
+                    ttl_rounds: 1,
+                    dedupe_key: "stall|warning".into(),
+                }],
+            }
         );
     }
 
     #[test]
-    fn reward_hacking_warning_retries_without_schema_restriction() {
+    fn policy_advisory_bundle_preserves_structured_short_lived_evidence() {
+        let payload = policy_advisory_bundle_value(&[PolicyAdvisory {
+            kind: "stall".into(),
+            severity: "warning".into(),
+            evidence: vec!["same tool call shape repeated".into()],
+            recommendation: "consider changing approach".into(),
+            ttl_rounds: 1,
+            dedupe_key: "stall|warning".into(),
+        }])
+        .expect("non-empty advisories should produce a payload");
+
+        assert_eq!(payload["schema"], "policy_advisory.v1");
+        assert_eq!(payload["authority"], "advisory_evidence_only");
+        assert_eq!(payload["advisories"][0]["kind"], "stall");
+        assert_eq!(payload["advisories"][0]["ttl_rounds"], 1);
+        assert_eq!(
+            payload["advisories"][0]["evidence"][0],
+            "same tool call shape repeated"
+        );
+    }
+
+    #[test]
+    fn reward_hacking_warning_records_without_retry_or_schema_restriction() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
-        let mut stall_events = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
@@ -317,11 +394,9 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            message: "inspect the code",
             tool_calls_for_guard: &tool_calls,
             intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
-            stall_events: &mut stall_events,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
             restricted_tools: &mut restricted_tools,
@@ -330,33 +405,32 @@ mod tests {
             current_user_id: None,
             current_session_id: None,
             max_turns: 8,
-            loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
-        assert_eq!(remaining_turns, 8);
+        let advisories = proceed_advisories(out);
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].severity, "warning");
+        assert_eq!(remaining_turns, 10);
         // Reward-hacking guidance is advisory and must not hide the schema.
         assert!(
             !restricted_tools.contains("read_file"),
             "read-only tools must not be added to restricted_tools"
         );
         assert!(
-            messages
-                .iter()
-                .any(|message| message.to_string().contains("Reward-hacking guard"))
+            messages.is_empty(),
+            "behavioral warnings must not inject corrective prompt messages"
         );
         assert_eq!(verdict_events.len(), 1);
         assert_eq!(verdict_events[0].severity, "warning");
     }
 
     #[test]
-    fn warning_checkpoint_records_actual_remaining_turns_after_policy_penalty() {
+    fn warning_checkpoint_preserves_configured_remaining_turns() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = vec![json!({"role": "user", "content": "inspect the code"})];
-        let mut stall_events = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
@@ -380,11 +454,9 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            message: "inspect the code",
             tool_calls_for_guard: &tool_calls,
             intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
-            stall_events: &mut stall_events,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
             restricted_tools: &mut restricted_tools,
@@ -393,14 +465,15 @@ mod tests {
             current_user_id: Some(&user_id),
             current_session_id: Some(&session_id),
             max_turns: 20,
-            loop_turn: 5,
             recent_tools: &["read_file".to_string()],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
-        assert_eq!(remaining_turns, 8);
+        let advisories = proceed_advisories(out);
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].severity, "warning");
+        assert_eq!(remaining_turns, 10);
         let checkpoint = last_heavy_checkpoint
             .as_ref()
             .expect("warning verdict should write a heavy checkpoint");
@@ -408,8 +481,8 @@ mod tests {
             panic!("expected heavy checkpoint");
         };
         assert_eq!(
-            heavy.budget_remaining_rounds, 8,
-            "checkpoint must record actual remaining_turns, not max_turns - loop_turn"
+            heavy.budget_remaining_rounds, 10,
+            "behavioral warning must not apply hidden budget penalties"
         );
     }
 
@@ -417,7 +490,6 @@ mod tests {
     fn cache_waste_info_records_without_retry_or_restriction() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
-        let mut stall_events = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
@@ -431,11 +503,9 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            message: "inspect the code",
             tool_calls_for_guard: &tool_calls,
             intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
-            stall_events: &mut stall_events,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
             restricted_tools: &mut restricted_tools,
@@ -444,13 +514,12 @@ mod tests {
             current_user_id: None,
             current_session_id: None,
             max_turns: 8,
-            loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        assert_eq!(out, AgenticPostToolPolicyOutcome::ProceedEndTurn);
+        assert!(proceed_advisories(out).is_empty());
         assert!(
             messages.is_empty(),
             "info-level cache guidance must not pollute model messages"
@@ -469,7 +538,6 @@ mod tests {
     fn advisory_avoid_tools_do_not_remove_visible_tool_schema() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
-        let mut stall_events = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
@@ -485,11 +553,9 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            message: "collect review results",
             tool_calls_for_guard: &tool_calls,
             intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
-            stall_events: &mut stall_events,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
             restricted_tools: &mut restricted_tools,
@@ -498,13 +564,14 @@ mod tests {
             current_user_id: None,
             current_session_id: None,
             max_turns: 8,
-            loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
+        let advisories = proceed_advisories(out);
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].kind, "tool_behavior");
         assert_eq!(verdict_events.len(), 1);
         assert!(
             verdict_events[0]
@@ -519,16 +586,19 @@ mod tests {
             !restricted_tools.contains("agent_fanout"),
             "advisory avoid_tools must not remove the tool schema"
         );
+        assert!(
+            messages.is_empty(),
+            "advisory avoid_tools must not be injected back into the prompt"
+        );
     }
 
     #[test]
     fn critical_verdict_does_not_physically_restrict_avoid_tools() {
-        // First-Critical verdict (critical_turns == 1, force_stop == false)
+        // First-Critical verdict remains below the strong-advisory threshold.
         // can still name tools in retry guidance, but it must not remove them
         // from the schema. A failure does not prove the tool is unusable.
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
-        let mut stall_events = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
@@ -549,11 +619,9 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            message: "do something",
             tool_calls_for_guard: &tool_calls,
             intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
-            stall_events: &mut stall_events,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
             restricted_tools: &mut restricted_tools,
@@ -562,13 +630,12 @@ mod tests {
             current_user_id: None,
             current_session_id: None,
             max_turns: 8,
-            loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        // First Critical does not force-stop (that's critical_turns >= 2).
+        // First Critical remains below the strong-advisory threshold.
         let verdict = verdict_events.first().expect("verdict recorded");
         assert_eq!(verdict.severity, "critical");
         assert!(
@@ -579,10 +646,13 @@ mod tests {
             restricted_tools.is_empty(),
             "critical health/stall guidance must not physically restrict avoid_tools"
         );
-        assert_ne!(
-            out,
-            AgenticPostToolPolicyOutcome::Abort(String::new()),
-            "first Critical is not a force-stop"
+        let advisories = proceed_advisories(out);
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].severity, "critical");
+        assert_eq!(remaining_turns, 10);
+        assert!(
+            messages.is_empty(),
+            "critical behavioral verdicts are recorded, not injected"
         );
     }
 
@@ -590,7 +660,6 @@ mod tests {
     fn health_deprioritized_tools_remain_same_turn_advisory() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
-        let mut stall_events = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
@@ -603,11 +672,9 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            message: "run command",
             tool_calls_for_guard: &[],
             intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
-            stall_events: &mut stall_events,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
             restricted_tools: &mut restricted_tools,
@@ -616,17 +683,22 @@ mod tests {
             current_user_id: None,
             current_session_id: None,
             max_turns: 8,
-            loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
+        let advisories = proceed_advisories(out);
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].kind, "tool_behavior");
         assert!(turn_guard.health.is_avoidance_advised("write_file"));
         assert!(
             !restricted_tools.contains("write_file"),
             "soft health-deprioritized tools must not be hidden"
+        );
+        assert!(
+            messages.is_empty(),
+            "soft health-deprioritization must remain out-of-band"
         );
     }
 
@@ -654,7 +726,6 @@ mod tests {
     fn canonical_tool_call_shape_feeds_intent_tracking() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
-        let mut stall_events = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
@@ -672,11 +743,9 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            message: "list the files",
             tool_calls_for_guard: &tool_calls,
             intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
-            stall_events: &mut stall_events,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
             restricted_tools: &mut restricted_tools,
@@ -685,13 +754,12 @@ mod tests {
             current_user_id: None,
             current_session_id: None,
             max_turns: 8,
-            loop_turn: 0,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        assert_eq!(out, AgenticPostToolPolicyOutcome::ProceedEndTurn);
+        assert!(proceed_advisories(out).is_empty());
         assert_eq!(intent_tool_turns.len(), 1);
         assert_eq!(intent_tool_turns[0].0, vec!["bash".to_string()]);
         assert!(intent_tool_turns[0].1.contains("\"command\":\"ls\""));

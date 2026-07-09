@@ -323,6 +323,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             result_quality,
             executed_ms,
             &execution.result_str,
+            source_error_kind,
         );
 
         ExecutedExecution {

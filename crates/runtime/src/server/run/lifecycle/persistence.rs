@@ -2229,7 +2229,7 @@ pub(crate) fn build_run_turn_complete_event_with_interruption(
     });
     Value::Object(astra_turn_core::complete::build_turn_complete_event(
         total_tool_calls > 0,
-        interruption.is_some(),
+        false,
         &astra_turn_core::stall::DivergenceStatus::Healthy,
         execution_state,
         (!final_text.is_empty()).then_some(final_text),

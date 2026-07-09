@@ -172,7 +172,7 @@ mod tests {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
@@ -214,7 +214,6 @@ mod tests {
             recent_tools: Vec::new(),
             turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
-            textless_stop_retries: 0,
             last_finish_reason: None,
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
@@ -393,10 +392,11 @@ mod tests {
 
         // Post-Task #45: drained mailbox rides the structured volatile
         // lane (Kind::Mailbox) instead of state.messages.
-        let has_mailbox_msg = state
-            .volatile_pending
-            .iter()
-            .any(|inj| inj.content.contains("📬") && inj.content.contains("orchestrator"));
+        let has_mailbox_msg = state.volatile_pending.iter().any(|inj| {
+            inj.payload
+                .as_str()
+                .is_some_and(|text| text.contains("📬") && text.contains("orchestrator"))
+        });
         assert!(
             has_mailbox_msg,
             "should have mailbox injection in volatile_pending: {:?}",

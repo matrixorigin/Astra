@@ -13,7 +13,10 @@ pub(crate) fn detect_correction_signal(message: &str) -> bool {
 pub(crate) struct FinalizedInput {
     pub(crate) user_message: String,
     pub(crate) user_intent: String,
+    /// External/session-recovery context required for the next turn.
     pub(crate) runtime_required_texts: Vec<String>,
+    /// Dynamic text from external session sources (background jobs and task
+    /// board snapshots). Runtime policy/guardrail signals use the typed lane.
     pub(crate) runtime_volatile_texts: Vec<String>,
 }
 
@@ -55,26 +58,13 @@ pub(crate) async fn finalize_effective_line(
     if state.turns_since_task_use >= TURNS_SINCE_TASK_USE_THRESHOLD
         && state.turns_since_task_reminder >= TURNS_BETWEEN_REMINDERS
     {
-        let nudge = match state.task_manager.load_active_tasks().await {
-            Ok(tasks) => format_open_task_reminder_list(&tasks).map(|task_list| {
-                format!(
-                    "The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, \
-                    consider using task_board(action='create') to add new tasks and task_board(action='update', task_id='...', new_status='...') to update task status \
-                    (set new_status='in_progress' when starting, new_status='completed' when done, or new_status='paused' when waiting). Also consider cleaning up the task list if it has become stale. \
-                    Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable. \
-                    Make sure that you NEVER mention this reminder to the user\n\
-                \n\
-                Here is the open task board:\n{task_list}"
-                )
-            }),
-            Err(error) => Some(format!(
-                "Task board state could not be loaded while checking whether a task reminder is needed: {error}\n\
-                Do not assume there are no open tasks. If task tracking is relevant to the current work, retry task_board(action='list') or continue without task updates if unrelated. \
-                This reminder is throttled; never mention it to the user."
-            )),
+        let snapshot = match state.task_manager.load_active_tasks().await {
+            Ok(tasks) => format_open_task_snapshot(&tasks)
+                .map(|task_list| format!("External task board snapshot:\n{task_list}")),
+            Err(error) => Some(format!("External task board snapshot unavailable: {error}")),
         };
-        if let Some(nudge) = nudge {
-            runtime_volatile_texts.push(nudge);
+        if let Some(snapshot) = snapshot {
+            runtime_volatile_texts.push(snapshot);
         }
         state.turns_since_task_reminder = 0;
     }
@@ -93,7 +83,7 @@ pub(crate) async fn finalize_effective_line(
     }
 }
 
-fn format_open_task_reminder_list(tasks: &[SessionTask]) -> Option<String> {
+fn format_open_task_snapshot(tasks: &[SessionTask]) -> Option<String> {
     let mut lines: Vec<String> = tasks
         .iter()
         .filter(|task| task.status.is_open_work())
@@ -571,22 +561,18 @@ mod tests {
 
         assert_eq!(finalized.user_message, "continue");
         assert_eq!(finalized.runtime_volatile_texts.len(), 1);
-        let reminder = &finalized.runtime_volatile_texts[0];
-        assert!(reminder.contains("The task tools haven't been used recently."));
-        assert!(reminder.contains("new_status='in_progress'"));
-        assert!(reminder.contains("new_status='completed'"));
-        assert!(reminder.contains("new_status='paused'"));
-        assert!(reminder.contains("Here is the open task board:"));
-        assert!(reminder.contains("Track the recovery cleanup"));
-        assert!(reminder.contains("[paused] task-2: Wait for operator input"));
+        let snapshot = &finalized.runtime_volatile_texts[0];
+        assert!(snapshot.contains("External task board snapshot:"));
+        assert!(snapshot.contains("Track the recovery cleanup"));
+        assert!(snapshot.contains("[paused] task-2: Wait for operator input"));
         assert!(
-            !reminder.contains("Already finished"),
-            "terminal completed history should not clutter the open-work reminder: {reminder}"
+            !snapshot.contains("Already finished"),
+            "terminal completed history should not clutter the open-work snapshot: {snapshot}"
         );
         assert!(
             !finalized
                 .user_message
-                .contains("The task tools haven't been used recently.")
+                .contains("External task board snapshot:")
         );
         assert_eq!(state.turns_since_task_use, 10);
         assert_eq!(state.turns_since_task_reminder, 0);
@@ -627,7 +613,7 @@ mod tests {
         assert!(
             !finalized
                 .user_message
-                .contains("Here is the open task board:"),
+                .contains("External task board snapshot:"),
             "no-open-work sessions should not render an empty board reminder in user text: {finalized:?}"
         );
         assert_eq!(state.turns_since_task_use, 10);
@@ -656,12 +642,9 @@ mod tests {
         assert_eq!(finalized.user_message, "continue");
         assert_eq!(finalized.runtime_volatile_texts.len(), 1);
         assert!(
-            finalized.runtime_volatile_texts[0].contains("Task board state could not be loaded"),
-            "task reminder load failures must not be silently treated as no open work: {finalized:?}"
-        );
-        assert!(
-            finalized.runtime_volatile_texts[0].contains("Do not assume there are no open tasks"),
-            "load failure reminder should preserve the task-board uncertainty: {finalized:?}"
+            finalized.runtime_volatile_texts[0]
+                .contains("External task board snapshot unavailable"),
+            "task snapshot load failures must not be silently treated as no open work: {finalized:?}"
         );
         assert_eq!(state.turns_since_task_use, 10);
         assert_eq!(
@@ -691,10 +674,9 @@ mod tests {
         assert_eq!(finalized.user_message, "continue");
         assert_eq!(finalized.runtime_volatile_texts.len(), 1);
         assert!(
-            finalized.runtime_volatile_texts[0]
-                .contains("The task tools haven't been used recently.")
+            finalized.runtime_volatile_texts[0].contains("External task board snapshot:")
                 && finalized.runtime_volatile_texts[0].contains("Open work"),
-            "non-task tool names should not suppress the canonical task reminder: {finalized:?}"
+            "non-task tool names should not suppress the external task snapshot: {finalized:?}"
         );
         assert_eq!(state.turns_since_task_use, 10);
         assert_eq!(state.turns_since_task_reminder, 0);

@@ -13,16 +13,14 @@
 //!   3. Fabrication markers in response text — precedence with hallucinated tools.
 //!   4. Echo-style non-answers — only fires without tool calls.
 //!   5. Prompt-leak hard-block precedence over quality signals.
-//!   6. Repetition-loop hard-block precedence over quality signals.
+//!   6. Repetition-loop advisory composes with other quality signals.
 //!   7. Runaway same-tool-call loop detection at exact window boundary.
 //!   8. Rate-limit cooldown blocks then releases after timeout (429 / 503).
 
 use astra_turn_core::bridge_rate_limit_cooldown::{
     CooldownReason, RateLimitAction, RateLimitCooldown,
 };
-use astra_turn_core::response_guard::{
-    PROMPT_LEAK_FALLBACK, REPETITION_LOOP_FALLBACK, apply_response_guards,
-};
+use astra_turn_core::response_guard::{PROMPT_LEAK_FALLBACK, apply_response_guards};
 use astra_turn_core::stall::{SERVER_STALL_WINDOW, detect_server_stall};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -173,10 +171,10 @@ fn prompt_leak_hard_block_beats_quality_signals() {
     assert!(!result.quality.has_fabrication_markers);
 }
 
-// ── 6. Repetition-loop hard-block also beats quality signals ────────────────
+// ── 6. Repetition-loop advisory composes with quality signals ────────────────
 
 #[test]
-fn repetition_loop_hard_block_beats_quality_signals() {
+fn repetition_loop_advisory_preserves_other_quality_signals() {
     let tool_calls = vec![tc("invent_code", json!({}))]; // normally flagged
     let allowed = &["read_file"];
     // is_repetition_loop triggers on ≥8 identical consecutive words.
@@ -184,12 +182,9 @@ fn repetition_loop_hard_block_beats_quality_signals() {
 
     let result = apply_response_guards(&text, &tool_calls, allowed, "review");
 
-    assert_eq!(
-        result.replacement.as_deref(),
-        Some(REPETITION_LOOP_FALLBACK),
-        "repetition replacement must win over quality path"
-    );
-    assert!(result.quality.hallucinated_tools.is_empty());
+    assert!(result.replacement.is_none());
+    assert!(result.quality.has_repetition_loop);
+    assert_eq!(result.quality.hallucinated_tools, vec!["invent_code"]);
 }
 
 // ── 7. Runaway same-tool loop detection at exact window boundary ────────────

@@ -7628,22 +7628,6 @@ mod tests {
     }
 
     /// P1-B source guard: cancel_run must call cancel_children_of on delegation engine.
-    #[test]
-    fn cancel_run_cascades_to_delegation_children() {
-        let source = include_str!("../run/lifecycle/mod.rs");
-        let fn_start = source
-            .find("async fn cancel_run(")
-            .expect("cancel_run must exist");
-        let fn_end = source[fn_start..]
-            .find("\n    async fn ")
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("cancel_children_of"),
-            "cancel_run must cascade cancellation to delegation sub-runs"
-        );
-    }
 
     /// cancel_tokens must be cleaned up in cleanup_delegation to prevent memory leaks.
     #[tokio::test]

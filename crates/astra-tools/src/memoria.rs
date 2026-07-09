@@ -26,6 +26,7 @@ pub enum HttpMethod {
 pub struct BoostSearchHit {
     pub memory_id: Option<String>,
     pub content: String,
+    pub score: Option<f64>,
 }
 
 /// Parse content strings from a Memoria search/retrieve response.
@@ -65,6 +66,7 @@ pub fn parse_memory_search_hits(raw: &str) -> Vec<BoostSearchHit> {
             return vec![BoostSearchHit {
                 memory_id: mid,
                 content: c.to_string(),
+                score: parse_memory_hit_score(&val),
             }];
         }
         return vec![];
@@ -87,9 +89,46 @@ pub fn parse_memory_search_hits(raw: &str) -> Vec<BoostSearchHit> {
             Some(BoostSearchHit {
                 memory_id,
                 content: content.to_string(),
+                score: parse_memory_hit_score(item),
             })
         })
         .collect()
+}
+
+fn parse_memory_hit_score(item: &Value) -> Option<f64> {
+    item.get("score")
+        .or_else(|| item.get("final_score"))
+        .or_else(|| item.get("relevance_score"))
+        .or_else(|| item.get("retrieval_score"))
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|raw| raw.parse::<f64>().ok()))
+        })
+        .filter(|score| score.is_finite())
+}
+
+#[cfg(test)]
+mod boost_search_hit_tests {
+    use super::parse_memory_search_hits;
+
+    #[test]
+    fn parse_memory_search_hits_preserves_relevance_scores() {
+        let hits = parse_memory_search_hits(
+            r#"{"memories":[
+                {"memory_id":"a","content":"alpha","score":0.9},
+                {"memory_id":"b","content":"beta","final_score":"0.42"},
+                {"memory_id":"c","content":"gamma","relevance_score":"NaN"},
+                {"memory_id":"d","content":"delta"}
+            ]}"#,
+        );
+
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].score, Some(0.9));
+        assert_eq!(hits[1].score, Some(0.42));
+        assert_eq!(hits[2].score, None);
+        assert_eq!(hits[3].score, None);
+    }
 }
 
 /// Return true when text appears to contain credentials or similarly

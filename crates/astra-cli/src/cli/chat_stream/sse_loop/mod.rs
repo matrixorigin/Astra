@@ -778,9 +778,8 @@ pub(crate) async fn stream_chat_sse(
         total_cache_read: 0,
         total_cache_creation: 0,
         total_tool_calls: 0,
-        textless_stop_retries: 0,
         last_finish_reason: None,
-        total_evidence_tool_calls: 0,
+        total_observation_tool_calls: 0,
         has_any_usage: false,
         max_turns,
         remaining_turns: max_turns,
@@ -814,22 +813,17 @@ pub(crate) async fn stream_chat_sse(
             verdict_events: Vec::new(),
             last_heavy_checkpoint: None,
             tool_call_records: Vec::new(),
-            forced_factual_retry: false,
-            factual_retry_fallback_text: None,
-            forced_execution_retry: false,
-            forced_answer_relevance_retry: false,
-            forced_execution_escalation: false,
-            forced_parallel_batching: false,
-            forced_round_budget_phase1: false,
-            forced_round_budget_phase2: false,
+            execution_escalation_advisory_emitted: false,
+            parallel_batching_advisory_emitted: false,
+            repetition_advisory_emitted: false,
             introspection_count: 0,
-            forced_redundant_reads_corrective: false,
-            forced_cache_waste_corrective: false,
-            forced_search_fanout_corrective: false,
-            forced_exploration_family_corrective: false,
-            forced_exploration_family_phase2: false,
-            exploration_family_corrective_family: None,
-            forced_intent_drift: false,
+            redundant_reads_advisory_emitted: false,
+            cache_waste_advisory_emitted: false,
+            search_fanout_advisory_emitted: false,
+            exploration_family_advisory_emitted: false,
+            stronger_exploration_family_advisory_emitted: false,
+            exploration_family_advisory_family: None,
+            intent_drift_advisory_emitted: false,
             drift_nudge_count: 0,
             last_drift_correction_round: 0,
             nudge_count: 0,
@@ -838,8 +832,6 @@ pub(crate) async fn stream_chat_sse(
             ),
             guardrail_tuner: astra_runtime::config_admin::guardrail::GuardrailTuner::default(),
             guardrail_tuner_records_cursor: 0,
-            forced_completion_soft_stop: false,
-            forced_task_board_completion_gate: false,
         },
         telemetry: TelemetryState {
             explain_turns: Vec::new(),
@@ -1315,7 +1307,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn mutating_profile() -> TaskExecutionProfile {
-        TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard, true)
+        TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard)
     }
 
     #[test]
@@ -1377,25 +1369,6 @@ mod tests {
             Some("sess-missing-model")
         );
         assert!(failure.error.contains("default_model"), "{}", failure.error);
-    }
-
-    #[test]
-    fn stream_chat_sse_resolves_server_default_before_missing_model_preflight() {
-        let source = include_str!("mod.rs");
-        let fn_start = source
-            .find("pub(crate) async fn stream_chat_sse")
-            .expect("stream_chat_sse should exist");
-        let default_idx = source[fn_start..]
-            .find("resolve_server_default_model")
-            .expect("stream_chat_sse should resolve server default model");
-        let preflight_idx = source[fn_start..]
-            .find("require_selected_turn_model")
-            .expect("stream_chat_sse should keep missing-model preflight");
-
-        assert!(
-            default_idx < preflight_idx,
-            "server default model must be resolved before missing-model preflight"
-        );
     }
 
     #[test]

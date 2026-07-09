@@ -2,9 +2,8 @@ use std::time::{Duration, Instant};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, DeferredInputState,
-    FactualRetryFallbackJudgeContext, HostTurnResult, TaskBoardSnapshot, finalize_and_render,
-    finalize_turn_trace, try_write_heavy_checkpoint,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, DeferredInputState, HostTurnResult,
+    TaskBoardSnapshot, finalize_and_render, finalize_turn_trace, try_write_heavy_checkpoint,
 };
 use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
@@ -15,12 +14,13 @@ use astra_core::render_compact_status;
 use astra_services::{ContextManifestWrite, DatabaseContextManifestStore};
 use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
-    FactualRetryFallbackDecision, agentic_turn_stream_snapshot_with_kind,
-    ingest_agentic_turn_stream, map_ingest_outcome_to_iteration_control,
+    agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
+    map_ingest_outcome_to_iteration_control,
 };
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interaction_types::TurnInteractionMode;
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
+use astra_turn_core::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON;
 use astra_turn_core::stall::IntentDrift;
 use uuid::Uuid;
 
@@ -157,12 +157,6 @@ pub(crate) fn deferred_user_input_text(input: &serde_json::Value) -> Option<Stri
     }
 }
 
-fn render_deferred_user_input(content: &str) -> String {
-    format!(
-        "Newer user message(s) arrived during execution and now supersede the previous plan.\n\nNew user message(s):\n{content}\n\nRequired behavior:\n- Treat the last new user message as the newest user instruction.\n- Address it before making more tool calls.\n- Do not continue the previous plan blindly.\n- Only make another tool call if it is directly necessary to satisfy the newest user message."
-    )
-}
-
 pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -233,10 +227,6 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
             state
                 .deferred_input
                 .record_delivered_user_inputs(&observed.contents);
-            state.push_volatile(
-                super::host::VolatileKind::DeferredUserInput,
-                render_deferred_user_input(&combined),
-            );
         }
     }
 
@@ -321,44 +311,6 @@ fn record_early_exit_llm_round(
     }
 }
 
-fn unfinished_task_board_snapshot(state: &AgenticLoopState) -> Option<&TaskBoardSnapshot> {
-    state
-        .hooks
-        .task_board_snapshot
-        .has_completion_blocking_tasks()
-        .then_some(&state.hooks.task_board_snapshot)
-}
-
-fn unfinished_task_board_corrective_message(
-    snapshot: &TaskBoardSnapshot,
-    original_query: &str,
-) -> String {
-    format!(
-        "[unfinished-task-board:v1]\n\
-         Runtime correction: the session task board still has unfinished work. {}.\n\n\
-         REQUIRED next-step behavior:\n\
-         - Continue executing the remaining task-board work before reporting completion.\n\
-         - If a listed task is no longer needed, explicitly update/cancel/close it instead of ignoring it.\n\
-         - Do NOT give a success-shaped final answer while these tasks remain open.\n\n\
-         Original user query: {original_query}",
-        snapshot.status_count_summary(),
-    )
-}
-
-fn circuit_breaker_abort_detail(state: &AgenticLoopState) -> String {
-    let mut detail = format!(
-        "The circuit breaker stopped this turn after round {} because the model kept calling tools after the runtime injected a finalization correction.",
-        state.llm_rounds_completed
-    );
-    if let Some(diagnosis) = interruption_diagnosis_summary(state) {
-        detail.push_str(&format!(" Likely cause: {diagnosis}."));
-    }
-    detail.push_str(
-        " Progress from earlier rounds is preserved. Resume by synthesizing verified evidence before calling more tools.",
-    );
-    detail
-}
-
 pub(crate) struct TurnExecutionPhase {
     pub(crate) llm_wall_start: Instant,
     pub(crate) turn_result: HostTurnResult,
@@ -370,14 +322,115 @@ pub(crate) enum TurnExecutionControl {
     Return(AgenticLoopOutcome),
 }
 
+fn route_runtime_policy_evidence(
+    state: &mut AgenticLoopState,
+    facts: &astra_core::observation_journal::JournalFacts,
+    evidence: crate::turn::runtime_policy::RuntimePolicyEvidence,
+) {
+    use crate::turn::runtime_policy::{PhaseTarget, RuntimePolicyEvidence};
+
+    match evidence {
+        RuntimePolicyEvidence::BudgetExpansionSuggested {
+            factor,
+            max_ceiling,
+        } => {
+            state.push_volatile_payload(
+                super::host::VolatileKind::BudgetReview,
+                serde_json::json!({
+                    "schema": "runtime_policy_advisory.v1",
+                    "signal": "budget_expansion_suggested",
+                    "evidence": {
+                        "consecutive_outcomes": facts.streaks.consecutive_rounds_with_outcome,
+                        "current_max_turns": state.max_turns,
+                        "remaining_turns": state.remaining_turns,
+                        "suggested_factor": factor,
+                        "configured_ceiling": max_ceiling,
+                    },
+                    "authority": "advisory_evidence_only",
+                    "model_discretion": "The policy did not change the runtime budget. Continue within the actual remaining budget shown by the runtime.",
+                }),
+            );
+            tracing::info!(
+                target: "astra::policy",
+                factor,
+                max_ceiling,
+                "policy recorded budget-expansion evidence without mutating budget"
+            );
+        }
+        RuntimePolicyEvidence::Advisory { message } => {
+            state.push_volatile_payload(
+                super::host::VolatileKind::BehaviorAdvisory,
+                serde_json::json!({
+                    "schema": "runtime_policy_advisory.v1",
+                    "signal": "policy_observation",
+                    "evidence": message,
+                    "authority": "advisory_evidence_only",
+                }),
+            );
+            tracing::info!(
+                target: "astra::policy",
+                signal = %message,
+                "policy observation recorded as advisory evidence"
+            );
+        }
+        RuntimePolicyEvidence::ContextPressureObserved { urgency } => {
+            let pressure = facts.performance.token_pressure;
+            state.push_volatile_payload(
+                super::host::VolatileKind::ContextPressure,
+                serde_json::json!({
+                    "schema": "runtime_policy_advisory.v1",
+                    "signal": "context_pressure_observed",
+                    "evidence": {
+                        "token_pressure": pressure,
+                        "urgency": urgency.to_string(),
+                    },
+                    "recommendation": "Consider reusing prior results, avoiding duplicate reads, or selecting a narrow next action.",
+                    "authority": "advisory_evidence_only",
+                }),
+            );
+            tracing::info!(
+                target: "astra::policy",
+                %urgency,
+                token_pressure = pressure,
+                "policy context-pressure evidence recorded"
+            );
+        }
+        RuntimePolicyEvidence::PhaseTransitionSuggested { target } => {
+            let phase_label = match target {
+                PhaseTarget::Reflection => "reflection",
+                PhaseTarget::Summarization => "summarization",
+                PhaseTarget::Planning => "planning",
+                PhaseTarget::Completion => "completion",
+            };
+            state.push_volatile_payload(
+                super::host::VolatileKind::BehaviorAdvisory,
+                serde_json::json!({
+                    "schema": "runtime_policy_advisory.v1",
+                    "signal": "phase_transition_suggested",
+                    "evidence": {
+                        "suggested_phase": phase_label,
+                        "task_completion_ratio": facts.task.task_completion_ratio,
+                    },
+                    "recommendation": "Consider transitioning if that best serves the current user goal.",
+                    "authority": "advisory_evidence_only",
+                    "model_discretion": "The runtime did not change phase or require finalization.",
+                }),
+            );
+            tracing::info!(
+                target: "astra::policy",
+                %target,
+                completion_ratio = facts.task.task_completion_ratio,
+                "policy phase-transition evidence recorded"
+            );
+        }
+        RuntimePolicyEvidence::NoAdvisory => {}
+    }
+}
+
 fn manifest_reason_for_llm_call(state: &AgenticLoopState) -> &'static str {
-    let has_compaction_marker = state.messages.iter().any(|message| {
-        message
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|content| content.to_ascii_lowercase().contains("compaction"))
-    });
-    if has_compaction_marker {
+    if state.compact_tier_applied != astra_turn_core::compaction_types::CompactionTier::Normal
+        || state.compaction_effectiveness.attempt_count > 0
+    {
         "post_compaction"
     } else {
         "normal_turn"
@@ -530,128 +583,6 @@ fn context_window_tokens_for_context_manifest(state: &AgenticLoopState) -> u32 {
         .unwrap_or(crate::prompts::DEFAULT_CONTEXT_WINDOW_TOKENS as u32)
 }
 
-fn circuit_breaker_introspection_message(
-    llm_rounds_completed: u32,
-    consecutive_read_only: usize,
-) -> String {
-    format!(
-        "[Self-check — round {}] You have been reading/exploring for {} consecutive rounds \
-         without writing. Take a moment to assess:\n\
-         - Do you have enough information to produce your answer? If yes, do so now.\n\
-         - If not, what specific information are you still missing?\n\
-         Tools remain available.",
-        llm_rounds_completed, consecutive_read_only
-    )
-}
-
-async fn maybe_judge_factual_retry_fallback<H: AgenticLoopHost>(
-    host: &mut H,
-    state: &AgenticLoopState,
-    retry_text: &str,
-    round_has_edge_work: bool,
-) -> Option<FactualRetryFallbackDecision> {
-    if round_has_edge_work
-        || !state.stall.forced_factual_retry
-        || state.total_evidence_tool_calls != 0
-        || retry_text.trim().is_empty()
-    {
-        return None;
-    }
-    let fallback_text = state.stall.factual_retry_fallback_text.as_deref()?;
-    if fallback_text.trim().is_empty() {
-        return None;
-    }
-
-    host.judge_factual_retry_fallback(FactualRetryFallbackJudgeContext {
-        original_query: state.message.as_str(),
-        fallback_text,
-        retry_text,
-    })
-    .await
-}
-
-fn has_successful_real_tool_evidence(state: &AgenticLoopState) -> bool {
-    state.total_evidence_tool_calls > 0
-        || state.stall.tool_call_records.iter().any(|record| {
-            record.ok && !record.is_synthetic_placeholder() && !record.was_blocked_by_policy()
-        })
-}
-
-fn should_force_answer_relevance_retry(state: &AgenticLoopState) -> bool {
-    if state.stall.forced_answer_relevance_retry
-        || state.final_text.trim().is_empty()
-        || !has_successful_real_tool_evidence(state)
-        || state.budget_wrapup_injected
-        || state.stall.hard_intervention_active()
-    {
-        return false;
-    }
-
-    let latest_user_message = answer_relevance_latest_user_message(state);
-    astra_turn_core::evaluation::final_answer_relevance_signal(
-        latest_user_message.as_str(),
-        state.final_text.as_str(),
-    )
-    .is_some()
-}
-
-/// Check if the retry was attempted and the answer is STILL off-target.
-/// If so, produce an interruption instead of delivering a bad answer.
-fn is_answer_relevance_retry_exhausted(state: &AgenticLoopState) -> bool {
-    if !state.stall.forced_answer_relevance_retry || state.final_text.trim().is_empty() {
-        return false;
-    }
-    let latest_user_message = answer_relevance_latest_user_message(state);
-    astra_turn_core::evaluation::final_answer_relevance_signal(
-        latest_user_message.as_str(),
-        state.final_text.as_str(),
-    )
-    .is_some()
-}
-
-fn answer_relevance_latest_user_message(state: &AgenticLoopState) -> String {
-    state
-        .messages
-        .iter()
-        .rev()
-        .filter(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-        .filter(|message| !is_execution_corrective_message(message))
-        .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
-        .map(astra_turn_core::chat_turn_heuristics::active_user_task_text)
-        .find(|content| !content.trim().is_empty())
-        .unwrap_or_else(|| {
-            astra_turn_core::chat_turn_heuristics::active_user_task_text(state.message.as_str())
-        })
-}
-
-fn remove_trailing_assistant_final_answer(messages: &mut Vec<serde_json::Value>, final_text: &str) {
-    let Some(last) = messages.last() else {
-        return;
-    };
-    let is_matching_final = last
-        .get("role")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|role| role == "assistant")
-        && last
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|content| content.trim() == final_text.trim());
-    if is_matching_final {
-        messages.pop();
-    }
-}
-
-fn answer_relevance_retry_message(latest_user_message: &str) -> String {
-    format!(
-        "{FINAL_ANSWER_RELEVANCE_RETRY_MARKER}\n\
-         The previous final answer did not answer the latest user request.\n\
-         Latest user request: {latest_user_message}\n\
-         Use the already available tool results and answer that request directly now. \
-         Do not discuss resume state, degraded context, workspace readiness, or waiting for \
-         another instruction unless the user explicitly asked about those topics."
-    )
-}
-
 pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -666,12 +597,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     // ── Nudge suppression gate ──────────────────────────────────────────
     // In PermissionMode::Auto the user has explicitly asked to let the
-    // model run to completion without interruption. Skip all corrective
-    // / interruption-style nudges in that case: execution escalation,
-    // parallel-batching force, circuit-breaker correction/introspect/
-    // soft-stop, exploration-family retries, redundant-reads, cache-
-    // waste. Safety-critical abort (circuit breaker) still fires — it
-    // terminates the loop, not just nudges.
+    // model run to completion without interruption. Skip optional behavioral
+    // advisory evidence in that case. True safety, permission, capability, and
+    // budget boundaries remain enforced independently.
     //
     // Observed in session 3b7ac18f: ~10 nudge injections across 15
     // turns in Auto mode, user complaint "不停的被打断,不一气呵成".
@@ -684,26 +612,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // Skip when the host already injects guidance (e.g. server path injects
     // it into the system prompt in its own execute_turn).
     //
-    // The guidance is *ephemeral*: we strip any prior guidance message before
-    // injecting a fresh one so the message vec (and any downstream REPL-history
-    // replay that keys off it) does not accumulate one guidance block per
-    // LLM round. Detection uses the stable headings produced by
-    // `round_budget_directive`.
-    fn is_ephemeral_round_budget_msg(m: &serde_json::Value) -> bool {
-        if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-            return false;
-        }
-        m.get("content").and_then(|c| c.as_str()).is_some_and(|s| {
-            s.contains("## ⚡ Round Budget")
-                || s.contains("## ⚠ Round Budget")
-                || s.contains("## ⚡ Self-Status")
-        })
-    }
-
     if !host.injects_round_guidance() {
-        // Drop any stale guidance/status messages from prior rounds.
-        state.messages.retain(|m| !is_ephemeral_round_budget_msg(m));
-
         // ── Self-Status injection (push-mode observation) ─────────────────
         // Always inject a compact self-status block so the agent sees its
         // current health (token pressure, trends, alerts, circuit breaker)
@@ -721,7 +630,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             let token_pressure = status_provider.token_pressure();
             let alerts: Vec<String> = {
                 let mut a = Vec::new();
-                if state.stall.forced_execution_escalation {
+                if state.stall.execution_escalation_advisory_emitted {
                     a.push("execution_escalation".to_string());
                 }
                 if state.stall.drift_nudge_count > 0 {
@@ -761,20 +670,17 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
-    // Mid-loop execution escalation: if the model has been burning tool calls
-    // on read-only inspection of a mutating task without committing a single
-    // edit, force a high-signal correction BEFORE the next LLM call. This
-    // catches the failure mode where the loop runs out of budget in an
-    // inspection spiral (see session 4178c6a7). One-shot per turn; stripped
-    // by `finalize_and_render`.
-    if !suppress_nudges && should_escalate_execution(state) {
+    // If a mutating task has accumulated only read-only observations, surface
+    // that fact before the next LLM call. It remains advisory because further
+    // investigation may still be justified by a concrete unknown.
+    if !suppress_nudges && should_emit_execution_escalation_advisory(state) {
         let read_only_calls = state
             .stall
             .tool_call_records
             .iter()
             .filter(|r| !r.is_synthetic_placeholder() && r.ok)
             .count();
-        state.stall.forced_execution_escalation = true;
+        state.stall.execution_escalation_advisory_emitted = true;
         let msg = execution_escalation_message(&state.message, read_only_calls);
         state.push_volatile(super::host::VolatileKind::ExecutionEscalation, msg);
         tracing::warn!(
@@ -782,13 +688,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             tier = "execution_escalation",
             read_only_calls,
             round = state.llm_rounds_completed,
-            "loop guard fired"
+            "execution-pattern advisory observed"
         );
         if !prep.quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
                 format!(
-                    "↻ Mutating task accumulated {read_only_calls} read-only tool calls with zero edits; forcing escalation…"
+                    "↻ Mutating task accumulated {read_only_calls} read-only tool calls with zero edits; adding execution advisory…"
                 ),
             );
         }
@@ -808,16 +714,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     // ── Composable guard pipeline ────────────────────────────────────────
     // Each guard is defined in the `guards` module. The pipeline evaluates
-    // them in order, injects corrections, and propagates aborts. Guards are
+    // them in order and records advisory evidence. Guards are
     // independently testable — see guards.rs for individual unit tests.
     //
     // Previously each guard was inlined as ~30-line blocks below; the
     // pipeline reduces this section from ~80 lines to ~15.
     //
-    // Runs *after* the circuit breaker so guards that defer to budget
-    // pressure (redundant_reads, cache_waste) see the final
-    // `forced_round_budget_phase1` state and can correctly skip when the
-    // breaker has already escalated.
+    // Runs after the circuit breaker so guards can avoid stacking redundant
+    // advisory evidence when a stronger signal was already emitted.
     {
         let guard_cfg = super::guards::GuardConfig {
             suppress_nudges,
@@ -826,47 +730,17 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             cache_waste_threshold,
         };
         let guards = super::guards::default_guards();
-        match super::guards::evaluate_guards(&guards, state, &guard_cfg) {
-            Ok(corrections) => {
-                for (hint_style, hint_text) in corrections {
-                    if !prep.quiet {
-                        host.emit_headless_line(hint_style, hint_text);
-                    }
-                }
-            }
-            Err(abort_reason) => {
-                // Guard pipeline requested abort — terminate the turn.
-                //
-                // Record a structured InterruptionRecord so resumption surfaces
-                // *why* the guard pipeline halted the turn. Without this, the
-                // abort reason lives only in `final_text` (an opaque string),
-                // and a resumed session cannot tell a guard abort apart from a
-                // normal completion. The journal/checkpoint consumer relies on
-                // `state.interruption` for machine-readable recovery context.
-                state.final_text = abort_reason.clone();
-                state.interruption = Some(InterruptionRecord::new(
-                    InterruptionKind::GuardAbort,
-                    ResumeAction::ContinueImmediately,
-                    interruption_state_summary(state, Some(abort_reason)),
-                ));
-                tracing::warn!(
-                    target: "astra::loop_guard",
-                    tier = "guard_pipeline_abort",
-                    round = state.llm_rounds_completed,
-                    "guard pipeline abort — turn terminated by guard"
-                );
-                state.step_recorder.end_turn(false);
-                finalize_and_render(host, state).await;
-                return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
+        for (hint_style, hint_text) in super::guards::evaluate_guards(&guards, state, &guard_cfg) {
+            if !prep.quiet {
+                host.emit_headless_line(hint_style, hint_text);
             }
         }
     }
 
     // ── Policy-driven evaluation (RuntimePolicy) ───────────────────────
     // Compute JournalFacts from the current loop state and delegate to
-    // RuntimePolicy::decide(). The Policy produces FrameworkActions that
-    // complement the guard pipeline above — budget expansion, phase
-    // transitions, and signal injection.
+    // RuntimePolicy::decide(). The policy produces `RuntimePolicyEvidence`
+    // values that complement the guard pipeline above.
     //
     // This runs after the guard pipeline so it sees the latest tool-call
     // records and circuit-breaker state.
@@ -875,7 +749,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         use crate::turn::providers::{
             LiveRuntimeProvider, ObservationProvider, SessionStateProvider,
         };
-        use crate::turn::runtime_policy::FrameworkAction;
         use astra_core::observation_journal::JournalFacts;
 
         let provider = LocalSessionProvider::new(state);
@@ -887,7 +760,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         // extract_facts provides streak and budget data from the journal
         // window; these fields come from the full session state.
         facts.budget.rounds_completed = state.llm_rounds_completed;
-        facts.performance.total_evidence_calls = state.total_evidence_tool_calls;
+        facts.performance.total_observation_calls = state.total_observation_tool_calls;
         facts.performance.total_errors = state.turn_guard.health.recent_errors(10).len() as u32;
         facts.performance.total_tool_calls = state.total_tool_calls;
 
@@ -902,9 +775,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
         let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
         let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
-        let actions = policy.decide(&facts);
+        let policy_evidence = policy.decide(&facts);
 
-        // ── Observation pipeline: dispatch PolicyDecision events ──
+        // ── Observation pipeline: dispatch PolicyEvidence events ──
         {
             let mut dispatcher = ObservationDispatcher::new();
             dispatcher.register(MemorySink::new(&mut state.observation_journal));
@@ -918,119 +791,40 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         .to_string(),
                 ));
             }
-            for action in &actions {
-                dispatcher.dispatch(ObservationEvent::PolicyDecision {
-                    action: action.clone(),
+            for evidence in &policy_evidence {
+                dispatcher.dispatch(ObservationEvent::PolicyEvidence {
+                    evidence: evidence.clone(),
                 });
             }
         } // dispatcher dropped — releases &mut observation_journal
 
-        for action in actions {
-            match action {
-                FrameworkAction::ExpandBudget {
-                    factor,
-                    max_ceiling,
-                } => {
-                    let new_max = ((state.max_turns as f64) * factor).ceil() as usize;
-                    let ceiling = max_ceiling as usize;
-                    let capped = new_max.min(ceiling);
-                    if capped > state.max_turns {
-                        let added = capped - state.max_turns;
-                        state.max_turns = capped;
-                        state.remaining_turns += added;
-                        // Reset self-pacing hint flags so the new budget gets fresh hints
-                        state.turn_budget_hint_emitted_90 = false;
-                        state.turn_budget_hint_emitted_50 = false;
-                        state.turn_budget_hint_emitted_20 = false;
-                        let msg = format!(
-                            "[Budget review] Recent progress: expanding budget by ×{factor:.1} ({added} additional turns). Hard ceiling: {ceiling} total turns."
-                        );
-                        state.push_volatile(super::host::VolatileKind::BudgetReview, msg);
-                        tracing::info!(
-                            target: "astra::policy",
-                            factor,
-                            max_ceiling,
-                            new_max = capped,
-                            "Policy-driven budget expansion"
-                        );
-                    }
-                }
-                FrameworkAction::InjectSignal { message } => {
-                    state.push_volatile(
-                        super::host::VolatileKind::Corrective,
-                        format!("[Framework signal] {}", message),
-                    );
-                    tracing::info!(
-                        target: "astra::policy",
-                        signal = %message,
-                        "Policy injected signal into agent context"
-                    );
-                }
-                FrameworkAction::SignalContextPressure { urgency } => {
-                    let pressure = facts.performance.token_pressure;
-                    let msg = format!(
-                        "[Context pressure] Token pressure is {:.0}% ({urgency}). Conserve context: reuse prior tool results, avoid duplicate reads, summarize current evidence briefly, and prefer targeted next actions.",
-                        pressure * 100.0,
-                        urgency = urgency,
-                    );
-                    state.push_volatile(super::host::VolatileKind::ContextPressure, msg);
-                    tracing::info!(
-                        target: "astra::policy",
-                        %urgency,
-                        token_pressure = pressure,
-                        "Policy context-pressure guidance injected"
-                    );
-                }
-                FrameworkAction::TransitionPhase { target } => {
-                    let phase_label = match target {
-                        crate::turn::runtime_policy::PhaseTarget::Reflection => "reflection",
-                        crate::turn::runtime_policy::PhaseTarget::Summarization => "summarization",
-                        crate::turn::runtime_policy::PhaseTarget::Planning => "planning",
-                        crate::turn::runtime_policy::PhaseTarget::Completion => "completion",
-                    };
-                    let msg = format!(
-                        "[Framework action] Phase transition requested: {phase_label}. Consider wrapping up and preparing to transition."
-                    );
-                    state.push_volatile(super::host::VolatileKind::Corrective, msg);
-                    if target == crate::turn::runtime_policy::PhaseTarget::Completion {
-                        // Signal completion — inject a stronger nudge when all tasks are done.
-                        let completion_msg = format!(
-                            "[Framework action] All tasks completed (ratio: {:.0}%). Consider finalizing the turn.",
-                            facts.task.task_completion_ratio * 100.0,
-                        );
-                        state.push_volatile(super::host::VolatileKind::Corrective, completion_msg);
-                    }
-                    tracing::info!(
-                        target: "astra::policy",
-                        %target,
-                        completion_ratio = facts.task.task_completion_ratio,
-                        "Policy-driven phase transition"
-                    );
-                }
-                FrameworkAction::Continue => {}
-            }
+        for evidence in policy_evidence {
+            route_runtime_policy_evidence(state, &facts, evidence);
         }
     }
 
     // ── Intent drift detection ─────────────────────────────────────────
     // Check if the agent has drifted from the user's original intent by
     // analyzing recent tool calls against the user query. If drift is
-    // detected, inject a correction via the volatile lane so the LLM
+    // detected, surface advisory evidence via the volatile lane so the LLM
     // refocuses on the original task. Singleton kind ensures only the
-    // latest correction rides the wire, avoiding prompt cache bloat.
+    // latest observation rides the wire, avoiding prompt cache bloat.
     //
     // Runs after the guard pipeline so it sees the most recent tool calls
     // in `state.stall.intent_tool_turns`. Skipped when `suppress_nudges`
     // is true (Auto mode) to avoid interrupting the flow.
     //
-    // One-shot per turn: once forced_intent_drift is set, no further
-    // corrections are injected this turn, preserving prompt-cache prefix.
-    if !suppress_nudges && !state.stall.forced_intent_drift && state.llm_rounds_completed > 0 {
+    // One-shot per turn: once intent_drift_advisory_emitted is set, no further
+    // repeated advisories are not injected this turn, preserving prompt-cache prefix.
+    if !suppress_nudges
+        && !state.stall.intent_drift_advisory_emitted
+        && state.llm_rounds_completed > 0
+    {
         let drift = host
             .detect_intent_drift(&state.message, &state.stall.intent_tool_turns)
             .await;
         if let IntentDrift::Drifting { correction, .. } = drift {
-            state.stall.forced_intent_drift = true;
+            state.stall.intent_drift_advisory_emitted = true;
             state.stall.drift_nudge_count += 1;
             state
                 .turn_guard
@@ -1042,7 +836,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 tier = "intent_drift",
                 round = state.llm_rounds_completed,
                 drift_nudge_count = state.stall.drift_nudge_count,
-                "intent drift detected — injecting correction"
+                "intent drift evidence recorded"
             );
             if !prep.quiet {
                 host.emit_headless_line(
@@ -1057,89 +851,84 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     // ── Circuit breaker observation ──────────────────────────────────────
-    // Feed the previous round's signal to the circuit breaker. On the first
-    // round (no previous tool calls), this is skipped. The breaker decides
-    // whether to inject a correction or abort based on anomaly detection.
+    // Feed the previous round's signal to the circuit breaker. The runtime
+    // treats loop-pattern detectors as observation, not authority: repeated
+    // read/search/tool patterns can be valid work. Only infrastructure hard
+    // ceilings may terminate the turn here. Advisory signals are recorded for
+    // telemetry and introspection but do not inject extra user messages.
     if state.llm_rounds_completed > 0 {
         let signal = build_circuit_breaker_signal(state);
         let action = state.stall.circuit_breaker.observe(signal);
         match action {
-            astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection
-                if suppress_nudges =>
-            {
-                // Auto mode suppresses the corrective message. Do not move
-                // the breaker to HalfOpen because no correction was actually
-                // delivered; otherwise a later Abort can appear without the
-                // promised prior warning.
+            astra_turn_core::loop_circuit_breaker::BreakerAction::PatternObserved => {
+                if !suppress_nudges {
+                    state.push_volatile_payload(
+                        super::host::VolatileKind::CircuitBreaker,
+                        serde_json::json!({
+                            "signal": "repeated_behavior_pattern",
+                            "round": state.llm_rounds_completed,
+                            "assessment": "The recent tool pattern may be repetitive. Treat this as evidence when choosing the next action; continue if the repetition is justified by the task."
+                        }),
+                    );
+                }
+                state
+                    .stall
+                    .circuit_breaker
+                    .acknowledge_pattern_observation();
+                tracing::info!(
+                    target: "astra::loop_guard",
+                    tier = "circuit_breaker_advisory",
+                    round = state.llm_rounds_completed,
+                    suppressed = suppress_nudges,
+                    "circuit breaker observed a repeated pattern; no advisory message injected"
+                );
             }
-            astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection => {
-                state.stall.forced_round_budget_phase1 = true;
-                state.stall.circuit_breaker.correction_injected();
-                // Tool use remains available. The breaker can identify a loop
-                // pattern, but it cannot know whether the failure is a broken
-                // tool, stale arguments, or the model's strategy. Keep the tool
-                // surface stable and inject guidance instead of banning tools.
-                let msg = round_budget_phase1_message(state.llm_rounds_completed, &state.message);
-                state.push_volatile(super::host::VolatileKind::BudgetAdvisory, msg);
+            astra_turn_core::loop_circuit_breaker::BreakerAction::AdvisoryThresholdReached => {
+                let diagnosis = interruption_diagnosis_summary(state);
+                if !suppress_nudges {
+                    state.push_volatile_payload(
+                        super::host::VolatileKind::CircuitBreaker,
+                        serde_json::json!({
+                            "signal": "repetition_threshold_reached",
+                            "round": state.llm_rounds_completed,
+                            "diagnosis": diagnosis,
+                            "assessment": "A behavior-pattern detector reached its configured threshold. This is advisory evidence, not a budget or safety boundary; decide whether to change approach or continue with the current evidence."
+                        }),
+                    );
+                }
                 tracing::warn!(
                     target: "astra::loop_guard",
-                    tier = "circuit_breaker_correction",
+                    tier = "circuit_breaker_threshold_advisory",
                     round = state.llm_rounds_completed,
-                    "circuit breaker tripped — injecting guidance"
+                    "circuit breaker threshold recorded as advisory evidence"
                 );
                 if !prep.quiet {
                     host.emit_headless_line(
                         HeadlessStderrStyle::Yellow,
                         format!(
-                            "↻ Circuit breaker tripped at round {} (stall/regression detected); injecting convergence guidance…",
+                            "↻ Repetition threshold observed at round {}; continuing with advisory evidence.",
                             state.llm_rounds_completed
                         ),
                     );
                 }
             }
-            astra_turn_core::loop_circuit_breaker::BreakerAction::Abort => {
-                state.stall.forced_round_budget_phase2 = true;
-                let diagnosis = interruption_diagnosis_summary(state);
-                // Rich, contextual abort message: includes the diagnosis,
-                // the most recent preserved tool calls, and a concrete
-                // next-step line tied to the stall pattern. Used when the
-                // model has not yet produced any free-form text — the old
-                // behaviour was to leave users with a single red banner.
-                let abort_msg = super::lifecycle::build_circuit_breaker_abort_message(state);
-                if state.final_text.trim().is_empty() {
-                    state.final_text = abort_msg.clone();
-                } else {
-                    state.final_text.push_str("\n\n");
-                    state.final_text.push_str(&abort_msg);
-                }
-                state.final_text_streamed = false;
+            astra_turn_core::loop_circuit_breaker::BreakerAction::HardRoundLimitReached {
+                rounds,
+                limit,
+            } => {
+                let detail = format!("Infrastructure round limit reached: {rounds}/{limit} rounds");
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::BudgetExhausted,
                     ResumeAction::ContinueImmediately,
-                    interruption_state_summary(state, Some(abort_msg)),
+                    interruption_state_summary(state, Some(detail.clone())),
                 ));
-                tracing::warn!(
-                    target: "astra::loop_guard",
-                    tier = "circuit_breaker_abort",
-                    round = state.llm_rounds_completed,
-                    "circuit breaker abort — agent did not recover"
-                );
                 if !prep.quiet {
                     host.emit_headless_line(
                         HeadlessStderrStyle::Yellow,
-                        if let Some(diagnosis) = diagnosis.as_deref() {
-                            format!(
-                                "⛔ Circuit breaker abort at round {}; likely cause: {}.",
-                                state.llm_rounds_completed, diagnosis
-                            )
-                        } else {
-                            format!(
-                                "⛔ Circuit breaker abort at round {}; agent did not recover after correction.",
-                                state.llm_rounds_completed
-                            )
-                        },
+                        format!("⚠ {detail}; preserving completed work."),
                     );
                 }
+                try_write_heavy_checkpoint(state);
                 state.step_recorder.end_turn(false);
                 finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
@@ -1147,57 +936,49 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             astra_turn_core::loop_circuit_breaker::BreakerAction::Introspect { .. }
                 if suppress_nudges =>
             {
-                // Auto mode: don't interject a [Self-check — round N]
-                // message; the user opted in to uninterrupted execution.
+                // Auto mode: advisory signal only.
             }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Introspect {
                 consecutive_read_only,
             } => {
-                // `introspection_count` is monotonic for the lifetime of this turn
-                // (not reset between introspect emissions). It mirrors the breaker's
-                // own `introspect_emissions_since_last_write` counter but is retained
-                // for structured logging / observability only.
                 state.stall.introspection_count = state.stall.introspection_count.saturating_add(1);
                 let emission_index = state.stall.introspection_count;
-                let msg = circuit_breaker_introspection_message(
-                    state.llm_rounds_completed,
-                    consecutive_read_only,
+                state.push_volatile_payload(
+                    super::host::VolatileKind::CircuitBreaker,
+                    serde_json::json!({
+                        "signal": "read_only_streak",
+                        "consecutive_read_only": consecutive_read_only,
+                        "round": state.llm_rounds_completed,
+                        "assessment": "Review whether the current read-only investigation is still producing new evidence. This signal does not require stopping or changing tools."
+                    }),
                 );
-                state.push_volatile(super::host::VolatileKind::CircuitBreaker, msg);
                 tracing::info!(
                     target: "astra::loop_guard",
-                    tier = "circuit_breaker_introspect",
+                    tier = "circuit_breaker_introspect_advisory",
                     round = state.llm_rounds_completed,
                     consecutive_read_only,
                     emission = emission_index,
-                    "circuit breaker introspection — periodic self-check injected"
+                    "circuit breaker introspection signal recorded; no prompt injected"
                 );
-                if !prep.quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Yellow,
-                        format!(
-                            "↻ Self-check prompt injected at round {} ({} consecutive read-only rounds, emission #{}).",
-                            state.llm_rounds_completed, consecutive_read_only, emission_index
-                        ),
-                    );
-                }
             }
-            astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop if suppress_nudges => {}
-            astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop => {
-                state.stall.forced_completion_soft_stop = true;
-                let msg = completion_soft_stop_message(state.llm_rounds_completed, &state.message);
-                state.push_volatile(super::host::VolatileKind::CircuitBreaker, msg);
+            astra_turn_core::loop_circuit_breaker::BreakerAction::CompletionObserved
+                if suppress_nudges => {}
+            astra_turn_core::loop_circuit_breaker::BreakerAction::CompletionObserved => {
+                state.push_volatile_payload(
+                    super::host::VolatileKind::CircuitBreaker,
+                    completion_observation_payload(state.llm_rounds_completed, &state.message),
+                );
                 tracing::info!(
                     target: "astra::loop_guard",
-                    tier = "completion_soft_stop",
+                    tier = "completion_observation",
                     round = state.llm_rounds_completed,
-                    "completion soft-stop injected"
+                    "completion observation injected"
                 );
                 if !prep.quiet {
                     host.emit_headless_line(
                         HeadlessStderrStyle::Yellow,
                         format!(
-                            "↻ Task appears complete at round {}; nudging model to stop unless work remains.",
+                            "↻ Task completion evidence observed at round {}; model retains final-action discretion.",
                             state.llm_rounds_completed
                         ),
                     );
@@ -1211,14 +992,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     if !suppress_nudges
-        && !state.stall.forced_round_budget_phase1
-        && !state.stall.forced_completion_soft_stop
+        && !state.stall.stronger_advisory_emitted()
         && let Some((family, retry_cautioned_tools)) = exploration_family_phase2_candidate(state)
     {
-        state.stall.forced_exploration_family_phase2 = true;
+        state.stall.stronger_exploration_family_advisory_emitted = true;
         let msg =
             exploration_family_phase2_message(&family, &retry_cautioned_tools, &state.message);
-        state.push_volatile(super::host::VolatileKind::Corrective, msg);
+        state.push_volatile(super::host::VolatileKind::BehaviorAdvisory, msg);
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "exploration_family_phase2",
@@ -1231,31 +1011,31 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
                 format!(
-                    "↻ repeated low-yield {family} retry [{}]; injecting convergence corrective…",
+                    "↻ repeated low-yield {family} retry [{}]; adding convergence advisory…",
                     retry_cautioned_tools.join(", ")
                 ),
             );
         }
     }
 
-    // Redundant-reads and cache-waste correctives are now handled by the
+    // Redundant-reads and cache-waste advisories are now handled by the
     // composable guard pipeline above (`default_guards()`). They were
     // previously inlined here as ~30-line blocks; the pipeline version also
     // carries their stderr hints so the host doesn't need to re-render them.
     if !suppress_nudges
-        && !state.stall.hard_intervention_active()
-        && !state.stall.forced_redundant_reads_corrective
-        && !state.stall.forced_cache_waste_corrective
-        && should_inject_search_fanout_corrective(state, search_fanout_threshold)
+        && !state.stall.stronger_advisory_emitted()
+        && !state.stall.redundant_reads_advisory_emitted
+        && !state.stall.cache_waste_advisory_emitted
+        && should_emit_search_fanout_advisory(state, search_fanout_threshold)
     {
         let count =
             astra_turn_core::evaluation::count_search_fanout(&state.stall.tool_call_records);
-        state.stall.forced_search_fanout_corrective = true;
-        let msg = search_fanout_corrective_message(count, &state.message);
-        state.push_volatile(super::host::VolatileKind::Corrective, msg);
+        state.stall.search_fanout_advisory_emitted = true;
+        let msg = search_fanout_advisory_message(count, &state.message);
+        state.push_volatile(super::host::VolatileKind::BehaviorAdvisory, msg);
         tracing::warn!(
             target: "astra::loop_guard",
-            tier = "search_fanout_corrective",
+            tier = "search_fanout_advisory",
             round = state.llm_rounds_completed,
             count = count,
             threshold = search_fanout_threshold,
@@ -1264,30 +1044,28 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         if !prep.quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
-                format!("↻ {count} search calls in an implementation turn; forcing synthesis before more search…"),
+                format!(
+                    "↻ {count} search calls in an implementation turn; adding synthesis advisory…"
+                ),
             );
         }
     }
     if !suppress_nudges
-        && !state.stall.hard_intervention_active()
-        && !state.stall.forced_redundant_reads_corrective
-        && !state.stall.forced_cache_waste_corrective
-        && !state.stall.forced_search_fanout_corrective
+        && !state.stall.stronger_advisory_emitted()
+        && !state.stall.redundant_reads_advisory_emitted
+        && !state.stall.cache_waste_advisory_emitted
+        && !state.stall.search_fanout_advisory_emitted
         && let Some((family, streak)) =
-            exploration_family_corrective_candidate(state, exploration_family_threshold)
+            exploration_family_advisory_candidate(state, exploration_family_threshold)
     {
-        let retry_cautioned = mark_exploration_family_corrective(state, &family);
-        state.stall.forced_exploration_family_corrective = true;
-        let msg = exploration_family_corrective_message(
-            &family,
-            streak,
-            &retry_cautioned,
-            &state.message,
-        );
-        state.push_volatile(super::host::VolatileKind::Corrective, msg);
+        let retry_cautioned = mark_exploration_family_advisory(state, &family);
+        state.stall.exploration_family_advisory_emitted = true;
+        let msg =
+            exploration_family_advisory_message(&family, streak, &retry_cautioned, &state.message);
+        state.push_volatile(super::host::VolatileKind::BehaviorAdvisory, msg);
         tracing::warn!(
             target: "astra::loop_guard",
-            tier = "exploration_family_corrective",
+            tier = "exploration_family_advisory",
             round = state.llm_rounds_completed,
             family = family,
             streak = streak,
@@ -1423,9 +1201,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     update_turn_trace_collector(state, &turn_result);
 
     let edge_len = turn_result.edge_tool_round.len();
-    let round_has_edge_work = edge_len > 0 || !snap.tool_calls.is_empty();
-    let factual_retry_fallback_decision =
-        maybe_judge_factual_retry_fallback(host, state, snap.full_text, round_has_edge_work).await;
     let ingest_outcome = ingest_agentic_turn_stream(
         &snap,
         edge_len,
@@ -1434,30 +1209,28 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         &state.recent_tools,
         prep.quiet,
         AgenticTurnIngestMut {
-            task_profile: state.task_profile,
             step_persistence_enabled: state.context_manifest_user_id.is_some(),
             first_ttft_ms: &mut state.telemetry.first_ttft_ms,
             current_session_id: &mut state.current_session_id,
             current_run_id: &mut state.current_run_id,
             final_text: &mut state.final_text,
+            last_finish_reason: &mut state.last_finish_reason,
             total_prompt: &mut state.total_prompt,
             total_completion: &mut state.total_completion,
             total_cache_read: &mut state.total_cache_read,
             total_cache_creation: &mut state.total_cache_creation,
             total_tool_calls: &mut state.total_tool_calls,
-            total_evidence_tool_calls: &mut state.total_evidence_tool_calls,
+            total_observation_tool_calls: &mut state.total_observation_tool_calls,
             step_recorder: &mut state.step_recorder,
             all_tools_used: &mut state.telemetry.all_tools_used,
             has_any_usage: &mut state.has_any_usage,
-            forced_factual_retry: &mut state.stall.forced_factual_retry,
-            factual_retry_fallback_text: &mut state.stall.factual_retry_fallback_text,
-            factual_retry_fallback_decision,
             messages: &mut state.messages,
             last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
             consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
-            turn_policy: state.last_turn_policy.clone(),
         },
     );
+
+    let response_guard_blocked = record_response_guard_blocked_interruption_if_needed(state);
 
     // PR 5a: post-sampling hook. Fires exactly once after a
     // successful turn has been received AND cleanly ingested
@@ -1471,7 +1244,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // at the variant via `matches!` so the original `ingest_outcome`
     // can still move by-value into the control-flow mapper below.
     let ingest_is_fatal = matches!(ingest_outcome, AgenticTurnIngestOutcome::Fatal(_));
-    if !ingest_is_fatal {
+    if !ingest_is_fatal && !response_guard_blocked {
         let turn = session_turn_number(state);
         let session_id = state.current_session_id.clone();
         let model_id = state
@@ -1796,204 +1569,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             return Err(e);
         }
         AgenticIngestIterationControl::BreakLoop => {
-            if let Some(retry_reason) = execution_retry_reason(state) {
-                state.stall.forced_execution_retry = true;
-                state.final_text.clear();
-                // The corrective user message is pushed onto `state.messages`
-                // for this loop iteration. The one-shot
-                // `forced_execution_retry` flag prevents a second injection,
-                // and `finalize_and_render` strips the marker before the next
-                // user turn so it does not pollute future conversations.
-                state.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": execution_retry_message(&state.message, retry_reason),
-                }));
-                tracing::warn!(
-                    target: "astra::loop_guard",
-                    tier = "execution_retry",
-                    round = state.llm_rounds_completed,
-                    "loop guard fired"
-                );
-                if !prep.quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Yellow,
-                        execution_retry_notice(retry_reason),
-                    );
-                }
-                // Intentionally skip record_verdict: no evaluation happened, only
-                // StepIncomplete is emitted as the terminal event.
-                record_early_exit_llm_round(
-                    state,
-                    &turn_result,
-                    prep.turn_start_time,
-                    Some("execution_retry"),
-                );
-                state.step_recorder.end_turn(false);
-                try_write_heavy_checkpoint(state);
-                return Ok(TurnExecutionControl::ContinueLoop);
-            }
-
-            if !state.stall.forced_task_board_completion_gate
-                && let Some(snapshot) = unfinished_task_board_snapshot(state).cloned()
-            {
-                state.stall.forced_task_board_completion_gate = true;
-                state.final_text.clear();
-                state.final_text_streamed = false;
-                state.push_volatile(
-                    super::host::VolatileKind::TaskBoardCompletionGate,
-                    unfinished_task_board_corrective_message(&snapshot, &state.message),
-                );
-                tracing::info!(
-                    target: "astra::loop_guard",
-                    tier = "unfinished_task_board",
-                    round = state.llm_rounds_completed,
-                    summary = %snapshot.short_summary(),
-                    "unfinished task-board work blocked loop completion"
-                );
-                if !prep.quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Yellow,
-                        format!(
-                            "↻ Unfinished tasks remain; continuing ({})",
-                            snapshot.short_summary()
-                        ),
-                    );
-                }
-                record_early_exit_llm_round(
-                    state,
-                    &turn_result,
-                    prep.turn_start_time,
-                    Some("unfinished_tasks"),
-                );
-                state.step_recorder.end_turn(false);
-                try_write_heavy_checkpoint(state);
-                return Ok(TurnExecutionControl::ContinueLoop);
-            }
-
-            if should_force_answer_relevance_retry(state) {
-                let rejected_final = state.final_text.clone();
-                let latest_user_message = answer_relevance_latest_user_message(state);
-                let retry_message = answer_relevance_retry_message(&latest_user_message);
-                state.stall.forced_answer_relevance_retry = true;
-                remove_trailing_assistant_final_answer(&mut state.messages, &rejected_final);
-                state.final_text.clear();
-                state.final_text_streamed = false;
-                state.push_volatile(super::host::VolatileKind::Corrective, retry_message);
-                tracing::warn!(
-                    target: "astra::loop_guard",
-                    tier = "final_answer_relevance_retry",
-                    round = state.llm_rounds_completed,
-                    "final answer did not answer latest user request; forcing one synthesis retry"
-                );
-                if !prep.quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Yellow,
-                        "↻ Final answer missed the latest request; retrying synthesis.".to_string(),
-                    );
-                }
-                record_early_exit_llm_round(
-                    state,
-                    &turn_result,
-                    prep.turn_start_time,
-                    Some("final_answer_relevance_retry"),
-                );
-                state.step_recorder.end_turn(false);
-                try_write_heavy_checkpoint(state);
-                return Ok(TurnExecutionControl::ContinueLoop);
-            }
-
-            // Post-retry exhaustion check: if retry was attempted and answer is STILL off-target
-            if is_answer_relevance_retry_exhausted(state) {
-                state.final_text.clear();
-                state.final_text_streamed = false;
-                let reason = "Answer relevance retry exhausted: model remained off-target after one forced retry.".to_string();
-                state.interruption = Some(InterruptionRecord::new(
-                    InterruptionKind::BudgetExhausted,
-                    ResumeAction::RequiresIntervention {
-                        description: reason.clone(),
-                    },
-                    interruption_state_summary(state, Some(reason)),
-                ));
-                tracing::warn!(
-                    target: "astra::loop_guard",
-                    tier = "answer_relevance_retry_exhausted",
-                    round = state.llm_rounds_completed,
-                    "answer relevance retry exhausted; terminating with interruption"
-                );
-                if !prep.quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Red,
-                        "✗ Answer relevance retry exhausted; producing final answer with interruption marker.".to_string(),
-                    );
-                }
-                finalize_and_render(host, state).await;
-                return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
-            }
-
-            if state.hooks.stop_hook_runs == 0 && should_skip_auto_verify_stop_hooks(state) {
-                state.hooks.stop_hook_runs = 1;
-                if !prep.quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Green,
-                        "✓ Verification already observed after latest change; skipping duplicate auto hook.".to_string(),
-                    );
-                }
-            } else if state.hooks.stop_hook_runs == 0
-                && let Some(prompt) =
-                    astra_turn_core::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
-            {
-                state.hooks.stop_hook_runs = 1;
-                if !prep.quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Yellow,
-                        "⚠ Verification required, continuing…".to_string(),
-                    );
-                }
-                state.messages.push(prompt);
-                // Intentionally skip record_verdict: no evaluation happened, only
-                // StepIncomplete is emitted as the terminal event.
-                record_early_exit_llm_round(
-                    state,
-                    &turn_result,
-                    prep.turn_start_time,
-                    Some("stop_hook"),
-                );
-                state.step_recorder.end_turn(false);
-                try_write_heavy_checkpoint(state);
-                return Ok(TurnExecutionControl::ContinueLoop);
-            }
-
-            // ── Textless stop retry (policy-driven) ──────────────────────
-            // Delegate to RuntimePolicy::decide_textless_stop which
-            // centralizes the retry logic, exploration-task exemption,
-            // and nudge construction. The policy returns InjectSignal
-            // when a retry is warranted.
-            if state.final_text.trim().is_empty() {
-                let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
-                let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
-                if let Some(crate::turn::runtime_policy::FrameworkAction::InjectSignal {
-                    message: nudge,
-                }) = policy.decide_textless_stop(
-                    state.textless_stop_retries,
-                    state.total_tool_calls,
-                    state.task_profile.exploratory_task,
-                    suppress_nudges,
-                ) {
-                    {
-                        state.textless_stop_retries += 1;
-                        state.push_volatile(super::host::VolatileKind::BudgetAdvisory, nudge);
-                        record_early_exit_llm_round(
-                            state,
-                            &turn_result,
-                            prep.turn_start_time,
-                            Some("textless_stop_retry"),
-                        );
-                        state.step_recorder.end_turn(false);
-                        try_write_heavy_checkpoint(state);
-                        return Ok(TurnExecutionControl::ContinueLoop);
-                    }
-                }
-            }
+            // Final-answer relevance is evaluated post-mortem only. Runtime
+            // must not act as a semantic judge that deletes a model answer,
+            // injects a synthetic retry prompt, or terminates with a synthetic
+            // interruption. If the answer is imperfect, preserve it and let
+            // the next user turn correct course.
 
             // Record the LLM round even for text-only responses (no tool calls).
             // Without this, simple Q&A turns have llm_rounds=0 in the
@@ -2027,40 +1607,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         AgenticIngestIterationControl::ProceedWithToolCalls => {}
     }
 
-    // Circuit breaker post-LLM check: if the correction was injected (phase1)
-    // but the model still emitted tool calls, escalate to abort. We do NOT
-    // call observe() again — the breaker observes exactly once per completed
-    // round (in the pre-LLM block). Here we just check: correction was given,
-    // model ignored it → abort.
-    if state.stall.forced_round_budget_phase1 && !state.stall.forced_round_budget_phase2 {
-        state.stall.forced_round_budget_phase2 = true;
-        let abort_detail = circuit_breaker_abort_detail(state);
-        state.final_text.clear();
-        state.final_text_streamed = false;
-        state.interruption = Some(InterruptionRecord::new(
-            InterruptionKind::BudgetExhausted,
-            ResumeAction::ContinueImmediately,
-            interruption_state_summary(state, Some(abort_detail)),
-        ));
-        tracing::warn!(
-            target: "astra::loop_guard",
-            tier = "circuit_breaker_phase2_abort",
-            round = state.llm_rounds_completed,
-            "circuit breaker phase2 abort (model ignored correction)"
-        );
-        if !prep.quiet {
-            host.emit_headless_line(
-                HeadlessStderrStyle::Yellow,
-                format!(
-                    "⛔ Correction ignored at round {}; aborting turn.",
-                    state.llm_rounds_completed
-                ),
-            );
-        }
-        state.step_recorder.end_turn(false);
-        finalize_and_render(host, state).await;
-        return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
-    }
+    // Circuit-breaker pattern signals are advisory-only. Continuing to use
+    // tools after such a signal is not a protocol violation, so there is no
+    // "ignored correction" phase and no synthetic abort here.
     emit_subrun_text_preview(host, state, prep.quiet);
     if let Some(control) = handle_token_budget(host, state, turn_index, prep, &turn_result).await {
         return Ok(control);
@@ -2079,327 +1628,21 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     )))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecutionRetryReason {
-    MissingMutation,
-    MissingBrowserVerification,
-}
-
-#[cfg(test)]
-fn should_force_execution_retry(state: &AgenticLoopState) -> bool {
-    execution_retry_reason(state).is_some()
-}
-
-fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReason> {
-    if state.stall.forced_execution_retry {
-        return None;
+fn record_response_guard_blocked_interruption_if_needed(state: &mut AgenticLoopState) -> bool {
+    let response_guard_blocked =
+        state.last_finish_reason.as_deref() == Some(RESPONSE_GUARD_BLOCKED_FINISH_REASON);
+    if response_guard_blocked && state.interruption.is_none() {
+        let summary = interruption_state_summary(
+            state,
+            Some("response guard blocked the model's final output".to_string()),
+        );
+        state.interruption = Some(InterruptionRecord::new(
+            InterruptionKind::ResponseGuardBlocked,
+            ResumeAction::ContinueImmediately,
+            summary,
+        ));
     }
-    // If mid-loop escalation already fired this turn, the model has already
-    // received a stronger corrective message telling it to apply an edit.
-    // Adding a second retry injection would duplicate correction, waste
-    // tokens, and risk contradicting guidance. One corrective injection per
-    // turn is the invariant.
-    if state.stall.forced_execution_escalation {
-        return None;
-    }
-    if state.stall.forced_parallel_batching {
-        return None;
-    }
-    if state.stall.any_intervention_active() {
-        return None;
-    }
-    if missing_browser_verification_evidence(state) {
-        return Some(ExecutionRetryReason::MissingBrowserVerification);
-    }
-    if has_concrete_workspace_mutation(state) {
-        return None;
-    }
-    if state.final_text.trim().is_empty() {
-        return None;
-    }
-    if state.task_profile.mutates_workspace {
-        // Mutating-profile tasks need either a concrete workspace mutation or
-        // a single corrective retry. The mutating profile is only produced
-        // from structured judge output (`workspace_mutation=must_mutate`), not
-        // from natural-language keyword matching.
-        return Some(ExecutionRetryReason::MissingMutation);
-    }
-    None
-}
-
-fn missing_browser_verification_evidence(state: &AgenticLoopState) -> bool {
-    if state.final_text.trim().is_empty() {
-        return false;
-    }
-    if !state
-        .turn_intent
-        .as_ref()
-        .is_some_and(|intent| intent.browser_verification_required)
-    {
-        return false;
-    }
-    !has_browser_verification_evidence(state)
-}
-
-fn has_browser_verification_evidence(state: &AgenticLoopState) -> bool {
-    state
-        .stall
-        .tool_call_records
-        .iter()
-        .filter(|record| record.ok && !record.is_synthetic_placeholder())
-        .any(tool_record_has_browser_verification_evidence)
-}
-
-fn tool_record_has_browser_verification_evidence(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    let lower_name = record.name.to_lowercase();
-    if [
-        "playwright",
-        "selenium",
-        "puppeteer",
-        "cypress",
-        "chromedriver",
-        "geckodriver",
-        "webdriver",
-    ]
-    .iter()
-    .any(|needle| lower_name.contains(needle))
-    {
-        return true;
-    }
-    if record.name == "bash" {
-        let command = super::lifecycle::extract_bash_command(record.args_full.as_deref())
-            .or_else(|| super::lifecycle::extract_bash_command(record.args_preview.as_deref()));
-        if command
-            .as_deref()
-            .is_some_and(text_has_browser_verification_evidence)
-        {
-            return true;
-        }
-    }
-    [
-        record.args_full.as_deref(),
-        record.args_preview.as_deref(),
-        record.result_full.as_deref(),
-        record.result_preview.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(text_has_browser_verification_evidence)
-}
-
-fn text_has_browser_verification_evidence(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    [
-        "playwright",
-        "selenium",
-        "puppeteer",
-        "cypress",
-        "chromium",
-        "google-chrome",
-        "chrome --headless",
-        "chrome-headless",
-        "firefox --headless",
-        "webkit",
-        "chromedriver",
-        "geckodriver",
-        "--screenshot",
-        "--dump-dom",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn has_concrete_workspace_mutation(state: &AgenticLoopState) -> bool {
-    state
-        .stall
-        .tool_call_records
-        .iter()
-        .filter(|record| record.ok && !record.is_synthetic_placeholder())
-        .any(tool_record_is_workspace_mutation)
-}
-
-fn should_skip_auto_verify_stop_hooks(state: &AgenticLoopState) -> bool {
-    if state.hooks.stop_hooks.is_empty() {
-        return false;
-    }
-    if !state
-        .hooks
-        .stop_hooks
-        .iter()
-        .all(is_auto_verify_changes_hook)
-    {
-        return false;
-    }
-    !has_concrete_workspace_mutation(state)
-        || has_successful_verification_after_latest_mutation(state)
-}
-
-fn is_auto_verify_changes_hook(hook: &astra_turn_core::stop_hooks::StopHook) -> bool {
-    hook.label == "verify-changes"
-        && hook
-            .command
-            .contains("Based on the files you actually modified")
-}
-
-fn has_successful_verification_after_latest_mutation(state: &AgenticLoopState) -> bool {
-    let Some(last_mutation_index) = state.stall.tool_call_records.iter().rposition(|record| {
-        record.ok && !record.is_synthetic_placeholder() && tool_record_is_workspace_mutation(record)
-    }) else {
-        return false;
-    };
-
-    state
-        .stall
-        .tool_call_records
-        .iter()
-        .skip(last_mutation_index + 1)
-        .any(tool_record_is_successful_verification)
-}
-
-fn tool_record_is_successful_verification(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    if !record.ok
-        || record.is_synthetic_placeholder()
-        || !tool_record_result_looks_successful(record)
-    {
-        return false;
-    }
-    if record.name == "bash" {
-        let command = super::lifecycle::extract_bash_command(record.args_full.as_deref())
-            .or_else(|| super::lifecycle::extract_bash_command(record.args_preview.as_deref()));
-        return command
-            .as_deref()
-            .is_some_and(command_looks_like_verification);
-    }
-    tool_name_looks_like_verification(&record.name)
-}
-
-fn tool_record_result_looks_successful(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    if record.result_class.as_deref().is_some_and(|class| {
-        matches!(
-            class,
-            "error" | "failure" | "failed" | "tool_error" | "command_error"
-        )
-    }) {
-        return false;
-    }
-    [
-        record.error.as_deref(),
-        record.result_full.as_deref(),
-        record.result_preview.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::to_lowercase)
-    .all(|text| {
-        let trimmed = text.trim_start();
-        !trimmed.starts_with('✗')
-            && !text.contains("(exit 1)")
-            && !text.contains("exit status 1")
-            && !text.contains("test result: failed")
-            && !text.contains("error: unexpected argument")
-            && !text.contains("\nerror:")
-            && !trimmed.starts_with("error:")
-    })
-}
-
-fn tool_name_looks_like_verification(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    [
-        "test",
-        "check",
-        "lint",
-        "clippy",
-        "pytest",
-        "playwright",
-        "cypress",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn command_looks_like_verification(command: &str) -> bool {
-    let lower = command.to_lowercase();
-    [
-        "cargo test",
-        "cargo check",
-        "cargo clippy",
-        "npm test",
-        "npm run test",
-        "npm run build",
-        "pnpm test",
-        "pnpm build",
-        "yarn test",
-        "yarn build",
-        "pytest",
-        "python -m pytest",
-        "ruff check",
-        "mypy",
-        "go test",
-        "go vet",
-        "swift test",
-        "gradle test",
-        "mvn test",
-        "make test",
-        "make check",
-        "just test",
-        "just check",
-        "git diff --check",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-/// Stable marker prefix embedded in the corrective user message so that
-/// `finalize_and_render` can strip it after the turn completes. Keeps the
-/// conversation history clean across user turns without depending on the
-/// downstream compactor's heuristics.
-pub(crate) const EXECUTION_RETRY_MARKER: &str = "## ⤴ Execution Retry Correction";
-pub(crate) const FINAL_ANSWER_RELEVANCE_RETRY_MARKER: &str = "## ⤴ Final Answer Relevance Retry";
-
-pub(crate) fn is_execution_retry_correction(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
-    }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(EXECUTION_RETRY_MARKER))
-}
-
-fn execution_retry_notice(reason: ExecutionRetryReason) -> String {
-    match reason {
-        ExecutionRetryReason::MissingMutation => {
-            "↻ Execution requested but no edits were applied; forcing corrective retry…".to_string()
-        }
-        ExecutionRetryReason::MissingBrowserVerification => {
-            "↻ Browser verification was claimed without browser-capable evidence; forcing corrective retry…".to_string()
-        }
-    }
-}
-
-fn execution_retry_message(original_query: &str, reason: ExecutionRetryReason) -> String {
-    let correction = match reason {
-        ExecutionRetryReason::MissingMutation => {
-            "Runtime correction: the user requested or confirmed code execution, \
-             but your previous response ended without applying any concrete workspace mutation. \
-             Do not ask for permission again and do not only restate a plan. \
-             Use the available file-editing tools to make the change, then run the appropriate existing verification."
-        }
-        ExecutionRetryReason::MissingBrowserVerification => {
-            "Runtime correction: this task explicitly required browser/UI verification, \
-             but your previous response claimed success without recording any browser-capable verification evidence. \
-             Do not treat curl/server/process checks as browser verification. \
-             Use a real browser-capable tool or workflow (for example Playwright, Selenium, Puppeteer, Cypress, \
-             a headless browser screenshot, or a browser DOM dump after page execution), \
-             or say plainly that you could not verify it in a browser."
-        }
-    };
-    format!("{EXECUTION_RETRY_MARKER}\n{correction}\n\nOriginal user query: {original_query}")
+    response_guard_blocked
 }
 
 /// Mid-loop escalation: kicks in while the model is still calling tools but
@@ -2416,52 +1659,26 @@ pub(crate) const EXECUTION_ESCALATION_MARKER: &str = "## ⤴ Execution Escalatio
 /// catching runaway read loops well before budget exhaustion.
 pub(crate) const EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD: usize = 8;
 
-pub(crate) fn is_execution_escalation(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
-    }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(EXECUTION_ESCALATION_MARKER))
+fn has_concrete_workspace_mutation(state: &AgenticLoopState) -> bool {
+    state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|record| record.ok && !record.is_synthetic_placeholder())
+        .any(tool_record_is_workspace_mutation)
 }
 
-pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
-    is_execution_retry_correction(m)
-        || is_execution_escalation(m)
-        || is_parallel_batching_force(m)
-        || is_round_budget_phase1(m)
-        || is_completion_soft_stop(m)
-        || is_redundant_reads_corrective(m)
-        || is_cache_waste_corrective(m)
-        || is_search_fanout_corrective(m)
-        || is_exploration_family_corrective(m)
-        || is_exploration_family_phase2(m)
-        || is_final_answer_relevance_retry(m)
-}
-
-fn is_final_answer_relevance_retry(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
-    }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(FINAL_ANSWER_RELEVANCE_RETRY_MARKER))
-}
-
-/// Third-tier guard for the parallel-batching layer. The prompt-side soft
+/// Third-tier observation for the parallel-batching layer. The prompt-side soft
 /// nudge fires when the trailing single-tool round streak hits
 /// `PARALLEL_BATCHING_NUDGE_THRESHOLD` (=6). If the model ignores the nudge
 /// and produces yet another single-tool round, the streak crosses the
 /// resolved `parallel_batching_force_streak` threshold (default 8, per-model
-/// overrides via `ModelPolicyProfile`) and we inject a hard corrective
-/// `user` message.
-///
-/// The circuit breaker handles persistent stalls that ignore the hard force —
-/// no escalation layer needed.
-pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batching Force";
+/// overrides via `ModelPolicyProfile`) and we emit advisory evidence in the
+/// typed runtime lane.
+pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batching Observation";
 
 /// Trailing single-tool-round streak length at which the soft prompt nudge
-/// (=6) escalates into a forced corrective injection.
+/// (=6) escalates into typed advisory evidence.
 /// Default for the threshold; the actual value used at runtime flows through
 /// `ToolSelectionConfig::effective_parallel_batching_force_streak` (and
 /// per-model overrides via `ModelPolicyProfile`).
@@ -2470,80 +1687,32 @@ pub(crate) const PARALLEL_BATCHING_FORCE_MARKER: &str = "## ⤴ Parallel Batchin
 pub(crate) const PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD: usize =
     astra_config::runtime_config::DEFAULT_PARALLEL_BATCHING_FORCE_STREAK as usize;
 
-pub(crate) fn is_parallel_batching_force(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+pub(crate) fn should_emit_parallel_batching_advisory(
+    state: &AgenticLoopState,
+    threshold: usize,
+) -> bool {
+    if state.stall.parallel_batching_advisory_emitted {
         return false;
     }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(PARALLEL_BATCHING_FORCE_MARKER))
-}
-
-pub(crate) fn should_force_parallel_batching(state: &AgenticLoopState, threshold: usize) -> bool {
-    if state.stall.forced_parallel_batching {
-        return false;
-    }
-    // One corrective injection per turn: if any other mid-loop intervention
-    // already fired (advisory or hard), a parallel-batching force would
-    // duplicate correction and stack two guidance messages.
-    if state.stall.any_intervention_active() {
+    // One advisory per turn: avoid stacking redundant behavior evidence.
+    if state.stall.any_advisory_emitted() {
         return false;
     }
     let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
     streak >= threshold
 }
 
-pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &str) -> String {
+pub(crate) fn parallel_batching_advisory_message(streak: usize, original_query: &str) -> String {
     format!(
         "{PARALLEL_BATCHING_FORCE_MARKER}\n\
-         Runtime correction: your last {streak} rounds each ran exactly ONE tool, \
-         despite the prompt-layer nudge to batch independent calls. This wastes \
-         a round of latency, tokens, and budget for each call. \
-         Your NEXT response MUST do exactly one of the following:\n\
-         - Produce your final answer now if you already have enough information, OR\n\
-         - Call ≥2 independent tools in a single parallel batch (different files, \
-           different greps, different reads — anything that does not strictly \
-           depend on the previous tool's output).\n\
-         Do not produce another single-tool round.\n\n\
+         Observation: the last {streak} rounds each ran exactly one tool. When \
+         calls are independent, that pattern may add avoidable latency, token use, \
+         and round-budget pressure. Possible next actions include answering from \
+         the evidence already gathered or batching independent calls. A further \
+         single-tool round remains appropriate when its input genuinely depends on \
+         the prior result.\n\n\
          Original user query: {original_query}"
     )
-}
-
-// ─── Round-budget convergence guard (two-phase) ─────────────────────────
-//
-// Phase 1 fires when the loop has completed >= effective round-budget hard
-// limit but the model is still calling tools. The runtime injects a hard
-// corrective `user` message AND restricts all tools for the upcoming round,
-// so the model is forced into a text-only finalization. The corrective
-// wording is explicitly anti-hallucination: it tells the model to enumerate
-// what was verified and what was NOT verified instead of fabricating.
-//
-// Phase 2 is the safety net: if the model still produces tool calls after
-// phase 1 (i.e. ignores both the corrective AND attempts tools that were
-// runtime-restricted), `should_abort_for_round_budget_phase2` returns true
-// and the caller aborts the loop — analogous to a hard max-turns error,
-// but reached only after one extra grace round, which avoids the
-// overkill of an immediate hard cap on weaker models.
-
-pub(crate) const ROUND_BUDGET_PHASE1_MARKER: &str = "## ⤴ Round Budget Reached";
-pub(crate) const COMPLETION_SOFT_STOP_MARKER: &str = "## ✓ Task Appears Complete";
-
-pub(crate) fn is_round_budget_phase1(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
-    }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(ROUND_BUDGET_PHASE1_MARKER))
-}
-
-pub(crate) fn is_completion_soft_stop(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
-    }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(COMPLETION_SOFT_STOP_MARKER))
 }
 
 fn tool_record_is_git_commit_action(
@@ -2609,13 +1778,9 @@ fn build_circuit_breaker_signal(
             .take(state.max_tools_per_turn as usize)
             .any(tool_record_is_workspace_mutation)
     };
-    let task_completed = !state
-        .hooks
-        .task_board_snapshot
-        .has_completion_blocking_tasks()
-        && latest_round_records
-            .iter()
-            .any(|record| tool_record_is_git_commit_action(record));
+    let task_completed = latest_round_records
+        .iter()
+        .any(|record| tool_record_is_git_commit_action(record));
 
     RoundSignal {
         tool_signatures,
@@ -2625,39 +1790,26 @@ fn build_circuit_breaker_signal(
     }
 }
 
-pub(crate) fn completion_soft_stop_message(round_index: u32, original_query: &str) -> String {
-    format!(
-        "{COMPLETION_SOFT_STOP_MARKER}\n\
-         Runtime signal: a successful git commit indicates the requested work is likely complete after {round_index} tool round(s).\n\n\
-         Stop now and provide the final answer unless you can name concrete remaining work that is necessary for the user's request. \
-         Do not run more verification or status checks just to be extra sure; only use tools if there is specific unresolved work.\n\n\
-         Original user query: {original_query}"
-    )
+pub(crate) fn completion_observation_payload(
+    round_index: u32,
+    original_query: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "signal": "task_completion_observed",
+        "round": round_index,
+        "evidence": "A successful git commit indicates that the requested work may be complete.",
+        "recommendation": "Consider providing the final answer unless concrete work required by the user remains.",
+        "model_discretion": "This evidence does not require stopping or prohibit further necessary verification.",
+        "original_user_query": original_query,
+    })
 }
 
-pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str) -> String {
-    format!(
-        "{ROUND_BUDGET_PHASE1_MARKER}\n\
-         Runtime correction: this turn has used {round_index} tool rounds and \
-         is past the configured hard limit.\n\n\
-         The tool surface remains available. Your next message should be the \
-         final text-only answer unless you can name a truly necessary unresolved \
-         fact and a changed plan for obtaining it.\n\n\
-         IMPORTANT (anti-hallucination):\n\
-         - Synthesize what you DID verify with the tool calls already made.\n\
-         - Explicitly list anything you could NOT verify or finish.\n\
-         - Do NOT fabricate, infer, or invent results you did not actually observe.\n\
-         - A partial-but-honest answer is strictly better than a confident-but-fabricated one.\n\n\
-         Original user query: {original_query}"
-    )
-}
-
-// Redundant-reads mid-loop corrective.
+// Redundant-reads mid-loop advisory.
 //
 // Detects the pattern where the model re-reads overlapping line ranges of the
 // same file with no intervening workspace mutation. The detection algorithm
 // lives in `astra-turn-core::evaluation::count_redundant_overlapping_reads`
-// (post-mortem use) and is reused here for a one-shot mid-loop corrective.
+// (post-mortem use) and is reused here for a one-shot mid-loop advisory.
 //
 // Threshold note: post-mortem flags at count ≥ 3; mid-loop fires at ≥
 // `REDUNDANT_READS_MIDLOOP_THRESHOLD` to err slightly on the side of
@@ -2671,13 +1823,13 @@ pub(crate) const CACHE_WASTE_MARKER: &str = "## ⤴ Repeated Cached Tool Calls D
 pub(crate) const SEARCH_FANOUT_MARKER: &str = "## ⤴ Search Fanout Detected";
 pub(crate) const EXPLORATION_FAMILY_MARKER: &str = "## ⤴ Exploration Family Churn Detected";
 pub(crate) const EXPLORATION_FAMILY_PHASE2_MARKER: &str =
-    "## ⤴ Exploration Family Convergence Required";
+    "## ⤴ Exploration Family Convergence Observation";
 /// Default cache-waste midloop threshold. Used in tests; production code
 /// reads from `ToolSelectionConfig::effective_cache_waste_midloop_threshold()`.
 #[cfg(test)]
 pub(crate) const CACHE_WASTE_MIDLOOP_THRESHOLD: usize = 3;
 
-/// Mid-loop corrective threshold (intentionally one above the post-mortem
+/// Mid-loop advisory threshold (intentionally one above the post-mortem
 /// signal threshold). One redundant overlap is normal noise; two can be
 /// healthy double-checking; three matches the post-mortem signal but at
 /// mid-loop we wait one more event to avoid premature intervention on
@@ -2688,15 +1840,6 @@ pub(crate) const CACHE_WASTE_MIDLOOP_THRESHOLD: usize = 3;
 /// match that accessor's zero-default.
 #[cfg(test)]
 pub(crate) const REDUNDANT_READS_MIDLOOP_THRESHOLD: usize = 4;
-
-pub(crate) fn is_redundant_reads_corrective(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
-    }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(REDUNDANT_READS_MARKER))
-}
 
 pub(crate) fn cache_wasteful_tools(
     state: &AgenticLoopState,
@@ -2711,42 +1854,6 @@ pub(crate) fn cache_wasteful_tools(
         .collect();
     tools.sort_by(|left, right| left.0.cmp(&right.0));
     tools
-}
-
-pub(crate) fn is_cache_waste_corrective(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
-    }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(CACHE_WASTE_MARKER))
-}
-
-pub(crate) fn is_search_fanout_corrective(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
-    }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(SEARCH_FANOUT_MARKER))
-}
-
-pub(crate) fn is_exploration_family_corrective(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
-    }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(EXPLORATION_FAMILY_MARKER))
-}
-
-pub(crate) fn is_exploration_family_phase2(m: &serde_json::Value) -> bool {
-    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
-        return false;
-    }
-    m.get("content")
-        .and_then(|c| c.as_str())
-        .is_some_and(|s| s.starts_with(EXPLORATION_FAMILY_PHASE2_MARKER))
 }
 
 fn retry_cautioned_tools_for_exploration_family(family: &str) -> &'static [&'static str] {
@@ -2767,11 +1874,11 @@ fn exploration_family_label(family: &str) -> &'static str {
     }
 }
 
-pub(crate) fn exploration_family_corrective_candidate(
+pub(crate) fn exploration_family_advisory_candidate(
     state: &AgenticLoopState,
     threshold: usize,
 ) -> Option<(String, usize)> {
-    if state.stall.forced_exploration_family_corrective {
+    if state.stall.exploration_family_advisory_emitted {
         return None;
     }
     let (family, streak) = astra_turn_core::evaluation::exploration_family_round_streak(
@@ -2780,13 +1887,13 @@ pub(crate) fn exploration_family_corrective_candidate(
     (streak >= threshold).then(|| (family.to_string(), streak))
 }
 
-fn mark_exploration_family_corrective(state: &mut AgenticLoopState, family: &str) -> Vec<String> {
+fn mark_exploration_family_advisory(state: &mut AgenticLoopState, family: &str) -> Vec<String> {
     let mut cautioned = retry_cautioned_tools_for_exploration_family(family)
         .iter()
         .map(|tool| (*tool).to_string())
         .collect::<Vec<_>>();
     cautioned.sort();
-    state.stall.exploration_family_corrective_family = Some(family.to_string());
+    state.stall.exploration_family_advisory_family = Some(family.to_string());
     cautioned
 }
 
@@ -2836,15 +1943,12 @@ fn repeated_prior_signature(
 pub(crate) fn exploration_family_phase2_candidate(
     state: &AgenticLoopState,
 ) -> Option<(String, Vec<String>)> {
-    if !state.stall.forced_exploration_family_corrective
-        || state.stall.forced_exploration_family_phase2
+    if !state.stall.exploration_family_advisory_emitted
+        || state.stall.stronger_exploration_family_advisory_emitted
     {
         return None;
     }
-    let family = state
-        .stall
-        .exploration_family_corrective_family
-        .as_deref()?;
+    let family = state.stall.exploration_family_advisory_family.as_deref()?;
     let retry_cautioned = retry_cautioned_tools_for_exploration_family(family);
     let (latest_round, latest_round_records) = latest_non_synthetic_round_records(state)?;
     if latest_round_records.is_empty() {
@@ -2870,36 +1974,18 @@ pub(crate) fn exploration_family_phase2_candidate(
     Some((family.to_string(), repeated_tools))
 }
 
-/// Whether to inject the redundant-reads mid-loop corrective on the upcoming
-/// round. One-shot per turn (the flag is set when corrective fires).
-pub(crate) fn should_inject_redundant_reads_corrective(
-    state: &AgenticLoopState,
-    threshold: usize,
-) -> bool {
-    if state.stall.forced_redundant_reads_corrective {
-        return false;
-    }
-    let count = astra_turn_core::evaluation::count_redundant_overlapping_reads(
-        &state.stall.tool_call_records,
-    );
-    count >= threshold
-}
-
-pub(crate) fn should_inject_cache_waste_corrective(
-    state: &AgenticLoopState,
-    threshold: usize,
-) -> bool {
-    if state.stall.forced_cache_waste_corrective {
+pub(crate) fn should_emit_cache_waste_advisory(state: &AgenticLoopState, threshold: usize) -> bool {
+    if state.stall.cache_waste_advisory_emitted {
         return false;
     }
     !cache_wasteful_tools(state, threshold).is_empty()
 }
 
-pub(crate) fn should_inject_search_fanout_corrective(
+pub(crate) fn should_emit_search_fanout_advisory(
     state: &AgenticLoopState,
     threshold: usize,
 ) -> bool {
-    if state.stall.forced_search_fanout_corrective {
+    if state.stall.search_fanout_advisory_emitted {
         return false;
     }
     if !state.task_profile.mutates_workspace {
@@ -2908,7 +1994,7 @@ pub(crate) fn should_inject_search_fanout_corrective(
     astra_turn_core::evaluation::count_search_fanout(&state.stall.tool_call_records) >= threshold
 }
 
-pub(crate) fn cache_waste_corrective_message(
+pub(crate) fn cache_waste_advisory_message(
     tools: &[(impl AsRef<str>, usize)],
     original_query: &str,
 ) -> String {
@@ -2919,35 +2005,29 @@ pub(crate) fn cache_waste_corrective_message(
         .join(", ");
     format!(
         "{CACHE_WASTE_MARKER}\n\
-         Runtime correction: you have repeated cached tool calls this turn [{tool_list}]. \
+         Observation: cached tool calls were repeated this turn [{tool_list}]. \
          Those results are already in context — calling the same tool again wastes tokens and does not add evidence.\n\n\
-         REQUIRED next-step behavior:\n\
-         - Reuse the cached result you already have; do NOT repeat the same tool call again.\n\
-         - Only call another tool if it fetches genuinely new evidence (different file, different diff target, different query, or changed worktree).\n\
-         - If you already have enough evidence, write the final answer now.\n\
-         - If you still need more evidence, explain the ONE specific missing fact and use a different tool or different arguments to get it.\n\n\
-         Anti-hallucination: do NOT pretend a repeated cached call produced new information.\n\n\
+         Recommendation: reuse the cached result when it answers the current need. \
+         If evidence is still missing, a different target, query, argument set, or \
+         changed worktree may add new information. Repeated cached output should not \
+         be treated as new evidence.\n\n\
          Original user query: {original_query}"
     )
 }
 
-pub(crate) fn search_fanout_corrective_message(count: usize, original_query: &str) -> String {
+pub(crate) fn search_fanout_advisory_message(count: usize, original_query: &str) -> String {
     format!(
         "{SEARCH_FANOUT_MARKER}\n\
-         Runtime correction: you have made {count} grep/rg/find-like search calls in an implementation turn. \
+         Observation: {count} grep/rg/find-like search calls occurred in an implementation turn. \
          Broad search has crossed the low-yield threshold: more search is likely to expand context instead of finishing the task.\n\n\
-         REQUIRED next-step behavior:\n\
-         - Synthesize the evidence already gathered before doing anything else.\n\
-         - Do NOT run another broad search (`grep`, `rg`, `glob`, or `find`) in the next round.\n\
-         - If a change is still needed, edit the specific file already identified.\n\
-         - If validation is needed, run the narrow relevant test/check instead of more discovery.\n\
-         - If one fact is still missing, read the exact file/range that contains it.\n\
-         - If you already have enough evidence, write the final answer now.\n\n\
+         Recommendation: consider synthesizing the current evidence before widening \
+         discovery. A specific edit, narrow validation, exact file/range read, or final \
+         answer may be higher value if the necessary target is already known.\n\n\
          Original user query: {original_query}"
     )
 }
 
-pub(crate) fn exploration_family_corrective_message(
+pub(crate) fn exploration_family_advisory_message(
     family: &str,
     streak: usize,
     retry_cautioned_tools: &[String],
@@ -2957,15 +2037,13 @@ pub(crate) fn exploration_family_corrective_message(
     let label = exploration_family_label(family);
     format!(
         "{EXPLORATION_FAMILY_MARKER}\n\
-         Runtime correction: the last {streak} consecutive multi-call rounds stayed inside the same {label} family. \
+         Observation: the last {streak} consecutive multi-call rounds stayed inside the same {label} family. \
          That is now classified as low-yield exploration churn. Retry-cautioned tools: [{tool_list}]. \
          They remain available, but repeating the same path without changed inputs or a new hypothesis is low value.\n\n\
-         REQUIRED next-step behavior:\n\
-         - First synthesize the evidence already gathered from prior tool calls.\n\
-         - If one fact is still missing, switch to a different tool family that can add genuinely new evidence.\n\
-         - Do NOT reopen the same {family} path unless the worktree or target changed.\n\
-         - If you already have enough evidence, write the answer now.\n\n\
-         Anti-hallucination: do NOT claim that repeated {family} exploration produced new evidence when it did not.\n\n\
+         Recommendation: consider synthesizing prior evidence. If a fact remains \
+         missing, another tool family or changed target may add more information. \
+         Repeating the same {family} path is still reasonable when inputs changed, \
+         but repetition alone is not new evidence.\n\n\
          Original user query: {original_query}"
     )
 }
@@ -2978,49 +2056,41 @@ pub(crate) fn exploration_family_phase2_message(
     let retry_cautioned_list = retry_cautioned_tools.join(", ");
     format!(
         "{EXPLORATION_FAMILY_PHASE2_MARKER}\n\
-         Runtime correction: after the earlier {family}-family retry caution, your most recent tool round still repeated only the same low-yield path [{retry_cautioned_list}] with already-seen inputs. \
-         That produced little or no new evidence, so this turn must now converge instead of retrying the same path.\n\n\
-         REQUIRED next-step behavior:\n\
-         - Either write the answer now from the evidence already gathered, OR\n\
-         - State the ONE missing fact and use ONE tool from a different family to fetch it.\n\
-         - Do not repeat identical calls to [{retry_cautioned_list}] again this turn unless the worktree or target actually changed.\n\
-         - If you still cannot finish, explicitly summarize verified facts and remaining gaps instead of continuing exploratory retries.\n\n\
-         Anti-hallucination: a repeated low-yield retry does NOT count as new evidence.\n\n\
+         Observation: after an earlier {family}-family advisory, the most recent \
+         tool round repeated the same low-yield path [{retry_cautioned_list}] with \
+         already-seen inputs and added little or no evidence.\n\n\
+         Recommendation: consider answering from verified evidence, naming the \
+         specific remaining gap, or using a different family if it can fetch that \
+         fact. Identical calls may be useful after the worktree or target changes; \
+         otherwise their repeated output is not new evidence.\n\n\
          Original user query: {original_query}"
     )
 }
 
-pub(crate) fn redundant_reads_corrective_message(count: usize, original_query: &str) -> String {
+pub(crate) fn redundant_reads_advisory_message(count: usize, original_query: &str) -> String {
     format!(
         "{REDUNDANT_READS_MARKER}\n\
-         Runtime correction: you have re-read overlapping line ranges of the \
-         same file {count} times this turn without any intervening edit. The \
+         Observation: overlapping line ranges of the same file were re-read \
+         {count} times this turn without any intervening edit. The \
          content has not changed — re-reading wastes tokens and stalls progress.\n\n\
-         REQUIRED next-step behavior:\n\
-         - Use the file content already in your context; do NOT issue another \
-           read for any range you have already loaded.\n\
-         - If you genuinely need a new section, use the `view` tool with \
-           explicit `view_range` (NOT `bash sed`/`bash cat`) and only for ranges \
-           you have not already seen.\n\
-         - If you have enough information to answer, produce the final answer now.\n\
-         - If you do not, state precisely what is still unknown and which ONE \
-           specific new piece of evidence you need — do not loop on the same files.\n\n\
-         Anti-hallucination: do NOT fabricate file contents you have not actually \
-         observed. A partial-but-honest answer beats a confident-but-fabricated one.\n\n\
+         Recommendation: reuse loaded content when it answers the current need. \
+         If a genuinely unseen section is required, an exact range read can add \
+         evidence. Otherwise, synthesizing verified facts and naming the remaining \
+         gap may be higher value. Unobserved file contents remain unknown.\n\n\
          Original user query: {original_query}"
     )
 }
 
-pub(crate) fn should_escalate_execution(state: &AgenticLoopState) -> bool {
-    if state.stall.forced_execution_escalation {
+pub(crate) fn should_emit_execution_escalation_advisory(state: &AgenticLoopState) -> bool {
+    if state.stall.execution_escalation_advisory_emitted {
         return false;
     }
-    // One corrective injection per turn: if parallel-batching force already
-    // fired, skip escalation to avoid double-injecting corrective messages.
+    // One advisory per turn: if the parallel-batching signal was already
+    // emitted, skip this one to avoid stacking redundant evidence.
     // NOTE: execution order in execute_turn_and_ingest_phase is
     //   escalation → parallel-batching, so in practice escalation runs first.
     //   This guard is defensive against future reordering.
-    if state.stall.forced_parallel_batching {
+    if state.stall.parallel_batching_advisory_emitted {
         return false;
     }
     if !state.task_profile.mutates_workspace {
@@ -3052,13 +2122,11 @@ pub(crate) fn should_escalate_execution(state: &AgenticLoopState) -> bool {
 pub(crate) fn execution_escalation_message(original_query: &str, read_only_calls: usize) -> String {
     format!(
         "{EXECUTION_ESCALATION_MARKER}\n\
-         Runtime correction: you have made {read_only_calls} read-only tool calls on a task that \
-         clearly requires changing the workspace, and have not applied a single edit yet. \
-         Stop reading more files. Your NEXT response must invoke an editing tool \
-         (`apply_patch`, `edit_file`, `str_replace`, `write_file`, or a `bash` command that \
-         actually modifies files such as `sed -i`, a redirect `>`/`>>`, or `apply_patch`). \
-         Do not produce another round of `cat`/`grep`/`ls`/`git diff`/`find`. Do not ask the \
-         user for permission. Apply the change, then run the appropriate existing verification.\n\n\
+         Observation: {read_only_calls} read-only tool calls have occurred on a task whose \
+         structured intent requires changing the workspace, and no concrete mutation is \
+         recorded yet. Consider whether the current evidence is sufficient for a targeted \
+         edit and relevant verification. More inspection remains reasonable when a specific \
+         unknown still blocks a safe change.\n\n\
          Original user query: {original_query}"
     )
 }
@@ -3421,7 +2489,6 @@ mod tests {
             true,
             false,
             astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-            true,
         )
     }
 
@@ -3434,9 +2501,18 @@ mod tests {
         );
     }
 
-    fn require_browser_verification(state: &mut AgenticLoopState) {
-        let intent = state.turn_intent.take().unwrap_or_default();
-        state.turn_intent = Some(intent.with_browser_verification_required(true));
+    #[test]
+    fn manifest_reason_uses_structured_compaction_state_not_message_text() {
+        let mut state = make_state();
+        state.messages.push(serde_json::json!({
+            "role": "user",
+            "content": "Please explain compaction without changing the context."
+        }));
+        assert_eq!(manifest_reason_for_llm_call(&state), "normal_turn");
+
+        state.compact_tier_applied =
+            astra_turn_core::compaction_types::CompactionTier::CompactHistory;
+        assert_eq!(manifest_reason_for_llm_call(&state), "post_compaction");
     }
 
     #[test]
@@ -3447,6 +2523,40 @@ mod tests {
         assert_eq!(
             alert_dispatch_session_id(Some("  session-123  ")).as_deref(),
             Some("session-123")
+        );
+    }
+
+    #[test]
+    fn runtime_policy_budget_evidence_preserves_budget_and_history() {
+        let mut state = make_state();
+        state.max_turns = 8;
+        state.remaining_turns = 2;
+        let mut facts = astra_core::observation_journal::JournalFacts::default();
+        facts.streaks.consecutive_rounds_with_outcome = 3;
+        let history_before = state.messages.clone();
+
+        route_runtime_policy_evidence(
+            &mut state,
+            &facts,
+            crate::turn::runtime_policy::RuntimePolicyEvidence::BudgetExpansionSuggested {
+                factor: 1.5,
+                max_ceiling: 20,
+            },
+        );
+
+        assert_eq!(state.max_turns, 8);
+        assert_eq!(state.remaining_turns, 2);
+        assert_eq!(state.messages, history_before);
+        let pending = state.take_volatile_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, VolatileKind::BudgetReview);
+        assert_eq!(
+            pending[0].payload["signal"].as_str(),
+            Some("budget_expansion_suggested")
+        );
+        assert_eq!(
+            pending[0].payload["authority"].as_str(),
+            Some("advisory_evidence_only")
         );
     }
 
@@ -3513,26 +2623,6 @@ mod tests {
         assert!(summary.contains("- str_replace"), "{summary}");
     }
 
-    struct SnapshotClearingHost {
-        turn_results: Vec<HostTurnResult>,
-        current_turn: usize,
-        emitted_lines: Vec<String>,
-        rendered_final_text: Vec<String>,
-        valid_tools: HashSet<String>,
-    }
-
-    impl SnapshotClearingHost {
-        fn new(turn_results: Vec<HostTurnResult>) -> Self {
-            Self {
-                turn_results,
-                current_turn: 0,
-                emitted_lines: Vec::new(),
-                rendered_final_text: Vec::new(),
-                valid_tools: HashSet::new(),
-            }
-        }
-    }
-
     struct StubRunControlProvider {
         polls: Mutex<VecDeque<RunQueuedInputPoll>>,
         poll_calls: Mutex<Vec<usize>>,
@@ -3562,12 +2652,6 @@ mod tests {
         async fn poll_call_count(&self) -> usize {
             self.poll_calls.lock().await.len()
         }
-    }
-
-    struct JudgeOnlyHost {
-        decision: Option<FactualRetryFallbackDecision>,
-        calls: Vec<(String, String, String)>,
-        valid_tools: HashSet<String>,
     }
 
     struct DirectErrorHost {
@@ -3602,90 +2686,6 @@ mod tests {
         fn valid_tool_names(&self) -> &HashSet<String> {
             &self.valid_tools
         }
-    }
-
-    #[async_trait]
-    impl AgenticLoopHost for JudgeOnlyHost {
-        async fn execute_turn(
-            &mut self,
-            _state: &mut AgenticLoopState,
-        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
-            Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::Unknown,
-                "not used",
-            ))
-        }
-
-        async fn judge_factual_retry_fallback(
-            &mut self,
-            ctx: FactualRetryFallbackJudgeContext<'_>,
-        ) -> Option<FactualRetryFallbackDecision> {
-            self.calls.push((
-                ctx.original_query.to_string(),
-                ctx.fallback_text.to_string(),
-                ctx.retry_text.to_string(),
-            ));
-            self.decision
-        }
-
-        fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, _line: String) {}
-
-        fn is_quiet(&self) -> bool {
-            true
-        }
-
-        fn valid_tool_names(&self) -> &HashSet<String> {
-            &self.valid_tools
-        }
-    }
-
-    #[tokio::test]
-    async fn factual_retry_fallback_judge_called_only_for_no_evidence_retry_final() {
-        let mut host = JudgeOnlyHost {
-            decision: Some(FactualRetryFallbackDecision::RestoreFallback),
-            calls: Vec::new(),
-            valid_tools: HashSet::new(),
-        };
-        let mut state = make_state();
-        state.message = "what do 59% and 117k mean?".to_string();
-        state.user_intent = state.message.clone();
-        state.stall.forced_factual_retry = true;
-        state.stall.factual_retry_fallback_text =
-            Some("59% is context usage; 117k is token count.".to_string());
-        state.total_evidence_tool_calls = 0;
-
-        let decision =
-            maybe_judge_factual_retry_fallback(&mut host, &state, "I completed the work.", false)
-                .await;
-
-        assert_eq!(
-            decision,
-            Some(FactualRetryFallbackDecision::RestoreFallback)
-        );
-        assert_eq!(host.calls.len(), 1);
-        assert_eq!(host.calls[0].0, "what do 59% and 117k mean?");
-    }
-
-    #[tokio::test]
-    async fn factual_retry_fallback_judge_not_called_when_evidence_exists_or_fallback_missing() {
-        let mut host = JudgeOnlyHost {
-            decision: Some(FactualRetryFallbackDecision::RestoreFallback),
-            calls: Vec::new(),
-            valid_tools: HashSet::new(),
-        };
-        let mut state = make_state();
-        state.stall.forced_factual_retry = true;
-        state.stall.factual_retry_fallback_text = Some("original".to_string());
-        state.total_evidence_tool_calls = 1;
-
-        let decision = maybe_judge_factual_retry_fallback(&mut host, &state, "retry", false).await;
-        assert_eq!(decision, None);
-
-        state.total_evidence_tool_calls = 0;
-        state.stall.factual_retry_fallback_text = None;
-        let decision = maybe_judge_factual_retry_fallback(&mut host, &state, "retry", false).await;
-        assert_eq!(decision, None);
-        assert!(host.calls.is_empty());
     }
 
     #[async_trait]
@@ -3734,57 +2734,6 @@ mod tests {
             self.released.lock().await.extend_from_slice(event_indices);
             Ok(())
         }
-    }
-
-    #[async_trait]
-    impl AgenticLoopHost for SnapshotClearingHost {
-        async fn execute_turn(
-            &mut self,
-            state: &mut AgenticLoopState,
-        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
-            if self.turn_results.is_empty() {
-                return Err(astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::BudgetExhausted,
-                    "no more turns",
-                ));
-            }
-            if self.current_turn == 1 {
-                state.hooks.task_board_snapshot = TaskBoardSnapshot::default();
-            }
-            self.current_turn += 1;
-            Ok(self.turn_results.remove(0))
-        }
-
-        fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
-            self.emitted_lines.push(line);
-        }
-
-        fn is_quiet(&self) -> bool {
-            true
-        }
-
-        fn turn_interaction_mode(&self) -> TurnInteractionMode {
-            TurnInteractionMode::NonInteractive
-        }
-
-        fn valid_tool_names(&self) -> &HashSet<String> {
-            &self.valid_tools
-        }
-
-        fn inject_tool_schema(&mut self, _schema: serde_json::Value) {}
-
-        fn render_final_text(&mut self, text: &str) {
-            self.rendered_final_text.push(text.to_string());
-        }
-    }
-
-    #[test]
-    fn circuit_breaker_introspection_message_uses_actual_read_only_streak() {
-        let message = circuit_breaker_introspection_message(18, 12);
-
-        assert!(message.contains("[Self-check — round 18]"));
-        assert!(message.contains("12 consecutive rounds"));
-        assert!(!message.contains("18 consecutive rounds"));
     }
 
     #[test]
@@ -4088,102 +3037,6 @@ mod tests {
     }
 
     #[test]
-    fn execution_retry_correction_is_detectable_and_stripped() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": execution_retry_message("fix the bug", ExecutionRetryReason::MissingMutation),
-        });
-        assert!(is_execution_retry_correction(&msg));
-
-        let unrelated = serde_json::json!({
-            "role": "user",
-            "content": "fix the bug",
-        });
-        assert!(!is_execution_retry_correction(&unrelated));
-
-        let assistant_with_marker = serde_json::json!({
-            "role": "assistant",
-            "content": EXECUTION_RETRY_MARKER,
-        });
-        assert!(!is_execution_retry_correction(&assistant_with_marker));
-    }
-
-    #[test]
-    fn execution_retry_blocks_plan_only_finish_for_mutating_task() {
-        let mut state = make_state();
-        mark_must_mutate(&mut state);
-        state.message = "修复这个问题".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "需要我直接执行这些修改吗？".into();
-        state.total_tool_calls = 2;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"grep -rn \"foo\" rust/"}"#.into()),
-            ..Default::default()
-        });
-
-        assert!(should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn execution_retry_forces_retry_on_zero_tool_noop_for_mutating_task() {
-        // A mutating-profile task where the model produces a bare conclusion
-        // with zero tool calls has no evidence for either a fix or a valid
-        // no-op conclusion. The runtime should force one corrective retry.
-        let mut state = make_state();
-        mark_must_mutate(&mut state);
-        state.message = "fix the bug".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I reviewed the code and the bug does not exist.".into();
-
-        assert!(should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn execution_retry_fires_when_mutating_task_only_planned() {
-        // Mutating profile + tool calls were made (exploration) but nothing
-        // committed → still retry to push for execution.
-        let mut state = make_state();
-        mark_must_mutate(&mut state);
-        state.message = "fix the bug".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "Here is the plan: change foo to bar.".into();
-        state.total_tool_calls = 1;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"cat src/foo.rs"}"#.into()),
-            ..Default::default()
-        });
-
-        assert!(should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn execution_retry_still_retries_no_change_text_for_required_mutation() {
-        let mut state = make_state();
-        mark_must_mutate(&mut state);
-        state.message = "fix the bug".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I reviewed the code path and the bug does not exist.".into();
-        state.total_tool_calls = 2;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"rg -n \"buggy_path\" rust/"}"#.into()),
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "view".into(),
-            ok: true,
-            ..Default::default()
-        });
-
-        assert!(should_force_execution_retry(&state));
-    }
-
-    #[test]
     fn bash_mutation_detects_compound_and_sudo_commands() {
         use crate::turn::agentic_loop::lifecycle::tool_record_is_workspace_mutation;
         let record = ToolCallRecord {
@@ -4215,352 +3068,6 @@ mod tests {
         // Non-JSON args are treated as missing rather than the raw string,
         // avoiding false positives from corrupted journal entries.
         assert!(!tool_record_is_workspace_mutation(&record));
-    }
-
-    #[test]
-    fn execution_retry_does_not_treat_bare_text_as_execution_without_structured_intent() {
-        let mut state = make_state();
-        state.message = "当然了".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "好的。".into();
-
-        assert!(!should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn execution_retry_does_not_fire_for_read_only_review() {
-        let mut state = make_state();
-        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-            "review local changes",
-        );
-        state.message = "review local changes".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I found one issue.".into();
-        state.total_tool_calls = 1;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"git diff --stat"}"#.into()),
-            ..Default::default()
-        });
-
-        assert!(!should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn execution_retry_ignores_runtime_scaffolding_without_structured_intent() {
-        let mut state = make_state();
-        state.message = concat!(
-            "review local changes",
-            "\n\n<system-reminder>\n",
-            "Previous runtime correction mentioned fix, apply, edit, and cleanup.\n",
-            "</system-reminder>"
-        )
-        .into();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
-        state.final_text = "I found one issue.".into();
-        state.total_tool_calls = 1;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"git diff --stat"}"#.into()),
-            ..Default::default()
-        });
-
-        assert!(!state.task_profile.mutates_workspace);
-        assert!(!should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn execution_retry_does_not_fire_after_concrete_edit() {
-        let mut state = make_state();
-        mark_must_mutate(&mut state);
-        state.message = "fix the bug".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "Done.".into();
-        state.total_tool_calls = 2;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "str_replace".into(),
-            ok: true,
-            ..Default::default()
-        });
-
-        assert!(!should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn browser_verification_retry_fires_for_curl_only_success_claim() {
-        let mut state = make_state();
-        require_browser_verification(&mut state);
-        state.message = "Test the game in browser and tell me if it works.".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I tested it and it's fully functional.".into();
-        state.total_tool_calls = 3;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"python3 -m http.server 8000"}"#.into()),
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"curl --noproxy '*' http://127.0.0.1:8000"}"#.into()),
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"ps -ef | grep http.server"}"#.into()),
-            ..Default::default()
-        });
-
-        assert_eq!(
-            execution_retry_reason(&state),
-            Some(ExecutionRetryReason::MissingBrowserVerification)
-        );
-    }
-
-    #[test]
-    fn browser_verification_retry_overrides_concrete_edit_short_circuit() {
-        let mut state = make_state();
-        mark_must_mutate(&mut state);
-        require_browser_verification(&mut state);
-        state.message = "fix the game bug and verify it in browser".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I fixed the bug and it's fully functional now.".into();
-        state.total_tool_calls = 3;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "str_replace".into(),
-            ok: true,
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"python3 -m http.server 8000"}"#.into()),
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"curl http://127.0.0.1:8000"}"#.into()),
-            ..Default::default()
-        });
-
-        assert_eq!(
-            execution_retry_reason(&state),
-            Some(ExecutionRetryReason::MissingBrowserVerification)
-        );
-    }
-
-    #[test]
-    fn browser_verification_retry_skips_when_playwright_evidence_exists() {
-        let mut state = make_state();
-        require_browser_verification(&mut state);
-        state.message = "Test the game in browser and tell me if it works.".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I tested it and it's fully functional.".into();
-        state.total_tool_calls = 1;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"npx playwright test tests/game.spec.ts"}"#.into()),
-            ..Default::default()
-        });
-
-        assert!(!should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn browser_verification_retry_does_not_parse_final_text_admissions() {
-        let mut state = make_state();
-        require_browser_verification(&mut state);
-        state.message = "Test the game in browser and tell me if it works.".into();
-        state.user_intent = state.message.clone();
-        state.final_text =
-            "I could not verify this in a browser because no browser-capable tool is available."
-                .into();
-        state.total_tool_calls = 1;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"python3 -m http.server 8000"}"#.into()),
-            ..Default::default()
-        });
-
-        assert!(should_force_execution_retry(&state));
-    }
-
-    fn auto_verify_hook() -> astra_turn_core::stop_hooks::StopHook {
-        astra_turn_core::stop_hooks::StopHook {
-            label: "verify-changes".into(),
-            command: "Based on the files you actually modified, run ONLY the relevant checks."
-                .into(),
-            working_dir: None,
-            depends_on: Vec::new(),
-            timeout_secs: None,
-            cache_key: None,
-        }
-    }
-
-    #[test]
-    fn auto_verify_stop_hook_skips_after_latest_mutation_was_verified() {
-        let mut state = make_state();
-        state.hooks.stop_hooks = vec![auto_verify_hook()];
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "str_replace".into(),
-            ok: true,
-            args_full: Some(r#"{"path":"src/lib.rs","old_str":"a","new_str":"b"}"#.into()),
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(
-                r#"{"command":"cargo test -p astra-cli --lib edge_tools::tests"}"#.into(),
-            ),
-            result_preview: Some("✓ cargo | 426 passed, 0 failed".into()),
-            ..Default::default()
-        });
-
-        assert!(should_skip_auto_verify_stop_hooks(&state));
-    }
-
-    #[test]
-    fn auto_verify_stop_hook_skips_when_no_workspace_mutation_happened() {
-        let mut state = make_state();
-        state.hooks.stop_hooks = vec![auto_verify_hook()];
-        state.final_text = "Here is the advice you asked for.".into();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "read_file".into(),
-            ok: true,
-            args_full: Some(r#"{"path":"src/lib.rs"}"#.into()),
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"git diff --stat"}"#.into()),
-            result_preview: Some("no changes".into()),
-            ..Default::default()
-        });
-
-        assert!(should_skip_auto_verify_stop_hooks(&state));
-    }
-
-    #[test]
-    fn auto_verify_stop_hook_does_not_skip_declarative_hook() {
-        let mut state = make_state();
-        state.hooks.stop_hooks = vec![astra_turn_core::stop_hooks::StopHook {
-            label: "project-contract".into(),
-            command: "make verify".into(),
-            working_dir: None,
-            depends_on: Vec::new(),
-            timeout_secs: None,
-            cache_key: None,
-        }];
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "str_replace".into(),
-            ok: true,
-            args_full: Some(r#"{"path":"src/lib.rs","old_str":"a","new_str":"b"}"#.into()),
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"cargo check"}"#.into()),
-            result_preview: Some("✓ cargo | finished".into()),
-            ..Default::default()
-        });
-
-        assert!(!should_skip_auto_verify_stop_hooks(&state));
-    }
-
-    #[test]
-    fn auto_verify_stop_hook_does_not_count_failed_cargo_pipeline() {
-        let mut state = make_state();
-        state.hooks.stop_hooks = vec![auto_verify_hook()];
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "str_replace".into(),
-            ok: true,
-            args_full: Some(r#"{"path":"src/lib.rs","old_str":"a","new_str":"b"}"#.into()),
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(
-                r#"{"command":"cargo test -p astra-cli test_a test_b 2>&1 | tail -30"}"#.into(),
-            ),
-            result_preview: Some(
-                "✗ unknown | 1 error(s) (exit 1)\nerror: unexpected argument 'test_b' found".into(),
-            ),
-            ..Default::default()
-        });
-
-        assert!(!should_skip_auto_verify_stop_hooks(&state));
-    }
-
-    #[test]
-    fn execution_retry_suppressed_when_round_budget_corrective_already_fired() {
-        let mut state = make_state();
-        state.message = "implement the feature".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I'll implement that for you.".into();
-        state.total_tool_calls = 0;
-        mark_must_mutate(&mut state);
-        state.stall.forced_round_budget_phase1 = true;
-        assert_eq!(execution_retry_reason(&state), None);
-    }
-
-    #[test]
-    fn execution_retry_suppressed_when_redundant_reads_corrective_already_fired() {
-        let mut state = make_state();
-        state.message = "implement the feature".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I'll implement that for you.".into();
-        state.total_tool_calls = 0;
-        mark_must_mutate(&mut state);
-        state.stall.forced_redundant_reads_corrective = true;
-        assert_eq!(execution_retry_reason(&state), None);
-    }
-
-    #[test]
-    fn execution_retry_suppressed_when_exploration_family_corrective_already_fired() {
-        let mut state = make_state();
-        state.message = "implement the feature".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I'll implement that for you.".into();
-        state.total_tool_calls = 0;
-        mark_must_mutate(&mut state);
-        state.stall.forced_exploration_family_corrective = true;
-        assert_eq!(execution_retry_reason(&state), None);
-    }
-
-    #[test]
-    fn execution_retry_suppressed_when_search_fanout_corrective_already_fired() {
-        let mut state = make_state();
-        state.message = "implement the feature".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I'll implement that for you.".into();
-        state.total_tool_calls = 0;
-        mark_must_mutate(&mut state);
-        state.stall.forced_search_fanout_corrective = true;
-        assert_eq!(execution_retry_reason(&state), None);
-    }
-
-    #[test]
-    fn execution_retry_suppressed_when_cache_waste_corrective_already_fired() {
-        let mut state = make_state();
-        state.message = "implement the feature".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "I'll implement that for you.".into();
-        state.total_tool_calls = 0;
-        mark_must_mutate(&mut state);
-        state.stall.forced_cache_waste_corrective = true;
-        assert_eq!(execution_retry_reason(&state), None);
     }
 
     #[test]
@@ -4639,7 +3146,7 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_signal_does_not_mark_completion_when_active_tasks_remain() {
+    fn task_board_state_does_not_suppress_completion_observation() {
         let mut state = make_state();
         state.llm_rounds_completed = 4;
         state.hooks.task_board_snapshot =
@@ -4675,212 +3182,8 @@ mod tests {
 
         let signal = build_circuit_breaker_signal(&state);
 
-        assert!(
-            !signal.task_completed,
-            "unfinished task-board work must suppress completion soft-stop"
-        );
+        assert!(signal.task_completed);
         assert!(signal.produced_mutation);
-    }
-
-    #[test]
-    fn circuit_breaker_signal_allows_completion_with_pending_backlog_only() {
-        let mut state = make_state();
-        state.llm_rounds_completed = 4;
-        state.hooks.task_board_snapshot =
-            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
-                astra_tools::task_mgmt::SessionTask {
-                    archived_at: None,
-                    id: "task-1".to_string(),
-                    title: "optional follow-up".to_string(),
-                    description: None,
-                    status: astra_tools::task_mgmt::SessionTaskStatusKind::Pending,
-                    subtasks: Vec::new(),
-                    created_at: "2025-01-01T00:00:00Z".to_string(),
-                    updated_at: "2025-01-01T00:00:00Z".to_string(),
-                    active_form: None,
-                    owner: None,
-                    metadata: None,
-                    blocks: Vec::new(),
-                    blocked_by: Vec::new(),
-                },
-            ]);
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "git".into(),
-            ok: true,
-            round: Some(3),
-            args_full: Some(r#"{"action":"commit","message":"finish"}"#.into()),
-            ..Default::default()
-        });
-
-        let signal = build_circuit_breaker_signal(&state);
-
-        assert!(
-            signal.task_completed,
-            "pending-only task board is backlog and must not suppress completion"
-        );
-    }
-
-    #[tokio::test]
-    async fn unfinished_task_board_guard_forces_another_round() {
-        let mut host = SnapshotClearingHost::new(vec![
-            text_result("Done.", 10, 5, Some(20)),
-            text_result("All task-board work is now complete.", 10, 5, Some(20)),
-        ]);
-        let mut state = make_state();
-        state.hooks.task_board_snapshot =
-            TaskBoardSnapshot::from_active_tasks(&[astra_tools::task_mgmt::SessionTask {
-                archived_at: None,
-                id: "task-1".to_string(),
-                title: "finish validation".to_string(),
-                description: None,
-                status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
-                subtasks: Vec::new(),
-                created_at: "2025-01-01T00:00:00Z".to_string(),
-                updated_at: "2025-01-01T00:00:00Z".to_string(),
-                active_form: None,
-                owner: None,
-                metadata: None,
-                blocks: Vec::new(),
-                blocked_by: Vec::new(),
-            }]);
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        assert!(outcome.is_ok(), "loop should continue until tasks clear");
-        assert_eq!(host.current_turn, 2);
-        assert_eq!(state.final_text, "All task-board work is now complete.");
-        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
-    }
-
-    /// Stub host whose `execute_turn` keeps returning text-only results AND
-    /// never clears the task-board snapshot — the same shape we'd see if the
-    /// model ignored the runtime's "unfinished tasks remain" corrective and
-    /// kept replying "Done." without making task-board progress.
-    struct StubbornTextOnlyHost {
-        turn_results: Vec<HostTurnResult>,
-        current_turn: usize,
-        emitted_lines: Vec<String>,
-        rendered_final_text: Vec<String>,
-        valid_tools: HashSet<String>,
-    }
-
-    impl StubbornTextOnlyHost {
-        fn new(turn_results: Vec<HostTurnResult>) -> Self {
-            Self {
-                turn_results,
-                current_turn: 0,
-                emitted_lines: Vec::new(),
-                rendered_final_text: Vec::new(),
-                valid_tools: HashSet::new(),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl AgenticLoopHost for StubbornTextOnlyHost {
-        async fn execute_turn(
-            &mut self,
-            _state: &mut AgenticLoopState,
-        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
-            if self.turn_results.is_empty() {
-                return Err(astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::BudgetExhausted,
-                    "no more turns",
-                ));
-            }
-            self.current_turn += 1;
-            Ok(self.turn_results.remove(0))
-        }
-
-        fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
-            self.emitted_lines.push(line);
-        }
-
-        fn is_quiet(&self) -> bool {
-            true
-        }
-
-        fn turn_interaction_mode(&self) -> TurnInteractionMode {
-            TurnInteractionMode::NonInteractive
-        }
-
-        fn valid_tool_names(&self) -> &HashSet<String> {
-            &self.valid_tools
-        }
-
-        fn inject_tool_schema(&mut self, _schema: serde_json::Value) {}
-
-        fn render_final_text(&mut self, text: &str) {
-            self.rendered_final_text.push(text.to_string());
-        }
-    }
-
-    /// Regression: the unfinished-task-board mid-loop gate must be one-shot
-    /// per turn so a model that ignores the corrective doesn't churn the
-    /// global round budget. After the gate fires once, the next text-only
-    /// completion should fall through to terminal rendering, where
-    /// terminal settlement leaves the task-board state observable without
-    /// turning a valid assistant answer into a paused run.
-    #[tokio::test]
-    async fn unfinished_task_board_gate_is_one_shot_per_turn() {
-        let mut host = StubbornTextOnlyHost::new(vec![
-            text_result("Done.", 10, 5, Some(20)),
-            text_result("Still done.", 10, 5, Some(20)),
-        ]);
-        let mut state = make_state();
-        state.hooks.task_board_snapshot =
-            TaskBoardSnapshot::from_active_tasks(&[astra_tools::task_mgmt::SessionTask {
-                archived_at: None,
-                id: "task-1".to_string(),
-                title: "finish validation".to_string(),
-                description: None,
-                status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
-                subtasks: Vec::new(),
-                created_at: "2025-01-01T00:00:00Z".to_string(),
-                updated_at: "2025-01-01T00:00:00Z".to_string(),
-                active_form: None,
-                owner: None,
-                metadata: None,
-                blocks: Vec::new(),
-                blocked_by: Vec::new(),
-            }]);
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        assert!(
-            outcome.is_ok(),
-            "loop must terminate even when the model ignores the corrective"
-        );
-        assert_eq!(
-            host.current_turn, 2,
-            "exactly two turns should run: one before the gate, one after the corrective"
-        );
-        assert_eq!(
-            state.final_text, "Still done.",
-            "task-board control state must not be rewritten into assistant prose"
-        );
-        assert!(
-            state.interruption.is_none(),
-            "in-progress task-board bookkeeping must not pause a run that produced an answer"
-        );
-        let unfinished_notices = host
-            .emitted_lines
-            .iter()
-            .filter(|line| line.contains("Unfinished tasks remain"))
-            .count();
-        // Even though the loop's quiet flag suppresses these in
-        // `unfinished_task_board_guard_forces_another_round`, that test runs
-        // the same code path; here `host.is_quiet()` returns true so the
-        // gate's headless line is suppressed too — the meaningful proof
-        // that the gate is one-shot is `current_turn == 2` (no third turn).
-        assert!(
-            unfinished_notices <= 1,
-            "the gate's stderr notice must fire at most once, got {unfinished_notices}"
-        );
-        // `forced_task_board_completion_gate` is reset by
-        // `finalize_and_render` on terminal exit, so we don't assert on it
-        // here. The structural proof is in the turn count plus the rewritten
-        // terminal text.
     }
 
     #[test]
@@ -4912,60 +3215,6 @@ mod tests {
             !signal.task_completed,
             "only the latest completed round may emit completion"
         );
-    }
-
-    #[test]
-    fn completion_soft_stop_message_is_ephemeral_corrective() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": completion_soft_stop_message(7, "finish and commit the fix"),
-        });
-
-        assert!(is_completion_soft_stop(&msg));
-        assert!(is_execution_corrective_message(&msg));
-        assert!(
-            msg["content"]
-                .as_str()
-                .unwrap()
-                .contains("Stop now and provide the final answer")
-        );
-    }
-
-    #[test]
-    fn circuit_breaker_abort_detail_explains_reason_and_resume_path() {
-        let mut state = make_state();
-        state.llm_rounds_completed = 6;
-        let detail = circuit_breaker_abort_detail(&state);
-
-        assert!(detail.contains("circuit breaker stopped this turn"));
-        assert!(detail.contains("Progress from earlier rounds is preserved"));
-        assert!(detail.contains("Resume by synthesizing verified evidence"));
-    }
-
-    #[test]
-    fn task_board_corrective_uses_cache_stable_counts_only() {
-        let snapshot =
-            TaskBoardSnapshot::from_active_tasks(&[astra_tools::task_mgmt::SessionTask {
-                archived_at: None,
-                id: "task-1".to_string(),
-                title: "very specific changing task title".to_string(),
-                description: None,
-                status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
-                subtasks: Vec::new(),
-                created_at: "2025-01-01T00:00:00Z".to_string(),
-                updated_at: "2025-01-01T00:00:00Z".to_string(),
-                active_form: None,
-                owner: None,
-                metadata: None,
-                blocks: Vec::new(),
-                blocked_by: Vec::new(),
-            }]);
-
-        let msg = unfinished_task_board_corrective_message(&snapshot, "finish the task");
-
-        assert!(msg.contains("1 in_progress task(s) remain"));
-        assert!(!msg.contains("task-1"));
-        assert!(!msg.contains("very specific changing task title"));
     }
 
     #[tokio::test]
@@ -5157,13 +3406,13 @@ mod tests {
     #[test]
     fn escalation_fires_after_threshold_of_read_only_calls_on_mutating_task() {
         let state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
-        assert!(should_escalate_execution(&state));
+        assert!(should_emit_execution_escalation_advisory(&state));
     }
 
     #[test]
     fn escalation_does_not_fire_just_below_threshold() {
         let state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD - 1);
-        assert!(!should_escalate_execution(&state));
+        assert!(!should_emit_execution_escalation_advisory(&state));
     }
 
     #[test]
@@ -5174,7 +3423,7 @@ mod tests {
         state.task_profile = astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default();
         state.turn_intent = None;
         assert!(!state.task_profile.mutates_workspace);
-        assert!(!should_escalate_execution(&state));
+        assert!(!should_emit_execution_escalation_advisory(&state));
     }
 
     #[test]
@@ -5186,7 +3435,7 @@ mod tests {
             ok: true,
             ..Default::default()
         });
-        assert!(!should_escalate_execution(&state));
+        assert!(!should_emit_execution_escalation_advisory(&state));
     }
 
     #[test]
@@ -5198,15 +3447,15 @@ mod tests {
             args_full: Some(r#"{"command":"sed -i 's/a/b/' foo.rs"}"#.into()),
             ..Default::default()
         });
-        assert!(!should_escalate_execution(&state));
+        assert!(!should_emit_execution_escalation_advisory(&state));
     }
 
     #[test]
     fn escalation_is_one_shot_per_turn() {
         let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
-        state.stall.forced_execution_escalation = true;
+        state.stall.execution_escalation_advisory_emitted = true;
         assert!(
-            !should_escalate_execution(&state),
+            !should_emit_execution_escalation_advisory(&state),
             "flag must prevent a second injection"
         );
     }
@@ -5215,12 +3464,12 @@ mod tests {
     fn escalation_suppressed_when_parallel_batching_already_fired() {
         let mut state = make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD);
         // Precondition: without the flag, escalation would fire.
-        assert!(should_escalate_execution(&state));
+        assert!(should_emit_execution_escalation_advisory(&state));
         // Once parallel-batching force has fired, escalation must yield to
-        // honor the one-corrective-per-turn invariant.
-        state.stall.forced_parallel_batching = true;
+        // honor the one-advisory-per-turn invariant.
+        state.stall.parallel_batching_advisory_emitted = true;
         assert!(
-            !should_escalate_execution(&state),
+            !should_emit_execution_escalation_advisory(&state),
             "escalation must not fire when parallel-batching force already active"
         );
     }
@@ -5241,7 +3490,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        assert!(!should_escalate_execution(&state));
+        assert!(!should_emit_execution_escalation_advisory(&state));
     }
 
     #[test]
@@ -5266,44 +3515,8 @@ mod tests {
             .iter()
             .all(|r| r.is_synthetic_placeholder());
         if all_synthetic {
-            assert!(!should_escalate_execution(&state));
+            assert!(!should_emit_execution_escalation_advisory(&state));
         }
-    }
-
-    #[test]
-    fn retry_guard_yields_to_prior_escalation_in_same_turn() {
-        // If escalation already fired mid-loop, retry must NOT also fire at
-        // BreakLoop — one corrective injection per turn.
-        let mut state = make_state();
-        state.message = "fix the bug".into();
-        state.user_intent = state.message.clone();
-        mark_must_mutate(&mut state);
-        state.final_text = "I will proceed with the edits now.".into();
-        state.total_tool_calls = 10;
-
-        // Sanity: without the escalation flag this state would trigger retry.
-        state.stall.forced_execution_escalation = false;
-        assert!(should_force_execution_retry(&state));
-
-        // With the escalation flag set, retry must yield.
-        state.stall.forced_execution_escalation = true;
-        assert!(!should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn parallel_batching_force_blocks_subsequent_retry_in_same_turn() {
-        let mut state = make_state();
-        state.message = "fix the bug".into();
-        state.user_intent = state.message.clone();
-        mark_must_mutate(&mut state);
-        state.final_text = "I'll continue investigating.".into();
-        state.total_tool_calls = 10;
-        // Without the parallel-batching flag, this state would trigger retry.
-        assert!(should_force_execution_retry(&state));
-        // Once the parallel-batching force fired, retry must yield to honor
-        // the one-corrective-per-turn invariant.
-        state.stall.forced_parallel_batching = true;
-        assert!(!should_force_execution_retry(&state));
     }
 
     #[test]
@@ -5315,46 +3528,29 @@ mod tests {
             push_single_tool_round(&mut state);
         }
         // Precondition: without escalation flag, parallel-batching would fire.
-        assert!(should_force_parallel_batching(
+        assert!(should_emit_parallel_batching_advisory(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
         // Once escalation has fired, parallel-batching must yield.
-        state.stall.forced_execution_escalation = true;
+        state.stall.execution_escalation_advisory_emitted = true;
         assert!(
-            !should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD),
+            !should_emit_parallel_batching_advisory(
+                &state,
+                PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+            ),
             "parallel-batching must not fire when escalation already active"
-        );
-    }
-
-    #[test]
-    fn parallel_batching_suppressed_when_retry_already_fired() {
-        let mut state = make_state();
-        state.message = "explore the codebase".into();
-        state.user_intent = state.message.clone();
-        for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
-            push_single_tool_round(&mut state);
-        }
-        assert!(should_force_parallel_batching(
-            &state,
-            PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
-        ));
-        state.stall.forced_execution_retry = true;
-        assert!(
-            !should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD),
-            "parallel-batching must not fire when retry already active"
         );
     }
 
     #[test]
     fn parallel_batching_suppressed_when_cascade_guard_already_fired() {
         let flags: Vec<Box<dyn Fn(&mut AgenticLoopState)>> = vec![
-            Box::new(|s| s.stall.forced_round_budget_phase1 = true),
-            Box::new(|s| s.stall.forced_redundant_reads_corrective = true),
-            Box::new(|s| s.stall.forced_cache_waste_corrective = true),
-            Box::new(|s| s.stall.forced_search_fanout_corrective = true),
-            Box::new(|s| s.stall.forced_exploration_family_corrective = true),
-            Box::new(|s| s.stall.forced_exploration_family_phase2 = true),
+            Box::new(|s| s.stall.redundant_reads_advisory_emitted = true),
+            Box::new(|s| s.stall.cache_waste_advisory_emitted = true),
+            Box::new(|s| s.stall.search_fanout_advisory_emitted = true),
+            Box::new(|s| s.stall.exploration_family_advisory_emitted = true),
+            Box::new(|s| s.stall.stronger_exploration_family_advisory_emitted = true),
         ];
         for set_flag in &flags {
             let mut state = make_state();
@@ -5364,35 +3560,19 @@ mod tests {
                 push_single_tool_round(&mut state);
             }
             // Precondition: would fire without the flag.
-            assert!(should_force_parallel_batching(
+            assert!(should_emit_parallel_batching_advisory(
                 &state,
                 PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
             ));
             set_flag(&mut state);
             assert!(
-                !should_force_parallel_batching(&state, PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD),
+                !should_emit_parallel_batching_advisory(
+                    &state,
+                    PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
+                ),
                 "parallel-batching must not fire when a cascade guard already active"
             );
         }
-    }
-
-    #[test]
-    fn escalation_marker_detected_and_stripped_by_corrective_filter() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": execution_escalation_message("fix the bug", 9),
-        });
-        assert!(is_execution_escalation(&msg));
-        assert!(is_execution_corrective_message(&msg));
-
-        let retry = serde_json::json!({
-            "role": "user",
-            "content": execution_retry_message("fix the bug", ExecutionRetryReason::MissingMutation),
-        });
-        assert!(is_execution_corrective_message(&retry));
-
-        let unrelated = serde_json::json!({"role":"user","content":"fix the bug"});
-        assert!(!is_execution_corrective_message(&unrelated));
     }
 
     // ─── Parallel-batching force (third-tier guard) ─────────────────────
@@ -5414,7 +3594,7 @@ mod tests {
         for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
             push_single_tool_round(&mut state);
         }
-        assert!(should_force_parallel_batching(
+        assert!(should_emit_parallel_batching_advisory(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
@@ -5428,7 +3608,7 @@ mod tests {
         for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD - 1) {
             push_single_tool_round(&mut state);
         }
-        assert!(!should_force_parallel_batching(
+        assert!(!should_emit_parallel_batching_advisory(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
@@ -5453,7 +3633,7 @@ mod tests {
                 .messages
                 .push(serde_json::json!({"role": "tool", "content": "..."}));
         }
-        assert!(!should_force_parallel_batching(
+        assert!(!should_emit_parallel_batching_advisory(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
@@ -5468,49 +3648,26 @@ mod tests {
             push_single_tool_round(&mut state);
         }
         // First time would fire...
-        assert!(should_force_parallel_batching(
+        assert!(should_emit_parallel_batching_advisory(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
         // ...but once the flag is set, a second attempt is suppressed even
         // if the model produces yet another single-tool round.
-        state.stall.forced_parallel_batching = true;
+        state.stall.parallel_batching_advisory_emitted = true;
         push_single_tool_round(&mut state);
-        assert!(!should_force_parallel_batching(
+        assert!(!should_emit_parallel_batching_advisory(
             &state,
             PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD
         ));
     }
 
-    // ── Escalation tier (P0: session 8d9e5903 regression) ──
-    //
-    // When the first-tier force has fired but the model keeps producing
-    // single-tool rounds, the runtime must escalate — one-shot is too
-    // lenient. Guards prevent infinite re-fire and prevent escalation
-    // from firing *before* the first-tier has fired.
-
-    #[test]
-    fn parallel_batching_force_marker_recognized_by_corrective_filter() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": parallel_batching_force_message(7, "do something"),
-        });
-        assert!(is_parallel_batching_force(&msg));
-        assert!(is_execution_corrective_message(&msg));
-        // Other corrective markers must not be misclassified as this one.
-        let retry = serde_json::json!({
-            "role": "user",
-            "content": execution_retry_message("do something", ExecutionRetryReason::MissingMutation),
-        });
-        assert!(!is_parallel_batching_force(&retry));
-    }
-
     // ─── Cascade-invariant + per-model resolver wiring ─────────────────────
 
-    /// The runtime hard-corrective force MUST stay strictly above the
+    /// The runtime hard-advisory force MUST stay strictly above the
     /// prompt-layer soft nudge so the soft→hard cascade is preserved. If the
     /// resolved force ever drops to ≤ nudge, the runtime will inject a hard
-    /// `user`-role corrective before the model has had any chance to
+    /// `user`-role advisory before the model has had any chance to
     /// self-correct on the soft prompt nudge — that inverts the intended
     /// failure-mode escalation.
     #[test]
@@ -5568,7 +3725,7 @@ mod tests {
     /// per-model threshold rather than the global default. This pins the
     /// chain `state.context_manifest_model_name → resolve_for_model →
     /// EffectiveToolPolicy::parallel_batching_force_streak →
-    /// should_force_parallel_batching(_, threshold)`. A regression that
+    /// should_emit_parallel_batching_advisory(_, threshold)`. A regression that
     /// re-routes the guard back to `effective_parallel_batching_force_streak`
     /// (model-blind) would silently break this.
     #[test]
@@ -5597,9 +3754,12 @@ mod tests {
             push_single_tool_round(&mut state);
         }
 
-        // Resolved per-model threshold (=11) must suppress the corrective…
+        // Resolved per-model threshold (=11) must suppress the advisory…
         assert!(
-            !should_force_parallel_batching(&state, policy.parallel_batching_force_streak as usize),
+            !should_emit_parallel_batching_advisory(
+                &state,
+                policy.parallel_batching_force_streak as usize
+            ),
             "streak={global_default} must NOT fire under per-model force=11"
         );
 
@@ -5609,7 +3769,7 @@ mod tests {
         // would still pass but the first would change behavior — pinning
         // both makes the wiring explicit.
         assert!(
-            should_force_parallel_batching(
+            should_emit_parallel_batching_advisory(
                 &state,
                 cfg.effective_parallel_batching_force_streak() as usize
             ),
@@ -5622,8 +3782,8 @@ mod tests {
     /// `parallel_batching_force_streak = 1` (or any value at/below
     /// `PARALLEL_BATCHING_NUDGE_THRESHOLD`) MUST land above the nudge
     /// threshold after `apply_profile`'s clamp, otherwise the runtime
-    /// hard corrective fires before the prompt-layer ever nudges and
-    /// the soft→hard cascade is silently inverted.
+    /// advisory arrives before the prompt-layer nudge and the intended
+    /// progression is silently inverted.
     #[test]
     fn parallel_batching_force_per_profile_clamp_above_nudge() {
         for low in 1..=crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD as u32 {
@@ -5657,7 +3817,7 @@ mod tests {
 
     // ── Auto-mode nudge suppression ────────────────────────────────────
     // In PermissionMode::Auto (→ TurnInteractionMode::Auto) the user
-    // opted into uninterrupted execution. Every corrective nudge we
+    // opted into uninterrupted execution. Every advisory nudge we
     // would otherwise inject must be dropped. Regression coverage for
     // the "不停被打断" complaint in session 3b7ac18f.
 
@@ -5714,10 +3874,10 @@ mod tests {
                 .and_then(|c| c.as_str()),
             Some("Switch to writing tests first.")
         );
-        assert!(state.volatile_pending.iter().any(|entry| {
-            entry.kind == VolatileKind::DeferredUserInput
-                && entry.content.contains("Switch to writing tests first.")
-        }));
+        assert!(
+            state.volatile_pending.is_empty(),
+            "real deferred user input must not be duplicated as runtime context"
+        );
     }
 
     #[tokio::test]
@@ -6014,8 +4174,8 @@ mod tests {
             "Auto mode must not inject parallel-batching-force nudge"
         );
         assert!(
-            !state.stall.forced_parallel_batching,
-            "Auto mode must not set forced_parallel_batching flag"
+            !state.stall.parallel_batching_advisory_emitted,
+            "Auto mode must not set parallel_batching_advisory_emitted flag"
         );
     }
 
@@ -6035,7 +4195,7 @@ mod tests {
         state.user_intent = state.message.clone();
         // Accumulate EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD successful
         // read-only records with no write. `ok: true` + non-synthetic is
-        // the shape `should_escalate_execution` counts.
+        // the shape `should_emit_execution_escalation_advisory` counts.
         for i in 0..EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD {
             state.stall.tool_call_records.push(ToolCallRecord {
                 tool_call_id: None,
@@ -6074,13 +4234,13 @@ mod tests {
             !has_message_starting_with(&state, EXECUTION_ESCALATION_MARKER),
             "Auto mode must not inject execution-escalation nudge"
         );
-        assert!(!state.stall.forced_execution_escalation);
+        assert!(!state.stall.execution_escalation_advisory_emitted);
     }
 
     #[tokio::test]
     async fn auto_mode_suppresses_round_budget_guidance_injection() {
         // The prompt-side tool_round_guidance (parallel-batching soft
-        // nudge at streak=4, before the hard force at streak=5) also
+        // nudge at streak=4, before the higher-threshold advisory at streak=5) also
         // must stay silent in Auto.
         let mut state = make_state();
         state.message = "keep going".into();
@@ -6134,7 +4294,7 @@ mod tests {
     }
 
     #[test]
-    fn redundant_reads_corrective_fires_at_threshold() {
+    fn redundant_reads_advisory_fires_at_threshold() {
         let mut state = make_state();
         state.message = "fix the bug".into();
         state.user_intent = state.message.clone();
@@ -6143,14 +4303,23 @@ mod tests {
         for r in 0..(REDUNDANT_READS_MIDLOOP_THRESHOLD + 1) {
             push_redundant_sed_read(&mut state, r as u32);
         }
-        assert!(should_inject_redundant_reads_corrective(
-            &state,
-            REDUNDANT_READS_MIDLOOP_THRESHOLD
-        ));
+        let corrections = crate::turn::agentic_loop::guards::evaluate_guards(
+            &crate::turn::agentic_loop::guards::default_guards(),
+            &mut state,
+            &crate::turn::agentic_loop::guards::GuardConfig {
+                suppress_nudges: false,
+                parallel_batching_force_streak: usize::MAX,
+                redundant_reads_threshold: REDUNDANT_READS_MIDLOOP_THRESHOLD,
+                cache_waste_threshold: usize::MAX,
+            },
+        );
+
+        assert!(state.stall.redundant_reads_advisory_emitted);
+        assert_eq!(corrections.len(), 1);
     }
 
     #[test]
-    fn redundant_reads_corrective_silent_below_threshold() {
+    fn redundant_reads_advisory_silent_below_threshold() {
         let mut state = make_state();
         state.message = "fix the bug".into();
         state.user_intent = state.message.clone();
@@ -6158,102 +4327,98 @@ mod tests {
         for r in 0..REDUNDANT_READS_MIDLOOP_THRESHOLD {
             push_redundant_sed_read(&mut state, r as u32);
         }
-        assert!(!should_inject_redundant_reads_corrective(
-            &state,
-            REDUNDANT_READS_MIDLOOP_THRESHOLD
-        ));
+        let corrections = crate::turn::agentic_loop::guards::evaluate_guards(
+            &crate::turn::agentic_loop::guards::default_guards(),
+            &mut state,
+            &crate::turn::agentic_loop::guards::GuardConfig {
+                suppress_nudges: false,
+                parallel_batching_force_streak: usize::MAX,
+                redundant_reads_threshold: REDUNDANT_READS_MIDLOOP_THRESHOLD,
+                cache_waste_threshold: usize::MAX,
+            },
+        );
+
+        assert!(!state.stall.redundant_reads_advisory_emitted);
+        assert!(corrections.is_empty());
     }
 
     #[test]
-    fn redundant_reads_corrective_is_one_shot_per_turn() {
+    fn redundant_reads_advisory_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "fix the bug".into();
         state.user_intent = state.message.clone();
         for r in 0..(REDUNDANT_READS_MIDLOOP_THRESHOLD + 5) {
             push_redundant_sed_read(&mut state, r as u32);
         }
-        // First check fires...
-        assert!(should_inject_redundant_reads_corrective(
-            &state,
-            REDUNDANT_READS_MIDLOOP_THRESHOLD
-        ));
-        // ...then the one-shot flag gates the next attempt.
-        state.stall.forced_redundant_reads_corrective = true;
+        let cfg = crate::turn::agentic_loop::guards::GuardConfig {
+            suppress_nudges: false,
+            parallel_batching_force_streak: usize::MAX,
+            redundant_reads_threshold: REDUNDANT_READS_MIDLOOP_THRESHOLD,
+            cache_waste_threshold: usize::MAX,
+        };
+        let first = crate::turn::agentic_loop::guards::evaluate_guards(
+            &crate::turn::agentic_loop::guards::default_guards(),
+            &mut state,
+            &cfg,
+        );
+        assert!(state.stall.redundant_reads_advisory_emitted);
+        assert_eq!(first.len(), 1);
+
         push_redundant_sed_read(&mut state, 99);
-        assert!(!should_inject_redundant_reads_corrective(
-            &state,
-            REDUNDANT_READS_MIDLOOP_THRESHOLD
-        ));
+        let second = crate::turn::agentic_loop::guards::evaluate_guards(
+            &crate::turn::agentic_loop::guards::default_guards(),
+            &mut state,
+            &cfg,
+        );
+        assert!(second.is_empty());
     }
 
     #[test]
-    fn redundant_reads_corrective_marker_recognized() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": redundant_reads_corrective_message(5, "fix the bug"),
-        });
-        assert!(is_redundant_reads_corrective(&msg));
-        let unrelated = serde_json::json!({"role": "user", "content": "hello"});
-        assert!(!is_redundant_reads_corrective(&unrelated));
-    }
-
-    #[test]
-    fn cache_waste_corrective_fires_at_threshold() {
+    fn cache_waste_advisory_fires_at_threshold() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.user_intent = state.message.clone();
         for _ in 0..CACHE_WASTE_MIDLOOP_THRESHOLD {
             state.turn_guard.record_cache_hit("git_diff");
         }
-        assert!(should_inject_cache_waste_corrective(
+        assert!(should_emit_cache_waste_advisory(
             &state,
             CACHE_WASTE_MIDLOOP_THRESHOLD
         ));
     }
 
     #[test]
-    fn cache_waste_corrective_silent_below_threshold() {
+    fn cache_waste_advisory_silent_below_threshold() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.user_intent = state.message.clone();
         for _ in 0..(CACHE_WASTE_MIDLOOP_THRESHOLD - 1) {
             state.turn_guard.record_cache_hit("git_diff");
         }
-        assert!(!should_inject_cache_waste_corrective(
+        assert!(!should_emit_cache_waste_advisory(
             &state,
             CACHE_WASTE_MIDLOOP_THRESHOLD
         ));
     }
 
     #[test]
-    fn cache_waste_corrective_is_one_shot_per_turn() {
+    fn cache_waste_advisory_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.user_intent = state.message.clone();
         for _ in 0..(CACHE_WASTE_MIDLOOP_THRESHOLD + 2) {
             state.turn_guard.record_cache_hit("git_diff");
         }
-        assert!(should_inject_cache_waste_corrective(
+        assert!(should_emit_cache_waste_advisory(
             &state,
             CACHE_WASTE_MIDLOOP_THRESHOLD
         ));
-        state.stall.forced_cache_waste_corrective = true;
+        state.stall.cache_waste_advisory_emitted = true;
         state.turn_guard.record_cache_hit("git_diff");
-        assert!(!should_inject_cache_waste_corrective(
+        assert!(!should_emit_cache_waste_advisory(
             &state,
             CACHE_WASTE_MIDLOOP_THRESHOLD
         ));
-    }
-
-    #[test]
-    fn cache_waste_corrective_marker_recognized() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": cache_waste_corrective_message(&[("git_diff", 3)], "review local changes"),
-        });
-        assert!(is_cache_waste_corrective(&msg));
-        let unrelated = serde_json::json!({"role": "user", "content": "hello"});
-        assert!(!is_cache_waste_corrective(&unrelated));
     }
 
     fn push_search_call(state: &mut AgenticLoopState, idx: usize) {
@@ -6266,7 +4431,7 @@ mod tests {
     }
 
     #[test]
-    fn search_fanout_corrective_fires_for_mutating_task() {
+    fn search_fanout_advisory_fires_for_mutating_task() {
         let mut state = make_state();
         state.message = "fix the bug".into();
         state.user_intent = state.message.clone();
@@ -6275,11 +4440,11 @@ mod tests {
             push_search_call(&mut state, idx);
         }
 
-        assert!(should_inject_search_fanout_corrective(&state, 8));
+        assert!(should_emit_search_fanout_advisory(&state, 8));
     }
 
     #[test]
-    fn search_fanout_corrective_skips_read_only_review() {
+    fn search_fanout_advisory_skips_read_only_review() {
         let mut state = make_state();
         state.message = "review the branch".into();
         state.user_intent = state.message.clone();
@@ -6288,11 +4453,11 @@ mod tests {
             push_search_call(&mut state, idx);
         }
 
-        assert!(!should_inject_search_fanout_corrective(&state, 8));
+        assert!(!should_emit_search_fanout_advisory(&state, 8));
     }
 
     #[test]
-    fn search_fanout_corrective_is_one_shot_per_turn() {
+    fn search_fanout_advisory_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "fix the bug".into();
         state.user_intent = state.message.clone();
@@ -6300,21 +4465,9 @@ mod tests {
         for idx in 0..10 {
             push_search_call(&mut state, idx);
         }
-        assert!(should_inject_search_fanout_corrective(&state, 8));
-        state.stall.forced_search_fanout_corrective = true;
-        assert!(!should_inject_search_fanout_corrective(&state, 8));
-    }
-
-    #[test]
-    fn search_fanout_corrective_marker_recognized() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": search_fanout_corrective_message(8, "fix the bug"),
-        });
-        assert!(is_search_fanout_corrective(&msg));
-        assert!(is_execution_corrective_message(&msg));
-        let unrelated = serde_json::json!({"role": "user", "content": "hello"});
-        assert!(!is_search_fanout_corrective(&unrelated));
+        assert!(should_emit_search_fanout_advisory(&state, 8));
+        state.stall.search_fanout_advisory_emitted = true;
+        assert!(!should_emit_search_fanout_advisory(&state, 8));
     }
 
     fn push_diff_round(state: &mut AgenticLoopState, round: u32) {
@@ -6365,7 +4518,7 @@ mod tests {
     }
 
     #[test]
-    fn exploration_family_corrective_fires_at_threshold_and_cautions_explicit_tools() {
+    fn exploration_family_advisory_fires_at_threshold_and_cautions_explicit_tools() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.user_intent = state.message.clone();
@@ -6373,11 +4526,11 @@ mod tests {
             push_diff_round(&mut state, round as u32);
         }
 
-        let Some((family, streak)) = exploration_family_corrective_candidate(
+        let Some((family, streak)) = exploration_family_advisory_candidate(
             &state,
             astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD,
         ) else {
-            panic!("expected exploration-family corrective candidate");
+            panic!("expected exploration-family advisory candidate");
         };
 
         assert_eq!(family, "diff");
@@ -6386,20 +4539,20 @@ mod tests {
             astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
         );
 
-        let retry_cautioned = mark_exploration_family_corrective(&mut state, &family);
+        let retry_cautioned = mark_exploration_family_advisory(&mut state, &family);
         assert_eq!(retry_cautioned, vec!["git".to_string()]);
         assert!(
             !state.restricted_tools.contains("git"),
-            "exploration-family corrective must not hard-restrict the tool"
+            "exploration-family advisory must not hard-restrict the tool"
         );
         assert!(
             !state.restricted_tools.contains("bash"),
-            "exploration-family corrective must not globally block bash"
+            "exploration-family advisory must not globally block bash"
         );
     }
 
     #[test]
-    fn exploration_family_corrective_silent_below_threshold() {
+    fn exploration_family_advisory_silent_below_threshold() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.user_intent = state.message.clone();
@@ -6408,7 +4561,7 @@ mod tests {
         }
 
         assert!(
-            exploration_family_corrective_candidate(
+            exploration_family_advisory_candidate(
                 &state,
                 astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD,
             )
@@ -6417,7 +4570,7 @@ mod tests {
     }
 
     #[test]
-    fn exploration_family_corrective_is_one_shot_per_turn() {
+    fn exploration_family_advisory_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.user_intent = state.message.clone();
@@ -6426,16 +4579,16 @@ mod tests {
         }
 
         assert!(
-            exploration_family_corrective_candidate(
+            exploration_family_advisory_candidate(
                 &state,
                 astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD,
             )
             .is_some()
         );
 
-        state.stall.forced_exploration_family_corrective = true;
+        state.stall.exploration_family_advisory_emitted = true;
         assert!(
-            exploration_family_corrective_candidate(
+            exploration_family_advisory_candidate(
                 &state,
                 astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD,
             )
@@ -6444,63 +4597,12 @@ mod tests {
     }
 
     #[test]
-    fn exploration_family_corrective_marker_recognized() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": exploration_family_corrective_message(
-                "diff",
-                3,
-                &["git".to_string()],
-                "review local changes",
-            ),
-        });
-        assert!(is_exploration_family_corrective(&msg));
-        assert!(is_execution_corrective_message(&msg));
-        let unrelated = serde_json::json!({"role": "user", "content": "hello"});
-        assert!(!is_exploration_family_corrective(&unrelated));
-    }
-
-    #[test]
-    fn answer_relevance_retry_message_is_classified_as_corrective() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": answer_relevance_retry_message("相关的测试够硬核吗？"),
-        });
-
-        assert!(is_final_answer_relevance_retry(&msg));
-        assert!(is_execution_corrective_message(&msg));
-    }
-
-    #[test]
-    fn answer_relevance_retry_exhausted_only_triggers_when_still_off_target() {
-        let mut state = make_state();
-        state.message = "相关的测试够硬核吗？".into();
-        state.user_intent = state.message.clone();
-        state.final_text = "测试覆盖了 provider routing、edge offline、prompt cache 和 unhappy path，但还缺一次全量在线回归。".into();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"ls"}"#.into()),
-            ..Default::default()
-        });
-
-        assert!(!state.stall.forced_answer_relevance_retry);
-        assert!(!is_answer_relevance_retry_exhausted(&state));
-
-        state.stall.forced_answer_relevance_retry = true;
-        assert!(!is_answer_relevance_retry_exhausted(&state));
-
-        state.final_text = "148 files changed, +9498 / -2335 lines, 11 commits.".into();
-        assert!(is_answer_relevance_retry_exhausted(&state));
-    }
-
-    #[test]
     fn exploration_family_phase2_fires_after_repeated_retry_signature_round() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.user_intent = state.message.clone();
-        state.stall.forced_exploration_family_corrective = true;
-        state.stall.exploration_family_corrective_family = Some("diff".into());
+        state.stall.exploration_family_advisory_emitted = true;
+        state.stall.exploration_family_advisory_family = Some("diff".into());
         let args = r#"{"action":"diff","path":"src/lib.rs"}"#;
         push_retry_cautioned_round(&mut state, "git", 6, args);
         push_retry_cautioned_round(&mut state, "git", 7, args);
@@ -6517,8 +4619,8 @@ mod tests {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.user_intent = state.message.clone();
-        state.stall.forced_exploration_family_corrective = true;
-        state.stall.exploration_family_corrective_family = Some("diff".into());
+        state.stall.exploration_family_advisory_emitted = true;
+        state.stall.exploration_family_advisory_family = Some("diff".into());
         let args = r#"{"action":"diff","path":"src/lib.rs"}"#;
         push_retry_cautioned_round(&mut state, "git", 6, args);
         push_retry_cautioned_round(&mut state, "git", 7, args);
@@ -6538,8 +4640,8 @@ mod tests {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.user_intent = state.message.clone();
-        state.stall.forced_exploration_family_corrective = true;
-        state.stall.exploration_family_corrective_family = Some("diff".into());
+        state.stall.exploration_family_advisory_emitted = true;
+        state.stall.exploration_family_advisory_family = Some("diff".into());
         push_retry_cautioned_round(
             &mut state,
             "git",
@@ -6564,35 +4666,19 @@ mod tests {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.user_intent = state.message.clone();
-        state.stall.forced_exploration_family_corrective = true;
-        state.stall.exploration_family_corrective_family = Some("diff".into());
+        state.stall.exploration_family_advisory_emitted = true;
+        state.stall.exploration_family_advisory_family = Some("diff".into());
         let args = r#"{"action":"diff","path":"src/lib.rs"}"#;
         push_retry_cautioned_round(&mut state, "git", 6, args);
         push_retry_cautioned_round(&mut state, "git", 7, args);
 
         assert!(exploration_family_phase2_candidate(&state).is_some());
-        state.stall.forced_exploration_family_phase2 = true;
+        state.stall.stronger_exploration_family_advisory_emitted = true;
         assert!(exploration_family_phase2_candidate(&state).is_none());
     }
 
     #[test]
-    fn exploration_family_phase2_marker_recognized() {
-        let msg = serde_json::json!({
-            "role": "user",
-            "content": exploration_family_phase2_message(
-                "diff",
-                &["git".to_string()],
-                "review local changes",
-            ),
-        });
-        assert!(is_exploration_family_phase2(&msg));
-        assert!(is_execution_corrective_message(&msg));
-        let unrelated = serde_json::json!({"role": "user", "content": "hello"});
-        assert!(!is_exploration_family_phase2(&unrelated));
-    }
-
-    #[test]
-    fn exploration_family_corrective_retry_cautions_search_tools_without_bash() {
+    fn exploration_family_advisory_retry_cautions_search_tools_without_bash() {
         let mut state = make_state();
         state.message = "investigate auth flow".into();
         state.user_intent = state.message.clone();
@@ -6600,11 +4686,11 @@ mod tests {
             push_search_round(&mut state, round as u32);
         }
 
-        let Some((family, streak)) = exploration_family_corrective_candidate(
+        let Some((family, streak)) = exploration_family_advisory_candidate(
             &state,
             astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD,
         ) else {
-            panic!("expected exploration-family search corrective candidate");
+            panic!("expected exploration-family search advisory candidate");
         };
 
         assert_eq!(family, "search");
@@ -6613,7 +4699,7 @@ mod tests {
             astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
         );
 
-        let retry_cautioned = mark_exploration_family_corrective(&mut state, &family);
+        let retry_cautioned = mark_exploration_family_advisory(&mut state, &family);
         assert_eq!(
             retry_cautioned,
             vec!["glob".to_string(), "grep".to_string(), "rg".to_string()]
@@ -6622,11 +4708,11 @@ mod tests {
             !state.restricted_tools.contains("glob")
                 && !state.restricted_tools.contains("grep")
                 && !state.restricted_tools.contains("rg"),
-            "search-family corrective must not hard-restrict search tools"
+            "search-family advisory must not hard-restrict search tools"
         );
         assert!(
             !state.restricted_tools.contains("bash"),
-            "search-family corrective must not globally block bash"
+            "search-family advisory must not globally block bash"
         );
     }
 
@@ -7080,4 +5166,45 @@ fn build_spill_summary(messages: &[serde_json::Value]) -> String {
     }
 
     summary
+}
+
+#[cfg(test)]
+mod response_guard_blocked_interruption_tests {
+    use super::*;
+
+    #[test]
+    fn response_guard_blocked_finish_reason_records_structured_interruption() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.last_finish_reason = Some(RESPONSE_GUARD_BLOCKED_FINISH_REASON.to_string());
+        state.remaining_turns = 7;
+
+        assert!(record_response_guard_blocked_interruption_if_needed(
+            &mut state
+        ));
+        let interruption = state
+            .interruption
+            .as_ref()
+            .expect("response guard finish reason must create interruption");
+        assert_eq!(interruption.kind, InterruptionKind::ResponseGuardBlocked);
+        assert_eq!(
+            interruption.resume_action,
+            ResumeAction::ContinueImmediately
+        );
+        assert_eq!(interruption.remaining_turns, 7);
+        assert_eq!(
+            interruption.error_detail.as_deref(),
+            Some("response guard blocked the model's final output")
+        );
+    }
+
+    #[test]
+    fn normal_finish_reason_does_not_record_response_guard_interruption() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.last_finish_reason = Some("normal".to_string());
+
+        assert!(!record_response_guard_blocked_interruption_if_needed(
+            &mut state
+        ));
+        assert!(state.interruption.is_none());
+    }
 }

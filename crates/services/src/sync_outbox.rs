@@ -7,9 +7,9 @@
 //! payload hash, explicit retry/backoff state, a contiguous ack watermark, and
 //! poison isolation so one bad record cannot block later records forever.
 
-use astra_core::canonical_json_string;
 use crate::session_journal::{self, JournalEvent, JournalEventType};
 use crate::sync_engine::SyncDomain;
+use astra_core::canonical_json_string;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -213,7 +213,7 @@ impl SyncOutboxStore {
         &self,
         event: &JournalEvent,
     ) -> std::io::Result<SyncOutboxEnqueueOutcome> {
-        let candidate = build_record(event, 0, unix_ms())?;
+        let candidate = build_record(event, 0, unix_ms()?)?;
         self.with_state(|state| {
             if let Some(index) = state
                 .records
@@ -234,7 +234,7 @@ impl SyncOutboxStore {
                     existing.payload_hash, candidate.payload_hash
                 ));
                 existing.last_error = existing.poison_reason.clone();
-                existing.updated_at_unix_ms = unix_ms();
+                existing.updated_at_unix_ms = unix_ms()?;
                 let outcome = SyncOutboxEnqueueOutcome::Poisoned {
                     record_id: existing.record_id.clone(),
                     sequence: existing.sequence,
@@ -248,29 +248,37 @@ impl SyncOutboxStore {
                 .find(|tombstone| tombstone.record_id == candidate.record_id)
             {
                 if !tombstone.payload_hash.is_empty()
-                    && tombstone.payload_hash != candidate.payload_hash
+                    && tombstone.payload_hash == candidate.payload_hash
                 {
-                    let mut record = candidate;
-                    record.sequence = state.next_sequence();
-                    record.state = SyncOutboxRecordState::Poisoned;
-                    record.poison_kind = Some(SyncOutboxPoisonKind::PayloadHashMismatch);
-                    record.poison_reason = Some(format!(
+                    return Ok(SyncOutboxEnqueueOutcome::Duplicate {
+                        record_id: tombstone.record_id.clone(),
+                        sequence: tombstone.sequence,
+                    });
+                }
+
+                let mut record = candidate;
+                record.sequence = state.next_sequence();
+                record.state = SyncOutboxRecordState::Poisoned;
+                record.poison_kind = Some(SyncOutboxPoisonKind::PayloadHashMismatch);
+                record.poison_reason = Some(if tombstone.payload_hash.is_empty() {
+                    format!(
+                        "compacted ack tombstone payload hash missing: record_id={}",
+                        tombstone.record_id
+                    )
+                } else {
+                    format!(
                         "compacted ack tombstone payload hash mismatch: tombstone={} incoming={}",
                         tombstone.payload_hash, record.payload_hash
-                    ));
-                    record.last_error = record.poison_reason.clone();
-                    let outcome = SyncOutboxEnqueueOutcome::Poisoned {
-                        record_id: record.record_id.clone(),
-                        sequence: record.sequence,
-                    };
-                    state.records.push(record);
-                    state.recompute_ack_watermark();
-                    return Ok(outcome);
-                }
-                return Ok(SyncOutboxEnqueueOutcome::Duplicate {
-                    record_id: tombstone.record_id.clone(),
-                    sequence: tombstone.sequence,
+                    )
                 });
+                record.last_error = record.poison_reason.clone();
+                let outcome = SyncOutboxEnqueueOutcome::Poisoned {
+                    record_id: record.record_id.clone(),
+                    sequence: record.sequence,
+                };
+                state.records.push(record);
+                state.recompute_ack_watermark();
+                return Ok(outcome);
             }
 
             let mut record = candidate;
@@ -298,7 +306,7 @@ impl SyncOutboxStore {
                 event_type: event_type_string(&event.event_type),
                 event_ts: Some(event.ts.clone()).filter(|ts| !ts.trim().is_empty()),
                 reason,
-                observed_at_unix_ms: unix_ms(),
+                observed_at_unix_ms: unix_ms()?,
             });
             state.compact_skipped_records();
             Ok(())
@@ -318,7 +326,7 @@ impl SyncOutboxStore {
             else {
                 return Ok(SyncOutboxAckOutcome::NotFound);
             };
-            let outcome = acknowledge_record(&mut state.records[index], payload_hash, unix_ms());
+            let outcome = acknowledge_record(&mut state.records[index], payload_hash, unix_ms()?);
             state.recompute_ack_watermark();
             Ok(outcome)
         })
@@ -329,7 +337,7 @@ impl SyncOutboxStore {
         settlements: &[SyncOutboxDeliverySettlement],
     ) -> std::io::Result<SyncOutboxSettlementReport> {
         self.with_state(|state| {
-            let now = unix_ms();
+            let now = unix_ms()?;
             let mut report = SyncOutboxSettlementReport::default();
             for settlement in settlements {
                 match settlement {
@@ -395,14 +403,14 @@ impl SyncOutboxStore {
                 return Ok(false);
             };
             let record = &mut state.records[index];
-            let updated = apply_delivery_failure(record, &error, unix_ms());
+            let updated = apply_delivery_failure(record, &error, unix_ms()?);
             state.recompute_ack_watermark();
             Ok(updated)
         })
     }
 
     pub fn claim_ready_records(&self, limit: usize) -> std::io::Result<Vec<SyncOutboxRecord>> {
-        let now = unix_ms();
+        let now = unix_ms()?;
         self.with_state(|state| {
             let mut claimed = Vec::new();
             for record in &mut state.records {
@@ -421,7 +429,7 @@ impl SyncOutboxStore {
     }
 
     pub fn mark_in_flight(&self, record_id: &str) -> std::io::Result<bool> {
-        let now = unix_ms();
+        let now = unix_ms()?;
         self.with_state(|state| {
             let Some(record) = state
                 .records
@@ -442,13 +450,11 @@ impl SyncOutboxStore {
 
     pub fn ready_records(&self, limit: usize) -> std::io::Result<Vec<SyncOutboxRecord>> {
         self.with_state_readonly(|state| {
-            let now = unix_ms();
+            let now = unix_ms()?;
             Ok(state
                 .records
                 .into_iter()
-                .filter(|record| {
-                    record_ready_for_claim(record, now)
-                })
+                .filter(|record| record_ready_for_claim(record, now))
                 .take(limit)
                 .collect())
         })
@@ -456,15 +462,17 @@ impl SyncOutboxStore {
 
     pub fn retry_deferred_now(&self) -> std::io::Result<u64> {
         self.with_state(|state| {
-            let now = unix_ms();
+            let now = unix_ms()?;
             let mut changed = 0;
             for record in &mut state.records {
                 if record.state == SyncOutboxRecordState::Pending
                     && record.next_retry_after_unix_ms.is_some()
                 {
                     changed += 1;
-                    record.state = SyncOutboxRecordState::Pending;
                     record.next_retry_after_unix_ms = None;
+                    record.last_error = None;
+                    record.poison_kind = None;
+                    record.poison_reason = None;
                     record.updated_at_unix_ms = now;
                 } else if record.state == SyncOutboxRecordState::InFlight
                     && in_flight_lease_expired(record, now)
@@ -481,7 +489,7 @@ impl SyncOutboxStore {
 
     pub fn repair_retry_exhausted_poison(&self) -> std::io::Result<u64> {
         self.with_state(|state| {
-            let now = unix_ms();
+            let now = unix_ms()?;
             let mut repaired = 0;
             for record in &mut state.records {
                 if record.state == SyncOutboxRecordState::Poisoned
@@ -503,20 +511,22 @@ impl SyncOutboxStore {
     }
 
     pub fn status(&self) -> std::io::Result<SyncOutboxStatus> {
-        self.with_state_readonly(|state| Ok(status_from_state(&state, unix_ms())))
+        self.with_state_readonly(|state| Ok(status_from_state(&state, unix_ms()?)))
     }
 
     fn with_state<R>(
         &self,
         f: impl FnOnce(&mut SyncOutboxFile) -> std::io::Result<R>,
     ) -> std::io::Result<R> {
-        self.locked(|state| {
+        let result = self.locked(|state| {
             let result = f(state)?;
             state.compact_acked_tail();
             state.compact_skipped_records();
             write_state(&self.path(), state)?;
             Ok(result)
-        })
+        });
+        sync_state_dir(&self.path());
+        result
     }
 
     fn with_state_readonly<R>(
@@ -542,10 +552,30 @@ impl SyncOutboxStore {
         state.normalize();
         let result = f(&mut state);
         let unlock_result = lock.unlock();
-        match (result, unlock_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
+
+        // If the operation succeeded, return success even if unlock fails.
+        // The operation already modified in-memory state and attempted disk write.
+        // Unlock failure is a resource leak, not a transaction failure.
+        match result {
+            Ok(value) => {
+                if let Err(unlock_err) = unlock_result {
+                    tracing::warn!(
+                        ?unlock_err,
+                        "failed to unlock sync outbox after successful operation"
+                    );
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                // Operation failed, unlock error is secondary
+                if let Err(unlock_err) = unlock_result {
+                    tracing::warn!(
+                        ?unlock_err,
+                        "failed to unlock sync outbox after failed operation"
+                    );
+                }
+                Err(error)
+            }
         }
     }
 }
@@ -570,14 +600,36 @@ impl SyncOutboxFile {
 
     fn recompute_ack_watermark(&mut self) {
         let mut watermark = self.ack_watermark;
-        for record in self.records.iter().filter(|record| record.sequence > 0) {
-            if record.sequence == watermark + 1 && record_is_terminal_for_watermark(record) {
-                watermark = record.sequence;
-            } else if record.sequence > watermark + 1 {
-                break;
-            } else if record.sequence == watermark + 1 {
-                break;
-            }
+        if let Some(first_open_sequence) = self
+            .records
+            .iter()
+            .filter(|record| {
+                record.sequence > 0
+                    && record.sequence <= watermark
+                    && !record_is_terminal_for_watermark(record)
+            })
+            .map(|record| record.sequence)
+            .min()
+        {
+            watermark = first_open_sequence.saturating_sub(1);
+        }
+
+        let terminal_sequences: std::collections::HashSet<u64> = self
+            .records
+            .iter()
+            .filter(|record| {
+                record.sequence > watermark && record_is_terminal_for_watermark(record)
+            })
+            .map(|record| record.sequence)
+            .chain(
+                self.acked_tombstones
+                    .iter()
+                    .filter(|tombstone| tombstone.sequence > watermark)
+                    .map(|tombstone| tombstone.sequence),
+            )
+            .collect();
+        while terminal_sequences.contains(&(watermark + 1)) {
+            watermark += 1;
         }
         self.ack_watermark = watermark;
     }
@@ -737,7 +789,7 @@ fn write_state(path: &Path, state: &SyncOutboxFile) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let tmp = path.with_extension(format!("json.tmp.{}", fastrand::u64(..)));
     {
         let mut file = OpenOptions::new()
             .create(true)
@@ -749,13 +801,21 @@ fn write_state(path: &Path, state: &SyncOutboxFile) -> std::io::Result<()> {
         file.write_all(b"\n")?;
         file.sync_data()?;
     }
-    std::fs::rename(tmp, path)?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Sync the directory after a write — call *outside* the exclusive lock to
+/// avoid serialising I/O under contention.
+fn sync_state_dir(path: &Path) {
     if let Some(parent) = path.parent()
         && let Ok(dir) = OpenOptions::new().read(true).open(parent)
     {
         let _ = dir.sync_all();
     }
-    Ok(())
 }
 
 fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
@@ -842,8 +902,7 @@ fn record_ready_for_claim(record: &SyncOutboxRecord, now: u64) -> bool {
         && record
             .next_retry_after_unix_ms
             .is_none_or(|retry_at| retry_at <= now))
-        || (record.state == SyncOutboxRecordState::InFlight
-            && in_flight_lease_expired(record, now))
+        || (record.state == SyncOutboxRecordState::InFlight && in_flight_lease_expired(record, now))
 }
 
 fn record_is_terminal_for_watermark(record: &SyncOutboxRecord) -> bool {
@@ -922,11 +981,16 @@ fn retry_backoff_ms(attempts: u32) -> u64 {
     1_000_u64.saturating_mul(1_u64 << shift)
 }
 
-fn unix_ms() -> u64 {
+fn unix_ms() -> std::io::Result<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("system clock is before UNIX epoch: {error}"),
+            )
+        })
 }
 
 fn sha256_prefixed(bytes: &[u8]) -> String {
@@ -994,6 +1058,31 @@ mod tests {
         assert_eq!(status.pending, 1);
         assert_eq!(status.ready, 1);
         assert_eq!(status.ack_watermark, 0);
+    }
+
+    #[test]
+    fn enqueue_write_failure_does_not_commit_or_report_success() {
+        let (_temp, _guard, store) = test_store();
+        std::fs::create_dir_all(store.path()).expect("block outbox file path");
+
+        let error = store
+            .enqueue_journal_event(&event("write-fails"))
+            .expect_err("durable write failure must be reported");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists
+                    | std::io::ErrorKind::IsADirectory
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Other
+            ),
+            "unexpected write failure kind: {error:?}"
+        );
+
+        std::fs::remove_dir_all(store.path()).expect("remove blocked outbox path");
+        let status = store.status().expect("status after failed write");
+        assert_eq!(status.total, 0);
+        assert_eq!(status.pending, 0);
     }
 
     #[test]
@@ -1094,6 +1183,10 @@ mod tests {
         let repaired = store.status().expect("repaired");
         assert_eq!(repaired.pending, 1);
         assert_eq!(repaired.poisoned, 0);
+        assert_eq!(
+            repaired.ack_watermark, 0,
+            "repair reopens the record, so the terminal-prefix watermark must move back"
+        );
         assert!(!repaired.degraded);
     }
 
@@ -1158,6 +1251,7 @@ mod tests {
                     .find(|record| record.record_id == record_id)
                     .expect("record");
                 record.updated_at_unix_ms = unix_ms()
+                    .expect("time")
                     .saturating_sub(SYNC_OUTBOX_IN_FLIGHT_LEASE_MS)
                     .saturating_sub(1);
                 Ok(())
@@ -1213,6 +1307,7 @@ mod tests {
                     .find(|record| record.record_id == record_id)
                     .expect("record");
                 record.updated_at_unix_ms = unix_ms()
+                    .expect("time")
                     .saturating_sub(SYNC_OUTBOX_IN_FLIGHT_LEASE_MS)
                     .saturating_sub(1);
                 Ok(())
@@ -1230,9 +1325,7 @@ mod tests {
     fn claim_ready_records_marks_batch_in_flight() {
         let (_temp, _guard, store) = test_store();
         for value in ["one", "two"] {
-            store
-                .enqueue_journal_event(&event(value))
-                .expect("enqueue");
+            store.enqueue_journal_event(&event(value)).expect("enqueue");
         }
 
         let claimed = store.claim_ready_records(10).expect("claim");
@@ -1240,7 +1333,12 @@ mod tests {
         let status = store.status().expect("status");
         assert_eq!(status.in_flight, 2);
         assert_eq!(status.ready, 0);
-        assert!(store.claim_ready_records(10).expect("claim again").is_empty());
+        assert!(
+            store
+                .claim_ready_records(10)
+                .expect("claim again")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1248,14 +1346,17 @@ mod tests {
         let (_temp, _guard, store) = test_store();
         let SyncOutboxEnqueueOutcome::Inserted {
             record_id: ack_id, ..
-        } = store.enqueue_journal_event(&event("ack")).expect("ack enqueue")
+        } = store
+            .enqueue_journal_event(&event("ack"))
+            .expect("ack enqueue")
         else {
             panic!("ack insert");
         };
         let SyncOutboxEnqueueOutcome::Inserted {
-            record_id: fail_id,
-            ..
-        } = store.enqueue_journal_event(&event("fail")).expect("fail enqueue")
+            record_id: fail_id, ..
+        } = store
+            .enqueue_journal_event(&event("fail"))
+            .expect("fail enqueue")
         else {
             panic!("fail insert");
         };
@@ -1287,6 +1388,65 @@ mod tests {
         assert_eq!(status.acked, 1);
         assert_eq!(status.pending, 1);
         assert_eq!(status.retry_deferred, 1);
+    }
+
+    #[test]
+    fn settle_delivery_batch_isolates_record_failure_without_replaying_sibling_ack() {
+        let (_temp, _guard, store) = test_store();
+        let SyncOutboxEnqueueOutcome::Inserted {
+            record_id: ack_id, ..
+        } = store
+            .enqueue_journal_event(&event("ack-stays-acked"))
+            .expect("ack enqueue")
+        else {
+            panic!("ack insert");
+        };
+        let SyncOutboxEnqueueOutcome::Inserted {
+            record_id: fail_id, ..
+        } = store
+            .enqueue_journal_event(&event("failure-isolated"))
+            .expect("fail enqueue")
+        else {
+            panic!("fail insert");
+        };
+        let claimed = store.claim_ready_records(10).expect("claim");
+        assert_eq!(claimed.len(), 2);
+        let ack_hash = claimed
+            .iter()
+            .find(|record| record.record_id == ack_id)
+            .expect("claimed ack")
+            .payload_hash
+            .clone();
+
+        for _ in 1..SYNC_OUTBOX_MAX_ATTEMPTS {
+            store
+                .mark_delivery_failed(&fail_id, "previous temporary outage")
+                .expect("preload retry attempts");
+        }
+
+        let report = store
+            .settle_delivery_batch(&[
+                SyncOutboxDeliverySettlement::Ack {
+                    record_id: ack_id,
+                    payload_hash: ack_hash,
+                },
+                SyncOutboxDeliverySettlement::Failed {
+                    record_id: fail_id,
+                    error: "final temporary outage".to_string(),
+                },
+            ])
+            .expect("settle");
+
+        assert_eq!(report.acked, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.poisoned, 0);
+        let status = store.status().expect("status");
+        assert_eq!(status.acked, 1);
+        assert_eq!(status.poisoned, 1);
+        assert_eq!(
+            status.ack_watermark, 2,
+            "a sibling failure must not cause the already-settled ack to replay"
+        );
     }
 
     #[test]
@@ -1327,6 +1487,46 @@ mod tests {
     }
 
     #[test]
+    fn repairing_poisoned_prefix_recomputes_watermark_from_open_record() {
+        let (_temp, _guard, store) = test_store();
+        let SyncOutboxEnqueueOutcome::Inserted {
+            record_id: poisoned_id,
+            ..
+        } = store
+            .enqueue_journal_event(&event("poisoned"))
+            .expect("poison enqueue")
+        else {
+            panic!("poison insert");
+        };
+        let SyncOutboxEnqueueOutcome::Inserted {
+            record_id: acked_id,
+            ..
+        } = store
+            .enqueue_journal_event(&event("acked-after-poison"))
+            .expect("ack enqueue")
+        else {
+            panic!("ack insert");
+        };
+
+        for _ in 0..SYNC_OUTBOX_MAX_ATTEMPTS {
+            store
+                .mark_delivery_failed(&poisoned_id, "permanent failure")
+                .expect("fail until poison");
+        }
+        store.acknowledge(&acked_id, None).expect("ack second");
+        assert_eq!(store.status().expect("poisoned").ack_watermark, 2);
+
+        assert_eq!(store.repair_retry_exhausted_poison().expect("repair"), 1);
+        let repaired = store.status().expect("repaired");
+        assert_eq!(repaired.pending, 1);
+        assert_eq!(repaired.acked, 1);
+        assert_eq!(
+            repaired.ack_watermark, 0,
+            "a repaired prefix record invalidates the contiguous terminal prefix even when later records remain acked"
+        );
+    }
+
+    #[test]
     fn acked_compaction_preserves_watermark_and_bounds_tail() {
         let (_temp, _guard, store) = test_store();
         let total = SYNC_OUTBOX_ACKED_RETAINED_RECORDS + 3;
@@ -1347,9 +1547,7 @@ mod tests {
         }
 
         for record_id in &ids {
-            store
-                .acknowledge(record_id, None)
-                .expect("acknowledge");
+            store.acknowledge(record_id, None).expect("acknowledge");
         }
 
         let status = store.status().expect("status");
@@ -1364,7 +1562,11 @@ mod tests {
             .with_state_readonly(|state| Ok(state.acked_tombstones))
             .expect("tombstones");
         assert_eq!(tombstones.len(), total - SYNC_OUTBOX_ACKED_RETAINED_RECORDS);
-        assert!(tombstones.iter().all(|tombstone| !tombstone.payload_hash.is_empty()));
+        assert!(
+            tombstones
+                .iter()
+                .all(|tombstone| !tombstone.payload_hash.is_empty())
+        );
 
         let replay = store
             .enqueue_journal_event(&first_event.expect("first event"))
@@ -1377,7 +1579,10 @@ mod tests {
             }
         );
         let replay_status = store.status().expect("replay status");
-        assert_eq!(replay_status.total, SYNC_OUTBOX_ACKED_RETAINED_RECORDS as u64);
+        assert_eq!(
+            replay_status.total,
+            SYNC_OUTBOX_ACKED_RETAINED_RECORDS as u64
+        );
         assert_eq!(replay_status.pending, 0);
     }
 
@@ -1410,7 +1615,7 @@ mod tests {
     fn compacted_tombstone_payload_hash_mismatch_is_poisoned() {
         let (_temp, _guard, store) = test_store();
         let item = event("future-migration-collision");
-        let candidate = build_record(&item, 0, unix_ms()).expect("candidate");
+        let candidate = build_record(&item, 0, unix_ms().expect("time")).expect("candidate");
         store
             .with_state(|state| {
                 state.acked_tombstones.push(SyncOutboxAckTombstone {
@@ -1432,6 +1637,35 @@ mod tests {
                 .last_error
                 .as_deref()
                 .is_some_and(|error| error.contains("tombstone payload hash mismatch"))
+        );
+    }
+
+    #[test]
+    fn compacted_tombstone_missing_payload_hash_is_poisoned() {
+        let (_temp, _guard, store) = test_store();
+        let item = event("legacy-tombstone-collision");
+        let candidate = build_record(&item, 0, unix_ms().expect("time")).expect("candidate");
+        store
+            .with_state(|state| {
+                state.acked_tombstones.push(SyncOutboxAckTombstone {
+                    record_id: candidate.record_id.clone(),
+                    sequence: 1,
+                    payload_hash: String::new(),
+                });
+                Ok(())
+            })
+            .expect("seed tombstone");
+
+        let outcome = store.enqueue_journal_event(&item).expect("enqueue");
+        assert!(matches!(outcome, SyncOutboxEnqueueOutcome::Poisoned { .. }));
+        let status = store.status().expect("status");
+        assert_eq!(status.poisoned, 1);
+        assert!(status.degraded);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("tombstone payload hash missing"))
         );
     }
 }

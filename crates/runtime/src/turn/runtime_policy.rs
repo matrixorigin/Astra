@@ -1,5 +1,5 @@
 //! Runtime policy engine: translates pure `JournalFacts` from the
-//! `ObservationJournal` into `FrameworkAction`s.
+//! `ObservationJournal` into structured `RuntimePolicyEvidence`.
 //!
 //! # Separation of concerns
 //!
@@ -7,11 +7,11 @@
 //! |-------|----------|----------------|
 //! | `JournalFacts` | `astra_core::observation_journal` | Pure factual snapshot — counts, streaks, no judgments |
 //! | `ObservationJournal` | `astra_core::observation_journal` | Data collection: record_turn, extract_facts, trends |
-//! | **`RuntimePolicy`** | `astra_runtime::turn::runtime_policy` | Decision engine: facts → actions |
+//! | **`RuntimePolicy`** | `astra_runtime::turn::runtime_policy` | Evidence engine: facts → advisories |
 //!
 //! The policy **never** inspects internal state beyond the `JournalFacts`
 //! snapshot. It is the runtime's responsibility — not the core data layer's —
-//! to decide what actions to take based on observed facts.
+//! to surface advisory evidence based on observed facts.
 
 use astra_core::observation_journal::{
     BudgetSnapshot, JournalFacts, PerformanceSnapshot, StallSnapshot, StreakSnapshot, TaskSnapshot,
@@ -74,39 +74,31 @@ impl std::fmt::Display for PhaseTarget {
     }
 }
 
-/// Actions the runtime policy engine can request.
+/// Structured evidence emitted by the runtime policy engine.
 ///
-/// These are **not** auto-applied. The caller (execution loop) receives them
-/// and decides whether and how to execute each one. This preserves the
-/// "framework never judges" principle: the policy is a runtime component,
-/// not a core data-layer one.
+/// None of these variants authorizes retries, phase changes, budget mutation,
+/// tool restrictions, or termination. The execution loop only serializes them
+/// into the typed advisory lane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FrameworkAction {
-    /// Expand the turn budget by multiplying current max rounds.
-    ExpandBudget {
+pub enum RuntimePolicyEvidence {
+    /// Evidence supporting a possible budget expansion.
+    BudgetExpansionSuggested {
         factor: f64,
         /// Absolute ceiling — never exceed this regardless of factor.
         max_ceiling: u32,
     },
-    /// Signal high token pressure to the agent.
+    /// Observed high token pressure.
     ///
     /// This is intentionally not a compaction event. Real compaction events are
     /// emitted only by the lifecycle/retry compression pipelines after they
     /// actually free tokens.
-    SignalContextPressure { urgency: ContextPressureUrgency },
-    /// Transition to a different turn phase.
-    TransitionPhase { target: PhaseTarget },
-    /// Inject a signal into the agent's context for the next round.
-    InjectSignal { message: String },
-    /// No action required.
-    Continue,
-}
-
-/// A signal injected by a policy decision, queued for the next round.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingSignal {
-    pub message: String,
-    pub injected_at_round: u32,
+    ContextPressureObserved { urgency: ContextPressureUrgency },
+    /// Evidence supporting a possible phase transition.
+    PhaseTransitionSuggested { target: PhaseTarget },
+    /// General advisory evidence for the next round.
+    Advisory { message: String },
+    /// No advisory evidence was produced.
+    NoAdvisory,
 }
 
 // ─── Context Pressure Policy ─────────────────────────────────────────────────
@@ -114,7 +106,7 @@ pub struct PendingSignal {
 /// Policy for agent-visible guidance under token pressure.
 ///
 /// When `token_pressure` (from `JournalFacts`) exceeds the threshold, the
-/// policy engine requests `FrameworkAction::SignalContextPressure` with the
+/// policy engine requests `RuntimePolicyEvidence::ContextPressureObserved` with the
 /// configured urgency level.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextPressurePolicy {
@@ -158,37 +150,6 @@ impl Default for CircuitPolicy {
             max_consecutive_errors: 5,
             max_consecutive_reads: 8,
             error_rate_threshold: 0.30,
-        }
-    }
-}
-
-// ─── Textless Stop Policy ─────────────────────────────────────────────────────
-
-/// Policy for handling turns where the model stops with tool calls but no text.
-///
-/// Exploration tasks (code review, large-scale investigation) legitimately
-/// batch many tool calls before producing a summary — the circuit breaker
-/// and stall detection handle real anomalies. This policy controls how many
-/// retry nudges to inject before accepting the silent stop.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextlessPolicy {
-    /// Maximum retries: inject a "produce text" nudge and ContinueLoop this
-    /// many times before admitting defeat. 0 disables retry entirely.
-    pub max_retries: u32,
-    /// When true, skip retry for exploration-profile tasks (code review,
-    /// large-scale read-only investigation).
-    pub exclude_exploratory: bool,
-    /// When true, append a `[truncated]` marker when the LLM's output was
-    /// cut off by the API token limit (`finish_reason == "length"`).
-    pub mark_truncated_text: bool,
-}
-
-impl Default for TextlessPolicy {
-    fn default() -> Self {
-        Self {
-            max_retries: 2,
-            exclude_exploratory: true,
-            mark_truncated_text: true,
         }
     }
 }
@@ -241,7 +202,8 @@ impl Default for TuningPolicy {
 /// - `CircuitPolicy`: diagnostic guidance under errors / read-only streaks
 /// - `TuningPolicy`: thresholds for generating tuning signals
 ///
-/// This lives in the runtime crate (not core) because it makes **decisions**.
+/// This lives in the runtime crate (not core) because it interprets facts into
+/// advisory evidence.
 /// Core only collects data (`ObservationJournal`) and exposes pure facts
 /// (`JournalFacts`). The runtime decides what to do with those facts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,12 +222,16 @@ pub struct RuntimePolicy {
     /// Circuit breaker sub-policy.
     #[serde(default)]
     pub circuit: CircuitPolicy,
-    /// Textless-stop retry sub-policy.
-    #[serde(default)]
-    pub textless: TextlessPolicy,
+    /// Append a marker when provider output was truncated by its token limit.
+    #[serde(default = "default_mark_truncated_text")]
+    pub mark_truncated_text: bool,
     /// Tuning signal generation sub-policy.
     #[serde(default)]
     pub tuning: TuningPolicy,
+}
+
+const fn default_mark_truncated_text() -> bool {
+    true
 }
 
 impl Default for RuntimePolicy {
@@ -277,47 +243,47 @@ impl Default for RuntimePolicy {
             reflect_after_consecutive_zero: 3,
             context_pressure: ContextPressurePolicy::default(),
             circuit: CircuitPolicy::default(),
-            textless: TextlessPolicy::default(),
+            mark_truncated_text: true,
             tuning: TuningPolicy::default(),
         }
     }
 }
 
 impl RuntimePolicy {
-    /// Evaluate `facts` and return the set of actions the runtime should take.
+    /// Evaluate `facts` and return structured advisory evidence.
     ///
-    /// Actions are determined in priority order. Stall is the highest-priority
+    /// Evidence is derived in priority order. Stall is the highest-priority
     /// signal (returns immediately); after that, pressure guidance, diagnostic guidance,
-    /// phase transition, and expansion/signal are evaluated. Multiple actions may
+    /// phase transition, and expansion signals are evaluated. Multiple items may
     /// be returned (e.g. pressure guidance + diagnostic signal).
     ///
-    /// This is **not** auto-applied — the caller receives the actions and
-    /// decides how to execute them. The policy only reads the pure factual
-    /// snapshot; it never mutates internal state.
-    pub fn decide(&self, facts: &JournalFacts) -> Vec<FrameworkAction> {
-        let mut actions = Vec::new();
+    /// The caller may serialize these items for the model or telemetry, but
+    /// must not apply them as runtime commands. The policy only reads the pure
+    /// factual snapshot and never mutates internal state.
+    pub fn decide(&self, facts: &JournalFacts) -> Vec<RuntimePolicyEvidence> {
+        let mut evidence = Vec::new();
 
         // ── Priority 1: Stall Interrupt ──────────────────────────────────
         // Framework-detected tool-signature repetition. Short-circuit
         // immediately — stall overrides all other decisions.
         if let Some(ref reason) = facts.stall.stall_reason {
-            actions.push(FrameworkAction::InjectSignal {
+            evidence.push(RuntimePolicyEvidence::Advisory {
                 message: format!(
                     "Stall detected: {}. Consider changing your approach or using a different tool.",
                     reason
                 ),
             });
-            return actions;
+            return evidence;
         }
 
         // ── Priority 2: Context Pressure Guidance ────────────────────────
         // Aggressive first (higher severity); Normal fallback.
         if facts.performance.token_pressure >= self.context_pressure.aggressive_pressure_threshold {
-            actions.push(FrameworkAction::SignalContextPressure {
+            evidence.push(RuntimePolicyEvidence::ContextPressureObserved {
                 urgency: ContextPressureUrgency::Aggressive,
             });
         } else if facts.performance.token_pressure >= self.context_pressure.pressure_threshold {
-            actions.push(FrameworkAction::SignalContextPressure {
+            evidence.push(RuntimePolicyEvidence::ContextPressureObserved {
                 urgency: ContextPressureUrgency::Normal,
             });
         }
@@ -351,7 +317,7 @@ impl RuntimePolicy {
             ));
         }
         if !circuit_reasons.is_empty() {
-            actions.push(FrameworkAction::InjectSignal {
+            evidence.push(RuntimePolicyEvidence::Advisory {
                 message: format!(
                     "Circuit-breaker risk detected ({}). Do not stop solely because of this. Adjust strategy: summarize evidence gathered so far, state the next hypothesis, and either run one targeted experiment or produce a direct answer if enough evidence is available.",
                     circuit_reasons.join(", ")
@@ -362,7 +328,7 @@ impl RuntimePolicy {
         // ── Priority 4: Phase Transition ─────────────────────────────────
         // All tasks complete → graceful completion signal.
         if facts.task.task_completion_ratio >= 1.0 {
-            actions.push(FrameworkAction::TransitionPhase {
+            evidence.push(RuntimePolicyEvidence::PhaseTransitionSuggested {
                 target: PhaseTarget::Completion,
             });
         }
@@ -376,7 +342,7 @@ impl RuntimePolicy {
         if facts.streaks.consecutive_rounds_with_outcome >= self.expand_after_consecutive_outcomes
             && facts.budget.budget_remaining <= expansion_threshold
         {
-            actions.push(FrameworkAction::ExpandBudget {
+            evidence.push(RuntimePolicyEvidence::BudgetExpansionSuggested {
                 factor: self.expand_factor,
                 max_ceiling: self.max_ceiling,
             });
@@ -385,7 +351,7 @@ impl RuntimePolicy {
         // ── Priority 6: Zero-streak Signal ───────────────────────────────
         // Agent stuck with zero outcomes too long.
         if facts.streaks.consecutive_rounds_without_outcome >= self.reflect_after_consecutive_zero {
-            actions.push(FrameworkAction::InjectSignal {
+            evidence.push(RuntimePolicyEvidence::Advisory {
                 message: format!(
                     "{} consecutive rounds without observable progress. Consider pausing to reflect on whether your approach is effective.",
                     facts.streaks.consecutive_rounds_without_outcome
@@ -393,68 +359,11 @@ impl RuntimePolicy {
             });
         }
 
-        if actions.is_empty() {
-            actions.push(FrameworkAction::Continue);
+        if evidence.is_empty() {
+            evidence.push(RuntimePolicyEvidence::NoAdvisory);
         }
 
-        actions
-    }
-
-    /// Decide whether to retry a textless stop.
-    ///
-    /// Called at `StopIterating` when the model produced tool calls but no
-    /// text summary. Returns `Some(InjectSignal)` with a nudge when a retry
-    /// is warranted, or `None` to accept the silent stop.
-    ///
-    /// Suppressed when:
-    /// - `suppress_nudges` is true (Auto mode)
-    /// - `textless.exclude_exploratory && is_exploratory` (exploration tasks)
-    /// - `retry_count >= textless.max_retries` (exhausted)
-    /// - No tool calls were made (`total_tool_calls == 0`)
-    pub fn decide_textless_stop(
-        &self,
-        retry_count: u32,
-        total_tool_calls: u32,
-        is_exploratory: bool,
-        suppress_nudges: bool,
-    ) -> Option<FrameworkAction> {
-        if suppress_nudges {
-            return None;
-        }
-        if self.textless.exclude_exploratory && is_exploratory {
-            return None;
-        }
-        if total_tool_calls == 0 {
-            return None;
-        }
-        if retry_count >= self.textless.max_retries {
-            tracing::info!(
-                retry_count,
-                max = self.textless.max_retries,
-                total_tool_calls,
-                "textless_stop_retries_exhausted: {total_tool_calls} tools, {retry_count} retries"
-            );
-            return None;
-        }
-        let nudge = format!(
-            "⚠ {} tool call(s) executed but NO summary text produced. \
-             Summarize what you found and any changes made. \
-             If you have more work to do, call tools as needed — \
-             just include a brief text update alongside them. \
-             (reminder {}/{})",
-            total_tool_calls,
-            retry_count + 1,
-            self.textless.max_retries,
-        );
-        tracing::info!(
-            retry = retry_count + 1,
-            max = self.textless.max_retries,
-            total_tool_calls,
-            "textless_stop_retry: injecting nudge (attempt {}/{})",
-            retry_count + 1,
-            self.textless.max_retries,
-        );
-        Some(FrameworkAction::InjectSignal { message: nudge })
+        evidence
     }
 
     /// Produce a truncation marker when the model's output was cut off by the
@@ -462,7 +371,7 @@ impl RuntimePolicy {
     /// when the policy is enabled and the reason signals truncation; `None`
     /// otherwise (prevents noise for normal stop/tool_calls).
     pub fn truncation_marker(&self, finish_reason: Option<&str>) -> Option<&'static str> {
-        if !self.textless.mark_truncated_text {
+        if !self.mark_truncated_text {
             return None;
         }
         if finish_reason == Some("length") {
@@ -499,7 +408,7 @@ mod tests {
                 consecutive_read_only: 0,
             },
             performance: PerformanceSnapshot {
-                total_evidence_calls: 0,
+                total_observation_calls: 0,
                 total_errors: 0,
                 total_tool_calls: 0,
                 current_error_rate: 0.0,
@@ -523,7 +432,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::BudgetExpansionSuggested { .. }))
         );
     }
 
@@ -535,7 +444,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::BudgetExpansionSuggested { .. }))
         );
     }
 
@@ -547,7 +456,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::BudgetExpansionSuggested { .. }))
         );
     }
 
@@ -559,7 +468,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::BudgetExpansionSuggested { .. }))
         );
     }
 
@@ -573,7 +482,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { .. }))
         );
     }
 
@@ -585,7 +494,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { .. }))
         );
     }
 
@@ -596,7 +505,7 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 0, 8, 10);
         let actions = policy.decide(&f);
-        assert!(matches!(actions[0], FrameworkAction::Continue));
+        assert!(matches!(actions[0], RuntimePolicyEvidence::NoAdvisory));
     }
 
     #[test]
@@ -604,7 +513,7 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 0, 10, 10);
         let actions = policy.decide(&f);
-        assert!(matches!(actions[0], FrameworkAction::Continue));
+        assert!(matches!(actions[0], RuntimePolicyEvidence::NoAdvisory));
     }
 
     // ── Custom parameters (existing) ────────────────────────────────────────
@@ -618,14 +527,14 @@ mod tests {
             reflect_after_consecutive_zero: 5,
             context_pressure: ContextPressurePolicy::default(),
             circuit: CircuitPolicy::default(),
-            textless: TextlessPolicy::default(),
+            mark_truncated_text: true,
             tuning: TuningPolicy::default(),
         };
         let f = facts(4, 0, 3, 10);
         let actions = policy.decide(&f);
         assert!(matches!(
             actions[0],
-            FrameworkAction::ExpandBudget {
+            RuntimePolicyEvidence::BudgetExpansionSuggested {
                 factor: 2.0,
                 max_ceiling: 200,
             }
@@ -641,14 +550,14 @@ mod tests {
             reflect_after_consecutive_zero: 3,
             context_pressure: ContextPressurePolicy::default(),
             circuit: CircuitPolicy::default(),
-            textless: TextlessPolicy::default(),
+            mark_truncated_text: true,
             tuning: TuningPolicy::default(),
         };
         let f = facts(1, 0, 5, 10);
         let actions = policy.decide(&f);
         assert!(matches!(
             actions[0],
-            FrameworkAction::ExpandBudget {
+            RuntimePolicyEvidence::BudgetExpansionSuggested {
                 max_ceiling: 100,
                 ..
             }
@@ -675,7 +584,7 @@ mod tests {
                 budget_max: 10,
             },
             performance: PerformanceSnapshot {
-                total_evidence_calls: 0,
+                total_observation_calls: 0,
                 total_errors: 0,
                 total_tool_calls: 0,
                 current_error_rate: 0.5,
@@ -690,7 +599,10 @@ mod tests {
         // Stall signal takes priority; only one action returned even though
         // token pressure, error rate, and completion ratio all suggest other actions.
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], FrameworkAction::InjectSignal { .. }));
+        assert!(matches!(
+            &actions[0],
+            RuntimePolicyEvidence::Advisory { .. }
+        ));
     }
 
     // ── E2E: full pipeline (existing) ───────────────────────────────────────
@@ -703,7 +615,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::BudgetExpansionSuggested { .. }))
         );
     }
 
@@ -715,7 +627,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { .. }))
         );
     }
 
@@ -724,7 +636,7 @@ mod tests {
         let policy = RuntimePolicy::default();
         let f = facts(0, 0, 8, 10);
         let actions = policy.decide(&f);
-        assert!(matches!(actions[0], FrameworkAction::Continue));
+        assert!(matches!(actions[0], RuntimePolicyEvidence::NoAdvisory));
     }
 
     #[test]
@@ -733,34 +645,34 @@ mod tests {
 
         // State 1: normal → Continue
         let actions = policy.decide(&facts(0, 0, 8, 10));
-        assert!(matches!(actions[0], FrameworkAction::Continue));
+        assert!(matches!(actions[0], RuntimePolicyEvidence::NoAdvisory));
 
-        // State 2: outcome streak + tight budget → ExpandBudget
+        // State 2: outcome streak + tight budget → BudgetExpansionSuggested
         let actions = policy.decide(&facts(2, 0, 3, 10));
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::BudgetExpansionSuggested { .. }))
         );
 
-        // State 3: zero streak → InjectSignal
+        // State 3: zero streak → Advisory
         let actions = policy.decide(&facts(0, 3, 7, 10));
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { .. }))
         );
 
-        // State 4: stall → InjectSignal only
+        // State 4: stall → Advisory only
         let mut stall_facts = facts(2, 0, 3, 10);
         stall_facts.stall.stall_reason = Some("stall".into());
         let actions = policy.decide(&stall_facts);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], FrameworkAction::InjectSignal { .. }));
+        assert!(matches!(actions[0], RuntimePolicyEvidence::Advisory { .. }));
 
         // State 5: normal → Continue
         let actions = policy.decide(&facts(1, 1, 8, 10));
-        assert!(matches!(actions[0], FrameworkAction::Continue));
+        assert!(matches!(actions[0], RuntimePolicyEvidence::NoAdvisory));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -777,7 +689,7 @@ mod tests {
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::SignalContextPressure {
+            RuntimePolicyEvidence::ContextPressureObserved {
                 urgency: ContextPressureUrgency::Normal,
             }
         )));
@@ -791,7 +703,7 @@ mod tests {
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::SignalContextPressure {
+            RuntimePolicyEvidence::ContextPressureObserved {
                 urgency: ContextPressureUrgency::Aggressive,
             }
         )));
@@ -806,7 +718,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::ContextPressureObserved { .. }))
         );
     }
 
@@ -818,7 +730,7 @@ mod tests {
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::SignalContextPressure {
+            RuntimePolicyEvidence::ContextPressureObserved {
                 urgency: ContextPressureUrgency::Normal,
             }
         )));
@@ -833,13 +745,13 @@ mod tests {
         // Should get Normal, not Aggressive
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::SignalContextPressure {
+            RuntimePolicyEvidence::ContextPressureObserved {
                 urgency: ContextPressureUrgency::Normal,
             }
         )));
         assert!(!actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::SignalContextPressure {
+            RuntimePolicyEvidence::ContextPressureObserved {
                 urgency: ContextPressureUrgency::Aggressive,
             }
         )));
@@ -857,7 +769,7 @@ mod tests {
                 aggressive_pressure_threshold: 0.80,
             },
             circuit: CircuitPolicy::default(),
-            textless: TextlessPolicy::default(),
+            mark_truncated_text: true,
             tuning: TuningPolicy::default(),
         };
         let mut f = facts(0, 0, 8, 10);
@@ -865,7 +777,7 @@ mod tests {
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::SignalContextPressure {
+            RuntimePolicyEvidence::ContextPressureObserved {
                 urgency: ContextPressureUrgency::Normal,
             }
         )));
@@ -882,12 +794,12 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { message } if message.contains("tool error rate")))
         );
         assert!(
             actions
                 .iter()
-                .all(|a| !matches!(a, FrameworkAction::ExpandBudget { .. })),
+                .all(|a| !matches!(a, RuntimePolicyEvidence::BudgetExpansionSuggested { .. })),
             "diagnostic risk should not be converted into budget mutation: {actions:?}"
         );
     }
@@ -901,13 +813,13 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("read-only")))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { message } if message.contains("read-only")))
         );
         assert!(
             actions.iter().all(|a| !matches!(
                 a,
-                FrameworkAction::ExpandBudget { .. }
-                    | FrameworkAction::SignalContextPressure { .. }
+                RuntimePolicyEvidence::BudgetExpansionSuggested { .. }
+                    | RuntimePolicyEvidence::ContextPressureObserved { .. }
             )),
             "large read-only investigations should get guidance, not runtime budget mutation"
         );
@@ -922,12 +834,12 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("without observable outcome")))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { message } if message.contains("without observable outcome")))
         );
         assert!(
             actions
                 .iter()
-                .all(|a| !matches!(a, FrameworkAction::ExpandBudget { .. }))
+                .all(|a| !matches!(a, RuntimePolicyEvidence::BudgetExpansionSuggested { .. }))
         );
     }
 
@@ -942,7 +854,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("Circuit-breaker risk")))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { message } if message.contains("Circuit-breaker risk")))
         );
     }
 
@@ -955,7 +867,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("Circuit-breaker risk")))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { message } if message.contains("Circuit-breaker risk")))
         );
     }
 
@@ -968,7 +880,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { message } if message.contains("tool error rate")))
         );
     }
 
@@ -985,7 +897,7 @@ mod tests {
                 max_consecutive_reads: 5,
                 error_rate_threshold: 0.10,
             },
-            textless: TextlessPolicy::default(),
+            mark_truncated_text: true,
             tuning: TuningPolicy::default(),
         };
         let mut f = facts(0, 0, 8, 20);
@@ -994,7 +906,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { message } if message.contains("tool error rate")))
         );
     }
 
@@ -1008,7 +920,7 @@ mod tests {
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::TransitionPhase {
+            RuntimePolicyEvidence::PhaseTransitionSuggested {
                 target: PhaseTarget::Completion,
             }
         )));
@@ -1023,7 +935,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::PhaseTransitionSuggested { .. }))
         );
     }
 
@@ -1035,7 +947,7 @@ mod tests {
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::PhaseTransitionSuggested { .. }))
         );
     }
 
@@ -1052,12 +964,12 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { message } if message.contains("tool error rate")))
         );
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::SignalContextPressure { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::ContextPressureObserved { .. }))
         );
     }
 
@@ -1070,12 +982,12 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::TransitionPhase { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::PhaseTransitionSuggested { .. }))
         );
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. }))
+                .any(|a| matches!(a, RuntimePolicyEvidence::BudgetExpansionSuggested { .. }))
         );
     }
 
@@ -1097,7 +1009,7 @@ mod tests {
                 consecutive_read_only: 0,
             },
             performance: PerformanceSnapshot {
-                total_evidence_calls: 0,
+                total_observation_calls: 0,
                 total_errors: 0,
                 total_tool_calls: 0,
                 current_error_rate: 0.0,
@@ -1111,7 +1023,7 @@ mod tests {
         };
         let actions = policy.decide(&f);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], FrameworkAction::Continue));
+        assert!(matches!(actions[0], RuntimePolicyEvidence::NoAdvisory));
     }
 
     // ── Extreme values (unhappy path) ──────────────────────────────────────
@@ -1124,7 +1036,7 @@ mod tests {
         let actions = policy.decide(&f);
         assert!(actions.iter().any(|a| matches!(
             a,
-            FrameworkAction::SignalContextPressure {
+            RuntimePolicyEvidence::ContextPressureObserved {
                 urgency: ContextPressureUrgency::Aggressive,
             }
         )));
@@ -1139,7 +1051,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { message } if message.contains("tool error rate")))
         );
     }
 
@@ -1152,109 +1064,18 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")))
+                .any(|a| matches!(a, RuntimePolicyEvidence::Advisory { message } if message.contains("tool error rate")))
         );
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, FrameworkAction::ExpandBudget { .. })),
+                .any(|a| matches!(a, RuntimePolicyEvidence::BudgetExpansionSuggested { .. })),
             "circuit guidance must not backdoor a computed budget floor: {actions:?}"
         );
     }
 
     // ���═════════════════════════════════════════════════════════════════════════
-    // Textless Stop Policy — unhappy path coverage
     // ══════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn textless_stop_retries_exhausted_returns_none() {
-        let policy = RuntimePolicy::default();
-        // retry_count (2) >= max_retries (2) → no retry
-        let result = policy.decide_textless_stop(2, 5, false, false);
-        assert!(result.is_none(), "exhausted retries must return None");
-    }
-
-    #[test]
-    fn textless_stop_retry_succeeds_below_limit() {
-        let policy = RuntimePolicy::default();
-        // retry_count (0) < max_retries (2), tool_calls > 0 → inject nudge
-        let result = policy.decide_textless_stop(0, 3, false, false);
-        assert!(result.is_some(), "below retry limit should inject nudge");
-        match result.unwrap() {
-            FrameworkAction::InjectSignal { message } => {
-                assert!(message.contains("NO summary text"));
-                assert!(message.contains("1/2"), "should show attempt 1 of 2");
-            }
-            other => panic!("expected InjectSignal, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn textless_stop_second_retry_shows_correct_count() {
-        let policy = RuntimePolicy::default();
-        let result = policy.decide_textless_stop(1, 7, false, false);
-        assert!(result.is_some());
-        match result.unwrap() {
-            FrameworkAction::InjectSignal { message } => {
-                assert!(message.contains("2/2"), "should show attempt 2 of 2");
-            }
-            other => panic!("expected InjectSignal, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn textless_stop_suppress_nudges_returns_none() {
-        let policy = RuntimePolicy::default();
-        let result = policy.decide_textless_stop(0, 5, false, true);
-        assert!(result.is_none(), "suppress_nudges must skip retry");
-    }
-
-    #[test]
-    fn textless_stop_exploratory_excluded_returns_none() {
-        let policy = RuntimePolicy::default();
-        // is_exploratory=true, exclude_exploratory=true (default)
-        let result = policy.decide_textless_stop(0, 5, true, false);
-        assert!(result.is_none(), "exploratory tasks must skip retry");
-    }
-
-    #[test]
-    fn textless_stop_exploratory_not_excluded_retries() {
-        let policy = RuntimePolicy {
-            textless: TextlessPolicy {
-                exclude_exploratory: false,
-                ..TextlessPolicy::default()
-            },
-            ..RuntimePolicy::default()
-        };
-        let result = policy.decide_textless_stop(0, 5, true, false);
-        assert!(
-            result.is_some(),
-            "when exclude_exploratory=false, should retry"
-        );
-    }
-
-    #[test]
-    fn textless_stop_no_tool_calls_returns_none() {
-        let policy = RuntimePolicy::default();
-        let result = policy.decide_textless_stop(0, 0, false, false);
-        assert!(result.is_none(), "no tool calls must skip retry");
-    }
-
-    #[test]
-    fn textless_stop_max_retries_zero_disables() {
-        let policy = RuntimePolicy {
-            textless: TextlessPolicy {
-                max_retries: 0,
-                ..TextlessPolicy::default()
-            },
-            ..RuntimePolicy::default()
-        };
-        let result = policy.decide_textless_stop(0, 5, false, false);
-        assert!(
-            result.is_none(),
-            "max_retries=0 must disable retry entirely"
-        );
-    }
 
     // ══════════════════════════════════════════════════════════════════════════
     // Truncation Marker — unhappy path coverage
@@ -1289,10 +1110,7 @@ mod tests {
     #[test]
     fn truncation_marker_disabled_returns_none() {
         let policy = RuntimePolicy {
-            textless: TextlessPolicy {
-                mark_truncated_text: false,
-                ..TextlessPolicy::default()
-            },
+            mark_truncated_text: false,
             ..RuntimePolicy::default()
         };
         assert!(

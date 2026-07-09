@@ -22,7 +22,7 @@
 //! recorder.complete_tool(tool_name, is_error, elapsed_ms);
 //!
 //! // After turn_guard.evaluate():
-//! recorder.record_verdict(severity, injections, force_stop);
+//! recorder.record_verdict(severity, stall, divergence, strong_advisory, injections);
 //!
 //! // After main loop:
 //! let summary = recorder.finalize();
@@ -1063,14 +1063,12 @@ impl StepRecorder {
         severity: &str,
         is_stall: bool,
         is_diverging: bool,
-        force_stop: bool,
+        advisory_threshold_reached: bool,
         injections_count: usize,
     ) {
         self.transition_phase(StepAction::Evaluate);
 
-        let verdict = if force_stop {
-            StepVerdict::Failed
-        } else if is_stall {
+        let verdict = if is_stall {
             StepVerdict::Stalled
         } else if is_diverging {
             StepVerdict::Diverging
@@ -1091,12 +1089,8 @@ impl StepRecorder {
             step.execution.result = Some(StepResult::Evaluate {
                 verdict,
                 progress,
-                should_continue: !force_stop,
-                next_action: if force_stop {
-                    StepAction::Fail
-                } else {
-                    StepAction::Act
-                },
+                should_continue: true,
+                next_action: StepAction::Act,
             });
         }
 
@@ -1110,7 +1104,7 @@ impl StepRecorder {
             },
             serde_json::json!({
                 "severity": severity,
-                "force_stop": force_stop,
+                "advisory_threshold_reached": advisory_threshold_reached,
                 "injections": injections_count,
             }),
         );
@@ -1764,7 +1758,7 @@ mod tests {
     }
 
     #[test]
-    fn recorder_verdict_force_stop() {
+    fn recorder_verdict_advisory_threshold_reached() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.begin_act(0);
@@ -1777,8 +1771,8 @@ mod tests {
             ..
         }) = &step.execution.result
         {
-            assert!(!should_continue);
-            assert_eq!(*next_action, StepAction::Fail);
+            assert!(*should_continue);
+            assert_eq!(*next_action, StepAction::Act);
         }
     }
 

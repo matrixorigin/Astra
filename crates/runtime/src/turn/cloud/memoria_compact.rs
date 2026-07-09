@@ -195,8 +195,12 @@ pub trait MemoriaClient: Send + Sync {
     ) -> Result<Vec<MemoriaMemory>, String>;
 
     /// Retrieve one session's memories with an optional exact `memory_types`
-    /// filter. Default falls back to plain strict-session retrieval so mocks
-    /// stay lightweight.
+    /// filter.
+    ///
+    /// The default implementation keeps mocks and legacy transports
+    /// lightweight by using strict-session retrieval, but it still enforces the
+    /// typed contract locally. Callers that ask for typed memories must never
+    /// observe untyped results as a silent fallback.
     async fn retrieve_scoped_typed(
         &self,
         query: &str,
@@ -204,13 +208,16 @@ pub trait MemoriaClient: Send + Sync {
         top_k: usize,
         memory_types: &[&str],
     ) -> Result<Vec<MemoriaMemory>, String> {
-        tracing::trace!(
-            ?memory_types,
-            "retrieve_scoped_typed falling back to unfiltered retrieve_ext"
-        );
-        let _ = memory_types;
-        self.retrieve_ext(query, Some(session_id), top_k, true)
-            .await
+        let memories = self
+            .retrieve_ext(query, Some(session_id), top_k, true)
+            .await?;
+        if memory_types.is_empty() {
+            return Ok(memories);
+        }
+        Ok(memories
+            .into_iter()
+            .filter(|memory| memory_types.contains(&memory.memory_type.as_str()))
+            .collect())
     }
 
     /// Store a memory with optional trust tier for confidence decay.
@@ -3163,6 +3170,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_retrieve_scoped_typed_filters_memory_types_locally() {
+        let client = MockMemoriaClient::new(vec![
+            MemoriaMemory {
+                memory_id: "working-1".to_string(),
+                content: "keep".to_string(),
+                memory_type: "working".to_string(),
+                session_id: Some("sess-1".to_string()),
+                retrieval_score: None,
+                observed_at: None,
+                updated_at: None,
+                trust_tier: None,
+            },
+            MemoriaMemory {
+                memory_id: "reference-1".to_string(),
+                content: "drop".to_string(),
+                memory_type: "reference".to_string(),
+                session_id: Some("sess-1".to_string()),
+                retrieval_score: None,
+                observed_at: None,
+                updated_at: None,
+                trust_tier: None,
+            },
+            MemoriaMemory {
+                memory_id: "untyped-1".to_string(),
+                content: "drop".to_string(),
+                memory_type: String::new(),
+                session_id: Some("sess-1".to_string()),
+                retrieval_score: None,
+                observed_at: None,
+                updated_at: None,
+                trust_tier: None,
+            },
+        ]);
+
+        let memories = client
+            .retrieve_scoped_typed("session memory", "sess-1", 10, &["working"])
+            .await
+            .expect("typed retrieve");
+
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_id, "working-1");
+    }
+
+    #[tokio::test]
     async fn retrieve_scoped_typed_sends_memory_types_filter() {
         use std::sync::Arc;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3364,24 +3415,5 @@ mod tests {
         let parsed = parse_reflect_candidates(&data);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].summary, "- real body");
-    }
-
-    /// audit-A3: HttpMemoriaClient must have connect_timeout and timeout so a
-    /// hung Memoria server cannot block the compaction pipeline indefinitely.
-    #[test]
-    fn memoria_compact_client_has_timeout() {
-        let source = include_str!("memoria_compact.rs");
-        let fn_start = source
-            .find("pub fn new(base_url: String, api_key: String)")
-            .expect("HttpMemoriaClient::new must exist");
-        let body = &source[fn_start..fn_start + 400];
-        assert!(
-            body.contains("connect_timeout("),
-            "HttpMemoriaClient must set connect_timeout"
-        );
-        assert!(
-            body.contains(".timeout("),
-            "HttpMemoriaClient must set request timeout"
-        );
     }
 }

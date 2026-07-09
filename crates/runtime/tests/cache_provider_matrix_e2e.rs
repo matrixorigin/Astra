@@ -691,14 +691,10 @@ async fn matrix_volatile_lane_keeps_history_clean() {
         state.max_turn_input_tokens = 200_000;
 
         // Simulate a turn where multiple runtime components fire volatile
-        // injections into the lane (working-set, already-fetched, a stall
-        // nudge, a coaching ping). After the turn runs, none of these
+        // injections into the lane (already-fetched, a stall nudge, a coaching
+        // ping). After the turn runs, none of these
         // should appear as standalone msgs in `state.messages` — they
         // should all be in the captured LAST user message's prefix.
-        state.push_volatile(
-            VolatileKind::WorkingSet,
-            "[working-set:v1]\ngoal: ship it\nrecent_tools:\n- bash [ok t1]",
-        );
         state.push_volatile(
             VolatileKind::AlreadyFetched,
             "## Already Fetched\nsrc/foo.rs",
@@ -901,12 +897,8 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
             }
         };
 
-        // `consolidate_mid_history_volatile_injections` folds the volatile
-        // injections INTO the last user message's prefix (that's how
-        // DeepSeek / Anthropic-protocol caches tolerate them). So the last
-        // user msg WILL contain the warning text — that's by design. We
-        // check mid-history instead: no message OTHER than the last user
-        // may still carry these patterns.
+        // Typed volatile injections may be folded into the last wire user
+        // message, but they must never become persisted mid-history turns.
         let last_idx = cap.messages.len().saturating_sub(1);
         let mid_history_with_pattern = |starts_with: &str| -> usize {
             cap.messages

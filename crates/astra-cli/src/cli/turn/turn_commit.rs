@@ -203,7 +203,7 @@ fn extend_runtime_sidecar_events(
             &verdict.injections,
             &verdict.avoid_tools,
             &verdict.health_avoidance_tools,
-            verdict.force_stop,
+            verdict.advisory_threshold_reached,
             verdict.nudge_count,
             verdict.total_errors,
             verdict.total_timeouts,

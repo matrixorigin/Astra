@@ -9,7 +9,6 @@ use crate::server::tool_admission::{
     ToolAdmissionContext, ToolAdmissionDecision, ToolHiddenReason,
     active_provider_declarations_for_binding, has_explicit_runtime_executor_provider,
 };
-#[cfg(test)]
 use crate::server::tool_route_selection::ToolExecutionRouteKind;
 
 use super::tool_execution_binding::{
@@ -160,11 +159,31 @@ fn runtime_surface_allows_selected_decision(
     registry: &astra_runtime_env::ToolRegistry,
 ) -> bool {
     let tool_name = admission.tool_name.as_str();
+    // Validate the surface against the provider selected by admission, not
+    // against the request's original executor. Shared tools can legitimately
+    // select server service while the workspace executor is edge-bound, and
+    // request-scoped MCP uses its own transport with no workspace.
+    let (surface_workspace, surface_executor, surface_runtime) = match admission.selected_route() {
+        ToolExecutionRouteKind::RequestScopedMcp => (
+            WorkspaceBinding::none(),
+            ExecutorBinding::request_scoped_mcp(),
+            None,
+        ),
+        ToolExecutionRouteKind::ServerRuntime => {
+            (workspace.clone(), ExecutorBinding::server_local(), None)
+        }
+        ToolExecutionRouteKind::ServerControlPlane => (
+            WorkspaceBinding::none(),
+            ExecutorBinding::server_control_plane(),
+            None,
+        ),
+        _ => (workspace.clone(), executor.clone(), runtime.cloned()),
+    };
     let binding = runtime_environment_binding_for_parts_with_provider_declarations(
         tool_name,
-        workspace,
-        executor,
-        runtime.cloned(),
+        &surface_workspace,
+        &surface_executor,
+        surface_runtime,
         policy,
         registry,
         providers,
@@ -1503,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_runtime_without_isolation_backend_does_not_hide_runtime_provider() {
+    fn ready_runtime_without_isolation_backend_hides_runtime_provider() {
         let mut runtime = astra_runtime_env::RuntimeBinding::host_process("runtime-no-isolation");
         runtime.isolation_backend = astra_runtime_env::RuntimeIsolationBackend::None;
 
@@ -1516,8 +1535,8 @@ mod tests {
 
         for expected in ["bash", "read_file", "write_file", "git"] {
             assert!(
-                names.contains(expected),
-                "{expected} must remain visible when runtime capacity is ready; isolation backend is policy evidence, not provider existence"
+                !names.contains(expected),
+                "{expected} must be hidden when runtime topology lacks an enforceable isolation backend"
             );
         }
     }
@@ -1630,7 +1649,7 @@ mod provider_decision_projection_tests {
     }
 
     #[test]
-    fn service_or_runtime_server_route_still_obeys_runtime_surface_policy() {
+    fn server_local_route_still_obeys_runtime_surface_policy() {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let workspace = WorkspaceBinding::server_sandbox("/workspace");
         let executor = ExecutorBinding::server_local();
@@ -1654,7 +1673,7 @@ mod provider_decision_projection_tests {
         assert!(admission.visible);
         assert_eq!(
             admission.selected_route(),
-            ToolExecutionRouteKind::ServerRuntime
+            ToolExecutionRouteKind::ServerLocal
         );
 
         let mut policy = ToolPolicySnapshot::default();

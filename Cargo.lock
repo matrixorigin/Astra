@@ -245,6 +245,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "temp-env",
  "tempfile",
@@ -616,6 +617,7 @@ dependencies = [
 name = "astra-thin-client"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
  "astra-runtime-env",
  "async-stream",
  "futures-util",

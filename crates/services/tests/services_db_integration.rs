@@ -5140,7 +5140,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         .await
         .expect("owner can list session events");
     assert_eq!(owner_events.events.len(), 1);
-    assert_eq!(owner_events.events[0].event_id, owner_event.event_id);
+    assert_eq!(owner_events.events[0].event_id, owner_event.record.event_id);
 
     let other_session_result = event_service
         .get_session_events(session_id.clone(), other_user_id.clone(), 100, None)
@@ -5153,7 +5153,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
     );
 
     let other_get_result = event_service
-        .get_event(owner_event.event_id.clone(), other_user_id.clone())
+        .get_event(owner_event.record.event_id.clone(), other_user_id.clone())
         .await;
     assert_eq!(
         other_get_result
@@ -5163,7 +5163,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
     );
 
     let other_delete_result = event_service
-        .delete_event(owner_event.event_id.clone(), other_user_id.clone())
+        .delete_event(owner_event.record.event_id.clone(), other_user_id.clone())
         .await;
     assert_eq!(
         other_delete_result
@@ -5174,7 +5174,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
 
     let owner_event_still_exists =
         sqlx::query("SELECT COUNT(*) AS c FROM agent_events WHERE event_id = ? AND user_id = ?")
-            .bind(&owner_event.event_id)
+            .bind(&owner_event.record.event_id)
             .bind(&owner_user_id)
             .fetch_one(&pool)
             .await
@@ -5252,7 +5252,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         &pool,
         &owner_user_id,
         std::slice::from_ref(&session_id),
-        &[owner_event.event_id],
+        &[owner_event.record.event_id],
         &[],
     )
     .await;
@@ -7134,14 +7134,14 @@ async fn sync_outbox_create_event_upserts_missing_session_header_live_matrixone(
     assert_eq!(
         row.try_get::<String, _>("last_event_id")
             .expect("decode last_event_id"),
-        created.event_id
+        created.record.event_id
     );
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
         &user_id,
         std::slice::from_ref(&session_id),
-        &[created.event_id],
+        &[created.record.event_id],
         &[],
     )
     .await;
@@ -7353,7 +7353,7 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
             .collect::<Vec<_>>();
     assert_eq!(state_event_ids.len(), 1);
 
-    let mut event_ids = vec![created_one.event_id, created_two.event_id];
+    let mut event_ids = vec![created_one.record.event_id, created_two.record.event_id];
     event_ids.extend(context_event_ids);
     event_ids.extend(state_event_ids);
     let _ = sqlx::query(

@@ -64,7 +64,7 @@ impl FromStr for AgentToolResultStatusKind {
         match normalized.as_str() {
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
-            "timeout" => Ok(Self::TimedOut),
+            "timeout" | "timed_out" => Ok(Self::TimedOut),
             "cancelled" => Ok(Self::Cancelled),
             "interrupted" => Ok(Self::Interrupted),
             "waiting" => Ok(Self::Waiting),
@@ -74,6 +74,120 @@ impl FromStr for AgentToolResultStatusKind {
             _ => Err(format!("unknown agent tool status: '{s}'")),
         }
     }
+}
+
+pub const AGENT_RESULT_CLASS_SUCCESS: &str = "success";
+pub const AGENT_RESULT_CLASS_AGENT_INCOMPLETE: &str = "agent_incomplete";
+pub const AGENT_RESULT_CLASS_FANOUT_INCOMPLETE: &str = "fanout_incomplete";
+
+pub fn agent_tool_status_needs_recovery(status: AgentToolResultStatusKind) -> bool {
+    matches!(
+        status,
+        AgentToolResultStatusKind::Failed
+            | AgentToolResultStatusKind::TimedOut
+            | AgentToolResultStatusKind::Cancelled
+            | AgentToolResultStatusKind::Interrupted
+            | AgentToolResultStatusKind::Waiting
+            | AgentToolResultStatusKind::StillRunning
+            | AgentToolResultStatusKind::Launched
+            | AgentToolResultStatusKind::Other
+    )
+}
+
+pub fn agent_tool_result_looks_like(value: &Value) -> bool {
+    value.get("agent_id").is_some() && value.get("status").is_some()
+}
+
+pub fn agent_tool_structured_result_class(value: &Value) -> Option<&'static str> {
+    if value.get("incomplete").and_then(Value::as_bool) == Some(true) {
+        return Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE);
+    }
+
+    match value
+        .get("status")
+        .and_then(Value::as_str)
+        .map(AgentToolResultStatusKind::parse_wire)?
+    {
+        AgentToolResultStatusKind::Completed => Some(AGENT_RESULT_CLASS_SUCCESS),
+        status if agent_tool_status_needs_recovery(status) => {
+            Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
+        }
+        _ => None,
+    }
+}
+
+pub fn agent_tool_result_needs_recovery(value: &Value) -> bool {
+    agent_tool_structured_result_class(value) == Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
+}
+
+pub fn agent_fanout_result_looks_like(value: &Value) -> bool {
+    value.get("group_id").is_some() && value.get("results").is_some()
+}
+
+pub fn agent_fanout_structured_result_class(value: &Value) -> Option<&'static str> {
+    if agent_fanout_result_has_recoverable_issue(value) {
+        return Some(AGENT_RESULT_CLASS_FANOUT_INCOMPLETE);
+    }
+
+    match value.get("status").and_then(Value::as_str)? {
+        "completed" => Some(AGENT_RESULT_CLASS_SUCCESS),
+        "incomplete"
+        | "completed_with_issues"
+        | "failed"
+        | "failed_to_start"
+        | "interrupted"
+        | "timeout"
+        | "timed_out"
+        | "cancelled" => Some(AGENT_RESULT_CLASS_FANOUT_INCOMPLETE),
+        _ => None,
+    }
+}
+
+pub fn agent_fanout_result_has_recoverable_issue(value: &Value) -> bool {
+    const ISSUE_COUNT_FIELDS: &[&str] = &[
+        "failed",
+        "interrupted",
+        "timed_out",
+        "cancelled_by_user",
+        "cancelled_by_parent_budget",
+        "spawn_rejected",
+        "incomplete_results",
+    ];
+    if ISSUE_COUNT_FIELDS
+        .iter()
+        .any(|field| value.get(*field).and_then(Value::as_u64).unwrap_or(0) > 0)
+    {
+        return true;
+    }
+
+    value
+        .get("results")
+        .and_then(Value::as_array)
+        .is_some_and(|results| {
+            results.iter().any(|item| {
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(fanout_slot_status_is_recoverable_issue)
+                    || item
+                        .get("result")
+                        .is_some_and(agent_tool_result_needs_recovery)
+            })
+        })
+}
+
+pub fn fanout_slot_status_is_recoverable_issue(status: &str) -> bool {
+    matches!(
+        status,
+        "failed"
+            | "failed_to_start"
+            | "interrupted"
+            | "timeout"
+            | "timed_out"
+            | "cancelled"
+            | "cancelled_by_user"
+            | "cancelled_by_parent_budget"
+            | "spawn_rejected"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -559,6 +673,56 @@ mod tests {
     }
 
     #[test]
+    fn structured_result_classification_is_shared_for_agent_and_fanout() {
+        let active_agent = json!({
+            "status": AgentToolResultStatusKind::StillRunning.as_str(),
+            "agent_id": "a1"
+        });
+        assert_eq!(
+            agent_tool_structured_result_class(&active_agent),
+            Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
+        );
+        assert!(agent_tool_result_needs_recovery(&active_agent));
+
+        let timeout_agent = json!({
+            "status": "timed_out",
+            "agent_id": "a1"
+        });
+        assert_eq!(
+            agent_tool_structured_result_class(&timeout_agent),
+            Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
+        );
+
+        let completed_agent = json!({
+            "status": AgentToolResultStatusKind::Completed.as_str(),
+            "agent_id": "a1",
+            "result": "done"
+        });
+        assert_eq!(
+            agent_tool_structured_result_class(&completed_agent),
+            Some(AGENT_RESULT_CLASS_SUCCESS)
+        );
+        assert!(!agent_tool_result_needs_recovery(&completed_agent));
+
+        let fanout = json!({
+            "status": "completed",
+            "group_id": "review",
+            "results": [{
+                "slot_index": 0,
+                "agent_id": "a1",
+                "result": active_agent
+            }]
+        });
+        assert_eq!(
+            agent_fanout_structured_result_class(&fanout),
+            Some(AGENT_RESULT_CLASS_FANOUT_INCOMPLETE)
+        );
+        assert!(agent_fanout_result_has_recoverable_issue(&fanout));
+        assert!(fanout_slot_status_is_recoverable_issue("spawn_rejected"));
+        assert!(fanout_slot_status_is_recoverable_issue("timed_out"));
+    }
+
+    #[test]
     fn render_wait_for_agent_status_preserves_waiting_reason_and_hint() {
         let rendered = render_wait_for_agent_status(
             "a1",
@@ -603,6 +767,22 @@ mod tests {
             AgentToolResultStatusKind::Interrupted.as_str()
         );
         assert_eq!(parsed["finish_reason"], "empty_completion");
+        assert_eq!(parsed["incomplete"], true);
+
+        let guarded = render_completed_agent_result(
+            "a1",
+            crate::response_guard::INTERNAL_PROTOCOL_FALLBACK,
+            Some(crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON),
+        );
+        let parsed: Value = serde_json::from_str(&guarded).unwrap();
+        assert_eq!(
+            parsed["status"],
+            AgentToolResultStatusKind::Interrupted.as_str()
+        );
+        assert_eq!(
+            parsed["finish_reason"],
+            crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON
+        );
         assert_eq!(parsed["incomplete"], true);
     }
 

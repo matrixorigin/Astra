@@ -104,8 +104,9 @@ pub(crate) struct StreamResult {
     pub(crate) budget_pressure: f64,
     /// Stall events that occurred during the agentic loop (stall_type, turn_number).
     pub(crate) stall_events: Vec<(String, u32)>,
-    /// TurnGuard verdict events (severity, turn, injections, avoid_tools, force_stop,
-    /// nudge_count, total_errors, health_avoidance_count). Only non-Healthy verdicts.
+    /// TurnGuard verdict events (severity, turn, injections, avoid_tools,
+    /// advisory threshold, error pressure, and health telemetry). Only
+    /// non-Healthy verdicts.
     pub(crate) verdict_events: Vec<VerdictEvent>,
     /// Step Protocol recorder summary for debugging and audit.
     pub(crate) step_recorder_summary: Option<astra_pipeline::step_recorder::RecorderSummary>,

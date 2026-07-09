@@ -1019,12 +1019,24 @@ pub(crate) fn assemble_context_pipeline(
             (system, preamble)
         }
     };
-    if let Some(required_text) = astra_turn_core::chat_turn_edge_profile::edge_profile_joined_text(
+    let mut required_runtime_texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
         input.runtime_signals.edge_profile,
         astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
-    )
-    .and_then(|text| crate::turn::wire_assembly::required_runtime_preamble_message(&text))
-    {
+    );
+    required_runtime_texts.extend(
+        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+            input.runtime_signals.edge_profile,
+        )
+        .into_iter()
+        .filter(|injection| {
+            injection.delivery_class
+                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+        })
+        .filter_map(|injection| injection.render_for_prompt()),
+    );
+    if let Some(required_text) = crate::turn::wire_assembly::required_runtime_preamble_message(
+        &required_runtime_texts.join("\n\n"),
+    ) {
         volatile_preamble.push(required_text);
     }
     let stable_system_message_count = system_messages.len();
@@ -1172,9 +1184,9 @@ fn queue_active_turn_frame(state: &mut AgenticLoopState) {
         "round_id": state.llm_rounds_completed,
         "instruction": "Answer the latest user message first. History, memory, and tool results are evidence for this goal; do not finish with an answer to an older question."
     });
-    state.push_volatile(
+    state.push_volatile_payload(
         crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
-        format!("[active-turn-frame:v1]\n{frame}\n[/active-turn-frame]"),
+        frame,
     );
 }
 
@@ -1929,7 +1941,7 @@ mod context_cache_contract_tests {
             "real user content must remain first: {tail_user}"
         );
         assert!(
-            tail_user.contains("[active-turn-frame:v1]"),
+            tail_user.contains("<runtime-required-context>"),
             "runtime goal frame must be visible in the protocol-valid tail suffix"
         );
         assert!(tail_user.contains("\"turn_id\":7"));
@@ -1948,7 +1960,7 @@ mod context_cache_contract_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            !system_text.contains("[active-turn-frame:v1]"),
+            !system_text.contains("<runtime-required-context>"),
             "active-turn runtime context must not mutate the stable system lane"
         );
         assert!(

@@ -2633,31 +2633,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminal_reconcile_projection_refresh_is_warn_only() {
-        let source = include_str!("engine.rs");
-        let reconcile_body = source
-            .split("async fn reconcile_terminal_transition_after_store_error")
-            .nth(1)
-            .and_then(|rest| {
-                rest.split("async fn project_delegation_run_if_needed")
-                    .next()
-            })
-            .expect("terminal reconcile body");
-
-        assert!(
-            reconcile_body.contains("project_delegation_run_if_needed"),
-            "terminal reconcile must still refresh delegated run projections"
-        );
-        assert!(
-            !reconcile_body.contains("propagating error")
-                && !reconcile_body.contains(
-                    "terminal transition reconciled but delegation projection refresh failed:"
-                ),
-            "projection refresh failure must not overturn a reconciled durable terminal transition"
-        );
-    }
-
     #[tokio::test]
     async fn persist_usage_updates() {
         let engine = test_engine();

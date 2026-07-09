@@ -1,5 +1,4 @@
-//! Turn execution profiles, factual-retry policy, session error classification,
-//! and memory repo extraction.
+//! Turn execution profiles, session error classification, and memory repo extraction.
 //!
 //! Natural-language turn intent is deliberately not inferred here. Strong
 //! runtime behavior must be driven by structured judge output or concrete
@@ -9,11 +8,7 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use serde_json::Value;
 use tracing::warn;
-
-use crate::chat_history_openai::openai_user_content_message;
-use crate::interaction_types::{ASK_USER_TOOL_NAME, TurnInteractionPolicy};
 
 const DEFAULT_STALL_WINDOW: usize = 3;
 const DEFAULT_EXPLORATION_ROUND_WINDOW: usize = 5;
@@ -73,7 +68,6 @@ pub struct AgenticTurnBudgetOverride {
 pub struct TaskExecutionProfile {
     pub mutates_workspace: bool,
     pub verification_required: bool,
-    pub allow_factual_retry: bool,
     pub exploration_round_window: usize,
     pub stall_window: usize,
     pub complexity: TaskComplexity,
@@ -86,7 +80,6 @@ impl Default for TaskExecutionProfile {
         Self {
             mutates_workspace: false,
             verification_required: false,
-            allow_factual_retry: false,
             exploration_round_window: DEFAULT_EXPLORATION_ROUND_WINDOW,
             stall_window: DEFAULT_STALL_WINDOW,
             complexity: TaskComplexity::Standard,
@@ -112,7 +105,6 @@ impl TaskExecutionProfile {
         mutates_workspace: bool,
         exploratory_task: bool,
         complexity: TaskComplexity,
-        allow_factual_retry: bool,
     ) -> Self {
         let stall_window = if exploratory_task || complexity == TaskComplexity::Complex {
             EXPLORATORY_STALL_WINDOW
@@ -127,7 +119,6 @@ impl TaskExecutionProfile {
         Self {
             mutates_workspace,
             verification_required: mutates_workspace,
-            allow_factual_retry,
             exploration_round_window,
             stall_window,
             complexity,
@@ -223,67 +214,6 @@ pub fn is_session_not_found_error(error: &str) -> bool {
     error.to_lowercase().contains("session not found")
 }
 
-pub fn should_force_factual_tool_retry(
-    profile: TaskExecutionProfile,
-    _input: &str,
-    _recent_tools: &[String],
-    total_evidence_tool_calls: u32,
-    already_retried: bool,
-    policy: &TurnInteractionPolicy,
-) -> bool {
-    profile.allow_factual_retry
-        && !already_retried
-        && total_evidence_tool_calls == 0
-        && policy.has_evidence_tools()
-}
-
-pub fn factual_tool_retry_message(original_query: &str, policy: &TurnInteractionPolicy) -> String {
-    let tools_hint = if policy.evidence_tool_names.is_empty() {
-        "This turn does not expose any evidence-gathering tools. Do not retry with bash or invented tools."
-            .to_string()
-    } else {
-        format!(
-            "You have exactly these evidence tools available for this turn: {}.\n\
-Only call tools from this list to gather evidence — do not use bash to work around missing tools.",
-            policy.evidence_tool_names.join(", ")
-        )
-    };
-    let clarification_hint = if policy.allow_ask_user
-        && policy
-            .visible_tool_names
-            .iter()
-            .any(|name| name == ASK_USER_TOOL_NAME)
-    {
-        "\nIf the request is genuinely ambiguous, you may use ask_user for clarification, but ask_user does not replace evidence collection."
-    } else if !policy.can_pause_for_user {
-        "\nThis turn cannot pause for user clarification."
-    } else {
-        ""
-    };
-    format!(
-        "Runtime correction: your previous response answered without using any tools. \
-        This query requires live data from the workspace, repository, or external sources \
-        that you cannot know from training data alone. Validate the answer with tools first.\n\
-        \n\
-        {tools_hint}\n\
-        {clarification_hint}\n\
-        \n\
-        If the available tools do not provide relevant evidence for the user's actual question, \
-        answer the question directly instead of writing task-progress commentary.\n\
-        \n\
-        Original user query: {original_query}"
-    )
-}
-
-/// OpenAI `messages` entry for [`factual_tool_retry_message`].
-#[must_use]
-pub fn openai_factual_tool_retry_user_message(
-    original_query: &str,
-    policy: &TurnInteractionPolicy,
-) -> Value {
-    openai_user_content_message(&factual_tool_retry_message(original_query, policy))
-}
-
 /// Extract `owner/repo` patterns from memory text.
 pub fn extract_repos_from_memory(text: &str) -> Vec<String> {
     static GITHUB_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -362,7 +292,6 @@ pub fn trim_trailing_punctuation(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interaction_types::TurnInteractionMode;
 
     #[test]
     fn natural_language_profile_inference_fails_closed() {
@@ -385,15 +314,10 @@ mod tests {
     #[test]
     fn structured_profiles_scale_budget_for_mutation_and_exploration() {
         let standard = TaskExecutionProfile::default();
-        let implementation = TaskExecutionProfile::from_structured_intent(
-            true,
-            false,
-            TaskComplexity::Standard,
-            true,
-        );
+        let implementation =
+            TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard);
         assert!(implementation.mutates_workspace);
         assert!(implementation.verification_required);
-        assert!(implementation.allow_factual_retry);
         assert!(
             implementation.agentic_turn_budget.initial_turns
                 > standard.agentic_turn_budget.initial_turns
@@ -403,26 +327,17 @@ mod tests {
                 > standard.agentic_turn_budget.hard_turn_limit
         );
 
-        let exploratory = TaskExecutionProfile::from_structured_intent(
-            false,
-            true,
-            TaskComplexity::Complex,
-            true,
-        );
+        let exploratory =
+            TaskExecutionProfile::from_structured_intent(false, true, TaskComplexity::Complex);
         assert!(exploratory.exploration_round_window > standard.exploration_round_window);
         assert!(exploratory.stall_window > standard.stall_window);
         assert!(exploratory.exploratory_task);
-        assert!(exploratory.allow_factual_retry);
     }
 
     #[test]
     fn resolve_agentic_turn_budget_clamps_override_to_runtime_ceiling() {
-        let profile = TaskExecutionProfile::from_structured_intent(
-            true,
-            false,
-            TaskComplexity::Standard,
-            true,
-        );
+        let profile =
+            TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard);
         let budget = resolve_agentic_turn_budget(
             profile,
             12,
@@ -434,112 +349,6 @@ mod tests {
         assert_eq!(budget.initial_turns, 12);
         assert_eq!(budget.hard_turn_limit, 12);
         assert_eq!(budget.max_extensions, 0);
-    }
-
-    #[test]
-    fn force_retry_requires_explicit_profile_signal() {
-        let none: Vec<String> = vec![];
-        let policy = TurnInteractionPolicy::from_visible_tool_names(
-            TurnInteractionMode::Deny,
-            vec!["github".into()],
-        );
-        assert!(!should_force_factual_tool_retry(
-            TaskExecutionProfile::default(),
-            "最新的一个ci?",
-            &none,
-            0,
-            false,
-            &policy,
-        ));
-
-        let explicit = TaskExecutionProfile {
-            allow_factual_retry: true,
-            ..TaskExecutionProfile::default()
-        };
-        assert!(should_force_factual_tool_retry(
-            explicit, "hello", &none, 0, false, &policy,
-        ));
-        assert!(!should_force_factual_tool_retry(
-            explicit, "hello", &none, 1, false, &policy,
-        ));
-        assert!(!should_force_factual_tool_retry(
-            explicit, "hello", &none, 0, true, &policy,
-        ));
-    }
-
-    #[test]
-    fn factual_retry_message_guides_toward_dedicated_tools() {
-        let policy = TurnInteractionPolicy::from_visible_tool_names(
-            TurnInteractionMode::Deny,
-            vec!["mo_query".into()],
-        );
-        let msg = factual_tool_retry_message("memoria 最新的一个ci?", &policy);
-        assert!(msg.contains("mo_query"));
-        assert!(msg.contains("cannot pause for user clarification"));
-        assert!(msg.contains("If the available tools do not provide relevant evidence"));
-        assert!(!msg.contains("Discard your previous draft"));
-    }
-
-    #[test]
-    fn factual_retry_message_lists_visible_tools_when_provided() {
-        let policy = TurnInteractionPolicy::from_visible_tool_names(
-            TurnInteractionMode::Deny,
-            vec![
-                "mo_query".to_string(),
-                "introspect".to_string(),
-                "read_file".to_string(),
-            ],
-        );
-        let msg = factual_tool_retry_message("看session指标", &policy);
-        assert!(msg.contains("mo_query"));
-        assert!(msg.contains("read_file"));
-        assert!(!msg.contains("introspect"));
-        assert!(msg.contains("Only call tools from this list"));
-    }
-
-    #[test]
-    fn factual_retry_message_mentions_ask_user_without_listing_it_as_evidence() {
-        let policy = TurnInteractionPolicy::from_visible_tool_names(
-            TurnInteractionMode::Prompt,
-            vec!["mo_query".to_string(), "ask_user".to_string()],
-        );
-        let msg = factual_tool_retry_message("看当前 session 指标", &policy);
-        assert!(msg.contains("mo_query"));
-        assert!(msg.contains("ask_user"));
-        assert!(!msg.contains("ask_user,"));
-    }
-
-    #[test]
-    fn openai_factual_tool_retry_user_message_shape() {
-        let policy = TurnInteractionPolicy::from_visible_tool_names(
-            TurnInteractionMode::Deny,
-            vec!["mo_query".into()],
-        );
-        let v = openai_factual_tool_retry_user_message("q", &policy);
-        assert_eq!(v["role"], "user");
-        let s = v["content"].as_str().unwrap();
-        assert!(s.contains("Runtime correction"));
-        assert!(s.contains("Original user query: q"));
-    }
-
-    #[test]
-    fn factual_retry_requires_evidence_tools() {
-        let policy = TurnInteractionPolicy::from_visible_tool_names(
-            TurnInteractionMode::Prompt,
-            vec!["ask_user".into()],
-        );
-        let explicit = TaskExecutionProfile {
-            allow_factual_retry: true,
-            ..TaskExecutionProfile::default()
-        };
-        assert!(!should_force_factual_tool_retry(
-            explicit,
-            "latest CI?",
-            &[],
-            0,
-            false,
-            &policy,
-        ));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::slash::{slash_health, slash_router::handle_slash_command};
+use crate::tests::isolate_credentials;
 use astra_core::{SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
 use astra_services::SyncOutboxStore;
 use astra_services::session_journal::{self, JournalDirGuard};
@@ -24,6 +25,14 @@ impl EnvVarGuard {
         let previous = std::env::var(key).ok();
         unsafe {
             std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
         }
         Self { key, previous }
     }
@@ -140,12 +149,10 @@ async fn slash_health_offline_shows_cloud_section() {
 // called from within a tokio runtime. We unset ASTRA_API_URL so they
 // take the graceful-fallback path (CLI is now HTTP-only).
 
+#[serial_test::serial]
 #[tokio::test]
 async fn try_cloud_pull_returns_unreachable_without_api_url() {
-    // Safety: test-only, single-threaded tokio runtime
-    unsafe {
-        std::env::remove_var("ASTRA_API_URL");
-    }
+    let _api = EnvVarGuard::remove("ASTRA_API_URL");
     let result = cloud_sync::try_cloud_pull("default").await;
     assert!(
         !result.cloud_reachable,
@@ -456,6 +463,43 @@ async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
     assert_eq!(status.acked, 0);
     assert_eq!(status.pending, 1);
     assert_eq!(status.retry_deferred, 1);
+    assert_eq!(status.ack_watermark, 0);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn drain_sync_outbox_without_token_leaves_ready_records_unmodified() {
+    let _creds = isolate_credentials();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _guard = JournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _token = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
+
+    let state = SessionState {
+        session_id: Some(format!(
+            "test-cloud-drain-no-token-{}",
+            uuid::Uuid::new_v4()
+        )),
+        ..Default::default()
+    };
+    let pull = CloudPullResult {
+        cloud_reachable: true,
+    };
+    append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
+
+    let report = cloud_sync::try_drain_sync_outbox(10).await;
+    assert!(report.cloud_configured);
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.acked, 0);
+    assert_eq!(report.failed, 0);
+
+    let status = SyncOutboxStore::local().status().expect("status");
+    assert_eq!(status.pending, 1);
+    assert_eq!(status.ready, 1);
+    assert_eq!(status.in_flight, 0);
+    assert_eq!(status.retry_deferred, 0);
+    assert_eq!(status.poisoned, 0);
     assert_eq!(status.ack_watermark, 0);
 }
 

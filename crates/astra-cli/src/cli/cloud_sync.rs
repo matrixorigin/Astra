@@ -19,8 +19,11 @@ use astra_services::{
 };
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use serde_json::{Value, json};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+
+use futures_util::FutureExt;
 
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
@@ -31,6 +34,50 @@ const SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS: usize = 4;
 const SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 static SYNC_OUTBOX_DRAIN_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+
+struct SyncOutboxDrainScheduleGuard;
+
+impl Drop for SyncOutboxDrainScheduleGuard {
+    fn drop(&mut self) {
+        release_sync_outbox_drain_schedule();
+    }
+}
+
+struct SyncOutboxRetryWakeGuard {
+    deadline: u64,
+}
+
+impl Drop for SyncOutboxRetryWakeGuard {
+    fn drop(&mut self) {
+        let _ = SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.compare_exchange(
+            self.deadline,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+/// Spawn a fire-and-forget future, logging any panic so it is not silently
+/// swallowed when the returned [`JoinHandle`] is dropped.
+fn spawn_tracked(fut: impl Future<Output = ()> + Send + 'static) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
+        if let Err(err) = result {
+            let msg = err
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| err.downcast_ref::<String>().map(|s| s.as_str()));
+            tracing::error!(
+                panic = msg.unwrap_or("unknown"),
+                "sync-outbox background task panicked; restart CLI to recover"
+            );
+        }
+    });
+}
 
 /// Result from cloud pull attempt at session start.
 pub(crate) struct CloudPullResult {
@@ -63,11 +110,12 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
     if !try_claim_sync_outbox_drain_schedule() {
         return;
     }
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+    if tokio::runtime::Handle::try_current().is_err() {
         release_sync_outbox_drain_schedule();
         return;
-    };
-    handle.spawn(async {
+    }
+    spawn_tracked(async {
+        let schedule_guard = SyncOutboxDrainScheduleGuard;
         for _ in 0..SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS {
             let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
             if !report.cloud_configured || report.remaining_ready == 0 || report.attempted == 0 {
@@ -78,7 +126,7 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
             .status()
             .ok()
             .and_then(|status| next_sync_outbox_drain_delay(&status));
-        release_sync_outbox_drain_schedule();
+        drop(schedule_guard);
         if let Some(delay) = next_delay {
             schedule_sync_outbox_drain_after(delay);
         }
@@ -86,15 +134,19 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
 }
 
 fn schedule_sync_outbox_retry_wake(delay: Duration) {
-    let deadline = unix_ms().saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64);
+    let Some(now) = unix_ms() else {
+        return;
+    };
+    let deadline = now.saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64);
     if !claim_sync_outbox_retry_wake_deadline(deadline) {
         return;
     }
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+    if tokio::runtime::Handle::try_current().is_err() {
         release_sync_outbox_retry_wake_schedule();
         return;
-    };
-    handle.spawn(async move {
+    }
+    spawn_tracked(async move {
+        let _wake_guard = SyncOutboxRetryWakeGuard { deadline };
         tokio::time::sleep(delay).await;
         if SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS
             .compare_exchange(deadline, 0, Ordering::AcqRel, Ordering::Acquire)
@@ -142,8 +194,8 @@ fn next_sync_outbox_drain_delay(status: &SyncOutboxStatus) -> Option<Duration> {
         return Some(Duration::ZERO);
     }
     let retry_at = status.next_retry_after_unix_ms?;
-    let delay_ms = retry_at.saturating_sub(unix_ms()).max(1);
-    Some(Duration::from_millis(delay_ms))
+    let now = unix_ms()?;
+    Some(Duration::from_millis(retry_at.saturating_sub(now)))
 }
 
 /// Parse a boolean preference value. Accepts "true"/"1"/"yes"/"on" as true,
@@ -342,8 +394,16 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
         cloud_configured: true,
         ..Default::default()
     };
-    let token = session_runtime::current_access_token(None);
-    let client = match astra_thin_client::ThinClient::new(&cloud_base, token.clone()) {
+    let Some(token) =
+        session_runtime::current_access_token(None).filter(|token| !token.trim().is_empty())
+    else {
+        tracing::debug!(
+            target: "astra_cli::cloud_sync",
+            "sync outbox drain skipped because no access token is available"
+        );
+        return report;
+    };
+    let client = match astra_thin_client::ThinClient::new(&cloud_base, Some(token.clone())) {
         Ok(client) => client,
         Err(error) => {
             tracing::warn!(
@@ -372,7 +432,7 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
         let body = event_body_from_outbox_record(&record);
         let delivery = tokio::time::timeout(
             SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT,
-            client.post_sync_outbox_event_json(token.as_deref(), &body),
+            client.post_sync_outbox_event_json(Some(token.as_str()), &body),
         )
         .await;
         match delivery {
@@ -451,11 +511,17 @@ fn record_settlement_result(
     }
 }
 
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+fn unix_ms() -> Option<u64> {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => Some(duration.as_millis() as u64),
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                "system clock is before UNIX epoch; skipping sync outbox scheduling"
+            );
+            None
+        }
+    }
 }
 
 fn event_body_from_outbox_record(record: &SyncOutboxRecord) -> Value {
@@ -586,11 +652,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CloudPullResult, SyncOutboxDrainReport, cloud_pull_warrants_sync_marker,
-        claim_sync_outbox_retry_wake_deadline, next_sync_outbox_drain_delay,
-        record_settlement_result, release_sync_outbox_drain_schedule,
-        release_sync_outbox_retry_wake_schedule, should_append_cloud_pull_journal,
-        try_claim_sync_outbox_drain_schedule,
+        CloudPullResult, SyncOutboxDrainReport, SyncOutboxDrainScheduleGuard,
+        SyncOutboxRetryWakeGuard, claim_sync_outbox_retry_wake_deadline,
+        cloud_pull_warrants_sync_marker, next_sync_outbox_drain_delay, record_settlement_result,
+        release_sync_outbox_drain_schedule, release_sync_outbox_retry_wake_schedule,
+        should_append_cloud_pull_journal, try_claim_sync_outbox_drain_schedule,
     };
     use astra_services::{SyncOutboxSettlementReport, SyncOutboxStatus};
 
@@ -600,6 +666,27 @@ mod tests {
             cloud_reachable: false,
         };
         assert!(!result.cloud_reachable);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn drain_schedule_guard_releases_claim_on_drop() {
+        release_sync_outbox_drain_schedule();
+        assert!(try_claim_sync_outbox_drain_schedule());
+        drop(SyncOutboxDrainScheduleGuard);
+        assert!(try_claim_sync_outbox_drain_schedule());
+        release_sync_outbox_drain_schedule();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn retry_wake_guard_releases_matching_deadline_on_drop() {
+        release_sync_outbox_retry_wake_schedule();
+        let deadline = 123_456;
+        assert!(claim_sync_outbox_retry_wake_deadline(deadline));
+        drop(SyncOutboxRetryWakeGuard { deadline });
+        assert!(claim_sync_outbox_retry_wake_deadline(deadline));
+        release_sync_outbox_retry_wake_schedule();
     }
 
     #[test]
@@ -664,6 +751,7 @@ mod tests {
         assert_eq!(report.failed, 2);
     }
 
+    #[serial_test::serial]
     #[test]
     fn drain_scheduler_allows_only_one_worker_until_released() {
         release_sync_outbox_drain_schedule();
@@ -684,7 +772,7 @@ mod tests {
     #[test]
     fn retry_delay_uses_ready_or_next_retry_after_without_user_action() {
         let mut status = SyncOutboxStatus {
-            next_retry_after_unix_ms: Some(super::unix_ms().saturating_add(10)),
+            next_retry_after_unix_ms: Some(super::unix_ms().expect("time").saturating_add(10)),
             ..Default::default()
         };
 

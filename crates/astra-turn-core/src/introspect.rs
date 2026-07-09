@@ -190,7 +190,7 @@ pub struct StallSnapshotSummary {
     /// Correction labels fired this turn (e.g. "execution_escalation",
     /// "parallel_batching_force", "cache_waste_corrective", …).
     #[serde(default)]
-    pub forced_corrections: Vec<String>,
+    pub advisory_signals: Vec<String>,
     /// How many drift nudges injected this session (persists across turns).
     #[serde(default)]
     pub drift_nudge_count: usize,
@@ -709,9 +709,9 @@ pub fn render_volatile_pending(s: &IntrospectSnapshot) -> String {
 /// Render `facet=stall` — stall / loop-guard telemetry.
 pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
     let st = &s.stall_state;
-    let any_forced = !st.forced_corrections.is_empty();
-    if st.nudge_count == 0 && st.events.is_empty() && !any_forced {
-        return "## Stall / Loop-Guard\n(Healthy — no nudges, no forced corrections this turn.)"
+    let any_advisory = !st.advisory_signals.is_empty();
+    if st.nudge_count == 0 && st.events.is_empty() && !any_advisory {
+        return "## Stall / Loop-Guard\n(Healthy — no nudges or advisory signals this turn.)"
             .to_string();
     }
     let mut out = String::from("## Stall / Loop-Guard\n");
@@ -727,9 +727,9 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
             out.push('\n');
         }
     }
-    if any_forced {
-        out.push_str("\n### Forced corrections fired this turn\n");
-        for correction in &st.forced_corrections {
+    if any_advisory {
+        out.push_str("\n### Advisory signals emitted this turn\n");
+        for correction in &st.advisory_signals {
             out.push_str("- ");
             out.push_str(correction);
             out.push('\n');
@@ -1577,7 +1577,7 @@ mod tests {
         let mut snap = IntrospectSnapshot::default();
         snap.stall_state.nudge_count = 2;
         snap.stall_state.introspection_count = 1;
-        snap.stall_state.forced_corrections = vec!["parallel_batching_force".into()];
+        snap.stall_state.advisory_signals = vec!["parallel_batching_force".into()];
         snap.stall_state.events = vec!["sig_stall @ turn 5".into()];
         let out = render_stall_state(&snap);
         assert!(out.contains("Soft nudges: 2"));

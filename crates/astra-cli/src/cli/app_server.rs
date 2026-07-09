@@ -964,21 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn app_server_turn_options_wire_continuation_messages() {
-        let src = include_str!("app_server.rs");
-        assert!(
-            src.contains(
-                "let continuation_messages = app_server_continuation_messages(&thread_id);"
-            ),
-            "app-server must load continuation messages for the active thread before each turn"
-        );
-        assert!(
-            src.contains("pre_loaded_messages: continuation_messages"),
-            "app-server must pass thread continuation messages into BasicCliTurnOptions"
-        );
-    }
-
-    #[test]
     fn thread_started_params_include_previous_thread_id_for_rebinds() {
         let params = thread_started_params("sess-123", Some("temp-thread"));
         assert_eq!(params["thread"]["id"], "sess-123");

@@ -1028,6 +1028,7 @@ pub struct ToolCallRecord {
 /// evaluation/analytics by [`ToolCallRecord::is_synthetic_placeholder`].
 pub const SURGICAL_REMOVAL_TOOL_NAME: &str = "(surgically_removed)";
 pub const NOOP_OR_CACHED_RESULT_CLASS: &str = "noop_or_cached";
+pub const BLOCKED_TOOL_RESULT_CLASS: &str = "blocked_tool";
 
 impl ToolCallRecord {
     /// Synthetic placeholders are audit-only records emitted when skill routing
@@ -1037,24 +1038,7 @@ impl ToolCallRecord {
     /// failure, so these records must be filtered out before computing
     /// analytics (tool_error_rate, repeat_tool_call, failed_tool_calls, …).
     pub fn is_synthetic_placeholder(&self) -> bool {
-        if self.surgically_removed == Some(true) {
-            return true;
-        }
-        if self.is_structured_noop_or_cached_result() {
-            return true;
-        }
-
-        let Some(result_preview) = self.result_preview.as_deref() else {
-            return false;
-        };
-
-        result_preview.starts_with("Skipped:")
-            || (self.error.is_none() && result_preview.starts_with("Deferred:"))
-            || (self.name == "delegate"
-                && result_preview.starts_with("Invalid delegation request:"))
-            || (self.name == "skill"
-                && result_preview.starts_with("Skill '")
-                && result_preview.contains(" was already loaded (turn "))
+        self.is_noop_or_cached_result()
     }
 
     /// True when this tool call was rejected by the pipeline before execution
@@ -1062,11 +1046,7 @@ impl ToolCallRecord {
     /// `tools_used` for pattern learning — they never ran, so attributing
     /// turn-level success/failure to them creates a self-reinforcing block loop.
     pub fn was_blocked_by_policy(&self) -> bool {
-        !self.ok
-            && self
-                .error
-                .as_deref()
-                .is_some_and(|e| e.starts_with("blocked_tool:"))
+        !self.ok && self.result_class.as_deref() == Some(BLOCKED_TOOL_RESULT_CLASS)
     }
 
     /// True when the tool call did not produce new observations because the
@@ -1077,68 +1057,11 @@ impl ToolCallRecord {
     /// "successful execution with fresh evidence" from cache hits, duplicate
     /// suppressions, and unchanged-result stubs.
     pub fn is_noop_or_cached_result(&self) -> bool {
-        if self.is_structured_noop_or_cached_result() {
-            return true;
-        }
-        self.error
-            .as_deref()
-            .is_some_and(is_noop_or_cached_result_text)
-            || self
-                .result_preview
-                .as_deref()
-                .is_some_and(is_noop_or_cached_result_text)
-            || self
-                .result_full
-                .as_deref()
-                .is_some_and(is_noop_or_cached_result_text)
-    }
-
-    /// Structured no-op/cache classification for current journal records.
-    /// Prefer this for new analytics. `is_noop_or_cached_result` keeps the
-    /// legacy text fallback for old local journals.
-    pub fn is_structured_noop_or_cached_result(&self) -> bool {
         self.result_class.as_deref() == Some(NOOP_OR_CACHED_RESULT_CLASS)
-            || matches!(
-                self.error.as_deref(),
-                Some("cached_cross_turn" | "duplicate_within_turn")
-            )
             || self.surgically_removed == Some(true)
             || self.skill_reentry_count.is_some()
             || self.skill_locked_out == Some(true)
     }
-}
-
-/// Classify a journal entry as a cache-hit / dedup stub rather than fresh
-/// evidence.
-///
-/// All emit sites bracket these markers at the start of the string
-/// (`[cached_cross_turn:`, `[Same read_file request…`, `[File already fully
-/// read…`, `[File unchanged since the earlier read…`, `Cached repeat skipped…`,
-/// `Repeated cached read skipped…`). We therefore anchor on the leading
-/// prefix instead of doing loose `contains()` over the whole payload: a tool
-/// that legitimately prints "I already read the file, refer to the docs" must
-/// not be misclassified as a cache no-op.
-fn is_noop_or_cached_result_text(text: &str) -> bool {
-    const ANCHORED_PREFIXES: &[&str] = &[
-        "[cached_cross_turn:",
-        "[Same read_file request",
-        "[File already fully read",
-        "[File unchanged since the earlier read",
-        "Cached repeat skipped",
-        "Duplicate call skipped",
-        "Repeated cached read skipped",
-        "⛔ Cached repeat",
-        "⛔ Repeated cached read suppressed",
-    ];
-
-    let trimmed = text.trim_start();
-    if ANCHORED_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
-        return true;
-    }
-
-    // `error:` is a short status code, not free-form prose, so exact match is
-    // both sufficient and immune to payload drift.
-    matches!(trimmed, "cached_cross_turn" | "duplicate_within_turn")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1209,6 +1132,14 @@ fn normalize_tool_call_records(records: Vec<ToolCallRecord>) -> Vec<ToolCallReco
             Some(record)
         })
         .collect()
+}
+
+fn material_tool_call_count(records: &[ToolCallRecord]) -> u32 {
+    let count = records
+        .iter()
+        .filter(|record| !record.is_synthetic_placeholder())
+        .count();
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 #[inline]
@@ -3988,8 +3919,11 @@ impl JournalEvent {
     /// Attach per-tool-call audit records to a turn event.
     pub fn with_tool_calls(mut self, records: Vec<ToolCallRecord>) -> Self {
         let records = normalize_tool_call_records(records);
+        self.tool_count = Some(material_tool_call_count(&records));
         if !records.is_empty() {
             self.tool_calls = Some(records);
+        } else {
+            self.tool_calls = None;
         }
         self
     }
@@ -4070,7 +4004,7 @@ impl JournalEvent {
     /// TurnGuard verdict event — records unified non-happy-path decisions.
     ///
     /// Only emitted for non-Healthy verdicts (Info, Warning, Critical).
-    /// Captures severity, injected messages, avoided tools, and force_stop.
+    /// Captures severity, injected messages, avoided tools, and advisory_threshold_reached.
     fn turn_guard_avoid_reason_codes(
         avoid_tools: &[String],
         health_avoidance_tools: &[String],
@@ -4141,7 +4075,7 @@ impl JournalEvent {
         injections: &[String],
         avoid_tools: &[String],
         health_avoidance_tools: &[String],
-        force_stop: bool,
+        advisory_threshold_reached: bool,
         nudge_count: usize,
         total_errors: usize,
         total_timeouts: usize,
@@ -4180,7 +4114,7 @@ impl JournalEvent {
             "timeout_dominant_tools": timeout_dominant_tools,
             "avoid_reason_codes": avoid_reason_codes,
             "avoid_reason_summary": avoid_reason_summary,
-            "force_stop": force_stop,
+            "advisory_threshold_reached": advisory_threshold_reached,
             "nudge_count": nudge_count,
             "total_errors": total_errors,
             "non_timeout_errors": non_timeout_errors,
@@ -6358,6 +6292,35 @@ mod tests {
     }
 
     #[test]
+    fn with_tool_calls_derives_tool_count_from_material_normalized_records() {
+        let evt = JournalEvent::turn(Some("s1"), 1, None, "hi", "hello", 99, 10, 5, 50)
+            .with_tool_calls(vec![
+                base_tool_record(" bash ", true, Some("ok")),
+                ToolCallRecord {
+                    name: "skill".into(),
+                    ok: true,
+                    ms: 1,
+                    surgically_removed: Some(true),
+                    ..Default::default()
+                },
+                ToolCallRecord {
+                    name: " ".into(),
+                    ok: true,
+                    ms: 1,
+                    ..Default::default()
+                },
+            ]);
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.tool_count, Some(1));
+        let calls = parsed.tool_calls.expect("audit records should be retained");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[1].surgically_removed, Some(true));
+    }
+
+    #[test]
     fn resolve_session_id_accepts_exact_match() {
         let sessions = vec![
             "abc12345-0000-0000-0000-000000000000".to_string(),
@@ -6437,7 +6400,7 @@ mod tests {
             meta["avoid_reason_summary"],
             "health avoidance tools: bash; 2 non-timeout failure(s) recorded; 1 stall/divergence nudge(s) issued"
         );
-        assert_eq!(meta["force_stop"], false);
+        assert_eq!(meta["advisory_threshold_reached"], false);
         assert_eq!(meta["nudge_count"], 1);
         assert_eq!(meta["total_errors"], 2);
         assert_eq!(meta["non_timeout_errors"], 2);
@@ -6448,7 +6411,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_guard_verdict_critical_force_stop() {
+    fn turn_guard_verdict_critical_advisory_threshold_reached() {
         let evt = JournalEvent::turn_guard_verdict(
             Some("sess-1"),
             5,
@@ -6471,7 +6434,7 @@ mod tests {
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         let meta = parsed.metadata.unwrap();
         assert_eq!(meta["severity"], "critical");
-        assert_eq!(meta["force_stop"], true);
+        assert_eq!(meta["advisory_threshold_reached"], true);
         assert_eq!(meta["injections"], 2);
         assert_eq!(meta["nudge_count"], 3);
         assert_eq!(meta["non_timeout_errors"], 3);
@@ -6511,7 +6474,7 @@ mod tests {
         let meta = parsed.metadata.unwrap();
         assert_eq!(meta["injections"], 0);
         assert!(meta["injection_preview"].is_null());
-        assert_eq!(meta["force_stop"], false);
+        assert_eq!(meta["advisory_threshold_reached"], false);
         assert_eq!(meta["non_timeout_errors"], 1);
         assert_eq!(meta["avoid_tools_count"], 0);
     }
@@ -7345,7 +7308,7 @@ mod tests {
             assert_eq!(meta["avoid_tools"][0], "bash");
             assert_eq!(meta["avoid_tools_count"], 1);
             assert_eq!(meta["health_avoidance_tools"][0], "bash");
-            assert_eq!(meta["force_stop"], false);
+            assert_eq!(meta["advisory_threshold_reached"], false);
             assert_eq!(meta["nudge_count"], 1);
             assert_eq!(meta["total_errors"], 2);
             assert_eq!(meta["non_timeout_errors"], 2);
@@ -7355,7 +7318,7 @@ mod tests {
             assert_eq!(meta["flaky_tools"], 0);
         }
 
-        // ── turn_guard_verdict: critical force_stop ──
+        // ── turn_guard_verdict: critical advisory_threshold_reached ──
         {
             let evt = JournalEvent::turn_guard_verdict(
                 Some("sess-1"),
@@ -7379,7 +7342,7 @@ mod tests {
             let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
             let meta = parsed.metadata.unwrap();
             assert_eq!(meta["severity"], "critical");
-            assert_eq!(meta["force_stop"], true);
+            assert_eq!(meta["advisory_threshold_reached"], true);
             assert_eq!(meta["injections"], 2);
             assert_eq!(meta["nudge_count"], 3);
             assert_eq!(meta["non_timeout_errors"], 3);
@@ -7418,7 +7381,7 @@ mod tests {
             let meta = parsed.metadata.unwrap();
             assert_eq!(meta["injections"], 0);
             assert!(meta["injection_preview"].is_null());
-            assert_eq!(meta["force_stop"], false);
+            assert_eq!(meta["advisory_threshold_reached"], false);
             assert_eq!(meta["non_timeout_errors"], 1);
             assert_eq!(meta["avoid_tools_count"], 0);
         }
@@ -7880,11 +7843,22 @@ mod tests {
                 original_tool_name: None,
                 ..Default::default()
             };
-            assert!(skipped.is_synthetic_placeholder());
-            assert!(deferred.is_synthetic_placeholder());
-            assert!(dedup.is_synthetic_placeholder());
-            assert!(invalid_delegate.is_synthetic_placeholder());
+            assert!(!skipped.is_synthetic_placeholder());
+            assert!(!deferred.is_synthetic_placeholder());
+            assert!(!dedup.is_synthetic_placeholder());
+            assert!(!invalid_delegate.is_synthetic_placeholder());
             assert!(!actual_failure.is_synthetic_placeholder());
+            assert!(
+                ToolCallRecord {
+                    name: "read_file".into(),
+                    ok: true,
+                    ms: 0,
+                    result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
+                    ..Default::default()
+                }
+                .is_synthetic_placeholder(),
+                "synthetic placeholder classification must come from structured fields"
+            );
         }
 
         // ── is_synthetic_placeholder ── all patterns
@@ -7899,12 +7873,14 @@ mod tests {
                 "sentinel name alone must not be treated as a supported synthetic marker"
             );
             assert!(
-                base_tool_record("read_file", false, Some("Skipped: skill routed"))
-                    .is_synthetic_placeholder()
+                !base_tool_record("read_file", false, Some("Skipped: skill routed"))
+                    .is_synthetic_placeholder(),
+                "human-readable skipped text must not classify infrastructure state"
             );
             assert!(
-                base_tool_record("read_file", false, Some("Deferred: skill invoked"))
-                    .is_synthetic_placeholder()
+                !base_tool_record("read_file", false, Some("Deferred: skill invoked"))
+                    .is_synthetic_placeholder(),
+                "human-readable deferred text must not classify infrastructure state"
             );
             let deferred_protocol_failure = ToolCallRecord {
                 name: "agent_fanout".into(),
@@ -7922,12 +7898,13 @@ mod tests {
                 "not-admitted deferred calls are protocol failures, not synthetic placeholders"
             );
             assert!(
-                base_tool_record(
+                !base_tool_record(
                     "skill",
                     true,
                     Some("Skill 'debug' was already loaded (turn 2). Follow those instructions.")
                 )
-                .is_synthetic_placeholder()
+                .is_synthetic_placeholder(),
+                "human-readable skill reentry text must not classify infrastructure state"
             );
             assert!(!base_tool_record("git", true, Some("diff")).is_synthetic_placeholder());
             assert!(
@@ -7956,6 +7933,7 @@ mod tests {
             assert!(ToolCallRecord {
                 name: "read_file".to_string(), ok: false,
                 error: Some("blocked_tool: Tool 'read_file' is currently restricted and cannot be executed.".into()),
+                result_class: Some(BLOCKED_TOOL_RESULT_CLASS.to_string()),
                 ..Default::default()
             }.was_blocked_by_policy());
             assert!(
@@ -7987,17 +7965,18 @@ mod tests {
                     result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
                     ..Default::default()
                 }
-                .is_structured_noop_or_cached_result()
+                .is_noop_or_cached_result()
             );
             assert!(
-                ToolCallRecord {
+                !ToolCallRecord {
                     name: "read_file".to_string(),
                     ok: true,
                     error: Some("cached_cross_turn".into()),
                     result_preview: Some("[cached_cross_turn: reused 200 bytes]".into()),
                     ..Default::default()
                 }
-                .is_noop_or_cached_result()
+                .is_noop_or_cached_result(),
+                "error/result text alone must not drive infrastructure classification"
             );
             assert!(
                 !(ToolCallRecord {
@@ -8006,25 +7985,27 @@ mod tests {
                     error: Some("unknown_tool: nope".to_string()),
                     ..Default::default()
                 }
-                .is_structured_noop_or_cached_result())
+                .is_noop_or_cached_result())
             );
             assert!(
-                base_tool_record(
+                !base_tool_record(
                     "read_file",
                     true,
                     Some(
                         "[File already fully read earlier in this turn and unchanged — refer to the earlier read_file result]"
                     )
                 )
-                .is_noop_or_cached_result()
+                .is_noop_or_cached_result(),
+                "human-readable result text must not drive infrastructure classification"
             );
             assert!(
-                base_tool_record(
+                !base_tool_record(
                     "bash",
                     false,
                     Some("Cached repeat skipped (call #3 for identical args, limit: 2).")
                 )
-                .is_noop_or_cached_result()
+                .is_noop_or_cached_result(),
+                "human-readable error text must not drive infrastructure classification"
             );
             assert!(
                 !base_tool_record("read_file", true, Some("fn main() {}"))

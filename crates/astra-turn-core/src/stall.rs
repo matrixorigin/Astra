@@ -23,23 +23,21 @@ pub enum StallDetectionError {
 pub const SERVER_STALL_WINDOW: usize = 3;
 
 /// When this many consecutive rounds emit the exact same tool-call
-/// signature, the agent is stuck in a hard loop — no amount of additional
-/// soft nudges is going to unstick it. Past this threshold we flip
-/// `force_stop` on the next verdict so the dispatcher terminates the turn
-/// with a clear reason.
+/// signature, the pattern is worth surfacing as advisory evidence. Repetition
+/// alone does not prove that the next call is invalid or that the turn should
+/// stop; actual resource ceilings remain separate.
 ///
 /// Session 05e63cac t10 observed four identical `cargo clippy` calls
 /// (r0-r3) and later three identical `git status` calls (r43/47/48)
 /// followed by `echo ok` twice; the existing 3-nudge-limit ran out at
 /// round ~3 and the loop kept burning tool rounds until
-/// `token_budget_exceeded`. Hard-stop at >= 5 catches the pathology
-/// well past the nudge quota while leaving room for legitimate
-/// exponential-backoff retry patterns.
-pub const CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP: usize = 5;
+/// `token_budget_exceeded`. Emitting at >= 5 catches the pattern well past the
+/// nudge quota while leaving room for legitimate exponential-backoff retries.
+pub const CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD: usize = 5;
 
 /// Count how many of the most recent `turn_sigs` entries share the same
 /// full `name+args` signature set. Used to decide whether we've crossed
-/// the [`CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP`] threshold.
+/// the [`CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD`] threshold.
 #[must_use]
 pub fn trailing_identical_sig_depth(turn_sigs: &[BTreeSet<String>]) -> usize {
     let Some(last) = turn_sigs.last() else {

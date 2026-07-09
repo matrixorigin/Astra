@@ -788,6 +788,8 @@ pub struct SkillCallResult {
 pub struct InterceptedToolResult {
     pub tool_call_id: String,
     pub tool_name: String,
+    pub ok: bool,
+    pub result_class: Option<String>,
     pub result: String,
 }
 
@@ -840,7 +842,7 @@ pub async fn partition_discover_and_execute_skills(
 
         let args = extract_tool_args(&tc);
 
-        let result = match args {
+        let (result, ok) = match args {
             Some(args) => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                 let (text, discovered) = execute_discover_skills(query, catalog, excluded.clone());
@@ -855,9 +857,12 @@ pub async fn partition_discover_and_execute_skills(
                         }
                     }
                 }
-                text
+                (text, true)
             }
-            None => "Invalid discover_skills arguments: expected object or JSON string".to_string(),
+            None => (
+                "Invalid discover_skills arguments: expected object or JSON string".to_string(),
+                false,
+            ),
         };
 
         combined_results.push(InterceptedToolResult {
@@ -868,6 +873,8 @@ pub async fn partition_discover_and_execute_skills(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            ok,
+            result_class: None,
             result,
         });
     }
@@ -1002,12 +1009,16 @@ pub async fn partition_and_execute_skills(
                 InterceptedToolResult {
                     tool_call_id: call_id,
                     tool_name,
+                    ok: effective_success,
+                    result_class: None,
                     result,
                 }
             }
             None => InterceptedToolResult {
                 tool_call_id: call_id,
                 tool_name,
+                ok: false,
+                result_class: None,
                 result: "Invalid skill arguments: expected object or JSON string".to_string(),
             },
         };

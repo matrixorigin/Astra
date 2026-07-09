@@ -305,7 +305,7 @@ fn tool_call_stats(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> Tool
             stats.fail += 1;
         } else {
             stats.ok += 1;
-            if c.is_structured_noop_or_cached_result() {
+            if c.is_noop_or_cached_result() {
                 stats.noop_or_cached += 1;
             } else {
                 stats.fresh += 1;
@@ -1745,10 +1745,8 @@ mod tests {
 
     #[test]
     fn digest_does_not_flag_cross_turn_cache_hits_as_failures() {
-        // Regression guard for session 6d6c1041: cross-turn cache
-        // hits are recorded with `error: "cached_cross_turn"` (an
-        // info tag, not a failure) + a non-empty
-        // `result_preview` starting with "[cached_cross_turn:".
+        // Cross-turn cache hits are recorded with a structured no-op/cache
+        // result class. `result_preview` is human-readable only.
         // Earlier versions with `result_preview: None` mis-reported
         // the tool as having returned an empty body and the LLM
         // hallucinated a `{}`-return bug. Pin both invariants:
@@ -1768,7 +1766,7 @@ mod tests {
         let sid = "test-cachehit-00000000-0000-0000-0000-0000000000aa";
         fs::write(
             journal_path_for_test(sid),
-            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":0,"error":"cached_cross_turn","output_bytes":2000,"result_preview":"[cached_cross_turn: reused 2000 bytes]","args_preview":"src/lib.rs"},{"name":"bash","ok":true,"ms":5,"result_preview":"ok"}]}"#,
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":0,"error":"cached_cross_turn","output_bytes":2000,"result_preview":"[cached_cross_turn: reused 2000 bytes]","result_class":"noop_or_cached","args_preview":"src/lib.rs"},{"name":"bash","ok":true,"ms":5,"result_preview":"ok"}]}"#,
         )
         .expect("write journal");
 

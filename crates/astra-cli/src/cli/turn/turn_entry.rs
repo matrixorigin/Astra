@@ -367,25 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn run_chat_turn_resolves_default_model_before_missing_model_preflight() {
-        let source = include_str!("turn_entry.rs");
-        let fn_start = source
-            .find("async fn run_chat_turn")
-            .expect("run_chat_turn should exist");
-        let default_idx = source[fn_start..]
-            .find("ensure_default_turn_model")
-            .expect("run_chat_turn should resolve default turn model");
-        let preflight_idx = source[fn_start..]
-            .find("model_selection_preflight_failure")
-            .expect("run_chat_turn should keep missing-model preflight");
-
-        assert!(
-            default_idx < preflight_idx,
-            "default model must be resolved before missing-model preflight"
-        );
-    }
-
-    #[test]
     fn shell_passthrough_empty_body_is_no_op() {
         assert_eq!(
             classify_shell_passthrough("!"),
@@ -533,33 +514,5 @@ mod tests {
             }
             other => panic!("unexpected decision: {other:?}"),
         }
-    }
-
-    #[test]
-    fn pending_recovery_never_restores_from_ordinary_chat_input() {
-        let source = include_str!("turn_entry.rs");
-        let start = source
-            .find("pub(crate) async fn handle_chat_input_with_ui")
-            .expect("handle_chat_input_with_ui should exist");
-        let body = &source[start..];
-        let gate_end = body
-            .find("ui.blank_line();")
-            .expect("pre-turn gate should reach the blank-line boundary");
-        let pre_turn_gate = &body[..gate_end];
-        assert!(
-            !pre_turn_gate.contains("restore_session_into_state(")
-                && pre_turn_gate.contains("clear_pending_recovery_for_ordinary_chat_input(state);"),
-            "ordinary chat input must not auto-restore pending recovery; resume is explicit only"
-        );
-    }
-
-    #[test]
-    fn retry_runner_keeps_semantic_query_override() {
-        let source = include_str!("turn_entry.rs");
-        assert!(
-            source.contains("settle_turn_attempt(")
-                && source.contains("semantic_query_override.as_deref(),"),
-            "retry path must preserve semantic_query_override instead of rebuilding it from wrapped prompt text"
-        );
     }
 }

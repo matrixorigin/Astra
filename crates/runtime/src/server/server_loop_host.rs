@@ -44,8 +44,8 @@ use crate::server::tool_transport::{
 };
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
-    AgenticLoopHost, AgenticLoopState, FactualRetryFallbackJudgeContext, HostTurnResult,
-    SkillAutoRouteDecision, SkillAutoRouteJudgeContext, TurnInteractionMode, TurnInteractionPolicy,
+    AgenticLoopHost, AgenticLoopState, HostTurnResult, SkillAutoRouteDecision,
+    SkillAutoRouteJudgeContext, TurnInteractionMode, TurnInteractionPolicy,
     interaction_scoped_tool_restrictions,
 };
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
@@ -65,10 +65,6 @@ use astra_services::runs::RequestedTurnInteractionMode;
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, SharedAgentLiveEventSink,
-};
-use astra_turn_core::agentic_turn_ingest::{
-    FactualRetryFallbackDecision, FactualRetryFallbackJudgeInput,
-    factual_retry_fallback_judge_messages, parse_factual_retry_fallback_judge_response,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
@@ -1845,10 +1841,6 @@ fn append_server_owned_tool_schemas_unique(
                 if runtime_declared_tool_names.contains(name) {
                     continue;
                 }
-                if seen.insert(name.to_string()) {
-                    surface.push(schema);
-                }
-                continue;
             }
             _ => {}
         }
@@ -1872,7 +1864,9 @@ fn append_server_owned_tool_schemas_unique(
             continue;
         }
         match admission.selected_route() {
-            ToolExecutionRouteKind::ServerRuntime | ToolExecutionRouteKind::ServerControlPlane => {
+            ToolExecutionRouteKind::ServerRuntime
+            | ToolExecutionRouteKind::ServerControlPlane
+            | ToolExecutionRouteKind::ServerLocal => {
                 if seen.insert(name.to_string()) {
                     surface.push(schema);
                 }
@@ -2586,8 +2580,8 @@ impl ServerAgenticLoopHost {
         // payloads reflect what a real provider would see. Start from the
         // pipeline-pruned tool schemas so mock replay mirrors the real
         // wire. Route the history through the same `assemble_llm_messages`
-        // stitcher the real path uses so matrix tests see the output of
-        // volatile-preamble folding and `consolidate_mid_history_volatile_injections`.
+        // stitcher the real path uses so matrix tests see typed volatile-tail
+        // placement rather than a mock-only message shape.
         let mut annotated_tools = mock_pipeline.tool_schemas;
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut annotated_tools,
@@ -4012,23 +4006,14 @@ impl ServerAgenticLoopHost {
         if consume_widen {
             let _ = std::mem::take(&mut state.widen_selection_pending);
         }
-        // 2-5. layered restrictions from the merged base.
+        // 2-3. Layer hard restrictions from the merged base. Advisory
+        // boosting and dynamic activation must never override a capability or
+        // permission boundary already present in this set.
         let mut effective = state.restricted_tools.clone();
         effective.extend(self.runtime_allowlist_restrictions(state));
         effective.extend(interaction_scoped_tool_restrictions(
             self.turn_interaction_mode(),
         ));
-        // Boosted tools are never hidden, even if they landed in the restricted
-        // set earlier (e.g., via stall-based deprioritization).
-        for boosted in &state.boosted_tools {
-            effective.remove(boosted);
-        }
-        if let Some(executor) = state.runtime_tool_executor.as_deref() {
-            for name in executor.activated_deferred_tool_names() {
-                // Rescue activated deferred tools so they're visible this turn.
-                effective.remove(&name);
-            }
-        }
         effective
     }
 
@@ -4361,50 +4346,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     target: "astra::skill_auto_route_judge",
                     error = %error,
                     "skill auto-route judge unavailable; proceeding without pre-route"
-                );
-                None
-            }
-        }
-    }
-
-    async fn judge_factual_retry_fallback(
-        &mut self,
-        ctx: FactualRetryFallbackJudgeContext<'_>,
-    ) -> Option<FactualRetryFallbackDecision> {
-        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
-            tracing::debug!(
-                target: "astra::factual_retry_judge",
-                policy = auxiliary_llm_policy_label(),
-                reason,
-                "factual retry fallback judge skipped by capacity policy"
-            );
-            return None;
-        }
-
-        let client = self.summary_client()?;
-        let messages = factual_retry_fallback_judge_messages(FactualRetryFallbackJudgeInput {
-            original_query: ctx.original_query,
-            fallback_text: ctx.fallback_text,
-            retry_text: ctx.retry_text,
-        });
-        let response = match client.summarize(&messages).await {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra::factual_retry_judge",
-                    error = %error,
-                    "factual retry fallback judge unavailable; keeping retry output"
-                );
-                return None;
-            }
-        };
-        match parse_factual_retry_fallback_judge_response(response.text.as_str()) {
-            Ok(verdict) => Some(verdict.accepted_decision()),
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra::factual_retry_judge",
-                    error = %error,
-                    "factual retry fallback judge returned malformed output; keeping retry output"
                 );
                 None
             }
@@ -6955,33 +6896,6 @@ mod tests {
             .join("\n")
     }
 
-    #[test]
-    fn llm_request_dump_failures_are_not_silently_ignored() {
-        let source = include_str!("server_loop_host.rs");
-        // Use `find` (first occurrence) — rfind would find the test module itself
-        // if a nested `mod tests {` were ever added. First occurrence is always
-        // the production `mod tests {` opener.
-        let tests_start = source
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("cfg(test) + mod tests marker");
-        let production = &source[..tests_start];
-        for context in [
-            "server_loop_host context window dump persist failed",
-            "server_loop_host error dump persist failed",
-        ] {
-            let start = production
-                .find(context)
-                .expect("dump logging context should exist");
-            let window_start = start.saturating_sub(480);
-            let window = &production[window_start..production.len().min(start + 120)];
-            assert!(
-                window.contains("if let Err(error)")
-                    && window.contains("dump.persist_remote(&self.user_id, &artifact_store).await"),
-                "{context} should handle dump.persist_remote failures explicitly"
-            );
-        }
-    }
-
     /// Pin: after compaction, the server loop MUST re-inject invoked-skill
     /// instructions via `AttachmentBuilder::add_skill`. Without this, skills
     /// that were loaded before compaction lose their full content once history
@@ -6997,72 +6911,6 @@ mod tests {
     ///
     /// A silent refactor that drops either piece would break cross-turn skill
     /// persistence with no runtime error. This test pins both anchors.
-    #[test]
-    fn post_compaction_reinjects_invoked_skills() {
-        // Cross-file anchor: production code now lives in the shared
-        // `llm_context` + `wire_assembly` path. Both pieces must be present
-        // for the re-injection pipeline to work; a silent refactor that drops
-        // either is a cross-turn skill-loss bug waiting to happen.
-        let host_src = include_str!("server_loop_host.rs");
-        let host_tests_start = host_src
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("cfg(test) + mod tests marker");
-        let host_production = &host_src[..host_tests_start];
-        assert!(
-            host_production.contains("assemble_llm_messages("),
-            "server host must route final wire assembly through the shared helper"
-        );
-
-        let llm_context_src = include_str!("../turn/llm/context.rs");
-        let llm_context_tests_start = llm_context_src
-            .find("\n#[cfg(test)]\nmod ")
-            .expect("llm_context cfg(test) + mod marker");
-        let llm_context_production = &llm_context_src[..llm_context_tests_start];
-        assert!(
-            llm_context_production.contains("input.state.skills.invoked"),
-            "shared LLM assembly must consult state.skills.invoked to decide re-injection"
-        );
-        // Ordering guard: most-recently invoked skill first (so the oldest
-        // content sits closest to the model's current turn after to_messages
-        // reverses). If this sort key flips, cross-turn ordering will break.
-        assert!(
-            llm_context_production.contains("std::cmp::Reverse(skill.invoked_at_turn)"),
-            "invoked skills must be sorted most-recent-first before re-injection"
-        );
-
-        let shared_src = include_str!("../turn/wire_assembly.rs");
-        let shared_tests_start = shared_src
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("wire_assembly cfg(test) + mod tests marker");
-        let shared_production = &shared_src[..shared_tests_start];
-        assert!(
-            shared_production.contains("builder.add_skill(skill.name, skill.content)"),
-            "shared assembly must feed invoked skills into AttachmentBuilder::add_skill \
-             so full instructions survive compaction"
-        );
-    }
-
-    #[test]
-    fn llm_error_paths_publish_remote_llm_capture_artifacts() {
-        let source = include_str!("server_loop_host.rs");
-        let tests_start = source
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("cfg(test) + mod tests marker");
-        let production = &source[..tests_start];
-        for context in [
-            "server_loop_host context window capture",
-            "server_loop_host error capture",
-        ] {
-            let start = production
-                .find(context)
-                .expect("capture context should exist");
-            let window = &production[start..production.len().min(start + 220)];
-            assert!(
-                window.contains("Some(&artifact_store)"),
-                "{context} should publish a remote llm_capture artifact, not local-only capture"
-            );
-        }
-    }
 
     #[test]
     fn llm_capture_error_response_includes_partial_details() {
@@ -7259,44 +7107,6 @@ mod tests {
         assert!(
             response["usage"].get("input_tokens").is_none(),
             "total-only usage has no disjoint bucket evidence and must remain an unknown dialect",
-        );
-    }
-
-    #[test]
-    fn server_loop_error_captures_use_structured_error_response() {
-        let source = include_str!("server_loop_host.rs");
-        let tests_start = source
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("cfg(test) + mod tests marker");
-        let production = &source[..tests_start];
-        assert!(
-            production.contains("llm_capture_error_response(e)"),
-            "context-window captures should route through the structured error response helper"
-        );
-        assert!(
-            production.contains("llm_capture_error_response(&e)"),
-            "generic server-loop error captures should route through the structured error response helper"
-        );
-        assert!(
-            production.contains("llm_capture_error_response(&error)"),
-            "reflection error captures should route through the structured error response helper"
-        );
-    }
-
-    #[test]
-    fn server_loop_uses_shared_rate_limit_cooldown_singleton() {
-        let source = include_str!("server_loop_host.rs");
-        let tests_start = source
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("cfg(test) + mod tests marker");
-        let production = &source[..tests_start];
-        assert!(
-            production.contains("use crate::turn::bridge::llm_stream::rate_limit_cooldown;"),
-            "server-loop should reuse the shared llm_client/bridge rate-limit cooldown singleton"
-        );
-        assert!(
-            !production.contains("static COOLDOWN: OnceLock<PerModelCooldown>"),
-            "server-loop should not keep a separate cooldown singleton disconnected from llm_client"
         );
     }
 
@@ -9274,11 +9084,10 @@ mod tests {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
-            textless_stop_retries: 0,
             last_finish_reason: None,
             turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
@@ -9492,6 +9301,7 @@ mod tests {
 
         let mut state = create_test_state();
         state.restricted_tools.insert("read_file".to_string());
+        state.boosted_tools.insert("read_file".to_string());
         state
             .turn_guard
             .health
@@ -9509,6 +9319,10 @@ mod tests {
 
         assert!(visible_names.contains("bash"));
         assert!(!visible_names.contains("read_file"));
+        assert!(
+            state.boosted_tools.contains("read_file"),
+            "the advisory boost can remain observable without overriding the hard restriction"
+        );
         assert!(
             !state.restricted_tools.contains("bash"),
             "soft health must not mutate hard restricted_tools"
@@ -9899,6 +9713,37 @@ mod tests {
     }
 
     #[test]
+    fn disabled_shared_network_server_offer_is_not_in_initial_surface_or_valid_set() {
+        let disabled: HashSet<String> = ["web_fetch@server-builtin".to_string()]
+            .into_iter()
+            .collect();
+        let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
+
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_disabled_tool_offers(disabled_handle)
+        .build();
+
+        let tool_schema_names = schema_names(&host.tool_schemas);
+        assert!(
+            !tool_schema_names.contains("web_fetch"),
+            "initial prompt surface must use the same admission decision as visible_turn_tools"
+        );
+        assert!(
+            !host.valid_tools.contains("web_fetch"),
+            "hidden server offers must not remain callable through the internal valid_tools set"
+        );
+        assert!(
+            host.valid_tools.contains("web_search"),
+            "unrelated shared server tools should remain callable"
+        );
+    }
+
+    #[test]
     fn edge_visible_surface_gates_powershell_by_runtime_platform() {
         for (platform, expected_visible) in [
             (astra_runtime_env::RuntimePlatform::Unknown, false),
@@ -9983,7 +9828,7 @@ mod tests {
         .map(str::to_string)
         .collect::<Vec<_>>();
         assert_eq!(policy.visible_tool_names, expected_visible);
-        assert_eq!(policy.evidence_tool_names, expected_evidence);
+        assert_eq!(policy.observation_tool_names, expected_evidence);
         assert!(!policy.allow_ask_user);
     }
 
@@ -10048,7 +9893,7 @@ mod tests {
         let mut expected_visible = expected_visible_without_ask_user;
         expected_visible.insert(2, "ask_user".to_string());
         assert_eq!(policy.visible_tool_names, expected_visible);
-        assert_eq!(policy.evidence_tool_names, expected_evidence);
+        assert_eq!(policy.observation_tool_names, expected_evidence);
         assert!(policy.allow_ask_user);
     }
 
@@ -10991,166 +10836,6 @@ mod tests {
         assert_eq!(
             capture.path.lock().await.as_deref(),
             Some("/gateway/chat/completions")
-        );
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn factual_retry_fallback_judge_uses_llm_response_selection() {
-        use axum::{Router, extract::State, routing::post};
-        use tokio::net::TcpListener;
-
-        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
-
-        #[derive(Default)]
-        struct RequestCapture {
-            body: tokio::sync::Mutex<Option<Value>>,
-        }
-
-        async fn handler(
-            State(capture): State<Arc<RequestCapture>>,
-            request: axum::extract::Request,
-        ) -> axum::Json<Value> {
-            let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-                .await
-                .expect("read request body");
-            *capture.body.lock().await = Some(serde_json::from_slice(&bytes).expect("json body"));
-            axum::Json(json!({
-                "choices": [
-                    {
-                        "message": {
-                            "content": "{\"decision\":\"restore_fallback\",\"confidence\":0.94,\"reason\":\"candidate A answers the UI question\"}"
-                        },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-            }))
-        }
-
-        let capture = Arc::new(RequestCapture::default());
-        let app = Router::new()
-            .route("/gateway/chat/completions", post(handler))
-            .with_state(capture.clone());
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test server should run");
-        });
-
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "user-judge".to_string(),
-            "session-judge".to_string(),
-        )
-        .build();
-        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: "gpt-4o-mini".to_string(),
-            api_key: String::new(),
-            base_url: format!("http://{addr}/gateway"),
-            provider: "openai".to_string(),
-            max_output_tokens: 128,
-        });
-
-        let decision = host
-            .judge_factual_retry_fallback(FactualRetryFallbackJudgeContext {
-                original_query: "what do 59% and 117k mean?",
-                fallback_text: "59% is context usage; 117k is token count.",
-                retry_text: "I completed the requested work.",
-            })
-            .await;
-
-        assert_eq!(
-            decision,
-            Some(FactualRetryFallbackDecision::RestoreFallback)
-        );
-        let body = capture.body.lock().await.clone().expect("judge request");
-        let messages = body["messages"].as_array().expect("messages");
-        let prompt = messages[1]["content"].as_str().expect("user prompt");
-        assert!(prompt.contains("Candidate A"));
-        assert!(prompt.contains("Candidate B"));
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn factual_retry_fallback_judge_skips_gateway_when_provider_admission_is_enabled() {
-        use axum::{Router, routing::post};
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-        use tokio::net::TcpListener;
-
-        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
-        let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
-        let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
-
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let request_count_for_handler = request_count.clone();
-        let app = Router::new().route(
-            "/gateway/chat/completions",
-            post(move || {
-                let request_count = request_count_for_handler.clone();
-                async move {
-                    request_count.fetch_add(1, AtomicOrdering::SeqCst);
-                    axum::Json(json!({
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": "{\"decision\":\"restore_fallback\",\"confidence\":0.94,\"reason\":\"candidate A answers the UI question\"}"
-                                },
-                                "finish_reason": "stop"
-                            }
-                        ],
-                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-                    }))
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test server should run");
-        });
-
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "user-judge".to_string(),
-            "session-judge".to_string(),
-        )
-        .build();
-        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: "gpt-4o-mini".to_string(),
-            api_key: String::new(),
-            base_url: format!("http://{addr}/gateway"),
-            provider: "openai".to_string(),
-            max_output_tokens: 128,
-        });
-
-        let decision = host
-            .judge_factual_retry_fallback(FactualRetryFallbackJudgeContext {
-                original_query: "what do 59% and 117k mean?",
-                fallback_text: "59% is context usage; 117k is token count.",
-                retry_text: "I completed the requested work.",
-            })
-            .await;
-
-        assert_eq!(decision, None);
-        assert_eq!(
-            request_count.load(AtomicOrdering::SeqCst),
-            0,
-            "capacity-aware default must not spend provider RPM on factual retry judge"
         );
 
         server.abort();

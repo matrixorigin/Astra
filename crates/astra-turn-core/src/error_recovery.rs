@@ -123,18 +123,20 @@ pub fn build_recovery_message(
     avoidance_advised: &[&str],
 ) -> String {
     let alternatives = suggest_alternatives(tool_name, avoidance_advised);
-    let error_lower = error_str.to_lowercase();
-    let ask_user_shape_error = tool_name == "ask_user"
-        && (matches!(
+    let ask_user_invalid_args = tool_name == "ask_user"
+        && matches!(
             category,
             ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest
-        ) || error_lower.contains("ask_user input is invalid")
-            || error_lower.contains("top-level 'questions'")
-            || error_lower.contains("'questions' must be an array"));
-    let write_file_missing_args = tool_name == "write_file"
-        && category == ErrorCategory::ToolInvalidArgs
-        && (error_lower.contains("missing 'path' parameter")
-            || error_lower.contains("missing 'content' parameter"));
+        );
+    let write_file_invalid_args =
+        tool_name == "write_file" && category == ErrorCategory::ToolInvalidArgs;
+    let file_edit_invalid_args = matches!(
+        tool_name,
+        "write_file" | "str_replace" | "multi_edit" | "apply_patch"
+    ) && matches!(
+        category,
+        ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest
+    );
     let task_board_invalid_args = tool_name == "task_board"
         && matches!(
             category,
@@ -162,12 +164,19 @@ pub fn build_recovery_message(
             tool_name
         ),
         ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest => {
-            if ask_user_shape_error {
+            if ask_user_invalid_args {
                 "⚠ ask_user failed: invalid questionnaire arguments. You chose ask_user because user clarification is required. Retry the SAME ask_user tool immediately with corrected questionnaire args. Do NOT continue implementation, guess defaults, or act as if the user already answered. Use a top-level `questions` array, for example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}.".to_string()
-            } else if write_file_missing_args {
-                "⚠ write_file failed: invalid arguments. Retry the same tool with both `path` and `content` for writes, or `path` + `delete=true` for deletes. Do NOT switch to bash or python just to write or delete this file.".to_string()
+            } else if write_file_invalid_args {
+                "⚠ write_file failed: invalid arguments or workspace safety precondition. Retry the same tool with both `path` and `content` for writes, or `path` + `delete=true` for deletes. For existing files, call read_file on the exact path in this session before editing it. Do NOT switch to bash or python just to write or delete this file.".to_string()
             } else if task_board_invalid_args {
                 astra_tools::task_tool_contract::task_invalid_args_recovery_message()
+            } else if file_edit_invalid_args {
+                format!(
+                    "⚠ {} failed: invalid file-edit arguments or workspace safety precondition. \
+                     Retry the same tool with the required structured arguments. For existing files, call read_file on the exact path in this session before editing it. \
+                     Do NOT switch to bash or python just to edit files.",
+                    tool_name
+                )
             } else {
                 format!(
                     "⚠ {} failed: invalid arguments. \
@@ -213,7 +222,7 @@ pub fn build_recovery_message(
             }
         }
         _ => {
-            if ask_user_shape_error {
+            if ask_user_invalid_args {
                 "⚠ ask_user failed: invalid questionnaire arguments. You chose ask_user because user clarification is required. Retry the SAME ask_user tool immediately with corrected questionnaire args. Do NOT continue implementation, guess defaults, or act as if the user already answered. Use a top-level `questions` array, for example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}.".to_string()
             } else {
                 astra_core::agent_debug!(
@@ -223,50 +232,27 @@ pub fn build_recovery_message(
                     error_str.chars().take(200).collect::<String>()
                 );
                 format!(
-                    "⚠ {} failed with an unexpected error. Check the tool output and adjust; \
-                     enable RUST_LOG=debug for a structured log line.",
+                    "⚠ {} failed with an unclassified tool error. Do NOT retry the identical call. \
+                     Use structured facts first: verify the tool name, required arguments, selected provider/runtime, and workspace preconditions; \
+                     retry only with corrected arguments or switch to a capability-equivalent tool that is visible in the current surface.",
                     tool_name
                 )
             }
         }
     };
 
-    if category == ErrorCategory::ToolInvalidArgs
-        && matches!(
-            tool_name,
-            "write_file" | "str_replace" | "multi_edit" | "apply_patch"
-        )
-        && astra_core::error_kind::is_workspace_read_before_write(&error_lower)
-    {
-        // The check_staleness error already contains the actionable "→ Action required"
-        // line with the concrete file path. Avoid duplicating the guidance — just add
-        // the workspace-safety framing and let the original error speak for itself.
+    if tool_name == "str_replace" && category == ErrorCategory::ToolInvalidArgs {
         msg = format!(
-            "⚠ {} was blocked by workspace safety: the path must be read in this session before you edit it. \
-             For existing files, call read_file on that exact path first (use a full read before write_file overwrite); \
-             if the file changed on disk since your last read, read it again. Then retry.",
-            tool_name
-        );
-    }
-
-    // When str_replace fails because old_str wasn't found, the model MUST re-read
-    // the file before retrying. Blind retries with stale content are the #1 source
-    // of wasted turns in str_replace error recovery (≈80% of failures).
-    if tool_name == "str_replace"
-        && (error_lower.contains("str_replace failed") || error_lower.contains("old_str not found"))
-    {
-        msg = format!(
-            "⚠ {tool_name} failed: old_str not found in the current file content. \
-             The file likely changed since you last read it. \
-             Do NOT retry str_replace with the same old_str. \
-             Immediately call read_file on the target file (use a targeted line range for large files), \
-             copy the exact bytes from the current file, then retry str_replace.",
+            "⚠ {tool_name} failed: invalid replacement arguments or stale file context. \
+             Do NOT retry str_replace with the same arguments. \
+             Call read_file on the target file first (use a targeted line range for large files), \
+             copy the exact current bytes, then retry str_replace.",
         );
     }
 
     if !alternatives.is_empty() {
         const SHELL_TOOLS: &[&str] = &["bash", "powershell"];
-        let filtered: Vec<&str> = if write_file_missing_args {
+        let filtered: Vec<&str> = if write_file_invalid_args {
             // Missing-args errors should steer the model to retry write_file, but legitimate
             // editing alternatives (str_replace, multi_edit) must still be visible.
             // Only suppress shell escalation paths.
@@ -282,13 +268,8 @@ pub fn build_recovery_message(
             msg.push_str(&format!(" Alternatives: [{}].", filtered.join(", ")));
         }
     }
-    if tool_name == "read_file" && error_lower.contains("file is too large") {
-        msg.push_str(
-            " For large files, do NOT switch to bash. Retry read_file with \
-             start_line/end_line for a narrow range, or outline=true to inspect definitions first.",
-        );
-    } else if tool_name == "read_file" && error_lower.contains("is a directory") {
-        msg.push_str(" Use list_dir for directories instead of retrying read_file.");
+    if tool_name == "read_file" && category == ErrorCategory::ResourceLimit {
+        msg.push_str("\n\nThe read target is too large for one call. Use start_line/end_line, a narrower path, or a search tool before reading the full content. do NOT switch to bash just to read it.");
     }
 
     msg
@@ -677,8 +658,8 @@ mod tests {
         // large file guidance
         let msg = build_recovery_message(
             "read_file",
-            "Error: file is too large (97716 bytes). Use start_line/end_line.",
-            ErrorCategory::Unknown,
+            "structured resource limit",
+            ErrorCategory::ResourceLimit,
             &[],
         );
         assert!(msg.contains("do NOT switch to bash"));

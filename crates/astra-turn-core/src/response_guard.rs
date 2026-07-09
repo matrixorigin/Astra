@@ -3,11 +3,14 @@ use crate::tool::args::shape::tool_call_name;
 // ── Fallback messages when guards fire ──────────────────────────────
 /// Replacement text when the LLM leaks the system prompt.
 pub const PROMPT_LEAK_FALLBACK: &str =
-    "I apologize, but I encountered an issue generating that response. Let me try again.";
+    "I can’t provide internal system instructions, but I can still help with the visible request.";
 
-/// Replacement text when the LLM enters a repetition loop.
-pub const REPETITION_LOOP_FALLBACK: &str =
-    "I noticed I was repeating myself. Let me approach this differently.";
+/// Replacement text when an internal control protocol leaks into final output.
+pub const INTERNAL_PROTOCOL_FALLBACK: &str = "An internal control message was generated instead of a user-facing answer. Please restate the request and I will continue from the visible conversation.";
+
+/// Finish reason used when a guarded fallback replaces a child agent's final
+/// text. It must be a typed interruption, not a normal completion.
+pub const RESPONSE_GUARD_BLOCKED_FINISH_REASON: &str = "response_guard_blocked";
 
 /// Apply response guards to LLM output. Returns `Some(replacement)` if the
 /// text was blocked, `None` if it passed all guards.
@@ -25,21 +28,21 @@ pub fn apply_response_guards(
     }
 
     // Hard blocks: replace entire text
+    if contains_internal_protocol_marker(text) {
+        return ResponseGuardResult {
+            replacement: Some(INTERNAL_PROTOCOL_FALLBACK.to_string()),
+            quality: QualityReport::default(),
+        };
+    }
     if is_prompt_leaked(text, &[]) {
         return ResponseGuardResult {
             replacement: Some(PROMPT_LEAK_FALLBACK.to_string()),
             quality: QualityReport::default(),
         };
     }
-    if is_repetition_loop(text) {
-        return ResponseGuardResult {
-            replacement: Some(REPETITION_LOOP_FALLBACK.to_string()),
-            quality: QualityReport::default(),
-        };
-    }
-
     // Soft signals: return quality report (caller decides what to do)
-    let quality = check_response_quality(text, tool_calls, allowed_tools, user_query);
+    let mut quality = check_response_quality(text, tool_calls, allowed_tools, user_query);
+    quality.has_repetition_loop = is_repetition_loop(text);
     ResponseGuardResult {
         replacement: None,
         quality,
@@ -66,6 +69,14 @@ const STRUCTURAL_MARKERS: &[&str] = &[
     "Introspection rules:",
 ];
 
+const INTERNAL_PROTOCOL_MARKERS: &[&str] = &[
+    "<ask_astra_data",
+    "</ask_astra_data>",
+    "<astra_internal",
+    "</astra_internal>",
+    "__astra_",
+];
+
 const REPEAT_THRESHOLD: usize = 8;
 
 /// Patterns that indicate the LLM fabricated file paths or data.
@@ -87,9 +98,10 @@ pub fn is_prompt_leaked(text: &str, fingerprints: &[String]) -> bool {
         return false;
     }
 
+    let visible_text = text_without_code_regions(text);
     if STRUCTURAL_MARKERS
         .iter()
-        .any(|marker| text.contains(marker))
+        .any(|marker| visible_text.contains(marker))
     {
         return true;
     }
@@ -98,10 +110,55 @@ pub fn is_prompt_leaked(text: &str, fingerprints: &[String]) -> bool {
         return false;
     }
 
-    let lower = text.to_lowercase();
+    let lower = visible_text.to_lowercase();
     fingerprints
         .iter()
         .any(|fingerprint| lower.contains(fingerprint))
+}
+
+pub fn contains_internal_protocol_marker(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+
+    let lower = text_without_code_regions(text).to_ascii_lowercase();
+    INTERNAL_PROTOCOL_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn text_without_code_regions(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push('\n');
+            continue;
+        }
+        if in_fence {
+            out.push('\n');
+            continue;
+        }
+        out.push_str(&line_without_inline_code(line));
+        out.push('\n');
+    }
+    out
+}
+
+fn line_without_inline_code(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_inline_code = false;
+    for ch in line.chars() {
+        if ch == '`' {
+            in_inline_code = !in_inline_code;
+            out.push(' ');
+        } else if !in_inline_code {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 pub fn is_repetition_loop(text: &str) -> bool {
@@ -188,6 +245,8 @@ pub struct QualityReport {
     pub has_fabrication_markers: bool,
     /// Whether the response is a non-answer (just the user's question echoed back).
     pub is_echo: bool,
+    /// Whether the output contains a repeated-token loop. Advisory only.
+    pub has_repetition_loop: bool,
 }
 
 impl QualityReport {
@@ -197,6 +256,7 @@ impl QualityReport {
             || !self.malformed_args.is_empty()
             || self.has_fabrication_markers
             || self.is_echo
+            || self.has_repetition_loop
     }
 
     /// Human-readable summary of quality issues for injection into conversation.
@@ -228,6 +288,9 @@ impl QualityReport {
                 "You echoed the question instead of answering it. Use tools to find the answer."
                     .to_string(),
             );
+        }
+        if self.has_repetition_loop {
+            parts.push("Response contains a repeated-token loop.".to_string());
         }
         Some(format!("⚠ Quality issues: {}", parts.join(" ")))
     }
@@ -278,6 +341,7 @@ pub fn check_response_quality(
         malformed_args,
         has_fabrication_markers,
         is_echo,
+        has_repetition_loop: false,
     }
 }
 
@@ -292,6 +356,12 @@ mod tests {
         assert!(is_prompt_leaked("## Core Rules are important", &[]));
         assert!(is_prompt_leaked("## Planning Protocol details", &[]));
         assert!(is_prompt_leaked("here are File editing rules: ...", &[]));
+    }
+
+    #[test]
+    fn prompt_leak_markers_inside_code_are_not_blocked() {
+        let review = "This diff defines:\n```md\n## Core Rules\nTool surface rules:\n```";
+        assert!(!is_prompt_leaked(review, &[]));
     }
 
     #[test]
@@ -328,6 +398,21 @@ mod tests {
     #[test]
     fn repetition_loop_short() {
         assert!(!is_repetition_loop("hello hello hello"));
+    }
+
+    #[test]
+    fn internal_protocol_markers_inside_code_are_not_blocked() {
+        let review = "The code contains `__astra_required_runtime_context` and:\n```rust\nlet tag = \"<ask_astra_data>\";\n```";
+        assert!(!contains_internal_protocol_marker(review));
+        let result = apply_response_guards(review, &[], &[], "review guard code");
+        assert!(result.replacement.is_none());
+    }
+
+    #[test]
+    fn visible_internal_protocol_marker_is_still_blocked() {
+        assert!(contains_internal_protocol_marker(
+            "<ask_astra_data><query>secret</query></ask_astra_data>"
+        ));
     }
 
     // ── Tool hallucination ──────────────────────────────────────
@@ -520,6 +605,7 @@ mod tests {
             malformed_args: vec![],
             has_fabrication_markers: false,
             is_echo: false,
+            has_repetition_loop: false,
         };
         let warning = report.to_warning().unwrap();
         assert!(warning.starts_with("⚠ Quality issues:"));
@@ -541,16 +627,35 @@ mod tests {
     }
 
     #[test]
-    fn guard_blocks_repetition() {
+    fn guard_reports_repetition_without_replacing_output() {
         let result = apply_response_guards(
             "loop loop loop loop loop loop loop loop loop",
             &[],
             &["bash"],
             "help me",
         );
+        assert!(result.replacement.is_none());
+        assert!(result.quality.has_repetition_loop);
+    }
+
+    #[test]
+    fn guard_blocks_internal_control_protocol_leak() {
+        let result = apply_response_guards(
+            "<ask_astra_data><query>previous task?</query></ask_astra_data>",
+            &[],
+            &["bash"],
+            "hi",
+        );
         assert_eq!(
             result.replacement.as_deref(),
-            Some(REPETITION_LOOP_FALLBACK)
+            Some(INTERNAL_PROTOCOL_FALLBACK)
+        );
+        assert!(
+            !result
+                .replacement
+                .as_deref()
+                .unwrap()
+                .contains("<ask_astra_data>")
         );
     }
 
@@ -594,10 +699,6 @@ mod tests {
     fn guard_constants_are_user_facing() {
         assert!(
             !PROMPT_LEAK_FALLBACK.is_empty(),
-            "fallback must have content"
-        );
-        assert!(
-            !REPETITION_LOOP_FALLBACK.is_empty(),
             "fallback must have content"
         );
         assert!(

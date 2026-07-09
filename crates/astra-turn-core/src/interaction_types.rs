@@ -69,7 +69,7 @@ impl TurnInteractionMode {
 pub struct TurnInteractionPolicy {
     pub mode: TurnInteractionMode,
     pub visible_tool_names: Vec<String>,
-    pub evidence_tool_names: Vec<String>,
+    pub observation_tool_names: Vec<String>,
     pub can_pause_for_user: bool,
     pub allow_ask_user: bool,
 }
@@ -93,15 +93,15 @@ impl TurnInteractionPolicy {
                 deduped_visible.push(name);
             }
         }
-        let evidence_tool_names = deduped_visible
+        let observation_tool_names = deduped_visible
             .iter()
-            .filter(|name| tool_counts_as_factual_evidence(name))
+            .filter(|name| tool_counts_as_external_observation(name))
             .cloned()
             .collect();
         Self {
             mode,
             visible_tool_names: deduped_visible,
-            evidence_tool_names,
+            observation_tool_names,
             can_pause_for_user: mode.can_pause_for_user(),
             allow_ask_user: mode.allows_ask_user(),
         }
@@ -127,8 +127,8 @@ impl TurnInteractionPolicy {
     }
 
     #[must_use]
-    pub fn has_evidence_tools(&self) -> bool {
-        !self.evidence_tool_names.is_empty()
+    pub fn has_observation_tools(&self) -> bool {
+        !self.observation_tool_names.is_empty()
     }
 }
 
@@ -142,13 +142,12 @@ pub fn interaction_scoped_tool_restrictions(mode: TurnInteractionMode) -> HashSe
     }
 }
 
-/// Whether a tool invocation counts as factual evidence for post-hoc live-data retry.
+/// Whether a tool invocation observes user, world, or workspace state.
 ///
-/// Evidence means the tool observes user/world/workspace data. Control-plane
-/// and runtime-self-observation tools are useful for agent steering, but they
-/// should not make a forced factual retry overwrite a good first answer.
+/// Control-plane and runtime-self-observation tools remain useful for steering,
+/// but are tracked separately from external observations in performance facts.
 #[must_use]
-pub fn tool_counts_as_factual_evidence(tool_name: &str) -> bool {
+pub fn tool_counts_as_external_observation(tool_name: &str) -> bool {
     if tool_name == ASK_USER_TOOL_NAME {
         return false;
     }
@@ -243,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_control_tools_do_not_count_as_factual_evidence() {
+    fn runtime_control_tools_do_not_count_as_external_observations() {
         for name in [
             ASK_USER_TOOL_NAME,
             "introspect",
@@ -256,8 +255,8 @@ mod tests {
             "exit_plan_mode",
         ] {
             assert!(
-                !tool_counts_as_factual_evidence(name),
-                "{name} must not satisfy factual-retry evidence"
+                !tool_counts_as_external_observation(name),
+                "{name} must not count as an external observation"
             );
         }
 
@@ -271,8 +270,8 @@ mod tests {
             "mo_query",
         ] {
             assert!(
-                tool_counts_as_factual_evidence(name),
-                "{name} should count as factual-retry evidence"
+                tool_counts_as_external_observation(name),
+                "{name} should count as an external observation"
             );
         }
     }
@@ -289,7 +288,7 @@ mod tests {
             ],
         );
 
-        assert_eq!(policy.evidence_tool_names, vec!["read_file", "grep"]);
-        assert!(policy.has_evidence_tools());
+        assert_eq!(policy.observation_tool_names, vec!["read_file", "grep"]);
+        assert!(policy.has_observation_tools());
     }
 }

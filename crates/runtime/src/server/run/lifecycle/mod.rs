@@ -153,22 +153,21 @@ fn should_restore_prior_prompt_history(
     request_targets_existing_session && session_has_prior_prompt_history
 }
 
-fn is_non_blocking_task_board_settlement(
-    interruption: &astra_turn_core::interruption::InterruptionRecord,
-    task_board_snapshot: &crate::turn::agentic_loop::host::TaskBoardSnapshot,
-    loop_state: &AgenticLoopState,
-    waiting_for: Option<&str>,
-) -> bool {
-    matches!(interruption.kind, InterruptionKind::EmptyCompletion)
-        && matches!(
-            interruption.resume_action,
-            ResumeAction::ContinueImmediately
-        )
-        && matches!(interruption.resume_mode, ResumeMode::Settle)
-        && waiting_for.is_none()
-        && loop_state.final_text.trim().is_empty()
-        && task_board_snapshot.has_unfinished_tasks()
-        && !task_board_snapshot.requires_settlement_intervention()
+fn task_board_settlement_payload(
+    snapshot: &crate::turn::agentic_loop::host::TaskBoardSnapshot,
+) -> Option<Value> {
+    snapshot.has_unfinished_tasks().then(|| {
+        json!({
+            "summary": snapshot.short_summary(),
+            "tracked_count": snapshot.tracked_count,
+            "pending_count": snapshot.pending_count,
+            "in_progress_count": snapshot.in_progress_count,
+            "paused_count": snapshot.paused_count,
+            "blocked_count": snapshot.blocked_count,
+            "terminal_non_success_count": snapshot.terminal_non_success_count,
+            "active_tasks": snapshot.active_tasks,
+        })
+    })
 }
 
 /// Wire a freshly-constructed [`runtime_tool_executor::RuntimeToolExecutor`]
@@ -2332,12 +2331,7 @@ impl AgenticRunLifecycleService {
                 Ok(AgenticLoopOutcome::Completed) => {
                     if let Some(interruption) = loop_state.interruption.as_ref() {
                         let task_board_snapshot = loop_state.hooks.task_board_snapshot.clone();
-                        let task_board_open = task_board_snapshot.has_unfinished_tasks();
-                        let task_board_requires_intervention =
-                            task_board_snapshot.requires_settlement_intervention();
-                        let waiting_for = if task_board_requires_intervention {
-                            Some("task_board_intervention".to_string())
-                        } else if matches!(
+                        let waiting_for = if matches!(
                             interruption.resume_action,
                             astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
                                 | astra_turn_core::interruption::ResumeAction::StartNewSession
@@ -2346,38 +2340,8 @@ impl AgenticRunLifecycleService {
                         } else {
                             None
                         };
-                        let task_board_payload = task_board_open.then(|| {
-                            json!({
-                                "summary": task_board_snapshot.short_summary(),
-                                "tracked_count": task_board_snapshot.tracked_count,
-                                "pending_count": task_board_snapshot.pending_count,
-                                "in_progress_count": task_board_snapshot.in_progress_count,
-                                "paused_count": task_board_snapshot.paused_count,
-                                "blocked_count": task_board_snapshot.blocked_count,
-                                "terminal_non_success_count": task_board_snapshot.terminal_non_success_count,
-                                "active_tasks": task_board_snapshot.active_tasks,
-                            })
-                        });
-                        if is_non_blocking_task_board_settlement(
-                            interruption,
-                            &task_board_snapshot,
-                            loop_state,
-                            waiting_for.as_deref(),
-                        ) {
-                            let mut finished = usage;
-                            finished["settled_interruption_kind"] =
-                                Value::String(interruption.kind.label().to_string());
-                            finished["resume_mode"] =
-                                Value::String(interruption.resume_mode.label().to_string());
-                            if let Some(task_board) = task_board_payload {
-                                finished["task_board"] = task_board;
-                            }
-                            events.push(json!({
-                                "event_type": "run_finished",
-                                "data": finished,
-                            }));
-                            return (events, RunStatus::Completed, None);
-                        }
+                        let task_board_payload =
+                            task_board_settlement_payload(&task_board_snapshot);
                         let mut interruption_json = interruption.to_json();
                         if let Some(obj) = interruption_json.as_object_mut() {
                             if let Some(waiting_for) = waiting_for.as_ref() {
@@ -2424,9 +2388,15 @@ impl AgenticRunLifecycleService {
                             "data": { "full_text": loop_state.final_text.clone() }
                             }));
                         }
+                        let mut finished = usage;
+                        if let Some(task_board) =
+                            task_board_settlement_payload(&loop_state.hooks.task_board_snapshot)
+                        {
+                            finished["task_board"] = task_board;
+                        }
                         events.push(json!({
                             "event_type": "run_finished",
-                            "data": usage,
+                            "data": finished,
                         }));
                         (RunStatus::Completed, None)
                     }
@@ -3450,9 +3420,9 @@ impl AgenticRunLifecycleService {
             .map(str::to_string);
         let binding_section = agent_binding_context
             .map(|context| Self::agent_binding_prompt_section(&context.binding));
-        // `runtime_system_prompt` is a session-stable system override. Per-turn
-        // facts must use `runtime_volatile_texts` so they land in
-        // RuntimeVolatile / CacheScope::None and do not churn the cached prefix.
+        // `runtime_system_prompt` is a session-stable system override. Dynamic
+        // request/binding facts use the external `runtime_volatile_texts` lane
+        // below so they land in RuntimeVolatile / CacheScope::None.
         let runtime_section = runtime_system_prompt
             .filter(|prompt| !prompt.is_empty())
             .map(str::to_string);
@@ -4035,9 +4005,8 @@ impl AgenticRunLifecycleService {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
-            textless_stop_retries: 0,
             last_finish_reason: None,
             max_turns,
             remaining_turns: max_turns,
@@ -7972,31 +7941,10 @@ fn server_subrun_live_reason(
 }
 
 fn server_subrun_completed_status(loop_state: &AgenticLoopState) -> &'static str {
-    let Some(interruption) = loop_state.interruption.as_ref() else {
+    let Some(_interruption) = loop_state.interruption.as_ref() else {
         return STATUS_COMPLETED;
     };
-    let task_board_snapshot = &loop_state.hooks.task_board_snapshot;
-    let waiting_for = if task_board_snapshot.requires_settlement_intervention() {
-        Some("task_board_intervention")
-    } else if matches!(
-        interruption.resume_action,
-        astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
-            | astra_turn_core::interruption::ResumeAction::StartNewSession
-    ) {
-        Some("user_intervention")
-    } else {
-        None
-    };
-    if is_non_blocking_task_board_settlement(
-        interruption,
-        task_board_snapshot,
-        loop_state,
-        waiting_for,
-    ) {
-        STATUS_COMPLETED
-    } else {
-        STATUS_PAUSED
-    }
+    STATUS_PAUSED
 }
 
 #[async_trait]
@@ -8551,9 +8499,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
-            textless_stop_retries: 0,
             last_finish_reason: None,
             max_turns,
             remaining_turns: max_turns,

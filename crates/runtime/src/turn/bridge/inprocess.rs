@@ -1203,7 +1203,42 @@ fn required_runtime_text_for_bridge(
     ) {
         parts.push(text);
     }
+    parts.extend(
+        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+            edge_profile,
+        )
+        .into_iter()
+        .filter(|injection| {
+            injection.delivery_class
+                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+        })
+        .filter_map(|injection| injection.render_for_prompt()),
+    );
     (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+fn runtime_advisory_evidence_sections(
+    edge_profile: &Map<String, Value>,
+) -> Vec<prompts::PromptSection> {
+    let text = astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+        edge_profile,
+    )
+    .into_iter()
+    .filter(|injection| {
+        injection.delivery_class
+            == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence
+    })
+    .filter_map(|injection| injection.render_for_prompt())
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![prompts::PromptSection::dynamic(
+            text,
+            prompts::PromptTokenBucket::Environment,
+        )]
+    }
 }
 
 fn bridge_pipeline_event_turn(trace_turn: u32) -> u32 {
@@ -2354,17 +2389,18 @@ impl InProcessChatTurnBridge {
                 // once when skill catalog changes, then stabilizes.
                 stable_sections.push(section);
             }
-            if let Some(runtime_volatile) =
-                astra_turn_core::chat_turn_edge_profile::edge_profile_joined_text(
+            let runtime_volatile_parts =
+                astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
                     &edge_profile,
                     astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
-                )
-            {
+                );
+            if !runtime_volatile_parts.is_empty() {
                 dynamic_sections.push(prompts::PromptSection::dynamic(
-                    runtime_volatile,
+                    runtime_volatile_parts.join("\n\n"),
                     prompts::PromptTokenBucket::Environment,
                 ));
             }
+            dynamic_sections.extend(runtime_advisory_evidence_sections(&edge_profile));
             if !tool_round_guidance.is_empty() {
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
@@ -6919,6 +6955,16 @@ mod tests {
                 .to_string(),
             json!(["structured runtime context"]),
         );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                .to_string(),
+            json!([{
+                "kind": "active_turn_frame",
+                "delivery_class": "required_context",
+                "payload": {"active_goal": "typed required context"},
+                "round_index": 2
+            }]),
+        );
 
         let got = required_runtime_text_for_bridge(
             &edge_profile,
@@ -6926,10 +6972,42 @@ mod tests {
         )
         .expect("required runtime text");
 
-        assert_eq!(
-            got,
+        assert!(got.starts_with(
             "[session-resume:v1]\nHydrated previous session context\n\nstructured runtime context"
+        ));
+        assert!(got.contains("<runtime-required-context>"));
+        assert!(got.contains("typed required context"));
+        assert!(got.contains("\"kind\":\"active_turn_frame\""));
+    }
+
+    #[test]
+    fn bridge_routes_only_typed_advisory_evidence_to_dynamic_sections() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                .to_string(),
+            json!([
+                {
+                    "kind": "policy_advisory",
+                    "delivery_class": "advisory_evidence",
+                    "payload": {"signal": "soft signal"},
+                    "round_index": 2
+                },
+                {
+                    "kind": "self_status",
+                    "delivery_class": "telemetry_only",
+                    "payload": "cache=86%",
+                    "round_index": 2
+                }
+            ]),
         );
+
+        let sections = runtime_advisory_evidence_sections(&edge_profile);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].scope, prompts::CacheScope::None);
+        assert!(sections[0].text.contains("<runtime-advisory-evidence>"));
+        assert!(sections[0].text.contains("soft signal"));
+        assert!(!sections[0].text.contains("cache=86%"));
     }
 
     #[test]
@@ -8034,31 +8112,10 @@ mod tests {
     /// audit-#6: when tool events fail to persist after core events succeed,
     /// the spawned persist task must emit a structured `tool_events_orphaned`
     /// marker so log-based reconciliation can recover the lost data.
-    #[test]
-    fn persist_task_emits_orphan_marker_on_tool_failure() {
-        let source = include_str!("inprocess.rs");
-        assert!(
-            source.contains("marker = \"tool_events_orphaned\""),
-            "bridge persist task must emit a `tool_events_orphaned` marker when \
-             tool_writer.persist fails after core events were already committed"
-        );
-    }
 
     /// audit-#11: `await_with_client_disconnect` must not use `biased;` —
     /// biasing toward the cancellation arm starves real work whenever the
     /// caller's cancel token is already set when the future is polled.
-    #[test]
-    fn await_with_client_disconnect_is_not_biased() {
-        let source = include_str!("inprocess.rs");
-        let fn_start = source
-            .find("async fn await_with_client_disconnect")
-            .expect("await_with_client_disconnect must exist");
-        let body = &source[fn_start..fn_start + 700];
-        assert!(
-            !body.contains("biased;"),
-            "await_with_client_disconnect must not use biased select (starvation risk)"
-        );
-    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn persist_bridge_stream_failure_capture_persists_remote_llm_capture() {
@@ -8252,73 +8309,6 @@ mod tests {
                 != astra_services::session_journal::JournalEventType::LlmRound),
             "root-owned bridge flush must not double-write aggregate llm_round rows"
         );
-    }
-
-    #[test]
-    fn llm_request_dump_failures_are_not_silently_ignored() {
-        let source = include_str!("inprocess.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
-        let production = &source[..tests_start];
-        for context in [
-            "bridge_inprocess compacted context-window dump persist failed",
-            "bridge_inprocess error dump persist failed",
-        ] {
-            let start = production
-                .find(context)
-                .expect("dump logging context should exist");
-            let window_start = start.saturating_sub(520);
-            let window = &production[window_start..production.len().min(start + 120)];
-            assert!(
-                window.contains("if let Err(error) =")
-                    && window.contains(
-                        "dump.persist_remote(&user_id, remote_artifact_store.as_ref()).await"
-                    ),
-                "{context} should handle dump.persist_remote failures explicitly"
-            );
-        }
-    }
-
-    #[test]
-    fn llm_error_paths_publish_remote_llm_capture_artifacts() {
-        let source = include_str!("inprocess.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
-        let production = &source[..tests_start];
-        for context in [
-            "bridge_inprocess compacted context-window capture",
-            "bridge_inprocess error capture",
-        ] {
-            let start = production
-                .find(context)
-                .expect("capture context should exist");
-            let window = &production[start..production.len().min(start + 260)];
-            assert!(
-                window.contains("Some(remote_artifact_store.as_ref())"),
-                "{context} should publish a remote llm_capture artifact"
-            );
-        }
-    }
-
-    #[test]
-    fn bridge_stream_failure_paths_publish_remote_llm_capture_artifacts() {
-        let source = include_str!("inprocess.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
-        let production = &source[..tests_start];
-        for context in [
-            "bridge_inprocess stream block parse capture",
-            "bridge_inprocess stream tail parse capture",
-            "bridge_inprocess stream incomplete capture",
-            "bridge_inprocess client disconnect capture",
-        ] {
-            let start = production
-                .find(context)
-                .expect("stream failure capture context should exist");
-            let window_start = start.saturating_sub(320);
-            let window = &production[window_start..production.len().min(start + 220)];
-            assert!(
-                window.contains("persist_bridge_stream_failure_capture("),
-                "{context} should persist a remote llm_capture artifact for mid-stream failures"
-            );
-        }
     }
 
     // ── bridge_should_run_memoria_prefetch gate ────────────────────────

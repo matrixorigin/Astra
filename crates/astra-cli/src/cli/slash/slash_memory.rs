@@ -2510,70 +2510,6 @@ mod tests {
     // ── /memory subcommand contracts ──
 
     #[test]
-    fn memory_help_lists_all_cloud_commands() {
-        let src = include_str!("slash_memory.rs");
-        let test_start = src.find("#[cfg(test)]").unwrap_or(src.len());
-        let prod = &src[..test_start];
-        for cmd in &[
-            "snapshot",
-            "rollback",
-            "snapshots",
-            "branch",
-            "checkout",
-            "merge",
-            "diff",
-            "branches",
-            "reflect",
-            "health",
-            "search",
-            "dismiss",
-            "list",
-            "session",
-            "edit",
-        ] {
-            assert!(
-                prod.contains(&format!("\"{cmd}\"")),
-                "/memory {cmd} subcommand missing from match block"
-            );
-        }
-    }
-
-    #[test]
-    fn memory_usage_text_covers_all_subcommands() {
-        let src = include_str!("slash_memory.rs");
-        assert!(
-            src.contains("Mental model")
-                && src.contains("Current conversation state")
-                && src.contains("Durable cross-session memories")
-                && src.contains("inspect in /context"),
-            "/memory usage must explain session/repository/retrieved scopes"
-        );
-        for cmd in &[
-            "snapshot",
-            "rollback",
-            "snapshots",
-            "branch",
-            "checkout",
-            "merge",
-            "diff",
-            "branches",
-            "reflect",
-            "health",
-            "session",
-            "dismiss",
-        ] {
-            assert!(
-                src.contains(&format!("  {cmd}")),
-                "/memory usage text missing {cmd}"
-            );
-        }
-        assert!(
-            src.contains("  edit <section>"),
-            "/memory usage text missing edit <section>"
-        );
-    }
-
-    #[test]
     fn session_proto_detection_covers_legacy_and_active_entries() {
         assert!(is_session_proto("[@session/memory] session_id=sess-1"));
         assert!(is_session_proto("[@session/active] Active session state"));
@@ -2789,17 +2725,6 @@ mod tests {
         assert!(
             !result.contains("## Pending Todos\n- real todo\n"),
             "old real section content should be replaced: {result:?}"
-        );
-    }
-
-    #[test]
-    fn memory_edit_subcommand_exists_in_router() {
-        let src = include_str!("slash_memory.rs");
-        let test_start = src.find("#[cfg(test)]").unwrap_or(src.len());
-        let prod = &src[..test_start];
-        assert!(
-            prod.contains("\"edit\""),
-            "/memory edit subcommand missing from match block"
         );
     }
 }

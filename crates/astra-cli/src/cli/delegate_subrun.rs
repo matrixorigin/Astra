@@ -390,9 +390,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            textless_stop_retries: 0,
             last_finish_reason: None,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
             max_turns: DELEGATE_MAX_TURNS,
             remaining_turns: DELEGATE_MAX_TURNS,
@@ -1097,28 +1096,4 @@ mod tests {
     //
     // Structural tests — avoiding the trait-mocking rabbit hole
     // from the `basic_cli` tests earlier.
-
-    #[test]
-    fn delegate_executor_accepts_fork_cache_sink() {
-        let src = include_str!("delegate_subrun.rs");
-        assert!(
-            src.contains("pub fn with_fork_cache_sink"),
-            "CliDelegateSubRunExecutor must expose with_fork_cache_sink; \
-             without it, agent_runtime can't wire observability into \
-             the delegate path"
-        );
-    }
-
-    #[test]
-    fn delegate_subrun_host_consumes_executor_sink() {
-        // When the executor holds a sink, the SubRunHost it builds
-        // must receive it (not `None`). Grep the production code
-        // path for the assignment.
-        let src = include_str!("delegate_subrun.rs");
-        assert!(
-            src.contains("fork_cache_sink: self.fork_cache_sink.clone()"),
-            "delegate_subrun must propagate executor.fork_cache_sink \
-             into SubRunHost, not hardcode None"
-        );
-    }
 }

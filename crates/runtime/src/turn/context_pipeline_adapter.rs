@@ -167,6 +167,22 @@ pub(crate) fn build_external_sources(
         }));
     }
 
+    let runtime_advisory_evidence =
+        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+            edge_profile,
+        )
+        .into_iter()
+        .filter(|injection| {
+            injection.delivery_class
+                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence
+        })
+        .collect::<Vec<_>>();
+    if !runtime_advisory_evidence.is_empty() {
+        providers.push(Box::new(RuntimeAdvisoryEvidenceProvider {
+            injections: runtime_advisory_evidence,
+        }));
+    }
+
     // Active skills visibility hint
     if !active_skill_names.is_empty() {
         providers.push(Box::new(ActiveSkillNamesProvider {
@@ -366,6 +382,34 @@ impl astra_turn_core::context_sources::ContextChannelProvider for EnvVolatilePro
 /// None scope by definition: these bytes can change every turn.
 struct RuntimeVolatileTextsProvider {
     texts: Vec<String>,
+}
+
+/// Runtime-owned advisory evidence received through the typed edge lane.
+/// Required context is attached separately by the LLM context assembler so it
+/// survives strict-history volatile suppression; telemetry has no prompt form.
+struct RuntimeAdvisoryEvidenceProvider {
+    injections: Vec<astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection>,
+}
+
+impl astra_turn_core::context_sources::ContextChannelProvider for RuntimeAdvisoryEvidenceProvider {
+    fn channel_id(&self) -> &'static str {
+        "runtime_advisory_evidence"
+    }
+    fn cache_scope(&self) -> CacheScope {
+        CacheScope::None
+    }
+    fn token_bucket(&self) -> PromptTokenBucket {
+        PromptTokenBucket::Environment
+    }
+    fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
+        let text = self
+            .injections
+            .iter()
+            .filter_map(|injection| injection.render_for_prompt())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then(|| PromptSection::dynamic(text, PromptTokenBucket::Environment))
+    }
 }
 
 impl astra_turn_core::context_sources::ContextChannelProvider for RuntimeVolatileTextsProvider {
@@ -2189,6 +2233,89 @@ mod tests {
                 .any(|section| section.text.contains("Runtime Turn Context")),
             "turn context must be routed to RuntimeVolatile / CacheScope::None"
         );
+    }
+
+    #[test]
+    fn external_sources_runtime_volatile_injections_use_dynamic_lane() {
+        let mut ep = serde_json::Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                .into(),
+            serde_json::json!([{
+                "kind": "policy_advisory",
+                "delivery_class": "advisory_evidence",
+                "payload": {
+                    "schema": "policy_advisory.v1",
+                    "advisories": [{"kind": "stall"}]
+                },
+                "round_index": 2
+            }]),
+        );
+        let state = make_state();
+        let sources = build_external_sources(&ep, &state, &[], None, None);
+
+        assert!(sources.system_override.is_none());
+        assert!(
+            sources
+                .extra_stable_sections
+                .iter()
+                .all(|section| !section.text.contains("policy_advisory.v1")),
+            "typed runtime volatile must not enter the session-stable prompt prefix"
+        );
+        assert!(
+            sources
+                .extra_dynamic_sections
+                .iter()
+                .any(|section| section.text.contains("policy_advisory.v1")),
+            "typed runtime volatile must be routed to RuntimeVolatile / CacheScope::None"
+        );
+    }
+
+    #[test]
+    fn typed_runtime_advisory_changes_do_not_churn_stable_prompt_sections() {
+        let state = make_state();
+        let build = |content: &str| {
+            let mut ep = serde_json::Map::new();
+            ep.insert(
+                "system_prompt_override".into(),
+                Value::String("stable session contract".to_string()),
+            );
+            ep.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                    .into(),
+                serde_json::json!([{
+                    "kind": "policy_advisory",
+                    "delivery_class": "advisory_evidence",
+                    "payload": content,
+                    "round_index": 3
+                }]),
+            );
+            build_external_sources(&ep, &state, &["bash"], None, None)
+        };
+
+        let first = build("first advisory sample");
+        let second = build("second advisory sample");
+        let stable_bytes = |sources: &ExternalSources| {
+            sources
+                .extra_stable_sections
+                .iter()
+                .map(|section| section.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let dynamic_bytes = |sources: &ExternalSources| {
+            sources
+                .extra_dynamic_sections
+                .iter()
+                .map(|section| section.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        assert_eq!(stable_bytes(&first), stable_bytes(&second));
+        assert_ne!(dynamic_bytes(&first), dynamic_bytes(&second));
+        assert!(dynamic_bytes(&first).contains("first advisory sample"));
+        assert!(dynamic_bytes(&second).contains("second advisory sample"));
     }
 
     #[test]

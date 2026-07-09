@@ -1794,8 +1794,8 @@ impl ChatWidget {
                 _ => "ℹ️",
             };
             let mut desc = format!("{} severity={}", icon, severity);
-            if item.force_stop {
-                desc.push_str(" force_stop");
+            if item.advisory_threshold_reached {
+                desc.push_str(" strong_advisory");
             }
             if item.total_errors > 0 {
                 desc.push_str(&format!(" errors={}", item.total_errors));

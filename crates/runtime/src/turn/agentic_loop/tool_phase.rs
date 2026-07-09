@@ -40,7 +40,7 @@ use crate::turn::providers::{LiveRuntimeProvider, ObservationProvider, SessionSt
 use crate::turn::runtime_policy::RuntimePolicy;
 use astra_turn_core::agentic_post_tool_policy::{
     AgenticPostToolIterationControl, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
-    map_post_tool_policy_outcome,
+    map_post_tool_policy_outcome, policy_advisory_bundle_value,
 };
 use astra_turn_core::agentic_turn_flow::{
     agentic_round_stall_preflight_with_tool_calls, append_explain_turn_batch,
@@ -96,53 +96,24 @@ fn detached_background_task_wait_reason(
 fn detached_background_task_reason_from_edge_result(
     result: &astra_turn_core::sse_stream_host::EdgeToolExecResult,
 ) -> Option<String> {
-    if result
-        .tool_result_fields
-        .as_ref()
-        .is_some_and(|fields| fields.get("bash_detached").and_then(Value::as_bool) == Some(true))
-        || result.output.contains("<bash_detached>")
-    {
-        return Some(detached_background_task_reason(
-            result
-                .tool_result_fields
-                .as_ref()
-                .and_then(|fields| background_task_id_from_map(fields))
-                .or_else(|| background_task_id_from_text(&result.output)),
-        ));
-    }
-    None
+    let fields = result.tool_result_fields.as_ref()?;
+    (fields.get("bash_detached").and_then(Value::as_bool) == Some(true))
+        .then(|| detached_background_task_reason(background_task_id_from_map(fields)))
 }
 
 fn detached_background_task_reason_from_tool_result(result: &Value) -> Option<String> {
     let result = result.as_object()?;
+    let metadata = result.get("metadata").and_then(Value::as_object);
     let detached = result.get("bash_detached").and_then(Value::as_bool) == Some(true)
-        || result
-            .get("metadata")
-            .and_then(Value::as_object)
-            .is_some_and(|metadata| {
-                metadata.get("bash_detached").and_then(Value::as_bool) == Some(true)
-            })
-        || ["output", "result", "content"]
-            .iter()
-            .filter_map(|key| result.get(*key).and_then(Value::as_str))
-            .any(|text| text.contains("<bash_detached>"));
+        || metadata.is_some_and(|metadata| {
+            metadata.get("bash_detached").and_then(Value::as_bool) == Some(true)
+        });
     if !detached {
         return None;
     }
     Some(detached_background_task_reason(
         background_task_id_from_map(result)
-            .or_else(|| {
-                result
-                    .get("metadata")
-                    .and_then(Value::as_object)
-                    .and_then(background_task_id_from_map)
-            })
-            .or_else(|| {
-                ["output", "result", "content"]
-                    .iter()
-                    .filter_map(|key| result.get(*key).and_then(Value::as_str))
-                    .find_map(background_task_id_from_text)
-            }),
+            .or_else(|| metadata.and_then(background_task_id_from_map)),
     ))
 }
 
@@ -152,17 +123,6 @@ fn background_task_id_from_map(map: &serde_json::Map<String, Value>) -> Option<S
         .find_map(|key| map.get(*key).and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn background_task_id_from_text(text: &str) -> Option<String> {
-    text.split_whitespace()
-        .map(|part| {
-            part.trim_matches(|ch: char| {
-                !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == ':')
-            })
-        })
-        .find(|part| part.starts_with("bg-shell-") || part.starts_with("bg-task-"))
         .map(ToString::to_string)
 }
 
@@ -370,10 +330,7 @@ async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState)
 
 #[cfg(test)]
 fn tool_record_was_rejected(rec: &astra_services::session_journal::ToolCallRecord) -> bool {
-    rec.error
-        .as_deref()
-        .map(|error| error.starts_with("blocked_tool:"))
-        .unwrap_or(false)
+    rec.was_blocked_by_policy()
 }
 
 fn tool_result_string_field(value: &Value, field: &str) -> Option<String> {
@@ -575,26 +532,34 @@ fn server_session_state_mutator_in_round(tool_calls: &[Value]) -> bool {
     })
 }
 
-/// Extract a strategy change description from a memory tool call's
-/// `args_preview`. The agent marks strategy changes with
+/// Extract a strategy-change observation from a memory tool call's structured
+/// arguments. The agent marks strategy changes with
 /// `memory(action='remember', tags=['strategy_change'], content='...')`.
-///
-/// Returns the `content` value if extractable, otherwise a default
-/// description.
-fn extract_strategy_change_desc(args_preview: &str) -> String {
-    // Simple extraction: find "content" key and grab its string value.
-    // The args_preview JSON is truncated to ~80 chars, but the content
-    // field is usually near the beginning for memory calls.
-    if let Some(start) = args_preview.find("\"content\":\"") {
-        let after_key = &args_preview[start + "\"content\":\"".len()..];
-        if let Some(end) = after_key.find('"') {
-            let desc = &after_key[..end];
-            if !desc.is_empty() {
-                return desc.to_string();
-            }
-        }
+fn strategy_change_description(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> Option<String> {
+    if record.name != "memory" {
+        return None;
     }
-    "Strategy changed".to_string()
+    let args = serde_json::from_str::<Value>(record.args_full.as_deref()?).ok()?;
+    let has_strategy_change_tag = args
+        .get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter()
+                .any(|tag| tag.as_str() == Some("strategy_change"))
+        });
+    if !has_strategy_change_tag {
+        return None;
+    }
+    Some(
+        args.get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .unwrap_or("Strategy changed")
+            .to_string(),
+    )
 }
 
 fn append_session_journal_event(
@@ -1209,57 +1174,21 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &mut state.turn_guard,
     );
 
-    // ── Force-stop on consecutive identical signatures ───────────────────
-    // `apply_cli_agentic_stall_preflight` pushes a
-    // `FORCE_STOP_CONSECUTIVE_EVENT` once the streak of identical tool-call
-    // signatures crosses `CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP`. At that
-    // point soft nudges have already fired and been ignored; we terminate
-    // the turn with a clear interruption reason instead of burning rounds
-    // until `token_budget_exceeded`. Session 05e63cac t10 regression:
-    // 4 identical `cargo clippy` calls tripped nudges, LLM ignored them
-    // and continued for ~50 rounds before budget cutoff.
-    let force_stop_fired = state.stall.events.iter().any(|(name, _)| {
-        name == astra_turn_core::agentic_stall_preflight::FORCE_STOP_CONSECUTIVE_EVENT
-    });
-    if force_stop_fired {
-        let last_sig = state
-            .stall
-            .turn_sigs
-            .last()
-            .and_then(|s| s.iter().next().cloned())
-            .unwrap_or_else(|| "<unknown>".to_string());
+    // Exact-signature repetition is behavior evidence, not a termination
+    // boundary. Surface it once; actual token/round ceilings remain enforced
+    // by the budget layer.
+    if let Some(last_sig) = queue_repetition_threshold_advisory(state) {
         if !prep.quiet {
             host.emit_headless_line(
                 super::super::agentic::headless_round::HeadlessStderrStyle::Yellow,
                 format!(
-                    "⚠ Hard-stop: {} consecutive identical tool calls ({}); \
-                     soft nudges were ignored. Terminating turn.",
-                    astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP,
+                    "↻ {} consecutive identical tool-call signatures observed ({}); \
+                     continuing with advisory evidence.",
+                    astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD,
                     last_sig,
                 ),
             );
         }
-        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
-            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-            super::lifecycle::interruption_state_summary(
-                state,
-                Some(format!(
-                    "force_stop_consecutive: {} identical tool-call signatures \
-                     in a row; soft nudges had no effect",
-                    astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_FORCE_STOP,
-                )),
-            ),
-        ));
-        observe_turn_end_without_tools(
-            state,
-            turn_index,
-            prep.turn_start_time,
-            turn_result.ttft_ms,
-            turn_result_tokens_consumed(&turn_result),
-        );
-        finalize_and_render(host, state).await;
-        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
     }
 
     let valid_tool_names = host.valid_tool_names().clone();
@@ -1566,18 +1495,12 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         }
 
         // ── Agent-marked strategy change ──
-        // Scan memory tool calls for `strategy_change` tag so the agent
-        // can explicitly signal "I changed my approach" and later see
-        // before/after verification in the self-status block.
+        // Read the structured memory-tool tag so the agent can explicitly
+        // signal a strategy change and later see before/after verification.
         for record in &round_tool_calls {
-            if record.name == "memory" {
-                if let Some(ref args) = record.args_preview {
-                    if args.contains("strategy_change") {
-                        let desc = extract_strategy_change_desc(args);
-                        state.observation_journal.mark_strategy_change(desc);
-                        break;
-                    }
-                }
+            if let Some(description) = strategy_change_description(record) {
+                state.observation_journal.mark_strategy_change(description);
+                break;
             }
         }
     }
@@ -1680,14 +1603,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     if let Some(ref emitter) = state.messaging.progress_emitter {
         for rec in &state.stall.tool_call_records {
-            if let Some(ref err) = rec.error
-                && err.starts_with("blocked_tool:")
-            {
-                emitter.permission_denied(
-                    &rec.name,
-                    err.trim_start_matches("blocked_tool: "),
-                    turn_index as u32,
-                );
+            if rec.was_blocked_by_policy() {
+                let reason = rec
+                    .error
+                    .as_deref()
+                    .and_then(|err| err.strip_prefix("blocked_tool: "))
+                    .unwrap_or("tool blocked by policy");
+                emitter.permission_denied(&rec.name, reason, turn_index as u32);
             }
         }
     }
@@ -1795,15 +1717,15 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                         .map(|c| format!("{c:?}"))
                         .unwrap_or_else(|| "Unknown".into());
                     let n = state.error_recovery.consecutive_same_error;
-                    state.push_volatile(
-                        super::host::VolatileKind::Corrective,
-                        format!(
-                            "🔄 ERROR BUDGET EXHAUSTED: You've hit {cat_name} errors \
-                             {n} turns in a row. Your current approach is not working. \
-                             STOP repeating the same strategy. You MUST try a fundamentally \
-                             different approach: different tool, different file, different \
-                             method. If you cannot make progress, explain what's blocking you.",
-                        ),
+                    state.push_volatile_payload(
+                        super::host::VolatileKind::BehaviorAdvisory,
+                        serde_json::json!({
+                            "signal": "repeated_error_category",
+                            "category": cat_name,
+                            "consecutive_rounds": n,
+                            "assessment": "The current approach may be repeating a failing strategy.",
+                            "recommendation": "Consider a different tool, file, or method when supported by the task evidence; otherwise explain the blocker."
+                        }),
                     );
                 }
                 state.error_recovery.consecutive_same_error = 0;
@@ -1840,11 +1762,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     match map_post_tool_policy_outcome(apply_agentic_post_tool_policy(
         AgenticPostToolPolicyRequest {
             turn_index: turn_index as u32,
-            message: &state.message,
             tool_calls_for_guard: &tool_calls_for_guard,
             intent_tool_turns: &mut state.stall.intent_tool_turns,
             messages: &mut state.messages,
-            stall_events: &mut state.stall.events,
             turn_guard: &mut state.turn_guard,
             verdict_events: &mut state.stall.verdict_events,
             restricted_tools: &mut state.restricted_tools,
@@ -1853,38 +1773,15 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             current_user_id: state.context_manifest_user_id.as_ref(),
             current_session_id: state.current_session_id.as_ref(),
             max_turns: state.max_turns,
-            loop_turn: turn_index,
             recent_tools: &state.recent_tools,
             last_heavy_checkpoint: &mut state.stall.last_heavy_checkpoint,
             interaction_mode: host.turn_interaction_mode(),
         },
     )) {
-        AgenticPostToolIterationControl::Abort(e) => {
-            // Wire CriticalVerdict interruption so the checkpoint / journal
-            // carry a structured record for resumption.
-            if state.interruption.is_none() {
-                use super::lifecycle::interruption_state_summary;
-                use astra_turn_core::interruption::{
-                    InterruptionKind, InterruptionRecord, ResumeAction,
-                };
-                state.interruption = Some(InterruptionRecord::new(
-                    InterruptionKind::CriticalVerdict,
-                    ResumeAction::ContinueImmediately,
-                    interruption_state_summary(
-                        state,
-                        Some(format!("TurnGuard critical verdict: {e}")),
-                    ),
-                ));
+        AgenticPostToolIterationControl::ProceedEndTurn { advisories } => {
+            if let Some(payload) = policy_advisory_bundle_value(&advisories) {
+                state.push_volatile_payload(super::host::VolatileKind::PolicyAdvisory, payload);
             }
-            state.step_recorder.end_turn(true);
-            finalize_turn_trace(state).await;
-            refresh_runtime_promotion_signals_from_db(state).await;
-            return Err(e);
-        }
-        AgenticPostToolIterationControl::RetryLlmClearToolResults => {
-            state.tool_results.clear();
-        }
-        AgenticPostToolIterationControl::ProceedEndTurn => {
             if let Some(ref emitter) = state.messaging.progress_emitter {
                 let tool_calls_this_turn =
                     state.total_tool_calls.saturating_sub(if turn_index > 0 {
@@ -1963,6 +1860,34 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     Ok(TurnToolPhaseControl::ContinueLoop)
 }
 
+fn queue_repetition_threshold_advisory(state: &mut AgenticLoopState) -> Option<String> {
+    let threshold_reached = state.stall.events.iter().any(|(name, _)| {
+        name == astra_turn_core::agentic_stall_preflight::REPETITION_THRESHOLD_EVENT
+    });
+    if !threshold_reached || state.stall.repetition_advisory_emitted {
+        return None;
+    }
+
+    state.stall.repetition_advisory_emitted = true;
+    let last_signature = state
+        .stall
+        .turn_sigs
+        .last()
+        .and_then(|signatures| signatures.iter().next().cloned())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    state.push_volatile_payload(
+        super::host::VolatileKind::BehaviorAdvisory,
+        serde_json::json!({
+            "signal": "identical_tool_signature_repetition",
+            "consecutive_rounds": astra_turn_core::stall::CONSECUTIVE_IDENTICAL_SIGS_ADVISORY_THRESHOLD,
+            "latest_signature": last_signature,
+            "assessment": "Repeated identical calls may indicate a low-yield loop, but repetition can be justified when external state is expected to change.",
+            "recommendation": "Use the user goal and tool evidence to decide whether to wait, change approach, or continue."
+        }),
+    );
+    Some(last_signature)
+}
+
 fn observe_gate_cancelled(
     state: &mut AgenticLoopState,
     _turn_index: usize,
@@ -2022,6 +1947,115 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn strategy_change_uses_structured_memory_tags() {
+        let record = ToolCallRecord {
+            name: "memory".into(),
+            args_full: Some(
+                serde_json::json!({
+                    "action": "remember",
+                    "tags": ["strategy_change", "debugging"],
+                    "content": "switch to a minimal reproducer",
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            strategy_change_description(&record).as_deref(),
+            Some("switch to a minimal reproducer")
+        );
+    }
+
+    #[test]
+    fn strategy_change_does_not_infer_tags_from_free_text() {
+        let record = ToolCallRecord {
+            name: "memory".into(),
+            args_full: Some(
+                serde_json::json!({
+                    "action": "remember",
+                    "tags": ["note"],
+                    "content": "the phrase strategy_change appears here only as prose",
+                })
+                .to_string(),
+            ),
+            args_preview: Some("strategy_change".into()),
+            ..Default::default()
+        };
+        assert_eq!(strategy_change_description(&record), None);
+    }
+
+    #[test]
+    fn detached_background_wait_uses_structured_edge_fields() {
+        let structured = astra_turn_core::sse_stream_host::EdgeToolExecResult {
+            request_id: "req-1".into(),
+            tool: "bash".into(),
+            args: serde_json::json!({}),
+            output: "human-readable background notice".into(),
+            tool_result_fields: Some(serde_json::Map::from_iter([
+                ("bash_detached".into(), serde_json::json!(true)),
+                ("background_task_id".into(), serde_json::json!("bg-shell-1")),
+            ])),
+            status: "completed".into(),
+            duration_ms: 1,
+        };
+        assert_eq!(
+            detached_background_task_reason_from_edge_result(&structured).as_deref(),
+            Some("background_task_detached:bg-shell-1")
+        );
+
+        let text_only = astra_turn_core::sse_stream_host::EdgeToolExecResult {
+            tool_result_fields: None,
+            output: "<bash_detached>bg-shell-1</bash_detached>".into(),
+            ..structured
+        };
+        assert_eq!(
+            detached_background_task_reason_from_edge_result(&text_only),
+            None
+        );
+    }
+
+    #[test]
+    fn identical_signature_threshold_emits_evidence_without_stopping_or_hiding_tools() {
+        let mut state = make_state();
+        state.stall.events.push((
+            astra_turn_core::agentic_stall_preflight::REPETITION_THRESHOLD_EVENT.to_string(),
+            4,
+        ));
+        state
+            .stall
+            .turn_sigs
+            .push(std::collections::BTreeSet::from([
+                "bash:{\"command\":\"cargo clippy\"}".to_string(),
+            ]));
+        let history_before = state.messages.clone();
+        let restricted_before = state.restricted_tools.clone();
+
+        let signature = queue_repetition_threshold_advisory(&mut state)
+            .expect("threshold event should emit once");
+
+        assert!(signature.contains("cargo clippy"));
+        assert!(state.interruption.is_none());
+        assert_eq!(state.messages, history_before);
+        assert_eq!(state.restricted_tools, restricted_before);
+        assert_eq!(state.volatile_pending.len(), 1);
+        let advisory = &state.volatile_pending[0];
+        assert_eq!(
+            advisory.kind,
+            super::super::host::VolatileKind::BehaviorAdvisory
+        );
+        assert_eq!(
+            advisory.kind.delivery_class(),
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence
+        );
+        assert_eq!(
+            advisory.payload["signal"],
+            "identical_tool_signature_repetition"
+        );
+        assert!(queue_repetition_threshold_advisory(&mut state).is_none());
+        assert_eq!(state.volatile_pending.len(), 1);
     }
 
     #[test]
@@ -2149,11 +2183,13 @@ mod tests {
 
     #[test]
     fn blocked_tool_records_still_mark_rejected() {
-        let rec = summary_tool_record(
+        let mut rec = summary_tool_record(
             false,
             Some("blocked_tool: Explicit approval required: action scope is unbounded."),
             None,
         );
+        rec.result_class =
+            Some(astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS.to_string());
         assert!(tool_record_was_rejected(&rec));
     }
 

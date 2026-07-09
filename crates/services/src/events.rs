@@ -222,12 +222,13 @@ fn verify_sync_outbox_event_identity(
     session_id: &str,
     event_type: &str,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let event: crate::session_journal::JournalEvent = serde_json::from_str(content).map_err(|error| {
-        error_response(
-            StatusCode::BAD_REQUEST,
-            format!("sync_outbox event content must be a serialized JournalEvent: {error}"),
-        )
-    })?;
+    let event: crate::session_journal::JournalEvent =
+        serde_json::from_str(content).map_err(|error| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("sync_outbox event content must be a serialized JournalEvent: {error}"),
+            )
+        })?;
     let expected_id = sync_outbox_stable_event_id(&event, payload_hash).map_err(internal_error)?;
     if expected_id != event_id {
         return Err(error_response(
@@ -266,7 +267,9 @@ fn duplicate_event_matches_request(
         return false;
     }
     if let Some(incoming_hash) = verified_sync_payload_hash {
-        return sync_outbox_content_payload_hash(&existing.content).ok().as_deref()
+        return sync_outbox_content_payload_hash(&existing.content)
+            .ok()
+            .as_deref()
             == Some(incoming_hash);
     }
     existing.session_id == session_id
@@ -618,13 +621,8 @@ impl EventService for DatabaseEventService {
                 &event_type,
             )?;
         }
-        ensure_event_session_requirement(
-            &mut tx,
-            &session_id,
-            &user_id,
-            sync_outbox_ingestion,
-        )
-        .await?;
+        ensure_event_session_requirement(&mut tx, &session_id, &user_id, sync_outbox_ingestion)
+            .await?;
         if let Some(existing_id) = client_event_id.as_deref() {
             let select_sql = format!(
                 "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
@@ -1780,8 +1778,7 @@ mod tests {
             })),
             Some(&incoming_hash),
         ));
-        let different_content_hash =
-            sync_outbox_content_payload_hash(r#"{"a":1,"b":3}"#).unwrap();
+        let different_content_hash = sync_outbox_content_payload_hash(r#"{"a":1,"b":3}"#).unwrap();
         assert!(!duplicate_event_matches_request(
             &existing,
             "session-a",

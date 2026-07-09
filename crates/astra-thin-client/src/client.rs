@@ -3,13 +3,13 @@
 use std::pin::Pin;
 use std::time::Duration;
 
+use astra_core::{SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
 use async_stream::stream;
 use futures_util::{Stream, StreamExt};
 use reqwest::{
     Client, Response, Url,
     header::{self, HeaderMap, HeaderValue},
 };
-use astra_core::{SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -1419,11 +1419,14 @@ impl ThinClient {
     ) -> Result<Value, ThinClientError> {
         let url = self.url(paths::SYNC_OUTBOX_EVENTS)?;
         let mut headers = self.auth_headers_for(bearer_override);
-        if let Some(token) = self.resolved_bearer_token(bearer_override)
-            && let Ok(signature) =
-                HeaderValue::from_str(&sync_outbox_request_signature(token, body))
-        {
-            headers.insert(SYNC_OUTBOX_SIGNATURE_HEADER, signature);
+        if let Some(token) = self.resolved_bearer_token(bearer_override) {
+            let signature = sync_outbox_request_signature(token, body);
+            let header = HeaderValue::from_str(&signature).map_err(|error| {
+                ThinClientError::InvalidInput(format!(
+                    "failed to encode sync-outbox signature header: {error}"
+                ))
+            })?;
+            headers.insert(SYNC_OUTBOX_SIGNATURE_HEADER, header);
         }
         let resp = self
             .http
