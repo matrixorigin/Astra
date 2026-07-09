@@ -205,9 +205,6 @@ jobs:
       http_proxy: http://proxy-service.proxy.svc.cluster.local:8001
       https_proxy: http://proxy-service.proxy.svc.cluster.local:8001
       no_proxy: .local,.cn,.gitee.com,.tencent.com,.tencentyun.com,.aliyun.com,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,localhost,127.0.0.0/8,.qq.com,169.254.0.0/16,.myqcloud.com,.matrixone.tech,.aliyuncs.com,.digicert.com,.microsoft.com,.visualstudio.com,.symcb.com,0.0.0.0
-      HTTP_PROXY: http://proxy-service.proxy.svc.cluster.local:8001
-      HTTPS_PROXY: http://proxy-service.proxy.svc.cluster.local:8001
-      NO_PROXY: .local,.cn,.gitee.com,.tencent.com,.tencentyun.com,.aliyun.com,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,localhost,127.0.0.0/8,.qq.com,169.254.0.0/16,.myqcloud.com,.matrixone.tech,.aliyuncs.com,.digicert.com,.microsoft.com,.visualstudio.com,.symcb.com,0.0.0.0
 
     steps:
       - uses: actions/checkout@v4
