@@ -2379,7 +2379,6 @@ fn build_anthropic_tools(tools: &[Value]) -> Vec<Value> {
 ///
 /// Returns a vec of (chunk_str, is_reasoning) pairs. Callers should route
 /// is_reasoning=true chunks to `reasoning_delta` and false to `text_delta`.
-#[allow(dead_code)] // Reserved for MiniMax M2.7 streaming support
 pub(crate) fn split_think_chunks(content: &str, in_think: &mut bool) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut pos = 0;
@@ -3114,6 +3113,7 @@ async fn collect_llm_stream(
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
     let mut made_progress = false;
+    let mut in_think = false;
     let partial_result = |full_text: &String,
                           reasoning: &String,
                           tool_calls_map: &HashMap<usize, Map<String, Value>>,
@@ -3239,9 +3239,22 @@ async fn collect_llm_stream(
                     ),
                 });
             }
-            full_text.push_str(content);
-            if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::TextDelta(content.to_string()));
+            let chunks = split_think_chunks(content, &mut in_think);
+            for (chunk, is_reasoning) in chunks {
+                if chunk.is_empty() {
+                    continue;
+                }
+                if is_reasoning {
+                    reasoning.push_str(&chunk);
+                    if let Some(callback) = stream_callback.as_deref_mut() {
+                        callback(LlmStreamUpdate::ReasoningDelta(chunk));
+                    }
+                } else {
+                    full_text.push_str(&chunk);
+                    if let Some(callback) = stream_callback.as_deref_mut() {
+                        callback(LlmStreamUpdate::TextDelta(chunk));
+                    }
+                }
             }
             made_progress = true;
         }
@@ -4928,6 +4941,46 @@ mod tests {
             }
             other => panic!("expected transport error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn collect_llm_stream_routes_inline_think_to_reasoning_before_partial_error() {
+        let err = sample_reqwest_stream_error().await;
+        let d1 = json!({"choices":[{"delta":{"content":"<think>hidden reasoning"}}]});
+        let d2 = json!({"choices":[{"delta":{"content":"</think>visible answer"}}]});
+        let byte_stream = stream::iter(vec![
+            Ok(Bytes::from(format!("data: {d1}\n\n"))),
+            Ok(Bytes::from(format!("data: {d2}\n\n"))),
+            Err(err),
+        ]);
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let res = collect_llm_stream(
+            byte_stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect_err("transport error");
+        match res {
+            StreamCollectError::Transport { partial, .. } => {
+                assert_eq!(partial.full_text, "visible answer");
+                assert_eq!(partial.reasoning, "hidden reasoning");
+                assert!(!partial.full_text.contains("<think>"));
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+        assert_eq!(
+            updates,
+            vec![
+                LlmStreamUpdate::ReasoningDelta("hidden reasoning".to_string()),
+                LlmStreamUpdate::TextDelta("visible answer".to_string()),
+            ]
+        );
     }
 
     // Note: Bedrock no longer uses `collect_llm_stream` (see `bridge_llm_stream::

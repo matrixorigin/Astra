@@ -21,6 +21,7 @@ use crate::turn::llm::client::{
     build_provider_request_body_with_overrides, consolidate_system_messages, llm_request_url,
     llm_request_url_for_provider, llm_retry_base_ms, parse_openai_sse_json_stream,
     provider_uses_anthropic_messages, provider_uses_bedrock_converse, sleep_ms_or_llm_cancel,
+    split_think_chunks,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
@@ -1165,6 +1166,7 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                 let cc = client_cancel.clone();
                 let mut full_text = String::new();
                 let mut reasoning = String::new();
+                let mut in_think = false;
                 let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
                     std::collections::HashMap::new();
                 let mut usage = Map::new();
@@ -1421,8 +1423,18 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
                             // Text content
                             if let Some(content) = delta.get("content").and_then(Value::as_str)
                                 && !content.is_empty() {
-                                    full_text.push_str(content);
-                                    yield render_sse(&json!({"type": "text_delta", "content": content}));
+                                    for (chunk, is_reasoning) in split_think_chunks(content, &mut in_think) {
+                                        if chunk.is_empty() {
+                                            continue;
+                                        }
+                                        if is_reasoning {
+                                            reasoning.push_str(&chunk);
+                                            yield render_sse(&json!({"type": "reasoning_delta", "content": chunk}));
+                                        } else {
+                                            full_text.push_str(&chunk);
+                                            yield render_sse(&json!({"type": "text_delta", "content": chunk}));
+                                        }
+                                    }
                                 }
 
                             // Reasoning (DeepSeek / o1 style)
@@ -2185,6 +2197,21 @@ mod tests {
         fallback_status: u16,
         fallback_body: &'static str,
     ) -> String {
+        spawn_raw_partial_transport_server_with_content(
+            hits,
+            "partial",
+            fallback_status,
+            fallback_body,
+        )
+        .await
+    }
+
+    async fn spawn_raw_partial_transport_server_with_content(
+        hits: TransportFallbackHits,
+        stream_content: &'static str,
+        fallback_status: u16,
+        fallback_body: &'static str,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind raw mock llm listener");
@@ -2204,7 +2231,7 @@ mod tests {
                         hits.stream_hits.fetch_add(1, Ordering::SeqCst);
                         let partial = format!(
                             "data: {}\n\n",
-                            json!({"choices":[{"delta":{"content":"partial"}}]})
+                            json!({"choices":[{"delta":{"content":stream_content}}]})
                         );
                         let chunk = format!("{:X}\r\n{}\r\n", partial.len(), partial);
                         let response = format!(
@@ -2497,6 +2524,57 @@ mod tests {
         assert!(
             body.contains("\"retryable\":true"),
             "transport fallback failure should stay retryable: {body}"
+        );
+        assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn call_llm_stream_routes_inline_think_to_reasoning_before_fallback_failure() {
+        let hits = TransportFallbackHits {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let base = spawn_raw_partial_transport_server_with_content(
+            hits.clone(),
+            "<think>hidden reasoning",
+            500,
+            r#"{"error":{"message":"fallback transport recovery failed"}}"#,
+        )
+        .await;
+        let stream = call_llm_stream(
+            &[json!({"role":"user","content":"hi"})],
+            &[],
+            "gpt-5-mini",
+            None,
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            None,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        )
+        .await
+        .expect("bridge stream");
+        let body = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .collect::<String>();
+        assert!(
+            !body.contains("<think>"),
+            "streamed body must not expose inline think tags: {body}"
+        );
+        assert!(
+            body.contains("\"type\":\"reasoning_delta\"")
+                && body.contains("\"content\":\"hidden reasoning\""),
+            "inline think content should be routed to reasoning_delta before fallback failure: {body}"
+        );
+        assert!(
+            body.contains("\"code\":\"stream_transport\""),
+            "transport fallback failure should still surface structured error: {body}"
         );
         assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
         assert_eq!(hits.fallback_hits.load(Ordering::SeqCst), 1);
