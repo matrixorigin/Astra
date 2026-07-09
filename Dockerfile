@@ -49,14 +49,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM chef AS planner
 
-WORKDIR /app/rust
-COPY rust/ ./
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
-WORKDIR /app/rust
-COPY --from=planner /app/rust/recipe.json recipe.json
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
 # Runtime image intentionally ships the API server plus the single public CLI.
 # Test-only mock_mcp_server and the standalone astra-edge daemon are excluded.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -66,7 +67,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra
 
-COPY rust/ ./
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
