@@ -57,7 +57,7 @@ jobs:
           echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
 
   build:
-    name: Build ${{ matrix.platform }}
+    name: Build DockerHub ${{ matrix.platform }}
     needs: version
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
@@ -82,12 +82,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.IDC_REGISTRY }}
-          username: ${{ secrets.IDC_REGISTRY_USERNAME }}
-          password: ${{ secrets.IDC_REGISTRY_PASSWORD }}
-
       - uses: docker/metadata-action@v5
         id: meta
         with:
@@ -105,9 +99,7 @@ jobs:
           context: .
           file: Dockerfile
           platforms: ${{ matrix.platform }}
-          tags: |
-            ${{ env.IMAGE_NAME }}
-            ${{ env.IDC_IMAGE_NAME }}
+          tags: ${{ env.IMAGE_NAME }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             IMAGE_VERSION=${{ needs.version.outputs.image_version }}
@@ -135,7 +127,7 @@ jobs:
           retention-days: 1
 
   merge:
-    name: Merge & Push Docker Manifest
+    name: Merge & Push DockerHub Manifest
     needs:
       - version
       - build
@@ -155,12 +147,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.IDC_REGISTRY }}
-          username: ${{ secrets.IDC_REGISTRY_USERNAME }}
-          password: ${{ secrets.IDC_REGISTRY_PASSWORD }}
-
       - uses: docker/metadata-action@v5
         id: meta
         with:
@@ -172,25 +158,12 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.latest == 'true' }}
             type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
 
-      - uses: docker/metadata-action@v5
-        id: idc-meta
-        with:
-          images: ${{ env.IDC_IMAGE_NAME }}
-          flavor: |
-            latest=false
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.latest == 'true' }}
-            type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
-
-      - name: Create Docker manifest lists
+      - name: Create DockerHub manifest list
         shell: bash
         working-directory: /tmp/digests
         env:
           DOCKERHUB_IMAGE_NAME: ${{ env.IMAGE_NAME }}
           DOCKERHUB_METADATA_JSON: ${{ steps.meta.outputs.json }}
-          IDC_IMAGE_NAME: ${{ env.IDC_IMAGE_NAME }}
-          IDC_METADATA_JSON: ${{ steps.idc-meta.outputs.json }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -219,4 +192,60 @@ jobs:
           }
 
           create_manifest_list "${DOCKERHUB_IMAGE_NAME}" "${DOCKERHUB_METADATA_JSON}"
-          create_manifest_list "${IDC_IMAGE_NAME}" "${IDC_METADATA_JSON}"
+
+  idc:
+    name: Push IDC image
+    needs: version
+    runs-on: amd64-mo-shanghai-dind
+    timeout-minutes: 45
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.IDC_REGISTRY }}
+          username: ${{ secrets.IDC_REGISTRY_USERNAME }}
+          password: ${{ secrets.IDC_REGISTRY_PASSWORD }}
+
+      - uses: docker/metadata-action@v5
+        id: idc-meta
+        with:
+          images: ${{ env.IDC_IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.latest == 'true' }}
+            type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
+
+      - uses: docker/build-push-action@v6
+        id: idc-build
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.idc-meta.outputs.tags }}
+          labels: ${{ steps.idc-meta.outputs.labels }}
+          build-args: |
+            IMAGE_VERSION=${{ needs.version.outputs.image_version }}
+            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_BRANCH=${{ github.ref_name }}
+          cache-from: type=registry,ref=${{ env.IDC_IMAGE_NAME }}:cache
+          cache-to: type=registry,ref=${{ env.IDC_IMAGE_NAME }}:cache,mode=max,oci-mediatypes=true,image-manifest=true,ignore-error=true
+
+      - name: Write IDC summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## IDC image publish"
+            echo
+            echo "- Target: \`${{ env.IDC_IMAGE_NAME }}\`"
+            echo "- DockerHub release jobs do not depend on this optional IDC job."
+            echo "- This job is capped at 45 minutes to avoid long registry retry loops."
+          } >> "${GITHUB_STEP_SUMMARY}"
