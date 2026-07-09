@@ -3909,18 +3909,18 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
         .send()
         .await
         .map_err(|e| {
+            let elapsed = started.elapsed();
             tracing::warn!(
                 target: "astra_runtime::llm_client",
                 url = %url,
+                elapsed_ms = elapsed.as_millis() as u64,
+                configured_timeout_s = effective_timeout.as_secs(),
                 error = %e,
                 "LLM non-stream fallback send failed"
             );
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Network,
-                format!(
-                    "LLM fallback request failed (timeout {}s): {e}",
-                    effective_timeout.as_secs()
-                ),
+                fallback_send_error_message(&e, effective_timeout, elapsed),
             )
         })?;
     if !resp.status().is_success() {
@@ -3950,6 +3950,23 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     Ok(parse_nonstream_response_for_provider(
         &v, provider, model_name, started,
     ))
+}
+
+fn fallback_send_error_message(
+    error: &reqwest::Error,
+    effective_timeout: std::time::Duration,
+    elapsed: std::time::Duration,
+) -> String {
+    let action = if error.is_timeout() {
+        "timed out"
+    } else {
+        "failed"
+    };
+    format!(
+        "LLM fallback request {action} after {}ms (configured timeout {}s): {error}",
+        elapsed.as_millis(),
+        effective_timeout.as_secs()
+    )
 }
 
 fn map_bedrock_finish_reason(stop_reason: &str) -> String {
@@ -5391,6 +5408,49 @@ mod tests {
                             .expect("write fallback response");
                         let _ = socket.shutdown().await;
                     }
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        format!("http://{addr}")
+    }
+
+    async fn spawn_raw_partial_transport_server_with_fallback_disconnect(
+        state: StreamIdleHit,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw mock llm listener");
+        let addr = listener.local_addr().expect("raw local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..read]);
+                    let is_stream = req.contains("\"stream\":true");
+                    if is_stream {
+                        state.stream_hits.fetch_add(1, Ordering::SeqCst);
+                        let partial = format!(
+                            "data: {}\n\n",
+                            json!({"choices":[{"delta":{"content":"partial"}}]})
+                        );
+                        let chunk = format!("{:X}\r\n{}\r\n", partial.len(), partial);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{chunk}"
+                        );
+                        socket
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write partial stream response");
+                    } else {
+                        state.fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = socket.shutdown().await;
                 });
             }
         });
@@ -7208,6 +7268,49 @@ mod tests {
             ),
             "{rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_reports_fallback_send_failure_without_timeout_label() {
+        let state = StreamIdleHit {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let base = spawn_raw_partial_transport_server_with_fallback_disconnect(state.clone()).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let error = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            None,
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
+        )
+        .await
+        .expect_err("transport fallback should fail");
+
+        assert!(
+            error.message.contains("LLM fallback request failed after"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("configured timeout"),
+            "{}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("failed (timeout"),
+            "{}",
+            error.message
+        );
+        assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
