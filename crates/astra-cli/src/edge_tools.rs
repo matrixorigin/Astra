@@ -2428,9 +2428,9 @@ impl ToolExecutor {
         // the old-format (pure JSON) and new-format (summary + JSON)
         // responses. Pre-prefix responses still work — `find('{')` on
         // a pure-JSON string returns 0 and we parse the whole string.
-        let json_body = match output.find('{') {
-            Some(pos) => &output[pos..],
-            None => return None,
+        let json_body = {
+            let pos = output.find('{')?;
+            &output[pos..]
         };
         serde_json::from_str::<Value>(json_body).ok()
     }

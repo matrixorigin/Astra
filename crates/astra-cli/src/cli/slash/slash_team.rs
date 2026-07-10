@@ -1618,7 +1618,7 @@ pub(crate) async fn handle_team_command(
                 "    {} Use '/team restore {} {}' to restore.",
                 "💡".dim(),
                 name,
-                &snapshot_id,
+                snapshot_id,
             );
             eprintln!();
         }

@@ -51,10 +51,9 @@ pub(crate) fn classify_shell_passthrough(line: &str) -> Option<ShellPassthroughD
     let trimmed = line.trim_start();
     let (override_high_risk, body) = if let Some(rest) = trimmed.strip_prefix("!!") {
         (true, rest)
-    } else if let Some(rest) = trimmed.strip_prefix('!') {
-        (false, rest)
     } else {
-        return None;
+        let rest = trimmed.strip_prefix('!')?;
+        (false, rest)
     };
     let cmd = body.trim();
     if cmd.is_empty() {

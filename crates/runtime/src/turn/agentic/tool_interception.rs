@@ -859,11 +859,10 @@ pub(crate) fn extract_repo_name_from_url(url: &str) -> Option<String> {
     let path = url.trim_end_matches('/');
     let segment = if let Some(idx) = path.rfind('/') {
         &path[idx + 1..]
-    } else if let Some(idx) = path.rfind(':') {
+    } else {
+        let idx = path.rfind(':')?;
         let after_colon = &path[idx + 1..];
         after_colon.rsplit('/').next().unwrap_or(after_colon)
-    } else {
-        return None;
     };
     let name = segment.strip_suffix(".git").unwrap_or(segment);
     if name.is_empty() {

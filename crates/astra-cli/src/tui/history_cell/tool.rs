@@ -857,13 +857,7 @@ pub(super) fn humanize_tool_name(name: &str) -> String {
 }
 
 fn non_empty_tool_text(value: Option<String>) -> Option<String> {
-    value.and_then(|text| {
-        if text.trim().is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    })
+    value.filter(|text| !text.trim().is_empty())
 }
 
 fn failure_detail_fallback(name: &str, description: &str) -> String {

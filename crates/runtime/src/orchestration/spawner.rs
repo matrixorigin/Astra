@@ -1532,9 +1532,9 @@ impl DynamicAgentSpawner {
         let agent_name = input
             .name
             .clone()
-            .unwrap_or_else(|| format!("{}_{}", input.agent_type, &Uuid::new_v4().to_string()));
+            .unwrap_or_else(|| format!("{}_{}", input.agent_type, Uuid::new_v4()));
         let run_id = Uuid::new_v4().to_string();
-        let agent_id = format!("{}@{}", agent_name, &run_id);
+        let agent_id = format!("{}@{}", agent_name, run_id);
 
         // 3. Determine model and turns
         let model = input

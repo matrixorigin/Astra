@@ -179,7 +179,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 if let Some(rec) = self.ctx.tool_call_records.last() {
                     let error_msg = format!(
                         "tool '{}' failed: {}",
-                        &execution.name,
+                        execution.name,
                         truncate_tool_error(&execution.result_str)
                     );
                     let event = astra_services::session_journal::JournalEvent::tool_call_error(

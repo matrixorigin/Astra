@@ -91,7 +91,7 @@ pub fn colorize_diff_summary(diff: &str) -> String {
             old_line += 1;
             new_line += 1;
             let prefix = format!("{:>4}   ", new_line);
-            parts.push(format!("{}{}", prefix.dim(), &line[1..].dim()));
+            parts.push(format!("{}{}", prefix.dim(), line[1..].dim()));
             continue;
         }
         parts.push(format!("{}", line.dim()));
