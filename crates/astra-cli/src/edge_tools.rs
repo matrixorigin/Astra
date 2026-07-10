@@ -3305,9 +3305,9 @@ impl ToolExecutor {
             };
             let get_results_call = format!(
                 "agent_fanout(action='get_results', group_id='{}')",
-                &group.group_id
+                group.group_id
             );
-            let task_output_call = format!("task_output(task_id='{}')", &group.group_id);
+            let task_output_call = format!("task_output(task_id='{}')", group.group_id);
             let instruction = format!(
                 "Recover existing results with {get_results_call} or {task_output_call}. Do not rerun solely because background_tasks count is zero."
             );
@@ -3321,7 +3321,7 @@ impl ToolExecutor {
                 summary.completed,
                 summary.failed,
                 summary.uncollected,
-                Self::xml_attr(&format!("agent_fanout:{}", &group.group_id)),
+                Self::xml_attr(&format!("agent_fanout:{}", group.group_id)),
                 Self::xml_attr(&get_results_call),
                 Self::xml_attr(&task_output_call),
                 Self::xml_attr(&instruction),

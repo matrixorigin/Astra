@@ -1238,7 +1238,7 @@ test-saas-coverage:
 	@command -v cargo-llvm-cov >/dev/null 2>&1 || { \
 		echo "cargo-llvm-cov not found; install with: cargo install cargo-llvm-cov"; exit 1; \
 	}
-	@rustup component add llvm-tools-preview --toolchain stable >/dev/null 2>&1 || { \
+	@rustup component add llvm-tools-preview >/dev/null 2>&1 || { \
 		echo "llvm-tools-preview required; run: rustup component add llvm-tools-preview"; exit 1; \
 	}
 	@if [ ! -f .env ]; then \

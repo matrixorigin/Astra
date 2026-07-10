@@ -35,7 +35,9 @@ runs:
         sudo docker image prune -af 2>/dev/null || true
         df -h /
 
-    - uses: dtolnay/rust-toolchain@stable
+    - name: Install pinned Rust toolchain
+      shell: bash
+      run: rustc --version
 
     - uses: taiki-e/install-action@nextest
 
