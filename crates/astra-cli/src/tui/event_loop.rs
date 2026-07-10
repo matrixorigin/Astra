@@ -3159,7 +3159,12 @@ pub(crate) async fn run_tui_session(
                                         match crate::cli::auth_flow::do_login(api, profile, &username, &password).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
-                                                crate::post_auth_cloud_resync(profile, &mut state).await;
+                                                let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
+                                                if let Some(notice) = sync_report.user_notice() {
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::warning(notice),
+                                                    );
+                                                }
                                                 if let Some(model) = sync_default_model_after_auth(
                                                     api,
                                                     &token,
@@ -3197,7 +3202,12 @@ pub(crate) async fn run_tui_session(
                                                 match crate::cli::auth_flow::do_login(api, profile, &username, &password).await {
                                                     Ok(token) => {
                                                         chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
-                                                        crate::post_auth_cloud_resync(profile, &mut state).await;
+                                                        let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
+                                                        if let Some(notice) = sync_report.user_notice() {
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::warning(notice),
+                                                            );
+                                                        }
                                                         if let Some(model) = sync_default_model_after_auth(
                                                             api,
                                                             &token,

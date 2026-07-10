@@ -26,7 +26,9 @@ use std::time::Duration;
 use futures_util::FutureExt;
 
 use crate::cli::session::session_runtime;
-use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
+use crate::cli::session::session_side_effects::{
+    enqueue_ingestion_for_immediate_drain_pub, enqueue_ingestion_pub,
+};
 use crate::{ExplainMode, SessionState};
 
 const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
@@ -86,13 +88,77 @@ pub(crate) struct CloudPullResult {
     pub cloud_reachable: bool,
 }
 
+#[must_use = "sync drain outcomes must be surfaced or deliberately handled"]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SyncOutboxDrainReport {
     pub cloud_configured: bool,
     pub attempted: u32,
     pub acked: u32,
     pub failed: u32,
+    pub terminal: u32,
     pub remaining_ready: u32,
+    pub blocker: Option<SyncOutboxDrainBlocker>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncOutboxDrainBlocker {
+    MissingAccessToken,
+    InvalidCloudBaseUrl,
+    LocalOutboxRead,
+    LocalSettlementWrite,
+    LocalStatusRead,
+}
+
+impl SyncOutboxDrainReport {
+    pub(crate) fn is_incomplete(&self) -> bool {
+        self.failed > 0 || self.terminal > 0 || self.blocker.is_some()
+    }
+
+    fn can_retry_automatically(&self) -> bool {
+        self.failed > 0 && self.blocker.is_none()
+    }
+
+    pub(crate) fn user_notice(&self) -> Option<String> {
+        if !self.is_incomplete() {
+            return None;
+        }
+        let detail = match self.blocker {
+            Some(SyncOutboxDrainBlocker::MissingAccessToken) => {
+                "no authenticated cloud token was available".to_string()
+            }
+            Some(SyncOutboxDrainBlocker::InvalidCloudBaseUrl) => {
+                "the configured cloud URL is invalid".to_string()
+            }
+            Some(SyncOutboxDrainBlocker::LocalOutboxRead) => {
+                "the local sync outbox could not be read".to_string()
+            }
+            Some(SyncOutboxDrainBlocker::LocalSettlementWrite) => {
+                "delivery results could not be persisted locally".to_string()
+            }
+            Some(SyncOutboxDrainBlocker::LocalStatusRead) => {
+                "the remaining local sync status could not be read".to_string()
+            }
+            None if self.failed > 0 && self.terminal > 0 => format!(
+                "{} record(s) remain retryable and {} reached a terminal local state",
+                self.failed, self.terminal
+            ),
+            None if self.failed > 0 => format!(
+                "{} queued record(s) could not yet be confirmed by the server",
+                self.failed
+            ),
+            None => format!("{} record(s) reached a terminal local state", self.terminal),
+        };
+        let recovery = if self.can_retry_automatically() && self.terminal > 0 {
+            "Retryable records remain queued in the background; use /sync repair for terminal records."
+        } else if self.can_retry_automatically() {
+            "They remain queued for background retry."
+        } else if self.blocker.is_some() {
+            "They remain in the local outbox; use /sync after resolving the issue."
+        } else {
+            "Use /sync to inspect or repair the terminal records."
+        };
+        Some(format!("Cloud sync is incomplete: {detail}. {recovery}"))
+    }
 }
 
 pub(crate) fn schedule_sync_outbox_drain() {
@@ -116,11 +182,27 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
     }
     spawn_tracked(async {
         let schedule_guard = SyncOutboxDrainScheduleGuard;
+        let mut blocked = false;
         for _ in 0..SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS {
             let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
+            blocked = report.blocker.is_some();
+            if report.attempted > 0 && report.is_incomplete() {
+                tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    attempted = report.attempted,
+                    acked = report.acked,
+                    failed = report.failed,
+                    terminal = report.terminal,
+                    blocker = ?report.blocker,
+                    "background sync outbox drain did not fully converge"
+                );
+            }
             if !report.cloud_configured || report.remaining_ready == 0 || report.attempted == 0 {
                 break;
             }
+        }
+        if blocked {
+            return;
         }
         let next_delay = SyncOutboxStore::local()
             .status()
@@ -374,14 +456,16 @@ pub(crate) async fn try_cloud_push_preferences(state: &SessionState) {
         }
     }
     let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
-    if report.failed > 0 {
+    if report.is_incomplete() {
         tracing::warn!(
             target: "astra_cli::cloud_sync",
             attempted = report.attempted,
             acked = report.acked,
             failed = report.failed,
+            terminal = report.terminal,
             remaining_ready = report.remaining_ready,
-            "sync outbox drain completed with failures"
+            blocker = ?report.blocker,
+            "sync outbox drain did not fully converge"
         );
     }
 }
@@ -394,9 +478,28 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
         cloud_configured: true,
         ..Default::default()
     };
+    let store = SyncOutboxStore::local();
+    match store.status() {
+        Ok(status) => {
+            report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
+            if report.remaining_ready == 0 {
+                return report;
+            }
+        }
+        Err(error) => {
+            report.blocker = Some(SyncOutboxDrainBlocker::LocalOutboxRead);
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                "sync outbox drain skipped because local outbox status is unreadable"
+            );
+            return report;
+        }
+    }
     let Some(token) =
         session_runtime::current_access_token(None).filter(|token| !token.trim().is_empty())
     else {
+        report.blocker = Some(SyncOutboxDrainBlocker::MissingAccessToken);
         tracing::debug!(
             target: "astra_cli::cloud_sync",
             "sync outbox drain skipped because no access token is available"
@@ -406,6 +509,7 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
     let client = match astra_thin_client::ThinClient::new(&cloud_base, Some(token.clone())) {
         Ok(client) => client,
         Err(error) => {
+            report.blocker = Some(SyncOutboxDrainBlocker::InvalidCloudBaseUrl);
             tracing::warn!(
                 target: "astra_cli::cloud_sync",
                 ?error,
@@ -414,10 +518,10 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
             return report;
         }
     };
-    let store = SyncOutboxStore::local();
     let records = match store.claim_ready_records(limit) {
         Ok(records) => records,
         Err(error) => {
+            report.blocker = Some(SyncOutboxDrainBlocker::LocalOutboxRead);
             tracing::warn!(
                 target: "astra_cli::cloud_sync",
                 ?error,
@@ -466,10 +570,21 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
             store.settle_delivery_batch(&settlements),
         );
     }
-    report.remaining_ready = store
-        .status()
-        .map(|status| status.claimable.min(u64::from(u32::MAX)) as u32)
-        .unwrap_or(0);
+    match store.status() {
+        Ok(status) => {
+            report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
+        }
+        Err(error) => {
+            report
+                .blocker
+                .get_or_insert(SyncOutboxDrainBlocker::LocalStatusRead);
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                "failed to read sync outbox status after drain"
+            );
+        }
+    }
     report
 }
 
@@ -481,10 +596,8 @@ fn record_settlement_result(
     match result {
         Ok(settlement) => {
             report.acked += settlement.acked;
-            report.failed += settlement
-                .failed
-                .saturating_add(settlement.missing)
-                .saturating_add(settlement.poisoned);
+            report.failed += settlement.failed;
+            report.terminal += settlement.missing.saturating_add(settlement.poisoned);
             if settlement.missing > 0 || settlement.poisoned > 0 {
                 tracing::warn!(
                     target: "astra_cli::cloud_sync",
@@ -496,6 +609,7 @@ fn record_settlement_result(
         }
         Err(error) => {
             report.failed += attempted_settlements.min(u32::MAX as usize) as u32;
+            report.blocker = Some(SyncOutboxDrainBlocker::LocalSettlementWrite);
             tracing::warn!(
                 target: "astra_cli::cloud_sync",
                 ?error,
@@ -609,6 +723,41 @@ pub(crate) fn append_cloud_pull_sync_journal(
     pull: &CloudPullResult,
     pref_keys: &[String],
 ) {
+    append_cloud_pull_sync_journal_with_enqueue(
+        state,
+        profile,
+        source,
+        pull,
+        pref_keys,
+        enqueue_ingestion_pub,
+    );
+}
+
+pub(crate) fn append_cloud_pull_sync_journal_for_immediate_drain(
+    state: &SessionState,
+    profile: &str,
+    source: &str,
+    pull: &CloudPullResult,
+    pref_keys: &[String],
+) {
+    append_cloud_pull_sync_journal_with_enqueue(
+        state,
+        profile,
+        source,
+        pull,
+        pref_keys,
+        enqueue_ingestion_for_immediate_drain_pub,
+    );
+}
+
+fn append_cloud_pull_sync_journal_with_enqueue(
+    state: &SessionState,
+    profile: &str,
+    source: &str,
+    pull: &CloudPullResult,
+    pref_keys: &[String],
+    enqueue: fn(&SessionState, &session_journal::JournalEvent),
+) {
     if !should_append_cloud_pull_journal(pull, pref_keys, source) {
         return;
     }
@@ -640,17 +789,44 @@ pub(crate) fn append_cloud_pull_sync_journal(
             "failed to append session journal event"
         );
     } else {
-        enqueue_ingestion_pub(state, &evt);
+        enqueue(state, &evt);
     }
 }
 
-/// Re-sync preferences from cloud after authentication.
-pub(crate) async fn post_auth_cloud_resync(profile: Option<&str>, state: &mut SessionState) {
+/// Re-sync preferences and queued edge events after authentication. Login is
+/// still successful when sync is delayed, but the structured report makes the
+/// partial outcome visible to every UI path.
+pub(crate) async fn post_auth_cloud_resync(
+    profile: Option<&str>,
+    state: &mut SessionState,
+) -> SyncOutboxDrainReport {
     let profile_name = profile.unwrap_or("default");
     let pull = try_cloud_pull(profile_name).await;
     let pref_keys = try_cloud_pull_preferences(state).await;
-    append_cloud_pull_sync_journal(state, profile_name, "post_login", &pull, &pref_keys);
-    let _ = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
+    append_cloud_pull_sync_journal_for_immediate_drain(
+        state,
+        profile_name,
+        "post_login",
+        &pull,
+        &pref_keys,
+    );
+    let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
+    if report.is_incomplete() {
+        tracing::warn!(
+            target: "astra_cli::cloud_sync",
+            attempted = report.attempted,
+            acked = report.acked,
+            failed = report.failed,
+            terminal = report.terminal,
+            remaining_ready = report.remaining_ready,
+            blocker = ?report.blocker,
+            "post-authentication cloud sync did not fully converge"
+        );
+    }
+    if report.can_retry_automatically() {
+        schedule_sync_outbox_drain();
+    }
+    report
 }
 
 #[cfg(test)]
@@ -754,7 +930,10 @@ mod tests {
         );
 
         assert_eq!(report.acked, 1);
-        assert_eq!(report.failed, 2);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.terminal, 2);
+        assert!(report.is_incomplete());
+        assert!(!report.can_retry_automatically());
     }
 
     #[serial_test::serial]

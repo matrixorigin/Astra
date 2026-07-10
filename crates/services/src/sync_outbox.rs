@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const SYNC_OUTBOX_SCHEMA_VERSION: u32 = 1;
 pub const SYNC_OUTBOX_MAX_ATTEMPTS: u32 = 5;
@@ -25,6 +26,8 @@ pub const SYNC_OUTBOX_IN_FLIGHT_LEASE_MS: u64 = 5 * 60 * 1000;
 pub const SYNC_OUTBOX_ACKED_RETAINED_RECORDS: usize = 128;
 pub const SYNC_OUTBOX_ACK_TOMBSTONE_RETAINED_RECORDS: usize = 4096;
 pub const SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS: usize = 128;
+const SYNC_OUTBOX_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const SYNC_OUTBOX_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -376,7 +379,11 @@ impl SyncOutboxStore {
                             continue;
                         };
                         if apply_delivery_failure(record, error, now) {
-                            report.failed = report.failed.saturating_add(1);
+                            if record.state == SyncOutboxRecordState::Poisoned {
+                                report.poisoned = report.poisoned.saturating_add(1);
+                            } else {
+                                report.failed = report.failed.saturating_add(1);
+                            }
                         } else if record.state == SyncOutboxRecordState::Poisoned {
                             report.poisoned = report.poisoned.saturating_add(1);
                         }
@@ -518,15 +525,16 @@ impl SyncOutboxStore {
         &self,
         f: impl FnOnce(&mut SyncOutboxFile) -> std::io::Result<R>,
     ) -> std::io::Result<R> {
+        let path = self.path();
         let result = self.locked(|state| {
             let result = f(state)?;
             state.compact_acked_tail();
             state.compact_skipped_records();
-            write_state(&self.path(), state)?;
+            write_state(&path, state)?;
             Ok(result)
-        });
-        sync_state_dir(&self.path());
-        result
+        })?;
+        sync_state_dir(&path)?;
+        Ok(result)
     }
 
     fn with_state_readonly<R>(
@@ -547,7 +555,7 @@ impl SyncOutboxStore {
             .read(true)
             .write(true)
             .open(lock_path)?;
-        lock.lock_exclusive()?;
+        lock_exclusive_with_timeout(&lock, SYNC_OUTBOX_LOCK_TIMEOUT)?;
         let mut state = read_state(&self.path())?;
         state.normalize();
         let result = f(&mut state);
@@ -576,6 +584,29 @@ impl SyncOutboxStore {
                 }
                 Err(error)
             }
+        }
+    }
+}
+
+fn lock_exclusive_with_timeout(lock: &std::fs::File, timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out after {}ms waiting for the sync outbox lock",
+                            timeout.as_millis()
+                        ),
+                    ));
+                }
+                std::thread::sleep(SYNC_OUTBOX_LOCK_POLL_INTERVAL.min(deadline - now));
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -809,13 +840,13 @@ fn write_state(path: &Path, state: &SyncOutboxFile) -> std::io::Result<()> {
 }
 
 /// Sync the directory after a write — call *outside* the exclusive lock to
-/// avoid serialising I/O under contention.
-fn sync_state_dir(path: &Path) {
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = OpenOptions::new().read(true).open(parent)
-    {
-        let _ = dir.sync_all();
-    }
+/// avoid serialising I/O under contention. A successful mutation is not
+/// reported until both the file contents and the rename are durable.
+fn sync_state_dir(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    OpenOptions::new().read(true).open(parent)?.sync_all()
 }
 
 fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
@@ -1028,6 +1059,37 @@ mod tests {
         let mut event = JournalEvent::config_change(Some("sess-1"), "model", value);
         event.ts = "2026-07-08T00:00:00Z".to_string();
         event
+    }
+
+    #[test]
+    fn store_lock_contention_times_out_and_recovers_after_release() {
+        let (_temp, _guard, store) = test_store();
+        std::fs::create_dir_all(&store.root).expect("create outbox root");
+        let lock_path = store.root.join("outbox.lock");
+        let held_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open lock handle");
+        held_lock.try_lock_exclusive().expect("acquire held lock");
+
+        let error = store
+            .status()
+            .expect_err("contended store lock must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+
+        held_lock.unlock().expect("release held lock");
+        let status = store.status().expect("store must recover after release");
+        assert_eq!(status.total, 0);
+    }
+
+    #[test]
+    fn directory_sync_open_failure_is_reported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing_path = temp.path().join("missing").join("outbox.json");
+        let error = sync_state_dir(&missing_path).expect_err("missing parent must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -1438,8 +1500,8 @@ mod tests {
             .expect("settle");
 
         assert_eq!(report.acked, 1);
-        assert_eq!(report.failed, 1);
-        assert_eq!(report.poisoned, 0);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.poisoned, 1);
         let status = store.status().expect("status");
         assert_eq!(status.acked, 1);
         assert_eq!(status.poisoned, 1);

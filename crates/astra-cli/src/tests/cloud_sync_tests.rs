@@ -1,5 +1,6 @@
 use crate::cli::cloud_sync::{
-    self, CloudPullResult, append_cloud_pull_sync_journal, cloud_pull_warrants_sync_marker,
+    self, CloudPullResult, append_cloud_pull_sync_journal,
+    append_cloud_pull_sync_journal_for_immediate_drain, cloud_pull_warrants_sync_marker,
     should_append_cloud_pull_journal, try_cloud_pull, try_cloud_pull_preferences,
     try_cloud_push_preferences,
 };
@@ -9,7 +10,7 @@ use crate::cli::session::session_state::SessionState;
 use crate::cli::slash::{slash_health, slash_router::handle_slash_command};
 use crate::tests::isolate_credentials;
 use astra_services::SyncOutboxStore;
-use astra_services::session_journal::{self, JournalDirGuard};
+use astra_services::session_journal::{self, JournalDirGuard, ProcessJournalDirGuard};
 use astra_sync_protocol::{SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
 use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path};
@@ -348,7 +349,7 @@ fn enqueue_ingestion_does_not_patch_missing_session_id_from_state() {
 #[tokio::test]
 async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let _guard = JournalDirGuard::new(temp.path());
+    let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
     let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
@@ -361,7 +362,7 @@ async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
     let pull = CloudPullResult {
         cloud_reachable: true,
     };
-    append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
+    append_cloud_pull_sync_journal_for_immediate_drain(&state, "default", "post_login", &pull, &[]);
 
     let ready = SyncOutboxStore::local()
         .ready_records(10)
@@ -422,7 +423,7 @@ async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
 #[tokio::test]
 async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_ack() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let _guard = JournalDirGuard::new(temp.path());
+    let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
     let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
@@ -432,7 +433,7 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
         session_id: Some(sid.clone()),
         ..Default::default()
     };
-    append_cloud_pull_sync_journal(
+    append_cloud_pull_sync_journal_for_immediate_drain(
         &state,
         "default",
         "post_login",
@@ -520,9 +521,65 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
 
 #[serial_test::serial]
 #[tokio::test]
+async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
+    let _creds = isolate_credentials();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+    let mut state = SessionState {
+        session_id: Some(format!(
+            "test-post-auth-foreground-drain-{}",
+            uuid::Uuid::new_v4()
+        )),
+        ..Default::default()
+    };
+
+    Mock::given(method("GET"))
+        .and(path("/preferences"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "preferences": [] })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("sync request JSON");
+            ResponseTemplate::new(201).set_body_json(json!({
+                "schema_version": 1,
+                "record_id": body.get("event_id").and_then(Value::as_str),
+                "payload_hash": body
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("sync_outbox"))
+                    .and_then(|sync| sync.get("payload_hash"))
+                    .and_then(Value::as_str),
+                "ingestion_status": "created"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let report = cloud_sync::post_auth_cloud_resync(None, &mut state).await;
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.acked, 1);
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.terminal, 0);
+    assert_eq!(report.blocker, None);
+    assert!(!report.is_incomplete());
+
+    let status = SyncOutboxStore::local().status().expect("status");
+    assert_eq!(status.acked, 1);
+    assert_eq!(status.pending, 0);
+    assert_eq!(status.in_flight, 0);
+}
+
+#[serial_test::serial]
+#[tokio::test]
 async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let _guard = JournalDirGuard::new(temp.path());
+    let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
     let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
@@ -535,7 +592,7 @@ async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
     let pull = CloudPullResult {
         cloud_reachable: true,
     };
-    append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
+    append_cloud_pull_sync_journal_for_immediate_drain(&state, "default", "post_login", &pull, &[]);
 
     Mock::given(method("POST"))
         .and(path("/sync/outbox/events"))
@@ -548,6 +605,9 @@ async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
     assert_eq!(report.attempted, 1);
     assert_eq!(report.acked, 0);
     assert_eq!(report.failed, 1);
+    assert_eq!(report.blocker, None);
+    assert!(report.is_incomplete());
+    assert!(report.user_notice().is_some());
     let status = SyncOutboxStore::local().status().expect("status");
     assert_eq!(status.acked, 0);
     assert_eq!(status.pending, 1);
@@ -557,15 +617,15 @@ async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn drain_sync_outbox_without_token_leaves_ready_records_unmodified() {
+async fn post_auth_sync_reports_missing_token_and_preserves_ready_records() {
     let _creds = isolate_credentials();
     let temp = tempfile::tempdir().expect("tempdir");
-    let _guard = JournalDirGuard::new(temp.path());
+    let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
     let _token = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
 
-    let state = SessionState {
+    let mut state = SessionState {
         session_id: Some(format!(
             "test-cloud-drain-no-token-{}",
             uuid::Uuid::new_v4()
@@ -575,13 +635,18 @@ async fn drain_sync_outbox_without_token_leaves_ready_records_unmodified() {
     let pull = CloudPullResult {
         cloud_reachable: true,
     };
-    append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
+    append_cloud_pull_sync_journal_for_immediate_drain(&state, "default", "post_login", &pull, &[]);
 
-    let report = cloud_sync::try_drain_sync_outbox(10).await;
+    let report = cloud_sync::post_auth_cloud_resync(None, &mut state).await;
     assert!(report.cloud_configured);
     assert_eq!(report.attempted, 0);
     assert_eq!(report.acked, 0);
     assert_eq!(report.failed, 0);
+    assert_eq!(
+        report.blocker,
+        Some(cloud_sync::SyncOutboxDrainBlocker::MissingAccessToken)
+    );
+    assert!(report.user_notice().is_some());
 
     let status = SyncOutboxStore::local().status().expect("status");
     assert_eq!(status.pending, 1);
@@ -590,6 +655,25 @@ async fn drain_sync_outbox_without_token_leaves_ready_records_unmodified() {
     assert_eq!(status.retry_deferred, 0);
     assert_eq!(status.poisoned, 0);
     assert_eq!(status.ack_watermark, 0);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn drain_empty_sync_outbox_does_not_require_cloud_credentials() {
+    let _creds = isolate_credentials();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _token = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
+
+    let report = cloud_sync::try_drain_sync_outbox(10).await;
+    assert!(report.cloud_configured);
+    assert_eq!(report.attempted, 0);
+    assert_eq!(report.remaining_ready, 0);
+    assert_eq!(report.blocker, None);
+    assert!(!report.is_incomplete());
+    assert_eq!(report.user_notice(), None);
 }
 
 #[tokio::test]

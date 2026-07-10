@@ -4,7 +4,11 @@ use astra_services::session_journal;
 use std::time::Instant;
 
 /// Cloud journal ingestion is server-owned; CLI keeps the local journal path.
-fn enqueue_ingestion(_state: &SessionState, event: &session_journal::JournalEvent) {
+fn enqueue_ingestion(
+    _state: &SessionState,
+    event: &session_journal::JournalEvent,
+    schedule_background_drain: bool,
+) {
     let store = astra_services::SyncOutboxStore::local();
     if event
         .session_id
@@ -31,7 +35,8 @@ fn enqueue_ingestion(_state: &SessionState, event: &session_journal::JournalEven
         return;
     }
     match store.enqueue_journal_event(event) {
-        Ok(_) => crate::cli::cloud_sync::schedule_sync_outbox_drain(),
+        Ok(_) if schedule_background_drain => crate::cli::cloud_sync::schedule_sync_outbox_drain(),
+        Ok(_) => {}
         Err(error) => {
             tracing::warn!(
                 target: "astra_cli::cloud_sync",
@@ -45,7 +50,14 @@ fn enqueue_ingestion(_state: &SessionState, event: &session_journal::JournalEven
 }
 
 pub(crate) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
-    enqueue_ingestion(state, event);
+    enqueue_ingestion(state, event, true);
+}
+
+pub(crate) fn enqueue_ingestion_for_immediate_drain_pub(
+    state: &SessionState,
+    event: &session_journal::JournalEvent,
+) {
+    enqueue_ingestion(state, event, false);
 }
 
 pub(crate) fn drop_unattributed_memory_recalls_at_turn_end(session_id: Option<&str>) -> usize {

@@ -31,10 +31,11 @@ pub(crate) async fn handle_sync_command(arg: &str, _state: &SessionState) {
             Ok(count) => {
                 let report = cloud_sync::try_drain_sync_outbox(64).await;
                 cli_ok!(
-                    "Queued {count} retryable sync record(s); attempted {}, acked {}, failed {}.",
+                    "Queued {count} retryable sync record(s); attempted {}, acked {}, retryable failures {}, terminal {}.",
                     report.attempted,
                     report.acked,
-                    report.failed
+                    report.failed,
+                    report.terminal
                 );
                 if !report.cloud_configured {
                     cli_dim!("ASTRA_API_URL is not configured; records remain durable locally.");
@@ -48,10 +49,11 @@ pub(crate) async fn handle_sync_command(arg: &str, _state: &SessionState) {
             Ok(count) => {
                 let report = cloud_sync::try_drain_sync_outbox(64).await;
                 cli_ok!(
-                    "Repaired {count} retry-exhausted sync record(s); attempted {}, acked {}, failed {}.",
+                    "Repaired {count} retry-exhausted sync record(s); attempted {}, acked {}, retryable failures {}, terminal {}.",
                     report.attempted,
                     report.acked,
-                    report.failed
+                    report.failed,
+                    report.terminal
                 );
                 cli_dim!(
                     "Payload hash mismatch records remain poisoned until the conflicting source is inspected."

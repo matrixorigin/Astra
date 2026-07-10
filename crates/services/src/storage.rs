@@ -6500,30 +6500,6 @@ mod tests {
     }
 
     #[test]
-    fn add_agent_session_event_count_upsert_is_atomically_owner_guarded() {
-        let sql = ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL;
-        assert!(
-            sql.contains("WHERE session_id = ? AND user_id <> ?"),
-            "insert path must reject an existing session_id owned by another user"
-        );
-        assert!(
-            !sql.contains(concat!("ELSE ", "NULL")),
-            "owner mismatch must not rely on NOT NULL constraint failures"
-        );
-        for assignment in [
-            "event_count = IF(user_id = VALUES(user_id), event_count + VALUES(event_count), event_count)",
-            "last_event_id = IF(user_id = VALUES(user_id), COALESCE(VALUES(last_event_id), last_event_id), last_event_id)",
-            "updated_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at)",
-            "last_active_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)",
-        ] {
-            assert!(
-                sql.contains(assignment),
-                "upsert assignment must be owner-guarded: {assignment}"
-            );
-        }
-    }
-
-    #[test]
     fn session_activity_timestamp_updates_are_coalesced() {
         let source = include_str!("storage.rs");
         let coalesced = "last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND)";
