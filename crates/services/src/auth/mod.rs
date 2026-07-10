@@ -1,7 +1,9 @@
 use crate::storage::database_user_from_row;
 use astra_core::{
     ErrorResponse, JwtSettings, MatrixOneSettings, ProviderRequestAuthConfig, SharedPool,
-    bearer_token, error_response, error_response_coded, internal_error, is_duplicate_key_error,
+    bearer_token, error_response, error_response_coded,
+    identity::{USER_ID_MAX_LEN, USERNAME_MAX_LEN},
+    internal_error, is_duplicate_key_error,
 };
 use async_trait::async_trait;
 use axum::{
@@ -1121,6 +1123,17 @@ impl AuthService for DatabaseAuthService {
             "provider_authorized:{}:{}",
             authorized.provider_id, authorized.external_subject
         );
+        let username_len = authorized.external_subject.chars().count();
+        if username_len > USERNAME_MAX_LEN {
+            return Err(provider_request_auth_error(
+                "Provider request external subject exceeds the Astra username limit",
+            ));
+        }
+        if user_id.chars().count() > USER_ID_MAX_LEN {
+            return Err(provider_request_auth_error(
+                "Provider-authorized user principal exceeds the Astra user_id limit",
+            ));
+        }
         Ok(AuthPrincipal {
             user: AuthUserRecord {
                 user_id,
@@ -1406,6 +1419,46 @@ mod tests {
             "provider_authorized:moi:user_2"
         );
         assert_ne!(first_principal.user.user_id, second_principal.user.user_id);
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_accepts_maximum_provider_principal() {
+        let now = Utc::now().timestamp();
+        let prefix_len = "provider_authorized:moi:".chars().count();
+        let subject = "u".repeat(USER_ID_MAX_LEN - prefix_len);
+        let token = hmac_provider_token(&subject, "workspace_1", "moi", now, now + 300);
+        let principal = hmac_provider_service()
+            .current_principal_for_request(
+                &provider_headers(&token, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect("maximum-length provider principal should resolve");
+
+        assert_eq!(principal.user.user_id.chars().count(), USER_ID_MAX_LEN);
+        assert_eq!(principal.user.username, subject);
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_oversized_provider_principal() {
+        let now = Utc::now().timestamp();
+        let prefix_len = "provider_authorized:moi:".chars().count();
+        let subject = "u".repeat(USER_ID_MAX_LEN - prefix_len + 1);
+        let token = hmac_provider_token(&subject, "workspace_1", "moi", now, now + 300);
+        let (status, body) = hmac_provider_service()
+            .current_principal_for_request(
+                &provider_headers(&token, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect_err("oversized provider principal must be rejected before persistence");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            body.0
+                .detail
+                .contains("user principal exceeds the Astra user_id limit")
+        );
     }
 
     #[tokio::test]

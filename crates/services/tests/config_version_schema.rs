@@ -214,7 +214,7 @@ async fn config_versions_schema_and_queries_hold_on_live_matrixone() {
     );
     assert_eq!(
         columns.get("user_id"),
-        Some(&("varchar".to_string(), Some(64), "NO".to_string()))
+        Some(&("varchar".to_string(), Some(128), "NO".to_string()))
     );
     let toml_body = columns
         .get("toml_body")

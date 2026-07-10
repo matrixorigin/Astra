@@ -1,11 +1,11 @@
 use super::AuthRegisterRequestData;
-use astra_core::{ErrorResponse, error_response};
+use astra_core::{ErrorResponse, error_response, identity::USERNAME_MAX_LEN};
 use axum::{Json, http::StatusCode};
 
 pub(super) fn validate_register_request(
     request: &AuthRegisterRequestData,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let valid_username_len = (3..=50).contains(&request.username.len());
+    let valid_username_len = (3..=USERNAME_MAX_LEN).contains(&request.username.len());
     let valid_username_chars = request
         .username
         .chars()
@@ -19,7 +19,7 @@ pub(super) fn validate_register_request(
         .unwrap_or(true);
 
     let detail = if !valid_username_len {
-        "username must be 3-50 characters"
+        "username must be 3-128 characters"
     } else if !valid_username_chars {
         "username may only contain letters, digits, underscores, or hyphens"
     } else if !valid_password_len {
@@ -116,6 +116,28 @@ mod tests {
             display_name: None,
         };
         assert!(validate_register_request(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_username_boundary_128() {
+        let req = AuthRegisterRequestData {
+            username: "a".repeat(USERNAME_MAX_LEN),
+            email: "x@t.c".to_string(),
+            password: "password123".to_string(),
+            display_name: None,
+        };
+        assert!(validate_register_request(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_username_too_long() {
+        let req = AuthRegisterRequestData {
+            username: "a".repeat(USERNAME_MAX_LEN + 1),
+            email: "x@t.c".to_string(),
+            password: "password123".to_string(),
+            display_name: None,
+        };
+        assert!(validate_register_request(&req).is_err());
     }
 
     #[test]

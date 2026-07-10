@@ -502,7 +502,7 @@ async fn evaluation_schema_supports_calibration_reads() {
     assert_eq!(
         column_character_maximum_length(&pool, &schema, "eval_calibration_assessments", "user_id")
             .await,
-        Some(64),
+        Some(128),
         "eval_calibration_assessments.user_id must use the standard owner width"
     );
     assert_eq!(

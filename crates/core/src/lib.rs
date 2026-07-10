@@ -11,6 +11,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
+pub mod identity;
+
 pub mod canonical_names;
 #[cfg(any(test, feature = "dev-defaults"))]
 pub mod test_paths;

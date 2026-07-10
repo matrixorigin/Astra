@@ -6,7 +6,7 @@
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS config_versions (
 //!     version_id          VARCHAR(24) NOT NULL,
-//!     user_id             VARCHAR(64) NOT NULL,
+//!     user_id             VARCHAR(128) NOT NULL,
 //!     toml_body           MEDIUMTEXT NOT NULL,
 //!     created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 //!     first_seen_session  VARCHAR(64) NULL,
@@ -26,7 +26,7 @@
 /// `ensure_core_schema` on every server boot.
 pub const CONFIG_VERSIONS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS config_versions (
     version_id          VARCHAR(24) NOT NULL,
-    user_id             VARCHAR(64) NOT NULL,
+    user_id             VARCHAR(128) NOT NULL,
     toml_body           MEDIUMTEXT NOT NULL,
     created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     first_seen_session  VARCHAR(64) NULL,

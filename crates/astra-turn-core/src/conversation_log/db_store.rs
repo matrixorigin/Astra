@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use sqlx::{Row, mysql::MySqlRow, query};
 use tokio::sync::OnceCell;
 
-use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
+use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone, identity::USER_ID_MAX_LEN};
 
 use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
 
@@ -120,10 +120,10 @@ fn validate_user_id(user_id: &str) -> Result<(), CslStoreError> {
             "DbCslStore requires a non-empty user_id".to_string(),
         ));
     }
-    if user_id.len() > 64 {
+    let user_id_len = user_id.chars().count();
+    if user_id_len > USER_ID_MAX_LEN {
         return Err(CslStoreError::Other(format!(
-            "DbCslStore user_id exceeds 64 bytes: {}",
-            user_id.len()
+            "DbCslStore user_id exceeds {USER_ID_MAX_LEN} characters: {user_id_len}"
         )));
     }
     Ok(())
@@ -133,6 +133,23 @@ fn owner_mismatch_error(session_id: &str, user_id: &str, reason: &str) -> CslSto
     CslStoreError::Other(format!(
         "conversation_log owner mismatch for session_id={session_id} user_id={user_id}: {reason}"
     ))
+}
+
+#[cfg(test)]
+mod user_id_validation_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_user_id_at_repository_limit() {
+        assert!(validate_user_id(&"u".repeat(USER_ID_MAX_LEN)).is_ok());
+    }
+
+    #[test]
+    fn rejects_user_id_above_repository_limit() {
+        let error = validate_user_id(&"u".repeat(USER_ID_MAX_LEN + 1))
+            .expect_err("oversized user_id must be rejected");
+        assert!(error.to_string().contains("exceeds 128 characters"));
+    }
 }
 
 #[async_trait]

@@ -82,7 +82,7 @@ fn team_cursor_required_id(
 /// ```sql
 /// CREATE TABLE IF NOT EXISTS team_definitions (
 ///     team_id       VARCHAR(64)  PRIMARY KEY,
-///     user_id       VARCHAR(64)  NOT NULL,
+///     user_id       VARCHAR(128)  NOT NULL,
 ///     name          VARCHAR(128) NOT NULL,
 ///     description   TEXT,
 ///     coordination  TEXT         NOT NULL,
