@@ -57,25 +57,30 @@ jobs:
           echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
 
   build:
-    name: Build ${{ matrix.platform }}
+    name: Build & Push DockerHub and IDC Images
     needs: version
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            slug: linux-amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            slug: linux-arm64
+    runs-on: amd64-mo-shanghai-dind
+    timeout-minutes: 240
+    env:
+      http_proxy: http://proxy-service.proxy.svc.cluster.local:8001
+      https_proxy: http://proxy-service.proxy.svc.cluster.local:8001
+      no_proxy: .local,.cn,.gitee.com,.tencent.com,.tencentyun.com,.aliyun.com,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,localhost,127.0.0.0/8,.qq.com,169.254.0.0/16,.myqcloud.com,.matrixone.tech,.aliyuncs.com,.digicert.com,.microsoft.com,.visualstudio.com,.symcb.com,0.0.0.0
 
     steps:
       - uses: actions/checkout@v4
 
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+          cache-image: false
+
       - uses: docker/setup-buildx-action@v3
+        id: buildx
+        with:
+          driver-opts: |
+            env.https_proxy=${{ env.https_proxy }}
+            env.http_proxy=${{ env.http_proxy }}
+            "env.no_proxy=${{ env.no_proxy }}"
 
       - uses: docker/login-action@v3
         with:
@@ -91,7 +96,9 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.IMAGE_NAME }}
+            ${{ env.IDC_IMAGE_NAME }}
           flavor: |
             latest=false
           tags: |
@@ -100,123 +107,34 @@ jobs:
             type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
 
       - uses: docker/build-push-action@v6
-        id: build
         with:
+          builder: ${{ steps.buildx.outputs.name }}
           context: .
           file: Dockerfile
-          platforms: ${{ matrix.platform }}
-          tags: |
-            ${{ env.IMAGE_NAME }}
-            ${{ env.IDC_IMAGE_NAME }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             IMAGE_VERSION=${{ needs.version.outputs.image_version }}
             IMAGE_REVISION=${{ github.sha }}
             IMAGE_BRANCH=${{ github.ref_name }}
-          cache-from: type=gha,scope=docker-${{ matrix.slug }}
-          cache-to: type=gha,scope=docker-${{ matrix.slug }},mode=max
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+            http_proxy=${{ env.http_proxy }}
+            https_proxy=${{ env.https_proxy }}
+            no_proxy=${{ env.no_proxy }}
+            HTTP_PROXY=${{ env.http_proxy }}
+            HTTPS_PROXY=${{ env.https_proxy }}
+            NO_PROXY=${{ env.no_proxy }}
+          cache-from: type=gha,scope=release-docker
+          cache-to: type=gha,scope=release-docker,mode=max
           provenance: mode=max
           sbom: true
 
-      - name: Export digest
+      - name: Verify published manifests
         shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ matrix.slug }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  merge:
-    name: Merge & Push Docker Manifest
-    needs:
-      - version
-      - build
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: digests-*
-          path: /tmp/digests
-          merge-multiple: true
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.IDC_REGISTRY }}
-          username: ${{ secrets.IDC_REGISTRY_USERNAME }}
-          password: ${{ secrets.IDC_REGISTRY_PASSWORD }}
-
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          flavor: |
-            latest=false
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.latest == 'true' }}
-            type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
-
-      - uses: docker/metadata-action@v5
-        id: idc-meta
-        with:
-          images: ${{ env.IDC_IMAGE_NAME }}
-          flavor: |
-            latest=false
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.latest == 'true' }}
-            type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
-
-      - name: Create Docker manifest lists
-        shell: bash
-        working-directory: /tmp/digests
         env:
-          DOCKERHUB_IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          DOCKERHUB_METADATA_JSON: ${{ steps.meta.outputs.json }}
-          IDC_IMAGE_NAME: ${{ env.IDC_IMAGE_NAME }}
-          IDC_METADATA_JSON: ${{ steps.idc-meta.outputs.json }}
+          IMAGE_VERSION: ${{ needs.version.outputs.image_version }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-
-          create_manifest_list() {
-            local image_name="$1"
-            local metadata_json="$2"
-            local -a tag_args=()
-            local -a sources=()
-
-            mapfile -t tag_args < <(jq -r '.tags[] | "-t", .' <<< "${metadata_json}")
-            if [ "${#tag_args[@]}" -eq 0 ]; then
-              echo "No Docker tags were generated for ${image_name}" >&2
-              exit 1
-            fi
-
-            for digest in *; do
-              sources+=("${image_name}@sha256:${digest}")
-            done
-            if [ "${#sources[@]}" -eq 0 ]; then
-              echo "No platform image digests were downloaded" >&2
-              exit 1
-            fi
-
-            docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
-          }
-
-          create_manifest_list "${DOCKERHUB_IMAGE_NAME}" "${DOCKERHUB_METADATA_JSON}"
-          create_manifest_list "${IDC_IMAGE_NAME}" "${IDC_METADATA_JSON}"
+          docker buildx imagetools inspect "${IMAGE_NAME}:${IMAGE_VERSION}" >/dev/null
+          docker buildx imagetools inspect "${IDC_IMAGE_NAME}:${IMAGE_VERSION}" >/dev/null
