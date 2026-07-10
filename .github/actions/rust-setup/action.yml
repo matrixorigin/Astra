@@ -18,6 +18,10 @@ inputs:
     description: "Use mold as the Linux linker"
     required: false
     default: "true"
+  install-nextest:
+    description: "Install cargo-nextest"
+    required: false
+    default: "true"
 
 runs:
   using: "composite"
@@ -40,6 +44,7 @@ runs:
       run: rustc --version
 
     - uses: taiki-e/install-action@nextest
+      if: ${{ inputs.install-nextest == 'true' }}
 
     - name: Install mold linker
       if: ${{ inputs.use-mold == 'true' && runner.os == 'Linux' }}

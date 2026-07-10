@@ -105,8 +105,10 @@ jobs:
             IMAGE_VERSION=${{ needs.version.outputs.image_version }}
             IMAGE_REVISION=${{ github.sha }}
             IMAGE_BRANCH=${{ github.ref_name }}
-          cache-from: type=gha,scope=docker-${{ matrix.slug }}
-          cache-to: type=gha,scope=docker-${{ matrix.slug }},mode=max
+          # Registry caches are shared across release tags/branches and do not
+          # compete with Rust/sccache for the repository's Actions cache quota.
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.slug }}
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.slug }},mode=max
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true

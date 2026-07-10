@@ -27,6 +27,9 @@ test-threads = 2
 fail-fast = false
 slow-timeout = { period = "30s", terminate-after = 1 }
 failure-output = "immediate"
+# Hosted runners are intentionally small. Shards provide workflow-level
+# parallelism, so keep each runner's test process fan-out bounded.
+test-threads = 2
 
 [profile.strict]
 fail-fast = false

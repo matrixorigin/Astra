@@ -1400,8 +1400,17 @@ check: lint format-check type-check check-web
 ci: check test
 	@echo "✅ All CI checks passed!"
 
+.PHONY: toolchain-check
+toolchain-check:
+	@toolchain_version=$$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml); \
+	docker_version=$$(sed -nE 's/^ARG RUST_VERSION=([0-9.]+)-.*/\1/p' Dockerfile); \
+	if [ -z "$$toolchain_version" ] || [ -z "$$docker_version" ] || [ "$$toolchain_version" != "$$docker_version" ]; then \
+		echo "❌ Rust toolchain mismatch: rust-toolchain.toml=$${toolchain_version:-missing}, Dockerfile=$${docker_version:-missing}"; \
+		exit 1; \
+	fi
+
 .PHONY: lint
-lint: sweep
+lint: toolchain-check sweep
 	@echo "Running clippy..."
 	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
 
