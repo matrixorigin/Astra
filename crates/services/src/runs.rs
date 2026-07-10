@@ -1236,15 +1236,11 @@ impl Default for InMemoryRunStateStore {
     }
 }
 
-fn run_requires_session_exclusive_start(record: &DurableRunRecord) -> bool {
+fn run_requires_session_execution_slot(record: &DurableRunRecord) -> bool {
     record.parent_run_id.is_none()
         && record.retry_of.is_none()
         && record.delegation_id.is_none()
         && record.agent_id.is_none()
-}
-
-fn run_record_owns_session_execution_slot(run: &DurableRunRecord) -> bool {
-    run_requires_session_exclusive_start(run)
 }
 
 fn sync_in_memory_execution_slot(
@@ -1253,7 +1249,7 @@ fn sync_in_memory_execution_slot(
     status: &str,
     waiting_for: Option<&str>,
 ) -> Result<(), String> {
-    if !run_record_owns_session_execution_slot(run) {
+    if !run_requires_session_execution_slot(run) {
         return Ok(());
     }
     let key = (run.user_id.clone(), run.session_id.clone());
@@ -1294,7 +1290,7 @@ fn reconcile_in_memory_execution_slot_for_session(
             if runs.get(owner).is_some_and(|run| {
                 run.user_id == user_id
                     && run.session_id == session_id
-                    && run_record_owns_session_execution_slot(run)
+                    && run_requires_session_execution_slot(run)
                     && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
             }) =>
         {
@@ -1307,7 +1303,7 @@ fn reconcile_in_memory_execution_slot_for_session(
     for run in runs.values().filter(|run| {
         run.user_id == user_id
             && run.session_id == session_id
-            && run_record_owns_session_execution_slot(run)
+            && run_requires_session_execution_slot(run)
             && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
     }) {
         if let Some(existing) = owner {
@@ -1549,7 +1545,7 @@ impl RunStateStore for InMemoryRunStateStore {
             &runs,
             &record.user_id,
             &record.session_id,
-            run_requires_session_exclusive_start(&record)
+            run_requires_session_execution_slot(&record)
                 && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref()),
         )?;
         sync_in_memory_execution_slot(
@@ -2514,7 +2510,7 @@ impl DatabaseRunStateStore {
         status: &str,
         waiting_for: Option<&str>,
     ) -> DbStoreResult<bool> {
-        if !run_record_owns_session_execution_slot(run) {
+        if !run_requires_session_execution_slot(run) {
             return Ok(true);
         }
         if durable_run_status_blocks_session(status, waiting_for) {
@@ -3380,7 +3376,7 @@ impl RunStateStore for DatabaseRunStateStore {
             record.last_event_idx = -1;
         }
 
-        let insert_result = if run_requires_session_exclusive_start(&record)
+        let insert_result = if run_requires_session_execution_slot(&record)
             && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref())
         {
             let mut tx = self.pool.get().begin().await.map_err(|source| {
@@ -6259,25 +6255,25 @@ mod tests {
     }
 
     #[test]
-    fn session_exclusive_start_applies_only_to_user_root_runs() {
+    fn session_execution_slot_applies_only_to_user_root_runs() {
         let root = durable_run_record("root");
-        assert!(run_requires_session_exclusive_start(&root));
+        assert!(run_requires_session_execution_slot(&root));
 
         let mut retry = durable_run_record("retry");
         retry.retry_of = Some("root".into());
-        assert!(!run_requires_session_exclusive_start(&retry));
+        assert!(!run_requires_session_execution_slot(&retry));
 
         let mut child = durable_run_record("child");
         child.parent_run_id = Some("root".into());
-        assert!(!run_requires_session_exclusive_start(&child));
+        assert!(!run_requires_session_execution_slot(&child));
 
         let mut delegated = durable_run_record("delegated");
         delegated.delegation_id = Some("delegation-1".into());
-        assert!(!run_requires_session_exclusive_start(&delegated));
+        assert!(!run_requires_session_execution_slot(&delegated));
 
         let mut team_parent = durable_run_record("team-parent");
         team_parent.agent_id = Some("orchestrator".into());
-        assert!(!run_requires_session_exclusive_start(&team_parent));
+        assert!(!run_requires_session_execution_slot(&team_parent));
     }
 
     #[test]
@@ -7831,6 +7827,113 @@ mod tests {
         for (_label, input, check) in &cases {
             let out = transform_run_event_for_client(input.clone());
             check(&out);
+        }
+    }
+
+    #[test]
+    fn public_sse_event_wire_contract_is_exact_for_core_lifecycle() {
+        let cases = vec![
+            (
+                make_event("text_delta", json!({"chunk": "hi"})),
+                json!({"type": "text_delta", "content": "hi"}),
+            ),
+            (
+                make_event(
+                    "tool_call_start",
+                    json!({
+                        "name": "bash",
+                        "tool_call_id": "call-1",
+                        "args": {"command": "pwd"},
+                        "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
+                        "executor": {"kind": "edge_agent", "executor_id": "edge-1"},
+                        "transport": "edge_ws"
+                    }),
+                ),
+                json!({
+                    "type": "tool_call_start",
+                    "tool": "bash",
+                    "call_id": "call-1",
+                    "arguments": {"command": "pwd"},
+                    "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
+                    "executor": {"kind": "edge_agent", "executor_id": "edge-1"},
+                    "transport": "edge_ws"
+                }),
+            ),
+            (
+                make_event(
+                    "tool_result",
+                    json!({
+                        "name": "bash",
+                        "tool_call_id": "call-1",
+                        "output": "ok",
+                        "success": true,
+                        "duration_ms": 12,
+                        "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
+                        "executor": {"kind": "edge_agent", "executor_id": "edge-1"},
+                        "transport": "edge_ws"
+                    }),
+                ),
+                json!({
+                    "type": "tool_call_end",
+                    "tool": "bash",
+                    "call_id": "call-1",
+                    "result": "ok",
+                    "success": true,
+                    "duration_ms": 12,
+                    "workspace": {"kind": "edge_workspace", "cwd": "/repo"},
+                    "executor": {"kind": "edge_agent", "executor_id": "edge-1"},
+                    "transport": "edge_ws"
+                }),
+            ),
+            (
+                make_event(
+                    "run_finished",
+                    json!({
+                        "run_id": "run-1",
+                        "status": "paused",
+                        "error_code": "network",
+                        "interrupted": true,
+                        "interruption_kind": "executor_offline",
+                        "resumable": true,
+                        "waiting_for": "executor"
+                    }),
+                ),
+                json!({
+                    "type": "run_finished",
+                    "run_id": "run-1",
+                    "status": "paused",
+                    "error_code": "network",
+                    "interrupted": true,
+                    "interruption_kind": "executor_offline",
+                    "resumable": true,
+                    "waiting_for": "executor"
+                }),
+            ),
+            (
+                make_event(
+                    "run_error",
+                    json!({
+                        "run_id": "run-1",
+                        "error": "slow down",
+                        "error_kind": "rate_limit"
+                    }),
+                ),
+                json!({
+                    "type": "run_error",
+                    "run_id": "run-1",
+                    "message": "slow down",
+                    "error": "slow down",
+                    "error_kind": "rate_limit",
+                    "error_code": "rate_limit",
+                    "code": "LLM_RATE_LIMIT",
+                    "retryable": true,
+                    "retry_after_ms": 5_000
+                }),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(transform_run_event_for_client(input), expected);
         }
     }
 

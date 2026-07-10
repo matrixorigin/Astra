@@ -211,6 +211,11 @@ pub struct CompactResult {
     /// Structured current-session memory routed separately through the
     /// context pipeline instead of being injected as a synthetic history blob.
     pub session_memory_context: Option<String>,
+    /// Additional current-session working memories retrieved during
+    /// compaction. These stay structured so callers can re-run the shared
+    /// Memory binder and preserve identity, ranking, budgeting, and
+    /// `CacheScope::None` placement.
+    pub retrieved_memory_entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
     /// Required per-compaction runtime context routed through the volatile
     /// system lane, never persisted as user/assistant/tool history.
     pub runtime_contexts: Vec<String>,
@@ -287,6 +292,7 @@ pub(crate) fn compact_tiered_impl(
             boundary: None,
             tier,
             session_memory_context: None,
+            retrieved_memory_entries: Vec::new(),
             runtime_contexts: Vec::new(),
         };
     }
@@ -324,6 +330,7 @@ pub(crate) fn compact_tiered_impl(
             boundary: None,
             tier,
             session_memory_context: None,
+            retrieved_memory_entries: Vec::new(),
             runtime_contexts: Vec::new(),
         };
     }
@@ -462,6 +469,7 @@ pub(crate) fn compact_tiered_impl(
         boundary: Some(boundary),
         tier,
         session_memory_context: None,
+        retrieved_memory_entries: Vec::new(),
         runtime_contexts: Vec::new(),
     }
 }

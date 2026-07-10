@@ -531,15 +531,18 @@ impl SyncOutboxStore {
         f: impl FnOnce(&mut SyncOutboxFile) -> std::io::Result<R>,
     ) -> std::io::Result<R> {
         let path = self.path();
-        let result = self.locked(|state| {
+        self.locked(|state| {
             let result = f(state)?;
             state.compact_acked_tail();
             state.compact_skipped_records();
             write_state(&path, state)?;
+            // The directory fsync is part of the same durable transaction as
+            // the rename. Keep the cross-process lock until it succeeds so no
+            // writer can observe and build on a state that has not crossed its
+            // own durability boundary yet.
+            sync_state_dir(&path)?;
             Ok(result)
-        })?;
-        sync_state_dir(&path)?;
-        Ok(result)
+        })
     }
 
     fn with_state_readonly<R>(
@@ -844,9 +847,8 @@ fn write_state(path: &Path, state: &SyncOutboxFile) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Sync the directory after a write — call *outside* the exclusive lock to
-/// avoid serialising I/O under contention. A successful mutation is not
-/// reported until both the file contents and the rename are durable.
+/// Sync the directory after a write. Callers hold the exclusive outbox lock so
+/// the file rename and its durability barrier form one ordered transaction.
 fn sync_state_dir(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -927,10 +929,16 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
 }
 
 fn in_flight_lease_expired(record: &SyncOutboxRecord, now: u64) -> bool {
-    record
-        .updated_at_unix_ms
-        .saturating_add(SYNC_OUTBOX_IN_FLIGHT_LEASE_MS)
-        <= now
+    // A persistent lease needs wall-clock timestamps to survive process
+    // restart. If the wall clock moves backwards past the recorded claim,
+    // prefer an idempotent redelivery over leaving the outbox stuck until the
+    // clock catches up. Stable record ids make that the safe at-least-once
+    // failure mode.
+    now < record.updated_at_unix_ms
+        || record
+            .updated_at_unix_ms
+            .saturating_add(SYNC_OUTBOX_IN_FLIGHT_LEASE_MS)
+            <= now
 }
 
 fn record_ready_for_claim(record: &SyncOutboxRecord, now: u64) -> bool {
@@ -1335,6 +1343,37 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].record_id, record_id);
         assert!(store.mark_in_flight(&record_id).expect("reclaim"));
+    }
+
+    #[test]
+    fn wall_clock_rollback_reclaims_in_flight_record_for_idempotent_redelivery() {
+        let (_temp, _guard, store) = test_store();
+        let SyncOutboxEnqueueOutcome::Inserted { record_id, .. } = store
+            .enqueue_journal_event(&event("clock-rollback"))
+            .expect("enqueue")
+        else {
+            panic!("insert");
+        };
+        assert!(store.mark_in_flight(&record_id).expect("mark"));
+
+        let observed_now = unix_ms().expect("time");
+        store
+            .with_state(|state| {
+                let record = state
+                    .records
+                    .iter_mut()
+                    .find(|record| record.record_id == record_id)
+                    .expect("record");
+                record.updated_at_unix_ms = observed_now.saturating_add(60_000);
+                Ok(())
+            })
+            .expect("future-dated claim");
+
+        let status = store.status().expect("status");
+        assert_eq!(status.stale_in_flight, 1);
+        let ready = store.ready_records(10).expect("ready");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].record_id, record_id);
     }
 
     #[test]

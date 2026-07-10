@@ -94,19 +94,46 @@ pub(crate) fn session_memory_entry_for_user_turn(
     session_memory_entry_for_pipeline(content, snapshot_updated_turn)
 }
 
-pub(crate) fn rerun_with_distinct_session_memory_entry_for_user_turn<T>(
+pub(crate) fn rerun_with_compaction_memory_for_user_turn<T>(
     content: Option<&str>,
-    existing: Option<&astra_turn_core::context_sources::MemoryEntry>,
+    existing_session: Option<&astra_turn_core::context_sources::MemoryEntry>,
     snapshot_updated_turn: Option<u32>,
-    rerun: impl FnOnce(astra_turn_core::context_sources::MemoryEntry) -> T,
+    existing_memories: &[astra_turn_core::context_sources::MemoryEntry],
+    retrieved_memories: &[astra_turn_core::context_sources::MemoryEntry],
+    rerun: impl FnOnce(
+        Option<astra_turn_core::context_sources::MemoryEntry>,
+        &[astra_turn_core::context_sources::MemoryEntry],
+    ) -> T,
 ) -> Option<T> {
-    let entry = session_memory_entry_for_user_turn(content, snapshot_updated_turn)?;
-    if existing.is_some_and(|current| {
-        current.content_hash == entry.content_hash && current.content == entry.content
-    }) {
+    let session_entry = session_memory_entry_for_user_turn(content, snapshot_updated_turn)
+        .or_else(|| existing_session.cloned());
+    let session_changed = session_entry.as_ref() != existing_session;
+
+    let mut merged_memories = existing_memories.to_vec();
+    for retrieved in retrieved_memories {
+        // The initial prefetch already passed typed-protocol admission and is
+        // the turn's coherent read snapshot. A second compaction retrieval may
+        // surface the same backend row; keep the admitted entry and use the
+        // compaction result only to fill identities that prefetch missed.
+        let identity_exists = retrieved.memory_id.as_ref().is_some_and(|memory_id| {
+            merged_memories
+                .iter()
+                .any(|current| current.memory_id.as_ref() == Some(memory_id))
+        });
+        if !identity_exists
+            && !merged_memories
+                .iter()
+                .any(|current| current.content_hash == retrieved.content_hash)
+        {
+            merged_memories.push(retrieved.clone());
+        }
+    }
+    let memories_changed = merged_memories != existing_memories;
+
+    if !session_changed && !memories_changed {
         return None;
     }
-    Some(rerun(entry))
+    Some(rerun(session_entry, &merged_memories))
 }
 
 /// Session-level context that Memoria compaction needs. Bundled into one
@@ -737,33 +764,63 @@ mod tests {
     }
 
     #[test]
-    fn rerun_with_distinct_session_memory_entry_for_user_turn_skips_identical_content() {
+    fn compaction_memory_rerun_skips_identical_context() {
         let current = session_memory_entry_for_pipeline(Some("same memory"), Some(7))
             .expect("current session memory entry");
-        let rerun = rerun_with_distinct_session_memory_entry_for_user_turn(
+        let rerun = rerun_with_compaction_memory_for_user_turn(
             Some("same memory"),
             Some(&current),
             Some(7),
-            |_| panic!("identical content should not rerun"),
+            &[],
+            &[],
+            |_, _| panic!("identical content should not rerun"),
         );
         assert!(rerun.is_none());
     }
 
     #[test]
-    fn rerun_with_distinct_session_memory_entry_for_user_turn_keeps_changed_content() {
+    fn compaction_memory_rerun_keeps_changed_session_snapshot() {
         let current = session_memory_entry_for_pipeline(Some("old memory"), Some(7))
             .expect("current session memory entry");
-        let rerun = rerun_with_distinct_session_memory_entry_for_user_turn(
+        let rerun = rerun_with_compaction_memory_for_user_turn(
             Some("new memory"),
             Some(&current),
             Some(7),
-            |entry| entry,
+            &[],
+            &[],
+            |entry, _| entry,
         )
         .expect("changed session memory should rerun");
         assert_eq!(
             rerun,
-            session_memory_entry_for_pipeline(Some("new memory"), Some(7)).expect("rerun entry")
+            Some(
+                session_memory_entry_for_pipeline(Some("new memory"), Some(7))
+                    .expect("rerun entry")
+            )
         );
+    }
+
+    #[test]
+    fn compaction_memory_rerun_merges_without_replacing_prefetched_identity() {
+        let existing = astra_turn_core::context_sources::MemoryEntry::scored("old", 0.4)
+            .with_memory_identity("mem-1", "working");
+        let replacement = astra_turn_core::context_sources::MemoryEntry::scored("new", 0.9)
+            .with_memory_identity("mem-1", "working");
+        let additional = astra_turn_core::context_sources::MemoryEntry::scored("next", 0.8)
+            .with_memory_identity("mem-2", "working");
+
+        let rerun = rerun_with_compaction_memory_for_user_turn(
+            None,
+            None,
+            None,
+            &[existing.clone()],
+            &[replacement, additional.clone()],
+            |session, memories| (session, memories.to_vec()),
+        )
+        .expect("retrieved working memories should rerun the pipeline");
+
+        assert!(rerun.0.is_none());
+        assert_eq!(rerun.1, vec![existing, additional]);
     }
 
     #[test]

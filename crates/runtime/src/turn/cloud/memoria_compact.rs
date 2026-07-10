@@ -32,6 +32,8 @@ pub struct MemoriaCompactConfig {
     pub min_tokens_for_retrieval: usize,
     /// Maximum memories to retrieve for context.
     pub max_memories: usize,
+    /// Maximum prompt tokens reserved for non-snapshot working memories.
+    pub max_memory_tokens: usize,
 }
 
 impl Default for MemoriaCompactConfig {
@@ -39,6 +41,7 @@ impl Default for MemoriaCompactConfig {
         Self {
             min_tokens_for_retrieval: 5_000,
             max_memories: 10,
+            max_memory_tokens: 4_000,
         }
     }
 }
@@ -813,6 +816,80 @@ fn build_session_memory_context(
     })
 }
 
+/// Preserve query-relevant current-session working memories that are not the
+/// canonical session snapshot. The snapshot has a dedicated lane; tool-written
+/// task notes, intermediate state, and session lessons still belong in the
+/// shared typed Memory lane after compaction.
+fn build_retrieved_working_memory_entries(
+    memories: &[MemoriaMemory],
+    session_id: &str,
+    max_tokens: usize,
+) -> Vec<astra_turn_core::context_sources::MemoryEntry> {
+    if max_tokens == 0 {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_content = std::collections::HashSet::new();
+    let mut remaining_tokens = max_tokens;
+
+    for memory in memories {
+        if memory.memory_type != "working" {
+            continue;
+        }
+        if crate::session_memory::runner::decode_session_memory_entry(&memory.content, session_id)
+            .is_some()
+        {
+            continue;
+        }
+
+        let memory_id = memory.memory_id.trim();
+        let content = memory.content.trim();
+        if memory_id.is_empty()
+            || content.is_empty()
+            || !seen_ids.insert(memory_id.to_string())
+            || !seen_content.insert(content.to_string())
+        {
+            continue;
+        }
+
+        let freshness = memory.freshness_suffix();
+        let evidence = format!(
+            "Current-session working-memory evidence. It may be incomplete or stale; the latest user request and live tool results take precedence.\n{content}{freshness}"
+        );
+        let estimated_tokens = crate::prompts::estimate_str_tokens(&evidence).max(1);
+        let bounded_content = if estimated_tokens > remaining_tokens {
+            if !entries.is_empty() {
+                break;
+            }
+            truncate_str(&evidence, remaining_tokens.saturating_mul(4).max(1))
+        } else {
+            evidence
+        };
+        let bounded_tokens = crate::prompts::estimate_str_tokens(&bounded_content).max(1);
+        if bounded_tokens > remaining_tokens {
+            break;
+        }
+
+        let score = memory
+            .retrieval_score
+            .filter(|score| score.is_finite())
+            .unwrap_or(0.0);
+        entries.push(
+            astra_turn_core::context_sources::MemoryEntry::scored(bounded_content, score)
+                .with_memory_identity(memory_id, "working")
+                .with_source("memoria.compaction_working"),
+        );
+        remaining_tokens = remaining_tokens.saturating_sub(bounded_tokens);
+        if remaining_tokens == 0 {
+            break;
+        }
+    }
+
+    entries
+}
+
 // ---------------------------------------------------------------------------
 // Unified budget for Memoria injection + LLM summary + truncated messages
 // ---------------------------------------------------------------------------
@@ -1045,10 +1122,20 @@ pub async fn compact_with_memoria(
         .as_ref()
         .map(|text| text.chars().count())
         .unwrap_or(0);
+    let retrieved_memory_entries =
+        build_retrieved_working_memory_entries(&memories, sid, config.max_memory_tokens);
+    let retrieved_memory_chars = retrieved_memory_entries
+        .iter()
+        .map(|entry| {
+            usize::try_from(entry.token_estimate)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(4)
+        })
+        .fold(0_usize, usize::saturating_add);
 
     let adjusted_budget_chars = adjusted_message_budget_chars(
         params.budget_chars,
-        session_memory_chars,
+        session_memory_chars.saturating_add(retrieved_memory_chars),
         summary_reserve_chars,
     );
 
@@ -1064,6 +1151,7 @@ pub async fn compact_with_memoria(
     );
 
     result.session_memory_context = session_memory_context;
+    result.retrieved_memory_entries = retrieved_memory_entries;
 
     // Step 5: Optionally generate an LLM summary. Session working memory is
     // owned by `session_memory::runner`; compaction must not create a second
@@ -1400,6 +1488,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retrieved_working_memory_entries_exclude_snapshot_and_preserve_identity() {
+        let memories = vec![
+            MemoriaMemory {
+                memory_id: "snapshot-1".to_string(),
+                content: crate::session_memory::runner::encode_session_memory_entry(
+                    "sess-1",
+                    "## Current State\n- canonical snapshot\n",
+                ),
+                memory_type: "working".to_string(),
+                session_id: Some("sess-1".to_string()),
+                retrieval_score: Some(1.0),
+                ..Default::default()
+            },
+            MemoriaMemory {
+                memory_id: "working-2".to_string(),
+                content: "Tool migration reached the server bridge; CLI remains.".to_string(),
+                memory_type: "working".to_string(),
+                session_id: Some("sess-1".to_string()),
+                retrieval_score: Some(0.82),
+                ..Default::default()
+            },
+        ];
+
+        let entries = build_retrieved_working_memory_entries(&memories, "sess-1", 1_000);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].memory_id.as_deref(), Some("working-2"));
+        assert_eq!(entries[0].memory_type.as_deref(), Some("working"));
+        assert_eq!(
+            entries[0].source.as_deref(),
+            Some("memoria.compaction_working")
+        );
+        assert!(entries[0].content.contains("server bridge"));
+        assert!(!entries[0].content.contains("canonical snapshot"));
+    }
+
     #[tokio::test]
     async fn compact_without_client_falls_back() {
         let msgs = vec![user("hello"), assistant("hi")];
@@ -1510,6 +1635,56 @@ mod tests {
         assert!(
             ctx_content.contains("Working on auth module"),
             "typed context should carry the snapshot, got: {ctx_content}"
+        );
+        assert!(result.retrieved_memory_entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn compact_preserves_non_snapshot_working_memory_in_typed_dynamic_lane() {
+        let msgs = vec![user("finish the migration"), assistant("continuing")];
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            ..Default::default()
+        };
+        let mock = MockMemoriaPort::new(vec![MemoriaMemory {
+            memory_id: "working-1".to_string(),
+            content: "CLI route is complete; server route still needs verification.".to_string(),
+            memory_type: "working".to_string(),
+            session_id: Some("sess1".to_string()),
+            retrieval_score: Some(0.9),
+            ..Default::default()
+        }]);
+        let params = MemoriaCompactParams {
+            budget_chars: 10_000,
+            keep_chars: 2_000,
+            tier: CompactionTier::CompactHistory,
+            keep_recent_turns: 4,
+            current_tokens: 6_000,
+            session_facts: None,
+        };
+
+        let result = compact_with_memoria(
+            &msgs,
+            Some("sess1"),
+            &config,
+            &params,
+            Some(&mock),
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.messages, msgs);
+        assert!(result.session_memory_context.is_none());
+        assert_eq!(result.retrieved_memory_entries.len(), 1);
+        assert_eq!(
+            result.retrieved_memory_entries[0].memory_id.as_deref(),
+            Some("working-1")
+        );
+        assert!(
+            result.retrieved_memory_entries[0]
+                .content
+                .contains("server route still needs verification")
         );
     }
 

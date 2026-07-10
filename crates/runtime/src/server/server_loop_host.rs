@@ -4703,26 +4703,27 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg,
             )
             .await;
-        if let Some(rerun) =
-            crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry_for_user_turn(
-                compact_result.session_memory_context.as_deref(),
-                initial_session_memory_entry.as_ref(),
-                None,
-                |session_memory_entry| {
-                    self.run_turn_pipeline_with_cache_capability_and_session_memory(
-                        state,
-                        &visible_tools,
-                        &llm_cfg.provider,
-                        &llm_cfg.model_name,
-                        llm_cfg.context_window,
-                        llm_cfg.cache_capability,
-                        Some(session_memory_entry),
-                        &memoria_prefetch_entries,
-                        &user_content,
-                    )
-                },
-            )
-            .transpose()?
+        if let Some(rerun) = crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
+            compact_result.session_memory_context.as_deref(),
+            initial_session_memory_entry.as_ref(),
+            None,
+            &memoria_prefetch_entries,
+            &compact_result.retrieved_memory_entries,
+            |session_memory_entry, memory_entries| {
+                self.run_turn_pipeline_with_cache_capability_and_session_memory(
+                    state,
+                    &visible_tools,
+                    &llm_cfg.provider,
+                    &llm_cfg.model_name,
+                    llm_cfg.context_window,
+                    llm_cfg.cache_capability,
+                    session_memory_entry,
+                    memory_entries,
+                    &user_content,
+                )
+            },
+        )
+        .transpose()?
         {
             debug_assert_eq!(rerun.tier, tier);
             final_system_messages = rerun.system_messages;

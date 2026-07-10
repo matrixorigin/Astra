@@ -2535,11 +2535,13 @@ impl InProcessChatTurnBridge {
                 let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
 
                 if let Some(rerun) =
-                    crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry_for_user_turn(
+                    crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
                         compact_result.session_memory_context.as_deref(),
                         initial_session_memory_entry.as_ref(),
                         None,
-                        |session_memory_entry| {
+                        &memoria_prefetch_entries,
+                        &compact_result.retrieved_memory_entries,
+                        |session_memory_entry, memory_entries| {
                             crate::turn::llm::context::assemble_bridge_context(
                                 crate::turn::llm::context::BridgeContextAssemblyInput {
                                     tool_surface:
@@ -2552,8 +2554,8 @@ impl InProcessChatTurnBridge {
                                         crate::turn::llm::context::BridgeRuntimeSignals::new(
                                             &stable_sections,
                                             &effective_dynamic_sections,
-                                            &memoria_prefetch_entries,
-                                            Some(session_memory_entry),
+                                            memory_entries,
+                                            session_memory_entry,
                                             edge_profile
                                                 .get("system_prompt_override")
                                                 .and_then(Value::as_str),

@@ -2571,6 +2571,39 @@ mod tests {
     }
 
     #[test]
+    fn runtime_policy_phase_evidence_reaches_typed_lane_without_forcing_control_flow() {
+        let mut state = make_state();
+        let mut facts = astra_core::observation_journal::JournalFacts::default();
+        facts.task.task_completion_ratio = 0.92;
+        let history_before = state.messages.clone();
+
+        route_runtime_policy_evidence(
+            &mut state,
+            &facts,
+            crate::turn::runtime_policy::RuntimePolicyEvidence::PhaseTransitionSuggested {
+                target: crate::turn::runtime_policy::PhaseTarget::Completion,
+            },
+        );
+
+        assert_eq!(state.messages, history_before);
+        let pending = state.take_volatile_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, VolatileKind::BehaviorAdvisory);
+        assert_eq!(
+            pending[0].payload["signal"].as_str(),
+            Some("phase_transition_suggested")
+        );
+        assert_eq!(
+            pending[0].payload["evidence"]["suggested_phase"].as_str(),
+            Some("completion")
+        );
+        assert_eq!(
+            pending[0].payload["authority"].as_str(),
+            Some("advisory_evidence_only")
+        );
+    }
+
+    #[test]
     fn context_manifest_turn_intent_ignores_prompt_facing_benchmark_marker() {
         let mut state = make_state();
         state.message = "please compare these results [TASK_ID:bnh]".into();
