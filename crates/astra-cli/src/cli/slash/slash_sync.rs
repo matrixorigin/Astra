@@ -8,11 +8,10 @@ use crate::{cli_dim, cli_info, cli_ok, cli_section, cli_warn};
 /// proves which edge facts still need cloud acknowledgement.
 pub(crate) async fn handle_sync_command(arg: &str, _state: &SessionState) {
     let sub = arg.trim();
-    let store = astra_services::SyncOutboxStore::local();
     cli_section!("Sync Outbox");
     eprintln!();
     match sub {
-        "" | "status" => match store.status() {
+        "" | "status" => match cloud_sync::read_sync_outbox_status().await {
             Ok(status) => display_outbox_status(&status),
             Err(error) => {
                 cli_warn!("Local sync outbox is unreadable: {error}");
@@ -22,12 +21,15 @@ pub(crate) async fn handle_sync_command(arg: &str, _state: &SessionState) {
             }
         },
         "log" => {
-            cli_info!("Durable outbox file: {}", store.path().display());
+            cli_info!(
+                "Durable outbox file: {}",
+                astra_services::SyncOutboxStore::local().path().display()
+            );
             cli_dim!(
                 "Cloud delivery is server-owned; this file is the local edge-to-cloud boundary."
             );
         }
-        "retry" => match store.retry_deferred_now() {
+        "retry" => match cloud_sync::retry_deferred_sync_outbox_records().await {
             Ok(count) => {
                 let report = cloud_sync::try_drain_sync_outbox(64).await;
                 cli_ok!(
@@ -45,7 +47,7 @@ pub(crate) async fn handle_sync_command(arg: &str, _state: &SessionState) {
                 cli_warn!("Failed to update retry state: {error}");
             }
         },
-        "repair" => match store.repair_retry_exhausted_poison() {
+        "repair" => match cloud_sync::repair_retry_exhausted_sync_outbox_records().await {
             Ok(count) => {
                 let report = cloud_sync::try_drain_sync_outbox(64).await;
                 cli_ok!(

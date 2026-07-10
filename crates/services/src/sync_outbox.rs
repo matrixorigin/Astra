@@ -194,6 +194,11 @@ pub struct SyncOutboxStatus {
     pub degraded: bool,
 }
 
+/// Blocking, file-backed durable outbox transaction boundary.
+///
+/// Every mutating method may wait for the cross-process file lock and perform
+/// read/write/rename/fsync work. Async hosts must move the complete method call
+/// to a blocking executor; moving only lock polling off-thread is insufficient.
 #[derive(Debug, Clone)]
 pub struct SyncOutboxStore {
     root: PathBuf,

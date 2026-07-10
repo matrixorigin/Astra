@@ -20,7 +20,7 @@ use astra_services::{
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use serde_json::{Value, json};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -34,14 +34,22 @@ use crate::{ExplainMode, SessionState};
 const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
 const SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS: usize = 4;
 const SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
-static SYNC_OUTBOX_DRAIN_SCHEDULED: AtomicBool = AtomicBool::new(false);
+static SYNC_OUTBOX_DRAIN_OWNER: AtomicU64 = AtomicU64::new(0);
+static SYNC_OUTBOX_NEXT_DRAIN_OWNER: AtomicU64 = AtomicU64::new(1);
 static SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 
-struct SyncOutboxDrainScheduleGuard;
+struct SyncOutboxDrainScheduleGuard {
+    owner: u64,
+}
 
 impl Drop for SyncOutboxDrainScheduleGuard {
     fn drop(&mut self) {
-        release_sync_outbox_drain_schedule();
+        let _ = SYNC_OUTBOX_DRAIN_OWNER.compare_exchange(
+            self.owner,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
@@ -60,13 +68,16 @@ impl Drop for SyncOutboxRetryWakeGuard {
     }
 }
 
-/// Spawn a fire-and-forget future, logging any panic so it is not silently
-/// swallowed when the returned [`JoinHandle`] is dropped.
-fn spawn_tracked(fut: impl Future<Output = ()> + Send + 'static) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    handle.spawn(async move {
+/// Deliberately detach bounded, durable outbox work from the initiating turn.
+///
+/// Scheduling is backpressured by the drain/wake ownership guards. The outbox
+/// itself is durable, so runtime shutdown may cancel this task without losing
+/// the queued records; a later process reclaims stale in-flight records.
+fn spawn_detached_tracked(
+    handle: &tokio::runtime::Handle,
+    fut: impl Future<Output = ()> + Send + 'static,
+) {
+    let task = handle.spawn(async move {
         let result = std::panic::AssertUnwindSafe(fut).catch_unwind().await;
         if let Err(err) = result {
             let msg = err
@@ -79,6 +90,40 @@ fn spawn_tracked(fut: impl Future<Output = ()> + Send + 'static) {
             );
         }
     });
+    drop(task);
+}
+
+/// Run the complete local outbox transaction on Tokio's blocking pool.
+///
+/// `SyncOutboxStore` intentionally exposes synchronous, durable filesystem
+/// transactions. Moving only the lock polling sleep would still leave file
+/// open/read/write/rename/fsync on an async worker, so async callers cross the
+/// boundary here around the whole store operation.
+async fn run_sync_outbox_io<T>(
+    store: SyncOutboxStore,
+    operation: impl FnOnce(SyncOutboxStore) -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || operation(store))
+        .await
+        .map_err(|error| std::io::Error::other(format!("sync outbox worker failed: {error}")))?
+}
+
+pub(crate) async fn read_sync_outbox_status() -> std::io::Result<SyncOutboxStatus> {
+    run_sync_outbox_io(SyncOutboxStore::local(), |store| store.status()).await
+}
+
+pub(crate) async fn retry_deferred_sync_outbox_records() -> std::io::Result<u64> {
+    run_sync_outbox_io(SyncOutboxStore::local(), |store| store.retry_deferred_now()).await
+}
+
+pub(crate) async fn repair_retry_exhausted_sync_outbox_records() -> std::io::Result<u64> {
+    run_sync_outbox_io(SyncOutboxStore::local(), |store| {
+        store.repair_retry_exhausted_poison()
+    })
+    .await
 }
 
 /// Result from cloud pull attempt at session start.
@@ -173,15 +218,17 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
         schedule_sync_outbox_retry_wake(delay);
         return;
     }
-    if !try_claim_sync_outbox_drain_schedule() {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            target: "astra_cli::cloud_sync",
+            "sync outbox drain was not scheduled because no Tokio runtime is active"
+        );
         return;
-    }
-    if tokio::runtime::Handle::try_current().is_err() {
-        release_sync_outbox_drain_schedule();
+    };
+    let Some(schedule_guard) = try_claim_sync_outbox_drain_schedule() else {
         return;
-    }
-    spawn_tracked(async {
-        let schedule_guard = SyncOutboxDrainScheduleGuard;
+    };
+    spawn_detached_tracked(&handle, async move {
         let mut blocked = false;
         for _ in 0..SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS {
             let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
@@ -204,10 +251,18 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
         if blocked {
             return;
         }
-        let next_delay = SyncOutboxStore::local()
-            .status()
-            .ok()
-            .and_then(|status| next_sync_outbox_drain_delay(&status));
+        let next_delay =
+            match run_sync_outbox_io(SyncOutboxStore::local(), |store| store.status()).await {
+                Ok(status) => next_sync_outbox_drain_delay(&status),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_cli::cloud_sync",
+                        ?error,
+                        "failed to read sync outbox status while scheduling the next drain"
+                    );
+                    None
+                }
+            };
         drop(schedule_guard);
         if let Some(delay) = next_delay {
             schedule_sync_outbox_drain_after(delay);
@@ -220,15 +275,18 @@ fn schedule_sync_outbox_retry_wake(delay: Duration) {
         return;
     };
     let deadline = now.saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64);
-    if !claim_sync_outbox_retry_wake_deadline(deadline) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            target: "astra_cli::cloud_sync",
+            "sync outbox retry wake was not scheduled because no Tokio runtime is active"
+        );
         return;
-    }
-    if tokio::runtime::Handle::try_current().is_err() {
-        release_sync_outbox_retry_wake_schedule();
+    };
+    let Some(wake_guard) = claim_sync_outbox_retry_wake_deadline(deadline) else {
         return;
-    }
-    spawn_tracked(async move {
-        let _wake_guard = SyncOutboxRetryWakeGuard { deadline };
+    };
+    spawn_detached_tracked(&handle, async move {
+        let _wake_guard = wake_guard;
         tokio::time::sleep(delay).await;
         if SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS
             .compare_exchange(deadline, 0, Ordering::AcqRel, Ordering::Acquire)
@@ -239,21 +297,29 @@ fn schedule_sync_outbox_retry_wake(delay: Duration) {
     });
 }
 
-fn try_claim_sync_outbox_drain_schedule() -> bool {
-    SYNC_OUTBOX_DRAIN_SCHEDULED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+fn try_claim_sync_outbox_drain_schedule() -> Option<SyncOutboxDrainScheduleGuard> {
+    let owner = loop {
+        let candidate = SYNC_OUTBOX_NEXT_DRAIN_OWNER.fetch_add(1, Ordering::Relaxed);
+        if candidate != 0 {
+            break candidate;
+        }
+    };
+    SYNC_OUTBOX_DRAIN_OWNER
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| SyncOutboxDrainScheduleGuard { owner })
 }
 
+#[cfg(test)]
 fn release_sync_outbox_drain_schedule() {
-    SYNC_OUTBOX_DRAIN_SCHEDULED.store(false, Ordering::Release);
+    SYNC_OUTBOX_DRAIN_OWNER.store(0, Ordering::Release);
 }
 
-fn claim_sync_outbox_retry_wake_deadline(deadline: u64) -> bool {
+fn claim_sync_outbox_retry_wake_deadline(deadline: u64) -> Option<SyncOutboxRetryWakeGuard> {
     let mut current = SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.load(Ordering::Acquire);
     loop {
         if current != 0 && current <= deadline {
-            return false;
+            return None;
         }
         match SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.compare_exchange_weak(
             current,
@@ -261,12 +327,13 @@ fn claim_sync_outbox_retry_wake_deadline(deadline: u64) -> bool {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => return true,
+            Ok(_) => return Some(SyncOutboxRetryWakeGuard { deadline }),
             Err(next) => current = next,
         }
     }
 }
 
+#[cfg(test)]
 fn release_sync_outbox_retry_wake_schedule() {
     SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS.store(0, Ordering::Release);
 }
@@ -479,7 +546,7 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
         ..Default::default()
     };
     let store = SyncOutboxStore::local();
-    match store.status() {
+    match run_sync_outbox_io(store.clone(), |store| store.status()).await {
         Ok(status) => {
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
             if report.remaining_ready == 0 {
@@ -518,7 +585,11 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
             return report;
         }
     };
-    let records = match store.claim_ready_records(limit) {
+    let records = match run_sync_outbox_io(store.clone(), move |store| {
+        store.claim_ready_records(limit)
+    })
+    .await
+    {
         Ok(records) => records,
         Err(error) => {
             report.blocker = Some(SyncOutboxDrainBlocker::LocalOutboxRead);
@@ -564,13 +635,14 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
         }
     }
     if !settlements.is_empty() {
-        record_settlement_result(
-            &mut report,
-            settlements.len(),
-            store.settle_delivery_batch(&settlements),
-        );
+        let attempted_settlements = settlements.len();
+        let settlement_result = run_sync_outbox_io(store.clone(), move |store| {
+            store.settle_delivery_batch(&settlements)
+        })
+        .await;
+        record_settlement_result(&mut report, attempted_settlements, settlement_result);
     }
-    match store.status() {
+    match run_sync_outbox_io(store, |store| store.status()).await {
         Ok(status) => {
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
         }
@@ -834,13 +906,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CloudPullResult, SyncOutboxDrainReport, SyncOutboxDrainScheduleGuard,
-        SyncOutboxRetryWakeGuard, claim_sync_outbox_retry_wake_deadline,
+        CloudPullResult, SyncOutboxDrainReport, claim_sync_outbox_retry_wake_deadline,
         cloud_pull_warrants_sync_marker, next_sync_outbox_drain_delay, record_settlement_result,
         release_sync_outbox_drain_schedule, release_sync_outbox_retry_wake_schedule,
-        should_append_cloud_pull_journal, try_claim_sync_outbox_drain_schedule,
+        run_sync_outbox_io, should_append_cloud_pull_journal, try_claim_sync_outbox_drain_schedule,
     };
-    use astra_services::{SyncOutboxSettlementReport, SyncOutboxStatus};
+    use astra_services::{SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore};
+    use fs2::FileExt;
 
     #[test]
     fn cloud_pull_result_default_not_reachable() {
@@ -854,9 +926,28 @@ mod tests {
     #[test]
     fn drain_schedule_guard_releases_claim_on_drop() {
         release_sync_outbox_drain_schedule();
-        assert!(try_claim_sync_outbox_drain_schedule());
-        drop(SyncOutboxDrainScheduleGuard);
-        assert!(try_claim_sync_outbox_drain_schedule());
+        let guard = try_claim_sync_outbox_drain_schedule().expect("first drain claim");
+        drop(guard);
+        assert!(try_claim_sync_outbox_drain_schedule().is_some());
+        release_sync_outbox_drain_schedule();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn stale_drain_guard_cannot_release_a_new_owner() {
+        release_sync_outbox_drain_schedule();
+        let stale = try_claim_sync_outbox_drain_schedule().expect("stale drain owner");
+        release_sync_outbox_drain_schedule();
+        let current = try_claim_sync_outbox_drain_schedule().expect("current drain owner");
+
+        drop(stale);
+
+        assert!(
+            try_claim_sync_outbox_drain_schedule().is_none(),
+            "a stale guard must not clear another worker's ownership"
+        );
+        drop(current);
+        assert!(try_claim_sync_outbox_drain_schedule().is_some());
         release_sync_outbox_drain_schedule();
     }
 
@@ -865,10 +956,56 @@ mod tests {
     fn retry_wake_guard_releases_matching_deadline_on_drop() {
         release_sync_outbox_retry_wake_schedule();
         let deadline = 123_456;
-        assert!(claim_sync_outbox_retry_wake_deadline(deadline));
-        drop(SyncOutboxRetryWakeGuard { deadline });
-        assert!(claim_sync_outbox_retry_wake_deadline(deadline));
+        let guard = claim_sync_outbox_retry_wake_deadline(deadline).expect("first wake claim");
+        drop(guard);
+        assert!(claim_sync_outbox_retry_wake_deadline(deadline).is_some());
         release_sync_outbox_retry_wake_schedule();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn stale_retry_wake_guard_cannot_clear_an_earlier_replacement() {
+        release_sync_outbox_retry_wake_schedule();
+        let stale = claim_sync_outbox_retry_wake_deadline(200).expect("later wake claim");
+        let current = claim_sync_outbox_retry_wake_deadline(100).expect("earlier replacement");
+
+        drop(stale);
+
+        assert!(
+            claim_sync_outbox_retry_wake_deadline(150).is_none(),
+            "dropping the replaced owner must preserve the earlier wake"
+        );
+        drop(current);
+        assert!(claim_sync_outbox_retry_wake_deadline(150).is_some());
+        release_sync_outbox_retry_wake_schedule();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_outbox_boundary_keeps_runtime_responsive_during_lock_contention() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join("outbox.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .expect("open lock");
+        lock.lock_exclusive().expect("hold outbox lock");
+        let store = SyncOutboxStore::new(temp.path());
+        let status_task = tokio::spawn(run_sync_outbox_io(store, |store| store.status()));
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        })
+        .await
+        .expect("local file-lock contention must not block the async worker");
+
+        lock.unlock().expect("release outbox lock");
+        status_task
+            .await
+            .expect("join blocking status task")
+            .expect("status after lock release");
     }
 
     #[test]
@@ -942,15 +1079,17 @@ mod tests {
         release_sync_outbox_drain_schedule();
         release_sync_outbox_retry_wake_schedule();
 
-        assert!(try_claim_sync_outbox_drain_schedule());
-        assert!(!try_claim_sync_outbox_drain_schedule());
+        let first_drain = try_claim_sync_outbox_drain_schedule().expect("first drain owner");
+        assert!(try_claim_sync_outbox_drain_schedule().is_none());
+        drop(first_drain);
+        let second_drain = try_claim_sync_outbox_drain_schedule().expect("replacement drain owner");
+        drop(second_drain);
         release_sync_outbox_drain_schedule();
-        assert!(try_claim_sync_outbox_drain_schedule());
-
-        release_sync_outbox_drain_schedule();
-        assert!(claim_sync_outbox_retry_wake_deadline(200));
-        assert!(claim_sync_outbox_retry_wake_deadline(100));
-        assert!(!claim_sync_outbox_retry_wake_deadline(150));
+        let later = claim_sync_outbox_retry_wake_deadline(200).expect("later wake");
+        let earlier = claim_sync_outbox_retry_wake_deadline(100).expect("earlier wake");
+        assert!(claim_sync_outbox_retry_wake_deadline(150).is_none());
+        drop(later);
+        drop(earlier);
         release_sync_outbox_retry_wake_schedule();
     }
 
