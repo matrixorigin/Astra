@@ -1952,6 +1952,93 @@ async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timesta
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_artifact_persist_uses_microsecond_created_at_for_latest_ordering() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let first_id = format!("zz-{}", Uuid::new_v4());
+    let second_id = format!("aa-{}", Uuid::new_v4());
+
+    cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'artifact-created-at-precision', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert session");
+
+    let store = DatabaseSessionArtifactStore::new(settings).with_pool(shared);
+    let first = store
+        .persist_json_artifact(astra_services::SessionArtifactJsonRecord {
+            artifact_id: first_id.clone(),
+            session_id: session_id.clone(),
+            user_id: user_id.clone(),
+            artifact_kind: "llm_capture".into(),
+            source: Some("created-at-precision-test".into()),
+            turn: Some(1),
+            round: Some(0),
+            content: serde_json::json!({"marker": "first"}),
+            metadata: None,
+        })
+        .await
+        .expect("persist first artifact");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let second = store
+        .persist_json_artifact(astra_services::SessionArtifactJsonRecord {
+            artifact_id: second_id.clone(),
+            session_id: session_id.clone(),
+            user_id: user_id.clone(),
+            artifact_kind: "llm_capture".into(),
+            source: Some("created-at-precision-test".into()),
+            turn: Some(2),
+            round: Some(0),
+            content: serde_json::json!({"marker": "second"}),
+            metadata: None,
+        })
+        .await
+        .expect("persist second artifact");
+
+    let created_ats = [
+        first.created_at.as_deref().expect("first created_at"),
+        second.created_at.as_deref().expect("second created_at"),
+    ];
+    assert!(
+        created_ats.iter().all(|created_at| {
+            created_at
+                .rsplit_once('.')
+                .is_some_and(|(_, fraction)| fraction.len() == 6)
+        }),
+        "persisted artifacts must expose DATETIME(6) created_at values: {created_ats:?}"
+    );
+    assert!(
+        created_ats.iter().any(|created_at| {
+            created_at
+                .rsplit_once('.')
+                .is_some_and(|(_, fraction)| fraction != "000000")
+        }),
+        "artifact writes must use sub-second database time, not second-precision NOW(): {created_ats:?}"
+    );
+
+    let latest = store
+        .load_latest_json_artifact(&user_id, &session_id, "llm_capture")
+        .await
+        .expect("load latest")
+        .expect("latest artifact");
+    assert_eq!(
+        latest.artifact_id, second_id,
+        "latest ordering must prefer the later created_at even when its artifact_id sorts lower"
+    );
+
+    cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();

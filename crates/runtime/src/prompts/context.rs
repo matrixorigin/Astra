@@ -1,29 +1,38 @@
-/// CJK-aware token estimation for a string.
+/// Unicode-aware token estimation for a string.
 ///
-/// BPE tokenizers (GPT-4, Claude, etc.) encode CJK characters at ~1.5 tokens
-/// each on average — a single character often splits into 2 BPE tokens, but
-/// common bigrams merge back.  We use 3/2 integer arithmetic for accuracy
-/// without floating-point.  ASCII text averages ~4 bytes per token.
+/// BPE tokenizers (GPT-4, Claude, etc.) encode dense non-ASCII scripts
+/// (CJK, kana, Hangul, Cyrillic, Arabic, etc.) at roughly 1.5 tokens per
+/// character on average. A single character often splits into 2 BPE tokens,
+/// while common bigrams merge back. We use 3/2 integer arithmetic for a
+/// conservative estimate without floating point. ASCII text averages ~4 bytes
+/// per token.
 ///
 /// JSON content uses ~2 bytes per token due to many single-character tokens
 /// (`{`, `}`, `:`, `,`, `"`). Detected by leading `{` or `[`.
+///
+/// Emoji typically consume 2-3 tokens each, so they use a separate 2.5-token
+/// estimate. All non-ASCII text not classified as emoji uses the dense-script
+/// estimate; this avoids brittle Unicode block allowlists.
 pub fn estimate_str_tokens(s: &str) -> usize {
-    let mut cjk_chars: usize = 0;
+    let mut dense_unicode_tokens: usize = 0;
+    let mut emoji_tokens: usize = 0;
     let mut ascii_bytes: usize = 0;
+
     for ch in s.chars() {
-        if ('\u{4E00}'..='\u{9FFF}').contains(&ch)
-            || ('\u{3400}'..='\u{4DBF}').contains(&ch)
-            || ('\u{F900}'..='\u{FAFF}').contains(&ch)
-            || ('\u{3000}'..='\u{303F}').contains(&ch)
-            || ('\u{FF00}'..='\u{FFEF}').contains(&ch)
-        {
-            cjk_chars += 1;
-        } else {
+        if ch.is_ascii() {
             ascii_bytes += ch.len_utf8();
+        } else if is_emoji_like(ch) {
+            emoji_tokens += 1;
+        } else {
+            dense_unicode_tokens += 1;
         }
     }
-    // CJK: ~1.5 tokens per char (3*n/2).
-    let cjk_tokens = (cjk_chars * 3).div_ceil(2);
+
+    // Dense Unicode scripts: ~1.5 tokens per char (3*n/2).
+    let dense_unicode_total = (dense_unicode_tokens * 3).div_ceil(2);
+    // Emoji: ~2.5 tokens each (5*n/2)
+    let emoji_total = (emoji_tokens * 5).div_ceil(2);
+
     // JSON-like content: ~2 bytes/token. Regular text: ~4 bytes/token.
     // Trim leading whitespace before peeking — tool results often have
     // newlines or spaces before the opening brace.
@@ -34,7 +43,17 @@ pub fn estimate_str_tokens(s: &str) -> usize {
         .copied()
         .unwrap_or(0);
     let ascii_divisor = if first == b'{' || first == b'[' { 2 } else { 4 };
-    cjk_tokens + ascii_bytes / ascii_divisor
+
+    dense_unicode_total + emoji_total + ascii_bytes / ascii_divisor
+}
+
+fn is_emoji_like(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1F000..=0x1FAFF // pictographs, flags, symbols, supplemental emoji
+            | 0x2600..=0x27BF // miscellaneous symbols and dingbats
+            | 0xFE00..=0xFE0F // variation selectors used in emoji presentation
+    )
 }
 
 /// Approximate token count with CJK-aware estimation.
@@ -708,6 +727,9 @@ mod tests {
         assert_eq!(estimate_str_tokens("你好世界"), 6); // (4*3)/2 = 6
         assert_eq!(estimate_str_tokens("你好世界测试"), 9); // (6*3)/2 = 9
         assert_eq!(estimate_str_tokens("你好世界测试纯中文"), 14); // (9*3)/2 = 14
+        assert_eq!(estimate_str_tokens("かなカナ"), 6); // Japanese kana
+        assert_eq!(estimate_str_tokens("한글테스트"), 8); // Hangul
+        assert_eq!(estimate_str_tokens("Ελληνικά"), 12); // Greek
 
         // mixed EN+CN
         let mixed = estimate_str_tokens("hello 你好 world 世界");

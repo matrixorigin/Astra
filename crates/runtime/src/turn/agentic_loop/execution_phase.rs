@@ -10,6 +10,7 @@ use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
     interruption_state_summary, session_turn_number, tool_record_is_workspace_mutation,
 };
+use astra_config::user_profile::Scenario;
 use astra_core::render_compact_status;
 use astra_services::{ContextManifestWrite, DatabaseContextManifestStore};
 use astra_turn_core::agentic_turn_ingest::{
@@ -383,25 +384,13 @@ fn manifest_reason_for_llm_call(state: &AgenticLoopState) -> &'static str {
     }
 }
 
-fn infer_turn_intent_for_llm_call(
-    state: &AgenticLoopState,
-    pre_llm_messages: &[serde_json::Value],
-) -> String {
-    let combined = pre_llm_messages
-        .iter()
-        .rev()
-        .take(8)
-        .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_ascii_lowercase();
-    if combined.contains("benchmark")
-        && (combined.contains("compare")
-            || combined.contains("comparison")
-            || combined.contains("对比")
-            || combined.contains("比较"))
+fn infer_turn_intent_for_llm_call(state: &AgenticLoopState) -> String {
+    if let Some(intent) = state.turn_intent.as_ref()
+        && let Some(scenario) = intent
+            .requested_scenario
+            .filter(|scenario| intent.allows_scenario(*scenario))
     {
-        return "benchmark_comparison".to_string();
+        return scenario_context_manifest_label(scenario).to_string();
     }
     if state.task_profile.mutates_workspace {
         "implementation".to_string()
@@ -409,6 +398,23 @@ fn infer_turn_intent_for_llm_call(
         "exploration".to_string()
     } else {
         "normal".to_string()
+    }
+}
+
+fn scenario_context_manifest_label(scenario: Scenario) -> &'static str {
+    match scenario {
+        Scenario::CodeReview => "code_review",
+        Scenario::Debugging => "debugging",
+        Scenario::Exploration => "exploration",
+        Scenario::Planning => "planning",
+        Scenario::Implementation => "implementation",
+        Scenario::Refactoring => "refactoring",
+        Scenario::Testing => "testing",
+        Scenario::Documentation => "documentation",
+        Scenario::DevOps => "dev_ops",
+        Scenario::Learning => "learning",
+        Scenario::QuickAnswer => "quick_answer",
+        Scenario::BenchmarkComparison => astra_services::TURN_INTENT_BENCHMARK_COMPARISON,
     }
 }
 
@@ -433,7 +439,7 @@ async fn persist_context_manifest_for_llm_call(
     ) else {
         return;
     };
-    let turn_intent = infer_turn_intent_for_llm_call(state, pre_llm_messages);
+    let turn_intent = infer_turn_intent_for_llm_call(state);
     let schema_tokens = state.pinned_tool_schema_tokens.min(u64::from(u32::MAX)) as u32;
     let result_prompt_tokens = turn_result
         .map(|result| {
@@ -1466,6 +1472,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // can still move by-value into the control-flow mapper below.
     let ingest_is_fatal = matches!(ingest_outcome, AgenticTurnIngestOutcome::Fatal(_));
     if !ingest_is_fatal {
+        let turn = session_turn_number(state);
+        let session_id = state.current_session_id.clone();
+        let model_id = state
+            .skills
+            .model_override
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         if let Some(ref mut pipeline_sess) = state.pipeline_session {
             let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
                 turn_result.accum.prompt_tokens,
@@ -1474,23 +1487,21 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 turn_result.accum.completion_tokens,
                 false,
             );
-            let model_id = state.skills.model_override.as_deref().unwrap_or("default");
-            pipeline_sess.record_feedback(model_id, "agentic_loop", &mut feedback, None);
+            pipeline_sess.record_feedback(&model_id, "agentic_loop", &mut feedback, None);
 
             // Emit pipeline journal events for observability and cloud sync
             if let Some(ref mut buf) = state.turn_event_buffer {
-                let turn = state.llm_rounds_completed;
-                let session_id = state.current_session_id.as_deref();
-
                 // Per-turn feedback event
                 let feedback_evt =
                     astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
-                        turn, model_id, &feedback,
+                        turn, &model_id, &feedback,
                     );
                 if let Ok(payload) = serde_json::to_value(&feedback_evt) {
                     buf.record(
                         astra_services::session_journal::JournalEvent::pipeline_feedback(
-                            session_id, turn, payload,
+                            session_id.as_deref(),
+                            turn,
+                            payload,
                         ),
                     );
                 }
@@ -1500,7 +1511,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     if let Ok(payload) = serde_json::to_value(&audit) {
                         buf.record(
                             astra_services::session_journal::JournalEvent::pipeline_compaction_audit(
-                                session_id, turn, payload,
+                                session_id.as_deref(),
+                                turn,
+                                payload,
                             ),
                         );
                     }
@@ -1518,7 +1531,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 // connection pool + TLS session cache across turns. Dispatch
                 // runs async so it never blocks turn execution.
                 if !alerts.is_empty() {
-                    if let Some(session_id_str) = alert_dispatch_session_id(session_id) {
+                    if let Some(session_id_str) = alert_dispatch_session_id(session_id.as_deref()) {
                         if let Some(dispatcher) = global_alert_dispatcher() {
                             let alerts_to_send = alerts.clone();
                             let dispatcher = dispatcher.clone();
@@ -1541,7 +1554,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     if let Ok(payload) = serde_json::to_value(&alert_evt) {
                         buf.record(
                             astra_services::session_journal::JournalEvent::pipeline_alert(
-                                session_id, turn, payload,
+                                session_id.as_deref(),
+                                turn,
+                                payload,
                             ),
                         );
                     }
@@ -1711,7 +1726,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             if let Ok(writer) =
                                 astra_services::session_journal::JournalWriter::new(sid)
                             {
-                                let _ = writer.append(&evt);
+                                if let Err(error) = writer.append(&evt) {
+                                    tracing::warn!(
+                                        session_id = sid,
+                                        error = %error,
+                                        "failed to append compaction retry event to session journal"
+                                    );
+                                }
                             }
                         }
 
@@ -2087,9 +2108,7 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
     if state.stall.any_intervention_active() {
         return None;
     }
-    let active_message =
-        astra_turn_core::chat_turn_heuristics::active_user_task_text(&state.message);
-    if missing_browser_verification_evidence(state, &active_message) {
+    if missing_browser_verification_evidence(state) {
         return Some(ExecutionRetryReason::MissingBrowserVerification);
     }
     if has_concrete_workspace_mutation(state) {
@@ -2098,127 +2117,28 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
     if state.final_text.trim().is_empty() {
         return None;
     }
-    let attempted_work_without_mutation = state.total_tool_calls > 0;
-    let defers = final_text_defers_execution(&state.final_text);
     if state.task_profile.mutates_workspace {
-        if attempted_work_without_mutation
-            && !defers
-            && final_text_concludes_no_change_needed(&state.final_text)
-        {
-            return None;
-        }
         // Mutating-profile tasks need either a concrete workspace mutation or
-        // inspected evidence that no mutation is needed. A zero-tool text-only
-        // completion is a high-risk silent no-op, so force exactly one retry.
+        // a single corrective retry. The mutating profile is only produced
+        // from structured judge output (`workspace_mutation=must_mutate`), not
+        // from natural-language keyword matching.
         return Some(ExecutionRetryReason::MissingMutation);
     }
-    (user_confirmed_execution_from_recent_context(state, &active_message)
-        && (attempted_work_without_mutation || defers))
-        .then_some(ExecutionRetryReason::MissingMutation)
+    None
 }
 
-fn missing_browser_verification_evidence(state: &AgenticLoopState, active_message: &str) -> bool {
+fn missing_browser_verification_evidence(state: &AgenticLoopState) -> bool {
     if state.final_text.trim().is_empty() {
         return false;
     }
-    if !message_requires_browser_verification(active_message) {
-        return false;
-    }
-    if final_text_admits_browser_not_verified(&state.final_text) {
-        return false;
-    }
-    if !final_text_claims_browser_success(&state.final_text) {
+    if !state
+        .turn_intent
+        .as_ref()
+        .is_some_and(|intent| intent.browser_verification_required)
+    {
         return false;
     }
     !has_browser_verification_evidence(state)
-}
-
-fn message_requires_browser_verification(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    let mentions_browser = [
-        "browser",
-        "in browser",
-        "playwright",
-        "selenium",
-        "puppeteer",
-        "cypress",
-        "chromium",
-        "chrome",
-        "firefox",
-        "webkit",
-        "浏览器",
-        "ui",
-        "页面",
-        "canvas",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    let mentions_verification = [
-        "test",
-        "verify",
-        "validation",
-        "validate",
-        "check",
-        "open",
-        "run",
-        "qa",
-        "smoke",
-        "测试",
-        "验证",
-        "检查",
-        "打开",
-        "试玩",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    mentions_browser && mentions_verification
-}
-
-fn final_text_claims_browser_success(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    [
-        "tested",
-        "verified",
-        "works",
-        "working",
-        "fully functional",
-        "looks good",
-        "all good",
-        "passes",
-        "passed",
-        "successfully",
-        "已经验证",
-        "已验证",
-        "测试通过",
-        "功能正常",
-        "可以正常",
-        "运行正常",
-        "一切正常",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn final_text_admits_browser_not_verified(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    [
-        "could not verify in a browser",
-        "could not verify in browser",
-        "can't verify in a browser",
-        "can't verify in browser",
-        "not verified in browser",
-        "unable to open a browser",
-        "unable to open the browser",
-        "no browser-capable tool",
-        "无法在浏览器中验证",
-        "没法在浏览器里验证",
-        "不能在浏览器中验证",
-        "没有浏览器工具",
-        "未在浏览器验证",
-        "无法打开浏览器",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 fn has_browser_verification_evidence(state: &AgenticLoopState) -> bool {
@@ -2430,141 +2350,6 @@ fn command_looks_like_verification(command: &str) -> bool {
         "just test",
         "just check",
         "git diff --check",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn user_confirmed_execution_from_recent_context(
-    state: &AgenticLoopState,
-    active_message: &str,
-) -> bool {
-    if !looks_like_execution_confirmation(active_message) {
-        return false;
-    }
-
-    state
-        .messages
-        .iter()
-        .rev()
-        .take(8)
-        .filter(|message| message.get("role").and_then(|role| role.as_str()) == Some("assistant"))
-        .filter_map(|message| message.get("content").and_then(|content| content.as_str()))
-        .any(assistant_text_offered_execution)
-}
-
-fn looks_like_execution_confirmation(message: &str) -> bool {
-    let normalized = message
-        .trim()
-        .trim_matches(|c: char| {
-            c.is_ascii_punctuation()
-                || c.is_whitespace()
-                || matches!(c, '。' | '，' | '！' | '？' | '；' | '：')
-        })
-        .to_lowercase();
-    if normalized.is_empty() || normalized.chars().count() > 24 {
-        return false;
-    }
-
-    matches!(
-        normalized.as_str(),
-        "yes"
-            | "y"
-            | "ok"
-            | "okay"
-            | "go ahead"
-            | "do it"
-            | "proceed"
-            | "continue"
-            | "sure"
-            | "当然"
-            | "当然了"
-            | "好"
-            | "好的"
-            | "可以"
-            | "没问题"
-            | "继续"
-            | "继续吧"
-            | "执行"
-            | "直接执行"
-            | "开始"
-            | "做吧"
-    ) || normalized.contains("继续")
-        || normalized.contains("执行")
-}
-
-fn assistant_text_offered_execution(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    let offered = [
-        "需要我",
-        "我可以",
-        "要继续吗",
-        "即可执行",
-        "shall i",
-        "should i",
-        "want me to",
-        "i can",
-        "go ahead",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    let action = [
-        "执行",
-        "修改",
-        "修复",
-        "apply",
-        "patch",
-        "edit",
-        "change",
-        "implement",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    offered && action
-}
-
-fn final_text_defers_execution(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    [
-        "需要我直接执行",
-        "要继续吗",
-        "即可执行",
-        "等待确认",
-        "shall i",
-        "should i",
-        "want me to",
-        "ready to apply",
-        "can apply",
-        "can execute",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn final_text_concludes_no_change_needed(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    [
-        "bug does not exist",
-        "bug doesn't exist",
-        "issue does not exist",
-        "issue doesn't exist",
-        "no change needed",
-        "no changes needed",
-        "nothing to change",
-        "already correct",
-        "already fixed",
-        "not reproducible",
-        "cannot reproduce",
-        "can't reproduce",
-        "无需修改",
-        "不需要修改",
-        "没有需要修改",
-        "问题不存在",
-        "没有这个问题",
-        "无法复现",
-        "未复现",
-        "已经正确",
-        "已经修复",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -3616,7 +3401,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use astra_services::session_journal::ToolCallRecord;
+    use astra_services::session_journal::{JournalEventType, ToolCallRecord, TurnEventBuffer};
     use async_trait::async_trait;
     use tokio::sync::Mutex;
 
@@ -3630,6 +3415,30 @@ mod tests {
     use crate::turn::run_control::{RunInputProvider, RunQueuedInputPoll, RunStatusProvider};
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 
+    fn structured_mutating_profile() -> astra_turn_core::chat_turn_heuristics::TaskExecutionProfile
+    {
+        astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+            true,
+            false,
+            astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            true,
+        )
+    }
+
+    fn mark_must_mutate(state: &mut AgenticLoopState) {
+        state.task_profile = structured_mutating_profile();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default().with_workspace_mutation(
+                astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+            ),
+        );
+    }
+
+    fn require_browser_verification(state: &mut AgenticLoopState) {
+        let intent = state.turn_intent.take().unwrap_or_default();
+        state.turn_intent = Some(intent.with_browser_verification_required(true));
+    }
+
     #[test]
     fn alert_dispatch_session_id_requires_real_session_identity() {
         assert_eq!(alert_dispatch_session_id(None), None);
@@ -3639,6 +3448,69 @@ mod tests {
             alert_dispatch_session_id(Some("  session-123  ")).as_deref(),
             Some("session-123")
         );
+    }
+
+    #[test]
+    fn context_manifest_turn_intent_ignores_prompt_facing_benchmark_marker() {
+        let mut state = make_state();
+        state.message = "please compare these results [TASK_ID:bnh]".into();
+        state
+            .messages
+            .push(serde_json::json!({"role": "user", "content": state.message}));
+
+        assert_eq!(
+            infer_turn_intent_for_llm_call(&state),
+            "normal",
+            "prompt-facing marker text must not become control-plane turn intent"
+        );
+    }
+
+    #[test]
+    fn context_manifest_turn_intent_uses_structured_benchmark_scenario() {
+        let mut state = make_state();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_requested_scenario(Scenario::BenchmarkComparison),
+        );
+
+        assert_eq!(
+            infer_turn_intent_for_llm_call(&state),
+            astra_services::TURN_INTENT_BENCHMARK_COMPARISON
+        );
+    }
+
+    #[test]
+    fn spill_summary_does_not_promote_read_paths_into_prompt_facing_memory() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"rust/astra/src/bridge/mod.rs\"}"
+                    }
+                },
+                {
+                    "function": {
+                        "name": "str_replace",
+                        "arguments": "{\"path\":\"crates/runtime/src/bridge/mod.rs\",\"old_str\":\"a\",\"new_str\":\"b\"}"
+                    }
+                }
+            ]
+        })];
+
+        let summary = build_spill_summary(&messages);
+
+        assert!(
+            !summary.contains("rust/astra"),
+            "read-only paths must not become prompt-facing memory: {summary}"
+        );
+        assert!(
+            summary.contains("crates/runtime/src/bridge/mod.rs"),
+            "mutated files should remain visible: {summary}"
+        );
+        assert!(summary.contains("- read_file"), "{summary}");
+        assert!(summary.contains("- str_replace"), "{summary}");
     }
 
     struct SnapshotClearingHost {
@@ -3776,6 +3648,7 @@ mod tests {
         };
         let mut state = make_state();
         state.message = "what do 59% and 117k mean?".to_string();
+        state.user_intent = state.message.clone();
         state.stall.forced_factual_retry = true;
         state.stall.factual_retry_fallback_text =
             Some("59% is context usage; 117k is token count.".to_string());
@@ -4238,9 +4111,9 @@ mod tests {
     #[test]
     fn execution_retry_blocks_plan_only_finish_for_mutating_task() {
         let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("修复这个问题");
+        mark_must_mutate(&mut state);
         state.message = "修复这个问题".into();
+        state.user_intent = state.message.clone();
         state.final_text = "需要我直接执行这些修改吗？".into();
         state.total_tool_calls = 2;
         state.stall.tool_call_records.push(ToolCallRecord {
@@ -4259,9 +4132,9 @@ mod tests {
         // with zero tool calls has no evidence for either a fix or a valid
         // no-op conclusion. The runtime should force one corrective retry.
         let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        mark_must_mutate(&mut state);
         state.message = "fix the bug".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I reviewed the code and the bug does not exist.".into();
 
         assert!(should_force_execution_retry(&state));
@@ -4272,9 +4145,9 @@ mod tests {
         // Mutating profile + tool calls were made (exploration) but nothing
         // committed → still retry to push for execution.
         let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        mark_must_mutate(&mut state);
         state.message = "fix the bug".into();
+        state.user_intent = state.message.clone();
         state.final_text = "Here is the plan: change foo to bar.".into();
         state.total_tool_calls = 1;
         state.stall.tool_call_records.push(ToolCallRecord {
@@ -4288,11 +4161,11 @@ mod tests {
     }
 
     #[test]
-    fn execution_retry_skips_reviewed_no_bug_conclusion_after_read_only_inspection() {
+    fn execution_retry_still_retries_no_change_text_for_required_mutation() {
         let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        mark_must_mutate(&mut state);
         state.message = "fix the bug".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I reviewed the code path and the bug does not exist.".into();
         state.total_tool_calls = 2;
         state.stall.tool_call_records.push(ToolCallRecord {
@@ -4307,13 +4180,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(!should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn confirmation_detector_ignores_keyi_in_descriptive_sentence() {
-        // "可以看到这里有问题" is description, not a confirmation.
-        assert!(!looks_like_execution_confirmation("可以看到这里有问题"));
+        assert!(should_force_execution_retry(&state));
     }
 
     #[test]
@@ -4351,47 +4218,11 @@ mod tests {
     }
 
     #[test]
-    fn execution_retry_recognizes_affirmative_followup_context() {
+    fn execution_retry_does_not_treat_bare_text_as_execution_without_structured_intent() {
         let mut state = make_state();
         state.message = "当然了".into();
-        state.final_text = "我可以继续执行，确认后开始。".into();
-        state.total_tool_calls = 1;
-        state.messages.push(serde_json::json!({
-            "role": "assistant",
-            "content": "需要我直接执行这些修改吗？"
-        }));
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(r#"{"command":"cat crates/runtime/src/lib.rs"}"#.into()),
-            ..Default::default()
-        });
-
-        assert!(should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn execution_retry_recognizes_english_affirmative_followup_context() {
-        let mut state = make_state();
-        state.message = "go ahead".into();
-        state.final_text = "I can apply the patch now.".into();
-        state.messages.push(serde_json::json!({
-            "role": "assistant",
-            "content": "Should I apply this patch?"
-        }));
-
-        assert!(should_force_execution_retry(&state));
-    }
-
-    #[test]
-    fn execution_retry_does_not_treat_bare_affirmative_as_execution() {
-        let mut state = make_state();
-        state.message = "当然了".into();
+        state.user_intent = state.message.clone();
         state.final_text = "好的。".into();
-        state.messages.push(serde_json::json!({
-            "role": "assistant",
-            "content": "这个解释有帮助吗？"
-        }));
 
         assert!(!should_force_execution_retry(&state));
     }
@@ -4403,6 +4234,7 @@ mod tests {
             "review local changes",
         );
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I found one issue.".into();
         state.total_tool_calls = 1;
         state.stall.tool_call_records.push(ToolCallRecord {
@@ -4416,7 +4248,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_retry_uses_active_user_text_not_runtime_scaffolding() {
+    fn execution_retry_ignores_runtime_scaffolding_without_structured_intent() {
         let mut state = make_state();
         state.message = concat!(
             "review local changes",
@@ -4443,9 +4275,9 @@ mod tests {
     #[test]
     fn execution_retry_does_not_fire_after_concrete_edit() {
         let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        mark_must_mutate(&mut state);
         state.message = "fix the bug".into();
+        state.user_intent = state.message.clone();
         state.final_text = "Done.".into();
         state.total_tool_calls = 2;
         state.stall.tool_call_records.push(ToolCallRecord {
@@ -4460,7 +4292,9 @@ mod tests {
     #[test]
     fn browser_verification_retry_fires_for_curl_only_success_claim() {
         let mut state = make_state();
+        require_browser_verification(&mut state);
         state.message = "Test the game in browser and tell me if it works.".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I tested it and it's fully functional.".into();
         state.total_tool_calls = 3;
         state.stall.tool_call_records.push(ToolCallRecord {
@@ -4491,10 +4325,10 @@ mod tests {
     #[test]
     fn browser_verification_retry_overrides_concrete_edit_short_circuit() {
         let mut state = make_state();
-        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-            "fix the game bug and verify it in browser",
-        );
+        mark_must_mutate(&mut state);
+        require_browser_verification(&mut state);
         state.message = "fix the game bug and verify it in browser".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I fixed the bug and it's fully functional now.".into();
         state.total_tool_calls = 3;
         state.stall.tool_call_records.push(ToolCallRecord {
@@ -4524,7 +4358,9 @@ mod tests {
     #[test]
     fn browser_verification_retry_skips_when_playwright_evidence_exists() {
         let mut state = make_state();
+        require_browser_verification(&mut state);
         state.message = "Test the game in browser and tell me if it works.".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I tested it and it's fully functional.".into();
         state.total_tool_calls = 1;
         state.stall.tool_call_records.push(ToolCallRecord {
@@ -4538,9 +4374,11 @@ mod tests {
     }
 
     #[test]
-    fn browser_verification_retry_skips_when_model_admits_not_verified() {
+    fn browser_verification_retry_does_not_parse_final_text_admissions() {
         let mut state = make_state();
+        require_browser_verification(&mut state);
         state.message = "Test the game in browser and tell me if it works.".into();
+        state.user_intent = state.message.clone();
         state.final_text =
             "I could not verify this in a browser because no browser-capable tool is available."
                 .into();
@@ -4552,7 +4390,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(!should_force_execution_retry(&state));
+        assert!(should_force_execution_retry(&state));
     }
 
     fn auto_verify_hook() -> astra_turn_core::stop_hooks::StopHook {
@@ -4669,9 +4507,10 @@ mod tests {
     fn execution_retry_suppressed_when_round_budget_corrective_already_fired() {
         let mut state = make_state();
         state.message = "implement the feature".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I'll implement that for you.".into();
         state.total_tool_calls = 0;
-        state.task_profile.mutates_workspace = true;
+        mark_must_mutate(&mut state);
         state.stall.forced_round_budget_phase1 = true;
         assert_eq!(execution_retry_reason(&state), None);
     }
@@ -4680,9 +4519,10 @@ mod tests {
     fn execution_retry_suppressed_when_redundant_reads_corrective_already_fired() {
         let mut state = make_state();
         state.message = "implement the feature".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I'll implement that for you.".into();
         state.total_tool_calls = 0;
-        state.task_profile.mutates_workspace = true;
+        mark_must_mutate(&mut state);
         state.stall.forced_redundant_reads_corrective = true;
         assert_eq!(execution_retry_reason(&state), None);
     }
@@ -4691,9 +4531,10 @@ mod tests {
     fn execution_retry_suppressed_when_exploration_family_corrective_already_fired() {
         let mut state = make_state();
         state.message = "implement the feature".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I'll implement that for you.".into();
         state.total_tool_calls = 0;
-        state.task_profile.mutates_workspace = true;
+        mark_must_mutate(&mut state);
         state.stall.forced_exploration_family_corrective = true;
         assert_eq!(execution_retry_reason(&state), None);
     }
@@ -4702,9 +4543,10 @@ mod tests {
     fn execution_retry_suppressed_when_search_fanout_corrective_already_fired() {
         let mut state = make_state();
         state.message = "implement the feature".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I'll implement that for you.".into();
         state.total_tool_calls = 0;
-        state.task_profile.mutates_workspace = true;
+        mark_must_mutate(&mut state);
         state.stall.forced_search_fanout_corrective = true;
         assert_eq!(execution_retry_reason(&state), None);
     }
@@ -4713,9 +4555,10 @@ mod tests {
     fn execution_retry_suppressed_when_cache_waste_corrective_already_fired() {
         let mut state = make_state();
         state.message = "implement the feature".into();
+        state.user_intent = state.message.clone();
         state.final_text = "I'll implement that for you.".into();
         state.total_tool_calls = 0;
-        state.task_profile.mutates_workspace = true;
+        mark_must_mutate(&mut state);
         state.stall.forced_cache_waste_corrective = true;
         assert_eq!(execution_retry_reason(&state), None);
     }
@@ -5294,9 +5137,8 @@ mod tests {
     fn make_mutating_state_with_reads(n: usize) -> AgenticLoopState {
         let mut state = make_state();
         state.message = "fix the bug in foo".into();
-        state.task_profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-            "fix the bug in foo",
-        );
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
         assert!(
             state.task_profile.mutates_workspace,
             "test precondition: profile must be mutating"
@@ -5329,8 +5171,8 @@ mod tests {
         let mut state =
             make_mutating_state_with_reads(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD + 2);
         // Flip profile to read-only exploration — escalation must not engage.
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("review the diff");
+        state.task_profile = astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default();
+        state.turn_intent = None;
         assert!(!state.task_profile.mutates_workspace);
         assert!(!should_escalate_execution(&state));
     }
@@ -5387,8 +5229,8 @@ mod tests {
     fn escalation_ignores_failed_tool_calls_for_threshold() {
         let mut state = make_state();
         state.message = "fix the bug".into();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
         // 20 failed reads — don't count toward threshold (they weren't real
         // progress; retrying reads is already flagged elsewhere).
         for _ in 0..20 {
@@ -5406,8 +5248,8 @@ mod tests {
     fn escalation_ignores_synthetic_placeholders() {
         let mut state = make_state();
         state.message = "fix the bug".into();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
         for _ in 0..(EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD + 2) {
             state.stall.tool_call_records.push(ToolCallRecord {
                 name: "bash".into(),
@@ -5434,8 +5276,8 @@ mod tests {
         // BreakLoop — one corrective injection per turn.
         let mut state = make_state();
         state.message = "fix the bug".into();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
         state.final_text = "I will proceed with the edits now.".into();
         state.total_tool_calls = 10;
 
@@ -5452,8 +5294,8 @@ mod tests {
     fn parallel_batching_force_blocks_subsequent_retry_in_same_turn() {
         let mut state = make_state();
         state.message = "fix the bug".into();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
         state.final_text = "I'll continue investigating.".into();
         state.total_tool_calls = 10;
         // Without the parallel-batching flag, this state would trigger retry.
@@ -5468,6 +5310,7 @@ mod tests {
     fn parallel_batching_suppressed_when_escalation_already_fired() {
         let mut state = make_state();
         state.message = "explore the codebase".into();
+        state.user_intent = state.message.clone();
         for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
             push_single_tool_round(&mut state);
         }
@@ -5488,6 +5331,7 @@ mod tests {
     fn parallel_batching_suppressed_when_retry_already_fired() {
         let mut state = make_state();
         state.message = "explore the codebase".into();
+        state.user_intent = state.message.clone();
         for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
             push_single_tool_round(&mut state);
         }
@@ -5515,6 +5359,7 @@ mod tests {
         for set_flag in &flags {
             let mut state = make_state();
             state.message = "explore the codebase".into();
+            state.user_intent = state.message.clone();
             for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
                 push_single_tool_round(&mut state);
             }
@@ -5565,6 +5410,7 @@ mod tests {
     fn parallel_batching_force_fires_at_streak_threshold() {
         let mut state = make_state();
         state.message = "explore the codebase".into();
+        state.user_intent = state.message.clone();
         for _ in 0..PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD {
             push_single_tool_round(&mut state);
         }
@@ -5578,6 +5424,7 @@ mod tests {
     fn parallel_batching_force_silent_below_threshold() {
         let mut state = make_state();
         state.message = "explore the codebase".into();
+        state.user_intent = state.message.clone();
         for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD - 1) {
             push_single_tool_round(&mut state);
         }
@@ -5591,6 +5438,7 @@ mod tests {
     fn parallel_batching_force_silent_when_last_round_batched() {
         let mut state = make_state();
         state.message = "explore the codebase".into();
+        state.user_intent = state.message.clone();
         // Long single-tool history that crossed threshold...
         for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD + 2) {
             push_single_tool_round(&mut state);
@@ -5615,6 +5463,7 @@ mod tests {
     fn parallel_batching_force_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "explore the codebase".into();
+        state.user_intent = state.message.clone();
         for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD + 3) {
             push_single_tool_round(&mut state);
         }
@@ -5743,6 +5592,7 @@ mod tests {
         // Build a state with a streak equal to the global default.
         let mut state = make_state();
         state.message = "explore the codebase".into();
+        state.user_intent = state.message.clone();
         for _ in 0..global_default {
             push_single_tool_round(&mut state);
         }
@@ -6148,6 +5998,7 @@ mod tests {
         // single-tool streak past threshold.
         let mut state = make_state();
         state.message = "explore the codebase".into();
+        state.user_intent = state.message.clone();
         for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD + 2) {
             push_single_tool_round(&mut state);
         }
@@ -6181,6 +6032,7 @@ mod tests {
         // read-only successful tool calls on a mutating-sounding task.
         let mut state = make_state();
         state.message = "fix the broken auth middleware".into();
+        state.user_intent = state.message.clone();
         // Accumulate EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD successful
         // read-only records with no write. `ok: true` + non-synthetic is
         // the shape `should_escalate_execution` counts.
@@ -6232,6 +6084,7 @@ mod tests {
         // must stay silent in Auto.
         let mut state = make_state();
         state.message = "keep going".into();
+        state.user_intent = state.message.clone();
         // Below the force threshold but at/above the soft-nudge
         // threshold (=4). This should emit a user message in non-auto.
         for _ in 0..crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD {
@@ -6284,6 +6137,7 @@ mod tests {
     fn redundant_reads_corrective_fires_at_threshold() {
         let mut state = make_state();
         state.message = "fix the bug".into();
+        state.user_intent = state.message.clone();
         // First read seeds the file's history; subsequent overlapping reads
         // each contribute one redundant event.
         for r in 0..(REDUNDANT_READS_MIDLOOP_THRESHOLD + 1) {
@@ -6299,6 +6153,7 @@ mod tests {
     fn redundant_reads_corrective_silent_below_threshold() {
         let mut state = make_state();
         state.message = "fix the bug".into();
+        state.user_intent = state.message.clone();
         // Threshold-many reads = (threshold-1) overlap events: stays silent.
         for r in 0..REDUNDANT_READS_MIDLOOP_THRESHOLD {
             push_redundant_sed_read(&mut state, r as u32);
@@ -6313,6 +6168,7 @@ mod tests {
     fn redundant_reads_corrective_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "fix the bug".into();
+        state.user_intent = state.message.clone();
         for r in 0..(REDUNDANT_READS_MIDLOOP_THRESHOLD + 5) {
             push_redundant_sed_read(&mut state, r as u32);
         }
@@ -6345,6 +6201,7 @@ mod tests {
     fn cache_waste_corrective_fires_at_threshold() {
         let mut state = make_state();
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         for _ in 0..CACHE_WASTE_MIDLOOP_THRESHOLD {
             state.turn_guard.record_cache_hit("git_diff");
         }
@@ -6358,6 +6215,7 @@ mod tests {
     fn cache_waste_corrective_silent_below_threshold() {
         let mut state = make_state();
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         for _ in 0..(CACHE_WASTE_MIDLOOP_THRESHOLD - 1) {
             state.turn_guard.record_cache_hit("git_diff");
         }
@@ -6371,6 +6229,7 @@ mod tests {
     fn cache_waste_corrective_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         for _ in 0..(CACHE_WASTE_MIDLOOP_THRESHOLD + 2) {
             state.turn_guard.record_cache_hit("git_diff");
         }
@@ -6410,7 +6269,8 @@ mod tests {
     fn search_fanout_corrective_fires_for_mutating_task() {
         let mut state = make_state();
         state.message = "fix the bug".into();
-        state.task_profile.mutates_workspace = true;
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
         for idx in 0..8 {
             push_search_call(&mut state, idx);
         }
@@ -6422,6 +6282,7 @@ mod tests {
     fn search_fanout_corrective_skips_read_only_review() {
         let mut state = make_state();
         state.message = "review the branch".into();
+        state.user_intent = state.message.clone();
         state.task_profile.mutates_workspace = false;
         for idx in 0..12 {
             push_search_call(&mut state, idx);
@@ -6434,7 +6295,8 @@ mod tests {
     fn search_fanout_corrective_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "fix the bug".into();
-        state.task_profile.mutates_workspace = true;
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
         for idx in 0..10 {
             push_search_call(&mut state, idx);
         }
@@ -6506,6 +6368,7 @@ mod tests {
     fn exploration_family_corrective_fires_at_threshold_and_cautions_explicit_tools() {
         let mut state = make_state();
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         for round in 0..astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD {
             push_diff_round(&mut state, round as u32);
         }
@@ -6539,6 +6402,7 @@ mod tests {
     fn exploration_family_corrective_silent_below_threshold() {
         let mut state = make_state();
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         for round in 0..(astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD - 1) {
             push_diff_round(&mut state, round as u32);
         }
@@ -6556,6 +6420,7 @@ mod tests {
     fn exploration_family_corrective_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         for round in 0..(astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD + 2) {
             push_diff_round(&mut state, round as u32);
         }
@@ -6610,6 +6475,7 @@ mod tests {
     fn answer_relevance_retry_exhausted_only_triggers_when_still_off_target() {
         let mut state = make_state();
         state.message = "相关的测试够硬核吗？".into();
+        state.user_intent = state.message.clone();
         state.final_text = "测试覆盖了 provider routing、edge offline、prompt cache 和 unhappy path，但还缺一次全量在线回归。".into();
         state.stall.tool_call_records.push(ToolCallRecord {
             name: "bash".into(),
@@ -6632,6 +6498,7 @@ mod tests {
     fn exploration_family_phase2_fires_after_repeated_retry_signature_round() {
         let mut state = make_state();
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
         let args = r#"{"action":"diff","path":"src/lib.rs"}"#;
@@ -6649,6 +6516,7 @@ mod tests {
     fn exploration_family_phase2_stays_silent_on_mixed_progress_round() {
         let mut state = make_state();
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
         let args = r#"{"action":"diff","path":"src/lib.rs"}"#;
@@ -6669,6 +6537,7 @@ mod tests {
     fn exploration_family_phase2_stays_silent_on_changed_retry_signature() {
         let mut state = make_state();
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
         push_retry_cautioned_round(
@@ -6694,6 +6563,7 @@ mod tests {
     fn exploration_family_phase2_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "review local changes".into();
+        state.user_intent = state.message.clone();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
         let args = r#"{"action":"diff","path":"src/lib.rs"}"#;
@@ -6725,6 +6595,7 @@ mod tests {
     fn exploration_family_corrective_retry_cautions_search_tools_without_bash() {
         let mut state = make_state();
         state.message = "investigate auth flow".into();
+        state.user_intent = state.message.clone();
         for round in 0..astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD {
             push_search_round(&mut state, round as u32);
         }
@@ -6786,6 +6657,12 @@ mod tests {
         use astra_turn_core::pipeline_session::PipelineSession;
 
         let mut state = make_state();
+        state.current_session_id = Some("session-1".to_string());
+        state.session_turn = 6;
+        state.turn_event_buffer = Some(TurnEventBuffer::begin_turn(
+            state.current_session_id.as_deref(),
+            state.session_turn,
+        ));
         state.pipeline_session = Some(PipelineSession::new(PipelineConfig::default()));
 
         let mut host = MockHost::new(vec![text_result("Hello", 1000, 200, Some(50))]);
@@ -6800,6 +6677,25 @@ mod tests {
         let sess = state.pipeline_session.as_ref().unwrap();
         assert_eq!(sess.turns_completed(), 1);
         assert_eq!(sess.stats.turns_executed, 1);
+
+        let mut buffer = state
+            .turn_event_buffer
+            .take()
+            .expect("pipeline feedback should be buffered");
+        let events = buffer.drain();
+        let feedback_event = events
+            .iter()
+            .find(|event| event.event_type == JournalEventType::PipelineFeedback)
+            .expect("pipeline feedback event");
+        assert_eq!(feedback_event.turn, Some(6));
+        assert_eq!(
+            feedback_event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("turn"))
+                .and_then(|turn| turn.as_u64()),
+            Some(6)
+        );
     }
 
     #[tokio::test]
@@ -6975,7 +6871,9 @@ fn spill_old_messages_to_disk(
             return 0;
         }
     };
-    let tokens_freed = (spill_json.len() / 4) as u64;
+    let tokens_freed = u64::from(astra_turn_core::section_types::estimate_text_tokens(
+        &spill_json,
+    ));
 
     // Write full transcript to session dir.
     let spill_dir = astra_services::session_journal::local_sessions_dir().join(session_id);
@@ -7054,7 +6952,10 @@ fn build_spill_summary(messages: &[serde_json::Value]) -> String {
         None
     };
 
-    // Record a tool invocation, extracting a `path` arg when present.
+    // Record a tool invocation. Paths from read/search tools are deliberately
+    // not persisted into the prompt-facing spill summary: failed exploratory
+    // reads often contain stale or deleted paths, and promoting those into a
+    // system summary makes the next turn treat them as current workspace facts.
     let mut record_tool = |name: &str, args: &serde_json::Value| {
         let path = args.get("path").and_then(|p| p.as_str());
         if let Some(p) = path {
@@ -7064,10 +6965,8 @@ fn build_spill_summary(messages: &[serde_json::Value]) -> String {
                     files_modified.push(ps);
                 }
             }
-            tools_used.push(format!("{name}({p})"));
-        } else {
-            tools_used.push(name.to_string());
         }
+        tools_used.push(name.to_string());
     };
 
     for msg in messages {

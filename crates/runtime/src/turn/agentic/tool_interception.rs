@@ -785,7 +785,7 @@ fn build_skill_extra(state: &AgenticLoopState) -> HashMap<String, String> {
 
     extra.insert("os".into(), std::env::consts::OS.into());
 
-    let turns_used = state.max_turns.saturating_sub(state.remaining_turns);
+    let turns_used = state.current_session_turn_number();
     extra.insert("turn_number".into(), turns_used.to_string());
     extra.insert("turns_remaining".into(), state.remaining_turns.to_string());
     extra.insert("total_prompt_tokens".into(), state.total_prompt.to_string());
@@ -982,6 +982,18 @@ mod tests {
 
         assert!(notice.contains("read_file"));
         assert!(notice.contains("Skill `allowed_tools` stays a prompt hint"));
+    }
+
+    #[test]
+    fn skill_context_extra_uses_session_turn_not_request_local_step() {
+        let mut state = make_state();
+        state.session_turn = 12;
+        state.max_turns = 50;
+        state.remaining_turns = 49;
+
+        let ctx = build_skill_context(&state);
+
+        assert_eq!(ctx.extra.get("turn_number").map(String::as_str), Some("12"));
     }
 
     #[test]

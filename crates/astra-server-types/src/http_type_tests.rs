@@ -1125,6 +1125,7 @@ fn chat_request_into_data_maps_all_fields() {
     ctx.insert("tool".into(), json!("calc"));
     let req = ChatRequest {
         message: "hello".into(),
+        user_intent: Some("pure hello".into()),
         parts: vec![json!({"type": "text", "text": "hello"})],
         attachments: vec![json!({"id": "att-1", "kind": "file"})],
         runtime_system_prompt: Some("Runtime SQL scope db_name: retail.".into()),
@@ -1175,6 +1176,7 @@ fn chat_request_into_data_maps_all_fields() {
     };
     let data = chat_request_into_data(req);
     assert_eq!(data.message, "hello");
+    assert_eq!(data.user_intent.as_deref(), Some("pure hello"));
     assert_eq!(data.parts, vec![json!({"type": "text", "text": "hello"})]);
     assert_eq!(
         data.attachments,
@@ -1247,6 +1249,7 @@ fn chat_request_into_data_maps_defaults() {
 fn chat_request_into_data_merges_plan_subtask_into_context() {
     let req = ChatRequest {
         message: "do step".into(),
+        user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
         runtime_system_prompt: None,

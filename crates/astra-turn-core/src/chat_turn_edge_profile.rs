@@ -1,6 +1,6 @@
 //! Pieces of `/chat` `edge_profile` built on the CLI edge (cwd, memoria, git branch, active skills).
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 /// Protocol key for skill-listing text routed through `edge_profile` from
 /// the CLI to the runtime bridge (volatile lane). Shared between writer
@@ -13,6 +13,13 @@ pub const EDGE_PROFILE_KEY_SKILL_LISTING_TEXT: &str = "skill_listing_text";
 /// resolves model cache capability before deciding whether to inject or drop
 /// this lane.
 pub const EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS: &str = "runtime_volatile_texts";
+
+/// Protocol key for runtime control context that must reach the current model
+/// turn but must not become user-message content or persisted prompt-facing
+/// history. Unlike [`EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS`], this lane is not
+/// best-effort: strict-history providers place it adjacent to the current user
+/// turn instead of dropping it for cache locality.
+pub const EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS: &str = "runtime_required_texts";
 
 /// Protocol key for the session-stable deferred-tool manifest routed through
 /// `edge_profile` from the CLI to the runtime bridge.
@@ -47,6 +54,39 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: &str = "deferred_tool_om
 /// does not reflect user overrides, causing cache-prefix drift and ~500+ token
 /// cache misses per turn.
 pub const EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES: &str = "always_load_tool_names";
+
+/// Read a structured edge-profile text lane. Accepting a single string keeps
+/// older callers easy to migrate, but writers should send arrays so independent
+/// producers never concatenate their own framing.
+pub fn edge_profile_texts(edge_profile: &Map<String, Value>, key: &str) -> Vec<String> {
+    match edge_profile.get(key) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(text)) => {
+            let text = text.trim();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text.to_string()]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+pub fn edge_profile_joined_text(edge_profile: &Map<String, Value>, key: &str) -> Option<String> {
+    let texts = edge_profile_texts(edge_profile, key);
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n\n"))
+    }
+}
 
 /// `git rev-parse --abbrev-ref HEAD` for edge_profile (best-effort).
 pub fn read_git_branch_abbrev() -> Option<String> {

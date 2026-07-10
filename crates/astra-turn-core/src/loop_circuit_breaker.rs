@@ -486,7 +486,7 @@ impl Default for LoopCircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat_turn_heuristics::infer_task_execution_profile;
+    use crate::chat_turn_heuristics::{TaskComplexity, TaskExecutionProfile};
 
     fn sig(tools: &[&str]) -> BTreeSet<String> {
         tools.iter().map(|s| s.to_string()).collect()
@@ -578,7 +578,12 @@ mod tests {
 
     #[test]
     fn mutating_objective_keeps_read_only_stall_threshold_relaxed() {
-        let profile = infer_task_execution_profile("fix the runtime bug");
+        let profile = TaskExecutionProfile::from_structured_intent(
+            true,
+            false,
+            TaskComplexity::Standard,
+            true,
+        );
         assert!(profile.mutates_workspace);
 
         let cfg = BreakerConfig {
@@ -595,7 +600,12 @@ mod tests {
 
     #[test]
     fn read_only_review_keeps_wider_exploration_threshold() {
-        let profile = infer_task_execution_profile("review local changes");
+        let profile = TaskExecutionProfile::from_structured_intent(
+            false,
+            true,
+            TaskComplexity::Standard,
+            true,
+        );
         assert!(!profile.mutates_workspace);
 
         let cfg = BreakerConfig {

@@ -5,12 +5,15 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 
 use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
 
 const LOG_FILENAME: &str = "conversation_log.jsonl";
+static APPEND_LOCKS: LazyLock<DashMap<PathBuf, Arc<Mutex<()>>>> = LazyLock::new(DashMap::new);
 
 /// File-backed CSL store. Each session gets a JSONL file under `base_dir`.
 #[derive(Debug, Clone)]
@@ -64,6 +67,16 @@ impl FileCslStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let lock = APPEND_LOCKS
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value()
+            .clone();
+        let _guard = lock
+            .lock()
+            .map_err(|_| CslStoreError::Other("conversation log append lock poisoned".into()))?;
+        let entries = Self::read_all_entries(path)?;
+        validate_append_sequence(&entries, entry)?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -99,6 +112,28 @@ impl FileCslStore {
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
+}
+
+fn validate_append_sequence(entries: &[CslEntry], entry: &CslEntry) -> Result<(), CslStoreError> {
+    let Some(current_seq) = entries.iter().map(CslEntry::seq).max() else {
+        if entry.is_snapshot() {
+            return Ok(());
+        }
+        return Err(CslStoreError::Other(
+            "conversation log must begin with a snapshot".to_string(),
+        ));
+    };
+
+    let expected_seq = current_seq.checked_add(1).ok_or_else(|| {
+        CslStoreError::Other("conversation log seq overflow at append boundary".to_string())
+    })?;
+    if entry.seq() != expected_seq {
+        return Err(CslStoreError::Other(format!(
+            "stale conversation log append: expected seq {expected_seq} after current seq {current_seq}, got {}",
+            entry.seq()
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -516,24 +551,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_only_deltas_without_snapshot_returns_empty() {
+    async fn append_rejects_delta_before_first_snapshot() {
         let tmp = TempDir::new().unwrap();
         let store = FileCslStore::new(tmp.path());
         let sid = "deltas-only";
 
-        store
+        let err = store
             .append(sid, &make_delta(0, 1, vec![user_msg("orphan1")]), &meta())
             .await
-            .unwrap();
-        store
-            .append(sid, &make_delta(1, 2, vec![user_msg("orphan2")]), &meta())
-            .await
-            .unwrap();
+            .expect_err("orphan deltas must be rejected at append time");
 
-        let entries = store.load_from_latest_snapshot(sid).await.unwrap();
         assert!(
-            entries.is_empty(),
-            "should return empty when no Snapshot exists"
+            err.to_string().contains("must begin with a snapshot"),
+            "unexpected error: {err}"
         );
     }
 

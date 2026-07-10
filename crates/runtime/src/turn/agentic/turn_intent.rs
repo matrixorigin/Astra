@@ -40,6 +40,8 @@ pub(crate) async fn judge_turn_intent_with_llm(
                 requested = ?intent.requested_scenario,
                 continuation = ?intent.continuation_mode,
                 reanchors = intent.reanchors_current_objective,
+                workspace_mutation = ?intent.workspace_mutation,
+                browser_verification_required = intent.browser_verification_required,
                 "turn intent judged"
             );
             Some(intent)

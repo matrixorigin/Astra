@@ -144,6 +144,10 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM workspace_records WHERE session_id = ? AND owner_id = ?",
     },
     SessionDeleteStatement {
+        label: "edge_pending_dispatch",
+        sql: "DELETE FROM edge_pending_dispatch WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "session_artifacts_grants",
         sql: "DELETE FROM session_artifacts_grants WHERE session_id = ? AND user_id = ?",
     },
@@ -424,6 +428,13 @@ fn record_table_delete(
         .rows_deleted
         .checked_add(rows_deleted)
         .ok_or_else(|| format!("delete_session.{label}: deleted row total overflow"))?;
+    if let Some(existing) = outcome.tables.iter_mut().find(|table| table.label == label) {
+        existing.rows_deleted = existing
+            .rows_deleted
+            .checked_add(rows_deleted)
+            .ok_or_else(|| format!("delete_session.{label}: deleted row total overflow"))?;
+        return Ok(());
+    }
     outcome.tables.push(SessionTableDeleteOutcome {
         label,
         rows_deleted,
@@ -662,6 +673,16 @@ pub(crate) async fn hard_delete_session_rows(
         .await?;
         record_table_delete(&mut outcome, statement.label, rows_deleted)?;
     }
+
+    let rows_deleted = delete_session_rows_session_user_batched(
+        tx,
+        "agent_event_edges",
+        SESSION_DELETE_AGENT_EVENT_EDGES_SQL,
+        session_id,
+        user_id,
+    )
+    .await?;
+    record_table_delete(&mut outcome, "agent_event_edges", rows_deleted)?;
 
     verify_core_session_tables_deleted(tx, session_id, user_id).await?;
 
@@ -975,6 +996,29 @@ mod tests {
                 SessionTableDeleteOutcome {
                     label: "agent_sessions",
                     rows_deleted: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn session_database_delete_outcome_merges_multi_phase_table_deletes() {
+        let mut outcome = SessionDatabaseDeleteOutcome::default();
+        record_table_delete(&mut outcome, "agent_event_edges", 2).expect("record initial edges");
+        record_table_delete(&mut outcome, "agent_events", 3).expect("record events");
+        record_table_delete(&mut outcome, "agent_event_edges", 5).expect("record final edges");
+
+        assert_eq!(outcome.rows_deleted, 10);
+        assert_eq!(
+            outcome.tables,
+            vec![
+                SessionTableDeleteOutcome {
+                    label: "agent_event_edges",
+                    rows_deleted: 7
+                },
+                SessionTableDeleteOutcome {
+                    label: "agent_events",
+                    rows_deleted: 3
                 },
             ]
         );

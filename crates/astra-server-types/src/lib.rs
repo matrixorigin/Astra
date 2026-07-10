@@ -87,6 +87,8 @@ pub struct ChatRouteRequest {
 pub struct ChatRequest {
     pub message: String,
     #[serde(default)]
+    pub user_intent: Option<String>,
+    #[serde(default)]
     pub parts: Vec<serde_json::Value>,
     #[serde(default)]
     pub attachments: Vec<serde_json::Value>,
@@ -1184,6 +1186,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
     );
     ChatRequestData {
         message: request.message,
+        user_intent: request.user_intent,
         parts: request.parts,
         attachments: request.attachments,
         runtime_system_prompt: request.runtime_system_prompt,

@@ -72,7 +72,7 @@ Run only gates that can be affected by the change.
 | Frontend/SDK | Relevant package script or existing make target |
 | Shell/deployment | Exact owning make/script dry run |
 
-Do not run root-level raw cargo commands. The Rust workspace is under `rust/`.
+Run raw cargo commands from the repository root; `Cargo.toml` is the workspace manifest.
 
 ## Phase 3: Execute And Interpret
 

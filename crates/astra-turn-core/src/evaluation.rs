@@ -183,6 +183,73 @@ pub struct TurnEvaluation {
     pub thresholds: EvaluationThresholds,
 }
 
+pub const TURN_EVALUATION_INCOMPLETE_MARKER: &str = "[Turn evaluation: incomplete.";
+
+pub fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
+    let outcome_failures = eval
+        .signals
+        .iter()
+        .filter_map(|signal| match signal {
+            EvalSignal::ToolOutcomeFailure { class, count } => Some(format!("{class} x{count}")),
+            EvalSignal::BlockedToolCall { count } => Some(format!("blocked_tool x{count}")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !outcome_failures.is_empty() {
+        return Some(format!(
+            "Turn finished with unresolved tool/runtime failure(s): {}. Treat the final answer as incomplete until validation passes or the provider surface changes.",
+            outcome_failures.join(", ")
+        ));
+    }
+
+    if eval.success {
+        return None;
+    }
+
+    let reason = eval
+        .signals
+        .iter()
+        .find_map(turn_evaluation_signal_reason)
+        .unwrap_or("turn evaluation failed");
+    Some(format!(
+        "Turn evaluation marked this turn incomplete (quality {:.2}): {reason}.",
+        eval.quality
+    ))
+}
+
+pub fn turn_evaluation_signal_reason(signal: &EvalSignal) -> Option<&'static str> {
+    match signal {
+        EvalSignal::ToolErrorRate(rate) if *rate >= 0.5 => Some("tool error rate is high"),
+        EvalSignal::StallDetected => Some("stall/divergence was detected"),
+        EvalSignal::VerdictWarning => Some("TurnGuard emitted a warning"),
+        EvalSignal::NoToolsNeeded => Some("needed tools were not used"),
+        EvalSignal::BlockedToolCall { .. } => Some("tool calls were blocked before execution"),
+        EvalSignal::HighCostLowYield { .. } => Some("high-cost exploration produced low yield"),
+        EvalSignal::LlmRoundChurn { .. } => Some("too many LLM rounds were used"),
+        EvalSignal::PromptGrowthChurn { .. } => Some("prompt size ballooned across rounds"),
+        EvalSignal::RedundantValidationRetries(_) => Some("validation was retried redundantly"),
+        EvalSignal::RedundantOverlappingReads(_) => Some("content was re-read redundantly"),
+        EvalSignal::ExplorationFamilyChurn { .. } => Some("exploration stayed in one tool family"),
+        _ => None,
+    }
+}
+
+pub fn build_turn_evaluation_annotated_text(
+    full_text: &str,
+    evaluation: &TurnEvaluation,
+) -> String {
+    if evaluation.success || full_text.contains(TURN_EVALUATION_INCOMPLETE_MARKER) {
+        return full_text.to_string();
+    }
+    let notice = turn_evaluation_status_notice(evaluation).unwrap_or_else(|| {
+        format!(
+            "Turn evaluation marked this turn incomplete (quality {:.2}).",
+            evaluation.quality
+        )
+    });
+    format!("{full_text}\n\n{TURN_EVALUATION_INCOMPLETE_MARKER} {notice}]")
+}
+
 /// Per-tool-call record for evaluation (matches ToolCallRecord shape).
 #[derive(Debug, Clone)]
 pub struct ToolCallInfo {
@@ -1786,6 +1853,41 @@ mod tests {
             output_bytes: Some(120),
             no_op: true,
         }
+    }
+
+    #[test]
+    fn annotated_text_marks_failed_turn_once() {
+        let eval = TurnEvaluation {
+            success: false,
+            quality: 0.2,
+            confidence: 0.9,
+            signals: vec![EvalSignal::ToolErrorRate(1.0)],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        let annotated = build_turn_evaluation_annotated_text("Done.", &eval);
+        let annotated_again = build_turn_evaluation_annotated_text(&annotated, &eval);
+
+        assert!(annotated.contains(TURN_EVALUATION_INCOMPLETE_MARKER));
+        assert!(annotated.contains("tool error rate is high"));
+        assert_eq!(annotated_again, annotated);
+    }
+
+    #[test]
+    fn annotated_text_leaves_successful_turn_unchanged() {
+        let eval = TurnEvaluation {
+            success: true,
+            quality: 0.8,
+            confidence: 0.7,
+            signals: vec![EvalSignal::AllToolsHealthy],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        assert_eq!(
+            build_turn_evaluation_annotated_text("Done.", &eval),
+            "Done."
+        );
+        assert!(turn_evaluation_status_notice(&eval).is_none());
     }
 
     #[test]

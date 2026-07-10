@@ -13,6 +13,7 @@ use crate::tool::schema::prune::filter_tool_schemas_by_excluded_names;
 /// Inputs for [`chat_turn_base_payload`] (keeps the arity aligned with the JSON body without a 9-arg function).
 pub struct ChatTurnBasePayloadInput<'a> {
     pub messages: &'a [Value],
+    pub user_intent: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub agent_id: Option<&'a str>,
     pub model_id: Option<&'a str>,
@@ -35,6 +36,7 @@ pub struct ChatTurnBasePayloadInput<'a> {
 pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
     let ChatTurnBasePayloadInput {
         messages,
+        user_intent,
         session_id,
         agent_id,
         model_id,
@@ -50,6 +52,7 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
     } = input;
     let mut payload = json!({
         "messages": messages,
+        "user_intent": user_intent,
         "session_id": session_id,
         "agent_id": agent_id,
         "interaction_mode": interaction_mode,
@@ -166,6 +169,7 @@ mod tests {
         let msgs = vec![json!({"role": "user", "content": "hi"})];
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &msgs,
+            user_intent: Some("hi"),
             session_id: None,
             agent_id: Some("test-agent"),
             model_id: Some("model-gpt-test"),
@@ -180,6 +184,7 @@ mod tests {
             thinking: crate::thinking_config::ThinkingConfig::Off,
         });
         assert_eq!(p["messages"], json!(msgs));
+        assert_eq!(p["user_intent"], "hi");
         assert_eq!(p["session_id"], Value::Null);
         assert_eq!(p["agent_id"], "test-agent");
         assert!(p.get("model").is_none());
@@ -201,6 +206,7 @@ mod tests {
     fn base_payload_session_id_some() {
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &[],
+            user_intent: None,
             session_id: Some("sess-1"),
             agent_id: None,
             model_id: None,
@@ -224,6 +230,7 @@ mod tests {
     fn base_payload_thinking_included_when_enabled() {
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &[],
+            user_intent: None,
             session_id: None,
             agent_id: None,
             model_id: None,
@@ -247,6 +254,7 @@ mod tests {
     fn base_payload_thinking_absent_when_off() {
         let p = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &[],
+            user_intent: None,
             session_id: None,
             agent_id: None,
             model_id: None,

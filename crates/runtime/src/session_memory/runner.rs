@@ -479,10 +479,9 @@ pub(crate) async fn run_extraction(
 }
 
 fn session_memory_extraction_messages(messages: &[Value]) -> Vec<Value> {
-    messages
-        .iter()
+    astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(messages.to_vec())
+        .into_iter()
         .filter(|msg| !is_ephemeral_message_for_session_memory(msg))
-        .cloned()
         .collect()
 }
 
@@ -3000,6 +2999,42 @@ review uncommitted changes
         assert!(!astra_turn_types::is_persistent_memory_type(
             SESSION_MEMORY_MEMORIA_TYPE
         ));
+    }
+
+    #[test]
+    fn session_memory_extraction_uses_prompt_facing_history_boundary() {
+        let messages = vec![
+            json!({"role": "user", "content": "我说过的所有话，还有回复\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{
+                    "id": "skill-auto-route-analyze-session",
+                    "function": {"name": "skill", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "skill-auto-route-analyze-session", "content": "<skill-loaded name=\"analyze-session\"/>"}),
+            json!({"role": "assistant", "content": "你问过我总结这段会话。"}),
+        ];
+
+        let filtered = session_memory_extraction_messages(&messages);
+        let joined = filtered
+            .iter()
+            .filter_map(|msg| msg["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            filtered,
+            vec![
+                json!({"role": "user", "content": "我说过的所有话，还有回复"}),
+                json!({"role": "assistant", "content": "你问过我总结这段会话。"}),
+            ]
+        );
+        assert!(!joined.contains("<system-reminder>"));
+        assert!(!joined.contains("[session-resume:v1]"));
+        assert!(!joined.contains("<skill-loaded"));
+        assert!(!joined.contains("skill-auto-route"));
     }
 
     #[test]

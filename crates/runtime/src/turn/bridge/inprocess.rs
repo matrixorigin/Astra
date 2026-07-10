@@ -402,6 +402,7 @@ fn has_inprocess_persisted_events(
 
 #[derive(Debug, Default)]
 struct BridgePipelineBaseline {
+    #[cfg(test)]
     next_turn: u32,
     stats: astra_turn_core::pipeline_stats::PipelineStats,
     cache_detector: astra_turn_core::cache_diagnostics::CacheBreakDetector,
@@ -423,6 +424,7 @@ fn event_matches_bridge_cache_source(
 fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     if session_id.is_empty() {
         return BridgePipelineBaseline {
+            #[cfg(test)]
             next_turn: 1,
             ..Default::default()
         };
@@ -434,6 +436,7 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     }
     let Ok(events) = astra_services::session_journal::read_journal_tail(session_id, 500) else {
         return BridgePipelineBaseline {
+            #[cfg(test)]
             next_turn: 1,
             cache_detector,
             ..Default::default()
@@ -442,13 +445,18 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
 
     let mut feedback_ratios = Vec::new();
     let mut raw_ratios = Vec::new();
+    #[cfg(test)]
     let mut response_count = 0u32;
+    #[cfg(test)]
     let mut max_turn = 0u32;
     let mut pending_request_snapshot = None;
     let mut last_tool_schemas = Vec::new();
 
     for event in events {
-        max_turn = max_turn.max(event.turn.unwrap_or(0));
+        #[cfg(test)]
+        {
+            max_turn = max_turn.max(event.turn.unwrap_or(0));
+        }
         match event.event_type {
             astra_services::session_journal::JournalEventType::PipelineFeedback => {
                 if let Some(ratio) = event
@@ -473,7 +481,10 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
                 if !event_matches_bridge_cache_source(&event) {
                     continue;
                 }
-                response_count = response_count.saturating_add(1);
+                #[cfg(test)]
+                {
+                    response_count = response_count.saturating_add(1);
+                }
                 let usage = bridge_usage_from_response_event(&event);
                 if let Some(usage) = usage.as_ref() {
                     let total_input = usage
@@ -508,6 +519,7 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     };
 
     BridgePipelineBaseline {
+        #[cfg(test)]
         next_turn: max_turn.max(response_count).saturating_add(1),
         stats: astra_turn_core::pipeline_stats::PipelineStats {
             turns_executed: ratios.len() as u32,
@@ -1169,6 +1181,35 @@ fn latest_user_message_text(messages: &[Value]) -> Option<&str> {
         .and_then(|m| m.get("content").and_then(Value::as_str))
 }
 
+fn normalize_bridge_prompt_messages(messages: Vec<Value>) -> (Vec<Value>, Vec<String>) {
+    let normalized =
+        astra_turn_core::runtime_scaffolding::normalize_prompt_facing_runtime_messages(messages);
+    (normalized.messages, normalized.required_runtime_texts)
+}
+
+fn required_runtime_text_for_bridge(
+    edge_profile: &Map<String, Value>,
+    recovered_required_runtime_texts: &[String],
+) -> Option<String> {
+    let mut parts: Vec<String> = recovered_required_runtime_texts
+        .iter()
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .collect();
+    if let Some(text) = astra_turn_core::chat_turn_edge_profile::edge_profile_joined_text(
+        edge_profile,
+        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+    ) {
+        parts.push(text);
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+fn bridge_pipeline_event_turn(trace_turn: u32) -> u32 {
+    trace_turn.max(1)
+}
+
 fn latest_assistant_message_text(messages: &[Value]) -> Option<&str> {
     messages
         .iter()
@@ -1417,7 +1458,8 @@ impl InProcessChatTurnBridge {
             .get("agent_id")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        let messages = optional_payload_array(&payload, "messages")?;
+        let (messages, recovered_required_runtime_texts) =
+            normalize_bridge_prompt_messages(optional_payload_array(&payload, "messages")?);
         let tool_results = optional_payload_array(&payload, "tool_results")?;
         let edge_tools = optional_payload_array(&payload, "edge_tools")?;
         let edge_profile = optional_payload_object(&payload, "edge_profile")?;
@@ -2312,22 +2354,16 @@ impl InProcessChatTurnBridge {
                 // once when skill catalog changes, then stabilizes.
                 stable_sections.push(section);
             }
-            if let Some(texts) = edge_profile
-                .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS)
-                .and_then(Value::as_array)
+            if let Some(runtime_volatile) =
+                astra_turn_core::chat_turn_edge_profile::edge_profile_joined_text(
+                    &edge_profile,
+                    astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
+                )
             {
-                let runtime_volatile = texts
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                if !runtime_volatile.is_empty() {
-                    dynamic_sections.push(prompts::PromptSection::dynamic(
-                        runtime_volatile,
-                        prompts::PromptTokenBucket::Environment,
-                    ));
-                }
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    runtime_volatile,
+                    prompts::PromptTokenBucket::Environment,
+                ));
             }
             if !tool_round_guidance.is_empty() {
                 dynamic_sections.push(
@@ -2377,6 +2413,8 @@ impl InProcessChatTurnBridge {
                 round_index,
                 &dynamic_sections,
             );
+            let required_runtime_text =
+                required_runtime_text_for_bridge(&edge_profile, &recovered_required_runtime_texts);
             // Compute session-stable skill context. Selector-based
             // `<deferred-tools>` was removed; skills are surfaced through the
             // full `<available_skills>` catalog in `CacheScope::Session`, so a
@@ -2625,10 +2663,12 @@ impl InProcessChatTurnBridge {
                 crate::turn::llm::context::finalize_bridge_wire_messages(
                 &mut llm_messages,
                 bridge_volatile_text.take(),
+                required_runtime_text.clone(),
                 &provider,
                 &model_name,
                 &thinking_config,
                 cache_capability,
+                &cache_cfg,
             );
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
@@ -3191,19 +3231,35 @@ impl InProcessChatTurnBridge {
                                 })
                                 .count();
                             let (system_prefix, original_msgs) = llm_messages.split_at(sys_count);
+                            let retry_compaction_history =
+                                crate::turn::llm::context::bridge_retry_compaction_history(
+                                    original_msgs,
+                                );
                             let compact_result = aggressive_ctx
                                 .compact_with_overrides(
-                                    original_msgs,
+                                    &retry_compaction_history,
                                     system_prefix,
                                     &round_edge_tools,
                                     overrides,
                                 )
                                 .await;
 
-                            // Rebuild llm_messages: unchanged system prefix +
-                            // fresh compacted tail from Memoria.
-                            llm_messages.truncate(sys_count);
-                            llm_messages.extend(compact_result.messages);
+                            let rebuilt_retry_messages =
+                                crate::turn::llm::context::rebuild_bridge_retry_wire_messages(
+                                    crate::turn::llm::context::BridgeRetryWireRebuildInput {
+                                        previous_messages: &llm_messages,
+                                        compacted_messages: compact_result.messages,
+                                        boundary_present: compact_result.boundary.is_some(),
+                                        required_runtime_text: required_runtime_text.clone(),
+                                        provider: &provider,
+                                        model_name: &model_name,
+                                        thinking: &thinking_config,
+                                        cache_capability,
+                                        cache_cfg: &cache_cfg,
+                                        session_id: &session_id,
+                                    },
+                                );
+                            llm_messages = rebuilt_retry_messages;
 
                             // Also prune tool schemas more aggressively
                             pruned_tools = prune_tool_schemas(
@@ -4037,7 +4093,7 @@ impl InProcessChatTurnBridge {
 
                 // ── Formal pipeline feedback / alerts ──
                 if let Some(buf) = turn_event_buffer.as_mut() {
-                    let current_turn = bridge_pipeline_baseline.next_turn.max(1);
+                    let current_turn = bridge_pipeline_event_turn(trace_turn);
                     let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
                         usage_snapshot.input_tokens,
                         usage_snapshot.cached_input_tokens,
@@ -4124,7 +4180,17 @@ impl InProcessChatTurnBridge {
 
                             // Emit tool_request so the CLI executes the tool
                             // locally and populates edge_tool_round.
-                            let req_event = astra_turn_core::stream_events::build_tool_request_event(tc_map);
+                            let request_id =
+                                tc_map.get("id").and_then(Value::as_str).unwrap_or("");
+                            let identity =
+                                astra_services::multi_agent::EdgeDispatchIdentity::new(
+                                    &user_id,
+                                    &session_id,
+                                    &turn_chain_id,
+                                    &turn_chain_id,
+                                    request_id,
+                                );
+                            let req_event = astra_turn_core::stream_events::build_tool_request_event(tc_map, &identity);
                             yield render_sse_map(&req_event);
                         }
                     }
@@ -5513,10 +5579,12 @@ mod tests {
             crate::turn::llm::context::finalize_bridge_wire_messages(
                 &mut llm_messages,
                 Some("volatile".to_string()),
+                None,
                 "anthropic",
                 "claude-sonnet-4",
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
                 None,
+                &cache_cfg,
             );
         crate::turn::llm::context::apply_bridge_message_cache_metadata(
             &mut llm_messages,
@@ -6822,6 +6890,52 @@ mod tests {
             json!({"role": "user", "content": "继续处理"}),
         ];
         assert_eq!(latest_user_message_text(&messages), Some("继续处理"));
+    }
+
+    #[test]
+    fn normalize_bridge_prompt_messages_routes_runtime_affix_out_of_user_content() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": "我说过的所有话\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"
+        })];
+
+        let (messages, required_runtime_texts) = normalize_bridge_prompt_messages(messages);
+
+        assert_eq!(
+            messages,
+            vec![json!({"role": "user", "content": "我说过的所有话"})]
+        );
+        assert_eq!(
+            required_runtime_texts,
+            vec!["[session-resume:v1]\nHydrated previous session context"]
+        );
+    }
+
+    #[test]
+    fn required_runtime_text_for_bridge_merges_recovered_and_structured_lanes() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS
+                .to_string(),
+            json!(["structured runtime context"]),
+        );
+
+        let got = required_runtime_text_for_bridge(
+            &edge_profile,
+            &["[session-resume:v1]\nHydrated previous session context".to_string()],
+        )
+        .expect("required runtime text");
+
+        assert_eq!(
+            got,
+            "[session-resume:v1]\nHydrated previous session context\n\nstructured runtime context"
+        );
+    }
+
+    #[test]
+    fn bridge_pipeline_event_turn_uses_session_trace_turn() {
+        assert_eq!(bridge_pipeline_event_turn(8), 8);
+        assert_eq!(bridge_pipeline_event_turn(0), 1);
     }
 
     #[test]

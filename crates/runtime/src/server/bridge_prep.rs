@@ -584,10 +584,56 @@ async fn prepare_chat_turn_bridge_identifiers(
     explicit_identity: Option<&ExplicitBridgeTurnIdentity>,
 ) -> Result<(String, String, u32), (StatusCode, Json<ErrorResponse>)> {
     if let Some(identity) = explicit_identity {
+        let inferred_session_turn = crate::server::session_turn::infer_session_turn(
+            state.shared_pool.as_ref(),
+            user_id,
+            session_id,
+        )
+        .await;
         let now = current_unix_seconds();
         let cache_key = bridge_cache_key(user_id, session_id);
         let mut cache = state.chat_turn_bridge_cache.lock().await;
         let mut updated_entry = cache.get(&cache_key, now).unwrap_or_default();
+        let cached_turn = cached_bridge_session_turn(&updated_entry).map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("bridge cache session_turn is corrupt: {error}"),
+            )
+        })?;
+        let same_identity = cached_turn.is_some()
+            && updated_entry
+                .get("turn_chain_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(identity.turn_chain_id.as_str())
+            && updated_entry
+                .get("user_query_event_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(identity.user_query_event_id.as_str());
+        let is_continuation = bridge_turn_is_continuation(messages, has_tool_results);
+        let minimum_session_turn = if is_continuation || same_identity {
+            cached_turn.unwrap_or(inferred_session_turn)
+        } else {
+            cached_turn
+                .map(|turn| turn.saturating_add(1))
+                .unwrap_or(inferred_session_turn)
+        };
+        if identity.session_turn < minimum_session_turn {
+            return Err(astra_core::error_response_coded_with_metadata(
+                StatusCode::CONFLICT,
+                format!(
+                    "explicit bridge session_turn {} is stale for session {}; expected at least {}",
+                    identity.session_turn, session_id, minimum_session_turn
+                ),
+                "bridge_session_turn_stale",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "actual_session_turn": identity.session_turn,
+                    "expected_session_turn": minimum_session_turn,
+                    "turn_chain_id": identity.turn_chain_id.as_str(),
+                    "user_query_event_id": identity.user_query_event_id.as_str(),
+                }),
+            ));
+        }
         updated_entry.insert(
             "turn_chain_id".to_string(),
             serde_json::Value::String(identity.turn_chain_id.clone()),
@@ -1403,7 +1449,7 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "selected_model": selected_model(),
-                "session_turn": 2,
+                "session_turn": 10,
                 "turn_chain_id": "root-chain",
                 "user_query_event_id": "root-query",
                 "messages": [{"role": "user", "content": "review local changes"}]
@@ -1416,9 +1462,62 @@ mod tests {
                 .await
                 .expect("explicit identity should prepare");
 
-        assert_eq!(prepared.session_turn.as_deref(), Some("2"));
+        assert_eq!(prepared.session_turn.as_deref(), Some("10"));
         assert_eq!(prepared.turn_chain_id.as_deref(), Some("root-chain"));
         assert_eq!(prepared.user_query_event_id.as_deref(), Some("root-query"));
+    }
+
+    #[tokio::test]
+    async fn prepare_body_rejects_explicit_session_turn_regression_for_new_root_turn() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let now = current_unix_seconds();
+        {
+            let mut cache = state.chat_turn_bridge_cache.lock().await;
+            let mut entry = serde_json::Map::new();
+            entry.insert("turn_chain_id".to_string(), json!("previous-chain"));
+            entry.insert("user_query_event_id".to_string(), json!("previous-query"));
+            entry.insert("session_turn".to_string(), json!(1));
+            cache.insert(bridge_cache_key("u1", "bound-session"), entry, now);
+        }
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "selected_model": selected_model(),
+                "session_turn": 1,
+                "turn_chain_id": "new-chain",
+                "user_query_event_id": "new-query",
+                "messages": [{"role": "user", "content": "second turn"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let (status, body) =
+            match prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
+                .await
+            {
+                Ok(_) => panic!("new root turn must not reuse a stale explicit session_turn"),
+                Err(error) => error,
+            };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.0
+                .detail
+                .contains("explicit bridge session_turn 1 is stale"),
+            "{}",
+            body.0.detail
+        );
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("bridge_session_turn_stale")
+        );
+        let metadata = body
+            .0
+            .metadata
+            .as_ref()
+            .expect("stale turn conflict should carry reconciliation metadata");
+        assert_eq!(metadata["actual_session_turn"], json!(1));
+        assert_eq!(metadata["expected_session_turn"], json!(2));
+        assert_eq!(metadata["session_id"], json!("bound-session"));
     }
 
     #[tokio::test]

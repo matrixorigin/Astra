@@ -13,6 +13,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 use uuid::Uuid;
 
@@ -87,6 +88,7 @@ fn external_request_descriptor(
     uri: &Uri,
     headers: &HeaderMap,
     route: &'static str,
+    body: &Bytes,
 ) -> astra_services::ProviderRequestDescriptor {
     astra_services::ProviderRequestDescriptor {
         method: method.as_str().to_string(),
@@ -96,8 +98,12 @@ fn external_request_descriptor(
             .get("x-request-id")
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned),
-        body_digest: None,
+        body_digest: Some(format!("sha256:{}", hex_sha256(body))),
     }
+}
+
+fn hex_sha256(body: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(body))
 }
 pub(crate) mod tool_plan_gate;
 pub(crate) mod tool_route_boundary;
@@ -550,7 +556,7 @@ mod tests {
     use astra_services::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
         RunListRecord, RunStatusRecord,
-        multi_agent::{EdgeDispatchRow, EdgeDispatchService},
+        multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService},
     };
     use async_trait::async_trait;
     use axum::{Json, http::StatusCode};
@@ -565,9 +571,8 @@ mod tests {
     impl EdgeDispatchService for RecordingEdgeDispatchService {
         async fn insert_dispatch(
             &self,
-            _user_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _request_id: &str,
             _payload_json: &str,
         ) -> Result<(), String> {
             unreachable!("insert_dispatch is not used in cleanup tests")
@@ -583,8 +588,7 @@ mod tests {
 
         async fn deliver_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
         ) -> Result<bool, String> {
@@ -593,8 +597,7 @@ mod tests {
 
         async fn fail_dispatch(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _reason: &str,
         ) -> Result<bool, String> {
             unreachable!("fail_dispatch is not used in cleanup tests")
@@ -602,8 +605,7 @@ mod tests {
 
         async fn wait_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &EdgeDispatchIdentity,
             _timeout: std::time::Duration,
         ) -> Result<Option<String>, String> {
             unreachable!("wait_result is not used in cleanup tests")

@@ -54,6 +54,7 @@ pub(crate) mod session_lifecycle;
 pub mod session_reaper;
 pub mod session_restore;
 pub mod session_workspace;
+pub mod skill_auto_route_judge;
 pub mod skill_config;
 pub mod skills;
 pub mod snapshot_sql;
@@ -152,10 +153,10 @@ pub use context_manifest::{
     ContextManifestError, ContextManifestItemWrite, ContextManifestWrite,
     DELEGATION_BLOCKER_ZONE_CAP, DELEGATION_ZONE_CAP, DatabaseContextManifestStore,
     DelegationBudget, DelegationBudgetAllocation, RECENT_TAIL_BENCHMARK_FLOOR, RenderMode,
-    RetrievalStage, TurnIntentBudgetAllocation, artifact_id_from_raw_ref, budget_for_turn_intent,
-    content_hash_with_normalize_version, cross_session_retrieval_requires_user_filter,
-    delegation_budget, delegation_budget_allocation, expired_artifact_placeholder,
-    next_action_confidence_action, suggested_next_action_expires_at,
+    RetrievalStage, TURN_INTENT_BENCHMARK_COMPARISON, TurnIntentBudgetAllocation,
+    artifact_id_from_raw_ref, budget_for_turn_intent, content_hash_with_normalize_version,
+    cross_session_retrieval_requires_user_filter, delegation_budget, delegation_budget_allocation,
+    expired_artifact_placeholder, next_action_confidence_action, suggested_next_action_expires_at,
 };
 pub use contract_generator::{
     ContractGenerator, ProjectDetection, acceptance_checks_to_criteria, detect_build_command,
@@ -237,10 +238,11 @@ pub use models::{
 };
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,
-    EdgeAgentRecord, EdgeDispatchRow, EdgeDispatchService, EdgeRegistryService, LeaseClaimResult,
-    LeaseRenewalConfig, LeaseRenewalTask, NextClaimableLeaseClaimResult, TaskLeaseHoldCache,
-    TaskLeaseService, TaskLeaseView, TasksPackPushResult, UnconfiguredEdgeDispatchService,
-    UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
+    EdgeAgentRecord, EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService,
+    EdgeRegistryService, LeaseClaimResult, LeaseRenewalConfig, LeaseRenewalTask,
+    NextClaimableLeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView,
+    TasksPackPushResult, UnconfiguredEdgeDispatchService, UnconfiguredEdgeRegistryService,
+    UnconfiguredTaskLeaseService,
 };
 pub use pagination::{
     MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, clamp_admin_audit_limit,
@@ -293,6 +295,11 @@ pub use session_artifact_store::{
     local_session_artifact_store,
 };
 pub use session_fork::{ForkSessionOptions, ForkSessionResult, fork_local_session};
+pub use skill_auto_route_judge::{
+    SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
+    SkillAutoRouteJudgeError, build_skill_auto_route_prompt, parse_skill_auto_route_response,
+    skill_auto_route_judge_messages,
+};
 pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
 };

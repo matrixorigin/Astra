@@ -1279,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn factual_retry_is_reachable_from_workspace_evidence_profile() {
+    fn factual_retry_is_reachable_from_structured_profile() {
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: Some(50),
             session_id: &None,
@@ -1295,8 +1295,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        pack.task_profile =
-            crate::chat_turn_heuristics::infer_task_execution_profile("show me the latest PR");
+        pack.task_profile.allow_factual_retry = true;
 
         let out = ingest_agentic_turn_stream(
             &snap,

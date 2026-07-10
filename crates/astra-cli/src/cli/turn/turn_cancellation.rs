@@ -169,6 +169,10 @@ mod tests {
         assert!(state.history[0].1.contains("user_interrupted"));
         assert!(state.history[0].1.contains("The first half of the answer"));
         assert!(state.last_turn_interrupted);
+        assert_eq!(
+            state.turn, 1,
+            "Ctrl+C failure settlement must consume the bridge turn"
+        );
 
         let event = state
             .last_turn_event
@@ -259,6 +263,10 @@ mod tests {
                 .contains("Interrupted by user before any response"),
         );
         assert!(state.last_turn_interrupted);
+        assert_eq!(
+            state.turn, 1,
+            "Ctrl+C before first token must still consume the bridge turn"
+        );
 
         let events = session_journal::read_journal(&sid).unwrap();
         let event = events

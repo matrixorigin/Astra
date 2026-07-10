@@ -14,6 +14,7 @@
 
 use serde_json::Value;
 
+use crate::section_types::estimate_text_tokens;
 use crate::tool::args::shape::tool_call_name;
 
 /// Placeholder that replaces cleared tool result content.
@@ -391,11 +392,8 @@ impl AdaptiveCompactConfig {
     }
 }
 
-/// Rough token estimate for a string. ~4 bytes per token for English/code.
-/// Underestimates for CJK (~2 bytes/token) — acceptable since the budget
-/// is a soft threshold, not a hard limit.
 fn estimate_tokens(s: &str) -> usize {
-    s.len() / 4
+    estimate_text_tokens(s) as usize
 }
 
 fn should_preserve_protected_prefix_result(
@@ -899,6 +897,7 @@ mod tests {
         assert_eq!(estimate_tokens(""), 0);
         // Short content rounds down
         assert_eq!(estimate_tokens("abc"), 0);
+        assert_eq!(estimate_tokens("你好世界"), 4);
     }
 
     #[test]

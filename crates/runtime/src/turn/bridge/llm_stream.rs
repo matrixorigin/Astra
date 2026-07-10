@@ -18,10 +18,9 @@ use uuid::Uuid;
 use crate::turn::bridge::sse_helpers::render_sse;
 use crate::turn::llm::client::{
     LLM_MAX_RETRIES, LlmCancel, apply_llm_header_overrides, apply_provider_auth,
-    build_provider_request_body_with_overrides, consolidate_system_messages, llm_request_url,
-    llm_request_url_for_provider, llm_retry_base_ms, parse_openai_sse_json_stream,
-    provider_uses_anthropic_messages, provider_uses_bedrock_converse, sleep_ms_or_llm_cancel,
-    split_think_chunks,
+    build_provider_request_body_with_overrides, llm_request_url, llm_request_url_for_provider,
+    llm_retry_base_ms, parse_openai_sse_json_stream, provider_uses_anthropic_messages,
+    provider_uses_bedrock_converse, sleep_ms_or_llm_cancel, split_think_chunks,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
@@ -1023,7 +1022,8 @@ pub(crate) async fn call_llm_stream_with_request_overrides(
     client_builder = crate::turn::llm::client::apply_env_proxy(client_builder);
     let client = client_builder.build().map_err(|e| e.to_string())?;
 
-    let messages = consolidate_system_messages(messages);
+    let messages =
+        crate::turn::llm::client::consolidate_system_messages_for_provider(messages, provider);
     if provider_uses_bedrock_converse(provider) {
         return bedrock_stream_with_retry(
             &client,

@@ -7,8 +7,8 @@
 mod common;
 
 use astra_services::multi_agent::{
-    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDispatchService,
-    EdgeRegistryService,
+    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDispatchIdentity,
+    EdgeDispatchService, EdgeRegistryService,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -17,6 +17,16 @@ use uuid::Uuid;
 
 fn unique_suffix() -> String {
     Uuid::new_v4().to_string()
+}
+
+fn dispatch_identity(user_id: &str, request_id: &str) -> EdgeDispatchIdentity {
+    EdgeDispatchIdentity::new(
+        user_id,
+        format!("sess-{request_id}"),
+        format!("run-{request_id}"),
+        format!("chain-{request_id}"),
+        request_id,
+    )
 }
 
 /// All online tests require the env var gate.
@@ -43,10 +53,11 @@ async fn edge_dispatch_full_lifecycle() {
     let user_id = format!("ed-usr-{}", unique_suffix());
     let agent_id = format!("ed-agent-{}", unique_suffix());
     let request_id = Uuid::new_v4().to_string();
+    let identity = dispatch_identity(&user_id, &request_id);
 
     // 1. Insert dispatch
     let payload = r#"{"tool":"bash","args":{"command":"echo hi"}}"#;
-    svc.insert_dispatch(&user_id, &agent_id, &request_id, payload)
+    svc.insert_dispatch(&identity, &agent_id, payload)
         .await
         .expect("insert_dispatch");
 
@@ -67,14 +78,14 @@ async fn edge_dispatch_full_lifecycle() {
 
     // 4. Deliver result (with edge_agent_id for auth)
     let ok = svc
-        .deliver_result(&user_id, &request_id, &agent_id, r#"{"output":"hello"}"#)
+        .deliver_result(&identity, &agent_id, r#"{"output":"hello"}"#)
         .await
         .expect("deliver_result");
     assert!(ok, "deliver_result should return true for existing request");
 
     // 6. wait_result returns the result
     let result = svc
-        .wait_result(&user_id, &request_id, std::time::Duration::from_secs(5))
+        .wait_result(&identity, std::time::Duration::from_secs(5))
         .await
         .expect("wait_result");
     assert!(
@@ -95,9 +106,10 @@ async fn edge_dispatch_deliver_result_nonexistent_returns_false() {
     let pool = common::setup_pool().await;
     let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
     let user_id = format!("ed-miss-usr-{}", unique_suffix());
+    let identity = dispatch_identity(&user_id, "no-such-request");
 
     let ok = svc
-        .deliver_result(&user_id, "no-such-request", "any-agent", "{}")
+        .deliver_result(&identity, "any-agent", "{}")
         .await
         .expect("deliver_result");
     assert!(
@@ -117,20 +129,16 @@ async fn edge_dispatch_deliver_result_wrong_agent_rejected() {
     let user_id = format!("ed-usr-{}", unique_suffix());
     let agent_id = format!("ed-agent-{}", unique_suffix());
     let request_id = Uuid::new_v4().to_string();
+    let identity = dispatch_identity(&user_id, &request_id);
 
     // Insert dispatch with agent_id
-    svc.insert_dispatch(&user_id, &agent_id, &request_id, r#"{"test":true}"#)
+    svc.insert_dispatch(&identity, &agent_id, r#"{"test":true}"#)
         .await
         .expect("insert_dispatch");
 
     // Try to deliver with a DIFFERENT agent — must be rejected
     let ok = svc
-        .deliver_result(
-            &user_id,
-            &request_id,
-            "wrong-agent-id",
-            r#"{"output":"stolen"}"#,
-        )
+        .deliver_result(&identity, "wrong-agent-id", r#"{"output":"stolen"}"#)
         .await
         .expect("deliver_result");
     assert!(
@@ -140,7 +148,7 @@ async fn edge_dispatch_deliver_result_wrong_agent_rejected() {
 
     // Verify the original agent can still deliver
     let ok = svc
-        .deliver_result(&user_id, &request_id, &agent_id, r#"{"output":"legit"}"#)
+        .deliver_result(&identity, &agent_id, r#"{"output":"legit"}"#)
         .await
         .expect("deliver_result");
     assert!(
@@ -160,14 +168,15 @@ async fn edge_dispatch_wait_result_timeout() {
     let user_id = format!("ed-to-usr-{}", unique_suffix());
     let agent_id = format!("ed-to-agent-{}", unique_suffix());
     let request_id = Uuid::new_v4().to_string();
+    let identity = dispatch_identity(&user_id, &request_id);
 
-    svc.insert_dispatch(&user_id, &agent_id, &request_id, "{}")
+    svc.insert_dispatch(&identity, &agent_id, "{}")
         .await
         .expect("insert_dispatch");
 
     // 200ms timeout — should not be enough to deliver result
     let result = svc
-        .wait_result(&user_id, &request_id, std::time::Duration::from_millis(200))
+        .wait_result(&identity, std::time::Duration::from_millis(200))
         .await
         .expect("wait_result");
     assert!(result.is_none(), "wait_result should time out (Some=None)");
@@ -185,7 +194,9 @@ async fn edge_dispatch_poll_isolation() {
     let user_b = format!("ed-iso-usr-b-{}", unique_suffix());
     let agent = format!("ed-iso-agent-{}", unique_suffix());
 
-    svc.insert_dispatch(&user_a, &agent, &Uuid::new_v4().to_string(), "{}")
+    let request_id = Uuid::new_v4().to_string();
+    let identity = dispatch_identity(&user_a, &request_id);
+    svc.insert_dispatch(&identity, &agent, "{}")
         .await
         .expect("insert for user A");
 
@@ -210,11 +221,13 @@ async fn edge_dispatch_request_id_is_owner_scoped() {
     let agent_a = format!("ed-own-agent-a-{}", unique_suffix());
     let agent_b = format!("ed-own-agent-b-{}", unique_suffix());
     let request_id = Uuid::new_v4().to_string();
+    let identity_a = dispatch_identity(&user_a, &request_id);
+    let identity_b = dispatch_identity(&user_b, &request_id);
 
-    svc.insert_dispatch(&user_a, &agent_a, &request_id, r#"{"owner":"a"}"#)
+    svc.insert_dispatch(&identity_a, &agent_a, r#"{"owner":"a"}"#)
         .await
         .expect("insert user A dispatch");
-    svc.insert_dispatch(&user_b, &agent_b, &request_id, r#"{"owner":"b"}"#)
+    svc.insert_dispatch(&identity_b, &agent_b, r#"{"owner":"b"}"#)
         .await
         .expect("insert user B dispatch with same request_id");
     let owner_scope = sqlx::query(
@@ -240,7 +253,7 @@ async fn edge_dispatch_request_id_is_owner_scoped() {
     );
 
     let wrong_owner = svc
-        .deliver_result(&user_b, &request_id, &agent_a, r#"{"output":"stolen"}"#)
+        .deliver_result(&identity_b, &agent_a, r#"{"output":"stolen"}"#)
         .await
         .expect("wrong owner deliver_result");
     assert!(
@@ -249,23 +262,23 @@ async fn edge_dispatch_request_id_is_owner_scoped() {
     );
 
     let ok_a = svc
-        .deliver_result(&user_a, &request_id, &agent_a, r#"{"output":"owner-a"}"#)
+        .deliver_result(&identity_a, &agent_a, r#"{"output":"owner-a"}"#)
         .await
         .expect("owner A deliver_result");
     assert!(ok_a, "owner A should complete its own dispatch");
     let ok_b = svc
-        .deliver_result(&user_b, &request_id, &agent_b, r#"{"output":"owner-b"}"#)
+        .deliver_result(&identity_b, &agent_b, r#"{"output":"owner-b"}"#)
         .await
         .expect("owner B deliver_result");
     assert!(ok_b, "owner B should complete its own dispatch");
 
     let result_a = svc
-        .wait_result(&user_a, &request_id, std::time::Duration::from_secs(1))
+        .wait_result(&identity_a, std::time::Duration::from_secs(1))
         .await
         .expect("wait owner A result")
         .expect("owner A result");
     let result_b = svc
-        .wait_result(&user_b, &request_id, std::time::Duration::from_secs(1))
+        .wait_result(&identity_b, std::time::Duration::from_secs(1))
         .await
         .expect("wait owner B result")
         .expect("owner B result");
@@ -284,13 +297,14 @@ async fn edge_dispatch_cleanup_stale_removes_completed() {
     let user_id = format!("ed-cln-usr-{}", unique_suffix());
     let agent_id = format!("ed-cln-agent-{}", unique_suffix());
     let request_id = Uuid::new_v4().to_string();
+    let identity = dispatch_identity(&user_id, &request_id);
 
-    svc.insert_dispatch(&user_id, &agent_id, &request_id, "{}")
+    svc.insert_dispatch(&identity, &agent_id, "{}")
         .await
         .expect("insert_dispatch");
 
     // Complete it
-    svc.deliver_result(&user_id, &request_id, &agent_id, r#"{"done":true}"#)
+    svc.deliver_result(&identity, &agent_id, r#"{"done":true}"#)
         .await
         .expect("deliver_result");
 
@@ -318,7 +332,7 @@ async fn edge_dispatch_cleanup_stale_removes_completed() {
 
     // wait_result now returns None (row was deleted)
     let result = svc
-        .wait_result(&user_id, &request_id, std::time::Duration::from_millis(100))
+        .wait_result(&identity, std::time::Duration::from_millis(100))
         .await
         .expect("wait_result after cleanup");
     assert!(result.is_none(), "request should be gone after cleanup");
@@ -547,9 +561,10 @@ async fn edge_dispatch_concurrent_poll_single_winner() {
     let user_id = format!("ed-cc-usr-{}", unique_suffix());
     let agent_id = format!("ed-cc-agent-{}", unique_suffix());
     let request_id = Uuid::new_v4().to_string();
+    let identity = dispatch_identity(&user_id, &request_id);
 
     let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
-    svc.insert_dispatch(&user_id, &agent_id, &request_id, r#"{"tool":"bash"}"#)
+    svc.insert_dispatch(&identity, &agent_id, r#"{"tool":"bash"}"#)
         .await
         .expect("insert_dispatch");
 
@@ -617,7 +632,8 @@ async fn edge_dispatch_concurrent_poll_multi_row_multi_poller() {
     let mut request_ids = Vec::new();
     for i in 0..3 {
         let rid = format!("{}-{}", Uuid::new_v4(), i);
-        svc.insert_dispatch(&user_id, &agent_id, &rid, r#"{"test":true}"#)
+        let identity = dispatch_identity(&user_id, &rid);
+        svc.insert_dispatch(&identity, &agent_id, r#"{"test":true}"#)
             .await
             .expect("insert_dispatch");
         request_ids.push(rid);

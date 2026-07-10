@@ -576,10 +576,9 @@ mod tests {
 
     #[test]
     fn cjk_content_triggers_compaction_without_measured_tokens() {
-        // CJK chars are ~1.5 tokens each, not 0.75 (3 bytes / 4).
-        // Without measured tokens, the fallback estimation should use
-        // CJK-aware logic so it correctly detects being over budget.
-        let cjk_content = "你好世界".repeat(2000); // 8000 CJK chars ≈ 12000 tokens
+        // Without measured tokens, fallback estimation must still account for
+        // dense non-ASCII content well enough to detect an over-budget request.
+        let cjk_content = "你好世界".repeat(2000);
         let mut msgs = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "任务"}),
@@ -589,9 +588,6 @@ mod tests {
             json!({"role": "user", "content": "完成"}),
             json!({"role": "assistant", "content": &cjk_content, "tool_calls": []}),
         ];
-        // limit = 15K tokens. With naive bytes/4: 3*24K bytes / 4 = 18K → over.
-        // But CJK chars are 3 bytes, so tokens = 3*8000*1.5 = 36K → way over.
-        // Both should trigger, but CJK-aware estimate should be higher.
         let result = try_compact_for_retry(&mut msgs, None, 15_000);
         assert!(
             result.is_some(),

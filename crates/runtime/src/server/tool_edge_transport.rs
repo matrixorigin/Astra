@@ -209,6 +209,19 @@ async fn try_edge_dispatch(
         ));
     }
     let request_id = plan.dispatch_request_id().to_string();
+    let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+        &request.user_id,
+        &request.session_id,
+        &request.run_id,
+        &request.turn_chain_id,
+        &request_id,
+    );
+    if !identity.is_complete() {
+        return EdgeTransportAttempt::Delivered(astra_tools::ToolResult::error(
+            "edge dispatch identity is incomplete; run_id and turn_chain_id are required"
+                .to_string(),
+        ));
+    }
     let payload_json = match plan.dispatch_payload_json() {
         Ok(json) => json,
         Err(error) => {
@@ -218,30 +231,24 @@ async fn try_edge_dispatch(
         }
     };
     if dispatch
-        .insert_dispatch(
-            &request.user_id,
-            &agent.edge_agent_id,
-            plan.dispatch_request_id(),
-            &payload_json,
-        )
+        .insert_dispatch(&identity, &agent.edge_agent_id, &payload_json)
         .await
         .is_err()
     {
         return EdgeTransportAttempt::TransportDisconnected;
     }
     let wait_dispatch = dispatch.clone();
-    let wait_user_id = request.user_id.clone();
-    let wait_request_id = request_id.clone();
+    let wait_identity = identity.clone();
     let wait_result = async move {
         wait_dispatch
-            .wait_result(&wait_user_id, &wait_request_id, plan.wait_timeout())
+            .wait_result(&wait_identity, plan.wait_timeout())
             .await
     };
     let result_json = if let Some(token) = cancel_token.as_ref() {
         tokio::select! {
             _ = token.cancelled() => {
                 if let Err(e) = dispatch
-                    .fail_dispatch(&request.user_id, &request_id, TOOL_ERROR_KIND_CANCELLED)
+                    .fail_dispatch(&identity, TOOL_ERROR_KIND_CANCELLED)
                     .await
                 {
                     tracing::warn!(
@@ -263,10 +270,7 @@ async fn try_edge_dispatch(
         wait_result.await.ok().flatten()
     };
     let Some(result_json) = result_json else {
-        if let Err(e) = dispatch
-            .fail_dispatch(&request.user_id, &request_id, "expired")
-            .await
-        {
+        if let Err(e) = dispatch.fail_dispatch(&identity, "expired").await {
             tracing::warn!(
                 error = %e,
                 request_id = %request_id,
@@ -283,7 +287,7 @@ async fn try_edge_dispatch(
     let (output, is_error) = parsed_result
         .map(|request| {
             (
-                request.output.unwrap_or_default(),
+                request.output,
                 matches!(request.status.as_str(), "error" | "failed"),
             )
         })

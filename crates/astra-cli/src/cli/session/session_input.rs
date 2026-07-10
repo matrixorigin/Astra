@@ -9,15 +9,12 @@ pub(crate) fn detect_correction_signal(message: &str) -> bool {
     input_classifier::is_reanchor_signal(message)
 }
 
-pub(crate) fn apply_resume_context(
-    mut effective_line: String,
-    resume_guidance: Option<String>,
-) -> String {
-    if let Some(guidance) = resume_guidance {
-        effective_line =
-            format!("{effective_line}\n\n<system-reminder>\n{guidance}\n</system-reminder>");
-    }
-    effective_line
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FinalizedInput {
+    pub(crate) user_message: String,
+    pub(crate) user_intent: String,
+    pub(crate) runtime_required_texts: Vec<String>,
+    pub(crate) runtime_volatile_texts: Vec<String>,
 }
 
 pub(crate) fn clear_pending_recovery_for_ordinary_chat_input(state: &mut SessionState) {
@@ -26,11 +23,14 @@ pub(crate) fn clear_pending_recovery_for_ordinary_chat_input(state: &mut Session
 }
 
 pub(crate) async fn finalize_effective_line(
-    mut effective_line: String,
+    effective_line: String,
+    user_intent: String,
     resume_guidance: Option<String>,
     state: &mut SessionState,
-) -> String {
+) -> FinalizedInput {
     state.diagnostics_context = None;
+    let mut runtime_required_texts = Vec::new();
+    let mut runtime_volatile_texts = Vec::new();
 
     if !state.pending_bg_notifications.is_empty() {
         let notifications = state
@@ -38,9 +38,9 @@ pub(crate) async fn finalize_effective_line(
             .drain(..)
             .collect::<Vec<_>>()
             .join("\n");
-        effective_line = format!(
-            "<system-reminder>\nBackground task updates since your last turn:\n{notifications}\n</system-reminder>\n\n{effective_line}"
-        );
+        runtime_volatile_texts.push(format!(
+            "Background task updates since your last turn:\n{notifications}"
+        ));
     }
 
     const TURNS_SINCE_TASK_USE_THRESHOLD: u32 = 10;
@@ -58,32 +58,39 @@ pub(crate) async fn finalize_effective_line(
         let nudge = match state.task_manager.load_active_tasks().await {
             Ok(tasks) => format_open_task_reminder_list(&tasks).map(|task_list| {
                 format!(
-                    "<system-reminder>\n\
-                The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, \
-                consider using task_board(action='create') to add new tasks and task_board(action='update', task_id='...', new_status='...') to update task status \
-                (set new_status='in_progress' when starting, new_status='completed' when done, or new_status='paused' when waiting). Also consider cleaning up the task list if it has become stale. \
-                Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable. \
-                Make sure that you NEVER mention this reminder to the user\n\
+                    "The task tools haven't been used recently. If you're working on tasks that would benefit from tracking progress, \
+                    consider using task_board(action='create') to add new tasks and task_board(action='update', task_id='...', new_status='...') to update task status \
+                    (set new_status='in_progress' when starting, new_status='completed' when done, or new_status='paused' when waiting). Also consider cleaning up the task list if it has become stale. \
+                    Only use these if relevant to the current work. This is just a gentle reminder - ignore if not applicable. \
+                    Make sure that you NEVER mention this reminder to the user\n\
                 \n\
-                Here is the open task board:\n{task_list}\n\
-                </system-reminder>"
+                Here is the open task board:\n{task_list}"
                 )
             }),
             Err(error) => Some(format!(
-                "<system-reminder>\n\
-                Task board state could not be loaded while checking whether a task reminder is needed: {error}\n\
+                "Task board state could not be loaded while checking whether a task reminder is needed: {error}\n\
                 Do not assume there are no open tasks. If task tracking is relevant to the current work, retry task_board(action='list') or continue without task updates if unrelated. \
-                This reminder is throttled; never mention it to the user.\n\
-                </system-reminder>"
+                This reminder is throttled; never mention it to the user."
             )),
         };
         if let Some(nudge) = nudge {
-            effective_line = format!("{nudge}\n\n{effective_line}");
+            runtime_volatile_texts.push(nudge);
         }
         state.turns_since_task_reminder = 0;
     }
 
-    apply_resume_context(effective_line, resume_guidance)
+    if let Some(guidance) = resume_guidance
+        && !guidance.trim().is_empty()
+    {
+        runtime_required_texts.push(guidance);
+    }
+
+    FinalizedInput {
+        user_message: effective_line,
+        user_intent,
+        runtime_required_texts,
+        runtime_volatile_texts,
+    }
 }
 
 fn format_open_task_reminder_list(tasks: &[SessionTask]) -> Option<String> {
@@ -168,7 +175,7 @@ pub(crate) fn build_effective_line(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_resume_context, build_effective_line, clear_pending_recovery_for_ordinary_chat_input,
+        build_effective_line, clear_pending_recovery_for_ordinary_chat_input,
         detect_correction_signal, finalize_effective_line,
     };
     use crate::cli::session::session_state::SessionState;
@@ -278,15 +285,27 @@ mod tests {
         assert_eq!(effective, "修一下输入法问题");
     }
 
-    #[test]
-    fn apply_resume_context_preserves_user_message_before_resume_guidance() {
-        let effective = apply_resume_context(
-            "continue".to_string(),
-            Some("Resume the interrupted turn before answering.".to_string()),
+    #[tokio::test]
+    async fn finalize_effective_line_routes_resume_guidance_to_required_lane() {
+        let mut state = SessionState::default();
+
+        let finalized = finalize_effective_line(
+            "continue".into(),
+            "raw continue".into(),
+            Some("Resume the interrupted turn before answering.".into()),
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(finalized.user_message, "continue");
+        assert_eq!(finalized.user_intent, "raw continue");
+        assert_eq!(
+            finalized.runtime_required_texts,
+            vec!["Resume the interrupted turn before answering.".to_string()]
         );
-        assert!(effective.starts_with("continue\n\n<system-reminder>"));
-        assert!(effective.contains("Resume the interrupted turn before answering."));
-        assert!(effective.ends_with("</system-reminder>"));
+        assert!(finalized.runtime_volatile_texts.is_empty());
+        assert!(!finalized.user_message.contains("<system-reminder>"));
+        assert!(!finalized.user_message.contains("[session-resume:v1]"));
     }
 
     #[test]
@@ -471,7 +490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_effective_line_drains_notifications_and_keeps_user_first() {
+    async fn finalize_effective_line_drains_notifications_without_mutating_user_message() {
         let mut state = SessionState {
             diagnostics_context: Some("<diag/>".into()),
             pending_bg_notifications: vec![
@@ -483,19 +502,26 @@ mod tests {
 
         let finalized = finalize_effective_line(
             "continue".into(),
+            "continue".into(),
             Some("Resume the interrupted task.".into()),
             &mut state,
         )
         .await;
 
-        assert!(finalized.starts_with("<system-reminder>\nBackground task updates"));
-        assert!(
-            finalized.contains("\n\ncontinue\n\n<system-reminder>\nResume the interrupted task.")
+        assert_eq!(finalized.user_message, "continue");
+        assert_eq!(
+            finalized.runtime_required_texts,
+            vec!["Resume the interrupted task."]
         );
-        assert!(finalized.contains("Background task updates since your last turn:"));
-        assert!(!finalized.contains("Background command updates"));
-        assert!(finalized.contains("bg-shell-1 completed"));
-        assert!(finalized.contains("bg-shell-2 failed"));
+        assert_eq!(finalized.runtime_volatile_texts.len(), 1);
+        assert!(
+            finalized.runtime_volatile_texts[0]
+                .contains("Background task updates since your last turn:")
+        );
+        assert!(!finalized.runtime_volatile_texts[0].contains("Background command updates"));
+        assert!(finalized.runtime_volatile_texts[0].contains("bg-shell-1 completed"));
+        assert!(finalized.runtime_volatile_texts[0].contains("bg-shell-2 failed"));
+        assert!(!finalized.user_message.contains("<system-reminder>"));
         assert!(state.pending_bg_notifications.is_empty());
         assert!(state.diagnostics_context.is_none());
     }
@@ -540,18 +566,27 @@ mod tests {
             .await;
         assert!(!done_update.starts_with("Error:"), "{done_update}");
 
-        let finalized = finalize_effective_line("continue".into(), None, &mut state).await;
+        let finalized =
+            finalize_effective_line("continue".into(), "continue".into(), None, &mut state).await;
 
-        assert!(finalized.contains("The task tools haven't been used recently."));
-        assert!(finalized.contains("new_status='in_progress'"));
-        assert!(finalized.contains("new_status='completed'"));
-        assert!(finalized.contains("new_status='paused'"));
-        assert!(finalized.contains("Here is the open task board:"));
-        assert!(finalized.contains("Track the recovery cleanup"));
-        assert!(finalized.contains("[paused] task-2: Wait for operator input"));
+        assert_eq!(finalized.user_message, "continue");
+        assert_eq!(finalized.runtime_volatile_texts.len(), 1);
+        let reminder = &finalized.runtime_volatile_texts[0];
+        assert!(reminder.contains("The task tools haven't been used recently."));
+        assert!(reminder.contains("new_status='in_progress'"));
+        assert!(reminder.contains("new_status='completed'"));
+        assert!(reminder.contains("new_status='paused'"));
+        assert!(reminder.contains("Here is the open task board:"));
+        assert!(reminder.contains("Track the recovery cleanup"));
+        assert!(reminder.contains("[paused] task-2: Wait for operator input"));
         assert!(
-            !finalized.contains("Already finished"),
-            "terminal completed history should not clutter the open-work reminder: {finalized}"
+            !reminder.contains("Already finished"),
+            "terminal completed history should not clutter the open-work reminder: {reminder}"
+        );
+        assert!(
+            !finalized
+                .user_message
+                .contains("The task tools haven't been used recently.")
         );
         assert_eq!(state.turns_since_task_use, 10);
         assert_eq!(state.turns_since_task_reminder, 0);
@@ -582,15 +617,18 @@ mod tests {
             .await;
         assert!(!done_update.starts_with("Error:"), "{done_update}");
 
-        let finalized = finalize_effective_line("continue".into(), None, &mut state).await;
+        let finalized =
+            finalize_effective_line("continue".into(), "continue".into(), None, &mut state).await;
 
         assert!(
-            !finalized.contains("The task tools haven't been used recently."),
-            "no-open-work sessions should not get noisy task reminders: {finalized}"
+            finalized.runtime_volatile_texts.is_empty(),
+            "no-open-work sessions should not get noisy task reminders: {finalized:?}"
         );
         assert!(
-            !finalized.contains("Here is the open task board:"),
-            "no-open-work sessions should not render an empty board reminder: {finalized}"
+            !finalized
+                .user_message
+                .contains("Here is the open task board:"),
+            "no-open-work sessions should not render an empty board reminder in user text: {finalized:?}"
         );
         assert_eq!(state.turns_since_task_use, 10);
         assert_eq!(
@@ -612,15 +650,18 @@ mod tests {
             std::sync::Arc::new(FailingTaskLoadStore),
         ));
 
-        let finalized = finalize_effective_line("continue".into(), None, &mut state).await;
+        let finalized =
+            finalize_effective_line("continue".into(), "continue".into(), None, &mut state).await;
 
+        assert_eq!(finalized.user_message, "continue");
+        assert_eq!(finalized.runtime_volatile_texts.len(), 1);
         assert!(
-            finalized.contains("Task board state could not be loaded"),
-            "task reminder load failures must not be silently treated as no open work: {finalized}"
+            finalized.runtime_volatile_texts[0].contains("Task board state could not be loaded"),
+            "task reminder load failures must not be silently treated as no open work: {finalized:?}"
         );
         assert!(
-            finalized.contains("Do not assume there are no open tasks"),
-            "load failure reminder should preserve the task-board uncertainty: {finalized}"
+            finalized.runtime_volatile_texts[0].contains("Do not assume there are no open tasks"),
+            "load failure reminder should preserve the task-board uncertainty: {finalized:?}"
         );
         assert_eq!(state.turns_since_task_use, 10);
         assert_eq!(
@@ -644,12 +685,16 @@ mod tests {
             .await;
         assert!(!create.starts_with("Error:"), "{create}");
 
-        let finalized = finalize_effective_line("continue".into(), None, &mut state).await;
+        let finalized =
+            finalize_effective_line("continue".into(), "continue".into(), None, &mut state).await;
 
+        assert_eq!(finalized.user_message, "continue");
+        assert_eq!(finalized.runtime_volatile_texts.len(), 1);
         assert!(
-            finalized.contains("The task tools haven't been used recently.")
-                && finalized.contains("Open work"),
-            "non-task tool names should not suppress the canonical task reminder: {finalized}"
+            finalized.runtime_volatile_texts[0]
+                .contains("The task tools haven't been used recently.")
+                && finalized.runtime_volatile_texts[0].contains("Open work"),
+            "non-task tool names should not suppress the canonical task reminder: {finalized:?}"
         );
         assert_eq!(state.turns_since_task_use, 10);
         assert_eq!(state.turns_since_task_reminder, 0);

@@ -45,7 +45,8 @@ use crate::server::tool_transport::{
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopState, FactualRetryFallbackJudgeContext, HostTurnResult,
-    TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
+    SkillAutoRouteDecision, SkillAutoRouteJudgeContext, TurnInteractionMode, TurnInteractionPolicy,
+    interaction_scoped_tool_restrictions,
 };
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
 use crate::turn::bridge::llm_stream::rate_limit_cooldown;
@@ -61,6 +62,7 @@ use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
 use astra_services::multi_agent::EdgeDispatchService;
 use astra_services::runs::RequestedTurnInteractionMode;
+use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, SharedAgentLiveEventSink,
 };
@@ -151,16 +153,12 @@ fn llm_main_attempt_metrics_slot() -> &'static RwLock<Option<Arc<MetricsRegistry
 
 pub(crate) fn set_llm_main_attempt_metrics_registry(registry: Arc<MetricsRegistry>) {
     register_llm_main_attempt_metrics(&registry);
-    *llm_main_attempt_metrics_slot()
-        .write()
-        .expect("llm main attempt metrics registry lock poisoned") = Some(registry);
+    *astra_core::sync_poison::recover_rwlock_write(llm_main_attempt_metrics_slot()) =
+        Some(registry);
 }
 
 fn llm_main_attempt_metrics_registry() -> Option<Arc<MetricsRegistry>> {
-    llm_main_attempt_metrics_slot()
-        .read()
-        .expect("llm main attempt metrics registry lock poisoned")
-        .clone()
+    astra_core::sync_poison::recover_rwlock_read(llm_main_attempt_metrics_slot()).clone()
 }
 
 fn register_llm_main_attempt_metrics(registry: &MetricsRegistry) {
@@ -357,12 +355,11 @@ fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
 }
 
 fn estimate_tool_schema_tokens(tools: &[Value]) -> u64 {
-    // Provider tokenizers differ, but UTF-8 bytes / 4 is the same coarse
-    // estimator used elsewhere in the manifest path. The important invariant
-    // is not exact accounting; it is that each LLM call's manifest records a
-    // non-zero, queryable tool-schema budget when tools were actually exposed.
+    // Provider tokenizers differ; the important invariant is not exact
+    // accounting, it is that each LLM call's manifest records a non-zero,
+    // queryable tool-schema budget when tools were actually exposed.
     serde_json::to_string(tools)
-        .map(|value| value.len().div_ceil(4) as u64)
+        .map(|value| u64::from(astra_turn_core::section_types::estimate_text_tokens(&value)))
         .unwrap_or(0)
 }
 
@@ -655,6 +652,10 @@ struct SummaryClientTurnIntentJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
 }
 
+struct SummaryClientSkillAutoRouteJudge {
+    client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+}
+
 const RESOLVED_TURN_LLM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[async_trait]
@@ -670,6 +671,45 @@ impl astra_services::TurnIntentJudge for SummaryClientTurnIntentJudge {
             .await
             .map_err(astra_services::TurnIntentJudgeError::Transport)?;
         astra_services::parse_turn_intent_response(response.text.as_str())
+    }
+}
+
+#[async_trait]
+impl SkillAutoRouteJudge for SummaryClientSkillAutoRouteJudge {
+    async fn judge(
+        &self,
+        ctx: &astra_services::SkillAutoRouteJudgeContext,
+    ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
+        let messages = astra_services::skill_auto_route_judge_messages(ctx)?;
+        let allowed = ctx
+            .visible_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>();
+        let response = self
+            .client
+            .summarize(&messages)
+            .await
+            .map_err(SkillAutoRouteJudgeError::Transport)?;
+        astra_services::parse_skill_auto_route_response(response.text.as_str(), &allowed)
+    }
+}
+
+fn skill_auto_route_service_context(
+    ctx: SkillAutoRouteJudgeContext<'_>,
+) -> astra_services::SkillAutoRouteJudgeContext {
+    astra_services::SkillAutoRouteJudgeContext {
+        query: ctx.query.to_string(),
+        visible_skills: ctx
+            .visible_skills
+            .iter()
+            .map(|skill| SkillAutoRouteCandidate {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                when_to_use: skill.when_to_use.clone(),
+                aliases: skill.aliases.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1214,6 +1254,10 @@ pub struct ServerAgenticLoopHost {
     /// the judge to classify the user's message. Judge failure is non-fatal:
     /// the turn proceeds without explicit semantic intent.
     turn_intent_judge: Option<Arc<dyn astra_services::TurnIntentJudge>>,
+    /// Optional LLM-based skill auto-route judge. When unset, the host may use
+    /// the configured auxiliary LLM path; failure is non-fatal and leaves
+    /// pre-routing disabled for that turn.
+    skill_auto_route_judge: Option<Arc<dyn SkillAutoRouteJudge>>,
 }
 
 #[derive(Clone)]
@@ -1718,6 +1762,7 @@ impl ServerAgenticLoopHostBuilder {
                 .provider_allowed_tools
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashMap::new()))),
             turn_intent_judge: None,
+            skill_auto_route_judge: None,
         }
     }
 
@@ -1909,6 +1954,10 @@ impl ServerAgenticLoopHost {
     /// intent.
     pub fn set_turn_intent_judge(&mut self, judge: Arc<dyn astra_services::TurnIntentJudge>) {
         self.turn_intent_judge = Some(judge);
+    }
+
+    pub fn set_skill_auto_route_judge(&mut self, judge: Arc<dyn SkillAutoRouteJudge>) {
+        self.skill_auto_route_judge = Some(judge);
     }
 
     async fn resolve_llm_config_for_state(
@@ -2714,7 +2763,8 @@ impl ServerAgenticLoopHost {
             // Record to the cross-host log, but do NOT use it to filter:
             // per-round new ids always emit. Lock span is kept minimal.
             {
-                let mut shared = self.emitted_tool_call_ids.lock().unwrap();
+                let mut shared =
+                    astra_core::sync_poison::recover_mutex_lock(&self.emitted_tool_call_ids);
                 shared.insert(key);
             }
             self.emit_event(json!({ "type": "tool_call", "tool_call": tc }));
@@ -3025,6 +3075,8 @@ impl ServerAgenticLoopHost {
     /// for results delivered by another pod.
     async fn deliver_edge_bound_tools_via_ledger(
         &mut self,
+        run_id: &str,
+        turn_chain_id: &str,
         tool_calls: &[Value],
     ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
         if self.event_tx.is_none() || tool_calls.is_empty() {
@@ -3034,7 +3086,7 @@ impl ServerAgenticLoopHost {
         if edge_bound_tool_calls.is_empty() {
             return Vec::new();
         }
-        self.deliver_edge_tools_via_ledger(&edge_bound_tool_calls)
+        self.deliver_edge_tools_via_ledger(run_id, turn_chain_id, &edge_bound_tool_calls)
             .await
     }
 
@@ -3081,8 +3133,26 @@ impl ServerAgenticLoopHost {
                 !self.edge_executor_offline_blocks_tool(&tool_name)
             })
             .collect::<Vec<_>>();
+        let Some(run_id) = state
+            .current_run_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            tracing::warn!(
+                session_id = %self.session_id,
+                user_id = %self.user_id,
+                tool_call_count = ledger_tool_calls.len(),
+                "skip browser edge-tool ledger because current run id is missing"
+            );
+            return results;
+        };
+        let turn_chain_id = state
+            .bridge_turn_chain_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(run_id);
         results.extend(
-            self.deliver_edge_bound_tools_via_ledger(&ledger_tool_calls)
+            self.deliver_edge_bound_tools_via_ledger(run_id, turn_chain_id, &ledger_tool_calls)
                 .await,
         );
         results
@@ -3118,6 +3188,8 @@ impl ServerAgenticLoopHost {
 
     async fn deliver_edge_tools_via_ledger(
         &mut self,
+        run_id: &str,
+        turn_chain_id: &str,
         tool_calls: &[Value],
     ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
         use astra_turn_core::cloud_tool_delivery::{
@@ -3273,7 +3345,15 @@ impl ServerAgenticLoopHost {
             }
 
             for tc in &executable_calls {
-                for m in sse_maps_through_tool_request(tc) {
+                let request_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+                    &self.user_id,
+                    &self.session_id,
+                    run_id,
+                    turn_chain_id,
+                    request_id,
+                );
+                for m in sse_maps_through_tool_request(tc, &identity) {
                     // L1094 (execute_mock_turn mock-LLM-response path) is the
                     // SINGLE owner of `tool_call` events per skill invocation.
                     // `sse_maps_through_tool_request` re-wraps the same tc as
@@ -3298,6 +3378,13 @@ impl ServerAgenticLoopHost {
                     continue;
                 }
                 let (id, tool_name, args) = parse_flat_tool_call_event(tc);
+                let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+                    &self.user_id,
+                    &self.session_id,
+                    run_id,
+                    turn_chain_id,
+                    &id,
+                );
 
                 // ── Dedup read-only tool invocations within a short window ──
                 // Only applies when the tool is parallelizable (args-aware);
@@ -3340,7 +3427,7 @@ impl ServerAgenticLoopHost {
                     )
                 } else {
                     let delivery = self
-                        .wait_tool_result_with_dispatch_fallback(tc, &id, ledger_wait)
+                        .wait_tool_result_with_dispatch_fallback(tc, &identity, ledger_wait)
                         .await;
 
                     let duration_ms = started.elapsed().as_millis() as u64;
@@ -3427,19 +3514,15 @@ impl ServerAgenticLoopHost {
     async fn wait_tool_result_with_dispatch_fallback(
         &self,
         tc: &Value,
-        request_id: &str,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
         ledger_wait: Duration,
     ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
         use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool;
         use astra_turn_core::edge_ledger::tool_callback_key;
 
-        let delivery = wait_tool_result_ledger_for_tool(
-            &self.edge_callback_ledger,
-            &self.user_id,
-            tc,
-            ledger_wait,
-        )
-        .await;
+        let delivery =
+            wait_tool_result_ledger_for_tool(&self.edge_callback_ledger, identity, tc, ledger_wait)
+                .await;
         if !edge_tool_delivery_timed_out(&delivery) {
             return delivery;
         }
@@ -3448,7 +3531,7 @@ impl ServerAgenticLoopHost {
             return delivery;
         };
         let result_json = match dispatch_service
-            .wait_result(&self.user_id, request_id, Duration::from_millis(0))
+            .wait_result(identity, Duration::from_millis(0))
             .await
         {
             Ok(Some(result_json)) => result_json,
@@ -3458,7 +3541,9 @@ impl ServerAgenticLoopHost {
                     target: "astra_runtime::server_loop_host",
                     user_id = %self.user_id,
                     session_id = %self.session_id,
-                    request_id = %request_id,
+                    run_id = %identity.run_id,
+                    turn_chain_id = %identity.turn_chain_id,
+                    request_id = %identity.request_id,
                     error = %error,
                     "edge tool ledger timed out and dispatch fallback failed"
                 );
@@ -3468,13 +3553,16 @@ impl ServerAgenticLoopHost {
 
         let body =
             serde_json::from_str::<Value>(&result_json).unwrap_or(Value::String(result_json));
-        let key = tool_callback_key(&self.user_id, request_id);
+        let key = tool_callback_key(identity);
         {
             let mut ledger = self.edge_callback_ledger.lock().await;
             ledger.entry(key).or_insert_with(|| {
                 json!({
                     "kind": "tool_result",
                     "user_id": self.user_id.as_str(),
+                    "session_id": self.session_id.as_str(),
+                    "run_id": identity.run_id.as_str(),
+                    "turn_chain_id": identity.turn_chain_id.as_str(),
                     "body": body,
                 })
             });
@@ -3482,7 +3570,7 @@ impl ServerAgenticLoopHost {
 
         wait_tool_result_ledger_for_tool(
             &self.edge_callback_ledger,
-            &self.user_id,
+            identity,
             tc,
             Duration::from_millis(0),
         )
@@ -3504,6 +3592,7 @@ impl ServerAgenticLoopHost {
                 let request = ToolExecutionRequest {
                     user_id: self.user_id.clone(),
                     run_id: String::new(),
+                    turn_chain_id: String::new(),
                     session_id: self.session_id.clone(),
                     tool_call_id: tool_call_id.to_string(),
                     tool_name: tool_name.to_string(),
@@ -4171,7 +4260,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     async fn judge_turn_intent(
         &mut self,
         state: &AgenticLoopState,
-    ) -> Option<astra_config::user_profile::TurnIntent> {
+    ) -> crate::turn::agentic_loop::host::TurnIntentJudgeOutcome {
         let has_prior_assistant_turn = state
             .messages
             .iter()
@@ -4180,16 +4269,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Use 1-based turn count: llm_rounds_completed counts *prior* rounds,
         // so the current user turn is +1.
         let turn_count = state.llm_rounds_completed.saturating_add(1);
+        let user_intent = state.runtime_decision_user_intent();
 
         if let Some(judge) = self.turn_intent_judge.as_ref() {
-            return crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
-                judge.as_ref(),
-                &state.message,
-                turn_count,
-                &state.recent_tools,
-                has_prior_assistant_turn,
-            )
-            .await;
+            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(
+                crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
+                    judge.as_ref(),
+                    &user_intent,
+                    turn_count,
+                    &state.recent_tools,
+                    has_prior_assistant_turn,
+                )
+                .await,
+            );
         }
 
         if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
@@ -4202,7 +4294,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 duration_ms = 0_u64,
                 "turn intent judge skipped by capacity policy"
             );
-            return None;
+            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable;
         }
 
         let phase_started_at = Instant::now();
@@ -4218,7 +4310,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 duration_ms,
                 "turn intent phase completed"
             );
-            return None;
+            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable;
         };
         let model_resolution_ms = model_resolution_started_at.elapsed().as_millis() as u64;
         let (model_name, provider) = self
@@ -4234,18 +4326,23 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let judge = SummaryClientTurnIntentJudge { client };
         let result = crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
             &judge,
-            &state.message,
+            &user_intent,
             turn_count,
             &state.recent_tools,
             has_prior_assistant_turn,
         )
         .await;
+        let outcome =
+            crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(result);
         let duration_ms = phase_started_at.elapsed().as_millis() as u64;
         let judge_ms = duration_ms.saturating_sub(model_resolution_ms);
         tracing::info!(
             target: "astra::turn_intent",
             operation = "turn_intent.phase",
-            status = if result.is_some() { "success" } else { "no_intent" },
+            status = match &outcome {
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(_) => "success",
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable => "no_intent",
+            },
             model = %model_name,
             provider = %provider,
             model_resolution_ms,
@@ -4253,7 +4350,55 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             duration_ms,
             "turn intent phase completed"
         );
-        result
+        outcome
+    }
+
+    async fn judge_skill_auto_route(
+        &mut self,
+        state: &AgenticLoopState,
+        ctx: SkillAutoRouteJudgeContext<'_>,
+    ) -> Option<SkillAutoRouteDecision> {
+        if ctx.query.trim().is_empty() || ctx.visible_skills.is_empty() {
+            return None;
+        }
+        let service_ctx = skill_auto_route_service_context(ctx);
+
+        let judged = if let Some(judge) = self.skill_auto_route_judge.as_ref() {
+            judge.judge(&service_ctx).await
+        } else {
+            if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
+                tracing::debug!(
+                    target: "astra::skill_auto_route_judge",
+                    policy = auxiliary_llm_policy_label(),
+                    reason,
+                    "skill auto-route judge skipped by capacity policy"
+                );
+                return None;
+            }
+            let client = self.turn_intent_summary_client(state).await?;
+            let judge = SummaryClientSkillAutoRouteJudge { client };
+            judge.judge(&service_ctx).await
+        };
+
+        match judged {
+            Ok(Some(skill_name)) => {
+                tracing::debug!(
+                    target: "astra::skill_auto_route_judge",
+                    skill_name,
+                    "skill auto-route judged"
+                );
+                Some(SkillAutoRouteDecision { skill_name })
+            }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra::skill_auto_route_judge",
+                    error = %error,
+                    "skill auto-route judge unavailable; proceeding without pre-route"
+                );
+                None
+            }
+        }
     }
 
     async fn judge_factual_retry_fallback(
@@ -5969,7 +6114,7 @@ mod tests {
     #[cfg(feature = "bridge-e2e-hooks")]
     use astra_services::SessionArtifactStore;
     use astra_turn_core::cloud_summary::SummaryLlmClient;
-    use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key};
+    use astra_turn_core::edge_ledger::approval_callback_key;
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
     use std::ffi::OsString;
 
@@ -6012,6 +6157,26 @@ mod tests {
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
     }
 
+    fn test_dispatch_identity(
+        user_id: &str,
+        session_id: &str,
+        request_id: &str,
+    ) -> astra_services::multi_agent::EdgeDispatchIdentity {
+        astra_services::multi_agent::EdgeDispatchIdentity::new(
+            user_id,
+            session_id,
+            "test-run",
+            "test-chain",
+            request_id,
+        )
+    }
+
+    fn tool_callback_key(user_id: &str, session_id: &str, request_id: &str) -> String {
+        astra_turn_core::edge_ledger::tool_callback_key(&test_dispatch_identity(
+            user_id, session_id, request_id,
+        ))
+    }
+
     struct NoopAuxiliaryEventWriter;
 
     #[async_trait::async_trait]
@@ -6024,14 +6189,14 @@ mod tests {
         }
     }
 
-    fn approval_allow_entry(request_id: &str) -> Value {
+    fn approval_allow_entry(session_id: &str, request_id: &str) -> Value {
         json!({
             "kind": "approval_respond",
             "body": astra_thin_client::ApprovalRespondRequest {
                 request_id: request_id.to_string(),
                 decision: astra_thin_client::ApprovalDecision::Allow,
                 reason: None,
-                session_id: "test-session".to_string(),
+                session_id: session_id.to_string(),
                 run_id: "test-run".to_string(),
                 tool_name: None,
                 approval_kind: None,
@@ -6039,16 +6204,17 @@ mod tests {
         })
     }
 
-    fn test_approval_key(user_id: &str, request_id: &str) -> String {
-        approval_callback_key(user_id, "test-session", "test-run", request_id)
+    fn test_approval_key(user_id: &str, session_id: &str, request_id: &str) -> String {
+        approval_callback_key(user_id, session_id, "test-run", request_id)
     }
 
     fn test_approval_audit_context(
         user_id: &str,
+        session_id: &str,
     ) -> astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
         astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
             user_id: user_id.to_string(),
-            session_id: "test-session".to_string(),
+            session_id: session_id.to_string(),
             run_id: "test-run".to_string(),
             turn: 1,
             agent_id: None,
@@ -6067,9 +6233,8 @@ mod tests {
     impl EdgeDispatchService for StaticWaitResultEdgeDispatch {
         async fn insert_dispatch(
             &self,
-            _user_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
-            _request_id: &str,
             _payload_json: &str,
         ) -> Result<(), String> {
             Err("not used".to_string())
@@ -6085,8 +6250,7 @@ mod tests {
 
         async fn deliver_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
         ) -> Result<bool, String> {
@@ -6095,8 +6259,7 @@ mod tests {
 
         async fn fail_dispatch(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _reason: &str,
         ) -> Result<bool, String> {
             Err("not used".to_string())
@@ -6104,8 +6267,7 @@ mod tests {
 
         async fn wait_result(
             &self,
-            _user_id: &str,
-            _request_id: &str,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
             _timeout: Duration,
         ) -> Result<Option<String>, String> {
             Ok(self.result_json.clone())
@@ -6247,6 +6409,24 @@ mod tests {
         ));
         assert!(rendered.contains(
             r#"astra_llm_main_attempt_tokens_total{attempt="retry",outcome="admission_rejected",phase="admission"} 4096"#
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial(llm_main_attempt_metrics)]
+    fn llm_main_attempt_metrics_registry_recovers_from_poisoned_slot() {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard =
+                astra_core::sync_poison::recover_rwlock_write(llm_main_attempt_metrics_slot());
+            panic!("poison main attempt metrics slot");
+        });
+
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        set_llm_main_attempt_metrics_registry(registry.clone());
+
+        assert!(Arc::ptr_eq(
+            &llm_main_attempt_metrics_registry().expect("registry should be readable"),
+            &registry
         ));
     }
 
@@ -8748,7 +8928,7 @@ mod tests {
         )
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
-        host.set_approval_audit_context(test_approval_audit_context("u-batch"));
+        host.set_approval_audit_context(test_approval_audit_context("u-batch", "s-batch"));
         // Register write_file as a valid tool so the edge ledger delivery path admits it.
         host.install_runtime_tool_schemas(vec![json!({
             "type": "function",
@@ -8776,28 +8956,30 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
-                test_approval_key("u-batch", "w1"),
-                approval_allow_entry("w1"),
+                test_approval_key("u-batch", "s-batch", "w1"),
+                approval_allow_entry("s-batch", "w1"),
             );
             guard.insert(
-                test_approval_key("u-batch", "w2"),
-                approval_allow_entry("w2"),
+                test_approval_key("u-batch", "s-batch", "w2"),
+                approval_allow_entry("s-batch", "w2"),
             );
             drop(guard);
 
             tokio::time::sleep(Duration::from_millis(10)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
-                tool_callback_key("u-batch", "w1"),
+                tool_callback_key("u-batch", "s-batch", "w1"),
                 json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-a"}}),
             );
             guard.insert(
-                tool_callback_key("u-batch", "w2"),
+                tool_callback_key("u-batch", "s-batch", "w2"),
                 json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-b"}}),
             );
         });
 
-        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+        let results = host
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .await;
 
         assert!(
             host.emitted_events
@@ -8838,12 +9020,25 @@ mod tests {
 
     #[tokio::test]
     async fn wait_tool_result_dispatch_fallback_uses_db_result_after_ledger_timeout() {
+        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            "u-dispatch",
+            "s-dispatch",
+            "test-run",
+            "test-chain",
+            "r1",
+        );
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
-            "r1".to_string(),
-            Some("edge-1".to_string()),
-            "completed".to_string(),
-            "from dispatch".to_string(),
-            17,
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                request_id: "r1".to_string(),
+                edge_agent_id: "edge-1".to_string(),
+                status: "completed".to_string(),
+                output: "from dispatch".to_string(),
+                duration_ms: 17,
+                tool_result_fields: None,
+            },
         );
         let result_json = serde_json::to_string(&body).expect("serialize tool result");
         let host = ServerAgenticLoopHostBuilder::new(
@@ -8863,7 +9058,11 @@ mod tests {
         });
 
         let delivery = host
-            .wait_tool_result_with_dispatch_fallback(&tool_call, "r1", Duration::from_millis(1))
+            .wait_tool_result_with_dispatch_fallback(
+                &tool_call,
+                &identity,
+                Duration::from_millis(1),
+            )
             .await;
 
         let tool_message = delivery
@@ -8925,7 +9124,7 @@ mod tests {
             "transport": "edge_ws",
         }));
         host.edge_callback_ledger.lock().await.insert(
-            tool_callback_key("u-edge-meta", "r1"),
+            tool_callback_key("u-edge-meta", "s-edge-meta", "r1"),
             json!({"body": {"request_id": "r1", "status": "ok", "output": "read-a"}}),
         );
         let tool_calls = vec![json!({
@@ -8934,7 +9133,9 @@ mod tests {
             "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
         })];
 
-        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+        let results = host
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, "ok");
@@ -8982,7 +9183,7 @@ mod tests {
                 }
             }),
         ]);
-        host.set_approval_audit_context(test_approval_audit_context("u-mixed"));
+        host.set_approval_audit_context(test_approval_audit_context("u-mixed", "s-mixed"));
         let ledger = host.edge_callback_ledger.clone();
         let tool_calls = vec![
             json!({
@@ -9010,37 +9211,39 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                tool_callback_key("u-mixed", "r1"),
+                tool_callback_key("u-mixed", "s-mixed", "r1"),
                 json!({"body": {"request_id": "r1", "status": "ok", "output": "read-a"}}),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                test_approval_key("u-mixed", "w1"),
-                approval_allow_entry("w1"),
+                test_approval_key("u-mixed", "s-mixed", "w1"),
+                approval_allow_entry("s-mixed", "w1"),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                tool_callback_key("u-mixed", "w1"),
+                tool_callback_key("u-mixed", "s-mixed", "w1"),
                 json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-b"}}),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                tool_callback_key("u-mixed", "r2"),
+                tool_callback_key("u-mixed", "s-mixed", "r2"),
                 json!({"body": {"request_id": "r2", "status": "ok", "output": "read-c"}}),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                test_approval_key("u-mixed", "w2"),
-                approval_allow_entry("w2"),
+                test_approval_key("u-mixed", "s-mixed", "w2"),
+                approval_allow_entry("s-mixed", "w2"),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                tool_callback_key("u-mixed", "w2"),
+                tool_callback_key("u-mixed", "s-mixed", "w2"),
                 json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-d"}}),
             );
         });
 
-        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+        let results = host
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .await;
 
         let request_ids: Vec<_> = host
             .emitted_events
@@ -9235,8 +9438,10 @@ mod tests {
                 astra_turn_core::pipeline_config::PipelineConfig::default(),
             )),
             message: "test query".to_string(),
+            user_intent: "test query".to_string(),
             recent_tools: Vec::new(),
             has_prior_assistant_turn: false,
+            turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
@@ -10445,6 +10650,7 @@ mod tests {
         .build();
         let mut state = create_test_state();
         state.message = "capture this turn".to_string();
+        state.user_intent = state.message.clone();
 
         host.run_one_mock_turn_for_test(&mut state)
             .await
@@ -10509,6 +10715,7 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "capture this turn"}));
         state.message = "capture this turn".to_string();
+        state.user_intent = state.message.clone();
 
         host.execute_turn(&mut state).await.expect("execute turn");
 
@@ -10545,9 +10752,23 @@ mod tests {
             llm_events[1].get("type").and_then(Value::as_str),
             Some("llm_response_full")
         );
+        let captured_request_messages = llm_events[0]["metadata"]["request"]["messages"]
+            .as_array()
+            .expect("captured request messages");
+        let captured_summary_roles = llm_events[0]["metadata"]["request_summary"]["message_roles"]
+            .as_array()
+            .expect("captured summary roles");
         assert_eq!(
             llm_events[0]["metadata"]["request_summary"]["message_count"].as_u64(),
-            Some(2)
+            Some(captured_request_messages.len() as u64)
+        );
+        assert_eq!(
+            captured_summary_roles.len(),
+            captured_request_messages.len()
+        );
+        assert!(
+            captured_request_messages.len() >= 2,
+            "expected at least system + user messages"
         );
         assert!(
             llm_events[0]["metadata"]["prompt_request_id"]
@@ -10635,6 +10856,7 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "capture this failed turn"}));
         state.message = "capture this failed turn".to_string();
+        state.user_intent = state.message.clone();
 
         let error = match host.execute_turn(&mut state).await {
             Ok(_) => panic!("execute turn should fail"),
@@ -10732,6 +10954,7 @@ mod tests {
             .messages
             .push(json!({"role": "user", "content": "capture disabled should stay quiet"}));
         state.message = "capture disabled should stay quiet".to_string();
+        state.user_intent = state.message.clone();
 
         host.execute_turn(&mut state).await.expect("execute turn");
 
@@ -10790,6 +11013,7 @@ mod tests {
         .build();
         let mut state = create_test_state();
         state.message = "fail this turn".to_string();
+        state.user_intent = state.message.clone();
 
         let error = match host.run_one_mock_turn_for_test(&mut state).await {
             Ok(_) => panic!("mock round should fail"),
@@ -11119,6 +11343,7 @@ mod tests {
         let mut state = create_test_state();
         state.max_turn_input_tokens = 100;
         state.message = "Fix the regression".to_string();
+        state.user_intent = state.message.clone();
         for i in 0..6 {
             state
                 .messages
@@ -11250,6 +11475,7 @@ mod tests {
         let mut state = create_test_state();
         state.max_turn_input_tokens = 100;
         state.message = "Fix the regression".to_string();
+        state.user_intent = state.message.clone();
         for i in 0..6 {
             state
                 .messages
@@ -12373,7 +12599,9 @@ mod tests {
         use super::*;
         use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
         use astra_services::{
-            LlmTokenServiceConfig, TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError,
+            LlmTokenServiceConfig, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
+            SkillAutoRouteJudgeError, TurnIntentJudge, TurnIntentJudgeContext,
+            TurnIntentJudgeError,
         };
         use async_trait::async_trait;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -12416,6 +12644,46 @@ mod tests {
             }
         }
 
+        struct ScriptedSkillRouteJudge {
+            calls: std::sync::Mutex<Vec<SkillAutoRouteJudgeContext>>,
+            response: std::sync::Mutex<Option<Result<Option<String>, SkillAutoRouteJudgeError>>>,
+        }
+
+        impl ScriptedSkillRouteJudge {
+            fn ok(skill_name: Option<&str>) -> Arc<Self> {
+                Arc::new(Self {
+                    calls: std::sync::Mutex::new(Vec::new()),
+                    response: std::sync::Mutex::new(Some(Ok(skill_name.map(str::to_string)))),
+                })
+            }
+
+            fn err(error: SkillAutoRouteJudgeError) -> Arc<Self> {
+                Arc::new(Self {
+                    calls: std::sync::Mutex::new(Vec::new()),
+                    response: std::sync::Mutex::new(Some(Err(error))),
+                })
+            }
+
+            fn calls(&self) -> Vec<SkillAutoRouteJudgeContext> {
+                self.calls.lock().unwrap().clone()
+            }
+        }
+
+        #[async_trait]
+        impl SkillAutoRouteJudge for ScriptedSkillRouteJudge {
+            async fn judge(
+                &self,
+                ctx: &SkillAutoRouteJudgeContext,
+            ) -> Result<Option<String>, SkillAutoRouteJudgeError> {
+                self.calls.lock().unwrap().push(ctx.clone());
+                self.response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("ScriptedSkillRouteJudge consumed twice")
+            }
+        }
+
         fn host_with_judge(judge: Arc<dyn TurnIntentJudge>) -> ServerAgenticLoopHost {
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
@@ -12425,6 +12693,20 @@ mod tests {
             )
             .build();
             host.set_turn_intent_judge(judge);
+            host
+        }
+
+        fn host_with_skill_route_judge(
+            judge: Arc<dyn SkillAutoRouteJudge>,
+        ) -> ServerAgenticLoopHost {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .build();
+            host.set_skill_auto_route_judge(judge);
             host
         }
 
@@ -12465,6 +12747,7 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "可以了，按你刚才说的方向继续往下走".to_string();
+            state.user_intent = state.message.clone();
             state.messages = vec![
                 serde_json::json!({"role": "user", "content": "earlier"}),
                 serde_json::json!({"role": "assistant", "content": "ok"}),
@@ -12473,7 +12756,10 @@ mod tests {
             state.llm_rounds_completed = 4;
 
             let intent = host.judge_turn_intent(&state).await;
-            assert_eq!(intent, Some(llm_intent));
+            assert_eq!(
+                intent,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(llm_intent)
+            );
 
             let calls = judge.calls();
             assert_eq!(calls.len(), 1, "judge must be called exactly once");
@@ -12491,7 +12777,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn judge_turn_intent_returns_none_when_judge_errors() {
+        async fn judge_turn_intent_returns_unavailable_when_judge_errors() {
             let judge = ScriptedJudge::err(TurnIntentJudgeError::Transport(
                 "connection reset".to_string(),
             ));
@@ -12499,12 +12785,16 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "please inspect the current changes".to_string();
+            state.user_intent = state.message.clone();
 
-            assert_eq!(host.judge_turn_intent(&state).await, None);
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
+            );
         }
 
         #[tokio::test]
-        async fn judge_turn_intent_returns_none_when_no_judge_set() {
+        async fn judge_turn_intent_returns_unavailable_when_no_judge_set() {
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
                 mock_encryptor(),
@@ -12515,8 +12805,78 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "please inspect the current changes".to_string();
+            state.user_intent = state.message.clone();
 
-            assert_eq!(host.judge_turn_intent(&state).await, None);
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
+            );
+        }
+
+        #[tokio::test]
+        async fn judge_skill_auto_route_invokes_wired_judge_with_visible_catalog() {
+            let judge = ScriptedSkillRouteJudge::ok(Some("review-changes"));
+            let mut host =
+                host_with_skill_route_judge(judge.clone() as Arc<dyn SkillAutoRouteJudge>);
+            let state = crate::turn::agentic_loop::host::tests::make_state();
+            let visible_skills = vec![crate::turn::skill_tool::SkillToolInfo {
+                name: "review-changes".into(),
+                description: "Review local changes".into(),
+                when_to_use: Some("Use for code review workflows".into()),
+                aliases: vec!["review".into()],
+                ..Default::default()
+            }];
+
+            let decision = host
+                .judge_skill_auto_route(
+                    &state,
+                    crate::turn::agentic_loop::host::SkillAutoRouteJudgeContext {
+                        query: "review current branch",
+                        visible_skills: &visible_skills,
+                    },
+                )
+                .await;
+
+            assert_eq!(
+                decision,
+                Some(crate::turn::agentic_loop::host::SkillAutoRouteDecision {
+                    skill_name: "review-changes".into()
+                })
+            );
+            let calls = judge.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].query, "review current branch");
+            assert_eq!(calls[0].visible_skills.len(), 1);
+            assert_eq!(calls[0].visible_skills[0].name, "review-changes");
+            assert_eq!(calls[0].visible_skills[0].aliases, vec!["review"]);
+        }
+
+        #[tokio::test]
+        async fn judge_skill_auto_route_returns_none_when_judge_errors() {
+            let judge = ScriptedSkillRouteJudge::err(SkillAutoRouteJudgeError::Transport(
+                "connection reset".into(),
+            ));
+            let mut host =
+                host_with_skill_route_judge(judge.clone() as Arc<dyn SkillAutoRouteJudge>);
+            let state = crate::turn::agentic_loop::host::tests::make_state();
+            let visible_skills = vec![crate::turn::skill_tool::SkillToolInfo {
+                name: "review-changes".into(),
+                description: "Review local changes".into(),
+                ..Default::default()
+            }];
+
+            assert_eq!(
+                host.judge_skill_auto_route(
+                    &state,
+                    crate::turn::agentic_loop::host::SkillAutoRouteJudgeContext {
+                        query: "review current branch",
+                        visible_skills: &visible_skills,
+                    },
+                )
+                .await,
+                None
+            );
+            assert_eq!(judge.calls().len(), 1);
         }
 
         #[tokio::test]
@@ -12558,7 +12918,7 @@ mod tests {
                     "choices": [
                         {
                             "message": {
-                                "content": "{\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":true}"
+                                "content": "{\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"continuation_mode\":\"continue_current_objective\",\"reanchors_current_objective\":true,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}"
                             },
                             "finish_reason": "stop"
                         }
@@ -12595,6 +12955,7 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "不对，我要的是系统性修复，不是临时补丁".to_string();
+            state.user_intent = state.message.clone();
             state.messages = vec![
                 serde_json::json!({"role": "user", "content": "earlier"}),
                 serde_json::json!({"role": "assistant", "content": "ok"}),
@@ -12608,10 +12969,11 @@ mod tests {
                 .forward_headers
                 .insert("x-workspace-id".to_string(), "ws-judge".to_string());
 
-            let intent = host
-                .judge_turn_intent(&state)
-                .await
-                .expect("gateway judge should return intent");
+            let crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(intent) =
+                host.judge_turn_intent(&state).await
+            else {
+                panic!("gateway judge should return intent");
+            };
 
             assert_eq!(intent.requested_scenario, Some(Scenario::Refactoring));
             assert_eq!(
@@ -12622,6 +12984,11 @@ mod tests {
                 intent.reanchors_current_objective,
                 "judge response should drive reanchor behavior"
             );
+            assert_eq!(
+                intent.workspace_mutation,
+                astra_config::user_profile::WorkspaceMutationIntent::MustMutate
+            );
+            assert!(!intent.browser_verification_required);
             assert_eq!(
                 capture.authorization.lock().await.as_deref(),
                 Some("Bearer forwarded-token")
@@ -12638,6 +13005,14 @@ mod tests {
             assert!(
                 prompt.contains("reanchors_current_objective"),
                 "judge prompt must request the structured reanchor field"
+            );
+            assert!(
+                prompt.contains("workspace_mutation"),
+                "judge prompt must request the structured workspace mutation field"
+            );
+            assert!(
+                prompt.contains("browser_verification_required"),
+                "judge prompt must request the structured browser verification field"
             );
             assert!(
                 prompt.contains("不对，我要的是系统性修复，不是临时补丁"),
@@ -12702,8 +13077,12 @@ mod tests {
 
             let mut state = crate::turn::agentic_loop::host::tests::make_state();
             state.message = "继续，但要系统性一点".to_string();
+            state.user_intent = state.message.clone();
 
-            assert_eq!(host.judge_turn_intent(&state).await, None);
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
+            );
             assert_eq!(
                 request_count.load(AtomicOrdering::SeqCst),
                 0,

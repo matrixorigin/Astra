@@ -67,7 +67,7 @@ help:
 	@echo "  make check              - Run all static checks (lint + format + type)"
 	@echo "  make ci                 - Run CI checks (check + test)"
 	@echo "  make lint               - Run clippy (warnings are errors)"
-	@echo "  make audit              - Run cargo-audit on rust/ (needs: cargo install cargo-audit)"
+	@echo "  make audit              - Run cargo-audit (needs: cargo install cargo-audit)"
 	@echo "  make format             - Format code"
 	@echo "  make format-check       - Check formatting"
 	@echo ""
@@ -1422,7 +1422,7 @@ format-check:
 .PHONY: audit
 audit:
 	@command -v cargo-audit >/dev/null 2>&1 || { echo "cargo-audit not found; install with: cargo install cargo-audit"; exit 1; }
-	@cargo audit --no-fetch --stale
+	@cargo audit --no-fetch
 
 .PHONY: type-check
 type-check: sweep

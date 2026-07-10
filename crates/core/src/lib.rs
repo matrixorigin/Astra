@@ -789,6 +789,8 @@ pub struct ErrorResponse {
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 impl ErrorResponse {
@@ -797,6 +799,7 @@ impl ErrorResponse {
             detail: detail.into(),
             error_code: None,
             request_id: None,
+            metadata: None,
         }
     }
 
@@ -807,6 +810,11 @@ impl ErrorResponse {
 
     pub fn with_request_id(mut self, id: impl Into<String>) -> Self {
         self.request_id = Some(id.into());
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 }
@@ -827,6 +835,22 @@ pub fn error_response_coded(
     (
         status,
         Json(ErrorResponse::new(detail).with_error_code(error_code)),
+    )
+}
+
+pub fn error_response_coded_with_metadata(
+    status: StatusCode,
+    detail: impl Into<String>,
+    error_code: impl Into<String>,
+    metadata: serde_json::Value,
+) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(
+            ErrorResponse::new(detail)
+                .with_error_code(error_code)
+                .with_metadata(metadata),
+        ),
     )
 }
 
@@ -899,6 +923,30 @@ mod tests {
         assert_eq!(body.detail, "bad");
         assert_eq!(body.error_code.as_deref(), Some("validation_failed"));
         assert!(body.request_id.is_none());
+        assert!(body.metadata.is_none());
+    }
+
+    #[test]
+    fn error_response_coded_with_metadata_sets_machine_fields() {
+        let (status, Json(body)) = error_response_coded_with_metadata(
+            StatusCode::CONFLICT,
+            "stale",
+            "bridge_session_turn_stale",
+            serde_json::json!({"expected_session_turn": 2}),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.detail, "stale");
+        assert_eq!(
+            body.error_code.as_deref(),
+            Some("bridge_session_turn_stale")
+        );
+        assert_eq!(
+            body.metadata
+                .as_ref()
+                .and_then(|value| value.get("expected_session_turn"))
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
     }
 
     #[test]
@@ -908,6 +956,7 @@ mod tests {
         assert_eq!(v["detail"], "x");
         assert!(v.get("error_code").is_none());
         assert!(v.get("request_id").is_none());
+        assert!(v.get("metadata").is_none());
     }
 
     // --- internal_error ---

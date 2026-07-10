@@ -212,6 +212,10 @@ impl TurnGuard {
         }
     }
 
+    pub fn set_task_profile(&mut self, task_profile: TaskExecutionProfile) {
+        self.task_profile = task_profile;
+    }
+
     /// Sync drift nudge count from StallTrackingState.
     /// Call this before evaluate() to feed drift signals into TurnGuard.
     pub fn sync_drift_nudge_count(&mut self, count: usize) {

@@ -32,13 +32,10 @@ use super::agentic_loop::host::AgenticLoopState;
 pub(crate) fn build_external_sources(
     edge_profile: &serde_json::Map<String, Value>,
     state: &AgenticLoopState,
-    user_content: &str,
     tool_names: &[&str],
     plan_resume_hint: Option<&str>,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
 ) -> ExternalSources {
-    let _ = user_content;
-
     // ── Typed fields (pipeline binder direct consumers) ──
 
     let effort_hint = {
@@ -157,6 +154,16 @@ pub(crate) fn build_external_sources(
     {
         providers.push(Box::new(EnvVolatileProvider {
             text: text.to_string(),
+        }));
+    }
+
+    let runtime_volatile_texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
+        edge_profile,
+        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
+    );
+    if !runtime_volatile_texts.is_empty() {
+        providers.push(Box::new(RuntimeVolatileTextsProvider {
+            texts: runtime_volatile_texts,
         }));
     }
 
@@ -352,6 +359,34 @@ impl astra_turn_core::context_sources::ContextChannelProvider for EnvVolatilePro
                 PromptTokenBucket::Environment,
             ))
         }
+    }
+}
+
+/// Runtime turn context supplied by a capacity provider or server runtime.
+/// None scope by definition: these bytes can change every turn.
+struct RuntimeVolatileTextsProvider {
+    texts: Vec<String>,
+}
+
+impl astra_turn_core::context_sources::ContextChannelProvider for RuntimeVolatileTextsProvider {
+    fn channel_id(&self) -> &'static str {
+        "runtime_volatile_texts"
+    }
+    fn cache_scope(&self) -> CacheScope {
+        CacheScope::None
+    }
+    fn token_bucket(&self) -> PromptTokenBucket {
+        PromptTokenBucket::Environment
+    }
+    fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
+        let text = self
+            .texts
+            .iter()
+            .filter(|text| !text.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then(|| PromptSection::dynamic(text, PromptTokenBucket::Environment))
     }
 }
 
@@ -989,7 +1024,7 @@ mod tests {
             Value::String("## User Memories\n- prefers Rust\n- hates emojis".into()),
         );
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], None, None);
+        let sources = build_external_sources(&ep, &state, &["bash"], None, None);
         assert!(
             !sources.memory_entries.is_empty(),
             "edge_profile.memory_section must flow into ExternalSources.memory_entries"
@@ -1023,7 +1058,7 @@ mod tests {
             ]),
         );
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], None, None);
+        let sources = build_external_sources(&ep, &state, &["bash"], None, None);
 
         assert_eq!(sources.memory_entries.len(), 2);
         assert_eq!(sources.memory_entries[0].content, "fresh structured memory");
@@ -1044,7 +1079,6 @@ mod tests {
         let sources = build_external_sources(
             &ep,
             &state,
-            "hi",
             &["bash", "read_file", "tool_search"],
             None,
             None,
@@ -1089,7 +1123,7 @@ mod tests {
     fn external_sources_empty_memory_when_edge_profile_has_none() {
         let ep = serde_json::Map::new();
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], None, None);
+        let sources = build_external_sources(&ep, &state, &["bash"], None, None);
         assert!(sources.memory_entries.is_empty());
     }
 
@@ -1100,7 +1134,6 @@ mod tests {
         let sources = build_external_sources(
             &ep,
             &state,
-            "hi",
             &["bash"],
             None,
             Some(astra_turn_core::cache_placement::CacheCapability {
@@ -1173,8 +1206,7 @@ mod tests {
             None,
         );
         let turn = build_turn_state(state, user_content);
-        let external =
-            build_external_sources(edge_profile, state, user_content, &["bash"], None, None);
+        let external = build_external_sources(edge_profile, state, &["bash"], None, None);
         CompositeInputs {
             statics,
             agent,
@@ -1976,7 +2008,7 @@ mod tests {
         state.remaining_turns = 15;
         state.max_turn_input_tokens = 100_000;
 
-        let sources = build_external_sources(&ep, &state, "hi", &["bash", "read_file"], None, None);
+        let sources = build_external_sources(&ep, &state, &["bash", "read_file"], None, None);
 
         // Check that sections from providers appear in the right lanes
         let stable_texts: Vec<&str> = sources
@@ -2017,7 +2049,7 @@ mod tests {
     fn external_sources_empty_edge_profile_produces_only_always_emit_sections() {
         let ep = serde_json::Map::new();
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &[], None, None);
+        let sources = build_external_sources(&ep, &state, &[], None, None);
 
         // With no tools, no env, no skills: only CapabilitiesProvider (always emits)
         // and no self_model/tool_conditional (gated on non-empty tool_names)
@@ -2040,7 +2072,7 @@ mod tests {
         let ep = serde_json::Map::new();
         let state = make_state();
 
-        let with_tools = build_external_sources(&ep, &state, "hi", &["bash"], None, None);
+        let with_tools = build_external_sources(&ep, &state, &["bash"], None, None);
         assert!(
             with_tools
                 .extra_dynamic_sections
@@ -2049,7 +2081,7 @@ mod tests {
             "tool_conditional emits when tools present"
         );
 
-        let without_tools = build_external_sources(&ep, &state, "hi", &[], None, None);
+        let without_tools = build_external_sources(&ep, &state, &[], None, None);
         assert!(
             !without_tools
                 .extra_dynamic_sections
@@ -2066,7 +2098,7 @@ mod tests {
         state.skills.agent_type = Some("code-review".into());
 
         let ep = serde_json::Map::new();
-        let sources = build_external_sources(&ep, &state, "hi", &[], None, None);
+        let sources = build_external_sources(&ep, &state, &[], None, None);
 
         assert!(
             sources.effort_hint.is_some(),
@@ -2098,7 +2130,6 @@ mod tests {
         let sources = build_external_sources(
             &ep,
             &state,
-            "hi",
             &[],
             Some("Executing step 3 of 5: refactor database layer"),
             None,
@@ -2111,7 +2142,7 @@ mod tests {
     fn external_sources_plan_context_none_when_empty_string() {
         let ep = serde_json::Map::new();
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &[], Some(""), None);
+        let sources = build_external_sources(&ep, &state, &[], Some(""), None);
         assert!(sources.plan_context.is_none(), "empty string → None");
     }
 
@@ -2123,7 +2154,7 @@ mod tests {
             Value::String("You are a specialized agent.".into()),
         );
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &[], None, None);
+        let sources = build_external_sources(&ep, &state, &[], None, None);
         assert!(sources.system_override.is_some());
         assert!(
             sources
@@ -2134,10 +2165,134 @@ mod tests {
     }
 
     #[test]
+    fn external_sources_runtime_volatile_texts_use_dynamic_lane() {
+        let mut ep = serde_json::Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS.into(),
+            serde_json::json!(["## Runtime Turn Context\n{\"mode\":\"create\"}"]),
+        );
+        let state = make_state();
+        let sources = build_external_sources(&ep, &state, &[], None, None);
+
+        assert!(sources.system_override.is_none());
+        assert!(
+            sources
+                .extra_stable_sections
+                .iter()
+                .all(|section| !section.text.contains("Runtime Turn Context")),
+            "turn context must not enter the session-stable prompt prefix"
+        );
+        assert!(
+            sources
+                .extra_dynamic_sections
+                .iter()
+                .any(|section| section.text.contains("Runtime Turn Context")),
+            "turn context must be routed to RuntimeVolatile / CacheScope::None"
+        );
+    }
+
+    #[test]
+    fn external_sources_runtime_volatile_text_accepts_single_string() {
+        let mut ep = serde_json::Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS.into(),
+            Value::String("## Runtime Turn Context\n{\"mode\":\"single\"}".to_string()),
+        );
+        let state = make_state();
+        let sources = build_external_sources(&ep, &state, &[], None, None);
+
+        assert!(
+            sources
+                .extra_stable_sections
+                .iter()
+                .all(|section| !section.text.contains("\"mode\":\"single\""))
+        );
+        assert!(
+            sources
+                .extra_dynamic_sections
+                .iter()
+                .any(|section| section.text.contains("\"mode\":\"single\""))
+        );
+    }
+
+    #[test]
+    fn runtime_volatile_texts_do_not_churn_prompt_cache_stable_system_bytes() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(
+            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
+        );
+        let state = make_state();
+        let cache_cfg = crate::turn::prompt_cache::PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: false,
+        };
+        let assemble = |turn_context: &str| {
+            let mut ep = serde_json::Map::new();
+            ep.insert(
+                "system_prompt_override".into(),
+                Value::String("## Agent Binding Instruction\nStable session contract.".to_string()),
+            );
+            ep.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS
+                    .into(),
+                serde_json::json!([turn_context]),
+            );
+            let sources = build_external_sources(&ep, &state, &["bash"], None, None);
+            crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
+                &["bash"],
+                &[],
+                &sources.extra_stable_sections,
+                &sources.extra_dynamic_sections,
+                &[],
+                None,
+                sources.system_override.as_deref(),
+                &cache_cfg,
+                None,
+                "sid-runtime-volatile-cache",
+                "gpt-4o",
+                None,
+                "openai",
+                None,
+                None,
+                None,
+                "",
+                "",
+                "2026-07-08",
+            )
+        };
+
+        let first = assemble("## Runtime Turn Context\n{\"raw_advice\":\"first\"}");
+        let second = assemble("## Runtime Turn Context\n{\"raw_advice\":\"second\"}");
+        let first_primary = serde_json::to_string(&first.primary_system).expect("first primary");
+        let second_primary = serde_json::to_string(&second.primary_system).expect("second primary");
+        assert_eq!(
+            first_primary, second_primary,
+            "per-turn runtime context must not change stable prompt-cache material"
+        );
+
+        let first_dynamic = first
+            .dynamic_system
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .expect("first dynamic system");
+        let second_dynamic = second
+            .dynamic_system
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .expect("second dynamic system");
+        assert_ne!(first_dynamic, second_dynamic);
+        assert!(first_dynamic.contains("\"raw_advice\":\"first\""));
+        assert!(second_dynamic.contains("\"raw_advice\":\"second\""));
+        assert!(!first_primary.contains("raw_advice"));
+        assert!(!second_primary.contains("raw_advice"));
+    }
+
+    #[test]
     fn external_sources_system_override_none_when_missing() {
         let ep = serde_json::Map::new();
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &[], None, None);
+        let sources = build_external_sources(&ep, &state, &[], None, None);
         assert!(sources.system_override.is_none());
     }
 
@@ -2157,7 +2312,7 @@ mod tests {
         state.max_turns = 10;
         state.remaining_turns = 5;
 
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], None, None);
+        let sources = build_external_sources(&ep, &state, &["bash"], None, None);
 
         let all_texts: Vec<&str> = sources
             .extra_stable_sections
@@ -2180,7 +2335,7 @@ mod tests {
         state.max_turns = 0;
         state.remaining_turns = 5;
 
-        let sources = build_external_sources(&ep, &state, "hi", &[], None, None);
+        let sources = build_external_sources(&ep, &state, &[], None, None);
         assert!(
             !sources
                 .extra_dynamic_sections
@@ -2197,7 +2352,6 @@ mod tests {
         let sources = build_external_sources(
             &ep,
             &state,
-            "hi",
             &[],
             None,
             Some(astra_turn_core::cache_placement::CacheCapability {
@@ -2224,7 +2378,6 @@ mod tests {
         let sources = build_external_sources(
             &ep,
             &state,
-            "hi",
             &[],
             None,
             Some(astra_turn_core::cache_placement::CacheCapability {
@@ -2258,14 +2411,8 @@ mod tests {
         let state = make_state();
 
         // Both plan_resume_hint and task_context_text present
-        let sources = build_external_sources(
-            &ep,
-            &state,
-            "hi",
-            &[],
-            Some("Executing step 2: refactor"),
-            None,
-        );
+        let sources =
+            build_external_sources(&ep, &state, &[], Some("Executing step 2: refactor"), None);
         let pc = sources.plan_context.unwrap();
         assert!(pc.contains("Executing step 2: refactor"), "{pc}");
         assert!(pc.contains("## Active Task Board"), "{pc}");
@@ -2281,7 +2428,7 @@ mod tests {
         );
         let state = make_state();
 
-        let sources = build_external_sources(&ep, &state, "hi", &[], None, None);
+        let sources = build_external_sources(&ep, &state, &[], None, None);
         let pc = sources.plan_context.unwrap();
         assert!(pc.contains("Refactor DB"), "{pc}");
         assert!(!pc.contains("Executing"), "no plan_resume_hint in output");
@@ -2293,7 +2440,7 @@ mod tests {
         ep.insert("task_context_text".into(), Value::String("".into()));
         let state = make_state();
 
-        let sources = build_external_sources(&ep, &state, "hi", &[], Some("Step 1"), None);
+        let sources = build_external_sources(&ep, &state, &[], Some("Step 1"), None);
         let pc = sources.plan_context.unwrap();
         assert_eq!(pc, "Step 1", "empty task_context_text must be filtered");
     }
@@ -2302,7 +2449,7 @@ mod tests {
     fn external_sources_plan_context_both_none_returns_none() {
         let ep = serde_json::Map::new();
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &[], None, None);
+        let sources = build_external_sources(&ep, &state, &[], None, None);
         assert!(sources.plan_context.is_none());
     }
 
@@ -2311,7 +2458,7 @@ mod tests {
         let mut ep = serde_json::Map::new();
         ep.insert("task_context_text".into(), Value::String("".into()));
         let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &[], Some(""), None);
+        let sources = build_external_sources(&ep, &state, &[], Some(""), None);
         assert!(sources.plan_context.is_none());
     }
 }

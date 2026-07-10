@@ -108,6 +108,9 @@ pub struct EdgeApprovalResult {
 /// A tool request bundled for batch execution.
 #[derive(Debug, Clone)]
 pub struct ToolBatchRequest {
+    pub session_id: String,
+    pub run_id: String,
+    pub turn_chain_id: String,
     pub request_id: String,
     pub tool: String,
     pub args: Value,
@@ -629,8 +632,8 @@ fn prioritize_skill_tools(items: &mut Vec<ChatTurnEdgePending>) {
 async fn flush_pending_via_host<H: SseStreamHost>(
     pending: &mut Vec<ChatTurnEdgePending>,
     host: &mut H,
-    session_id: Option<&str>,
-    run_id: Option<&str>,
+    fallback_session_id: Option<&str>,
+    fallback_run_id: Option<&str>,
     tool_results: &mut Vec<EdgeToolExecResult>,
     approval_results: &mut Vec<EdgeApprovalResult>,
 ) {
@@ -641,6 +644,9 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     for item in items {
         match item {
             ChatTurnEdgePending::ToolRequest {
+                session_id,
+                run_id,
+                turn_chain_id,
                 request_id,
                 tool,
                 args,
@@ -648,7 +654,20 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 if request_id.is_empty() || tool.is_empty() {
                     continue;
                 }
+                let session_id = if session_id.is_empty() {
+                    fallback_session_id.unwrap_or("").to_string()
+                } else {
+                    session_id
+                };
+                let run_id = if run_id.is_empty() {
+                    fallback_run_id.unwrap_or("").to_string()
+                } else {
+                    run_id
+                };
                 tool_batch.push(ToolBatchRequest {
+                    session_id,
+                    run_id,
+                    turn_chain_id,
                     request_id,
                     tool,
                     args,
@@ -687,7 +706,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     // execute the edit BEFORE the user / ledger granted permission.
     if approval_requests.len() > 1 {
         approval_results.extend(
-            host.resolve_approvals_batch(&approval_requests, session_id, run_id)
+            host.resolve_approvals_batch(&approval_requests, fallback_session_id, fallback_run_id)
                 .await,
         );
     } else if let Some(request) = approval_requests.into_iter().next() {
@@ -696,8 +715,8 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 &request.request_id,
                 &request.tool,
                 request.approval_kind,
-                session_id,
-                run_id,
+                fallback_session_id,
+                fallback_run_id,
                 request.detail.as_deref(),
                 request.display_label.as_deref(),
             )
@@ -1532,7 +1551,7 @@ mod tests {
             "{}{}{}",
             sse_event(
                 "tool_request",
-                ",\"request_id\":\"t1\",\"tool\":\"read_file\",\"args\":{\"path\":\"x\"}"
+                ",\"session_id\":\"s1\",\"run_id\":\"r1\",\"turn_chain_id\":\"c1\",\"request_id\":\"t1\",\"tool\":\"read_file\",\"args\":{\"path\":\"x\"}"
             ),
             sse_event("text_delta", ",\"content\":\"Based on the file, \""),
             sse_event("text_delta", ",\"content\":\"here is my analysis.\""),
@@ -1559,6 +1578,9 @@ mod tests {
 
     fn make_tool_pending(tool: &str) -> ChatTurnEdgePending {
         ChatTurnEdgePending::ToolRequest {
+            session_id: "s1".to_string(),
+            run_id: "r1".to_string(),
+            turn_chain_id: "c1".to_string(),
             request_id: format!("req-{tool}"),
             tool: tool.to_string(),
             args: serde_json::json!({}),

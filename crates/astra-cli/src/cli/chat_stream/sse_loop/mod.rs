@@ -650,6 +650,9 @@ pub(crate) async fn stream_chat_sse(
         term_width,
         render_policy: p.render_policy,
         message: p.message,
+        user_intent: p.user_intent,
+        input_runtime_required_texts: p.input_runtime_required_texts,
+        input_runtime_volatile_texts: p.input_runtime_volatile_texts,
         semantic_query_override: p.semantic_query_override,
         history: p.history,
         recent_tools: p.recent_tools,
@@ -912,8 +915,10 @@ pub(crate) async fn stream_chat_sse(
             )
         }),
         message: p.message.to_string(),
+        user_intent: p.user_intent.to_string(),
         recent_tools: p.recent_tools.to_vec(),
         has_prior_assistant_turn: false,
+        turn_intent: None,
         task_profile,
         last_turn_policy: astra_runtime::turn::agentic_loop::host::TurnInteractionPolicy::default(),
         api: p.api.clone(),
@@ -1301,11 +1306,17 @@ mod tests {
     };
     use crate::cli::permission_manager::{PermissionManager, PermissionMode};
     use astra_runtime::turn::permission_gate::{PermissionCheckResult, check_tool_permission};
-    use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
+    use astra_turn_core::chat_turn_heuristics::{
+        TaskComplexity, TaskExecutionProfile, infer_task_execution_profile,
+    };
     use serde_json::json;
     use std::path::Path;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    fn mutating_profile() -> TaskExecutionProfile {
+        TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard, true)
+    }
 
     #[test]
     fn circuit_breaker_config_uses_runtime_config_defaults() {
@@ -1711,11 +1722,7 @@ mod tests {
 
     #[test]
     fn mutating_requests_keep_stop_hooks() {
-        let s = detect_turn_hook_sets(
-            Path::new("."),
-            infer_task_execution_profile("implement a fix for the failing test"),
-            false,
-        );
+        let s = detect_turn_hook_sets(Path::new("."), mutating_profile(), false);
         // Smart hook returns a single "verify-changes" entry (if project detected)
         // or empty (if no project markers in cwd)
         let _ = s.stop_hooks;
@@ -1740,7 +1747,7 @@ hooks:
 "#,
         )
         .unwrap();
-        let prof = infer_task_execution_profile("implement the subtask");
+        let prof = mutating_profile();
         let s = detect_turn_hook_sets(dir.path(), prof, true);
         assert_eq!(s.stop_hooks.len(), 1);
         assert_eq!(s.stop_hooks[0].label, "sub");
@@ -1756,7 +1763,7 @@ hooks:
             "version: 1\nauto_detect: false\nhooks:\n  - label: only_stop\n    command: true\n    when: stop\n",
         )
         .unwrap();
-        let prof = infer_task_execution_profile("implement the subtask");
+        let prof = mutating_profile();
         let s = detect_turn_hook_sets(dir.path(), prof, true);
         assert!(s.stop_hooks.is_empty());
     }
@@ -1780,11 +1787,7 @@ hooks:
 "#,
         )
         .unwrap();
-        let s = detect_turn_hook_sets(
-            dir.path(),
-            infer_task_execution_profile("fix the bug"),
-            false,
-        );
+        let s = detect_turn_hook_sets(dir.path(), mutating_profile(), false);
         assert_eq!(s.stop_hooks.len(), 1);
         assert_eq!(s.teammate_idle_hooks.len(), 1);
         assert_eq!(s.teammate_idle_hooks[0].label, "after_delegate");

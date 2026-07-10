@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
+use astra_turn_core::section_types::estimate_text_tokens;
 use serde_json::Value;
 
 use crate::server::header_utils::CONNECTION_HEADER_TOKENS_KEY;
@@ -180,32 +181,6 @@ const DISCOVER_SKILLS_MAX_RESULTS: usize = 8;
 const DISCOVER_SKILLS_NO_MATCH_MESSAGE: &str = "No additional skills matched that query. Try different keywords, or proceed with general tools.";
 const LARGE_SKILL_CATALOG_WARNING_THRESHOLD: usize = 50;
 static LARGE_SKILL_CATALOG_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
-pub const DEFAULT_AUTO_ROUTE_MIN_SCORE: usize = 20;
-pub const DEFAULT_AUTO_ROUTE_MIN_MARGIN: usize = 8;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AutoRoutingConfig {
-    pub min_score: usize,
-    pub min_margin: usize,
-}
-
-impl Default for AutoRoutingConfig {
-    fn default() -> Self {
-        Self {
-            min_score: DEFAULT_AUTO_ROUTE_MIN_SCORE,
-            min_margin: DEFAULT_AUTO_ROUTE_MIN_MARGIN,
-        }
-    }
-}
-
-impl AutoRoutingConfig {
-    pub const fn new(min_score: usize, min_margin: usize) -> Self {
-        Self {
-            min_score,
-            min_margin,
-        }
-    }
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct SkillSurfacingPolicy {
@@ -550,85 +525,6 @@ impl astra_tools::relevance_score::Scoreable for SkillScoreAdapter<'_> {
     }
     fn score_extra(&self) -> Option<&str> {
         self.0.when_to_use.as_deref()
-    }
-}
-
-fn normalized_skill_text(text: &str) -> String {
-    let mut normalized = String::with_capacity(text.len());
-    let mut last_was_space = true;
-    for ch in text.chars().flat_map(char::to_lowercase) {
-        if ch.is_alphanumeric() {
-            normalized.push(ch);
-            last_was_space = false;
-        } else if !last_was_space {
-            normalized.push(' ');
-            last_was_space = true;
-        }
-    }
-    normalized.trim().to_string()
-}
-
-fn contains_token_subsequence(haystack: &str, needle: &str) -> bool {
-    let mut needle_tokens = needle.split_whitespace();
-    let Some(first) = needle_tokens.next() else {
-        return false;
-    };
-
-    let mut haystack_tokens = haystack.split_whitespace();
-    for token in std::iter::once(first).chain(needle_tokens) {
-        if !haystack_tokens.any(|candidate| candidate == token) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Deterministically select a skill for direct pre-routing when the user query
-/// is already an unambiguous match for one surfaced skill.
-///
-/// This is intentionally conservative: it prefers exact phrase matches on the
-/// canonical name / aliases, otherwise requires both a minimum relevance score
-/// and a margin over the next candidate.
-pub fn select_auto_routed_skill(query: &str, catalog: &[SkillToolInfo]) -> Option<String> {
-    select_auto_routed_skill_with_config(query, catalog, AutoRoutingConfig::default())
-}
-
-pub fn select_auto_routed_skill_with_config(
-    query: &str,
-    catalog: &[SkillToolInfo],
-    config: AutoRoutingConfig,
-) -> Option<String> {
-    let query = query.trim();
-    if query.is_empty() || catalog.is_empty() {
-        return None;
-    }
-
-    let query_lower = normalized_skill_text(query);
-    // Skill catalogs are unbounded user/plugin content, so relevance scoring
-    // is local retrieval over a catalog. Tool visibility stays declarative
-    // (`always_load` + deferred activation) and does not use this selector.
-    let adapters: Vec<SkillScoreAdapter> = catalog.iter().map(SkillScoreAdapter).collect();
-    let ranked = astra_tools::relevance_score::rank_by_relevance(&adapters, &query_lower, 2);
-    let (top_idx, top_score) = ranked.first().copied()?;
-    let top_skill = &catalog[top_idx];
-    let runner_up = ranked.get(1).map(|(_, score)| *score).unwrap_or(0);
-
-    let exact_phrase_match = std::iter::once(&top_skill.name)
-        .chain(top_skill.aliases.iter())
-        .map(|name| normalized_skill_text(name))
-        .any(|needle| {
-            query_lower == needle
-                || (needle.contains(' ') && query_lower.contains(&needle))
-                || (needle.contains(' ') && contains_token_subsequence(&query_lower, &needle))
-        });
-
-    if exact_phrase_match
-        || (top_score >= config.min_score
-            && top_score.saturating_sub(runner_up) >= config.min_margin)
-    {
-        Some(top_skill.name.clone())
-    } else {
-        None
     }
 }
 
@@ -1075,7 +971,7 @@ pub async fn partition_and_execute_skills(
                         .unwrap_or(skill_success);
                     tracker.record_outcome(&crate::skills::quality::SkillOutcome {
                         skill_name: skill_name.to_string(),
-                        tokens_used: (skill_output.len() as u32) / 4, // rough estimate
+                        tokens_used: estimate_text_tokens(&skill_output),
                         duration_ms,
                         all_required_passed: success,
                         partial: false,
@@ -1948,7 +1844,7 @@ fn execute_skill<'a>(
                                 ..Default::default()
                             },
                             instructions,
-                            instruction_tokens: (skill.instructions.len() as u32) / 4,
+                            instruction_tokens: estimate_text_tokens(&skill.instructions),
                             resources: None,
                             skill_dir: skill.skill_dir.as_ref().map(std::path::PathBuf::from),
                         };
@@ -2422,78 +2318,6 @@ mod tests {
             .expect("preserves resolver")
             .available_skills();
         assert_eq!(visible.len(), 2);
-    }
-
-    #[test]
-    fn auto_route_skill_prefers_exact_phrase_match() {
-        let catalog = vec![
-            SkillToolInfo {
-                name: "review-changes".into(),
-                description: "Review the current branch diff".into(),
-                aliases: vec!["review changes".into()],
-                ..Default::default()
-            },
-            SkillToolInfo {
-                name: "optimize-prompt".into(),
-                description: "Shrink prompts".into(),
-                aliases: vec!["prompt optimization".into()],
-                ..Default::default()
-            },
-        ];
-
-        let selected = select_auto_routed_skill("review changes on current branch", &catalog);
-
-        assert_eq!(selected.as_deref(), Some("review-changes"));
-    }
-
-    #[test]
-    fn auto_route_skill_matches_token_subsequence_queries() {
-        let catalog = vec![SkillToolInfo {
-            name: "review-changes".into(),
-            description: "Review the current branch diff".into(),
-            aliases: vec!["review changes".into()],
-            ..Default::default()
-        }];
-
-        let selected = select_auto_routed_skill("review code changes", &catalog);
-
-        assert_eq!(selected.as_deref(), Some("review-changes"));
-    }
-
-    #[test]
-    fn auto_route_skill_stays_conservative_for_ambiguous_query() {
-        let catalog = vec![
-            SkillToolInfo {
-                name: "review-changes".into(),
-                description: "Review the current branch diff".into(),
-                aliases: vec!["review changes".into()],
-                ..Default::default()
-            },
-            SkillToolInfo {
-                name: "review-code".into(),
-                description: "Review code quality and tests".into(),
-                aliases: vec!["code review".into()],
-                ..Default::default()
-            },
-        ];
-
-        let selected = select_auto_routed_skill("please help me review this", &catalog);
-
-        assert!(selected.is_none());
-    }
-
-    #[test]
-    fn auto_route_thresholds_are_configurable() {
-        let catalog = vec![SkillToolInfo {
-            name: "review-changes".into(),
-            description: "Review the current branch diff".into(),
-            ..Default::default()
-        }];
-
-        let selected =
-            select_auto_routed_skill_with_config("diff", &catalog, AutoRoutingConfig::new(1, 0));
-
-        assert_eq!(selected.as_deref(), Some("review-changes"));
     }
 
     #[test]

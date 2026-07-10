@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use astra_services::multi_agent::EdgeDispatchIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -194,8 +195,15 @@ pub fn history_has_reasoning(messages: &[Value]) -> bool {
 }
 
 #[inline]
-pub fn tool_callback_key(user_id: &str, request_id: &str) -> String {
-    format!("{user_id}:tool:{request_id}")
+pub fn tool_callback_key(identity: &EdgeDispatchIdentity) -> String {
+    format!(
+        "{}:tool:{}:{}:{}:{}",
+        identity.user_id,
+        identity.session_id,
+        identity.run_id,
+        identity.turn_chain_id,
+        identity.request_id
+    )
 }
 
 #[inline]
@@ -792,9 +800,17 @@ mod tests {
     use crate::history::{RecoveredEventRow, append_recovered_events};
     use tempfile::tempdir;
 
+    fn test_identity(user_id: &str, request_id: &str) -> EdgeDispatchIdentity {
+        EdgeDispatchIdentity::new(user_id, "s1", "run1", "chain1", request_id)
+    }
+
+    fn tool_callback_key(user_id: &str, request_id: &str) -> String {
+        super::tool_callback_key(&test_identity(user_id, request_id))
+    }
+
     #[test]
     fn callback_keys_match_handler_convention() {
-        assert_eq!(tool_callback_key("u42", "r7"), "u42:tool:r7");
+        assert_eq!(tool_callback_key("u42", "r7"), "u42:tool:s1:run1:chain1:r7");
         assert_eq!(
             approval_callback_key("u42", "s1", "run1", "a1"),
             "u42:approval:s1:run1:a1"
@@ -823,8 +839,8 @@ mod tests {
             4,
             "same request_id must never collide across users or callback namespaces"
         );
-        assert_eq!(user_a_tool, "user-a:tool:same-request");
-        assert_eq!(user_b_tool, "user-b:tool:same-request");
+        assert_eq!(user_a_tool, "user-a:tool:s1:run1:chain1:same-request");
+        assert_eq!(user_b_tool, "user-b:tool:s1:run1:chain1:same-request");
         assert_eq!(
             user_a_approval,
             "user-a:approval:session-a:run-a:same-request"

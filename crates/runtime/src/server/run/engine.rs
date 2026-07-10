@@ -2183,6 +2183,7 @@ mod tests {
         let engine = test_engine();
         let request = astra_services::runs::ChatRequestData {
             message: "hello".to_string(),
+            user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
             runtime_system_prompt: None,

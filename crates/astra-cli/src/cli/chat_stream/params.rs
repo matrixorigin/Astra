@@ -315,6 +315,16 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Credential profile used for in-turn auth refresh when edge result posts hit 401.
     pub(crate) auth_profile: Option<&'a str>,
     pub(crate) message: &'a str,
+    /// Raw user intent captured before CLI prompt wrapping/runtime scaffolding.
+    /// Runtime decision judges read this, not the prompt-facing `message`.
+    pub(crate) user_intent: &'a str,
+    /// Runtime-owned per-turn control text that must reach the current model
+    /// call while staying out of user content and prompt-facing history.
+    pub(crate) input_runtime_required_texts: &'a [String],
+    /// Runtime-owned per-turn control text derived outside the agent loop
+    /// from CLI/session state. This is not user content and must flow through
+    /// the volatile lane, not `message` or persisted prompt-facing history.
+    pub(crate) input_runtime_volatile_texts: &'a [String],
     /// Structured semantic query derived before prompt wrapping when the CLI
     /// knows the message is an active-thread follow-up attachment.
     pub(crate) semantic_query_override: Option<&'a str>,
@@ -566,6 +576,9 @@ impl<'a> ChatTurnParams<'a> {
             token,
             auth_profile: ctx.auth_profile,
             message: ctx.message,
+            user_intent: ctx.message,
+            input_runtime_required_texts: &[],
+            input_runtime_volatile_texts: &[],
             semantic_query_override: None,
             session_id,
             model_id: ctx.model_id.map(ToOwned::to_owned),

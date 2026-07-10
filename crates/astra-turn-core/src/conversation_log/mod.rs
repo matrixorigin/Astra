@@ -4,8 +4,9 @@
 //! a [`Snapshot`](CslEntry::Snapshot) followed by zero or more
 //! [`TurnDelta`](CslEntry::TurnDelta) entries.
 //!
-//! [`materialize`] replays the log to reconstruct the current
-//! `messages: Vec<Value>` + [`SessionStateCompact`] that the LLM sees.
+//! [`materialize`] replays the log to reconstruct canonical runtime
+//! `messages: Vec<Value>` + [`SessionStateCompact`]. Prompt-facing history is
+//! a projection of this state, not the stored source of truth.
 
 #[cfg(feature = "db-store")]
 pub mod db_store;

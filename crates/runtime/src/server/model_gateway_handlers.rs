@@ -1,5 +1,4 @@
 use super::*;
-use axum::extract::rejection::JsonRejection;
 
 #[derive(serde::Serialize)]
 pub(super) struct ModelGatewayCreateResponse {
@@ -21,24 +20,19 @@ pub(super) async fn create_model_gateway_handler(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    request: Result<Json<astra_services::ModelGatewayCreateRequestData>, JsonRejection>,
+    body: Bytes,
 ) -> Result<Json<ModelGatewayCreateResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let Json(request) = request.map_err(model_gateway_json_rejection_to_error)?;
     let _principal = state
         .auth_service
         .current_principal_for_request(
             &headers,
-            external_request_descriptor(&method, &uri, &headers, "/model-gateways"),
+            external_request_descriptor(&method, &uri, &headers, "/model-gateways", &body),
         )
         .await?;
+    let request = serde_json::from_slice::<astra_services::ModelGatewayCreateRequestData>(&body)
+        .map_err(|error| model_gateway_json_error_from_body_text(&error.to_string()))?;
     let record = state.model_gateway_service.create_gateway(request).await?;
     Ok(Json((&record).into()))
-}
-
-fn model_gateway_json_rejection_to_error(
-    rejection: JsonRejection,
-) -> (StatusCode, Json<ErrorResponse>) {
-    model_gateway_json_error_from_body_text(&rejection.body_text())
 }
 
 fn model_gateway_json_error_from_body_text(detail: &str) -> (StatusCode, Json<ErrorResponse>) {

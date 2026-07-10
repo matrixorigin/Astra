@@ -96,10 +96,21 @@ fn mark_agent_progress_lifecycle_event_sent(
     sent_lifecycle_events: &AgentProgressLifecycleLedger,
     key: AgentProgressLifecycleEventKey,
 ) {
-    sent_lifecycle_events
+    let mut guard = sent_lifecycle_events
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key);
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Hard cap: in pathological runs with many fan-out slots, the HashSet can
+    // grow unboundedly. The cap is far above any realistic run size; eviction
+    // here means duplicate events could be re-sent, which is harmless (SSE
+    // clients are idempotent for lifecycle events).
+    const MAX_LIFECYCLE_DEDUP_ENTRIES: usize = 10_000;
+    if guard.len() >= MAX_LIFECYCLE_DEDUP_ENTRIES {
+        guard.clear();
+        tracing::warn!(
+            "sent_lifecycle_events reached cap ({MAX_LIFECYCLE_DEDUP_ENTRIES}); clearing dedup set"
+        );
+    }
+    guard.insert(key);
 }
 
 fn has_agent_progress_lifecycle_event_sent(

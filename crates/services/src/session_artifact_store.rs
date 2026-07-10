@@ -554,7 +554,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         query(
             "INSERT INTO session_artifacts \
              (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
         )
         .bind(&record.artifact_id)
         .bind(&record.session_id)

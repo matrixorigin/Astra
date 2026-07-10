@@ -913,9 +913,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "description": "Atomic parallel sub-agent fan-out: start needs target_count and exactly target_count slots; each slot needs description+prompt; optional id; no brief/agents/background.\n\n\
          Actions: start, get_results, stop_slot.\n\n\
          - `start`: REQUIRES `action`, `target_count`, `slots`. `slots` length must equal `target_count`; every slot requires `description` and `prompt`. Optional per-slot `id` is a stable caller label returned in start/results/fanout projections. Foreground mode waits for all accepted slots and returns `results`; backgrounding is user-controlled with Ctrl+B, not a tool argument.\n\
-         - `get_results`: REQUIRES `action`, `group_id`. Blocks until accepted slots finish, then returns every slot result and the fanout summary.\n\
+         - `get_results`: REQUIRES `action`, `group_id`. Blocks until accepted slots finish, then returns bounded slot result windows and the fanout summary. For large output, pass `slot_index`, `offset`, and `max_bytes` to read one slot in chunks; do not inspect runtime artifact files with shell tools.\n\
          - `stop_slot`: REQUIRES `action`, `group_id`, `slot_index`. Cancels one running slot in the group.\n\n\
          Canonical start shape for two children: `agent_fanout(action='start', target_count=2, slots=[{id:'api', description:'Review API', prompt:'Full child task prompt for API'}, {id:'ui', description:'Review UI', prompt:'Full child task prompt for UI'}], defaults={agent_type:'code-review'})`.\n\
+         Canonical large-result read shape: `agent_fanout(action='get_results', group_id='<returned group_id>', slot_index=0, offset=0, max_bytes=8192)`; use `results[].next_call` for the next chunk.\n\
          Use this instead of `agent` when the user asks for multiple reviewers, parallel exploration, or N independent sub-agents. Do not pass an `agents:[...]` payload to `agent`. Do not put top-level `brief`, `agents`, or `run_in_background` on `agent_fanout`; put full work instructions in each `slots[i].prompt`. Do not put `agent_id` inside slots; use `id` for the caller-facing slot label.",
                 "parameters": {
                     "type": "object",
@@ -959,7 +960,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "allowed_tools": {"type": "array", "items": {"type": "string"}}
                             }
                         },
-                        "slot_index": {"type": "integer", "description": "REQUIRED for stop_slot. Zero-based slot index."}
+                        "slot_index": {"type": "integer", "minimum": 0, "description": "REQUIRED for stop_slot. Optional for get_results to read one slot result window."},
+                        "offset": {"type": "integer", "minimum": 0, "description": "Optional for get_results with slot_index. Byte offset for the slot result window. Default 0."},
+                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "Optional for get_results. Maximum result bytes per slot window. Default 8192, max 65536."}
                     },
                     "required": ["action"],
                     "additionalProperties": false,
@@ -1437,6 +1440,8 @@ mod tests {
         assert!(desc.contains("`id`"));
         assert!(desc.contains("Ctrl+B"));
         assert!(desc.contains("Foreground mode") || desc.contains("returns `results`"));
+        assert!(desc.contains("bounded slot result windows"));
+        assert!(desc.contains("results[].next_call"));
         assert!(desc.contains("top-level `brief`"));
         assert_eq!(params["additionalProperties"], false);
         assert_eq!(
@@ -1452,6 +1457,12 @@ mod tests {
             params["x-astra-per-action-required"]["start"],
             json!(["target_count", "slots"])
         );
+        assert_eq!(
+            params["x-astra-per-action-required"]["get_results"],
+            json!(["group_id"])
+        );
+        assert!(params["properties"].get("offset").is_some());
+        assert_eq!(params["properties"]["max_bytes"]["maximum"], 65536);
         assert_eq!(
             params["properties"]["slots"]["items"]["required"],
             json!(["description", "prompt"])

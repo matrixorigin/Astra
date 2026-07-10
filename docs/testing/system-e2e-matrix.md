@@ -7,7 +7,6 @@ This document maps **user-visible capabilities** to **HTTP routes**, **persisten
 ## How to run
 
 ```bash
-cd rust
 ASTRA_TEST_DB_IT=1 \
 ASTRA_TEST_BRIDGE_SECRET=system-matrix-e2e-secret \
 cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- \

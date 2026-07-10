@@ -111,16 +111,12 @@ fn llm_nonstream_fallback_metrics_slot() -> &'static RwLock<Option<Arc<MetricsRe
 
 pub(crate) fn set_llm_nonstream_fallback_metrics_registry(registry: Arc<MetricsRegistry>) {
     register_llm_nonstream_fallback_metrics(&registry);
-    *llm_nonstream_fallback_metrics_slot()
-        .write()
-        .expect("llm fallback metrics registry lock poisoned") = Some(registry);
+    *astra_core::sync_poison::recover_rwlock_write(llm_nonstream_fallback_metrics_slot()) =
+        Some(registry);
 }
 
 fn llm_nonstream_fallback_metrics_registry() -> Option<Arc<MetricsRegistry>> {
-    llm_nonstream_fallback_metrics_slot()
-        .read()
-        .expect("llm fallback metrics registry lock poisoned")
-        .clone()
+    astra_core::sync_poison::recover_rwlock_read(llm_nonstream_fallback_metrics_slot()).clone()
 }
 
 fn register_llm_nonstream_fallback_metrics(registry: &MetricsRegistry) {
@@ -652,9 +648,16 @@ fn bedrock_converse_url(base_url: &str, model_name: &str, streaming: bool) -> St
         reqwest::Url::parse("http://invalid.local").expect("valid fallback URL")
     });
     {
-        let mut segments = url
-            .path_segments_mut()
-            .expect("base URL must support path segments");
+        let Ok(mut segments) = url.path_segments_mut() else {
+            return format!(
+                "{base}/model/{model_name}/{}",
+                if streaming {
+                    "converse-stream"
+                } else {
+                    "converse"
+                }
+            );
+        };
         segments.pop_if_empty();
         segments.push("model");
         segments.push(model_name);
@@ -1591,6 +1594,20 @@ pub(crate) fn build_provider_request_body_with_overrides(
 ) -> Value {
     let sanitized_overrides =
         sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
+    let marker_stripped_messages;
+    let messages = if messages
+        .iter()
+        .any(crate::turn::wire_assembly::is_required_runtime_preamble)
+    {
+        marker_stripped_messages = {
+            let mut cloned = messages.to_vec();
+            strip_internal_runtime_markers(&mut cloned);
+            cloned
+        };
+        marker_stripped_messages.as_slice()
+    } else {
+        messages
+    };
     // Final send-time guard: some callers still reach request assembly without
     // the earlier edge-ledger normalization pass. Repair reasoning replay here
     // as the last line of defense so thinking providers never see a malformed
@@ -1890,7 +1907,32 @@ pub(crate) fn strip_empty_assistant_tool_calls(messages: &mut [Value]) {
     astra_turn_core::chat_history_openai::sanitize_empty_assistant_tool_calls_mut(messages);
 }
 
+#[cfg(test)]
 pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
+    consolidate_system_messages_inner(messages, false)
+}
+
+pub(crate) fn consolidate_system_messages_for_provider(
+    messages: &[Value],
+    provider: &str,
+) -> Vec<Value> {
+    let preserve_runtime_system_tail = matches!(
+        llm_provider_protocol(provider),
+        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible
+    );
+    consolidate_system_messages_inner(messages, preserve_runtime_system_tail)
+}
+
+fn strip_internal_runtime_markers(messages: &mut [Value]) {
+    for message in messages {
+        crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
+    }
+}
+
+fn consolidate_system_messages_inner(
+    messages: &[Value],
+    preserve_runtime_system_tail: bool,
+) -> Vec<Value> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut system_blocks: Vec<Value> = Vec::new();
     let mut structured_system = false;
@@ -1906,7 +1948,11 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
     };
 
     for msg in messages {
-        if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
+        let is_system = msg.get("role").and_then(|r| r.as_str()) == Some("system");
+        let preserve_runtime_control = preserve_runtime_system_tail
+            && is_system
+            && crate::turn::wire_assembly::is_required_runtime_preamble(msg);
+        if is_system && !preserve_runtime_control {
             match msg.get("content") {
                 Some(Value::String(text)) => {
                     if text.is_empty() {
@@ -1943,7 +1989,9 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
                 _ => {}
             }
         } else {
-            rest.push(msg.clone());
+            let mut cloned = msg.clone();
+            crate::turn::wire_assembly::strip_required_runtime_preamble_marker(&mut cloned);
+            rest.push(cloned);
         }
     }
 
@@ -1956,6 +2004,7 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
         out.push(json!({"role": "system", "content": system_parts.join("\n\n")}));
     }
     out.extend(rest);
+    strip_internal_runtime_markers(&mut out);
 
     // Sanitize assistant messages: remove empty tool_calls arrays and fix
     // tool_calls with empty function names.
@@ -2612,7 +2661,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides_and_stream_callb
     // Consolidate system messages: merge all system-role messages into the first
     // one, converting extras to a single leading system message. Some providers
     // (e.g. MiniMax) reject system messages after the first position.
-    let messages = consolidate_system_messages(messages);
+    let messages = consolidate_system_messages_for_provider(messages, provider);
 
     // All providers stream — including Bedrock (via converse-stream +
     // AWS vnd.amazon.eventstream). The body builder and URL builder flip
@@ -3867,7 +3916,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     let started = Instant::now();
     let upstream_name = wire_model_name.unwrap_or(model_name);
 
-    let messages = consolidate_system_messages(messages);
+    let messages = consolidate_system_messages_for_provider(messages, provider);
 
     let body = build_provider_request_body_with_overrides(
         &messages,
@@ -7553,6 +7602,64 @@ mod tests {
     }
 
     #[test]
+    fn consolidate_for_openai_preserves_runtime_control_system_tail() {
+        let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
+            "required resume context",
+        )
+        .expect("runtime message");
+        let msgs = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "hi"}),
+            runtime,
+        ];
+
+        let out = consolidate_system_messages_for_provider(&msgs, "openai");
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "stable");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "hi");
+        assert_eq!(out[2]["role"], "system");
+        assert_eq!(out[2]["content"], "required resume context");
+        assert!(
+            out[2]
+                .get(crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER)
+                .is_none(),
+            "internal marker must not reach provider request messages"
+        );
+    }
+
+    #[test]
+    fn consolidate_for_anthropic_preserves_runtime_control_system_tail() {
+        let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
+            "required resume context",
+        )
+        .expect("runtime message");
+        let msgs = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "hi"}),
+            runtime,
+        ];
+
+        let out = consolidate_system_messages_for_provider(&msgs, "anthropic");
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "stable");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"], "hi");
+        assert_eq!(out[2]["role"], "system");
+        assert_eq!(out[2]["content"], "required resume context");
+        assert!(
+            out.iter().all(|message| message
+                .get(crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER)
+                .is_none()),
+            "internal marker must not reach provider request messages"
+        );
+    }
+
+    #[test]
     fn consolidate_fixes_empty_tool_call_name() {
         let msgs = vec![
             json!({"role": "system", "content": "sys"}),
@@ -7676,6 +7783,38 @@ mod tests {
             ),
             "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse"
         );
+    }
+
+    #[test]
+    fn for_provider_bedrock_cannot_be_base_url_degrades_without_panic() {
+        assert_eq!(
+            llm_request_url_for_provider(
+                "mailto:bedrock-runtime",
+                "bedrock",
+                "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                true
+            ),
+            "mailto:bedrock-runtime/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_fallback_metrics_registry_recovers_from_poisoned_slot() {
+        let (_metrics_guard, _) = install_llm_fallback_metrics_for_test().await;
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = astra_core::sync_poison::recover_rwlock_write(
+                llm_nonstream_fallback_metrics_slot(),
+            );
+            panic!("poison fallback metrics slot");
+        });
+
+        let registry = Arc::new(MetricsRegistry::new());
+        set_llm_nonstream_fallback_metrics_registry(registry.clone());
+
+        assert!(Arc::ptr_eq(
+            &llm_nonstream_fallback_metrics_registry().expect("registry should be readable"),
+            &registry
+        ));
     }
 
     #[test]
@@ -9305,6 +9444,66 @@ mod tests {
             "string"
         );
         assert_eq!(body["tools"][0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn build_anthropic_body_keeps_runtime_system_tail_out_of_cached_prefix_block() {
+        let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
+            "required resume context",
+        )
+        .expect("runtime message");
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": [{
+                    "type": "text",
+                    "text": "stable",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }]
+            }),
+            json!({"role": "user", "content": "hello"}),
+            runtime,
+        ];
+        let messages = consolidate_system_messages_for_provider(&messages, "anthropic");
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "claude-sonnet-4-20250514",
+            "anthropic",
+            Some(1024),
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+
+        let system = body["system"].as_array().expect("top-level system blocks");
+        assert_eq!(system.len(), 2, "{system:#?}");
+        assert_eq!(system[0]["text"], "stable");
+        assert_eq!(system[0]["cache_control"]["ttl"], "1h");
+        assert_eq!(system[1]["text"], "required resume context");
+        assert!(system[1].get("cache_control").is_none());
+        assert!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message["role"] != "system"),
+            "system must remain top-level for Anthropic: {body:#?}"
+        );
+        let rendered = body.to_string();
+        assert!(
+            rendered
+                .find("stable")
+                .zip(rendered.find("required resume context"))
+                .is_some_and(|(stable, runtime)| stable < runtime),
+            "stable system block must precede runtime block: {body:#?}"
+        );
+        assert!(
+            !body
+                .to_string()
+                .contains(crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER),
+            "internal runtime marker must never reach the provider request body: {body:#?}"
+        );
     }
 
     #[test]

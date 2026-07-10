@@ -1038,10 +1038,7 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
         if event.event_type != session_journal::JournalEventType::Turn {
             continue;
         }
-        let user_input = restored_turn_user_input(&event);
-        restored
-            .history
-            .push((user_input, event.assistant_output.unwrap_or_default()));
+        restored.history.extend(restored_turn_history_pairs(&event));
         restored.turn = restored
             .turn
             .max(event.turn.unwrap_or(restored.turn.saturating_add(1)));
@@ -1061,43 +1058,56 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
     })
 }
 
-fn restored_turn_user_input(event: &session_journal::JournalEvent) -> String {
+fn restored_turn_history_pairs(event: &session_journal::JournalEvent) -> Vec<(String, String)> {
     let base = event.user_input.clone().unwrap_or_default();
+    let assistant = event.assistant_output.clone().unwrap_or_default();
     let deferred = deferred_user_inputs_from_turn_metadata(event.metadata.as_ref());
-    if deferred.is_empty() {
-        return base;
+
+    let mut inputs = Vec::with_capacity(1 + deferred.len());
+    if !base.trim().is_empty() {
+        inputs.push(base);
+    }
+    inputs.extend(deferred);
+
+    if inputs.is_empty() {
+        return vec![(String::new(), assistant)];
     }
 
-    let mut parts = Vec::new();
-    if !base.trim().is_empty() {
-        parts.push(base.clone());
+    let mut pairs = Vec::with_capacity(inputs.len());
+    let last_idx = inputs.len() - 1;
+    for (idx, input) in inputs.into_iter().enumerate() {
+        let output = if idx == last_idx {
+            assistant.clone()
+        } else {
+            String::new()
+        };
+        pairs.push((input, output));
     }
-    let base_sections = base
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect::<std::collections::HashSet<_>>();
-    for content in deferred {
-        let trimmed = content.trim();
-        if trimmed.is_empty() || base_sections.contains(trimmed) {
-            continue;
-        }
-        parts.push(trimmed.to_string());
-    }
-    parts.join("\n\n")
+    pairs
 }
 
 fn deferred_user_inputs_from_turn_metadata(metadata: Option<&serde_json::Value>) -> Vec<String> {
-    metadata
+    let mut inputs = metadata
         .and_then(|metadata| metadata.get("deferred_user_inputs"))
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|entry| entry.get("content").and_then(serde_json::Value::as_str))
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
-        .map(ToString::to_string)
-        .collect()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            let content = entry.get("content").and_then(serde_json::Value::as_str)?;
+            let content = content.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let event_index = entry
+                .get("event_index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(u64::MAX);
+            Some((event_index, idx, content.to_string()))
+        })
+        .collect::<Vec<_>>();
+    inputs.sort_by_key(|(event_index, idx, _)| (*event_index, *idx));
+    inputs.into_iter().map(|(_, _, content)| content).collect()
 }
 
 pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
@@ -1460,9 +1470,10 @@ mod tests {
         access_token_needs_refresh, banner_session_display, banner_welcome_text,
         context_window_for_model_from_models_response, current_access_token, current_git_root,
         default_model_from_models_response, default_model_selection_from_models_response,
-        ensure_state_default_model, fresh_access_token, initialize_session_state,
-        pending_recovery_status_line, resolve_server_model_context_window,
-        restore_history_from_journal, restore_session_state_from_journal, restored_journal_state,
+        deferred_user_inputs_from_turn_metadata, ensure_state_default_model, fresh_access_token,
+        initialize_session_state, pending_recovery_status_line,
+        resolve_server_model_context_window, restore_history_from_journal,
+        restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error,
     };
     use crate::cli::cli_config::cli_utils::{
@@ -1725,7 +1736,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_history_includes_structured_deferred_user_inputs() {
+    fn restore_history_preserves_deferred_user_inputs_as_ordered_events() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-restore-deferred-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
@@ -1748,9 +1759,65 @@ mod tests {
             .unwrap();
 
         let history = restore_history_from_journal(&sid).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].0, "1\n\n2");
-        assert_eq!(history[0].1, "handled latest input");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0], ("1".to_string(), String::new()));
+        assert_eq!(
+            history[1],
+            ("2".to_string(), "handled latest input".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_history_preserves_duplicate_deferred_user_events() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("test-restore-deferred-dup-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+
+        writer
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(&sid),
+                    1,
+                    None,
+                    "retry",
+                    "handled retry",
+                    0,
+                    10,
+                    5,
+                    100,
+                )
+                .with_deferred_user_inputs([(2, "retry"), (3, "retry")]),
+            )
+            .unwrap();
+
+        let history = restore_history_from_journal(&sid).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0], ("retry".to_string(), String::new()));
+        assert_eq!(history[1], ("retry".to_string(), String::new()));
+        assert_eq!(
+            history[2],
+            ("retry".to_string(), "handled retry".to_string())
+        );
+    }
+
+    #[test]
+    fn deferred_user_inputs_without_event_index_keep_array_order_after_indexed_inputs() {
+        let metadata = serde_json::json!({
+            "deferred_user_inputs": [
+                {"content": "missing-a"},
+                {"event_index": 2, "content": "indexed"},
+                {"content": "missing-b"}
+            ]
+        });
+
+        assert_eq!(
+            deferred_user_inputs_from_turn_metadata(Some(&metadata)),
+            vec![
+                "indexed".to_string(),
+                "missing-a".to_string(),
+                "missing-b".to_string()
+            ]
+        );
     }
 
     #[test]

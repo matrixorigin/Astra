@@ -384,10 +384,14 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         .and_then(|ao| ao.to_json());
 
     let checkpoint_blocked_tools = checkpoint_blocked_tools(&state.restricted_tools);
+    let checkpoint_messages =
+        astra_turn_core::runtime_scaffolding::sanitize_recoverable_runtime_messages(
+            state.messages.clone(),
+        );
     let Some(mut heavy) = state
         .step_recorder
         .build_heavy_checkpoint_with_interruption(
-            &state.messages,
+            &checkpoint_messages,
             0,
             state.remaining_turns as u32,
             &checkpoint_blocked_tools,
@@ -511,7 +515,13 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
                     if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
-                        let _ = buf.flush_interrupted(&writer);
+                        if let Err(error) = buf.flush_interrupted(&writer) {
+                            tracing::warn!(
+                                session_id = sid,
+                                error = %error,
+                                "failed to flush interrupted turn journal events after agentic loop error"
+                            );
+                        }
                     }
                 }
             }
@@ -530,7 +540,13 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             if let Some(buf) = state.turn_event_buffer.as_mut() {
                 if !buf.is_empty() {
                     if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
-                        let _ = buf.flush_interrupted(&writer);
+                        if let Err(error) = buf.flush_interrupted(&writer) {
+                            tracing::warn!(
+                                session_id = sid,
+                                error = %error,
+                                "failed to flush interrupted turn journal events"
+                            );
+                        }
                     }
                 }
             }
@@ -542,7 +558,13 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             )
             .with_agentic_step(Some(current_agentic_step(state)));
             if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
-                let _ = writer.append(&evt);
+                if let Err(error) = writer.append(&evt) {
+                    tracing::warn!(
+                        session_id = sid,
+                        error = %error,
+                        "failed to append interruption record to session journal"
+                    );
+                }
             }
         }
 
@@ -720,6 +742,45 @@ fn settlement_interruption_summary(
     interruption_state_summary(state, error_detail)
 }
 
+fn terminal_turn_evaluation(
+    state: &AgenticLoopState,
+) -> astra_turn_core::evaluation::TurnEvaluation {
+    let verdict_warning =
+        crate::server::run::lifecycle::has_turn_verdict_warning(&state.stall.verdict_events);
+    let mut eval =
+        crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds_and_telemetry(
+            &state.message,
+            &state.recent_tools,
+            &state.stall.tool_call_records,
+            state.stall.events.len(),
+            verdict_warning,
+            state.telemetry.first_budget_pressure,
+            crate::pipeline::evaluation::current_evaluation_thresholds(),
+            astra_turn_core::evaluation::TurnEvaluationTelemetry {
+                llm_rounds: Some(state.llm_rounds_completed),
+                prompt_tokens: Some(state.total_prompt),
+                first_round_prompt_tokens: None,
+                max_round_prompt_tokens: state.last_measured_prompt_tokens,
+            },
+        );
+    crate::pipeline::evaluation::apply_final_answer_relevance(
+        &mut eval,
+        &state.message,
+        &state.final_text,
+    );
+    eval
+}
+
+fn append_terminal_turn_evaluation_notice_if_needed(state: &mut AgenticLoopState) {
+    let eval = terminal_turn_evaluation(state);
+    let annotated =
+        astra_turn_core::evaluation::build_turn_evaluation_annotated_text(&state.final_text, &eval);
+    if annotated != state.final_text {
+        state.final_text = annotated;
+        state.final_text_streamed = false;
+    }
+}
+
 fn ensure_terminal_text(state: &mut AgenticLoopState) {
     if state
         .hooks
@@ -774,6 +835,8 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         }
     }
     if !state.final_text.trim().is_empty() {
+        append_terminal_turn_evaluation_notice_if_needed(state);
+
         // ── Truncation marker: finish_reason == "length" ─────────────
         // The model produced output but the API cut it off at max_tokens.
         // Append a visible marker so the user sees the text is incomplete.
@@ -1045,7 +1108,7 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
         );
         return;
     };
-    let turn_number = state.max_turns.saturating_sub(state.remaining_turns);
+    let turn_number = session_turn_number(state);
 
     let had_error = state.error_recovery.consecutive_same_error > 0;
 
@@ -1063,6 +1126,7 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
         .saturating_add(state.total_cache_read)
         .saturating_add(state.total_cache_creation) as usize;
 
+    let runtime_decision_user_intent = state.runtime_decision_user_intent();
     let req = crate::session_memory::ExtractionRequest {
         user_id,
         session_id,
@@ -1071,13 +1135,18 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
         current_tokens,
         current_tool_calls: state.total_tool_calls as usize,
         had_error,
-        had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(&state.message),
-        turn_number: turn_number as u32,
+        had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(
+            &runtime_decision_user_intent,
+        ),
+        turn_number,
         config: astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
         ),
     };
 
-    let _ = svc.maybe_spawn(req);
+    match svc.maybe_spawn(req) {
+        crate::session_memory::SpawnDecision::Spawned => {}
+        crate::session_memory::SpawnDecision::Skipped => {}
+    }
 }
 
 async fn close_pending_memory_feedback_at_turn_end(state: &mut AgenticLoopState) {
@@ -1125,6 +1194,71 @@ mod tests {
         ));
     }
 
+    fn mark_must_mutate(state: &mut AgenticLoopState) {
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                true,
+                false,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+                true,
+            );
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default().with_workspace_mutation(
+                astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+            ),
+        );
+    }
+
+    #[test]
+    fn terminal_text_marks_failed_structural_evaluation_incomplete() {
+        let mut state = make_state();
+        state.message = "fix the broken build".to_string();
+        state.user_intent = state.message.clone();
+        state.final_text = "Done.".to_string();
+        state.final_text_streamed = true;
+        state.llm_rounds_completed = 40;
+        state.total_prompt = 94_900;
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "read_file".to_string(),
+                ok: false,
+                error: Some("PATH_RESOLUTION_FAILED: requested path does not exist".to_string()),
+                file_path: Some("obsolete/workspace/src/lib.rs".to_string()),
+                ..Default::default()
+            });
+
+        ensure_terminal_text(&mut state);
+
+        assert!(state.final_text.starts_with("Done."));
+        assert!(state.final_text.contains("[Turn evaluation: incomplete."));
+        assert!(state.final_text.contains("tool error rate is high"));
+        assert!(
+            !state.final_text.contains("obsolete/workspace/src/lib.rs"),
+            "terminal evaluation notice must not promote failed file paths: {}",
+            state.final_text
+        );
+        assert!(
+            !state.final_text_streamed,
+            "rendering must replay the amended terminal text"
+        );
+    }
+
+    #[test]
+    fn terminal_text_leaves_healthy_text_completion_unchanged() {
+        let mut state = make_state();
+        state.message = "explain the code style".to_string();
+        state.user_intent = state.message.clone();
+        state.final_text = "The code style is consistent.".to_string();
+        state.final_text_streamed = true;
+
+        ensure_terminal_text(&mut state);
+
+        assert_eq!(state.final_text, "The code style is consistent.");
+        assert!(state.final_text_streamed);
+    }
+
     struct SessionDirGuard(std::path::PathBuf);
 
     impl SessionDirGuard {
@@ -1156,8 +1290,8 @@ mod tests {
         ]);
         let mut state = make_state();
         state.message = "修复这个 bug".to_string();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("修复这个 bug");
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
         assert!(
             state.task_profile.mutates_workspace,
             "test precondition: profile must be mutating"
@@ -1206,8 +1340,8 @@ mod tests {
         ]);
         let mut state = make_state();
         state.message = "fix the bug".to_string();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("fix the bug");
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
         assert!(state.task_profile.mutates_workspace);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -1244,8 +1378,8 @@ mod tests {
         ]);
         let mut state = make_state();
         state.message = "修复这个 bug".to_string();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("修复这个 bug");
+        state.user_intent = state.message.clone();
+        mark_must_mutate(&mut state);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop must terminate: {:?}", outcome);
@@ -1691,6 +1825,84 @@ mod tests {
                 .expect("read checkpoint")
                 .expect("heavy checkpoint");
         assert_eq!(heavy.blocked_tools, vec!["write_file".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial(session_journal_dir)]
+    fn heavy_checkpoint_strips_resume_hint_and_internal_auto_route_roundtrip() {
+        let user_id = "test-user";
+        let session_id = format!("runtime-clean-checkpoint-{}", uuid::Uuid::new_v4());
+        let sessions_dir = tempfile::tempdir().expect("temp sessions dir");
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
+        let _guard = SessionDirGuard::new(user_id, &session_id);
+        let mut state = make_state();
+        state.context_manifest_user_id = Some(user_id.to_string());
+        state.current_session_id = Some(session_id.clone());
+        state.session_turn = 10;
+        state.step_recorder.begin_turn(0);
+        state.messages = vec![
+            serde_json::json!({"role": "user", "content": "我说过的所有话\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "skill-auto-route-analyze-session",
+                    "type": "function",
+                    "function": {"name": crate::turn::skill_tool::SKILL_TOOL_NAME, "arguments": "{}"},
+                }],
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "skill-auto-route-analyze-session", "content": "<skill-loaded name=\"analyze-session\"/>"}),
+            serde_json::json!({"role": "assistant", "content": "你问过我所有话。"}),
+        ];
+
+        try_write_heavy_checkpoint(&mut state);
+
+        let heavy =
+            astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(user_id, &session_id)
+                .expect("read checkpoint")
+                .expect("heavy checkpoint");
+        assert_eq!(
+            heavy.messages,
+            vec![
+                serde_json::json!({"role": "user", "content": "我说过的所有话"}),
+                serde_json::json!({"role": "assistant", "content": "你问过我所有话。"}),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(session_journal_dir)]
+    fn heavy_checkpoint_preserves_ordinary_tool_roundtrip_for_recovery() {
+        let user_id = "test-user";
+        let session_id = format!("tool-roundtrip-checkpoint-{}", uuid::Uuid::new_v4());
+        let sessions_dir = tempfile::tempdir().expect("temp sessions dir");
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
+        let _guard = SessionDirGuard::new(user_id, &session_id);
+        let mut state = make_state();
+        state.context_manifest_user_id = Some(user_id.to_string());
+        state.current_session_id = Some(session_id.clone());
+        state.step_recorder.begin_turn(0);
+        state.messages = vec![
+            serde_json::json!({"role": "user", "content": "run tests"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"cmd\":\"cargo test\"}"},
+                }],
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "ok"}),
+        ];
+
+        try_write_heavy_checkpoint(&mut state);
+
+        let heavy =
+            astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(user_id, &session_id)
+                .expect("read checkpoint")
+                .expect("heavy checkpoint");
+        assert_eq!(heavy.messages, state.messages);
     }
 
     #[test]

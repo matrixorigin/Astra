@@ -13,6 +13,13 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 
 const CAUSAL_EDGE_KIND: &str = "causal";
+const EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS: &[&str] = &[
+    "user_id",
+    "session_id",
+    "run_id",
+    "turn_chain_id",
+    "request_id",
+];
 
 /// Standard column width for `agent_id` across all tables.
 /// All `agent_id`, `edge_agent_id`, `holder_agent_id`, and `parent_agent_id`
@@ -1148,6 +1155,22 @@ pub async fn ensure_core_schema(
             INDEX idx_auth_tokens_active (is_active),
             INDEX idx_auth_tokens_scope_user (scope_user_id),
             INDEX idx_auth_tokens_scope_repo (scope_repo)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS auth_provider_request_replay (
+            provider VARCHAR(64) NOT NULL,
+            request_authorization_id VARCHAR(512) NOT NULL,
+            external_subject VARCHAR(255) NOT NULL,
+            request_id VARCHAR(255) NOT NULL,
+            expires_at_unix BIGINT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (provider, request_authorization_id),
+            INDEX idx_auth_provider_request_replay_expires (expires_at_unix, provider, request_authorization_id),
+            INDEX idx_auth_provider_request_replay_request (provider, request_id)
         )",
     )
     .execute(&pool)
@@ -3562,6 +3585,9 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (
             user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            run_id VARCHAR(128) NOT NULL,
+            turn_chain_id VARCHAR(128) NOT NULL,
             edge_agent_id VARCHAR(255) NOT NULL,
             request_id VARCHAR(128) NOT NULL,
             payload_json JSON NOT NULL,
@@ -3571,8 +3597,8 @@ pub async fn ensure_core_schema(
             dispatched_at DATETIME(6) NULL,
             completed_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, request_id),
-            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, request_id),
+            PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, request_id),
+            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, session_id, run_id, turn_chain_id, request_id),
             INDEX idx_edge_dispatch_created (created_at)
         )",
     )
@@ -3582,7 +3608,7 @@ pub async fn ensure_core_schema(
         &pool,
         &settings.database,
         "edge_pending_dispatch",
-        &["user_id", "request_id"],
+        EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
         &["dispatch_id"],
         &["uq_edge_dispatch_owner_request"],
     )
@@ -3598,8 +3624,8 @@ pub async fn ensure_core_schema(
         &pool,
         &settings.database,
         "edge_pending_dispatch",
-        &["user_id", "request_id"],
-        "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, request_id)",
+        EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
+        "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, request_id)",
     )
     .await?;
     ensure_index_shape(
@@ -3607,8 +3633,17 @@ pub async fn ensure_core_schema(
         &settings.database,
         "edge_pending_dispatch",
         "idx_edge_dispatch_user_status",
-        &["user_id", "edge_agent_id", "status", "created_at", "request_id"],
-        "ALTER TABLE edge_pending_dispatch ADD INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, request_id)",
+        &[
+            "user_id",
+            "edge_agent_id",
+            "status",
+            "created_at",
+            "session_id",
+            "run_id",
+            "turn_chain_id",
+            "request_id",
+        ],
+        "ALTER TABLE edge_pending_dispatch ADD INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, session_id, run_id, turn_chain_id, request_id)",
     )
     .await?;
 
@@ -5176,6 +5211,7 @@ pub async fn cleanup_expired_data(
 ) -> Result<Vec<CleanupResult>, String> {
     const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const AUTH_TOKEN_BATCH_LIMIT: u32 = 1000;
+    const AUTH_PROVIDER_REQUEST_REPLAY_BATCH_LIMIT: u32 = 1000;
     const TASK_LEASE_BATCH_LIMIT: u32 = 1000;
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
     const PROMPT_REQUEST_BATCH_LIMIT: u32 = 1000;
@@ -5223,7 +5259,26 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 3. Expired task leases
+    // 3. Expired provider request replay guards. These are replay-prevention
+    // facts, not audit facts: after the capability token expiry passes, the
+    // row only consumes index space and can no longer authorize anything.
+    let deleted = sqlx::query(
+        "DELETE FROM auth_provider_request_replay \
+         WHERE expires_at_unix < UNIX_TIMESTAMP() \
+         ORDER BY expires_at_unix ASC, provider ASC, request_authorization_id ASC \
+         LIMIT ?",
+    )
+    .bind(AUTH_PROVIDER_REQUEST_REPLAY_BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| format!("cleanup auth_provider_request_replay: {e}"))?;
+    results.push(CleanupResult {
+        table: "auth_provider_request_replay",
+        rows_deleted: deleted,
+    });
+
+    // 4. Expired task leases
     let deleted = sqlx::query(
         "DELETE FROM task_leases \
          WHERE expires_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
@@ -5241,7 +5296,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 4. Old audit logs
+    // 5. Old audit logs
     let deleted = sqlx::query(
         "DELETE FROM auth_audit_logs \
          WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
@@ -5259,7 +5314,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 5. Old prompt observability rows. Select parent request records first so
+    // 6. Old prompt observability rows. Select parent request records first so
     // child prompt_deltas and parent prompt_request_records are pruned together.
     let prompt_request_retention_select_sql = format!(
         "SELECT p.user_id, p.session_id, p.request_id
@@ -5981,30 +6036,26 @@ mod tests {
     }
 
     #[test]
-    fn edge_pending_dispatch_identity_is_owner_request_bound() {
+    fn edge_pending_dispatch_identity_is_turn_scoped() {
         let source = include_str!("storage.rs");
-        let ddl = source
-            .split("CREATE TABLE IF NOT EXISTS edge_pending_dispatch")
-            .nth(1)
-            .and_then(|rest| rest.split(")\"").next())
-            .expect("edge_pending_dispatch DDL");
-
-        assert!(
-            ddl.contains("PRIMARY KEY (user_id, request_id)"),
-            "edge_pending_dispatch must use the owner/request product identity"
+        let production_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert_eq!(
+            EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS,
+            &[
+                "user_id",
+                "session_id",
+                "run_id",
+                "turn_chain_id",
+                "request_id"
+            ],
+            "edge_pending_dispatch identity must be scoped to the owning turn"
         );
         assert!(
-            !ddl.contains("dispatch_id BIGINT AUTO_INCREMENT"),
+            !production_source.contains("dispatch_id BIGINT AUTO_INCREMENT"),
             "edge_pending_dispatch must not reintroduce a global AUTO_INCREMENT surrogate"
         );
         assert!(
-            source.contains(
-                "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, request_id)"
-            ),
-            "schema bootstrap must verify the owner/request primary key"
-        );
-        assert!(
-            source.contains("&[\"dispatch_id\"]"),
+            production_source.contains("&[\"dispatch_id\"]"),
             "legacy dispatch_id schemas must fail startup instead of silently preserving the old hot surrogate"
         );
     }
@@ -6111,6 +6162,35 @@ mod tests {
         assert!(
             source.contains("&[\"uq_auth_user_roles_user_role\"]"),
             "legacy auth_user_roles unique-key-plus-surrogate schemas must fail startup"
+        );
+    }
+
+    #[test]
+    fn provider_request_replay_schema_is_shared_atomic_and_expiring() {
+        let source = include_str!("storage.rs");
+        let replay = source
+            .split("CREATE TABLE IF NOT EXISTS auth_provider_request_replay")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("auth_provider_request_replay DDL");
+        assert!(
+            replay.contains("PRIMARY KEY (provider, request_authorization_id)"),
+            "provider request replay identity must be shared and provider-scoped"
+        );
+        assert!(
+            replay.contains("request_authorization_id VARCHAR(512) NOT NULL"),
+            "provider request replay identity must fit the full signed request nonce"
+        );
+        assert!(
+            replay.contains("expires_at_unix BIGINT NOT NULL")
+                && replay.contains(
+                    "idx_auth_provider_request_replay_expires (expires_at_unix, provider, request_authorization_id)"
+                ),
+            "provider request replay rows must have an indexed TTL boundary"
+        );
+        assert!(
+            !replay.contains("id BIGINT AUTO_INCREMENT"),
+            "provider request replay must not reintroduce ownerless surrogate identity"
         );
     }
 
@@ -6385,6 +6465,7 @@ mod tests {
         for constant in [
             "AUTH_REFRESH_TOKEN_BATCH_LIMIT",
             "AUTH_TOKEN_BATCH_LIMIT",
+            "AUTH_PROVIDER_REQUEST_REPLAY_BATCH_LIMIT",
             "TASK_LEASE_BATCH_LIMIT",
             "AUTH_AUDIT_LOG_BATCH_LIMIT",
             "PROMPT_REQUEST_BATCH_LIMIT",
@@ -6398,6 +6479,7 @@ mod tests {
         }
         for ordering in [
             "ORDER BY created_at ASC, token_id ASC",
+            "ORDER BY expires_at_unix ASC, provider ASC, request_authorization_id ASC",
             "ORDER BY expires_at ASC, user_id ASC, task_id ASC",
             "ORDER BY created_at ASC, log_id ASC",
             "ORDER BY p.created_at_unix_ms ASC, p.user_id ASC, p.request_id ASC",
@@ -6490,6 +6572,11 @@ mod tests {
                 "global age-based cleanup must not directly delete replay/tool-output facts: {table}"
             );
         }
+        assert!(
+            body.contains("DELETE FROM auth_provider_request_replay")
+                && body.contains("WHERE expires_at_unix < UNIX_TIMESTAMP()"),
+            "provider request replay guards are nonce TTL facts and must expire by their signed token boundary, not generic retention age"
+        );
     }
 
     #[test]

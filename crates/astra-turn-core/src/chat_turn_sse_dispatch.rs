@@ -62,6 +62,8 @@ pub struct ChatTurnSseAccum {
     pub cache_creation_tokens: u64,
     pub has_usage: bool,
     pub error_message: Option<String>,
+    pub error_code: Option<String>,
+    pub error_metadata: Option<Value>,
     pub error_kind: Option<astra_core::ErrorKind>,
     /// System prompt token estimate from runtime (via `context_meta` SSE event).
     pub system_prompt_tokens: Option<u32>,
@@ -103,6 +105,9 @@ pub struct EdgeApprovalRequest {
 #[derive(Debug, Clone)]
 pub enum ChatTurnEdgePending {
     ToolRequest {
+        session_id: String,
+        run_id: String,
+        turn_chain_id: String,
         request_id: String,
         tool: String,
         args: Value,
@@ -340,6 +345,21 @@ fn apply_one_event(
                 && !request_id.is_empty()
             {
                 edge_pending.push(ChatTurnEdgePending::ToolRequest {
+                    session_id: event
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    run_id: event
+                        .get("run_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    turn_chain_id: event
+                        .get("turn_chain_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     request_id,
                     tool,
                     args,
@@ -426,6 +446,11 @@ fn apply_one_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
             accum.error_message = Some(format!("Error: {msg}"));
+            accum.error_code = event
+                .get("error_code")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            accum.error_metadata = event.get("metadata").cloned();
             accum.error_kind = event
                 .get("error_kind")
                 .and_then(|v| v.as_str())
@@ -831,6 +856,24 @@ mod tests {
     }
 
     #[test]
+    fn error_event_captures_code_and_metadata() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "error",
+                ",\"message\":\"turn mismatch\",\"error_code\":\"bridge_session_turn_stale\",\"metadata\":{\"actual_session_turn\":1,\"expected_session_turn\":2}",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.error_message.as_deref(), Some("Error: turn mismatch"));
+        assert_eq!(a.error_code.as_deref(), Some("bridge_session_turn_stale"));
+        let metadata = a.error_metadata.as_ref().expect("metadata");
+        assert_eq!(metadata["actual_session_turn"], 1);
+        assert_eq!(metadata["expected_session_turn"], 2);
+    }
+
+    #[test]
     fn tool_call_collected() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
@@ -1009,6 +1052,7 @@ mod tests {
                 request_id,
                 tool,
                 args,
+                ..
             } => {
                 assert_eq!(request_id, "tr-1");
                 assert_eq!(tool, "bash");

@@ -429,6 +429,36 @@ async fn reexecute_pending_requests(
     };
 
     for req in pending {
+        let session_id = match req.get("session_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.trim().is_empty() => id.to_string(),
+            _ => {
+                tracing::error!(
+                    target: "astra.edge.reconnect",
+                    "reconnection: skipped pending tool replay without session_id"
+                );
+                continue;
+            }
+        };
+        let run_id = match req.get("run_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.trim().is_empty() => id.to_string(),
+            _ => {
+                tracing::error!(
+                    target: "astra.edge.reconnect",
+                    "reconnection: skipped pending tool replay without run_id"
+                );
+                continue;
+            }
+        };
+        let turn_chain_id = match req.get("turn_chain_id").and_then(|v| v.as_str()) {
+            Some(id) if !id.trim().is_empty() => id.to_string(),
+            _ => {
+                tracing::error!(
+                    target: "astra.edge.reconnect",
+                    "reconnection: skipped pending tool replay without turn_chain_id"
+                );
+                continue;
+            }
+        };
         let request_id = match req.get("request_id").and_then(|v| v.as_str()) {
             Some(id) => id.to_string(),
             None => continue,
@@ -483,13 +513,18 @@ async fn reexecute_pending_requests(
             "completed"
         };
 
-        let body = astra_thin_client::ToolResultRequest::new_with_hash_and_fields(
-            request_id.clone(),
-            Some(executor_id.to_string()),
-            status.to_string(),
-            output,
-            0, // reconnection re-execution doesn't track timing
-            tool_result_fields,
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id,
+                run_id,
+                turn_chain_id,
+                request_id: request_id.clone(),
+                edge_agent_id: executor_id.to_string(),
+                status: status.to_string(),
+                output,
+                duration_ms: 0, // reconnection re-execution doesn't track timing
+                tool_result_fields,
+            },
         );
 
         match post_replayed_tool_result(api, profile, &mut replay_token, executor_id, &body).await {

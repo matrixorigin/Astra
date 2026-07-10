@@ -1,5 +1,9 @@
-//! Factual-query detection, session error classification, and memory repo extraction.
-//! Shared by CLI `chat_stream` / `repl_turn` and available for in-process bridge parity tests.
+//! Turn execution profiles, factual-retry policy, session error classification,
+//! and memory repo extraction.
+//!
+//! Natural-language turn intent is deliberately not inferred here. Strong
+//! runtime behavior must be driven by structured judge output or concrete
+//! tool/workspace evidence, not keyword lists over user text.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -28,179 +32,6 @@ const STANDARD_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
     AgenticTurnBudget::new(100, 200, 25, 4);
 const COMPLEX_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
     AgenticTurnBudget::new(140, 280, 35, 4);
-
-const WORKSPACE_EVIDENCE_PHRASES: &[&str] = &[
-    "working tree",
-    "local changes",
-    "current changes",
-    "pull request",
-    "test failure",
-    "build failure",
-    "仓库",
-    "工作区",
-    "改动",
-    "修改",
-    "变更",
-    "提交",
-    "分支",
-    "代码",
-    "文件",
-    "函数",
-    "测试失败",
-    "构建失败",
-];
-
-const WORKSPACE_EVIDENCE_WORDS: &[&str] = &[
-    "repo",
-    "repository",
-    "workspace",
-    "changes",
-    "diff",
-    "commit",
-    "branch",
-    "pr",
-    "ci",
-    "github",
-    "codebase",
-    "code",
-    "file",
-    "function",
-];
-
-const MUTATING_TERMS: &[&str] = &[
-    "fix",
-    "修改代码",
-    "修改文件",
-    "implement",
-    "write",
-    "edit",
-    "change code",
-    "change the code",
-    "update code",
-    "create",
-    "add ",
-    "remove",
-    "delete",
-    "patch",
-    "refactor",
-    "apply",
-    "rename",
-    "重构",
-    "实现",
-    "新增",
-    "删除",
-    "更新代码",
-    "更新文件",
-    "修复",
-    "修正",
-];
-
-const EXPLICIT_MUTATION_DIRECTIVE_TERMS: &[&str] = &[
-    "fix",
-    "fix issues",
-    "fix failures",
-    "implement",
-    "write",
-    "edit",
-    "update code",
-    "create",
-    "add ",
-    "remove",
-    "delete",
-    "patch",
-    "refactor",
-    "apply",
-    "cleanup",
-    "clean up",
-    "修改代码",
-    "修改文件",
-    "重构",
-    "实现",
-    "新增",
-    "删除",
-    "更新代码",
-    "更新文件",
-    "修复",
-    "修正",
-    "清理",
-    "合理采纳",
-];
-
-const ANALYSIS_TERMS: &[&str] = &[
-    "review",
-    "code review",
-    "commit review",
-    "审查",
-    "评审",
-    "审阅",
-    "看一眼",
-    "看一下",
-    "看改动",
-    "看修改",
-    "看变更",
-    "what changed",
-    "changed",
-    "what's in the commit",
-    "summarize",
-    "summary",
-    "explain",
-    "inspect",
-    "analyze",
-    "search",
-    "status",
-    "diff",
-    "show",
-    "read",
-    "list",
-    "latest commit",
-    "看看",
-    "解释",
-    "分析",
-    "总结",
-    "搜索",
-    "列出",
-];
-
-const EXPLORATION_TERMS: &[&str] = &[
-    "explore",
-    "exploration",
-    "investigate",
-    "deep dive",
-    "understand the codebase",
-    "understand this system",
-    "trace",
-    "root cause",
-    "walk through",
-    "map out",
-    "survey",
-    "dig into",
-    "探索",
-    "排查",
-    "调研",
-    "梳理",
-    "追踪",
-    "根因",
-    "深挖",
-    "看源码",
-];
-
-const COMPLEXITY_TERMS: &[&str] = &[
-    "complex",
-    "systematic",
-    "end-to-end",
-    "multi-step",
-    "architecture",
-    "subsystem",
-    "large refactor",
-    "cross-cutting",
-    "全链路",
-    "系统性",
-    "复杂",
-    "大型",
-    "架构",
-    "重构",
-    "整体",
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskComplexity {
@@ -265,91 +96,58 @@ impl Default for TaskExecutionProfile {
     }
 }
 
-fn contains_any_keyword(q: &str, keywords: &[&str]) -> bool {
-    keywords.iter().any(|kw| q.contains(kw))
-}
-
-fn contains_ascii_word(q: &str, word: &str) -> bool {
-    q.split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|part| part == word)
-}
-
-fn contains_workspace_evidence_signal(q: &str) -> bool {
-    contains_any_keyword(q, WORKSPACE_EVIDENCE_PHRASES)
-        || WORKSPACE_EVIDENCE_WORDS
-            .iter()
-            .any(|word| contains_ascii_word(q, word))
-}
-
 #[must_use]
 pub fn active_user_task_text(input: &str) -> String {
     crate::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(input)
 }
 
-#[must_use]
-pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
-    let active_input = active_user_task_text(input);
-    let q = active_input.to_lowercase();
-    let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
-    let has_explicit_mutation_directive =
-        contains_any_keyword(&q, EXPLICIT_MUTATION_DIRECTIVE_TERMS);
-    let has_analysis = contains_any_keyword(&q, ANALYSIS_TERMS);
-    let exploratory = contains_any_keyword(&q, EXPLORATION_TERMS);
-    let complexity = if contains_any_keyword(&q, COMPLEXITY_TERMS) {
-        TaskComplexity::Complex
-    } else {
-        TaskComplexity::Standard
-    };
-    let exploration_round_window = if exploratory {
-        EXPLORATORY_ROUND_WINDOW
-    } else {
-        DEFAULT_EXPLORATION_ROUND_WINDOW
-    };
-    let stall_window = if exploratory || complexity == TaskComplexity::Complex {
-        EXPLORATORY_STALL_WINDOW
-    } else {
-        DEFAULT_STALL_WINDOW
-    };
-    // When both mutating and analysis terms are present, an explicit mutation
-    // directive wins ("review and fix", "评审并修复", "清理过时测试"). Otherwise
-    // analysis wins for object descriptions such as "评审当前修改" / "review
-    // current changes".
-    let should_mutate = has_explicit_mutation_directive || has_mutating && !has_analysis;
-    let needs_workspace_evidence =
-        should_mutate || exploratory || contains_workspace_evidence_signal(&q);
-    if should_mutate {
-        TaskExecutionProfile {
-            mutates_workspace: true,
-            verification_required: true,
-            allow_factual_retry: needs_workspace_evidence,
+impl TaskExecutionProfile {
+    /// Build a profile from structured control-plane intent.
+    ///
+    /// This is the only supported path for semantic task classification.
+    /// `input`-text heuristics intentionally fail closed via
+    /// [`infer_task_execution_profile`].
+    #[must_use]
+    pub fn from_structured_intent(
+        mutates_workspace: bool,
+        exploratory_task: bool,
+        complexity: TaskComplexity,
+        allow_factual_retry: bool,
+    ) -> Self {
+        let stall_window = if exploratory_task || complexity == TaskComplexity::Complex {
+            EXPLORATORY_STALL_WINDOW
+        } else {
+            DEFAULT_STALL_WINDOW
+        };
+        let exploration_round_window = if exploratory_task {
+            EXPLORATORY_ROUND_WINDOW
+        } else {
+            DEFAULT_EXPLORATION_ROUND_WINDOW
+        };
+        Self {
+            mutates_workspace,
+            verification_required: mutates_workspace,
+            allow_factual_retry,
             exploration_round_window,
             stall_window,
             complexity,
-            exploratory_task: exploratory,
-            agentic_turn_budget: default_agentic_turn_budget(true, exploratory, complexity),
-        }
-    } else if has_analysis {
-        TaskExecutionProfile {
-            mutates_workspace: false,
-            verification_required: false,
-            allow_factual_retry: needs_workspace_evidence,
-            exploration_round_window,
-            stall_window,
-            complexity,
-            exploratory_task: exploratory,
-            agentic_turn_budget: default_agentic_turn_budget(false, exploratory, complexity),
-        }
-    } else {
-        TaskExecutionProfile {
-            exploration_round_window,
-            stall_window,
-            complexity,
-            exploratory_task: exploratory,
-            allow_factual_retry: needs_workspace_evidence,
-            agentic_turn_budget: default_agentic_turn_budget(false, exploratory, complexity),
-            ..TaskExecutionProfile::default()
+            exploratory_task,
+            agentic_turn_budget: default_agentic_turn_budget(
+                mutates_workspace,
+                exploratory_task,
+                complexity,
+            ),
         }
     }
+}
+
+/// Fallback profile for callers that don't yet have a structured intent.
+///
+/// Always returns `TaskExecutionProfile::default()` (standard analysis).
+/// Prefer [`TaskExecutionProfile::from_structured_intent`] for semantic
+/// classification; this exists only for call sites that haven't migrated.
+pub fn infer_task_execution_profile(_input: &str) -> TaskExecutionProfile {
+    TaskExecutionProfile::default()
 }
 
 fn default_agentic_turn_budget(
@@ -423,22 +221,6 @@ pub fn resolve_agentic_turn_budget(
 /// Cloud API returned no such session (case-insensitive substring match).
 pub fn is_session_not_found_error(error: &str) -> bool {
     error.to_lowercase().contains("session not found")
-}
-
-/// Detect requests that are likely to mutate the workspace and therefore
-/// benefit from verification stop hooks before the agent completes.
-///
-/// The default should be conservative in the user's favor: read-only tasks
-/// (review, explain, search, summarize, inspect) should not be forced through
-/// an extra verification round, while implementation/editing tasks should.
-pub fn looks_like_mutating_task(input: &str) -> bool {
-    let active_input = active_user_task_text(input);
-    let q = active_input.to_lowercase();
-    let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
-    let has_read_only = contains_any_keyword(&q, ANALYSIS_TERMS);
-    let has_explicit_mutation_directive =
-        contains_any_keyword(&q, EXPLICIT_MUTATION_DIRECTIVE_TERMS);
-    has_explicit_mutation_directive || has_mutating && !has_read_only
 }
 
 pub fn should_force_factual_tool_retry(
@@ -583,67 +365,66 @@ mod tests {
     use crate::interaction_types::TurnInteractionMode;
 
     #[test]
-    fn mutating_task_detection_distinguishes_read_only_flows() {
-        assert!(!looks_like_mutating_task("review 最新的commit"));
-        assert!(!looks_like_mutating_task(
-            "what changed in the latest commit?"
-        ));
-        assert!(!looks_like_mutating_task("explain this diff"));
-        assert!(!looks_like_mutating_task("评审当前修改"));
-        assert!(!looks_like_mutating_task("审查修改"));
-        assert!(!looks_like_mutating_task("看一下修改"));
-        // Pure mutating without analysis context
-        assert!(looks_like_mutating_task("implement the feature"));
-        assert!(looks_like_mutating_task("fix the bug"));
-        assert!(looks_like_mutating_task("修复这个问题"));
-        // Mixed review + explicit mutation should still get a mutating profile.
-        assert!(looks_like_mutating_task(
-            "review the latest commit and fix any issues"
-        ));
-        assert!(looks_like_mutating_task(
-            "review the current changes and fix any issues"
-        ));
-        assert!(looks_like_mutating_task(
-            "多角度review这个分支changes，清理过时测试"
-        ));
+    fn natural_language_profile_inference_fails_closed() {
+        let cases = [
+            "implement the feature",
+            "fix the bug",
+            "修复这个问题",
+            "review the current changes and fix any issues",
+            "当前的实现，能够想起来吗？",
+        ];
+        for input in cases {
+            assert_eq!(
+                infer_task_execution_profile(input),
+                TaskExecutionProfile::default(),
+                "natural-language text must not produce execution policy: {input}"
+            );
+        }
     }
 
     #[test]
-    fn task_execution_profile_scales_budget_for_implementation_and_exploration() {
-        let review = infer_task_execution_profile("review 最新的commit");
-        assert!(!review.mutates_workspace);
-        assert!(!review.verification_required);
-        assert!(review.allow_factual_retry);
-        assert_eq!(review.stall_window, DEFAULT_STALL_WINDOW);
-
-        let implementation = infer_task_execution_profile("implement the feature");
+    fn structured_profiles_scale_budget_for_mutation_and_exploration() {
+        let standard = TaskExecutionProfile::default();
+        let implementation = TaskExecutionProfile::from_structured_intent(
+            true,
+            false,
+            TaskComplexity::Standard,
+            true,
+        );
         assert!(implementation.mutates_workspace);
         assert!(implementation.verification_required);
         assert!(implementation.allow_factual_retry);
         assert!(
             implementation.agentic_turn_budget.initial_turns
-                > review.agentic_turn_budget.initial_turns
+                > standard.agentic_turn_budget.initial_turns
         );
         assert!(
             implementation.agentic_turn_budget.hard_turn_limit
-                > review.agentic_turn_budget.hard_turn_limit
+                > standard.agentic_turn_budget.hard_turn_limit
         );
 
-        let exploratory =
-            infer_task_execution_profile("explore the codebase and investigate the root cause");
-        assert!(exploratory.exploration_round_window > review.exploration_round_window);
-        assert!(
-            exploratory.agentic_turn_budget.hard_turn_limit
-                >= implementation.agentic_turn_budget.hard_turn_limit
+        let exploratory = TaskExecutionProfile::from_structured_intent(
+            false,
+            true,
+            TaskComplexity::Complex,
+            true,
         );
+        assert!(exploratory.exploration_round_window > standard.exploration_round_window);
+        assert!(exploratory.stall_window > standard.stall_window);
         assert!(exploratory.exploratory_task);
         assert!(exploratory.allow_factual_retry);
     }
 
     #[test]
     fn resolve_agentic_turn_budget_clamps_override_to_runtime_ceiling() {
+        let profile = TaskExecutionProfile::from_structured_intent(
+            true,
+            false,
+            TaskComplexity::Standard,
+            true,
+        );
         let budget = resolve_agentic_turn_budget(
-            infer_task_execution_profile("implement the feature"),
+            profile,
             12,
             Some(AgenticTurnBudgetOverride {
                 initial_turns: Some(20),
@@ -653,75 +434,6 @@ mod tests {
         assert_eq!(budget.initial_turns, 12);
         assert_eq!(budget.hard_turn_limit, 12);
         assert_eq!(budget.max_extensions, 0);
-    }
-
-    #[test]
-    fn chinese_review_queries_get_analysis_profile() {
-        // Root cause bug: "评审当前修改" was classified as mutating because
-        // single-char "修" in MUTATING_TERMS matched the "修" in "修改".
-        // Now fixed: "修" removed from MUTATING_TERMS; "评审" added to ANALYSIS_TERMS.
-        let cases = [
-            "评审当前修改",
-            "审查修改",
-            "审阅代码修改",
-            "看一下修改",
-            "看改动",
-            "看看变更",
-        ];
-        for input in &cases {
-            let profile = infer_task_execution_profile(input);
-            assert!(
-                !profile.verification_required,
-                "{input:?} should NOT require verification"
-            );
-            assert!(
-                !profile.mutates_workspace,
-                "{input:?} should NOT be classified as mutating"
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_mutation_wins_over_analysis_when_both_present() {
-        // "review and fix" is a mixed request: inspect first, then mutate.
-        let profile = infer_task_execution_profile("review the code and fix issues");
-        assert!(profile.verification_required);
-        assert!(profile.mutates_workspace);
-        let profile = infer_task_execution_profile("多角度review这个分支changes，清理过时测试");
-        assert!(profile.verification_required);
-        assert!(profile.mutates_workspace);
-        // Describing changes as the object of review remains read-only.
-        let profile = infer_task_execution_profile("review current changes");
-        assert!(!profile.verification_required);
-        // Pure mutating still works
-        let profile = infer_task_execution_profile("fix the compilation error");
-        assert!(profile.verification_required);
-    }
-
-    #[test]
-    fn runtime_scaffolding_does_not_pollute_task_profile() {
-        let review_with_runtime_tail = concat!(
-            "review uncommitted changes\n\n",
-            "<system-reminder>\n",
-            "last assistant state mentioned fix/apply/edit/cleanup many times\n",
-            "</system-reminder>"
-        );
-        let profile = infer_task_execution_profile(review_with_runtime_tail);
-        assert!(
-            !profile.mutates_workspace,
-            "runtime scaffolding must not turn a review request into mutation"
-        );
-        assert!(!profile.verification_required);
-
-        let fix_with_runtime_tail = concat!(
-            "fix the broken auth check\n\n",
-            "<system-reminder>\n",
-            "last assistant state was review-only\n",
-            "</system-reminder>"
-        );
-        let profile = infer_task_execution_profile(fix_with_runtime_tail);
-        assert!(profile.mutates_workspace);
-        assert!(profile.verification_required);
     }
 
     #[test]
@@ -753,25 +465,6 @@ mod tests {
         assert!(!should_force_factual_tool_retry(
             explicit, "hello", &none, 0, true, &policy,
         ));
-    }
-
-    #[test]
-    fn heuristic_profiles_enable_factual_retry_only_for_workspace_evidence() {
-        let profile = infer_task_execution_profile("review local changes");
-        assert!(profile.allow_factual_retry);
-        let profile2 = infer_task_execution_profile("explain this function");
-        assert!(profile2.allow_factual_retry);
-        let profile3 = infer_task_execution_profile("implement the feature");
-        assert!(profile3.allow_factual_retry);
-        let profile4 =
-            infer_task_execution_profile("what do 59% and 117k mean in the status line?");
-        assert!(!profile4.allow_factual_retry);
-        let profile5 = infer_task_execution_profile("what is Rust?");
-        assert!(!profile5.allow_factual_retry);
-        let profile6 = infer_task_execution_profile("explain recursion conceptually");
-        assert!(!profile6.allow_factual_retry);
-        let profile7 = infer_task_execution_profile("explain prompt profile settings");
-        assert!(!profile7.allow_factual_retry);
     }
 
     #[test]

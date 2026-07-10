@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use astra_skills::health_ranking::{HealthRankingInputs, rank_multiplier};
 use astra_skills::providers::mcp::McpSkillProvider;
 use astra_skills::quality::SkillQualityTracker;
+use astra_turn_core::section_types::estimate_text_tokens;
 
 use super::activation::ConditionalSkillTracker;
 use super::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
@@ -625,7 +626,7 @@ mod tests {
                 .map(|(m, instr)| LoadedSkill {
                     manifest: m.clone(),
                     instructions: instr.clone(),
-                    instruction_tokens: (instr.len() as u32) / 4,
+                    instruction_tokens: estimate_text_tokens(instr),
                     resources: None,
                     skill_dir: None,
                 })
@@ -798,7 +799,7 @@ mod tests {
                 .map(|(m, instr)| LoadedSkill {
                     manifest: m.clone(),
                     instructions: instr.clone(),
-                    instruction_tokens: (instr.len() as u32) / 4,
+                    instruction_tokens: estimate_text_tokens(instr),
                     resources: None,
                     skill_dir: None,
                 })

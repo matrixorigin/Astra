@@ -8737,15 +8737,17 @@ mod resume_tests {
 
         let finalized = crate::cli::session::session_input::finalize_effective_line(
             "continue".into(),
+            "continue".into(),
             None,
             &mut state,
         )
         .await;
 
         assert!(
-            !finalized.contains("The task tools haven't been used recently."),
-            "new forked child should not immediately inherit parent reminder pressure: {finalized}"
+            finalized.runtime_volatile_texts.is_empty(),
+            "new forked child should not immediately inherit parent reminder pressure: {finalized:?}"
         );
+        assert_eq!(finalized.user_message, "continue");
         assert_eq!(state.turns_since_task_use, 1);
         assert_eq!(state.turns_since_task_reminder, 1);
     }

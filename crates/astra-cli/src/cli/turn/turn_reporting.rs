@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
-use astra_runtime::pipeline::evaluation::{EvalSignal, TurnEvaluation};
+use astra_runtime::pipeline::evaluation::TurnEvaluation;
 use astra_services::session_journal;
 use crossterm::style::Stylize;
 
@@ -38,7 +38,8 @@ pub(crate) fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord
     let mut files = Vec::new();
     let mut failed = Vec::new();
     for record in records {
-        if let Some(file_path) = record.file_path.as_deref()
+        if record.ok
+            && let Some(file_path) = record.file_path.as_deref()
             && !files.contains(&file_path)
         {
             files.push(file_path);
@@ -175,7 +176,9 @@ pub(crate) fn print_turn_status_line(
     if let Some(notice) = interruption_status_notice(result) {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
-    if let Some(notice) = evaluation.and_then(turn_evaluation_status_notice) {
+    if let Some(notice) =
+        evaluation.and_then(astra_runtime::pipeline::evaluation::turn_evaluation_status_notice)
+    {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
     print_context_window_warning(result.budget_pressure);
@@ -184,55 +187,6 @@ pub(crate) fn print_turn_status_line(
         .map(|(columns, _)| columns as usize)
         .unwrap_or(80);
     eprintln!("{}", "─".repeat(width.min(72)).dim());
-}
-
-pub(crate) fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
-    let outcome_failures = eval
-        .signals
-        .iter()
-        .filter_map(|signal| match signal {
-            EvalSignal::ToolOutcomeFailure { class, count } => Some(format!("{class} x{count}")),
-            EvalSignal::BlockedToolCall { count } => Some(format!("blocked_tool x{count}")),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if !outcome_failures.is_empty() {
-        return Some(format!(
-            "Turn finished with unresolved tool/runtime failure(s): {}. Treat the final answer as incomplete until validation passes or the provider surface changes.",
-            outcome_failures.join(", ")
-        ));
-    }
-
-    if eval.success {
-        return None;
-    }
-
-    let reason = eval
-        .signals
-        .iter()
-        .find_map(turn_evaluation_signal_reason)
-        .unwrap_or("turn evaluation failed");
-    Some(format!(
-        "Turn evaluation marked this turn incomplete (quality {:.2}): {reason}.",
-        eval.quality
-    ))
-}
-
-fn turn_evaluation_signal_reason(signal: &EvalSignal) -> Option<&'static str> {
-    match signal {
-        EvalSignal::ToolErrorRate(rate) if *rate >= 0.5 => Some("tool error rate is high"),
-        EvalSignal::StallDetected => Some("stall/divergence was detected"),
-        EvalSignal::VerdictWarning => Some("TurnGuard emitted a warning"),
-        EvalSignal::NoToolsNeeded => Some("needed tools were not used"),
-        EvalSignal::BlockedToolCall { .. } => Some("tool calls were blocked before execution"),
-        EvalSignal::HighCostLowYield { .. } => Some("high-cost exploration produced low yield"),
-        EvalSignal::LlmRoundChurn { .. } => Some("too many LLM rounds were used"),
-        EvalSignal::PromptGrowthChurn { .. } => Some("prompt size ballooned across rounds"),
-        EvalSignal::RedundantValidationRetries(_) => Some("validation was retried redundantly"),
-        EvalSignal::RedundantOverlappingReads(_) => Some("content was re-read redundantly"),
-        EvalSignal::ExplorationFamilyChurn { .. } => Some("exploration stayed in one tool family"),
-        _ => None,
-    }
 }
 
 pub(crate) fn interruption_status_notice(result: &StreamResult) -> Option<String> {
@@ -296,9 +250,12 @@ pub(crate) fn print_context_window_warning(budget_pressure: f64) {
 mod tests {
     use super::{
         build_history_text, build_turn_tool_summary, cache_hit_percentage, compact_token_count,
-        interruption_status_notice, turn_evaluation_status_notice,
+        interruption_status_notice,
     };
-    use astra_runtime::pipeline::evaluation::{EvalSignal, EvaluationThresholds, TurnEvaluation};
+    use astra_runtime::pipeline::evaluation::{
+        EvalSignal, EvaluationThresholds, TurnEvaluation, build_turn_evaluation_annotated_text,
+        turn_evaluation_status_notice,
+    };
     use astra_services::session_journal;
 
     fn make_record(
@@ -346,6 +303,42 @@ mod tests {
     }
 
     #[test]
+    fn turn_evaluation_annotation_marks_incomplete_prompt_history() {
+        let eval = TurnEvaluation {
+            success: false,
+            quality: 0.0,
+            confidence: 0.9,
+            signals: vec![EvalSignal::LlmRoundChurn {
+                rounds: 40,
+                prompt_tokens: 94_900,
+            }],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        let annotated = build_turn_evaluation_annotated_text("完成。", &eval);
+
+        assert!(annotated.starts_with("完成。"));
+        assert!(annotated.contains("[Turn evaluation: incomplete."));
+        assert!(annotated.contains("too many LLM rounds"));
+    }
+
+    #[test]
+    fn turn_evaluation_annotation_leaves_successful_turn_unchanged() {
+        let eval = TurnEvaluation {
+            success: true,
+            quality: 0.8,
+            confidence: 0.7,
+            signals: vec![EvalSignal::AllToolsHealthy],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        assert_eq!(
+            build_turn_evaluation_annotated_text("Done.", &eval),
+            "Done."
+        );
+    }
+
+    #[test]
     fn interruption_status_notice_prefers_user_message() {
         let mut result = crate::tests::stub_stream_result("");
         result.interruption = Some(serde_json::json!({
@@ -380,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_summary_lists_files_touched() {
+    fn tool_summary_lists_successful_files_touched() {
         let records = vec![
             make_record("read_file", true, Some("src/main.rs")),
             make_record("str_replace", true, Some("src/lib.rs")),
@@ -394,19 +387,41 @@ mod tests {
     }
 
     #[test]
-    fn tool_summary_includes_failures_and_caps_files() {
+    fn tool_summary_includes_failures_without_failed_paths() {
+        let records = vec![
+            make_record("read_file", false, Some("rust/astra/src/bridge/mod.rs")),
+            make_record(
+                "str_replace",
+                true,
+                Some("crates/runtime/src/bridge/mod.rs"),
+            ),
+        ];
+
+        let summary = build_turn_tool_summary(&records);
+        assert!(summary.contains("files: crates/runtime/src/bridge/mod.rs"));
+        assert!(summary.contains("failed: read_file"));
+        assert!(
+            !summary.contains("rust/astra"),
+            "failed file paths must not be persisted into prompt-facing history: {summary}"
+        );
+    }
+
+    #[test]
+    fn tool_summary_caps_successful_files() {
         let mut records = Vec::new();
         for idx in 0..18 {
             records.push(make_record(
-                if idx % 2 == 0 { "read_file" } else { "edit" },
-                idx % 5 != 0,
+                "read_file",
+                true,
                 Some(&format!("src/file_{idx}.rs")),
             ));
         }
+        records.push(make_record("edit", false, Some("rust/old/path.rs")));
 
         let summary = build_turn_tool_summary(&records);
-        assert!(summary.contains("failed: read_file, edit"));
+        assert!(summary.contains("failed: edit"));
         assert!(summary.contains("(+3 more)"));
+        assert!(!summary.contains("rust/old/path.rs"));
     }
 
     #[test]
@@ -431,7 +446,11 @@ mod tests {
             "summary should be compact, got {} bytes: {summary}",
             summary.len()
         );
-        assert!(summary.contains("src/module_0/file_0.rs"));
+        assert!(summary.contains("src/module_0/file_1.rs"));
+        assert!(
+            !summary.contains("src/module_0/file_0.rs"),
+            "failed file paths must not be retained: {summary}"
+        );
         assert!(
             summary.contains("more)"),
             "should truncate beyond 15 files: {summary}"

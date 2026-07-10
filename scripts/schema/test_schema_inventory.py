@@ -32,7 +32,7 @@ class SchemaInventoryTest(unittest.TestCase):
         ]
         self.assertEqual(
             len(core_tables),
-            88,
+            89,
             "core storage DDL count changed; update the schema plan and inventory baseline",
         )
 
@@ -885,11 +885,16 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
         self.assertIn("consumer-scoped delivery state", row["merge_guidance"])
 
-    def test_edge_pending_dispatch_uses_owner_request_identity(self) -> None:
+    def test_edge_pending_dispatch_uses_turn_scoped_request_identity(self) -> None:
         row = self.tables["edge_pending_dispatch"]
-        self.assertEqual(row["primary_key"], ["user_id", "request_id"])
+        self.assertEqual(
+            row["primary_key"],
+            ["user_id", "session_id", "run_id", "turn_chain_id", "request_id"],
+        )
         self.assertEqual(row["auto_increment_columns"], [])
         self.assertEqual(row["auto_increment_hotspot_risk"], "not_applicable")
+        self.assertIn("turn-scoped dispatch lookup", row["primary_query"])
+        self.assertIn("turn_chain_id", row["primary_query"])
         self.assertIn("edge poll", row["primary_query"])
 
     def test_context_manifest_items_uses_manifest_order_identity(self) -> None:

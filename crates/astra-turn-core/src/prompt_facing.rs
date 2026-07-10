@@ -2,8 +2,9 @@
 //!
 //! Runtime state may contain provider tool-call frames, tool outputs, cache
 //! markers, reasoning-only assistant frames, and compaction boundaries. Those
-//! are execution trace, not stable cross-turn chat history. Use this module at
-//! session restore and CSL prompt-materialization boundaries.
+//! are execution trace, not stable prompt input. Use this module only at
+//! prompt/session-display projection boundaries; canonical stores such as CSL
+//! must retain raw runtime history.
 
 use crate::conversation_log::SessionStateCompact;
 use serde_json::{Value, json};
@@ -451,6 +452,50 @@ mod tests {
                 json!({"role": "assistant", "content": "Continuing."}),
             ]
         );
+    }
+
+    #[test]
+    fn resume_scaffolding_and_skill_loaded_trace_do_not_reach_prompt_history() {
+        let messages = vec![
+            json!({"role": "user", "content": "我说过的所有话，还有回复\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "skill-auto-route-analyze-session",
+                    "type": "function",
+                    "function": {
+                        "name": "skill",
+                        "arguments": "{\"skill_name\":\"analyze-session\",\"task\":\"我说过的所有话，还有回复\"}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "skill-auto-route-analyze-session",
+                "content": "<skill-loaded name=\"analyze-session\"/>\nUse this workflow."
+            }),
+            json!({"role": "assistant", "content": "你问过我总结这段会话。"}),
+        ];
+
+        let got = sanitize_prompt_facing_messages(messages);
+        let joined = got
+            .iter()
+            .filter_map(|msg| msg["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            got,
+            vec![
+                json!({"role": "user", "content": "我说过的所有话，还有回复"}),
+                json!({"role": "assistant", "content": "你问过我总结这段会话。"}),
+            ]
+        );
+        assert!(!joined.contains("<system-reminder>"));
+        assert!(!joined.contains("[session-resume:v1]"));
+        assert!(!joined.contains("<skill-loaded"));
+        assert!(!joined.contains("skill-auto-route"));
     }
 
     #[test]

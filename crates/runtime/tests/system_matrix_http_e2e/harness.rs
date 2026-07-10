@@ -421,6 +421,48 @@ pub async fn post_json_with_headers(
     (status, json)
 }
 
+pub fn tool_result_payload(parts: astra_thin_client::ToolResultRequestParts) -> Value {
+    serde_json::to_value(astra_thin_client::ToolResultRequest::new_with_hash(parts))
+        .expect("tool result payload serializes")
+}
+
+pub fn maybe_tool_result_payload_from_sse(
+    raw_sse: &str,
+    request_id: &str,
+    edge_agent_id: &str,
+    status: &str,
+    output: &str,
+    duration_ms: u64,
+) -> Option<Value> {
+    let event = raw_sse
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find(|event| {
+            event.get("type").and_then(Value::as_str) == Some("tool_request")
+                && event.get("request_id").and_then(Value::as_str) == Some(request_id)
+        })?;
+    let field = |name: &str| {
+        event
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("tool_request {request_id} missing {name}"))
+    };
+    Some(tool_result_payload(
+        astra_thin_client::ToolResultRequestParts {
+            session_id: field("session_id").to_string(),
+            run_id: field("run_id").to_string(),
+            turn_chain_id: field("turn_chain_id").to_string(),
+            request_id: request_id.to_string(),
+            edge_agent_id: edge_agent_id.to_string(),
+            status: status.to_string(),
+            output: output.to_string(),
+            duration_ms,
+            tool_result_fields: None,
+        },
+    ))
+}
+
 pub fn seeded_model_name(ctx: &MatrixE2eCtx) -> String {
     format!("mock-{}", ctx.suffix)
 }

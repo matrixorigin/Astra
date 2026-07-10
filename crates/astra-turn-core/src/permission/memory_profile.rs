@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn cargo_build_cd_wrapper_uses_command_family_without_block() {
         let args = serde_json::json!({
-            "command": "cd /home/xupeng/github/astra/rust && cargo build -p astra-turn-core -p astra-cli"
+            "command": "cd /home/xupeng/github/astra && cargo build -p astra-turn-core -p astra-cli"
         });
         let profile = permission_memory_profile("bash", &args);
         assert_eq!(

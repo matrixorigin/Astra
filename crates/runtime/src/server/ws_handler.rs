@@ -138,6 +138,8 @@ fn should_echo_close_frame(message: Option<&Result<Message, axum::Error>>) -> bo
 pub(super) struct WsChatMessage {
     content: String,
     #[serde(default)]
+    user_intent: Option<String>,
+    #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
     agent_id: Option<String>,
@@ -582,6 +584,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                             Ok(WsClientMessage::ChatMessage(message)) => {
                                 let WsChatMessage {
                                     content,
+                                    user_intent,
                                     session_id,
                                     agent_id,
                                     selected_model,
@@ -601,6 +604,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     state,
                                     &mut conn,
                                     &content,
+                                    user_intent,
                                     session_id,
                                     agent_id,
                                     selected_model,
@@ -715,6 +719,7 @@ async fn handle_chat_message(
     state: &AppState,
     conn: &mut WsConnection,
     content: &str,
+    user_intent: Option<String>,
     requested_session_id: Option<String>,
     agent_id: Option<String>,
     selected_model: astra_services::runs::SelectedModelRequest,
@@ -739,6 +744,7 @@ async fn handle_chat_message(
     let request_session_id = chat_request_session_id(conn, requested_session_id);
     let mut request = build_ws_chat_request(
         content,
+        user_intent,
         request_session_id,
         agent_id,
         selected_model,
@@ -1376,6 +1382,7 @@ fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>>
 
 fn build_ws_chat_request(
     content: &str,
+    user_intent: Option<String>,
     session_id: Option<String>,
     agent_id: Option<String>,
     selected_model: astra_services::runs::SelectedModelRequest,
@@ -1393,6 +1400,7 @@ fn build_ws_chat_request(
     let model = Some(selected_model.model.clone());
     astra_services::runs::ChatRequestData {
         message: content.to_string(),
+        user_intent,
         parts: Vec::new(),
         attachments: Vec::new(),
         runtime_system_prompt: None,
@@ -2680,12 +2688,13 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "selected_model": {"model": "gpt-5.4"}, "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_skill_sources": ["database"], "allow_tools": ["bash"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
+        let json = r#"{"type": "message", "content": "hello", "user_intent": "pure hello", "session_id": "s1", "agent_id": "agent-1", "selected_model": {"model": "gpt-5.4"}, "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "allow_skills": ["plan"], "allow_skill_sources": ["database"], "allow_tools": ["bash"], "execution_budget": {"initial_turns": 3, "hard_turn_limit": 7}, "explain": true, "interaction_mode": "auto", "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage(message) => {
                 let WsChatMessage {
                     content,
+                    user_intent,
                     session_id,
                     agent_id,
                     selected_model,
@@ -2701,6 +2710,7 @@ mod tests {
                     is_plan_subtask,
                 } = *message;
                 assert_eq!(content, "hello");
+                assert_eq!(user_intent.as_deref(), Some("pure hello"));
                 assert_eq!(session_id, Some("s1".into()));
                 assert_eq!(agent_id.as_deref(), Some("agent-1"));
                 assert_eq!(selected_model.model, "gpt-5.4");
@@ -2866,6 +2876,7 @@ mod tests {
     fn ws_chat_request_preserves_runtime_request_fields() {
         let request = build_ws_chat_request(
             "hello",
+            Some("pure hello".into()),
             Some("session-1".into()),
             Some("agent-1".into()),
             astra_services::runs::SelectedModelRequest {
@@ -2896,6 +2907,7 @@ mod tests {
         );
 
         assert_eq!(request.message, "hello");
+        assert_eq!(request.user_intent.as_deref(), Some("pure hello"));
         assert_eq!(request.session_id.as_deref(), Some("session-1"));
         assert_eq!(request.agent_id.as_deref(), Some("agent-1"));
         assert_eq!(request.model.as_deref(), Some("gpt-5.4"));

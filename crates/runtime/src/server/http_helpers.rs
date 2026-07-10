@@ -41,6 +41,19 @@ pub(super) fn sse_error_response_from_error(status: StatusCode, error: ErrorResp
             serde_json::Value::String(error_code),
         );
     }
+    if let Some(request_id) = error.request_id
+        && let Some(obj) = event.as_object_mut()
+    {
+        obj.insert(
+            "request_id".to_string(),
+            serde_json::Value::String(request_id),
+        );
+    }
+    if let Some(metadata) = error.metadata
+        && let Some(obj) = event.as_object_mut()
+    {
+        obj.insert("metadata".to_string(), metadata);
+    }
     sse_json_response(vec![event])
 }
 
@@ -240,6 +253,29 @@ mod tests {
     #[test]
     fn sse_retryable_validation_error_is_false() {
         assert!(!status_to_sse_retryable(StatusCode::UNPROCESSABLE_ENTITY));
+    }
+
+    #[tokio::test]
+    async fn sse_error_response_from_error_preserves_machine_fields() {
+        let error = ErrorResponse::new("stale")
+            .with_error_code("bridge_session_turn_stale")
+            .with_request_id("req-1")
+            .with_metadata(serde_json::json!({"expected_session_turn": 2}));
+        let response = sse_error_response_from_error(StatusCode::CONFLICT, error);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        let data = text
+            .strip_prefix("data: ")
+            .and_then(|value| value.strip_suffix("\n\n"))
+            .expect("single SSE data event");
+        let event: serde_json::Value = serde_json::from_str(data).expect("json");
+        assert_eq!(event["type"], "error");
+        assert_eq!(event["message"], "stale");
+        assert_eq!(event["error_code"], "bridge_session_turn_stale");
+        assert_eq!(event["request_id"], "req-1");
+        assert_eq!(event["metadata"]["expected_session_turn"], 2);
     }
 
     #[tokio::test]

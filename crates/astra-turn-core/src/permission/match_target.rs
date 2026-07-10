@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn default_bash_target_uses_command_family_not_broad_tool_or_cd_wrapper() {
         let args = serde_json::json!({
-            "command": "cd /home/xupeng/github/astra/rust && cargo test -p astra-cli -- --nocapture"
+            "command": "cd /home/xupeng/github/astra && cargo test -p astra-cli -- --nocapture"
         });
         let target = default_match_target("bash", &args);
         assert_eq!(target, AllowMatchTarget::Prefix("cargo test".to_string()));

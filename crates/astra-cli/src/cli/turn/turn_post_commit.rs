@@ -68,8 +68,6 @@ async fn persist_turn_csl_snapshot(
         .map(|manager| manager.last_session_state().clone())
         .unwrap_or_default();
     let session_state = build_full_session_state_compact(state, csl_checkpoint_fields, &prev_state);
-    let final_messages =
-        astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(final_messages);
     if let Some(manager) = state.csl_manager.as_mut()
         && let Err(error) = manager
             .persist_turn(turn, &final_messages, &session_state)
@@ -173,13 +171,13 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn csl_persist_writes_prompt_facing_messages_only() {
+    async fn csl_persist_writes_raw_canonical_messages() {
         use astra_turn_core::conversation_log::{
             CslStore, file_store::FileCslStore, manager::CslManager,
         };
 
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let session_id = format!("csl-prompt-facing-{}", uuid::Uuid::new_v4());
+        let session_id = format!("csl-canonical-{}", uuid::Uuid::new_v4());
         let store = std::sync::Arc::new(FileCslStore::new(
             astra_services::session_journal::local_owner_sessions_dir(),
         ));
@@ -203,17 +201,13 @@ mod tests {
 
         let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
         let mat = astra_turn_core::conversation_log::materialize(&entries).unwrap();
-        assert_eq!(mat.messages.len(), 3);
-        assert!(
-            mat.messages
-                .iter()
-                .all(|msg| msg["role"] != "tool" && msg.get("reasoning_content").is_none())
-        );
-        assert!(
-            mat.messages
-                .iter()
-                .all(|msg| !msg["content"].as_str().unwrap_or("").contains("old review"))
-        );
+        assert_eq!(mat.messages.len(), 6);
+        assert_eq!(mat.messages[0]["content"], "old review");
+        assert_eq!(mat.messages[2]["content"], "不要review啊！");
+        assert_eq!(mat.messages[3]["reasoning_content"], "trace");
+        assert_eq!(mat.messages[4]["role"], "tool");
+        assert_eq!(mat.messages[4]["content"], "tool output");
+        assert_eq!(mat.messages[5]["content"], "ok");
     }
 
     #[tokio::test]

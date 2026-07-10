@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::super::tool_transport_plan::{EdgeBoundExecutionPlan, edge_executor_id};
+use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow};
 
 struct CountingLocalTransport {
     calls: AtomicUsize,
@@ -369,7 +370,7 @@ impl StaticEdgeDispatch {
         }
     }
 
-    fn legacy_failed_result() -> Self {
+    fn failed_result() -> Self {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
@@ -383,9 +384,8 @@ impl StaticEdgeDispatch {
 impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
     async fn insert_dispatch(
         &self,
-        _user_id: &str,
+        _identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        _request_id: &str,
         _payload_json: &str,
     ) -> Result<(), String> {
         self.inserted_edge_agent_ids
@@ -405,8 +405,7 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
 
     async fn deliver_result(
         &self,
-        _user_id: &str,
-        _request_id: &str,
+        _identity: &EdgeDispatchIdentity,
         _edge_agent_id: &str,
         _result_json: &str,
     ) -> Result<bool, String> {
@@ -415,36 +414,40 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
 
     async fn fail_dispatch(
         &self,
-        _user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         reason: &str,
     ) -> Result<bool, String> {
         self.failed_dispatches
             .lock()
             .expect("failed dispatches lock")
-            .push((request_id.to_string(), reason.to_string()));
+            .push((identity.request_id.clone(), reason.to_string()));
         Ok(true)
     }
 
     async fn wait_result(
         &self,
-        _user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         _timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
         if !self.return_result {
             return Ok(None);
         }
         let result = astra_thin_client::ToolResultRequest::new_with_hash(
-            request_id.to_string(),
-            Some("edge-selected".to_string()),
-            self.result_status.to_string(),
-            if self.result_status == "completed" {
-                "ledger-result".to_string()
-            } else {
-                "edge dispatch expired".to_string()
+            astra_thin_client::ToolResultRequestParts {
+                session_id: identity.session_id.clone(),
+                run_id: identity.run_id.clone(),
+                turn_chain_id: identity.turn_chain_id.clone(),
+                request_id: identity.request_id.clone(),
+                edge_agent_id: "edge-selected".to_string(),
+                status: self.result_status.to_string(),
+                output: if self.result_status == "completed" {
+                    "ledger-result".to_string()
+                } else {
+                    "edge dispatch expired".to_string()
+                },
+                duration_ms: 12,
+                tool_result_fields: None,
             },
-            12,
         );
         serde_json::to_string(&result)
             .map(Some)
@@ -476,9 +479,8 @@ impl PendingEdgeDispatch {
 impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
     async fn insert_dispatch(
         &self,
-        _user_id: &str,
+        _identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        _request_id: &str,
         _payload_json: &str,
     ) -> Result<(), String> {
         self.inserted_edge_agent_ids
@@ -498,8 +500,7 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
 
     async fn deliver_result(
         &self,
-        _user_id: &str,
-        _request_id: &str,
+        _identity: &EdgeDispatchIdentity,
         _edge_agent_id: &str,
         _result_json: &str,
     ) -> Result<bool, String> {
@@ -508,21 +509,19 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
 
     async fn fail_dispatch(
         &self,
-        _user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         reason: &str,
     ) -> Result<bool, String> {
         self.failed_dispatches
             .lock()
             .expect("failed dispatches lock")
-            .push((request_id.to_string(), reason.to_string()));
+            .push((identity.request_id.clone(), reason.to_string()));
         Ok(true)
     }
 
     async fn wait_result(
         &self,
-        _user_id: &str,
-        _request_id: &str,
+        _identity: &EdgeDispatchIdentity,
         _timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
         let sender = self.wait_started.lock().expect("wait started lock").take();
@@ -540,9 +539,8 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
 
 #[derive(Clone, Debug)]
 struct SharedNoStickyDispatchRow {
-    user_id: String,
+    identity: EdgeDispatchIdentity,
     edge_agent_id: String,
-    request_id: String,
     payload_json: String,
     result_json: Option<String>,
     status: String,
@@ -550,7 +548,7 @@ struct SharedNoStickyDispatchRow {
 
 #[derive(Default)]
 struct SharedNoStickyEdgeDispatch {
-    rows: Mutex<HashMap<(String, String), SharedNoStickyDispatchRow>>,
+    rows: Mutex<HashMap<EdgeDispatchIdentity, SharedNoStickyDispatchRow>>,
     inserted: tokio::sync::Notify,
     terminal: tokio::sync::Notify,
 }
@@ -569,7 +567,8 @@ impl SharedNoStickyEdgeDispatch {
         self.rows
             .lock()
             .expect("shared dispatch rows")
-            .get(&(user_id.to_string(), request_id.to_string()))
+            .values()
+            .find(|row| row.identity.user_id == user_id && row.identity.request_id == request_id)
             .map(|row| row.status.clone())
     }
 }
@@ -578,17 +577,15 @@ impl SharedNoStickyEdgeDispatch {
 impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDispatch {
     async fn insert_dispatch(
         &self,
-        user_id: &str,
+        identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
-        request_id: &str,
         payload_json: &str,
     ) -> Result<(), String> {
         let mut rows = self.rows.lock().expect("shared dispatch rows");
-        rows.entry((user_id.to_string(), request_id.to_string()))
+        rows.entry(identity.clone())
             .or_insert_with(|| SharedNoStickyDispatchRow {
-                user_id: user_id.to_string(),
+                identity: identity.clone(),
                 edge_agent_id: edge_agent_id.to_string(),
-                request_id: request_id.to_string(),
                 payload_json: payload_json.to_string(),
                 result_json: None,
                 status: "pending".to_string(),
@@ -602,19 +599,22 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
         &self,
         user_id: &str,
         edge_agent_id: &str,
-    ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+    ) -> Result<Vec<EdgeDispatchRow>, String> {
         let mut rows = self.rows.lock().expect("shared dispatch rows");
         let mut claimed = Vec::new();
         for row in rows.values_mut() {
-            if row.user_id == user_id
+            if row.identity.user_id == user_id
                 && row.edge_agent_id == edge_agent_id
                 && row.status == "pending"
             {
                 row.status = "dispatched".to_string();
-                claimed.push(astra_services::multi_agent::EdgeDispatchRow {
-                    user_id: row.user_id.clone(),
+                claimed.push(EdgeDispatchRow {
+                    user_id: row.identity.user_id.clone(),
+                    session_id: row.identity.session_id.clone(),
+                    run_id: row.identity.run_id.clone(),
+                    turn_chain_id: row.identity.turn_chain_id.clone(),
                     edge_agent_id: row.edge_agent_id.clone(),
-                    request_id: row.request_id.clone(),
+                    request_id: row.identity.request_id.clone(),
                     payload_json: row.payload_json.clone(),
                     result_json: row.result_json.clone(),
                     status: row.status.clone(),
@@ -627,13 +627,12 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
 
     async fn deliver_result(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
     ) -> Result<bool, String> {
         let mut rows = self.rows.lock().expect("shared dispatch rows");
-        let Some(row) = rows.get_mut(&(user_id.to_string(), request_id.to_string())) else {
+        let Some(row) = rows.get_mut(identity) else {
             return Ok(false);
         };
         if row.edge_agent_id != edge_agent_id
@@ -650,12 +649,11 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
 
     async fn fail_dispatch(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         reason: &str,
     ) -> Result<bool, String> {
         let mut rows = self.rows.lock().expect("shared dispatch rows");
-        let Some(row) = rows.get_mut(&(user_id.to_string(), request_id.to_string())) else {
+        let Some(row) = rows.get_mut(identity) else {
             return Ok(false);
         };
         if !matches!(row.status.as_str(), "pending" | "dispatched") {
@@ -664,7 +662,10 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
         row.status = "failed".to_string();
         row.result_json = Some(
             serde_json::json!({
-                "request_id": request_id,
+                "session_id": identity.session_id,
+                "run_id": identity.run_id,
+                "turn_chain_id": identity.turn_chain_id,
+                "request_id": identity.request_id,
                 "status": "failed",
                 "output": format!("edge dispatch {reason}"),
                 "duration_ms": 0,
@@ -678,15 +679,14 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
 
     async fn wait_result(
         &self,
-        user_id: &str,
-        request_id: &str,
+        identity: &EdgeDispatchIdentity,
         timeout: std::time::Duration,
     ) -> Result<Option<String>, String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             {
                 let rows = self.rows.lock().expect("shared dispatch rows");
-                let Some(row) = rows.get(&(user_id.to_string(), request_id.to_string())) else {
+                let Some(row) = rows.get(identity) else {
                     return Ok(None);
                 };
                 if matches!(row.status.as_str(), "completed" | "failed") {
@@ -785,6 +785,7 @@ fn request(
         user_id: "user-1".to_string(),
         run_id: "run-1".to_string(),
         session_id: "session-1".to_string(),
+        turn_chain_id: "chain-1".to_string(),
         tool_call_id: "call-1".to_string(),
         tool_name: tool_name.to_string(),
         args: serde_json::json!({}),
@@ -2663,8 +2664,8 @@ async fn edge_dispatch_result_reports_edge_ledger_transport() {
 }
 
 #[tokio::test]
-async fn edge_dispatch_legacy_failed_result_reports_tool_error() {
-    let dispatch = Arc::new(StaticEdgeDispatch::legacy_failed_result());
+async fn edge_dispatch_failed_result_reports_tool_error() {
+    let dispatch = Arc::new(StaticEdgeDispatch::failed_result());
     let _local = CountingLocalTransport::new();
 
     let service = ToolExecutionService::builder()
@@ -2736,7 +2737,7 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
     });
 
     let edge_ws_pod = dispatch.clone();
-    let claimed_request_id = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+    let claimed_identity = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
         edge_ws_pod.wait_for_insert().await;
         let rows = astra_services::multi_agent::EdgeDispatchService::poll_pending(
             edge_ws_pod.as_ref(),
@@ -2750,6 +2751,7 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
         assert_eq!(row.user_id, "user-1");
         assert_eq!(row.edge_agent_id, "edge-selected");
         assert_eq!(row.status, "dispatched");
+        let identity = row.identity();
         let message: astra_server_types::edge_ws_protocol::EdgeServerMessage =
             serde_json::from_str(&row.payload_json).expect("dispatch payload should be WS message");
         match message {
@@ -2766,30 +2768,35 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
             }
             other => panic!("expected tool request payload, got {other:?}"),
         }
-        row.request_id.clone()
+        identity
     })
     .await
     .expect("edge WS pod should poll pending dispatch before timeout");
     assert_eq!(
         dispatch
-            .status_for("user-1", &claimed_request_id)
+            .status_for("user-1", &claimed_identity.request_id)
             .as_deref(),
         Some("dispatched")
     );
 
     let tool_result = astra_thin_client::ToolResultRequest::new_with_hash(
-        claimed_request_id.clone(),
-        Some("edge-selected".to_string()),
-        "completed".to_string(),
-        "no-sticky-result".to_string(),
-        9,
+        astra_thin_client::ToolResultRequestParts {
+            session_id: claimed_identity.session_id.clone(),
+            run_id: claimed_identity.run_id.clone(),
+            turn_chain_id: claimed_identity.turn_chain_id.clone(),
+            request_id: claimed_identity.request_id.clone(),
+            edge_agent_id: "edge-selected".to_string(),
+            status: "completed".to_string(),
+            output: "no-sticky-result".to_string(),
+            duration_ms: 9,
+            tool_result_fields: None,
+        },
     );
     let result_json =
         serde_json::to_string(&tool_result).expect("tool result should serialize for callback pod");
     let delivered = astra_services::multi_agent::EdgeDispatchService::deliver_result(
         dispatch.as_ref(),
-        "user-1",
-        &claimed_request_id,
+        &claimed_identity,
         "edge-selected",
         &result_json,
     )
@@ -2810,7 +2817,7 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
     assert_eq!(metadata["executor"]["executor_id"], "edge-selected");
     assert_eq!(
         dispatch
-            .status_for("user-1", &claimed_request_id)
+            .status_for("user-1", &claimed_identity.request_id)
             .as_deref(),
         Some("completed")
     );
@@ -3843,6 +3850,7 @@ fn edge_executor_id_returns_none_for_empty_id() {
         user_id: "test-user".to_string(),
         run_id: "run-1".to_string(),
         session_id: "session-1".to_string(),
+        turn_chain_id: "chain-1".to_string(),
         tool_call_id: "tc-1".to_string(),
         selected_offer: None,
         policy: ToolPolicySnapshot::default(),
@@ -3878,6 +3886,7 @@ fn edge_executor_id_rejects_whitespace_only_id() {
         user_id: "test-user".to_string(),
         run_id: "run-1".to_string(),
         session_id: "session-1".to_string(),
+        turn_chain_id: "chain-1".to_string(),
         tool_call_id: "tc-1".to_string(),
         selected_offer: None,
         policy: ToolPolicySnapshot::default(),
@@ -3913,6 +3922,7 @@ fn edge_executor_id_returns_some_for_valid_id() {
         user_id: "test-user".to_string(),
         run_id: "run-1".to_string(),
         session_id: "session-1".to_string(),
+        turn_chain_id: "chain-1".to_string(),
         tool_call_id: "tc-1".to_string(),
         selected_offer: None,
         policy: ToolPolicySnapshot::default(),
