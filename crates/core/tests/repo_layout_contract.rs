@@ -46,9 +46,27 @@ fn dockerfile_builds_from_workspace_root() {
         dockerfile.contains("WORKDIR /app"),
         "Dockerfile must build from the repository root workspace"
     );
+
+    let (_, planner_and_later) = dockerfile
+        .split_once("FROM chef AS planner")
+        .expect("Dockerfile must define the cargo-chef planner stage");
+    let (planner, builder) = planner_and_later
+        .split_once("FROM chef AS builder")
+        .expect("Dockerfile must define the cargo-chef builder stage");
+
+    for (name, stage) in [("planner", planner), ("builder", builder)] {
+        assert!(
+            stage.contains("COPY Cargo.toml Cargo.lock ./"),
+            "{name} stage must copy the root workspace manifests"
+        );
+        assert!(
+            stage.contains("COPY crates ./crates"),
+            "{name} stage must copy the root workspace crates"
+        );
+    }
     assert!(
-        dockerfile.contains("COPY . ./"),
-        "Dockerfile must copy the root workspace into cargo-chef stages"
+        !dockerfile.contains("COPY . ./"),
+        "Dockerfile must use scoped workspace copies so unrelated files do not invalidate Rust layers"
     );
     assert!(
         dockerfile.contains("COPY --from=planner /app/recipe.json recipe.json"),
