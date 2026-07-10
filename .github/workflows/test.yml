@@ -158,9 +158,13 @@ jobs:
   # Online tests use their own two-thread profile and run beside the offline
   # shards instead of waiting for an unrelated compile-only job.
   test-online:
-    name: "Test: online (DB)"
+    name: "Test: online (${{ matrix.lane }})"
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [core, integration]
     env:
       MATRIXONE_HOST: localhost
       MATRIXONE_PORT: "6001"
@@ -178,6 +182,7 @@ jobs:
       MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
       MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL }}
       MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM }}
+      ASTRA_ONLINE_LANE: ${{ matrix.lane }}
     steps:
       - uses: actions/checkout@v4
       - name: Prepare dependency env
