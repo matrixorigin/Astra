@@ -4739,7 +4739,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn session_id_captured_from_sse_accum() {
+    async fn first_streamed_session_id_binds_turn_state_and_observability_events() {
         let mut host = MockHost::new(vec![HostTurnResult {
             accum: ChatTurnSseAccum {
                 full_text: "hello".to_string(),
@@ -4759,6 +4759,20 @@ pub(crate) mod tests {
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert_eq!(state.current_session_id, Some("sess-42".to_string()));
         assert_eq!(state.current_run_id, Some("run-7".to_string()));
+        let events = state
+            .turn_event_buffer
+            .as_mut()
+            .expect("turn event buffer")
+            .drain();
+        assert!(
+            !events.is_empty(),
+            "first turn should emit observability events"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.session_id.as_deref() == Some("sess-42") })
+        );
     }
 
     // ── Headless round integration tests ────────────────────────────────────

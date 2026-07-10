@@ -1229,6 +1229,16 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
         },
     );
+    if let Some(session_id) = state.current_session_id.as_deref()
+        && let Some(buffer) = state.turn_event_buffer.as_mut()
+        && let Err(error) = buffer.bind_session_id(session_id)
+    {
+        tracing::warn!(
+            session_id,
+            error = %error,
+            "could not bind streamed session identity to first-round observability events"
+        );
+    }
 
     let response_guard_blocked = record_response_guard_blocked_interruption_if_needed(state);
 

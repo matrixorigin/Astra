@@ -298,7 +298,7 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
     clear_panic_guard();
 }
 
-fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
+pub(crate) fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
     let estimated_tokens = state
         .total_prompt_tokens
         .saturating_add(state.total_cache_read_tokens)

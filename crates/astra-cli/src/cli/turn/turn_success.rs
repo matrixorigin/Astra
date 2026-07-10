@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use astra_runtime::pipeline::evaluation::build_turn_evaluation_annotated_text;
 use astra_turn_core::conversation_log::manager::CslManager;
 
 use super::turn_commit::TurnCommitOutcome;
@@ -270,7 +269,6 @@ fn apply_turn_success_sync(
     let recent_tools = recent_tools_after_successful_turn(&state.recent_tools, &result);
     let learning_snap =
         analyze_chat_turn_learning(&latest_user_input, state.turn, &recent_tools, &result);
-    result.full_text = build_turn_evaluation_annotated_text(&result.full_text, &learning_snap.eval);
     state.last_response = Some(result.full_text.clone());
     state.history.push((
         effective_user_input.clone(),
@@ -418,7 +416,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn apply_turn_success_persists_incomplete_evaluation_notice() {
+    fn apply_turn_success_keeps_evaluation_out_of_canonical_history() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let mut state = SessionState::default();
         let mut result = crate::tests::stub_stream_result_with_records(
@@ -443,20 +441,20 @@ mod tests {
         );
 
         let last_response = state.last_response.as_deref().unwrap_or_default();
-        assert!(last_response.contains("[Turn evaluation: incomplete."));
-        assert!(last_response.contains("tool error rate is high"));
-        assert!(!last_response.contains("obsolete/workspace/src/lib.rs"));
+        assert_eq!(last_response, "Done.");
 
         let history_text = state
             .history
             .last()
             .map(|(_, assistant)| assistant.as_str())
             .unwrap_or_default();
-        assert!(history_text.contains("[Turn evaluation: incomplete."));
-        assert!(history_text.contains("failed: read_file"));
+        assert_eq!(
+            history_text, "Done.\n\n[Turn context: failed: read_file | tool_calls: 1]",
+            "canonical history should contain only the assistant response and the structured tool projection"
+        );
         assert!(
-            !history_text.contains("obsolete/workspace/src/lib.rs"),
-            "failed paths must not be promoted into prompt-facing history: {history_text}"
+            state.latest_turn_quality_feedback.is_none(),
+            "turn-finalization may consume transient quality feedback, but it must never serialize it into canonical history"
         );
     }
 

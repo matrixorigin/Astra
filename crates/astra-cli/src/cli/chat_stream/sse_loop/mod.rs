@@ -311,6 +311,11 @@ pub(crate) async fn stream_chat_sse(
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
     let current_session_turn = p.turn_index;
+    // Only callers that provide a durable session journal own checkpoint and
+    // composite-snapshot side effects. Internal utility calls such as
+    // `/compact` may reuse the active session as retrieval context, but must
+    // not advance its resumable timeline.
+    let persist_session_artifacts = p.file_journal.is_some() || p.session_state_journal.is_some();
     let mut executor = {
         let ex =
             edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
@@ -767,7 +772,7 @@ pub(crate) async fn stream_chat_sse(
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
         context_manifest_pool: None,
-        context_manifest_user_id: Some(current_user_id),
+        context_manifest_user_id: persist_session_artifacts.then_some(current_user_id),
         context_manifest_model_name: model_id_for_policy.map(str::to_string),
         runtime_manifest,
         recursion_depth: 0,

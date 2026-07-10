@@ -872,9 +872,14 @@ impl MemoriaForwarder for ReqwestMemoriaForwarder {
             let text = resp.text().await.unwrap_or_default();
             return Err(format!("Memoria error {status}: {text}"));
         }
-        resp.json::<serde_json::Value>()
+        let text = resp
+            .text()
             .await
-            .map_err(|e| format!("Memoria parse error: {e}"))
+            .map_err(|e| format!("Memoria response read error: {e}"))?;
+        if text.trim().is_empty() {
+            return Ok(serde_json::json!({}));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("Memoria parse error: {e}"))
     }
 }
 
@@ -1104,6 +1109,42 @@ mod tests {
             .await
             .expect("forward success");
         assert_eq!(result["method"], "PUT");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn memoria_forwarder_accepts_successful_empty_delete_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("DELETE /v1/memories/memory-1 "));
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+        });
+
+        let forwarder = ReqwestMemoriaForwarder::new_with_timeouts(
+            format!("http://{addr}"),
+            "test-key".to_string(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        let response = forwarder
+            .forward(
+                reqwest::Method::DELETE,
+                "/v1/memories/memory-1",
+                serde_json::json!({"user_id": "user-1"}),
+            )
+            .await
+            .expect("204 delete is a confirmed successful operation");
+        assert_eq!(response, serde_json::json!({}));
         server.await.unwrap();
     }
 

@@ -469,7 +469,7 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
                 .ok()
                 .and_then(|guard| guard.get(session_id).cloned())
         {
-            let path = format!("/memory/{memory_id}/correct");
+            let path = format!("/memory/correct/{memory_id}");
             let body = serde_json::json!({
                 "new_content": content,
                 "reason": "session memory update",
@@ -534,31 +534,28 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
             return Ok(0);
         };
 
-        let token = self.fresh_token().await?;
-        let body = serde_json::json!({
-            "memory_ids": [memory_id],
-            "reason": "session memory purge",
-        });
-        let response = self
-            .api
-            .post_memory_purge_json(&token, &body)
-            .await
-            .map_err(|error| format!("memory purge failed: {error}"))?;
-        let status = response.status();
-        let payload: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| format!("memory purge parse failed: {error}"))?;
-        if !status.is_success() {
-            return Err(format!("memory purge HTTP {status}"));
-        }
+        self.delete(&memory_id).await?;
         if let Ok(mut guard) = self.working_ids.lock() {
             guard.remove(session_id);
         }
-        Ok(payload
-            .get("deleted_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0))
+        Ok(1)
+    }
+
+    async fn delete(&self, memory_id: &str) -> Result<(), String> {
+        let memory_id = memory_id.trim();
+        if memory_id.is_empty() {
+            return Err("memory delete requires a non-empty memory_id".to_string());
+        }
+        let token = self.fresh_token().await?;
+        let encoded_id = urlencoding::encode(memory_id);
+        self.api
+            .delete_bearer_path_text(&token, &format!("/memory/{encoded_id}"))
+            .await
+            .map_err(|error| format!("memory delete failed: {error}"))?;
+        if let Ok(mut guard) = self.working_ids.lock() {
+            guard.retain(|_, tracked_id| tracked_id != memory_id);
+        }
+        Ok(())
     }
 }
 
@@ -833,12 +830,13 @@ pub(crate) async fn complete_session_startup(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_pending_adaptive_state, build_cli_session_memory_extractor, initialize_journal,
-        prune_stale_pending_recovery,
+        CliSessionMemoryMemoriaPort, apply_pending_adaptive_state,
+        build_cli_session_memory_extractor, initialize_journal, prune_stale_pending_recovery,
     };
     use crate::cli::session::session_state::SessionState;
+    use astra_runtime::turn::cloud::memoria_compact::MemoriaPort;
     use astra_services::session_journal;
-    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::matchers::{body_json, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn write_resumable_session(session_id: &str) {
@@ -1424,5 +1422,77 @@ mod tests {
             svc.is_none(),
             "missing auth identity should disable session memory extractor"
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_session_memory_port_updates_working_snapshot_through_server_contract() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("session-1");
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/memory/correct/memory-1"))
+            .and(header_exists("authorization"))
+            .and(body_json(serde_json::json!({
+                "new_content": "updated",
+                "reason": "session memory update",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "memory_id": "memory-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let port = CliSessionMemoryMemoriaPort::new(api, None);
+        port.working_ids
+            .lock()
+            .unwrap()
+            .insert("session-1".to_string(), "memory-1".to_string());
+
+        let id = port
+            .store("updated", "working", Some("session-1"), Some("T3"))
+            .await
+            .unwrap();
+        assert_eq!(id, "memory-1");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_session_memory_port_delete_requires_confirmed_remote_removal() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("session-1");
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/memory/memory-old"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let port = CliSessionMemoryMemoriaPort::new(api, None);
+        port.delete("memory-old").await.unwrap();
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_session_memory_port_delete_rejects_false_success() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("session-1");
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/memory/memory-missing"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let port = CliSessionMemoryMemoriaPort::new(api, None);
+        port.delete("memory-missing")
+            .await
+            .expect_err("404 must not be accepted as a completed delete");
     }
 }

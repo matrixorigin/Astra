@@ -137,9 +137,18 @@ async fn memory_proxy_call(
     body: serde_json::Value,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(headers).await?;
-    let user_id = user.user_id.clone();
+    memory_proxy_call_for_user(state, &user.user_id, method, endpoint, body).await
+}
+
+async fn memory_proxy_call_for_user(
+    state: &AppState,
+    user_id: &str,
+    method: reqwest::Method,
+    endpoint: &str,
+    body: serde_json::Value,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let inject_identity = should_inject_memory_proxy_identity(endpoint);
-    let body = apply_memory_proxy_identity(body, &user_id, inject_identity, endpoint);
+    let body = apply_memory_proxy_identity(body, user_id, inject_identity, endpoint);
 
     state
         .memoria_forwarder
@@ -163,6 +172,35 @@ async fn memory_proxy_call(
         })
 }
 
+fn exact_memory_ids_for_user_purge(body: &serde_json::Value) -> Result<Vec<String>, &'static str> {
+    const MAX_IDS: usize = 64;
+    if body.get("topic").is_some() {
+        return Err(
+            "topic purge is not available through the multi-tenant user endpoint; delete exact memory_ids instead",
+        );
+    }
+    let Some(ids) = body.get("memory_ids").and_then(serde_json::Value::as_array) else {
+        return Err("memory purge requires a non-empty memory_ids array");
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut exact = Vec::new();
+    for id in ids {
+        let Some(id) = id.as_str().map(str::trim).filter(|id| !id.is_empty()) else {
+            return Err("memory_ids must contain only non-empty strings");
+        };
+        if seen.insert(id.to_string()) {
+            exact.push(id.to_string());
+        }
+    }
+    if exact.is_empty() {
+        return Err("memory purge requires a non-empty memory_ids array");
+    }
+    if exact.len() > MAX_IDS {
+        return Err("memory purge accepts at most 64 distinct memory_ids");
+    }
+    Ok(exact)
+}
+
 fn parse_memoria_forward_status(error: &str) -> Option<StatusCode> {
     let suffix = error.strip_prefix("Memoria error ")?;
     let code = suffix.split_whitespace().next()?.parse::<u16>().ok()?;
@@ -171,6 +209,11 @@ fn parse_memoria_forward_status(error: &str) -> Option<StatusCode> {
 
 fn should_inject_memory_proxy_identity(endpoint: &str) -> bool {
     !endpoint.ends_with("/purge")
+}
+
+fn encode_memoria_memory_id(memory_id: &str) -> String {
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+    utf8_percent_encode(memory_id, NON_ALPHANUMERIC).to_string()
 }
 
 fn apply_memory_proxy_identity(
@@ -267,38 +310,26 @@ pub(super) async fn memory_proxy_purge_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let filter = body
-        .as_object()
-        .and_then(|o| {
-            o.get("topic")
-                .or(o.get("session_id"))
-                .or(o.get("memory_ids"))
-        })
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let result = memory_proxy_call(
-        &state,
-        &headers,
-        reqwest::Method::POST,
-        "/v1/memories/purge",
-        body,
-    )
-    .await?;
-    let deleted = result
-        .get("deleted_count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let message = if deleted == 0 {
-        format!("memory_purge: no entries matched filter [{filter}] (0 deleted)")
-    } else {
-        format!("memory_purge: deleted {deleted} entries matching [{filter}]")
-    };
+    let user = state.auth_service.current_user(&headers).await?;
+    let memory_ids = exact_memory_ids_for_user_purge(&body)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+    let mut deleted = 0_u64;
+    for memory_id in memory_ids {
+        let memory_id = encode_memoria_memory_id(&memory_id);
+        let _deleted_response = memory_proxy_call_for_user(
+            &state,
+            &user.user_id,
+            reqwest::Method::DELETE,
+            &format!("/v1/memories/{memory_id}"),
+            serde_json::json!({}),
+        )
+        .await?;
+        deleted = deleted.saturating_add(1);
+    }
     let enriched = serde_json::json!({
         "status": "ok",
         "deleted_count": deleted,
-        "message": message,
+        "message": format!("memory_purge: deleted {deleted} exact entries"),
     });
     Ok(Json(enriched))
 }
@@ -308,6 +339,7 @@ pub(super) async fn memory_proxy_expand_handler(
     headers: HeaderMap,
     Path(memory_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let memory_id = encode_memoria_memory_id(&memory_id);
     memory_proxy_call(
         &state,
         &headers,
@@ -339,6 +371,7 @@ pub(super) async fn memory_proxy_correct_by_id_handler(
     Path(memory_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let memory_id = encode_memoria_memory_id(&memory_id);
     memory_proxy_call(
         &state,
         &headers,
@@ -355,12 +388,29 @@ pub(super) async fn memory_proxy_feedback_handler(
     Path(memory_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let memory_id = encode_memoria_memory_id(&memory_id);
     memory_proxy_call(
         &state,
         &headers,
         reqwest::Method::POST,
         &format!("/v1/memories/{memory_id}/feedback"),
         body,
+    )
+    .await
+}
+
+pub(super) async fn memory_proxy_delete_by_id_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(memory_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let memory_id = encode_memoria_memory_id(&memory_id);
+    memory_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::DELETE,
+        &format!("/v1/memories/{memory_id}"),
+        serde_json::json!({}),
     )
     .await
 }
@@ -593,8 +643,9 @@ pub(super) async fn memoria_proxy_consolidate_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_memoria_management_identity, apply_memory_proxy_identity,
-        parse_memoria_forward_status, should_inject_memory_proxy_identity,
+        apply_memoria_management_identity, apply_memory_proxy_identity, encode_memoria_memory_id,
+        exact_memory_ids_for_user_purge, parse_memoria_forward_status,
+        should_inject_memory_proxy_identity,
     };
     use axum::http::StatusCode;
     use serde_json::json;
@@ -637,6 +688,27 @@ mod tests {
         ));
         assert!(should_inject_memory_proxy_identity("/v1/profiles/me"));
         assert!(!should_inject_memory_proxy_identity("/v1/memories/purge"));
+    }
+
+    #[test]
+    fn memory_id_is_encoded_as_one_upstream_path_segment() {
+        assert_eq!(encode_memoria_memory_id("a/b ?"), "a%2Fb%20%3F");
+    }
+
+    #[test]
+    fn user_purge_accepts_only_bounded_exact_ids() {
+        assert_eq!(
+            exact_memory_ids_for_user_purge(&json!({
+                "memory_ids": ["m1", "m1", "m2"]
+            }))
+            .unwrap(),
+            vec!["m1".to_string(), "m2".to_string()]
+        );
+        assert!(exact_memory_ids_for_user_purge(&json!({"topic": "shared"})).is_err());
+        assert!(exact_memory_ids_for_user_purge(&json!({"memory_ids": []})).is_err());
+        assert!(exact_memory_ids_for_user_purge(&json!({"memory_ids": ["m1", 2]})).is_err());
+        let too_many = (0..65).map(|index| format!("m{index}")).collect::<Vec<_>>();
+        assert!(exact_memory_ids_for_user_purge(&json!({"memory_ids": too_many})).is_err());
     }
 
     #[test]

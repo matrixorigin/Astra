@@ -1699,6 +1699,40 @@ impl TurnEventBuffer {
         }
     }
 
+    /// Bind a server-assigned session identity after the first streamed LLM
+    /// response reveals it. Events captured earlier in that same turn are
+    /// retrofitted atomically so first-round telemetry is not orphaned.
+    pub fn bind_session_id(&mut self, session_id: &str) -> Result<(), String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Err("cannot bind an empty session_id to turn events".to_string());
+        }
+        if let Some(existing) = self.session_id.as_deref()
+            && existing != session_id
+        {
+            return Err(format!(
+                "turn event buffer session mismatch: existing={existing}, incoming={session_id}"
+            ));
+        }
+        if let Some(conflicting) = self.events.iter().find_map(|event| {
+            event
+                .session_id
+                .as_deref()
+                .filter(|existing| *existing != session_id)
+        }) {
+            return Err(format!(
+                "buffered event session mismatch: existing={conflicting}, incoming={session_id}"
+            ));
+        }
+        self.session_id = Some(session_id.to_string());
+        for event in &mut self.events {
+            if event.session_id.is_none() {
+                event.session_id = Some(session_id.to_string());
+            }
+        }
+        Ok(())
+    }
+
     /// Push event, evicting oldest if buffer is full (ring-buffer semantics).
     fn push_event(&mut self, event: JournalEvent) {
         self.events.push_back(event);
@@ -8252,6 +8286,41 @@ mod turn_event_buffer_tests {
         assert_eq!(buf.current_round(), 4);
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn late_session_binding_retrofits_first_round_events() {
+        let mut buf = TurnEventBuffer::begin_turn(None, 1);
+        buf.record_llm_round(LlmRoundRecord {
+            duration_ms: 20,
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            ..Default::default()
+        });
+        buf.record(JournalEvent::base_public(JournalEventType::TraceSpan, None));
+
+        buf.bind_session_id("session-streamed").unwrap();
+        let events = buf.drain();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.session_id.as_deref() == Some("session-streamed") })
+        );
+    }
+
+    #[test]
+    fn late_session_binding_rejects_identity_conflicts_without_rewriting_events() {
+        let mut buf = TurnEventBuffer::begin_turn(None, 1);
+        buf.record(JournalEvent::base_public(
+            JournalEventType::TraceSpan,
+            Some("different-session"),
+        ));
+
+        buf.bind_session_id("session-streamed")
+            .expect_err("conflicting event identity must reject the late binding");
+        let events = buf.drain();
+        assert_eq!(events[0].session_id.as_deref(), Some("different-session"));
     }
 
     #[test]

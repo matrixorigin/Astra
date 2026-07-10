@@ -471,13 +471,7 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     }
 
     let turn = session_turn_number(state);
-    let mut snapshot =
-        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
-            .label(format!("checkpoint-t{turn}"))
-            .session_state(format!("{:06}-heavy.json", ckpt_num))
-            .workspace_state(sid.clone())
-            .build();
-
+    let checkpoint_ref = format!("{:06}-heavy.json", ckpt_num);
     let mut index = match step_checkpoint::read_composite_snapshot_index(user_id, sid) {
         Ok(index) => index,
         Err(error) => {
@@ -488,6 +482,25 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
             return;
         }
     };
+    if let Some(existing) = index.snapshots.iter().find(|snapshot| {
+        snapshot.session_id == *sid
+            && snapshot.turn == turn
+            && snapshot.session_state() == Some(checkpoint_ref.as_str())
+    }) {
+        // Multiple finalization paths may checkpoint the same logical step. The
+        // heavy file is safe to refresh, but promoting the same state reference
+        // twice creates a false timeline version and makes resume ordering
+        // ambiguous. Promotion is therefore idempotent on its durable identity.
+        state.last_composite_snapshot = Some(existing.clone());
+        state.stall.last_heavy_checkpoint = Some(cp);
+        return;
+    }
+    let mut snapshot =
+        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
+            .label(format!("checkpoint-t{turn}"))
+            .session_state(checkpoint_ref)
+            .workspace_state(sid.clone())
+            .build();
     if let Err(e) = index.append(&mut snapshot) {
         astra_core::agent_warn!("checkpoint", "Failed to append snapshot version: {e}");
         return;
@@ -1533,12 +1546,20 @@ mod tests {
 
         try_write_heavy_checkpoint(&mut state);
 
+        let first_snapshot = state
+            .last_composite_snapshot
+            .clone()
+            .expect("first composite snapshot");
+        try_write_heavy_checkpoint(&mut state);
+
         let index =
             astra_pipeline::step_checkpoint::read_composite_snapshot_index(user_id, &session_id)
                 .expect("read composite index");
         assert_eq!(index.snapshots.len(), 1);
         assert_eq!(index.snapshots[0].session_id, session_id);
         assert_eq!(index.snapshots[0].turn, 7);
+        assert_eq!(index.snapshots[0].snapshot_id, first_snapshot.snapshot_id);
+        assert_eq!(index.snapshots[0].version, first_snapshot.version);
         assert!(
             state.last_composite_snapshot.is_some(),
             "root loop must expose the current session composite snapshot"

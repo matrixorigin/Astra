@@ -1,4 +1,4 @@
-use axum::routing::put;
+use axum::routing::{delete, put};
 
 use super::*;
 
@@ -43,6 +43,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/memory/feedback/{memory_id}",
             post(auth_handlers::memory_proxy_feedback_handler),
+        )
+        .route(
+            "/memory/{memory_id}",
+            delete(auth_handlers::memory_proxy_delete_by_id_handler),
         )
         .route(
             "/memory/profile",
