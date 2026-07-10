@@ -1234,10 +1234,9 @@ impl MemoriaClient {
             .and_then(|tail| tail.strip_suffix("/feedback"))
         {
             format!("{cloud_base}/memory/feedback/{memory_id}")
-        } else if let Some(memory_id) = direct_endpoint.strip_prefix("/v1/memories/") {
-            format!("{cloud_base}/memory/expand/{memory_id}")
         } else {
-            return None;
+            let memory_id = direct_endpoint.strip_prefix("/v1/memories/")?;
+            format!("{cloud_base}/memory/expand/{memory_id}")
         };
         Some((endpoint, payload, method))
     }
