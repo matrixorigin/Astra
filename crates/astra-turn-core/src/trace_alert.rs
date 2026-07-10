@@ -32,6 +32,7 @@ pub struct TraceAlert {
 /// Returns alerts to be logged, surfaced in UI, or escalated.
 pub fn evaluate_alerts(
     turn: u32,
+    model_id: &str,
     feedback: &ContextFeedback,
     stats: &PipelineStats,
     recovery: &RecoveryState,
@@ -65,17 +66,19 @@ pub fn evaluate_alerts(
         });
     }
 
-    // Rule 3: Cache regression — session avg drops > 10% over 3 turns
-    if turn >= 4 && stats.avg_cache_hit_ratio > 0.0 {
+    // Rule 3: Cache regression against at least three prior observations for
+    // the same model. Cache namespaces and reuse profiles are model-specific.
+    if let Some(session_avg) = stats.model_cache_regression_baseline(model_id) {
         let recent_ratio = feedback.cache_hit_ratio;
-        let session_avg = stats.avg_cache_hit_ratio;
         if session_avg - recent_ratio > 0.10 {
             alerts.push(TraceAlert {
                 severity: AlertSeverity::Warning,
                 rule: "cache_regression".into(),
                 message: format!(
-                    "Cache hit ratio {recent_ratio:.0}% is {:.0}% below session avg {session_avg:.0}%.",
+                    "Prompt-cache read share {:.0}% is {:.0}% below session avg {:.0}%.",
+                    recent_ratio * 100.0,
                     (session_avg - recent_ratio) * 100.0,
+                    session_avg * 100.0,
                 ),
                 turn,
             });
@@ -150,7 +153,7 @@ mod tests {
         let f = make_feedback(0, 5000);
         let stats = PipelineStats::default();
         let recovery = RecoveryState::default();
-        let alerts = evaluate_alerts(2, &f, &stats, &recovery);
+        let alerts = evaluate_alerts(2, "model-a", &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "cache_cold_start"));
     }
 
@@ -158,7 +161,13 @@ mod tests {
     fn explicit_cache_break_emits_prompt_cache_break_alert() {
         let mut f = make_feedback(0, 5000);
         f.cache_break_detected = Some(CacheBreakReason::CacheControlChanged);
-        let alerts = evaluate_alerts(3, &f, &PipelineStats::default(), &RecoveryState::default());
+        let alerts = evaluate_alerts(
+            3,
+            "model-a",
+            &f,
+            &PipelineStats::default(),
+            &RecoveryState::default(),
+        );
         assert!(alerts.iter().any(|a| a.rule == "prompt_cache_break"));
         assert!(!alerts.iter().any(|a| a.rule == "cache_cold_start"));
     }
@@ -168,7 +177,7 @@ mod tests {
         let f = make_feedback(0, 5000);
         let stats = PipelineStats::default();
         let recovery = RecoveryState::default();
-        let alerts = evaluate_alerts(1, &f, &stats, &recovery);
+        let alerts = evaluate_alerts(1, "model-a", &f, &stats, &recovery);
         assert!(!alerts.iter().any(|a| a.rule == "cache_cold_start"));
     }
 
@@ -182,7 +191,7 @@ mod tests {
         };
         let recovery = RecoveryState::default();
 
-        let alerts = evaluate_alerts(5, &f, &stats, &recovery);
+        let alerts = evaluate_alerts(5, "model-a", &f, &stats, &recovery);
 
         assert!(
             alerts.is_empty(),
@@ -193,14 +202,41 @@ mod tests {
     #[test]
     fn cache_regression_alert_on_3_turn_drop() {
         let f = make_feedback(100, 900); // ratio = 0.1
-        let stats = PipelineStats {
-            turns_executed: 4,
-            avg_cache_hit_ratio: 0.85, // session avg much higher
-            ..Default::default()
-        };
+        let mut stats = PipelineStats::default();
+        for _ in 0..3 {
+            stats.record("model-a", "test", &make_feedback(850, 150));
+        }
+        stats.record("model-a", "test", &f);
         let recovery = RecoveryState::default();
-        let alerts = evaluate_alerts(5, &f, &stats, &recovery);
-        assert!(alerts.iter().any(|a| a.rule == "cache_regression"));
+        let alerts = evaluate_alerts(5, "model-a", &f, &stats, &recovery);
+        let alert = alerts
+            .iter()
+            .find(|alert| alert.rule == "cache_regression")
+            .expect("cache regression alert");
+        assert_eq!(
+            alert.message,
+            "Prompt-cache read share 10% is 75% below session avg 85%."
+        );
+    }
+
+    #[test]
+    fn cache_regression_does_not_compare_different_models() {
+        let mut stats = PipelineStats::default();
+        for _ in 0..3 {
+            stats.record("model-a", "test", &make_feedback(900, 100));
+        }
+        let model_b_feedback = make_feedback(100, 900);
+        stats.record("model-b", "test", &model_b_feedback);
+
+        let alerts = evaluate_alerts(
+            5,
+            "model-b",
+            &model_b_feedback,
+            &stats,
+            &RecoveryState::default(),
+        );
+
+        assert!(!alerts.iter().any(|alert| alert.rule == "cache_regression"));
     }
 
     #[test]
@@ -214,7 +250,7 @@ mod tests {
         stats.turns_executed = 6;
         stats.record_compaction(2000);
         let recovery = RecoveryState::default();
-        let alerts = evaluate_alerts(7, &f, &stats, &recovery);
+        let alerts = evaluate_alerts(7, "model-a", &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "compaction_cascade"));
     }
 
@@ -225,7 +261,7 @@ mod tests {
         let mut recovery = RecoveryState::default();
         recovery.record_ptl_error();
         recovery.record_ptl_error();
-        let alerts = evaluate_alerts(5, &f, &stats, &recovery);
+        let alerts = evaluate_alerts(5, "model-a", &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "recovery_loop"));
         assert!(alerts.iter().any(|a| a.severity == AlertSeverity::Error));
     }
@@ -239,7 +275,7 @@ mod tests {
             ..Default::default()
         };
         let recovery = RecoveryState::default();
-        let alerts = evaluate_alerts(4, &f, &stats, &recovery);
+        let alerts = evaluate_alerts(4, "model-a", &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "predictive_miss"));
     }
 }

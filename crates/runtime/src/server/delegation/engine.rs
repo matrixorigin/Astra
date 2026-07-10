@@ -7709,8 +7709,6 @@ mod tests {
         );
     }
 
-    /// P1-B source guard: cancel_run must call cancel_children_of on delegation engine.
-
     /// cancel_tokens must be cleaned up in cleanup_delegation to prevent memory leaks.
     #[tokio::test]
     async fn cleanup_delegation_removes_cancel_tokens() {

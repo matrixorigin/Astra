@@ -1141,6 +1141,9 @@ fn humanize_session_memory_skip(turn: &str, reason: &str) -> String {
         "no_growth" => format!(
             "Session memory was not refreshed on {turn} because the conversation had not changed enough since the last snapshot."
         ),
+        "already_current" => format!(
+            "Session memory already contains a durable snapshot through {turn}, so a duplicate extraction was not started."
+        ),
         "selector_cooldown" => format!(
             "Session memory was not refreshed on {turn} because the extractor model is cooling down after a recent failure."
         ),

@@ -67,7 +67,6 @@ pub fn agentic_turn_stream_snapshot_with_kind<'a>(
 
 /// Mutable agentic-loop fields updated by [`ingest_agentic_turn_stream`].
 pub struct AgenticTurnIngestMut<'a> {
-    pub step_persistence_enabled: bool,
     pub first_ttft_ms: &'a mut Option<u64>,
     pub current_session_id: &'a mut Option<String>,
     pub current_run_id: &'a mut Option<String>,
@@ -136,9 +135,7 @@ pub fn ingest_agentic_turn_stream(
 
     if let Some(sid) = snap.session_id.as_ref() {
         *st.current_session_id = Some(sid.clone());
-        if st.step_persistence_enabled {
-            st.step_recorder.attach_persistence(sid);
-        }
+        st.step_recorder.attach_persistence_if_configured(sid);
     }
     if snap.run_id.is_some() {
         *st.current_run_id = snap.run_id.clone();
@@ -383,15 +380,7 @@ mod tests {
         }
 
         fn ingest_mut(&mut self) -> AgenticTurnIngestMut<'_> {
-            self.ingest_mut_with_persistence(false)
-        }
-
-        fn ingest_mut_with_persistence(
-            &mut self,
-            step_persistence_enabled: bool,
-        ) -> AgenticTurnIngestMut<'_> {
             AgenticTurnIngestMut {
-                step_persistence_enabled,
                 first_ttft_ms: &mut self.first_ttft_ms,
                 current_session_id: &mut self.current_session_id,
                 current_run_id: &mut self.current_run_id,
@@ -418,7 +407,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let mut p = Pack::new();
-        p.step_recorder = StepRecorder::new(TEST_USER_ID, "ephemeral", "task-1");
+        p.step_recorder =
+            StepRecorder::with_deferred_persistence(TEST_USER_ID, "ephemeral", "task-1");
 
         let session_id = Some("authoritative-session".to_string());
         let run_id = None;
@@ -446,7 +436,7 @@ mod tests {
             "continue this session",
             &[],
             true,
-            p.ingest_mut_with_persistence(true),
+            p.ingest_mut(),
         );
 
         assert_eq!(outcome, AgenticTurnIngestOutcome::Break);

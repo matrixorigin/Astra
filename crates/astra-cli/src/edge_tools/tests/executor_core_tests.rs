@@ -1401,6 +1401,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
                 original_tool_name: None,
                 ..Default::default()
             }]),
+            tool_outcomes: None,
             budget_used: Some(8500),
             budget_pressure: Some(0.85),
             stall_type: None,

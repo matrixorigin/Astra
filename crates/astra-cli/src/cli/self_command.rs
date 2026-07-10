@@ -1376,6 +1376,7 @@ mod tests {
                     original_tool_name: None,
                     ..Default::default()
                 }]),
+                tool_outcomes: None,
                 budget_used: Some(7000),
                 budget_pressure: Some(0.7),
                 stall_type: None,
@@ -1459,6 +1460,7 @@ mod tests {
                 selected_skills: None,
                 tools_used: None,
                 tool_calls: None,
+                tool_outcomes: None,
                 budget_used: None,
                 budget_pressure: None,
                 stall_type: None,
@@ -1565,6 +1567,7 @@ mod tests {
                     original_tool_name: None,
                     ..Default::default()
                 }]),
+                tool_outcomes: None,
                 budget_used: Some(9100),
                 budget_pressure: Some(0.91),
                 stall_type: None,

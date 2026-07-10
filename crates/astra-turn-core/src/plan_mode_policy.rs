@@ -174,11 +174,11 @@ mod tests {
         }
         assert!(is_plan_mode_blocked_tool(
             "git",
-            &json!({"action": "stash", "stash_action": "pop"})
+            &json!({"action": "stash", "sub_action": "pop"})
         ));
         assert!(!is_plan_mode_blocked_tool(
             "git",
-            &json!({"action": "stash", "stash_action": "list"})
+            &json!({"action": "stash", "sub_action": "list"})
         ));
         for action in ["status", "diff", "log", "show", "blame"] {
             assert!(!is_plan_mode_blocked_tool(

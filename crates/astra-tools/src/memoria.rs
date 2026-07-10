@@ -409,6 +409,29 @@ fn memoria_output_is_error(output: &str) -> bool {
         .is_some()
 }
 
+fn validate_strict_recall_response(raw_text: &str, args: &Value) -> Result<(), String> {
+    if args.get("scope").and_then(Value::as_str) != Some("session")
+        || memoria_output_is_error(raw_text)
+    {
+        return Ok(());
+    }
+    let session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "memory_scope_violation: strict recall is missing session_id".to_string())?;
+    let payload = serde_json::from_str::<Value>(raw_text).map_err(|error| {
+        format!("memory_scope_violation: strict recall response is not valid JSON: {error}")
+    })?;
+    if let Some(user_id) = args.get("user_id").and_then(Value::as_str) {
+        let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
+        astra_memoria::validate_strict_recall_payload(&payload, &scope)
+    } else {
+        // Edge callers do not own the bearer identity. The authenticated
+        // server validates the full pair; retain a local session assertion.
+        astra_memoria::validate_strict_recall_session_payload(&payload, session_id)
+    }
+}
+
 const MAX_FAILS: u32 = 2;
 
 impl MemoriaToolGateway {
@@ -1001,6 +1024,21 @@ impl MemoriaToolGateway {
         // carry the same signals as the bridge-side prefetch path.
         if op == "recall" {
             let session_id = args.get("session_id").and_then(Value::as_str).unwrap_or("");
+            if let Err(error) = validate_strict_recall_response(&raw_text, args) {
+                tracing::error!(
+                    target: "astra::memory::scope",
+                    session_id,
+                    error = %error,
+                    "strict memory recall response failed identity validation"
+                );
+                return json!({
+                    "error": {
+                        "code": "memory_scope_violation",
+                        "message": "memory backend violated the requested session scope"
+                    }
+                })
+                .to_string();
+            }
             let turn = args.get("turn").and_then(Value::as_u64).unwrap_or(0) as u32;
             let seen = Self::seen_snapshot(session_id);
             let mut newly_surfaced = Vec::new();
@@ -2421,6 +2459,58 @@ mod tests {
         assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
         assert_eq!(pl["session_id"], "sess-abc");
         assert_eq!(pl["session_scope"], "only");
+    }
+
+    #[test]
+    fn strict_recall_response_rejects_foreign_session_before_prompt_decoration() {
+        let args = json!({
+            "scope": "session",
+            "session_id": "session-1",
+            "user_id": "user-1"
+        });
+        let raw = json!([{
+            "memory_id": "foreign",
+            "content": "must never surface",
+            "session_id": "session-2",
+            "user_id": "user-1"
+        }])
+        .to_string();
+        let error = validate_strict_recall_response(&raw, &args)
+            .expect_err("foreign session content must fail closed");
+        assert!(error.starts_with("memory_scope_violation:"));
+        assert!(!error.contains("must never surface"));
+    }
+
+    #[test]
+    fn strict_recall_response_requires_owner_when_runtime_knows_owner() {
+        let args = json!({
+            "scope": "session",
+            "session_id": "session-1",
+            "user_id": "user-1"
+        });
+        let missing_owner = json!([{
+            "memory_id": "unproven",
+            "session_id": "session-1"
+        }])
+        .to_string();
+        assert!(validate_strict_recall_response(&missing_owner, &args).is_err());
+
+        let valid = json!([{
+            "memory_id": "owned",
+            "session_id": "session-1",
+            "user_id": "user-1"
+        }])
+        .to_string();
+        validate_strict_recall_response(&valid, &args).unwrap();
+    }
+
+    #[test]
+    fn edge_strict_recall_still_rejects_foreign_session_without_user_field() {
+        let args = json!({"scope": "session", "session_id": "session-1"});
+        let valid = json!([{"memory_id": "m1", "session_id": "session-1"}]).to_string();
+        validate_strict_recall_response(&valid, &args).unwrap();
+        let foreign = json!([{"memory_id": "m2", "session_id": "session-2"}]).to_string();
+        assert!(validate_strict_recall_response(&foreign, &args).is_err());
     }
 
     #[test]

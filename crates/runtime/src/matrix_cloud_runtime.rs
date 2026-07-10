@@ -194,7 +194,8 @@ impl MatrixCloudRuntime {
     pub fn with_encryptor(mut self, enc: Arc<astra_services::FernetTokenEncryptor>) -> Self {
         self.encryptor = Some(Arc::clone(&enc));
         let ingestion = self.ingestion.lock().ok().and_then(|g| g.as_ref().cloned());
-        let memoria = crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env();
+        let memoria = crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env()
+            .map(|client| client.with_owner_user_id(self.user_id.to_string()));
         if let (Some(ingestion), Some(memoria)) = (ingestion, memoria) {
             let resolver: Arc<dyn crate::session_memory::SelectorParamsResolver> =
                 Arc::new(PoolSelectorResolver {

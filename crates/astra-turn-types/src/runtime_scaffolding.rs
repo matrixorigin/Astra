@@ -66,6 +66,7 @@ pub fn scaffolding_body_prefixes_for_filtering() -> impl Iterator<Item = &'stati
 /// 2. Any message whose trimmed `content` starts with one of
 ///    [`SCAFFOLDING_BODY_PREFIXES`] (applies across all roles — assistant
 ///    messages can carry runtime-stamped directives too).
+///
 /// Returns `false` for genuine user/assistant conversational turns.
 ///
 /// This is deliberately **shape-based** (role + prefix match) rather than

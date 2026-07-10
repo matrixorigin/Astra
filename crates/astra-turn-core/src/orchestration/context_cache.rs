@@ -1,9 +1,8 @@
 //! Shared context cache for cross-agent knowledge sharing.
 //!
-//! Provides three tiers of caching:
+//! Provides two concrete tiers of caching:
 //! 1. File content cache — avoid redundant disk reads across agents
 //! 2. Knowledge fragments — semantic key-value store for agent discoveries
-//! 3. Agent findings — structured results from spawned agents
 
 use dashmap::DashMap;
 use dashmap::mapref::multiple::RefMulti;
@@ -19,15 +18,12 @@ use std::time::{Duration, SystemTime};
 /// Thread-safe cache that allows multiple agents to share:
 /// - File contents (with mtime validation and TTL)
 /// - Knowledge fragments (semantic key-value pairs)
-/// - Agent findings (structured results from completed agents)
 #[derive(Debug)]
 pub struct SharedContextCache {
     /// file_path → CachedFile
     files: DashMap<PathBuf, CachedFile>,
     /// semantic_key → Knowledge
     knowledge: DashMap<String, Knowledge>,
-    /// agent_id → AgentFindings
-    agent_results: DashMap<String, AgentFindings>,
     /// TTL for file cache
     file_ttl: Duration,
     /// Max file cache size in bytes
@@ -67,57 +63,6 @@ pub struct Knowledge {
     pub access_count: u32,
 }
 
-/// Findings from a completed agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentFindings {
-    /// Agent ID.
-    pub agent_id: String,
-    /// Agent type (explore, code-review, etc.).
-    pub agent_type: String,
-    /// Brief summary of what the agent found.
-    pub summary: String,
-    /// Detailed findings.
-    pub findings: Vec<Finding>,
-    /// When the agent completed.
-    #[serde(with = "system_time_serde")]
-    pub completed_at: SystemTime,
-}
-
-/// A single finding from an agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Finding {
-    /// Category of this finding.
-    pub category: FindingCategory,
-    /// Short title.
-    pub title: String,
-    /// Detailed description.
-    pub detail: String,
-    /// Confidence score (0.0 to 1.0).
-    pub confidence: f32,
-    /// Related files.
-    pub related_files: Vec<PathBuf>,
-}
-
-/// Categories for agent findings.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FindingCategory {
-    /// Found code pattern or anti-pattern.
-    CodePattern,
-    /// Discovered dependency info.
-    Dependency,
-    /// Architecture insight.
-    Architecture,
-    /// Security observation.
-    Security,
-    /// Performance finding.
-    Performance,
-    /// Documentation gap or update.
-    Documentation,
-    /// User-defined category.
-    Custom(String),
-}
-
 // ─── Implementation ─────────────────────────────────────────────────────────
 
 impl Default for SharedContextCache {
@@ -125,7 +70,6 @@ impl Default for SharedContextCache {
         Self {
             files: DashMap::new(),
             knowledge: DashMap::new(),
-            agent_results: DashMap::new(),
             file_ttl: Duration::from_secs(30),
             max_file_cache_bytes: 100 * 1024 * 1024, // 100MB
             current_file_cache_bytes: AtomicUsize::new(0),
@@ -139,7 +83,6 @@ impl SharedContextCache {
         Self {
             files: DashMap::new(),
             knowledge: DashMap::new(),
-            agent_results: DashMap::new(),
             file_ttl,
             max_file_cache_bytes,
             current_file_cache_bytes: AtomicUsize::new(0),
@@ -279,57 +222,6 @@ impl SharedContextCache {
         self.knowledge.len()
     }
 
-    // ─── Agent Findings ─────────────────────────────────────────────────
-
-    /// Store findings from a completed agent.
-    pub fn store_agent_findings(&self, findings: AgentFindings) {
-        self.agent_results
-            .insert(findings.agent_id.clone(), findings);
-    }
-
-    /// Get findings from a specific agent.
-    pub fn get_agent_findings(&self, agent_id: &str) -> Option<AgentFindings> {
-        self.agent_results
-            .get(agent_id)
-            .map(|e: dashmap::mapref::one::Ref<'_, String, AgentFindings>| e.value().clone())
-    }
-
-    /// Get all findings of a specific category.
-    pub fn get_findings_by_category(&self, category: &FindingCategory) -> Vec<Finding> {
-        self.agent_results
-            .iter()
-            .flat_map(|e: RefMulti<'_, String, AgentFindings>| e.value().findings.to_vec())
-            .filter(|f| &f.category == category)
-            .collect()
-    }
-
-    /// Get all agent IDs that have stored findings.
-    pub fn list_agent_findings(&self) -> Vec<String> {
-        self.agent_results
-            .iter()
-            .map(|e: RefMulti<'_, String, AgentFindings>| e.value().agent_id.clone())
-            .collect()
-    }
-
-    /// Get summary of all agent findings for prompt injection.
-    pub fn summarize_findings(&self) -> String {
-        let mut lines = Vec::new();
-        for entry in self.agent_results.iter() {
-            let entry: RefMulti<'_, String, AgentFindings> = entry;
-            let val = entry.value();
-            lines.push(format!("## Agent: {} ({})", val.agent_id, val.agent_type));
-            lines.push(val.summary.clone());
-            for finding in &val.findings {
-                lines.push(format!(
-                    "- [{:?}] {}: {}",
-                    finding.category, finding.title, finding.detail
-                ));
-            }
-            lines.push(String::new());
-        }
-        lines.join("\n")
-    }
-
     // ─── Eviction ───────────────────────────────────────────────────────
 
     fn maybe_evict(&self, needed_bytes: usize) {
@@ -364,7 +256,6 @@ impl SharedContextCache {
     pub fn clear(&self) {
         self.files.clear();
         self.knowledge.clear();
-        self.agent_results.clear();
         self.current_file_cache_bytes.store(0, Ordering::Relaxed);
     }
 
@@ -374,7 +265,6 @@ impl SharedContextCache {
             file_count: self.files.len(),
             file_cache_bytes: self.current_file_cache_bytes.load(Ordering::Relaxed),
             knowledge_count: self.knowledge.len(),
-            agent_findings_count: self.agent_results.len(),
         }
     }
 }
@@ -385,7 +275,6 @@ pub struct CacheStats {
     pub file_count: usize,
     pub file_cache_bytes: usize,
     pub knowledge_count: usize,
-    pub agent_findings_count: usize,
 }
 
 // ─── Tool Schemas ───────────────────────────────────────────────────────────
@@ -535,45 +424,6 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_findings() {
-        let cache = SharedContextCache::default();
-
-        let findings = AgentFindings {
-            agent_id: "explore-1".to_string(),
-            agent_type: "explore".to_string(),
-            summary: "Found authentication patterns".to_string(),
-            findings: vec![
-                Finding {
-                    category: FindingCategory::Security,
-                    title: "JWT implementation".to_string(),
-                    detail: "Uses HS256 with env-based secret".to_string(),
-                    confidence: 0.95,
-                    related_files: vec![PathBuf::from("src/auth.rs")],
-                },
-                Finding {
-                    category: FindingCategory::CodePattern,
-                    title: "Error handling".to_string(),
-                    detail: "Uses Result with custom Error type".to_string(),
-                    confidence: 0.9,
-                    related_files: vec![PathBuf::from("src/error.rs")],
-                },
-            ],
-            completed_at: SystemTime::now(),
-        };
-
-        cache.store_agent_findings(findings);
-
-        // Get by agent
-        let retrieved = cache.get_agent_findings("explore-1").unwrap();
-        assert_eq!(retrieved.findings.len(), 2);
-
-        // Get by category
-        let security_findings = cache.get_findings_by_category(&FindingCategory::Security);
-        assert_eq!(security_findings.len(), 1);
-        assert_eq!(security_findings[0].title, "JWT implementation");
-    }
-
-    #[test]
     fn test_commonly_read_files() {
         let cache = SharedContextCache::default();
         let mtime = SystemTime::now();
@@ -619,29 +469,5 @@ mod tests {
         cache.put_file(PathBuf::from("file3.txt"), "z".repeat(60), mtime, "agent-1");
         // file1 should be evicted
         assert!(cache.get_file(&PathBuf::from("file1.txt")).is_none());
-    }
-
-    #[test]
-    fn test_summarize_findings() {
-        let cache = SharedContextCache::default();
-
-        cache.store_agent_findings(AgentFindings {
-            agent_id: "explore-1".to_string(),
-            agent_type: "explore".to_string(),
-            summary: "Found auth patterns".to_string(),
-            findings: vec![Finding {
-                category: FindingCategory::Security,
-                title: "JWT".to_string(),
-                detail: "Uses JWT".to_string(),
-                confidence: 0.9,
-                related_files: vec![],
-            }],
-            completed_at: SystemTime::now(),
-        });
-
-        let summary = cache.summarize_findings();
-        assert!(summary.contains("explore-1"));
-        assert!(summary.contains("JWT"));
-        assert!(summary.contains("Security"));
     }
 }

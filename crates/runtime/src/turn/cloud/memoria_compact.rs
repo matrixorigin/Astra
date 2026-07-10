@@ -153,7 +153,8 @@ pub fn claude_code_session_memory_path(cwd: &str, session_id: &str) -> PathBuf {
 }
 
 pub use astra_memoria::{
-    MemoriaMemory, MemoriaPort, ReflectCandidate, ReflectSummary, parse_reflect_candidates,
+    MemoriaMemory, MemoriaPort, MemoryScope, ReflectCandidate, ReflectSummary,
+    parse_reflect_candidates, validate_strict_memories,
 };
 
 fn cross_session_abstract(prefix: &str, evidence: &str) -> String {
@@ -223,6 +224,7 @@ pub struct HttpMemoriaPort {
     base_url: String,
     api_key: String,
     http: reqwest::Client,
+    owner_user_id: Option<String>,
 }
 
 impl HttpMemoriaPort {
@@ -236,7 +238,15 @@ impl HttpMemoriaPort {
                     .timeout(std::time::Duration::from_secs(60)),
                 "memoria compact client",
             ),
+            owner_user_id: None,
         }
+    }
+
+    /// Bind this transport to the authenticated owner that created the
+    /// runtime. Strict session operations fail closed when no owner is bound.
+    pub fn with_owner_user_id(mut self, user_id: impl Into<String>) -> Self {
+        self.owner_user_id = Some(user_id.into());
+        self
     }
 
     /// Create from environment variables.
@@ -318,8 +328,36 @@ fn parse_retrieved_memories(data: &Value) -> Vec<MemoriaMemory> {
     memories
 }
 
+fn parse_strict_retrieved_memories(
+    data: &Value,
+    scope: &astra_memoria::MemoryScope,
+) -> Result<Vec<MemoriaMemory>, String> {
+    astra_memoria::validate_strict_recall_payload(data, scope)?;
+    let entries = data
+        .as_array()
+        .or_else(|| data.get("memories").and_then(Value::as_array))
+        .expect("strict payload validation guarantees a memories array");
+    let memories = entries
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            serde_json::from_value::<MemoriaMemory>(value.clone())
+                .map_err(|error| format!("invalid strict Memoria retrieve item {index}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    astra_memoria::validate_strict_memories(&memories, scope)?;
+    Ok(memories)
+}
+
 #[async_trait::async_trait]
 impl MemoriaPort for HttpMemoriaPort {
+    fn bind_owner(&self, user_id: &str) -> Result<std::sync::Arc<dyn MemoriaPort>, String> {
+        let scope = astra_memoria::MemoryScope::new(user_id, "owner-binding-validation")?;
+        Ok(std::sync::Arc::new(
+            self.clone().with_owner_user_id(scope.user_id),
+        ))
+    }
+
     async fn retrieve_for_prompt(
         &self,
         query: &str,
@@ -377,6 +415,17 @@ impl MemoriaPort for HttpMemoriaPort {
             "query": query,
             "top_k": top_k,
         });
+        let strict_scope = if filter_session {
+            let sid = session_id.ok_or_else(|| {
+                "strict Memoria retrieve requires a non-empty session_id".to_string()
+            })?;
+            let user_id = self.owner_user_id.as_deref().ok_or_else(|| {
+                "strict Memoria retrieve requires an authenticated owner binding".to_string()
+            })?;
+            Some(astra_memoria::MemoryScope::new(user_id, sid)?)
+        } else {
+            None
+        };
         if let Some(sid) = session_id {
             body["session_id"] = json!(sid);
             if filter_session {
@@ -384,6 +433,9 @@ impl MemoriaPort for HttpMemoriaPort {
                 // legacy `filter_session` flag (Memoria never honored it).
                 body["session_scope"] = json!("only");
             }
+        }
+        if let Some(scope) = strict_scope.as_ref() {
+            body["user_id"] = json!(scope.user_id);
         }
 
         // Attach active focus hints (client-side, session-scoped TTL).
@@ -429,7 +481,10 @@ impl MemoriaPort for HttpMemoriaPort {
             .await
             .map_err(|e| format!("Memoria retrieve parse failed: {e}"))?;
 
-        Ok(parse_retrieved_memories(&data))
+        match strict_scope.as_ref() {
+            Some(scope) => parse_strict_retrieved_memories(&data, scope),
+            None => Ok(parse_retrieved_memories(&data)),
+        }
     }
 
     async fn retrieve_scoped_typed(
@@ -443,11 +498,16 @@ impl MemoriaPort for HttpMemoriaPort {
             "{}/v1/memories/retrieve",
             self.base_url.trim_end_matches('/')
         );
+        let user_id = self.owner_user_id.as_deref().ok_or_else(|| {
+            "typed Memoria retrieve requires an authenticated owner binding".to_string()
+        })?;
+        let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
         let mut body = json!({
             "query": query,
             "top_k": top_k,
             "session_id": session_id,
             "session_scope": "only",
+            "user_id": scope.user_id,
         });
         if !memory_types.is_empty() {
             body["memory_types"] = Value::Array(memory_types.iter().map(|ty| json!(ty)).collect());
@@ -471,7 +531,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .await
             .map_err(|e| format!("Memoria typed retrieve parse failed: {e}"))?;
 
-        Ok(parse_retrieved_memories(&data))
+        parse_strict_retrieved_memories(&data, &scope)
     }
 
     async fn store(
@@ -487,7 +547,14 @@ impl MemoriaPort for HttpMemoriaPort {
             "memory_type": memory_type,
         });
         if let Some(sid) = session_id {
-            body["session_id"] = json!(sid);
+            let user_id = self.owner_user_id.as_deref().ok_or_else(|| {
+                "session-scoped Memoria store requires an authenticated owner binding".to_string()
+            })?;
+            let scope = astra_memoria::MemoryScope::new(user_id, sid)?;
+            body["session_id"] = json!(scope.session_id);
+            body["user_id"] = json!(scope.user_id);
+        } else if let Some(user_id) = self.owner_user_id.as_deref() {
+            body["user_id"] = json!(user_id);
         }
         if let Some(tier) = trust_tier {
             body["trust_tier"] = json!(tier);
@@ -545,11 +612,16 @@ impl MemoriaPort for HttpMemoriaPort {
         if memory_types.is_empty() {
             return Ok(0);
         }
+        let user_id = self.owner_user_id.as_deref().ok_or_else(|| {
+            "session-scoped Memoria purge requires an authenticated owner binding".to_string()
+        })?;
+        let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
         let url = format!("{}/v1/memories/purge", self.base_url.trim_end_matches('/'));
         let body = json!({
-            "session_id": session_id,
+            "session_id": scope.session_id,
             "memory_types": memory_types,
             "reason": "session compaction cleanup",
+            "user_id": scope.user_id,
         });
 
         let resp = self
@@ -611,12 +683,18 @@ impl MemoriaPort for HttpMemoriaPort {
         if overview.trim().is_empty() {
             return Err("store_episode: empty overview".into());
         }
+        let user_id = self
+            .owner_user_id
+            .as_deref()
+            .ok_or_else(|| "store_episode requires an authenticated owner binding".to_string())?;
+        let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
         let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
         let content = encode_episode_memory(session_id, overview);
         let body = json!({
             "content": content,
             "memory_type": "episodic",
-            "session_id": session_id,
+            "session_id": scope.session_id,
+            "user_id": scope.user_id,
             "trust_tier": "T3",
             "source": {"agent": "session_end_orchestrator"},
             "tags": ["astra:episode"],
@@ -666,7 +744,15 @@ impl MemoriaPort for HttpMemoriaPort {
             "tags": ["astra:scene"],
         });
         if !session_id.is_empty() {
-            body["session_id"] = json!(session_id);
+            let user_id = self
+                .owner_user_id
+                .as_deref()
+                .ok_or_else(|| "store_scene requires an authenticated owner binding".to_string())?;
+            let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
+            body["session_id"] = json!(scope.session_id);
+            body["user_id"] = json!(scope.user_id);
+        } else if let Some(user_id) = self.owner_user_id.as_deref() {
+            body["user_id"] = json!(user_id);
         }
         let resp = self
             .http
@@ -704,7 +790,12 @@ impl MemoriaPort for HttpMemoriaPort {
         // `astra:scene`-tagged memories so next-session prewarm sees them.
         let mut body = json!({"force": force, "mode": "candidates"});
         if !session_id.is_empty() {
-            body["session_id"] = json!(session_id);
+            let user_id = self.owner_user_id.as_deref().ok_or_else(|| {
+                "reflect_session requires an authenticated owner binding".to_string()
+            })?;
+            let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
+            body["session_id"] = json!(scope.session_id);
+            body["user_id"] = json!(scope.user_id);
         }
         let resp = self
             .http
@@ -1261,6 +1352,30 @@ mod tests {
         assert_eq!(memories[0].memory_id, "m1");
     }
 
+    #[test]
+    fn strict_retrieved_memories_reject_every_unproven_or_malformed_item() {
+        let scope = astra_memoria::MemoryScope::new("user-1", "session-1").unwrap();
+        for data in [
+            json!({"memories": [{
+                "memory_id": "foreign",
+                "content": "must not surface",
+                "memory_type": "working",
+                "user_id": "user-2",
+                "session_id": "session-1"
+            }]}),
+            json!({"memories": [{
+                "memory_id": "malformed",
+                "content": "must not surface",
+                "user_id": "user-1",
+                "session_id": "session-1"
+            }]}),
+        ] {
+            let error = parse_strict_retrieved_memories(&data, &scope)
+                .expect_err("strict retrieve must fail as one atomic response");
+            assert!(!error.contains("must not surface"));
+        }
+    }
+
     struct MockMemoriaPort {
         memories: Mutex<Vec<MemoriaMemory>>,
     }
@@ -1431,6 +1546,7 @@ mod tests {
                 ),
                 memory_type: "working".to_string(),
                 session_id: Some("sess-1".to_string()),
+                user_id: None,
                 retrieval_score: Some(0.9),
                 ..Default::default()
             },
@@ -2101,7 +2217,8 @@ mod tests {
             let _ = sock.shutdown().await;
         });
 
-        let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string());
+        let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string())
+            .with_owner_user_id("user-7");
         let purged = client
             .purge_working("8ae95566-f123-4abc-9def-0123456789ab")
             .await
@@ -2147,6 +2264,7 @@ mod tests {
                 content: "keep".to_string(),
                 memory_type: "working".to_string(),
                 session_id: Some("sess-1".to_string()),
+                user_id: None,
                 retrieval_score: None,
                 observed_at: None,
                 updated_at: None,
@@ -2157,6 +2275,7 @@ mod tests {
                 content: "drop".to_string(),
                 memory_type: "reference".to_string(),
                 session_id: Some("sess-1".to_string()),
+                user_id: None,
                 retrieval_score: None,
                 observed_at: None,
                 updated_at: None,
@@ -2167,6 +2286,7 @@ mod tests {
                 content: "drop".to_string(),
                 memory_type: String::new(),
                 session_id: Some("sess-1".to_string()),
+                user_id: None,
                 retrieval_score: None,
                 observed_at: None,
                 updated_at: None,
@@ -2295,7 +2415,8 @@ mod tests {
             let _ = sock.shutdown().await;
         });
 
-        let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string());
+        let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string())
+            .with_owner_user_id("user-7");
         client
             .retrieve_scoped_typed(
                 "session memory",
@@ -2318,6 +2439,7 @@ mod tests {
             json.get("session_scope").and_then(Value::as_str),
             Some("only")
         );
+        assert_eq!(json.get("user_id").and_then(Value::as_str), Some("user-7"));
         assert_eq!(json.get("top_k").and_then(Value::as_u64), Some(7));
         let types = json
             .get("memory_types")
@@ -2325,6 +2447,60 @@ mod tests {
             .expect("memory_types array");
         assert_eq!(types.len(), 1);
         assert_eq!(types[0].as_str(), Some("session_memory"));
+    }
+
+    #[tokio::test]
+    async fn retrieve_scoped_typed_rejects_foreign_backend_response_without_leaking_content() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap_or_default();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .or_else(|| line.strip_prefix("Content-Length: "))
+                    })
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or_default();
+                if request.len().saturating_sub(header_end + 4) >= content_length {
+                    break;
+                }
+            }
+            let payload = br#"{"memories":[{"memory_id":"foreign","content":"private foreign memory","memory_type":"session_memory","user_id":"other-user","session_id":"session-9"}]}"#;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(payload).await.unwrap();
+        });
+
+        let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string())
+            .with_owner_user_id("user-7");
+        let error = client
+            .retrieve_scoped_typed("session memory", "session-9", 7, &["session_memory"])
+            .await
+            .expect_err("foreign response must be rejected");
+        server.await.unwrap();
+
+        assert!(error.starts_with("memory_scope_violation:"), "{error}");
+        assert!(!error.contains("private foreign memory"));
     }
 
     #[tokio::test]

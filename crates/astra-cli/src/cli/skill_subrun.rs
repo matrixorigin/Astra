@@ -17,9 +17,10 @@ use astra_runtime::{
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
     turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, CancellationState, HostTurnResult, SkillState,
-        StopHookState, TurnInteractionMode, TurnInteractionPolicy,
-        interaction_scoped_tool_restrictions, runtime_manifest_for_model,
+        AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState, HostTurnResult,
+        SkillState, StopHookState, TurnInteractionMode, TurnInteractionPolicy,
+        interaction_scoped_tool_restrictions, project_skill_subrun_outcome,
+        runtime_manifest_for_model,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
@@ -764,10 +765,16 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };
 
-        if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {
-            let err_str = err.to_string();
-            let failure_output = persist_failed_subrun(&mut state, &err_str);
-            return Err(failure_output);
+        let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        let outcome = project_skill_subrun_outcome(&loop_result, &state);
+        match &loop_result {
+            Ok(AgenticLoopOutcome::Error(error)) => {
+                persist_failed_subrun(&mut state, error);
+            }
+            Err(error) => {
+                persist_failed_subrun(&mut state, &error.to_string());
+            }
+            _ => {}
         }
 
         let turns = (SUBRUN_MAX_TURNS - state.remaining_turns) as u32;
@@ -777,6 +784,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             output: state.final_text,
             tokens_used,
             turns,
+            outcome,
         })
     }
 }

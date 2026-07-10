@@ -615,7 +615,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
             }
             Some("stash")
                 if args
-                    .and_then(|a| a.get("stash_action").or_else(|| a.get("sub_action")))
+                    .and_then(|a| a.get("sub_action"))
                     .and_then(|v| v.as_str())
                     .is_some_and(|action| matches!(action, "list" | "show")) =>
             {
@@ -701,7 +701,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
             ) => ToolIdempotency::PureRead,
             Some("stash")
                 if args
-                    .and_then(|a| a.get("stash_action").or_else(|| a.get("sub_action")))
+                    .and_then(|a| a.get("sub_action"))
                     .and_then(|v| v.as_str())
                     .is_some_and(|action| matches!(action, "list" | "show")) =>
             {

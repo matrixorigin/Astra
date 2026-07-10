@@ -7845,7 +7845,7 @@ esac
             .unwrap();
 
         let stash_list = exec
-            .execute("git", &json!({"action": "stash", "stash_action": "list"}))
+            .execute("git", &json!({"action": "stash", "sub_action": "list"}))
             .await;
         assert!(
             stash_list.contains("No stashes found")
@@ -7939,6 +7939,42 @@ esac
             .await;
         // Should attempt the call (may fail due to no server, but shouldn't crash)
         assert!(!result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_inventory_is_structured_and_does_not_call_recall() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute("memory", &json!({"action": "inventory"}))
+            .await;
+        let inventory: Value = serde_json::from_str(&result).expect("structured inventory");
+        assert_eq!(inventory["schema_version"].as_u64(), Some(1));
+        assert_eq!(
+            inventory["session_id"].as_str(),
+            Some(exec.session_id.as_str())
+        );
+        assert!(inventory["successful_extraction_versions"].is_u64());
+        assert!(inventory["distinct_successful_turns"].is_u64());
+        assert!(inventory["duplicate_successful_turns"].is_array());
+    }
+
+    #[tokio::test]
+    async fn memory_inventory_surfaces_local_journal_corruption() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let (exec, _dir) = test_executor();
+        let path = astra_services::session_journal::journal_file_path(&exec.session_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{not-json}\n").unwrap();
+
+        let result = exec
+            .execute_with_metadata("memory", &json!({"action": "inventory"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("cannot be exact"), "{result:?}");
     }
 
     #[tokio::test]
@@ -8250,11 +8286,11 @@ esac
         assert!(is_plan_mode_blocked_tool("git", &json!({"action": "push"})));
         assert!(is_plan_mode_blocked_tool(
             "git",
-            &json!({"action": "stash", "stash_action": "push"})
+            &json!({"action": "stash", "sub_action": "push"})
         ));
         assert!(!is_plan_mode_blocked_tool(
             "git",
-            &json!({"action": "stash", "stash_action": "list"})
+            &json!({"action": "stash", "sub_action": "list"})
         ));
         assert!(!is_plan_mode_blocked_tool(
             "git",

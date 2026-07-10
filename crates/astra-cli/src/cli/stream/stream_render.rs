@@ -2691,6 +2691,24 @@ fn sync_incremental_tool_result_state(
 ) {
     let is_failure = tool_result_status_is_failure(&result.status);
     let error = is_failure.then(|| result.output.clone());
+    let fields = result.tool_result_fields.as_ref();
+    let error_kind = fields
+        .and_then(|fields| fields.get("error_kind"))
+        .and_then(Value::as_str)
+        .and_then(astra_core::ErrorKind::parse_tag);
+    let disposition = fields
+        .and_then(|fields| fields.get("disposition"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(astra_services::session_journal::ToolCallDisposition::Executed);
+    let exit_semantics = fields
+        .and_then(|fields| fields.get("exit_semantics"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let result_class = fields
+        .and_then(|fields| fields.get("result_class"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     incremental_state.push_tool_record(astra_services::session_journal::ToolCallRecord {
         tool_call_id: Some(result.request_id.clone()),
         name: result.tool.clone(),
@@ -2699,6 +2717,10 @@ fn sync_incremental_tool_result_state(
         error,
         output_bytes: Some(result.output.len().min(u32::MAX as usize) as u32),
         result_preview: Some(tool_output_event_text(&result.tool, &result.output)),
+        error_kind,
+        disposition: Some(disposition),
+        exit_semantics,
+        result_class,
         ..Default::default()
     });
     incremental_state.add_tool_used(&result.tool);
@@ -2968,7 +2990,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     tool,
                     args,
                     body,
-                    Some(crate::edge_tools::noop_or_cached_tool_result_fields()),
+                    Some(crate::edge_tools::nonexecuted_tool_result_fields(
+                        astra_services::session_journal::ToolCallDisposition::Suppressed,
+                    )),
                     status.to_string(),
                     0,
                 )
@@ -2989,7 +3013,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     tool,
                     args,
                     cached_output,
-                    Some(crate::edge_tools::noop_or_cached_tool_result_fields()),
+                    Some(crate::edge_tools::nonexecuted_tool_result_fields(
+                        astra_services::session_journal::ToolCallDisposition::Reused,
+                    )),
                     cached_status,
                     0,
                 )
@@ -11366,6 +11392,10 @@ mod tests {
         assert_eq!(snap.tool_call_records[0].name, "read_file");
         assert!(snap.tool_call_records[0].ok);
         assert_eq!(snap.tool_call_records[0].ms, 42);
+        assert_eq!(
+            snap.tool_call_records[0].effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Executed
+        );
         assert_eq!(snap.tools_used, vec!["read_file"]);
 
         // error status records error
@@ -11400,7 +11430,9 @@ mod tests {
                 tool: "read_file".into(),
                 args: serde_json::json!({"path": "lib.rs"}),
                 output: "Duplicate call skipped.".into(),
-                tool_result_fields: None,
+                tool_result_fields: Some(crate::edge_tools::nonexecuted_tool_result_fields(
+                    astra_services::session_journal::ToolCallDisposition::Suppressed,
+                )),
                 status: "skipped".into(),
                 duration_ms: 0,
             },
@@ -11409,6 +11441,43 @@ mod tests {
         assert_eq!(snap.tool_call_records.len(), 1);
         assert!(snap.tool_call_records[0].ok);
         assert!(snap.tool_call_records[0].error.is_none());
+        assert_eq!(
+            snap.tool_call_records[0].effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Suppressed
+        );
         assert_eq!(snap.tools_used, vec!["read_file"]);
+    }
+
+    #[test]
+    fn sync_incremental_tool_result_preserves_typed_rejection_evidence() {
+        let state = IncrementalTurnState::default();
+        sync_incremental_tool_result_state(
+            &state,
+            &EdgeToolExecResult {
+                request_id: "req-invalid-git".into(),
+                tool: "git".into(),
+                args: serde_json::json!({"action": "diff", "path": "missing.rs"}),
+                output: "invalid request".into(),
+                tool_result_fields: Some(serde_json::Map::from_iter([
+                    ("error_kind".into(), serde_json::json!("tool_invalid_args")),
+                    ("disposition".into(), serde_json::json!("rejected")),
+                    ("result_class".into(), serde_json::json!("validation_error")),
+                ])),
+                status: "failed".into(),
+                duration_ms: 0,
+            },
+        );
+
+        let mut snapshot = state.snapshot();
+        let record = snapshot.tool_call_records.remove(0);
+        assert_eq!(
+            record.error_kind,
+            Some(astra_core::ErrorKind::ToolInvalidArgs)
+        );
+        assert_eq!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Rejected
+        );
+        assert_eq!(record.result_class.as_deref(), Some("validation_error"));
     }
 }

@@ -58,7 +58,9 @@ fn pipeline_feedback_event_captures_cache_metrics() {
 
     assert_eq!(event.kind, PipelineEventKind::Feedback);
     assert_eq!(event.turn, 3);
-    assert!((event.cache_hit_ratio.unwrap() - 0.8).abs() < 1e-9);
+    // Read share is measured against the complete prompt-token workload:
+    // fresh prompt + cache read + cache creation = 1000 + 800 + 200.
+    assert!((event.cache_hit_ratio.unwrap() - 0.4).abs() < 1e-9);
     assert_eq!(event.completion_tokens, Some(500));
 }
 

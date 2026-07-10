@@ -364,14 +364,20 @@ impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemoryS
 struct CliSessionMemoryMemoriaPort {
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
+    owner_user_id: String,
     working_ids: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl CliSessionMemoryMemoriaPort {
-    fn new(api: astra_thin_client::ThinClient, profile: Option<&str>) -> Self {
+    fn new(
+        api: astra_thin_client::ThinClient,
+        profile: Option<&str>,
+        owner_user_id: impl Into<String>,
+    ) -> Self {
         Self {
             api,
             profile: profile.map(str::to_string),
+            owner_user_id: owner_user_id.into(),
             working_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -426,6 +432,7 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
         let mut body = serde_json::json!({
             "query": query,
             "top_k": top_k,
+            "user_id": self.owner_user_id.as_str(),
         });
         if let Some(session_id) = session_id {
             body["session_id"] = serde_json::json!(session_id);
@@ -447,6 +454,17 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
             return Err(format!("memory retrieve HTTP {status}"));
         }
         let memories = Self::parse_memories(&payload);
+        if filter_session {
+            let session_id = session_id
+                .ok_or_else(|| "strict CLI memory retrieve requires a session_id".to_string())?;
+            let scope = astra_runtime::turn::cloud::memoria_compact::MemoryScope::new(
+                &self.owner_user_id,
+                session_id,
+            )?;
+            astra_runtime::turn::cloud::memoria_compact::validate_strict_memories(
+                &memories, &scope,
+            )?;
+        }
         if let Some(session_id) = session_id {
             self.track_working_id_from_memories(session_id, &memories);
         }
@@ -490,6 +508,7 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemo
         let mut body = serde_json::json!({
             "content": content,
             "memory_type": memory_type,
+            "user_id": self.owner_user_id.as_str(),
         });
         if let Some(session_id) = session_id {
             body["session_id"] = serde_json::json!(session_id);
@@ -625,7 +644,11 @@ async fn build_cli_session_memory_extractor(
         api: api.clone(),
         profile: profile.map(str::to_string),
     });
-    let memoria = std::sync::Arc::new(CliSessionMemoryMemoriaPort::new(api.clone(), profile))
+    let memoria = std::sync::Arc::new(CliSessionMemoryMemoriaPort::new(
+        api.clone(),
+        profile,
+        me.user_id.clone(),
+    ))
         as std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>;
     let ingestion = astra_services::event_ingestion::IngestionSender::disconnected();
     let broker =
@@ -1445,7 +1468,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let port = CliSessionMemoryMemoriaPort::new(api, None);
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
         port.working_ids
             .lock()
             .unwrap()
@@ -1456,6 +1479,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, "memory-1");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_session_memory_port_rejects_foreign_strict_recall_response() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("session-1");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/retrieve"))
+            .and(header_exists("authorization"))
+            .and(body_json(serde_json::json!({
+                "query": "session memory",
+                "top_k": 5,
+                "user_id": "user-1",
+                "session_id": "session-1",
+                "session_scope": "only",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "memory_id": "foreign-memory",
+                    "content": "must not be admitted",
+                    "memory_type": "working",
+                    "user_id": "user-1",
+                    "session_id": "session-2",
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        let error = port
+            .retrieve_ext("session memory", Some("session-1"), 5, true)
+            .await
+            .expect_err("foreign session result must fail closed");
+        assert!(error.starts_with("memory_scope_violation:"), "{error}");
+        assert!(port.working_ids.lock().unwrap().is_empty());
     }
 
     #[serial_test::serial]
@@ -1473,7 +1535,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let port = CliSessionMemoryMemoriaPort::new(api, None);
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
         port.delete("memory-old").await.unwrap();
     }
 
@@ -1490,7 +1552,7 @@ mod tests {
             .await;
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let port = CliSessionMemoryMemoriaPort::new(api, None);
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
         port.delete("memory-missing")
             .await
             .expect_err("404 must not be accepted as a completed delete");

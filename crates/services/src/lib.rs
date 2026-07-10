@@ -51,6 +51,7 @@ pub mod session_checkpoint;
 pub mod session_fork;
 pub mod session_journal;
 pub(crate) mod session_lifecycle;
+pub mod session_memory_inventory;
 pub mod session_reaper;
 pub mod session_restore;
 pub mod session_workspace;

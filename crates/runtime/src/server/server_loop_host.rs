@@ -1332,6 +1332,7 @@ impl ServerAgenticLoopHostBuilder {
         user_id: String,
         session_id: String,
     ) -> Self {
+        let memoria_owner_user_id = user_id.clone();
         Self {
             matrixone,
             encryptor,
@@ -1357,6 +1358,7 @@ impl ServerAgenticLoopHostBuilder {
             task_board_resume_hint: None,
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env().map(
                 |client| {
+                    let client = client.with_owner_user_id(memoria_owner_user_id.clone());
                     Arc::new(client) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
                 },
             ),
@@ -1866,10 +1868,10 @@ fn append_server_owned_tool_schemas_unique(
         };
         match spec.required.executor {
             astra_runtime_env::RequiredExecutor::RuntimeExecutor => continue,
-            astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor => {
-                if runtime_declared_tool_names.contains(name) {
-                    continue;
-                }
+            astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
+                if runtime_declared_tool_names.contains(name) =>
+            {
+                continue;
             }
             _ => {}
         }
@@ -1895,10 +1897,10 @@ fn append_server_owned_tool_schemas_unique(
         match admission.selected_route() {
             ToolExecutionRouteKind::ServerRuntime
             | ToolExecutionRouteKind::ServerControlPlane
-            | ToolExecutionRouteKind::ServerLocal => {
-                if seen.insert(name.to_string()) {
-                    surface.push(schema);
-                }
+            | ToolExecutionRouteKind::ServerLocal
+                if seen.insert(name.to_string()) =>
+            {
+                surface.push(schema);
             }
             _ => {}
         }

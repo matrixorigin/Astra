@@ -986,6 +986,7 @@ mod tests {
         let lock_path = temp.path().join("outbox.lock");
         let lock = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)

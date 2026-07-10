@@ -813,7 +813,7 @@ mod tests {
             None,
             None,
             None,
-            &[existing.clone()],
+            std::slice::from_ref(&existing),
             &[replacement, additional.clone()],
             |session, memories| (session, memories.to_vec()),
         )

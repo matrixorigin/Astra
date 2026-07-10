@@ -41,7 +41,8 @@
 //! - `execute_turn` is called at most `max_turns` times
 //! - Cancel flag is checked cooperatively between turns (not mid-turn)
 //! - Stall detection runs after every turn with tool calls
-//! - Post-tool policy may restrict tools or abort the loop
+//! - Post-tool policy contributes structured advisory evidence to subsequent
+//!   reasoning; hard stops remain reserved for actual runtime boundaries
 //!
 //! # Dispatch
 //!
@@ -1652,7 +1653,7 @@ pub fn runtime_volatile_injections_edge_profile_value(
             Some(serde_json::Value::Object(object))
         })
         .collect::<Vec<_>>();
-    (!items.is_empty()).then(|| serde_json::Value::Array(items))
+    (!items.is_empty()).then_some(serde_json::Value::Array(items))
 }
 
 /// Created by the CLI/host from session parameters; mutated by the runtime
@@ -2389,6 +2390,45 @@ pub enum AgenticLoopOutcome {
     Waiting(String),
 }
 
+/// Project the runtime loop's terminal state into the typed isolated-skill
+/// contract shared by CLI and Server hosts.
+///
+/// Text is intentionally not inspected.  In particular, a non-empty partial
+/// answer does not promote an interrupted child to `Completed`, and an empty
+/// answer does not by itself decide lifecycle state.
+pub fn project_skill_subrun_outcome(
+    outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    state: &AgenticLoopState,
+) -> astra_skills::executor::isolated::SubRunOutcome {
+    use astra_skills::executor::isolated::SubRunOutcome;
+
+    let interruption_reason = || {
+        state
+            .interruption
+            .as_ref()
+            .map(|interruption| interruption.kind.label().to_string())
+    };
+
+    match outcome {
+        Ok(AgenticLoopOutcome::Completed) => interruption_reason()
+            .map_or(SubRunOutcome::Completed, |finish_reason| {
+                SubRunOutcome::Interrupted { finish_reason }
+            }),
+        Ok(AgenticLoopOutcome::Waiting(reason)) => SubRunOutcome::Interrupted {
+            finish_reason: interruption_reason().unwrap_or_else(|| reason.clone()),
+        },
+        Ok(AgenticLoopOutcome::Cancelled) => SubRunOutcome::Cancelled {
+            reason: interruption_reason().unwrap_or_else(|| "cancelled".to_string()),
+        },
+        Ok(AgenticLoopOutcome::Error(error)) => SubRunOutcome::Failed {
+            error: error.clone(),
+        },
+        Err(error) => SubRunOutcome::Failed {
+            error: error.to_string(),
+        },
+    }
+}
+
 // ─── Delegation support ──────────────────────────────────────────────────────
 
 pub const DELEGATE_TOOL_NAME: &str =
@@ -3017,7 +3057,7 @@ pub(crate) mod tests {
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
 
-    fn edge_runtime_environment_fields() -> serde_json::Map<String, Value> {
+    pub(crate) fn edge_runtime_environment_fields() -> serde_json::Map<String, Value> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
             astra_runtime_env::RunBinding::edge_developer("/workspace/project", &registry),
@@ -5235,6 +5275,66 @@ pub(crate) mod tests {
             let _ = format!("{v:?}");
         }
         assert_eq!(variants.len(), 4);
+    }
+
+    #[test]
+    fn skill_subrun_projection_uses_typed_loop_and_interruption_state() {
+        use astra_skills::executor::isolated::SubRunOutcome;
+        use astra_turn_core::interruption::{
+            InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+        };
+
+        let mut state = make_state();
+        let completed = project_skill_subrun_outcome(&Ok(AgenticLoopOutcome::Completed), &state);
+        assert_eq!(completed, SubRunOutcome::Completed);
+
+        state.interruption = Some(InterruptionRecord::new(
+            InterruptionKind::BudgetExhausted,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 2,
+                turns_completed: 3,
+                remaining_turns: 0,
+                error_detail: None,
+                stall_signal: None,
+                resume_restricted_tools: vec![],
+            },
+        ));
+        let partial = project_skill_subrun_outcome(&Ok(AgenticLoopOutcome::Completed), &state);
+        assert_eq!(
+            partial,
+            SubRunOutcome::Interrupted {
+                finish_reason: "budget_exhausted".to_string()
+            }
+        );
+
+        state.interruption = None;
+        let waiting = project_skill_subrun_outcome(
+            &Ok(AgenticLoopOutcome::Waiting("approval_required".to_string())),
+            &state,
+        );
+        assert_eq!(
+            waiting,
+            SubRunOutcome::Interrupted {
+                finish_reason: "approval_required".to_string()
+            }
+        );
+        assert_eq!(
+            project_skill_subrun_outcome(&Ok(AgenticLoopOutcome::Cancelled), &state),
+            SubRunOutcome::Cancelled {
+                reason: "cancelled".to_string()
+            }
+        );
+        assert_eq!(
+            project_skill_subrun_outcome(
+                &Ok(AgenticLoopOutcome::Error("provider failed".to_string())),
+                &state,
+            ),
+            SubRunOutcome::Failed {
+                error: "provider failed".to_string()
+            }
+        );
     }
 
     // ── Delegation passthrough / E2E tests ──────────────────────────────────
@@ -8668,6 +8768,21 @@ mod observability_e2e_tests {
     }
 
     fn turn_with_tools(tools: &[&str], text: &str) -> HostTurnResult {
+        let edge_tool_round = tools
+            .iter()
+            .map(|name| {
+                let args = json!({"path": format!("/tmp/{name}.txt")});
+                EdgeToolExecResult {
+                    request_id: format!("call-{name}"),
+                    tool: (*name).to_string(),
+                    args,
+                    output: format!("{name} completed"),
+                    tool_result_fields: Some(edge_runtime_environment_fields()),
+                    status: "completed".to_string(),
+                    duration_ms: 10,
+                }
+            })
+            .collect();
         HostTurnResult {
             accum: ChatTurnSseAccum {
                 full_text: text.to_string(),
@@ -8680,7 +8795,7 @@ mod observability_e2e_tests {
                 ..Default::default()
             },
             ttft_ms: Some(50),
-            edge_tool_round: Vec::new(),
+            edge_tool_round,
             error_kind: None,
         }
     }
@@ -8725,7 +8840,7 @@ mod observability_e2e_tests {
             .stall
             .tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
+            .filter(|r| r.was_executed())
             .collect();
         assert!(
             !records.is_empty(),
@@ -8791,7 +8906,7 @@ mod observability_e2e_tests {
             .stall
             .tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
+            .filter(|r| r.was_executed())
             .collect();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].round, Some(0));
@@ -8892,7 +9007,7 @@ mod parallel_execution_tests {
         } else if name == "git" {
             json!({"action": "diff", "path": format!("/tmp/{id}.txt")})
         } else {
-            json!({"path": format!("/tmp/{name}.txt")})
+            json!({"path": format!("/tmp/{id}.txt")})
         };
         json!({
             "id": id,
@@ -8905,6 +9020,27 @@ mod parallel_execution_tests {
     }
 
     fn turn_with_named_tools(tools: &[(&str, &str)], text: &str) -> HostTurnResult {
+        let edge_tool_round = tools
+            .iter()
+            .map(|(name, id)| {
+                let args = if *name == "bash" {
+                    json!({"command": "true"})
+                } else if *name == "git" {
+                    json!({"action": "diff", "path": format!("/tmp/{id}.txt")})
+                } else {
+                    json!({"path": format!("/tmp/{id}.txt")})
+                };
+                EdgeToolExecResult {
+                    request_id: (*id).to_string(),
+                    tool: (*name).to_string(),
+                    args,
+                    output: format!("{name} completed"),
+                    tool_result_fields: Some(edge_runtime_environment_fields()),
+                    status: "completed".to_string(),
+                    duration_ms: 10,
+                }
+            })
+            .collect();
         HostTurnResult {
             accum: ChatTurnSseAccum {
                 full_text: text.to_string(),
@@ -8920,7 +9056,7 @@ mod parallel_execution_tests {
                 ..Default::default()
             },
             ttft_ms: Some(50),
-            edge_tool_round: Vec::new(),
+            edge_tool_round,
             error_kind: None,
         }
     }
@@ -8939,15 +9075,15 @@ mod parallel_execution_tests {
             ("read_file", "c1"),
             ("grep", "c2"),
             ("glob", "c3"),
-            ("git_status", "c4"),
-            ("git_diff", "c5"),
+            ("git", "c4"),
+            ("git", "c5"),
             ("read_file", "c6"),
         ];
         let mut host = MockHost::new(vec![
             turn_with_named_tools(&tools, ""),
             turn_with_named_tools(&[], "done"),
         ])
-        .with_valid_tools(&["read_file", "grep", "glob", "git_status", "git_diff"]);
+        .with_valid_tools(&["read_file", "grep", "glob", "git"]);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state)
             .await
@@ -8958,9 +9094,14 @@ mod parallel_execution_tests {
             .stall
             .tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
+            .filter(|r| r.was_executed())
             .collect();
-        assert_eq!(records.len(), 6, "expected 6 tool call records");
+        assert_eq!(
+            records.len(),
+            6,
+            "expected 6 executed tool call records; all records: {:#?}",
+            state.stall.tool_call_records
+        );
 
         // All should be in round 0, all parallel, all same batch_id.
         for rec in &records {

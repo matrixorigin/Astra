@@ -7,15 +7,159 @@
 //! shape observes the same semantics.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Canonical owner + session boundary for session-scoped memory operations.
+///
+/// `user_id` and `session_id` are distinct identities. A transport may derive
+/// the owner from authentication, but it must never replace the durable
+/// session id with that owner id. Keeping the pair typed makes that invariant
+/// explicit at CLI, edge, and server boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryScope {
+    pub user_id: String,
+    pub session_id: String,
+}
+
+impl MemoryScope {
+    pub fn new(user_id: impl Into<String>, session_id: impl Into<String>) -> Result<Self, String> {
+        let user_id = exact_scope_component("user_id", user_id.into())?;
+        let session_id = exact_scope_component("session_id", session_id.into())?;
+        Ok(Self {
+            user_id,
+            session_id,
+        })
+    }
+}
+
+fn exact_scope_component(field: &str, value: String) -> Result<String, String> {
+    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+        return Err(format!(
+            "memory scope {field} must be a non-empty exact string without surrounding whitespace or control characters"
+        ));
+    }
+    Ok(value)
+}
+
+/// Fail-closed validation for a strict session recall response.
+///
+/// Memoria may return either a top-level array or `{ "memories": [...] }`.
+/// Every item must echo both owner and session identity. A missing identity is
+/// treated as a boundary violation rather than as a legacy response: callers
+/// cannot safely surface content whose ownership was not proven.
+pub fn validate_strict_recall_payload(
+    payload: &Value,
+    expected: &MemoryScope,
+) -> Result<(), String> {
+    let entries = strict_recall_entries(payload)?;
+
+    for (index, entry) in entries.iter().enumerate() {
+        validate_recall_entry_identity(entry, expected, index)?;
+    }
+    Ok(())
+}
+
+/// Validate the session half of a strict recall at an edge that does not own
+/// the authenticated user id. The server must still call
+/// [`validate_strict_recall_payload`] with the full owner/session pair.
+pub fn validate_strict_recall_session_payload(
+    payload: &Value,
+    expected_session_id: &str,
+) -> Result<(), String> {
+    let expected_session_id = exact_scope_component("session_id", expected_session_id.to_string())?;
+    for (index, entry) in strict_recall_entries(payload)?.iter().enumerate() {
+        let object = entry.as_object().ok_or_else(|| {
+            format!("memory_scope_violation: strict recall item {index} is not an object")
+        })?;
+        if object.get("session_id").and_then(Value::as_str) != Some(expected_session_id.as_str()) {
+            let memory_id = object
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>");
+            return Err(format!(
+                "memory_scope_violation: strict recall item {index} ({memory_id}) has invalid session_id"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn strict_recall_entries(payload: &Value) -> Result<&[Value], String> {
+    payload
+        .as_array()
+        .or_else(|| payload.get("memories").and_then(Value::as_array))
+        .map(Vec::as_slice)
+        .ok_or_else(|| {
+            "memory_scope_violation: strict recall response is not an array or memories envelope"
+                .to_string()
+        })
+}
+
+fn validate_recall_entry_identity(
+    entry: &Value,
+    expected: &MemoryScope,
+    index: usize,
+) -> Result<(), String> {
+    let object = entry.as_object().ok_or_else(|| {
+        format!("memory_scope_violation: strict recall item {index} is not an object")
+    })?;
+    for (field, expected_value) in [
+        ("user_id", expected.user_id.as_str()),
+        ("session_id", expected.session_id.as_str()),
+    ] {
+        let actual = object.get(field).and_then(Value::as_str);
+        if actual != Some(expected_value) {
+            let memory_id = object
+                .get("memory_id")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>");
+            return Err(format!(
+                "memory_scope_violation: strict recall item {index} ({memory_id}) has invalid {field}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Typed equivalent of [`validate_strict_recall_payload`] for runtime ports.
+pub fn validate_strict_memories(
+    memories: &[MemoriaMemory],
+    expected: &MemoryScope,
+) -> Result<(), String> {
+    for (index, memory) in memories.iter().enumerate() {
+        if memory.user_id.as_deref() != Some(expected.user_id.as_str()) {
+            return Err(format!(
+                "memory_scope_violation: strict recall item {index} ({}) has invalid user_id",
+                memory.memory_id
+            ));
+        }
+        if memory.session_id.as_deref() != Some(expected.session_id.as_str()) {
+            return Err(format!(
+                "memory_scope_violation: strict recall item {index} ({}) has invalid session_id",
+                memory.memory_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Provider-neutral Memoria operations used by runtime orchestration.
 #[async_trait::async_trait]
 pub trait MemoriaPort: Send + Sync {
+    /// Return a transport bound to an authenticated owner.
+    ///
+    /// Server runtimes are multi-tenant and must scope the port before placing
+    /// it in request state.  Implementations that cannot establish a new owner
+    /// boundary fail closed instead of silently reusing another tenant's
+    /// credentials.
+    fn bind_owner(&self, _user_id: &str) -> Result<Arc<dyn MemoriaPort>, String> {
+        Err("Memoria transport does not support authenticated owner rebinding".to_string())
+    }
+
     async fn retrieve_for_prompt(
         &self,
         query: &str,
@@ -58,6 +202,14 @@ pub trait MemoriaPort: Send + Sync {
         let memories = self
             .retrieve_ext(query, Some(session_id), top_k, true)
             .await?;
+        for (index, memory) in memories.iter().enumerate() {
+            if memory.session_id.as_deref() != Some(session_id) {
+                return Err(format!(
+                    "memory_scope_violation: strict recall item {index} ({}) has invalid session_id",
+                    memory.memory_id
+                ));
+            }
+        }
         if memory_types.is_empty() {
             return Ok(memories);
         }
@@ -203,6 +355,8 @@ pub struct MemoriaMemory {
     pub trust_tier: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 impl MemoriaMemory {
@@ -569,6 +723,78 @@ pub fn memoria_runtime_state() -> &'static MemoriaRuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn memory_scope_keeps_owner_and_session_as_distinct_exact_identities() {
+        let scope = MemoryScope::new("user-1", "session-1").unwrap();
+        assert_eq!(scope.user_id, "user-1");
+        assert_eq!(scope.session_id, "session-1");
+        assert!(MemoryScope::new("user-1", "user-1").is_ok());
+        assert!(MemoryScope::new(" user-1", "session-1").is_err());
+        assert!(MemoryScope::new("user-1", "").is_err());
+    }
+
+    #[test]
+    fn strict_recall_payload_rejects_foreign_or_unproven_identity() {
+        let scope = MemoryScope::new("user-1", "session-1").unwrap();
+        validate_strict_recall_payload(
+            &json!([{
+                "memory_id": "m-ok",
+                "content": "safe",
+                "user_id": "user-1",
+                "session_id": "session-1"
+            }]),
+            &scope,
+        )
+        .unwrap();
+
+        for payload in [
+            json!([{
+                "memory_id": "m-foreign-session",
+                "user_id": "user-1",
+                "session_id": "session-2"
+            }]),
+            json!([{
+                "memory_id": "m-foreign-user",
+                "user_id": "user-2",
+                "session_id": "session-1"
+            }]),
+            json!([{
+                "memory_id": "m-missing-owner",
+                "session_id": "session-1"
+            }]),
+        ] {
+            let error = validate_strict_recall_payload(&payload, &scope)
+                .expect_err("strict recall must fail closed");
+            assert!(error.starts_with("memory_scope_violation:"), "{error}");
+            assert!(!error.contains("safe"));
+        }
+    }
+
+    #[test]
+    fn strict_recall_payload_accepts_memories_envelope_and_empty_results() {
+        let scope = MemoryScope::new("user-1", "session-1").unwrap();
+        validate_strict_recall_payload(&json!([]), &scope).unwrap();
+        validate_strict_recall_payload(&json!({"memories": []}), &scope).unwrap();
+        assert!(validate_strict_recall_payload(&json!({"items": []}), &scope).is_err());
+    }
+
+    #[test]
+    fn edge_session_validation_rejects_foreign_session_without_needing_owner_identity() {
+        validate_strict_recall_session_payload(
+            &json!([{"memory_id": "m1", "session_id": "session-1"}]),
+            "session-1",
+        )
+        .unwrap();
+        assert!(
+            validate_strict_recall_session_payload(
+                &json!([{"memory_id": "m1", "session_id": "session-2"}]),
+                "session-1",
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn session_state_closes_focus_seen_and_recall_lifecycle() {

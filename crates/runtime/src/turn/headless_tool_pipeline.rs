@@ -220,6 +220,7 @@ pub(crate) struct ExecutedExecution {
     pub execution: HeadlessResolvedExecution,
     pub idem_key: IdempotencyKey,
     pub is_err: bool,
+    pub error_kind: Option<astra_core::ErrorKind>,
     pub executed_ms: u64,
 }
 
@@ -449,9 +450,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     /// Execute a batch of read-only tools concurrently.
     /// Returns false if the round should be aborted.
     pub(crate) async fn run_batch_concurrent(&mut self, items: &[HeadlessRoundToolIdx]) -> bool {
-        use super::headless_tool_pipeline::execute::{
-            execute_tool_pure, execution_result_is_error,
-        };
+        use super::headless_tool_pipeline::execute::execute_tool_pure;
 
         // Phase 1: validate + permit serially (fast, needs &mut self).
         let mut permitted_batch: Vec<PermittedExecution> = Vec::with_capacity(items.len());
@@ -511,22 +510,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
         for ((execution, idem_key), started) in executions.into_iter().zip(started_at) {
-            let is_err = execution_result_is_error(
-                &execution.name,
-                &execution.result_str,
-                execution.tool_result_fields.as_ref(),
-            );
-            let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
-                execution.edge_duration_ms
-            } else {
-                started.elapsed().as_millis() as u64
-            };
-            let executed = ExecutedExecution {
-                execution,
-                idem_key,
-                is_err,
-                executed_ms,
-            };
+            let executed = self.postprocess_execution(execution, idem_key, started);
             self.record_execution(executed).await;
         }
         true
@@ -1587,6 +1571,7 @@ mod tests {
                     },
                     idem_key: IdempotencyKey::semantic(tool_name, &args),
                     is_err,
+                    error_kind: None,
                     executed_ms: 1,
                 })
                 .await;
@@ -1649,6 +1634,7 @@ mod tests {
                     },
                     idem_key: IdempotencyKey::semantic("str_replace", &args),
                     is_err: false,
+                    error_kind: None,
                     executed_ms: 1,
                 })
                 .await;
@@ -1739,6 +1725,7 @@ mod tests {
                     },
                     idem_key: IdempotencyKey::semantic("str_replace", &args),
                     is_err: false,
+                    error_kind: None,
                     executed_ms: 1,
                 })
                 .await;
@@ -2005,6 +1992,58 @@ mod tests {
             "got: {}",
             pipeline.ctx.tool_results[0]
         );
+    }
+
+    #[tokio::test]
+    async fn git_validation_rejection_reaches_journal_as_typed_non_execution() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
+        let mut pipeline = harness.pipeline_with_server_executor(3, Some(&server_exec));
+        let args = json!({"action": "diff", "path": "missing.rs"});
+        let permitted = PermittedExecution {
+            execution: HeadlessResolvedExecution {
+                id: "call-git-invalid".into(),
+                name: "git".into(),
+                args: args.clone(),
+                result_str: "Error: headless edge protocol: no matching edge result".into(),
+                tool_result_fields: None,
+                edge_duration_ms: 0,
+                is_edge_tool: false,
+                early_exit_ms: 0,
+            },
+            idem_key: IdempotencyKey::semantic("git", &args),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(executed.is_err);
+        assert_eq!(
+            executed.error_kind,
+            Some(astra_core::ErrorKind::ToolInvalidArgs)
+        );
+        pipeline.record_execution(executed).await;
+
+        let record = pipeline
+            .ctx
+            .tool_call_records
+            .last()
+            .expect("journal record");
+        assert_eq!(
+            record.error_kind,
+            Some(astra_core::ErrorKind::ToolInvalidArgs)
+        );
+        assert_eq!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Rejected
+        );
+        let summary = astra_services::session_journal::ToolOutcomeSummary::from_records(
+            pipeline.ctx.tool_call_records,
+        );
+        assert_eq!(summary.requested, 1);
+        assert_eq!(summary.executed, 0);
+        assert_eq!(summary.rejected, 1);
+        assert!(summary.is_consistent());
     }
 
     #[tokio::test]

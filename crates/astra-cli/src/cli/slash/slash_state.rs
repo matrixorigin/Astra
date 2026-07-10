@@ -361,19 +361,12 @@ async fn persist_history_edit_state(state: &mut SessionState, action: &str) -> R
             .as_deref()
             .filter(|session_id| !session_id.is_empty()),
     ) {
-        let user_id = state
-            .ingestion_user_id
-            .as_deref()
-            .filter(|user_id| !user_id.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(crate::cli::cli_config::cli_utils::cli_user_id);
         let had_error = state
             .last_turn_event
             .as_ref()
             .and_then(|event| event.error.as_ref())
             .is_some();
         let _ = service.maybe_spawn(astra_runtime::session_memory::ExtractionRequest {
-            user_id,
             session_id: session_id.to_string(),
             messages: crate::cli::session::session_projection::history_as_messages(&state.history),
             session_facts: crate::cli::session::session_cleanup::shutdown_session_facts(state),

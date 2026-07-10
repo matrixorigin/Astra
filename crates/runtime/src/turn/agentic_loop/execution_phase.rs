@@ -678,7 +678,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             .stall
             .tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder() && r.ok)
+            .filter(|r| r.was_executed() && r.ok)
             .count();
         state.stall.execution_escalation_advisory_emitted = true;
         let msg = execution_escalation_message(&state.message, read_only_calls);
@@ -1209,7 +1209,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         &state.recent_tools,
         prep.quiet,
         AgenticTurnIngestMut {
-            step_persistence_enabled: state.context_manifest_user_id.is_some(),
             first_ttft_ms: &mut state.telemetry.first_ttft_ms,
             current_session_id: &mut state.current_session_id,
             current_run_id: &mut state.current_run_id,
@@ -1257,12 +1256,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if !ingest_is_fatal && !response_guard_blocked {
         let turn = session_turn_number(state);
         let session_id = state.current_session_id.clone();
-        let model_id = state
-            .skills
-            .model_override
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-        if let Some(ref mut pipeline_sess) = state.pipeline_session {
+        let model_id = state.current_model_identity().map(str::to_string);
+        if let (Some(pipeline_sess), Some(model_id)) =
+            (&mut state.pipeline_session, model_id.as_deref())
+        {
             let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
                 turn_result.accum.prompt_tokens,
                 turn_result.accum.cache_read_tokens,
@@ -1270,14 +1267,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 turn_result.accum.completion_tokens,
                 false,
             );
-            pipeline_sess.record_feedback(&model_id, "agentic_loop", &mut feedback, None);
+            pipeline_sess.record_feedback(model_id, "agentic_loop", &mut feedback, None);
 
             // Emit pipeline journal events for observability and cloud sync
             if let Some(ref mut buf) = state.turn_event_buffer {
                 // Per-turn feedback event
                 let feedback_evt =
                     astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
-                        turn, &model_id, &feedback,
+                        turn, model_id, &feedback,
                     );
                 if let Ok(payload) = serde_json::to_value(&feedback_evt) {
                     buf.record(
@@ -1305,6 +1302,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 // Evaluate trace alerts and emit them to the journal.
                 let alerts = astra_turn_core::trace_alert::evaluate_alerts(
                     turn,
+                    model_id,
                     &feedback,
                     &pipeline_sess.stats,
                     &pipeline_sess.recovery,
@@ -1345,6 +1343,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     }
                 }
             }
+        } else if state.pipeline_session.is_some() {
+            tracing::warn!(
+                target: "astra_runtime::agentic_loop",
+                turn,
+                "skipping model-scoped pipeline feedback without resolved model identity"
+            );
         }
         host.on_turn_completed(state);
     }
@@ -1674,7 +1678,7 @@ fn has_concrete_workspace_mutation(state: &AgenticLoopState) -> bool {
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.ok && !record.is_synthetic_placeholder())
+        .filter(|record| record.was_executed() && record.ok)
         .any(tool_record_is_workspace_mutation)
 }
 
@@ -1728,7 +1732,7 @@ pub(crate) fn parallel_batching_advisory_message(streak: usize, original_query: 
 fn tool_record_is_git_commit_action(
     record: &astra_services::session_journal::ToolCallRecord,
 ) -> bool {
-    if !record.ok || record.name != "git" {
+    if !record.was_executed() || !record.ok || record.name != "git" {
         return false;
     }
     record
@@ -1914,14 +1918,14 @@ fn latest_non_synthetic_round_records(
         .stall
         .tool_call_records
         .iter()
-        .filter(|rec| !rec.is_synthetic_placeholder())
+        .filter(|rec| rec.was_executed())
         .filter_map(|rec| rec.round)
         .max()?;
     let records = state
         .stall
         .tool_call_records
         .iter()
-        .filter(|rec| !rec.is_synthetic_placeholder())
+        .filter(|rec| rec.was_executed())
         .filter(|rec| rec.round == Some(last_round))
         .collect::<Vec<_>>();
     Some((last_round, records))
@@ -1945,7 +1949,7 @@ fn repeated_prior_signature(
         .stall
         .tool_call_records
         .iter()
-        .filter(|prior| !prior.is_synthetic_placeholder())
+        .filter(|prior| prior.was_executed())
         .filter(|prior| prior.round.is_some_and(|round| round < latest_round))
         .any(|prior| tool_call_retry_signature(prior) == signature)
 }
@@ -2114,7 +2118,7 @@ pub(crate) fn should_emit_execution_escalation_advisory(state: &AgenticLoopState
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder())
+        .filter(|record| record.was_executed())
         .filter(|record| record.ok)
         .collect();
 
@@ -2783,6 +2787,7 @@ mod tests {
     fn observe_turn_end_without_tools_records_outer_session_turn() {
         let mut state = make_state();
         state.session_turn = 6;
+        state.context_manifest_model_name = Some("test-model".to_string());
         state.max_turns = 20;
         state.remaining_turns = 4;
         state.total_prompt = 10_000;
@@ -4264,6 +4269,8 @@ mod tests {
                 skill_locked_out: None,
                 exit_semantics: None,
                 result_class: None,
+                error_kind: None,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
             });
         }
 
@@ -4788,6 +4795,7 @@ mod tests {
         let mut state = make_state();
         state.current_session_id = Some("session-1".to_string());
         state.session_turn = 6;
+        state.context_manifest_model_name = Some("test-model".to_string());
         state.turn_event_buffer = Some(TurnEventBuffer::begin_turn(
             state.current_session_id.as_deref(),
             state.session_turn,

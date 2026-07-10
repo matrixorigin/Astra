@@ -4065,6 +4065,7 @@ impl InProcessChatTurnBridge {
 
                     for alert in astra_turn_core::trace_alert::evaluate_alerts(
                         current_turn,
+                        capture_model,
                         &feedback,
                         &bridge_pipeline_baseline.stats,
                         &astra_turn_core::recovery_state::RecoveryState::default(),
@@ -4449,7 +4450,7 @@ impl InProcessChatTurnBridge {
                 .unwrap_or("")
                 .to_string();
             let evaluation = (!tool_call_records.is_empty()).then(|| {
-                let mut eval = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
+                crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
                     &user_message_for_eval,
                     &recent_tools_for_quality,
                     &tool_call_records,
@@ -4457,13 +4458,7 @@ impl InProcessChatTurnBridge {
                     verdict_warning,
                     budget_pressure,
                     crate::pipeline::evaluation::current_evaluation_thresholds(),
-                );
-                crate::pipeline::evaluation::apply_final_answer_relevance(
-                    &mut eval,
-                    &user_message_for_eval,
-                    &full_text,
-                );
-                eval
+                )
             });
             let tool_execution_ms: u64 = merged_tool_results
                 .iter()
@@ -8078,10 +8073,6 @@ mod tests {
             });
         assert!(!is_cjk, "should not detect CJK in English content");
     }
-
-    /// audit-#6: when tool events fail to persist after core events succeed,
-    /// the spawned persist task must emit a structured `tool_events_orphaned`
-    /// marker so log-based reconciliation can recover the lost data.
 
     /// audit-#11: `await_with_client_disconnect` must not use `biased;` —
     /// biasing toward the cancellation arm starves real work whenever the

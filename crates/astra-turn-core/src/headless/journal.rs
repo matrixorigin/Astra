@@ -1,7 +1,7 @@
 //! `ToolCallRecord` rows for headless early-exit paths.
 
 use astra_services::session_journal::{
-    BLOCKED_TOOL_RESULT_CLASS, NOOP_OR_CACHED_RESULT_CLASS, ToolCallRecord,
+    BLOCKED_TOOL_RESULT_CLASS, NOOP_OR_CACHED_RESULT_CLASS, ToolCallDisposition, ToolCallRecord,
 };
 
 #[must_use]
@@ -22,6 +22,7 @@ pub fn journal_record_duplicate_within_turn(
         surgically_removed: None,
         original_tool_name: None,
         result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
+        disposition: Some(ToolCallDisposition::Suppressed),
         ..Default::default()
     }
 }
@@ -88,6 +89,7 @@ pub fn journal_record_cross_turn_cache_hit(
         surgically_removed: None,
         original_tool_name: None,
         result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
+        disposition: Some(ToolCallDisposition::Reused),
         ..Default::default()
     }
 }
@@ -122,6 +124,8 @@ pub fn journal_record_unknown_tool(name: String, tool_elapsed_ms: u64) -> ToolCa
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        error_kind: Some(astra_core::ErrorKind::ToolNotFound),
+        disposition: Some(ToolCallDisposition::Rejected),
         ..Default::default()
     }
 }
@@ -147,6 +151,8 @@ pub fn journal_record_tool_not_admitted(
         surgically_removed: None,
         original_tool_name: None,
         result_class: None,
+        error_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+        disposition: Some(ToolCallDisposition::Rejected),
         ..Default::default()
     }
 }
@@ -161,6 +167,8 @@ pub fn journal_record_deferred_activation_hint(
     let mut record = journal_record_tool_not_admitted(name, args_preview, reason, tool_elapsed_ms);
     record.ok = true;
     record.result_class = Some(NOOP_OR_CACHED_RESULT_CLASS.to_string());
+    record.error_kind = None;
+    record.disposition = Some(ToolCallDisposition::Deferred);
     record
 }
 
@@ -184,6 +192,7 @@ pub fn journal_record_blocked_tool(
         surgically_removed: None,
         original_tool_name: None,
         result_class: Some(BLOCKED_TOOL_RESULT_CLASS.to_string()),
+        disposition: Some(ToolCallDisposition::Rejected),
         ..Default::default()
     }
 }
@@ -210,6 +219,7 @@ pub fn journal_record_suppressed_tool_retry(
         surgically_removed: None,
         original_tool_name: None,
         result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
+        disposition: Some(ToolCallDisposition::Deferred),
         ..Default::default()
     }
 }
@@ -266,6 +276,7 @@ pub fn journal_record_executed_tool_call(
         original_tool_name: None,
         args_full,
         result_full,
+        disposition: Some(ToolCallDisposition::Executed),
         ..Default::default()
     }
 }

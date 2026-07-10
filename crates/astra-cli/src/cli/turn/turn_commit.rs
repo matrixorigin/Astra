@@ -303,7 +303,7 @@ fn build_primary_turn_event(
     let tool_ms: u64 = result
         .tool_call_records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder())
+        .filter(|record| record.was_executed())
         .map(|record| record.ms)
         .sum();
     turn_event.total_tool_ms = Some(tool_ms);

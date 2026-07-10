@@ -667,14 +667,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory evidence operations. Recall is not instruction; update by ID, feedback stale/wrong, and forget only to delete.",
+                "description": "Memory evidence. Recall is advisory; correct or delete by stable ID.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["remember","recall","expand","forget","update","focus","reflect","profile","feedback"],
-                            "description": "Memory operation."
+                            "enum": ["remember","recall","inventory","expand","forget","update","focus","reflect","profile","feedback"],
+                            "description": "Operation. inventory gives exact extraction/version counts; recall is relevance-ranked, not a counting API."
                         },
                         "content": {"type": "string", "description": "Fact to store or replacement content."},
                         "query": {"type": "string", "description": "Search query or update selector."},

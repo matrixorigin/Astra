@@ -129,6 +129,14 @@ pub struct MemoryExtractionService {
     /// fingerprint every turn, defeating debounce. Entries are removed on
     /// [`Self::forget_session`] (session end).
     session_states: Arc<std::sync::Mutex<std::collections::HashMap<String, SessionMemoryState>>>,
+    /// Request-owner scoped service handles. Each owner gets isolated
+    /// debounce/in-flight maps while endpoint health, shutdown accounting,
+    /// ingestion, and the activity broker remain shared.
+    owner_scoped_services: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Weak<MemoryExtractionService>>,
+        >,
+    >,
     local_event_sink: Option<Arc<LocalJournalEventSink>>,
     require_local_current_snapshot: bool,
 }
@@ -166,6 +174,9 @@ impl MemoryExtractionService {
             pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_done: Arc::new(tokio::sync::Notify::new()),
             session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            owner_scoped_services: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             local_event_sink: None,
             require_local_current_snapshot: false,
         }
@@ -189,6 +200,55 @@ impl MemoryExtractionService {
     pub fn with_local_current_snapshot(mut self) -> Self {
         self.require_local_current_snapshot = true;
         self
+    }
+
+    /// Bind a multi-tenant service to the authenticated request owner.
+    ///
+    /// Repeated requests for the same owner share process-local admission and
+    /// debounce state; different owners cannot collide even if a client
+    /// supplies the same session id. Unsupported transport rebinding fails
+    /// closed, disabling extraction for that request rather than writing under
+    /// a bootstrap/default tenant.
+    pub fn scoped_to_owner(self: &Arc<Self>, user_id: &str) -> Result<Arc<Self>, String> {
+        let scope = astra_memoria::MemoryScope::new(user_id, "owner-binding-validation")?;
+        if self.user_id.as_ref() == scope.user_id.as_str() {
+            return Ok(Arc::clone(self));
+        }
+
+        let mut scoped = self
+            .owner_scoped_services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = scoped
+            .get(&scope.user_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(existing);
+        }
+
+        let service = Arc::new(Self {
+            selector_resolver: Arc::clone(&self.selector_resolver),
+            memoria_client: self.memoria_client.bind_owner(&scope.user_id)?,
+            ingestion: self.ingestion.clone(),
+            user_id: Arc::from(scope.user_id.as_str()),
+            health: Arc::clone(&self.health),
+            memoria_health: Arc::clone(&self.memoria_health),
+            work: Arc::new(std::sync::Mutex::new(SessionWorkCoordinator::default())),
+            broker: Arc::clone(&self.broker),
+            pending: Arc::clone(&self.pending),
+            pending_done: Arc::clone(&self.pending_done),
+            session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            owner_scoped_services: Arc::clone(&self.owner_scoped_services),
+            local_event_sink: self.local_event_sink.clone(),
+            require_local_current_snapshot: self.require_local_current_snapshot,
+        });
+        scoped.insert(scope.user_id, Arc::downgrade(&service));
+        Ok(service)
+    }
+
+    #[must_use]
+    pub fn owner_user_id(&self) -> &str {
+        &self.user_id
     }
 
     fn write_required_local_snapshot(&self, session_id: &str, content: &str) -> Result<(), String> {
@@ -423,7 +483,7 @@ impl MemoryExtractionService {
                     Some(req.session_id.as_str())
                 };
                 self.emit_skip_event(
-                    &req.user_id,
+                    &self.user_id,
                     sid_opt,
                     req.turn_number,
                     reason,
@@ -463,10 +523,41 @@ impl MemoryExtractionService {
 
     async fn run_one(self: Arc<Self>, req: ExtractionRequest, content_fingerprint: u64) {
         let session_id = req.session_id.clone();
-        let user_id = req.user_id.clone();
+        let user_id = self.user_id.to_string();
         let turn = req.turn_number;
         let messages_count = req.messages.len() as u32;
         let started = Instant::now();
+        // Process-local admission cannot see a worker that completed in a
+        // previous CLI process or server pod. Read the durable snapshot before
+        // spending selector tokens. A normal turn is idempotent once that
+        // snapshot covers it; explicit correction/undo requests may replace a
+        // same-turn snapshot with corrected state.
+        let current = self.load_current_memory_with_freshness(&session_id).await;
+        if current
+            .as_ref()
+            .and_then(|loaded| loaded.updated_turn)
+            .is_some_and(|updated_turn| updated_turn >= turn)
+            && !req.had_user_correction
+        {
+            self.mark_session_extracted(&session_id, content_fingerprint, turn);
+            let breadcrumbs = SessionMemoryExtractionBreadcrumbs {
+                messages_count: Some(messages_count),
+                selector_model: None,
+                attempt: None,
+                llm_reason: None,
+                llm_detail: None,
+                persist_detail: None,
+            };
+            self.emit_skip_event(
+                &user_id,
+                Some(&session_id),
+                turn,
+                SessionMemoryExtractionSkipReason::AlreadyCurrent,
+                &breadcrumbs,
+            );
+            return;
+        }
+        let current_memory = current.map(|loaded| loaded.content).unwrap_or_default();
         let selector_candidates = self.selector_resolver.resolve_candidates().await;
         let resolved_selector_model = selector_candidates
             .first()
@@ -498,11 +589,6 @@ impl MemoryExtractionService {
                 turn,
             });
         }
-
-        // Fetch current L1 so the extraction prompt can build on it.
-        // Any retrieve failure (Memoria offline, auth) → treat as no
-        // prior memory; the next write will just reset state.
-        let current_memory = self.load_current_memory(&session_id).await;
 
         let artifacts = run_extraction(
             &self.memoria_client,
@@ -958,18 +1044,22 @@ impl MemoryExtractionService {
             .mark_extracted(content_fingerprint, current_turn);
     }
 
-    async fn load_current_memory(&self, session_id: &str) -> String {
+    async fn load_current_memory_with_freshness(
+        &self,
+        session_id: &str,
+    ) -> Option<super::runner::LoadedSessionMemory> {
         if self.require_local_current_snapshot {
-            super::runner::load_current_session_memory_preferring_local(
+            super::runner::load_current_session_memory_preferring_local_with_freshness(
                 self.memoria_client.as_ref(),
                 session_id,
             )
             .await
-            .unwrap_or_default()
         } else {
-            super::runner::load_current_session_memory(self.memoria_client.as_ref(), session_id)
-                .await
-                .unwrap_or_default()
+            super::runner::load_current_session_memory_with_freshness(
+                self.memoria_client.as_ref(),
+                session_id,
+            )
+            .await
         }
     }
 
@@ -1081,11 +1171,33 @@ mod tests {
         async fn retrieve_ext(
             &self,
             _query: &str,
-            _session_id: Option<&str>,
+            session_id: Option<&str>,
             _top_k: usize,
             _filter_session: bool,
         ) -> Result<Vec<MemoriaMemory>, String> {
-            Ok(Vec::new())
+            Ok(self
+                .stored
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, stored_session_id))| {
+                    session_id.is_none_or(|expected| stored_session_id.as_deref() == Some(expected))
+                })
+                .map(
+                    |(index, (content, memory_type, stored_session_id))| MemoriaMemory {
+                        memory_id: format!("mem-{}", index + 1),
+                        content: content.clone(),
+                        memory_type: memory_type.clone(),
+                        retrieval_score: None,
+                        observed_at: None,
+                        updated_at: None,
+                        trust_tier: Some("T3".to_string()),
+                        session_id: stored_session_id.clone(),
+                        user_id: Some("test-user".to_string()),
+                    },
+                )
+                .collect())
         }
 
         async fn store(
@@ -1107,6 +1219,80 @@ mod tests {
             self.purged.lock().unwrap().push(session_id.to_string());
             Ok(0)
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct OwnerBindingMemoria {
+        owner: Option<String>,
+        bindings: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl MemoriaPort for OwnerBindingMemoria {
+        fn bind_owner(&self, user_id: &str) -> Result<Arc<dyn MemoriaPort>, String> {
+            let scope = astra_memoria::MemoryScope::new(user_id, "owner-binding-test")?;
+            self.bindings.lock().unwrap().push(scope.user_id.clone());
+            Ok(Arc::new(Self {
+                owner: Some(scope.user_id),
+                bindings: Arc::clone(&self.bindings),
+            }))
+        }
+
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<MemoriaMemory>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            self.owner
+                .as_ref()
+                .map(|owner| format!("memory-for-{owner}"))
+                .ok_or_else(|| "owner was not bound".to_string())
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn owner_scoped_services_are_cached_per_owner_and_isolate_session_state() {
+        let port = Arc::new(OwnerBindingMemoria::default());
+        let bindings = Arc::clone(&port.bindings);
+        let (tx, _rx) = IngestionSender::for_tests(16);
+        let root = Arc::new(MemoryExtractionService::new(
+            Arc::new(ConstSelectorResolver(None)),
+            port,
+            tx,
+            "bootstrap-owner",
+            Arc::new(BackgroundActivityBroker::new()),
+        ));
+
+        let alice_a = root.scoped_to_owner("alice").unwrap();
+        let alice_b = root.scoped_to_owner("alice").unwrap();
+        let bob = root.scoped_to_owner("bob").unwrap();
+
+        assert!(Arc::ptr_eq(&alice_a, &alice_b));
+        assert!(!Arc::ptr_eq(&alice_a, &bob));
+        assert_eq!(alice_a.owner_user_id(), "alice");
+        assert_eq!(bob.owner_user_id(), "bob");
+        assert_eq!(&*bindings.lock().unwrap(), &["alice", "bob"]);
+
+        alice_a.mark_session_extracted("same-session", 11, 2);
+        assert!(alice_a.peek_state("same-session").is_some());
+        assert!(bob.peek_state("same-session").is_none());
+        assert!(Arc::ptr_eq(&alice_a.pending, &bob.pending));
     }
 
     async fn spawn_json_server_with_status(
@@ -1174,7 +1360,6 @@ mod tests {
 
     fn sample_req(session_id: &str, _tokens: usize, had_error: bool) -> ExtractionRequest {
         ExtractionRequest {
-            user_id: "test-user".to_string(),
             session_id: session_id.to_string(),
             messages: vec![
                 json!({"role": "user", "content": "Design a durable runtime history boundary that separates root conversation history from child agent artifacts and keeps prompt cache stable."}),
@@ -1189,7 +1374,6 @@ mod tests {
 
     fn meaningful_shutdown_req(session_id: &str, _tokens: usize) -> ExtractionRequest {
         ExtractionRequest {
-            user_id: "test-user".to_string(),
             session_id: session_id.to_string(),
             messages: vec![
                 json!({"role": "user", "content": "Need a cache-safe session memory design that still captures shutdown summaries for short sessions and resumed work."}),
@@ -1204,7 +1388,6 @@ mod tests {
 
     fn low_information_req(session_id: &str, _tokens: usize) -> ExtractionRequest {
         ExtractionRequest {
-            user_id: "test-user".to_string(),
             session_id: session_id.to_string(),
             messages: vec![
                 json!({"role": "user", "content": "1+1"}),
@@ -1362,7 +1545,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingestion_event_uses_request_user_not_service_fallback_user() {
+    async fn ingestion_event_uses_service_owner_as_the_only_authoritative_user() {
         let (ingestion, mut rx) = IngestionSender::for_tests(8);
         let broker = Arc::new(BackgroundActivityBroker::new());
         let memoria = Arc::new(CapturingMemoria::default());
@@ -1370,11 +1553,10 @@ mod tests {
             Arc::new(ConstSelectorResolver(None)),
             memoria,
             ingestion,
-            "service-fallback-user",
+            "service-owner",
             broker,
         ));
-        let mut req = sample_req("sess-request-user", 1_000, false);
-        req.user_id = "request-user".to_string();
+        let req = sample_req("sess-service-owner", 1_000, false);
 
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
         svc.wait_for_pending(Duration::from_secs(2)).await;
@@ -1382,9 +1564,51 @@ mod tests {
         let events = collect_extraction_events(&mut rx);
         assert_eq!(events.len(), 1);
         assert_eq!(
-            events[0].user_id, "request-user",
-            "cloud ingestion identity must follow the run/request owner"
+            events[0].user_id, "service-owner",
+            "cloud ingestion identity must come from the owner-bound service"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_prevents_same_turn_reextraction_after_service_restart() {
+        let memoria = Arc::new(CapturingMemoria::default());
+        let (ingestion_a, _rx_a) = IngestionSender::for_tests(16);
+        let service_a = Arc::new(MemoryExtractionService::new(
+            Arc::new(ConstSelectorResolver(None)),
+            Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
+            ingestion_a,
+            "test-user",
+            Arc::new(BackgroundActivityBroker::new()),
+        ));
+        let mut first = sample_req("restart-idempotent", 1_000, false);
+        first.turn_number = 7;
+        assert_eq!(service_a.maybe_spawn(first.clone()), SpawnDecision::Spawned);
+        assert_eq!(service_a.wait_for_pending(Duration::from_secs(2)).await, 0);
+        assert_eq!(memoria.stored.lock().unwrap().len(), 1);
+
+        // A fresh coordinator has no process-local fingerprint state. It must
+        // still observe the durable snapshot and avoid a second selector/store.
+        let (ingestion_b, mut rx_b) = IngestionSender::for_tests(16);
+        let service_b = Arc::new(MemoryExtractionService::new(
+            Arc::new(ConstSelectorResolver(None)),
+            Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
+            ingestion_b,
+            "test-user",
+            Arc::new(BackgroundActivityBroker::new()),
+        ));
+        assert_eq!(service_b.maybe_spawn(first), SpawnDecision::Spawned);
+        assert_eq!(service_b.wait_for_pending(Duration::from_secs(2)).await, 0);
+        assert_eq!(
+            memoria.stored.lock().unwrap().len(),
+            1,
+            "same-turn restart must not write a second snapshot"
+        );
+        let events = collect_extraction_events(&mut rx_b);
+        assert!(events.iter().any(|event| {
+            event.metadata.as_ref().is_some_and(|metadata| {
+                metadata["outcome"] == "skipped" && metadata["reason"] == "already_current"
+            })
+        }));
     }
 
     #[tokio::test]
@@ -1486,7 +1710,6 @@ mod tests {
     async fn shutdown_flush_skips_trivial_session() {
         let ctx = build_ctx(None);
         let req = ExtractionRequest {
-            user_id: "test-user".to_string(),
             session_id: format!("shutdown-trivial-{}", nanos()),
             messages: vec![
                 json!({"role": "user", "content": "hi"}),
@@ -2340,7 +2563,6 @@ mod tests {
         let sid = format!("bc-skip-{}", nanos());
         // One-character input is rejected by the semantic-information gate.
         let req = ExtractionRequest {
-            user_id: "test-user".to_string(),
             session_id: sid,
             messages: vec![json!({"role": "user", "content": "x"})],
             session_facts: astra_turn_types::session_facts::SessionFacts::default(),

@@ -675,6 +675,7 @@ mod tests {
             selected_skills: None,
             tools_used: None,
             tool_calls: None,
+            tool_outcomes: None,
             budget_used: None,
             budget_pressure: None,
             stall_type: None,

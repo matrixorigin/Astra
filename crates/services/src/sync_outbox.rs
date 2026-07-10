@@ -560,6 +560,7 @@ impl SyncOutboxStore {
         let lock_path = self.root.join("outbox.lock");
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)?;
@@ -718,7 +719,7 @@ impl SyncOutboxFile {
 
     fn compact_acked_tombstones(&mut self) {
         self.acked_tombstones
-            .sort_by(|left, right| left.sequence.cmp(&right.sequence));
+            .sort_by_key(|tombstone| tombstone.sequence);
         let mut seen = HashSet::new();
         let mut deduped = Vec::with_capacity(self.acked_tombstones.len());
         for tombstone in self.acked_tombstones.iter().rev() {
@@ -1081,6 +1082,7 @@ mod tests {
         let lock_path = store.root.join("outbox.lock");
         let held_lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)

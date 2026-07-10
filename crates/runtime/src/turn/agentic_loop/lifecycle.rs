@@ -63,7 +63,7 @@ pub(crate) fn completed_tool_calls(state: &AgenticLoopState) -> u32 {
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder())
+        .filter(|record| record.was_executed())
         .count()
         .min(u32::MAX as usize) as u32
 }
@@ -673,7 +673,7 @@ fn recent_activity_supports_budget_extension(state: &AgenticLoopState) -> bool {
         .tool_call_records
         .iter()
         .rev()
-        .filter(|record| !record.is_synthetic_placeholder())
+        .filter(|record| record.was_executed())
         .take(8)
         .collect();
     if recent_records.is_empty() {

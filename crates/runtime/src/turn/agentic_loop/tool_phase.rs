@@ -943,9 +943,9 @@ async fn finalize_server_rollback_boundary(
     // parallel round has no side effects and must not revert successful
     // mutations. This prevents "one cognitive error trashes the whole round"
     // behavior that otherwise makes model action-history diverge from disk.
-    let failed_mutator_record = new_records
-        .iter()
-        .find(|record| !record.ok && tool_record_is_server_mutator(record));
+    let failed_mutator_record = new_records.iter().find(|record| {
+        record.was_executed() && !record.ok && tool_record_is_server_mutator(record)
+    });
     if let Some(failed_record) = failed_mutator_record {
         let file_rollback = if let Some(file_checkpoint) = active.file_checkpoint {
             (file_entries_added > 0).then(|| {
@@ -1330,13 +1330,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 .or_else(|| Some(format!("b-{obs_llm_round}-0")));
             // Re-borrow after consuming turn_event_buffer's mutable access.
             let new_records = &mut state.stall.tool_call_records[new_records_start..];
-            let has_parallel = new_records
-                .iter()
-                .filter(|r| !r.is_synthetic_placeholder())
-                .count()
-                > 1;
+            let has_parallel = new_records.iter().filter(|r| r.was_executed()).count() > 1;
             for rec in new_records.iter_mut() {
-                if rec.is_synthetic_placeholder() {
+                if !rec.was_executed() {
                     continue;
                 }
                 rec.batch_id = batch_id.clone();
@@ -1345,12 +1341,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 }
             }
             if has_parallel {
-                parallel_count_emit = Some(
-                    new_records
-                        .iter()
-                        .filter(|r| !r.is_synthetic_placeholder())
-                        .count(),
-                );
+                parallel_count_emit = Some(new_records.iter().filter(|r| r.was_executed()).count());
             }
         }
         let snapshot = state.stall.tool_call_records[new_records_start..].to_vec();
@@ -1422,7 +1413,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     {
         let samples: Vec<astra_core::ToolCallSample<'_>> = round_tool_calls
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
+            .filter(|r| r.was_executed())
             .map(|r| astra_core::ToolCallSample {
                 name: &r.name,
                 ok: r.ok,

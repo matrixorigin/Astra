@@ -5232,7 +5232,7 @@ async fn context_meta_exposes_late_round_guidance_signals() {
 }
 
 #[tokio::test]
-async fn analysis_turn_injects_circuit_breaker_correction_after_repetition_stall() {
+async fn analysis_turn_records_circuit_breaker_advisory_without_aborting_repetition() {
     let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks();
 
     let resp = chat_stream_start(
@@ -5310,22 +5310,17 @@ async fn analysis_turn_injects_circuit_breaker_correction_after_repetition_stall
         1,
         "observer should fire once for the completed turn"
     );
-    // Circuit breaker fires after 3 identical rounds (repetition stall).
-    // The correction message is ephemeral and stripped from state.messages
-    // before the observer sees them. Round 4 is served but the post-LLM
-    // check aborts before the tool phase runs, so only 3 tool results
-    // (from rounds 1-3) are in the observer payload.
-    //
-    // This also proves the circuit breaker fired: 4 mock rounds were provided
-    // but only 3 tool results reached the observer — the loop was cut short.
+    // Repetition is advisory evidence, not an execution boundary. The fourth
+    // identical call must complete so a valid investigation is never stopped
+    // merely because its tool shape repeats.
     let tool_result_count = requests[0]
         .messages
         .iter()
         .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
         .count();
     assert_eq!(
-        tool_result_count, 3,
-        "expected exactly 3 tool results (circuit breaker aborted after round 4 before tool phase), got {tool_result_count}"
+        tool_result_count, 4,
+        "circuit-breaker advice must not abort a repeated but otherwise valid tool phase; got {tool_result_count}"
     );
 }
 

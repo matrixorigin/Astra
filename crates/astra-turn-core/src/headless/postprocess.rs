@@ -30,17 +30,30 @@ pub struct HeadlessOutputEnrichCtx<'a> {
     pub turn_guard: &'a mut TurnGuard,
 }
 
+/// Inputs and mutable output for enriching one headless tool result.
+pub struct HeadlessOutputEnrichRequest<'a> {
+    pub name: &'a str,
+    pub result_str: &'a mut String,
+    pub is_err: &'a mut bool,
+    pub source_error_kind: Option<ErrorCategory>,
+    pub source_recovery_evidence: Option<&'a astra_core::ToolFailureEvidence>,
+    pub tool_already_restricted: bool,
+}
+
 /// `true` when resource-limit handling forced error-quality treatment (matches CLI `resource_limit_recorded`).
 pub fn enrich_headless_tool_output_for_errors_and_limits(
-    name: &str,
-    result_str: &mut String,
-    is_err: &mut bool,
-    source_error_kind: Option<ErrorCategory>,
-    source_recovery_evidence: Option<&astra_core::ToolFailureEvidence>,
-    tool_already_restricted: bool,
+    request: HeadlessOutputEnrichRequest<'_>,
     ctx: &mut HeadlessOutputEnrichCtx<'_>,
     mut on_signal: impl FnMut(HeadlessOutputEnrichSignal),
 ) -> bool {
+    let HeadlessOutputEnrichRequest {
+        name,
+        result_str,
+        is_err,
+        source_error_kind,
+        source_recovery_evidence,
+        tool_already_restricted,
+    } = request;
     let mut resource_limit_recorded = false;
 
     if *is_err && !tool_already_restricted {
@@ -264,12 +277,14 @@ mod tests {
             turn_guard: &mut tg,
         };
         let rec = enrich_headless_tool_output_for_errors_and_limits(
-            "bash",
-            &mut out,
-            &mut is_err,
-            None,
-            None,
-            false,
+            HeadlessOutputEnrichRequest {
+                name: "bash",
+                result_str: &mut out,
+                is_err: &mut is_err,
+                source_error_kind: None,
+                source_recovery_evidence: None,
+                tool_already_restricted: false,
+            },
             &mut ctx,
             |s| signals.push(s),
         );
@@ -294,12 +309,14 @@ mod tests {
         };
 
         let rec = enrich_headless_tool_output_for_errors_and_limits(
-            "read_file",
-            &mut out,
-            &mut is_err,
-            None,
-            None,
-            false,
+            HeadlessOutputEnrichRequest {
+                name: "read_file",
+                result_str: &mut out,
+                is_err: &mut is_err,
+                source_error_kind: None,
+                source_recovery_evidence: None,
+                tool_already_restricted: false,
+            },
             &mut ctx,
             |s| signals.push(s),
         );
@@ -323,12 +340,14 @@ mod tests {
             turn_guard: &mut tg,
         };
         let rec = enrich_headless_tool_output_for_errors_and_limits(
-            "bash",
-            &mut out,
-            &mut is_err,
-            None,
-            None,
-            false,
+            HeadlessOutputEnrichRequest {
+                name: "bash",
+                result_str: &mut out,
+                is_err: &mut is_err,
+                source_error_kind: None,
+                source_recovery_evidence: None,
+                tool_already_restricted: false,
+            },
             &mut ctx,
             |s| signals.push(s),
         );
@@ -358,12 +377,14 @@ mod tests {
         );
 
         enrich_headless_tool_output_for_errors_and_limits(
-            "read_file",
-            &mut output,
-            &mut is_error,
-            Some(astra_core::ErrorKind::ToolInvalidArgs),
-            Some(&evidence),
-            false,
+            HeadlessOutputEnrichRequest {
+                name: "read_file",
+                result_str: &mut output,
+                is_err: &mut is_error,
+                source_error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+                source_recovery_evidence: Some(&evidence),
+                tool_already_restricted: false,
+            },
             &mut context,
             |_| {},
         );

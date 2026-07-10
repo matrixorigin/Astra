@@ -702,12 +702,19 @@ fn select_latest_session_memory_snapshot(
     session_id: &str,
 ) -> Option<SessionMemorySnapshot> {
     let mut latest_active: Option<SessionMemorySnapshot> = None;
+    let mut latest_key: Option<(u32, &str, &str)> = None;
     for memory in memories {
         if let Some(snapshot) = decode_session_memory_snapshot(&memory.content, session_id) {
-            if latest_active
-                .as_ref()
-                .is_none_or(|best| snapshot.updated_turn >= best.updated_turn)
-            {
+            // Multiple pods may legitimately persist the same turn before a
+            // distributed claim is available. Use a stable total order so all
+            // readers converge regardless of backend response ordering.
+            let key = (
+                snapshot.updated_turn,
+                memory.memory_id.as_str(),
+                memory.content.as_str(),
+            );
+            if latest_key.is_none_or(|best| key > best) {
+                latest_key = Some(key);
                 latest_active = Some(snapshot);
             }
         }
@@ -1234,13 +1241,19 @@ async fn cleanup_prior_session_memory_entries(
     // whose delete endpoint silently does nothing.
     const PAGE_SIZE: usize = 16;
     const MAX_PAGES: usize = 8;
+    let current_turn = decode_session_memory_snapshot(current_encoded, session_id)
+        .map(|snapshot| snapshot.updated_turn)
+        .ok_or(SessionMemoryExtractionErrorReason::WriteFailed)?;
     let mut seen_memory_ids = std::collections::HashSet::new();
     for _ in 0..MAX_PAGES {
         let memories = retrieve_prior_session_memory_page(memoria, session_id, PAGE_SIZE).await?;
 
         let stale_candidates: Vec<&MemoriaMemory> = memories
             .iter()
-            .filter(|memory| decode_session_memory_snapshot(&memory.content, session_id).is_some())
+            .filter(|memory| {
+                decode_session_memory_snapshot(&memory.content, session_id)
+                    .is_some_and(|snapshot| snapshot.updated_turn < current_turn)
+            })
             .filter(|memory| {
                 if !current_memory_id.is_empty() {
                     memory.memory_id != current_memory_id
@@ -1280,7 +1293,10 @@ async fn cleanup_prior_session_memory_entries(
     let remaining = retrieve_prior_session_memory_page(memoria, session_id, PAGE_SIZE).await?;
     if !remaining
         .iter()
-        .filter(|memory| decode_session_memory_snapshot(&memory.content, session_id).is_some())
+        .filter(|memory| {
+            decode_session_memory_snapshot(&memory.content, session_id)
+                .is_some_and(|snapshot| snapshot.updated_turn < current_turn)
+        })
         .any(|memory| {
             if !current_memory_id.is_empty() {
                 memory.memory_id != current_memory_id
@@ -2498,6 +2514,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_never_deletes_competing_same_or_newer_turn_snapshots() {
+        let encode = |turn, state: &str| {
+            SessionMemorySnapshot::from_markdown(
+                "sess-race",
+                &format!("# Session Memory\n\n## Current State\n- {state}\n"),
+                turn,
+                SessionFacts::default(),
+            )
+            .to_memory_entry()
+            .encode()
+        };
+        let current = encode(3, "writer-a");
+        let memoria = Arc::new(CapturingMemoria::default());
+        memoria.retrieve_results.lock().unwrap().extend([
+            MemoriaMemory {
+                memory_id: "writer-b-turn-3".to_string(),
+                content: encode(3, "writer-b"),
+                memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+                session_id: Some("sess-race".to_string()),
+                ..Default::default()
+            },
+            MemoriaMemory {
+                memory_id: "writer-newer-turn-4".to_string(),
+                content: encode(4, "writer-newer"),
+                memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+                session_id: Some("sess-race".to_string()),
+                ..Default::default()
+            },
+            MemoriaMemory {
+                memory_id: "stale-turn-2".to_string(),
+                content: encode(2, "stale"),
+                memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+                session_id: Some("sess-race".to_string()),
+                ..Default::default()
+            },
+        ]);
+        let memoria_dyn = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
+
+        let _ = cleanup_prior_session_memory_entries(
+            &memoria_dyn,
+            "sess-race",
+            "writer-a-turn-3",
+            &current,
+        )
+        .await;
+
+        assert_eq!(
+            memoria.deleted.lock().unwrap().as_slice(),
+            ["stale-turn-2"],
+            "concurrent writers may only collect versions older than their own"
+        );
+    }
+
+    #[test]
+    fn equal_turn_snapshot_selection_is_independent_of_backend_order() {
+        let memory = |memory_id: &str, state: &str| MemoriaMemory {
+            memory_id: memory_id.to_string(),
+            content: SessionMemorySnapshot::from_markdown(
+                "sess-tie",
+                &format!("# Session Memory\n\n## Current State\n- {state}\n"),
+                5,
+                SessionFacts::default(),
+            )
+            .to_memory_entry()
+            .encode(),
+            memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+            session_id: Some("sess-tie".to_string()),
+            ..Default::default()
+        };
+        let lower = memory("memory-a", "writer-a");
+        let higher = memory("memory-b", "writer-b");
+
+        let forward =
+            select_latest_session_memory_snapshot(&[lower.clone(), higher.clone()], "sess-tie")
+                .unwrap();
+        let reverse = select_latest_session_memory_snapshot(&[higher, lower], "sess-tie").unwrap();
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.updated_turn, 5);
+        assert_eq!(forward.narrative.current_state, vec!["writer-b"]);
+    }
+
+    #[tokio::test]
     async fn run_extraction_keeps_success_when_stale_snapshot_cleanup_fails() {
         let memoria = Arc::new(DeleteFailMemoria {
             retrieve_results: vec![MemoriaMemory {
@@ -2655,7 +2754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_current_session_memory_returns_only_matching_active_entry() {
+    async fn load_current_session_memory_fails_closed_on_mixed_session_response() {
         let memoria = CapturingMemoria {
             retrieve_results: Mutex::new(vec![
                 MemoriaMemory {
@@ -2674,6 +2773,13 @@ mod tests {
             ..Default::default()
         };
 
+        assert!(
+            load_current_session_memory(&memoria, "sess-42")
+                .await
+                .is_none(),
+            "a strict response containing any foreign session must be rejected as a whole"
+        );
+        memoria.retrieve_results.lock().unwrap().remove(0);
         let loaded = load_current_session_memory(&memoria, "sess-42")
             .await
             .expect("matching session memory should load");
@@ -2888,6 +2994,7 @@ mod tests {
         let memoria = CapturingMemoria {
             retrieve_results: Mutex::new(vec![MemoriaMemory {
                 memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+                session_id: Some(session_id.to_string()),
                 content: SessionMemorySnapshot::from_markdown(
                     session_id,
                     "# Session Memory\n\n## Current State\n- remote snapshot",

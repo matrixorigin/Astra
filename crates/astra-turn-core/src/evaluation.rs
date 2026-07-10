@@ -93,12 +93,6 @@ pub enum EvalSignal {
     /// still user-visible failed tool attempts and must not be evaluated as
     /// healthy execution.
     BlockedToolCall { count: usize },
-    /// The final answer had no lexical overlap with the latest user request,
-    /// so tool success alone is not enough to call the turn successful.
-    FinalAnswerOffTarget {
-        matched_terms: usize,
-        required_terms: usize,
-    },
 }
 
 /// Default threshold for [`EvalSignal::RedundantOverlappingReads`]: minimum
@@ -496,14 +490,12 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     thresholds: EvaluationThresholds,
     telemetry: TurnEvaluationTelemetry,
 ) -> TurnEvaluation {
-    // Synthetic placeholders (skill skipped/deferred, surgically removed
-    // parallel tool calls) are audit-only records that do NOT represent real
-    // tool execution. Blocked calls are different: they did not execute, but
-    // they are real user-visible failed tool attempts and must contribute to
-    // tool_error_rate so health cannot claim all tools were healthy.
+    // Execution health is computed only from calls that reached an executor.
+    // Rejected, reused, suppressed, and deferred requests remain available as
+    // typed audit evidence but must not be mislabeled as execution failures.
     let tool_calls = tool_call_records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder() || counts_as_noop_metric_record(record))
+        .filter(|record| record_was_executed(record) || counts_as_noop_metric_record(record))
         .map(|record| ToolCallInfo {
             name: record.name.clone(),
             // Prefer the *untruncated* args for the repeat-key. `args_preview`
@@ -660,304 +652,21 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     eval
 }
 
-pub fn apply_final_answer_relevance(
-    eval: &mut TurnEvaluation,
-    latest_user_message: &str,
-    final_answer: &str,
-) {
-    let Some(signal) = final_answer_relevance_signal(latest_user_message, final_answer) else {
-        return;
-    };
-    eval.signals
-        .retain(|signal| !matches!(signal, EvalSignal::AllToolsHealthy));
-    eval.signals.push(signal);
-    eval.success = false;
-    eval.quality = eval.quality.min(0.25);
-    eval.confidence = eval.confidence.max(0.75);
-}
-
-pub fn final_answer_relevance_signal(
-    latest_user_message: &str,
-    final_answer: &str,
-) -> Option<EvalSignal> {
-    let required = relevance_terms(latest_user_message);
-    if required.len() < 2 || final_answer.trim().is_empty() {
-        return None;
-    }
-    let answer_terms = relevance_terms(final_answer);
-    if answer_starts_with_direct_response(final_answer)
-        || answer_is_concise_work_status(&answer_terms)
-    {
-        return None;
-    }
-    if !answer_has_stale_work_artifact(final_answer, &answer_terms) {
-        return None;
-    }
-    let matched = required
-        .iter()
-        .filter(|term| answer_terms.contains(*term))
-        .count();
-    if matched == 0 {
-        Some(EvalSignal::FinalAnswerOffTarget {
-            matched_terms: matched,
-            required_terms: required.len(),
-        })
-    } else {
-        None
-    }
-}
-
-fn answer_is_concise_work_status(answer_terms: &std::collections::HashSet<String>) -> bool {
-    // Lexical relevance is a high-precision old-answer detector, not a
-    // semantic judge. A short status/completion answer after tool work
-    // ("Done.", "Reported to parent.", "Fan-out complete.") is too small to
-    // prove task drift, so forcing another LLM round is overkill and commonly
-    // burns the remaining scripted/real turn budget. Keep flagging contentful
-    // off-target syntheses such as stale diffs, line counts, or summaries.
-    const MAX_CONCISE_STATUS_TERMS: usize = 8;
-    const WORK_STATUS_TERMS: &[&str] = &[
-        "analyzed",
-        "analysed",
-        "complete",
-        "completed",
-        "done",
-        "finished",
-        "fixed",
-        "following",
-        "implemented",
-        "passed",
-        "read",
-        "recovered",
-        "reported",
-        "updated",
-        "written",
-    ];
-
-    !answer_terms.is_empty()
-        && answer_terms.len() <= MAX_CONCISE_STATUS_TERMS
-        && WORK_STATUS_TERMS
-            .iter()
-            .any(|term| answer_terms.contains(*term))
-}
-
-fn answer_has_stale_work_artifact(
-    final_answer: &str,
-    answer_terms: &std::collections::HashSet<String>,
-) -> bool {
-    // This guard is intentionally conservative: lexical non-overlap is not
-    // enough to prove drift. Only force a retry when the answer looks like a
-    // concrete stale work artifact from another turn (diff stats, commits,
-    // file/line counts, build/test failure summaries, etc.) or a runtime
-    // scaffolding fallback ("session context unavailable", "awaiting your
-    // next instruction") that clearly did not answer the user. Generic short
-    // synthesis like "Here is my summary." or "Final answer from skill output."
-    // may be low quality, but it is not a reliable stale-answer signal.
-    const STALE_WORK_ARTIFACT_TERMS: &[&str] = &[
-        "branch",
-        "branches",
-        "build",
-        "changed",
-        "commit",
-        "commits",
-        "coverage",
-        "delete",
-        "deleted",
-        "deletions",
-        "diff",
-        "error",
-        "errors",
-        "fail",
-        "failed",
-        "failures",
-        "file",
-        "files",
-        "insertions",
-        "line",
-        "lines",
-        "patch",
-        "test",
-        "tests",
-        "workspace",
-    ];
-
-    if final_answer.chars().any(|ch| ch.is_ascii_digit()) {
-        return true;
-    }
-    if answer_has_runtime_scaffolding_artifact(answer_terms) {
-        return true;
-    }
-    STALE_WORK_ARTIFACT_TERMS
-        .iter()
-        .filter(|term| answer_terms.contains(**term))
-        .take(2)
-        .count()
-        >= 2
-}
-
-fn answer_has_runtime_scaffolding_artifact(
-    answer_terms: &std::collections::HashSet<String>,
-) -> bool {
-    const RUNTIME_CONTEXT_TERMS: &[&str] = &[
-        "context",
-        "executor",
-        "history",
-        "prompt",
-        "resume",
-        "runtime",
-        "session",
-        "workspace",
-    ];
-    const NON_ANSWER_TERMS: &[&str] = &[
-        "awaiting",
-        "bound",
-        "degraded",
-        "incomplete",
-        "instruction",
-        "prior",
-        "restored",
-        "unavailable",
-    ];
-
-    let context_terms = RUNTIME_CONTEXT_TERMS
-        .iter()
-        .filter(|term| answer_terms.contains(**term))
-        .take(2)
-        .count();
-    let has_non_answer_term = NON_ANSWER_TERMS
-        .iter()
-        .any(|term| answer_terms.contains(*term));
-
-    context_terms >= 2 && has_non_answer_term
-}
-
 fn counts_as_noop_metric_record(record: &ToolCallRecord) -> bool {
     record.ok
         && record.is_noop_or_cached_result()
+        && matches!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Reused
+                | astra_services::session_journal::ToolCallDisposition::Suppressed
+        )
         && record.surgically_removed != Some(true)
         && record.skill_reentry_count.is_none()
         && record.skill_locked_out != Some(true)
 }
 
-fn relevance_terms(text: &str) -> std::collections::HashSet<String> {
-    let mut terms = std::collections::HashSet::new();
-    let mut ascii = String::new();
-    let mut cjk_run = String::new();
-
-    fn flush_ascii(buf: &mut String, terms: &mut std::collections::HashSet<String>) {
-        if buf.len() >= 3 && !is_relevance_stop_word(buf) {
-            terms.insert(buf.clone());
-        }
-        buf.clear();
-    }
-
-    fn flush_cjk(buf: &mut String, terms: &mut std::collections::HashSet<String>) {
-        let chars = buf.chars().collect::<Vec<_>>();
-        if chars.len() >= 2 {
-            for window in chars.windows(2) {
-                terms.insert(window.iter().collect::<String>());
-            }
-            for ch in chars {
-                if !is_cjk_stop_char(ch) {
-                    terms.insert(ch.to_string());
-                }
-            }
-        }
-        buf.clear();
-    }
-
-    for ch in text.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            flush_cjk(&mut cjk_run, &mut terms);
-            ascii.push(ch);
-        } else if is_cjk(ch) {
-            flush_ascii(&mut ascii, &mut terms);
-            cjk_run.push(ch);
-        } else {
-            flush_ascii(&mut ascii, &mut terms);
-            flush_cjk(&mut cjk_run, &mut terms);
-        }
-    }
-    flush_ascii(&mut ascii, &mut terms);
-    flush_cjk(&mut cjk_run, &mut terms);
-    terms
-}
-
-fn is_cjk(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF | 0x2A700..=0x2B73F
-    )
-}
-
-fn is_relevance_stop_word(word: &str) -> bool {
-    matches!(
-        word,
-        "the"
-            | "and"
-            | "for"
-            | "you"
-            | "are"
-            | "can"
-            | "could"
-            | "would"
-            | "should"
-            | "what"
-            | "why"
-            | "how"
-            | "this"
-            | "that"
-            | "with"
-            | "from"
-            | "into"
-            | "about"
-            | "please"
-    )
-}
-
-fn is_cjk_stop_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '的' | '了'
-            | '是'
-            | '在'
-            | '我'
-            | '你'
-            | '他'
-            | '她'
-            | '它'
-            | '这'
-            | '那'
-            | '和'
-            | '与'
-            | '或'
-            | '及'
-            | '吗'
-            | '呢'
-            | '啊'
-            | '吧'
-    )
-}
-
-fn answer_starts_with_direct_response(final_answer: &str) -> bool {
-    let trimmed = final_answer
-        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '-' | '*' | '#'))
-        .to_ascii_lowercase();
-    matches!(
-        trimmed.as_str(),
-        s if s.starts_with("yes")
-            || s.starts_with("no")
-            || s.starts_with("not yet")
-            || s.starts_with("it is")
-            || s.starts_with("it isn't")
-            || s.starts_with("it is not")
-            || s.starts_with("是")
-            || s.starts_with("不是")
-            || s.starts_with("否")
-            || s.starts_with("不够")
-            || s.starts_with("够")
-            || s.starts_with("可以")
-            || s.starts_with("不能")
-    )
+fn record_was_executed(record: &ToolCallRecord) -> bool {
+    record.effective_disposition() == astra_services::session_journal::ToolCallDisposition::Executed
 }
 
 fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
@@ -978,7 +687,6 @@ fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
             | EvalSignal::HighCostLowYield { .. }
             | EvalSignal::ToolOutcomeFailure { .. }
             | EvalSignal::BlockedToolCall { .. }
-            | EvalSignal::FinalAnswerOffTarget { .. }
     )
 }
 
@@ -1146,7 +854,7 @@ fn unresolved_tool_outcome_failure_counts(
     let mut unresolved_by_key = std::collections::BTreeMap::<String, String>::new();
 
     for record in records {
-        if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
+        if !record_was_executed(record) {
             continue;
         }
         let Some(class) = effective_tool_result_class(record) else {
@@ -1223,7 +931,7 @@ fn apply_blocked_tool_failures(eval: &mut TurnEvaluation, records: &[ToolCallRec
 
     let real_call_count = records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder())
+        .filter(|record| record_was_executed(record) || record.was_blocked_by_policy())
         .count()
         .max(1);
     if blocked == real_call_count || blocked.saturating_mul(2) >= real_call_count {
@@ -1321,7 +1029,7 @@ fn longest_exploration_family_round_streak(
 
     let mut per_round: BTreeMap<u32, RoundState> = BTreeMap::new();
     for record in records {
-        if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
+        if !record_was_executed(record) {
             continue;
         }
         let Some(round) = record.round else { continue };
@@ -1421,7 +1129,7 @@ fn is_search_like_tool_call(name: &str, args: &str) -> bool {
 pub fn count_search_fanout(records: &[ToolCallRecord]) -> usize {
     records
         .iter()
-        .filter(|rec| !rec.is_synthetic_placeholder() && !rec.was_blocked_by_policy())
+        .filter(|rec| record_was_executed(rec))
         .filter(|rec| is_search_like_tool_call(&rec.name, rec.args_full.as_deref().unwrap_or("")))
         .count()
 }
@@ -1484,7 +1192,7 @@ fn max_redundant_validation_retries(records: &[ToolCallRecord]) -> usize {
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut best = 0usize;
     for rec in records {
-        if rec.is_synthetic_placeholder() || rec.was_blocked_by_policy() {
+        if !record_was_executed(rec) {
             continue;
         }
         let args = rec.args_full.as_deref().unwrap_or("");
@@ -1667,7 +1375,7 @@ pub fn count_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
     let mut per_file: HashMap<String, Vec<ReadRange>> = HashMap::new();
     let mut redundant = 0usize;
     for rec in records {
-        if rec.is_synthetic_placeholder() || rec.was_blocked_by_policy() {
+        if !record_was_executed(rec) {
             continue;
         }
         let args = rec.args_full.as_deref().unwrap_or("");
@@ -1832,15 +1540,6 @@ pub fn eval_signal_to_json_with_thresholds(
             "count": count,
             "message": format!("Detected {count} blocked tool call(s)"),
         }),
-        EvalSignal::FinalAnswerOffTarget {
-            matched_terms,
-            required_terms,
-        } => json!({
-            "kind": "final_answer_off_target",
-            "matched_terms": matched_terms,
-            "required_terms": required_terms,
-            "message": "Final answer did not lexically overlap with the latest user request; tool activity alone cannot mark the turn successful",
-        }),
     }
 }
 pub fn eval_signals_to_json_with_thresholds(
@@ -1877,11 +1576,11 @@ pub fn build_turn_evaluation_journal_event(
         budget_pressure,
         stall_count,
         verdict_warning,
-        // Exclude synthetic placeholders (surgical removals, skipped skills) from
-        // the user-visible tool_call_count — they are audit-only records.
+        // Count only calls that reached an executor. Admission/cache/suppression
+        // dimensions are persisted separately in the turn outcome ledger.
         tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
+            .filter(|r| record_was_executed(r))
             .count(),
         eval_signals_to_json_with_thresholds(&eval.signals, eval.thresholds),
     )
@@ -1943,132 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn final_answer_relevance_flags_old_answer_to_new_question() {
-        let signal = final_answer_relevance_signal(
-            "相关的测试够硬核吗？",
-            "148 files changed, +9498 / -2335 lines, 11 commits.",
-        );
-
-        assert!(
-            matches!(signal, Some(EvalSignal::FinalAnswerOffTarget { .. })),
-            "obvious old-answer synthesis must be flagged: {signal:?}"
-        );
-    }
-
-    #[test]
-    fn final_answer_relevance_accepts_answer_covering_latest_question() {
-        let signal = final_answer_relevance_signal(
-            "相关的测试够硬核吗？",
-            "测试覆盖了 provider routing、edge offline、prompt cache 和 unhappy path，但还缺一次全量在线回归。",
-        );
-
-        assert_eq!(signal, None);
-    }
-
-    #[test]
-    fn final_answer_relevance_accepts_direct_short_answers() {
-        assert_eq!(
-            final_answer_relevance_signal("相关的测试够硬核吗？", "不够，还缺全量在线回归。"),
-            None
-        );
-        assert_eq!(
-            final_answer_relevance_signal("are the tests robust enough?", "No, not yet."),
-            None
-        );
-    }
-
-    #[test]
-    fn final_answer_relevance_accepts_concise_work_status_answers() {
-        for answer in [
-            "Done.",
-            "Reported to parent.",
-            "Read the file.",
-            "Fan-out complete.",
-            "Mixed delegation + tool complete.",
-            "Done! Tests written based on delegation results.",
-        ] {
-            assert_eq!(
-                final_answer_relevance_signal("test query", answer),
-                None,
-                "concise work status should not force another LLM round: {answer}"
-            );
-        }
-    }
-
-    #[test]
-    fn final_answer_relevance_accepts_generic_short_synthesis() {
-        for answer in [
-            "Here is my summary.",
-            "Compacted result.",
-            "Final answer from skill output.",
-        ] {
-            assert_eq!(
-                final_answer_relevance_signal("analyze code", answer),
-                None,
-                "generic synthesis is not a high-confidence stale answer: {answer}"
-            );
-        }
-    }
-
-    #[test]
-    fn final_answer_relevance_accepts_concise_tool_result_summaries() {
-        assert_eq!(
-            final_answer_relevance_signal("git status", "Workspace is clean."),
-            None
-        );
-    }
-
-    #[test]
-    fn final_answer_relevance_flags_runtime_scaffolding_instead_of_answer() {
-        let signal = final_answer_relevance_signal(
-            "有哪些子目录",
-            "Session context was unavailable or incomplete in this runtime \
-             (degraded resume — no prior prompt-facing history restored). \
-             Workspace is bound and ready with the executor online.\n\n\
-             Awaiting your next instruction.",
-        );
-
-        assert!(
-            matches!(signal, Some(EvalSignal::FinalAnswerOffTarget { .. })),
-            "runtime scaffolding fallback must be treated as off-target: {signal:?}"
-        );
-    }
-
-    #[test]
-    fn apply_final_answer_relevance_downgrades_tool_success_when_answer_is_off_target() {
-        let mut eval = TurnEvaluation {
-            success: true,
-            quality: 0.8,
-            confidence: 0.6,
-            signals: vec![EvalSignal::AllToolsHealthy],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        apply_final_answer_relevance(
-            &mut eval,
-            "are the tests robust enough?",
-            "148 files changed, +9498 / -2335 lines, 11 commits.",
-        );
-
-        assert!(!eval.success);
-        assert!(eval.quality <= 0.25);
-        assert!(eval.confidence >= 0.75);
-        assert!(
-            eval.signals
-                .iter()
-                .any(|signal| matches!(signal, EvalSignal::FinalAnswerOffTarget { .. }))
-        );
-        assert!(
-            !eval
-                .signals
-                .iter()
-                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
-            "tool success must not mask an off-target final answer"
-        );
-    }
-
-    #[test]
-    fn blocked_tool_calls_are_evaluation_failures_not_healthy_execution() {
+    fn blocked_tool_calls_fail_the_boundary_without_poisoning_execution_health() {
         let records = vec![ToolCallRecord {
             name: "memory".to_string(),
             ok: false,
@@ -2091,10 +1665,10 @@ mod tests {
 
         assert!(!eval.success);
         assert!(
-            eval.signals
+            !eval.signals
                 .iter()
                 .any(|signal| matches!(signal, EvalSignal::ToolErrorRate(rate) if (*rate - 1.0).abs() < f64::EPSILON)),
-            "blocked calls must contribute to tool_error_rate: {:?}",
+            "blocked calls did not execute and must not contribute to tool_error_rate: {:?}",
             eval.signals
         );
         assert!(
@@ -2125,7 +1699,7 @@ mod tests {
             &eval,
         );
         let metadata = event.metadata.expect("turn evaluation metadata");
-        assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["tool_call_count"], 0);
         assert!(
             metadata["signals"]
                 .as_array()

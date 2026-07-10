@@ -213,20 +213,14 @@ pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
     astra_turn_core::plan_mode_policy::is_plan_mode_blocked_tool(tool, args)
 }
 
-fn git_stash_action_args(args: &Value) -> Value {
-    let stash_action = args
-        .get("sub_action")
-        .or_else(|| args.get("stash_action"))
-        .and_then(Value::as_str);
-    let Some(stash_action) = stash_action else {
+fn git_stash_sub_action_args(args: &Value) -> Value {
+    let sub_action = args.get("sub_action").and_then(Value::as_str);
+    let Some(sub_action) = sub_action else {
         return args.clone();
     };
 
     let mut map = args.as_object().cloned().unwrap_or_default();
-    map.insert(
-        "action".to_string(),
-        Value::String(stash_action.to_string()),
-    );
+    map.insert("action".to_string(), Value::String(sub_action.to_string()));
     Value::Object(map)
 }
 
@@ -426,11 +420,19 @@ fn cli_tool_output_is_error(output: &str) -> bool {
 
 pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;
 
-pub(crate) fn noop_or_cached_tool_result_fields() -> serde_json::Map<String, Value> {
-    serde_json::Map::from_iter([(
-        "result_class".to_string(),
-        Value::String(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string()),
-    )])
+pub(crate) fn nonexecuted_tool_result_fields(
+    disposition: astra_services::session_journal::ToolCallDisposition,
+) -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([
+        (
+            "result_class".to_string(),
+            Value::String(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string()),
+        ),
+        (
+            "disposition".to_string(),
+            serde_json::to_value(disposition).expect("tool disposition must serialize"),
+        ),
+    ])
 }
 
 fn sandbox_denied_outcome_from_output(output: &str) -> Option<ToolExecutionOutcome> {
@@ -492,6 +494,22 @@ impl EdgeToolRun {
             output,
             error_kind: Some(kind),
             tool_result_fields: None,
+        }
+    }
+
+    fn failure_evidence(output: String, evidence: astra_core::ToolFailureEvidence) -> Self {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "disposition".to_string(),
+            serde_json::Value::String("rejected".to_string()),
+        );
+        if let Ok(value) = serde_json::to_value(&evidence) {
+            fields.insert("recovery_evidence".to_string(), value);
+        }
+        Self {
+            output,
+            error_kind: Some(evidence.kind),
+            tool_result_fields: Some(fields),
         }
     }
 
@@ -4439,7 +4457,7 @@ impl ToolExecutor {
                     return outcome;
                 }
                 astra_tools::git_tool_contract::GitAction::Stash => {
-                    let stash_args = git_stash_action_args(args);
+                    let stash_args = git_stash_sub_action_args(args);
                     let mut outcome = self.stash_with_metadata(&stash_args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
@@ -4476,6 +4494,11 @@ impl ToolExecutor {
     async fn execute_run(&self, name: &str, args: &Value) -> EdgeToolRun {
         if let Some(error) = self.tool_admission_denial(name, args) {
             return error;
+        }
+        if name == "git"
+            && let Err(error) = astra_tools::git_gix::validate_git_request(&self.project_root, args)
+        {
+            return EdgeToolRun::failure_evidence(error.message, error.evidence);
         }
         let mut tool_result_fields = None;
         let output = self.execute_raw(name, args, &mut tool_result_fields).await;
@@ -4601,7 +4624,7 @@ impl ToolExecutor {
                             self.revert_commit(args)
                         }
                         astra_tools::git_tool_contract::GitAction::Stash => {
-                            let stash_args = git_stash_action_args(args);
+                            let stash_args = git_stash_sub_action_args(args);
                             self.stash(&stash_args)
                         }
                         astra_tools::git_tool_contract::GitAction::CheckoutFile => {
@@ -4689,6 +4712,26 @@ impl ToolExecutor {
                             Ok(action) => action,
                             Err(error) => return format!("Error: {error}"),
                         };
+                    if action == astra_tools::memory_tool_contract::MemoryAction::Inventory {
+                        let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty())
+                        else {
+                            return "Error: memory inventory requires an active session_id"
+                                .to_string();
+                        };
+                        let inventory = match astra_services::session_memory_inventory::load_local_session_memory_inventory(
+                            &session_id,
+                        ) {
+                            Ok(inventory) => inventory,
+                            Err(error) => {
+                                return format!(
+                                    "Error: session memory inventory failed: {error}"
+                                );
+                            }
+                        };
+                        return serde_json::to_string(&inventory).unwrap_or_else(|error| {
+                            format!("Error: serialize session memory inventory: {error}")
+                        });
+                    }
                     let clean_args = self.memory_args_with_context(args);
                     self.memoria_call(action.as_str(), &clean_args).await
                 }
@@ -5687,13 +5730,20 @@ mod tests {
         AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputSnapshot, PERSIST_THRESHOLD, ToolExecutor,
         all_tool_schemas, detect_git_remote_repos, extract_github_owner_repo,
         file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
-        format_background_task_output_timeout, format_background_task_stop_error, memoria,
-        parse_memory_search_contents, utf16_col_to_char_idx,
+        format_background_task_output_timeout, format_background_task_stop_error,
+        git_stash_sub_action_args, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
     };
     use crate::lock_recovery::LockRecovery;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[test]
+    fn git_stash_bridge_remaps_canonical_sub_action() {
+        let canonical =
+            git_stash_sub_action_args(&serde_json::json!({"action":"stash","sub_action":"push"}));
+        assert_eq!(canonical["action"], "push");
+    }
 
     struct ImmediateSpawnExecutor;
 
@@ -5816,6 +5866,24 @@ mod tests {
             "shared trait must return the CLI tool output, got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn cli_git_invalid_path_preserves_typed_source_evidence() {
+        let (_dir, executor) = temp_executor();
+
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "git",
+            &serde_json::json!({"action": "diff", "path": "missing.rs"}),
+        )
+        .await;
+
+        assert!(result.is_error, "{result:?}");
+        let metadata = result.metadata.expect("typed validation metadata");
+        assert_eq!(metadata["error_kind"], "tool_invalid_args");
+        assert_eq!(metadata["recovery_evidence"]["cause"], "resource_missing");
+        assert_eq!(metadata["recovery_evidence"]["retryable"], false);
     }
 
     #[test]
@@ -7933,6 +8001,58 @@ mod tests {
         assert!(args.get("action").is_none());
         assert_eq!(args["session_id"].as_str(), Some("mem-session"));
         assert_eq!(args["turn"].as_u64(), Some(9));
+    }
+
+    #[tokio::test]
+    async fn memory_inventory_reads_authoritative_local_journal_without_memoria_recall() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "cli-memory-inventory";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(
+                Some(session_id),
+                5,
+                20,
+                astra_services::session_journal::SessionMemoryExtractionOutcome::Extracted {
+                    source:
+                        astra_services::session_journal::SessionMemoryExtractionSource::RuleFallback,
+                    bytes_written: 80,
+                },
+                &astra_services::session_journal::SessionMemoryExtractionBreadcrumbs::default(),
+            ))
+            .unwrap();
+        let executor = test_executor().with_active_session_id(session_id);
+
+        let output = executor
+            .execute("memory", &serde_json::json!({"action": "inventory"}))
+            .await;
+        let inventory: astra_services::session_memory_inventory::SessionMemoryInventory =
+            serde_json::from_str(&output).unwrap();
+
+        assert_eq!(inventory.session_id, session_id);
+        assert_eq!(inventory.successful_extraction_versions, 1);
+        assert_eq!(inventory.rule_fallback_versions, 1);
+        assert_eq!(inventory.logical_current_snapshot_count, Some(0));
+        assert_eq!(inventory.inventory_source, "local_journal");
+    }
+
+    #[tokio::test]
+    async fn memory_inventory_surfaces_corrupt_journal_instead_of_reporting_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "cli-memory-inventory-corrupt";
+        let path = astra_services::session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{not-json}\n").unwrap();
+        let executor = test_executor().with_active_session_id(session_id);
+
+        let output = executor
+            .execute("memory", &serde_json::json!({"action": "inventory"}))
+            .await;
+
+        assert!(output.starts_with("Error: session memory inventory failed:"));
+        assert!(output.contains("cannot be exact"));
     }
 
     // ── File-journal persistence wiring (regression guard) ──────────────

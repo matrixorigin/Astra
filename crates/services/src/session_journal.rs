@@ -938,7 +938,8 @@ pub struct ToolCallRecord {
     pub tool_call_id: Option<String>,
     /// Tool name.
     pub name: String,
-    /// Whether the call succeeded.
+    /// Whether the observed outcome is successful. For execution accounting,
+    /// consult `disposition`: reused/deferred/suppressed calls did not execute.
     pub ok: bool,
     /// Execution time in milliseconds.
     pub ms: u64,
@@ -1019,6 +1020,84 @@ pub struct ToolCallRecord {
     /// build/test pipeline whose final `tail` command exits successfully.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_class: Option<String>,
+    /// Source-authored error classification. This remains typed across
+    /// runtime, journal, ingestion, and reflection boundaries so downstream
+    /// systems never need to infer control semantics from error prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<astra_core::ErrorKind>,
+    /// What happened to the requested call at the execution boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<ToolCallDisposition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallDisposition {
+    /// The executor ran and produced a success or failure outcome.
+    Executed,
+    /// Admission, permission, binding, or argument validation rejected the
+    /// request before execution.
+    Rejected,
+    /// A previously computed observation was reused without execution.
+    Reused,
+    /// A duplicate/synthetic request was intentionally omitted.
+    Suppressed,
+    /// The request was intentionally postponed pending activation or a later
+    /// retry opportunity.
+    Deferred,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutcomeSummary {
+    pub requested: u32,
+    pub executed: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub rejected: u32,
+    pub reused: u32,
+    pub suppressed: u32,
+    pub deferred: u32,
+}
+
+impl ToolOutcomeSummary {
+    pub fn from_records(records: &[ToolCallRecord]) -> Self {
+        let mut summary = Self::default();
+        for record in records {
+            summary.requested = summary.requested.saturating_add(1);
+            match record.effective_disposition() {
+                ToolCallDisposition::Executed => {
+                    summary.executed = summary.executed.saturating_add(1);
+                    if record.ok {
+                        summary.succeeded = summary.succeeded.saturating_add(1);
+                    } else {
+                        summary.failed = summary.failed.saturating_add(1);
+                    }
+                }
+                ToolCallDisposition::Rejected => {
+                    summary.rejected = summary.rejected.saturating_add(1)
+                }
+                ToolCallDisposition::Reused => summary.reused = summary.reused.saturating_add(1),
+                ToolCallDisposition::Suppressed => {
+                    summary.suppressed = summary.suppressed.saturating_add(1)
+                }
+                ToolCallDisposition::Deferred => {
+                    summary.deferred = summary.deferred.saturating_add(1)
+                }
+            }
+        }
+        summary
+    }
+
+    pub fn is_consistent(&self) -> bool {
+        self.executed == self.succeeded.saturating_add(self.failed)
+            && self.requested
+                == self
+                    .executed
+                    .saturating_add(self.rejected)
+                    .saturating_add(self.reused)
+                    .saturating_add(self.suppressed)
+                    .saturating_add(self.deferred)
+    }
 }
 
 /// Tool call name sentinel used for assistant messages that had parallel tool
@@ -1031,6 +1110,26 @@ pub const NOOP_OR_CACHED_RESULT_CLASS: &str = "noop_or_cached";
 pub const BLOCKED_TOOL_RESULT_CLASS: &str = "blocked_tool";
 
 impl ToolCallRecord {
+    pub fn was_executed(&self) -> bool {
+        self.effective_disposition() == ToolCallDisposition::Executed
+    }
+
+    pub fn effective_disposition(&self) -> ToolCallDisposition {
+        if let Some(disposition) = self.disposition {
+            return disposition;
+        }
+        if self.was_blocked_by_policy() || self.skill_locked_out == Some(true) {
+            return ToolCallDisposition::Rejected;
+        }
+        if self.surgically_removed == Some(true) || self.skill_reentry_count.is_some() {
+            return ToolCallDisposition::Suppressed;
+        }
+        if self.result_class.as_deref() == Some(NOOP_OR_CACHED_RESULT_CLASS) {
+            return ToolCallDisposition::Reused;
+        }
+        ToolCallDisposition::Executed
+    }
+
     /// Synthetic placeholders are audit-only records emitted when skill routing
     /// suppresses a tool call without actually executing it, **or** when a
     /// parallel tool call was surgically removed from context after a skill
@@ -1134,14 +1233,6 @@ fn normalize_tool_call_records(records: Vec<ToolCallRecord>) -> Vec<ToolCallReco
         .collect()
 }
 
-fn material_tool_call_count(records: &[ToolCallRecord]) -> u32 {
-    let count = records
-        .iter()
-        .filter(|record| !record.is_synthetic_placeholder())
-        .count();
-    u32::try_from(count).unwrap_or(u32::MAX)
-}
-
 #[inline]
 fn is_false(b: &bool) -> bool {
     !*b
@@ -1173,7 +1264,9 @@ pub struct JournalEvent {
     /// Assistant response text (for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assistant_output: Option<String>,
-    /// Number of material tool executions in this turn.
+    /// Number of calls that actually reached an executor in this turn.
+    /// `tool_outcomes.requested` includes rejected/reused/suppressed/deferred
+    /// calls and is therefore the correct denominator for admission analysis.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_count: Option<u32>,
     /// Fresh input tokens used. Prompt-cache read/write buckets are carried in
@@ -1214,6 +1307,9 @@ pub struct JournalEvent {
     /// Per-tool-call detail: [{name, ok, ms, error?}] for granular audit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallRecord>>,
+    /// Mutually exclusive execution-boundary counts derived from `tool_calls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_outcomes: Option<ToolOutcomeSummary>,
     /// Token budget used by selected dynamic tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_used: Option<u32>,
@@ -1421,6 +1517,9 @@ pub enum JournalEventType {
 pub enum SessionMemoryExtractionSkipReason {
     NoSessionId,
     NoGrowth,
+    /// A durable snapshot already covers this turn. This closes the
+    /// cross-process/restart gap that an in-memory debounce cannot observe.
+    AlreadyCurrent,
     LowInformation,
     InFlight,
     SelectorCooldown,
@@ -3094,6 +3193,7 @@ impl JournalEvent {
             selected_skills: None,
             tools_used: None,
             tool_calls: None,
+            tool_outcomes: None,
             budget_used: None,
             budget_pressure: None,
             stall_type: None,
@@ -3952,11 +4052,16 @@ impl JournalEvent {
     /// Attach per-tool-call audit records to a turn event.
     pub fn with_tool_calls(mut self, records: Vec<ToolCallRecord>) -> Self {
         let records = normalize_tool_call_records(records);
-        self.tool_count = Some(material_tool_call_count(&records));
         if !records.is_empty() {
+            let outcomes = ToolOutcomeSummary::from_records(&records);
+            debug_assert!(outcomes.is_consistent());
+            self.tool_count = Some(outcomes.executed);
+            self.tool_outcomes = Some(outcomes);
             self.tool_calls = Some(records);
         } else {
+            self.tool_count = Some(0);
             self.tool_calls = None;
+            self.tool_outcomes = None;
         }
         self
     }
@@ -6322,6 +6427,7 @@ mod tests {
             !json.contains("tool_calls"),
             "empty tool_calls should be omitted: {json}"
         );
+        assert!(!json.contains("tool_outcomes"), "{json}");
     }
 
     #[test]
@@ -6347,10 +6453,86 @@ mod tests {
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed.tool_count, Some(1));
+        let outcomes = parsed.tool_outcomes.expect("derived outcome summary");
+        assert_eq!(outcomes.requested, 2);
+        assert_eq!(outcomes.executed, 1);
+        assert_eq!(outcomes.succeeded, 1);
+        assert_eq!(outcomes.suppressed, 1);
+        assert!(outcomes.is_consistent());
         let calls = parsed.tool_calls.expect("audit records should be retained");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "bash");
         assert_eq!(calls[1].surgically_removed, Some(true));
+    }
+
+    #[test]
+    fn tool_outcome_summary_is_mutually_exclusive_and_roundtrips_error_kind() {
+        let records = vec![
+            ToolCallRecord {
+                name: "read_file".into(),
+                ok: true,
+                ms: 3,
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "git".into(),
+                ok: false,
+                ms: 4,
+                error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 0,
+                disposition: Some(ToolCallDisposition::Rejected),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "read_file".into(),
+                ok: true,
+                ms: 0,
+                disposition: Some(ToolCallDisposition::Reused),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "grep".into(),
+                ok: true,
+                ms: 0,
+                disposition: Some(ToolCallDisposition::Suppressed),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "memory".into(),
+                ok: true,
+                ms: 0,
+                disposition: Some(ToolCallDisposition::Deferred),
+                ..Default::default()
+            },
+        ];
+
+        let event = JournalEvent::turn(Some("s1"), 1, None, "hi", "done", 99, 1, 1, 1)
+            .with_tool_calls(records);
+        let parsed: JournalEvent =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        let outcomes = parsed.tool_outcomes.expect("tool outcomes");
+
+        assert_eq!(parsed.tool_count, Some(2));
+        assert_eq!(outcomes.requested, 6);
+        assert_eq!(outcomes.executed, 2);
+        assert_eq!(outcomes.succeeded, 1);
+        assert_eq!(outcomes.failed, 1);
+        assert_eq!(outcomes.rejected, 1);
+        assert_eq!(outcomes.reused, 1);
+        assert_eq!(outcomes.suppressed, 1);
+        assert_eq!(outcomes.deferred, 1);
+        assert!(outcomes.is_consistent());
+        assert_eq!(
+            parsed.tool_calls.unwrap()[1].error_kind,
+            Some(astra_core::ErrorKind::ToolInvalidArgs)
+        );
     }
 
     #[test]

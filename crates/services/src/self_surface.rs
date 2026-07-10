@@ -739,11 +739,18 @@ fn build_run_surface(
                 .journal_events
                 .iter()
                 .map(|event| {
-                    event
-                        .tool_calls
-                        .as_ref()
-                        .map(|calls| calls.len())
-                        .unwrap_or_default()
+                    event.tool_outcomes.as_ref().map_or_else(
+                        || {
+                            event
+                                .tool_calls
+                                .as_ref()
+                                .map(|calls| {
+                                    calls.iter().filter(|call| call.was_executed()).count()
+                                })
+                                .unwrap_or_default()
+                        },
+                        |outcomes| outcomes.executed as usize,
+                    )
                 })
                 .sum(),
             failure_events: artifacts
@@ -755,10 +762,9 @@ fn build_run_surface(
                         JournalEventType::TurnError
                             | JournalEventType::Error
                             | JournalEventType::StallDetected
-                    ) || event
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|calls| calls.iter().any(|call| !call.ok))
+                    ) || event.tool_calls.as_ref().is_some_and(|calls| {
+                        calls.iter().any(|call| call.was_executed() && !call.ok)
+                    })
                 })
                 .count(),
             total_tokens_in: artifacts
@@ -1964,7 +1970,11 @@ fn recent_tool_failures(events: &[JournalEvent], limit: usize) -> Vec<ToolFailur
     let mut failures = Vec::new();
     for event in events.iter().rev() {
         if let Some(tool_calls) = event.tool_calls.as_ref() {
-            for call in tool_calls.iter().rev().filter(|call| !call.ok) {
+            for call in tool_calls
+                .iter()
+                .rev()
+                .filter(|call| call.was_executed() && !call.ok)
+            {
                 let tool = call.name.trim();
                 if tool.is_empty() {
                     continue;
@@ -2281,6 +2291,7 @@ mod tests {
                     original_tool_name: None,
                     ..Default::default()
                 }]),
+                tool_outcomes: None,
                 budget_used: Some(8300),
                 budget_pressure: Some(0.83),
                 stall_type: None,

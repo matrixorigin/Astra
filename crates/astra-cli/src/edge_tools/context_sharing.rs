@@ -58,30 +58,25 @@ pub fn execute_share_context(
 /// Retrieves knowledge shared by this or other agents.
 pub fn execute_query_context(cache: &Arc<SharedContextCache>, args: &Value) -> Value {
     let key = args.get("key").and_then(Value::as_str);
-    let prefix = args.get("prefix").and_then(Value::as_str);
+    let category_prefix = args
+        .get("category")
+        .and_then(Value::as_str)
+        .map(|category| format!("{category}/"));
+    let prefix = args
+        .get("prefix")
+        .and_then(Value::as_str)
+        .or(category_prefix.as_deref());
     let list_keys = args
         .get("list_keys")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let include_findings = args
-        .get("include_findings")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
     // List keys mode
     if list_keys {
         let keys = cache.list_knowledge_keys();
-        let mut result = json!({
+        return json!({
             "keys": keys,
             "count": keys.len()
         });
-
-        if include_findings {
-            let agent_ids = cache.list_agent_findings();
-            result["agent_findings_available"] = json!(agent_ids);
-        }
-
-        return result;
     }
 
     // Exact key lookup
@@ -116,37 +111,20 @@ pub fn execute_query_context(cache: &Arc<SharedContextCache>, args: &Value) -> V
             })
             .collect();
 
-        let mut result = json!({
+        return json!({
             "prefix": p,
             "matches": results,
             "count": results.len()
         });
-
-        // Include findings summary if requested
-        if include_findings {
-            let summary = cache.summarize_findings();
-            if !summary.is_empty() {
-                result["findings_summary"] = json!(summary);
-            }
-        }
-
-        return result;
     }
 
     // No parameters - return cache stats
-    let mut result = json!({
+    json!({
         "knowledge_count": cache.knowledge_count(),
         "file_cache_count": cache.file_count(),
         "file_cache_bytes": cache.file_cache_bytes(),
         "hint": "Use 'key' for exact lookup, 'prefix' for search, or 'list_keys: true' to see all keys"
-    });
-
-    if include_findings {
-        let agent_ids = cache.list_agent_findings();
-        result["agents_with_findings"] = json!(agent_ids);
-    }
-
-    result
+    })
 }
 
 #[cfg(test)]
@@ -211,6 +189,19 @@ mod tests {
         let result = execute_query_context(&cache, &json!({"prefix": "auth/"}));
 
         assert_eq!(result["count"], 2);
+    }
+
+    #[test]
+    fn test_query_context_category_uses_structured_prefix() {
+        let cache = Arc::new(SharedContextCache::default());
+        cache.share_knowledge("security/jwt", json!({"alg": "HS256"}), "agent-1");
+        cache.share_knowledge("architecture/runtime", json!("edge"), "agent-2");
+
+        let result = execute_query_context(&cache, &json!({"category": "security"}));
+
+        assert_eq!(result["prefix"], "security/");
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["matches"][0]["key"], "security/jwt");
     }
 
     #[test]

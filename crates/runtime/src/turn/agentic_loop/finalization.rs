@@ -1026,7 +1026,7 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     let Some(session_id) = state.current_session_id.clone() else {
         return;
     };
-    let Some(user_id) = state.context_manifest_user_id.clone() else {
+    let Some(_user_id) = state.context_manifest_user_id.clone() else {
         tracing::warn!(
             session_id = %session_id,
             "Skipping session-memory extraction: missing durable user_id"
@@ -1042,7 +1042,6 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     // was a semantic bug: on prompt-cache-heavy sessions 90% of the
     let runtime_decision_user_intent = state.runtime_decision_user_intent();
     let req = crate::session_memory::ExtractionRequest {
-        user_id,
         session_id,
         messages: state.messages.clone(),
         session_facts: state.session_facts.clone(),

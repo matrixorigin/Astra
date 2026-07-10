@@ -701,6 +701,9 @@ pub async fn run_product_matrix_full_journey(
     )
     .await;
     assert_eq!(st_mem_s, StatusCode::OK, "memory store: {mem_s}");
+    let stored_memory_id = mem_s["memory_id"]
+        .as_str()
+        .expect("memory store must return an exact memory_id");
 
     let (st_mem_r, mem_r) = post_json(
         app,
@@ -724,7 +727,7 @@ pub async fn run_product_matrix_full_journey(
         app,
         "/memory/purge",
         Some(auth_header.as_str()),
-        json!({ "memory_id": "e2e-purge-dummy" }),
+        json!({ "memory_ids": [stored_memory_id] }),
     )
     .await;
     assert_eq!(st_mem_p, StatusCode::OK, "memory purge: {mem_p}");

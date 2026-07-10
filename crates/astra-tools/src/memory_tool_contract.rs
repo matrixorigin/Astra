@@ -2,16 +2,26 @@ use serde_json::Value;
 
 /// Public actions exposed by the model-facing `memory` schema.
 pub const MEMORY_ACTIONS: &[&str] = &[
-    "remember", "recall", "expand", "forget", "update", "focus", "reflect", "profile", "feedback",
+    "remember",
+    "recall",
+    "inventory",
+    "expand",
+    "forget",
+    "update",
+    "focus",
+    "reflect",
+    "profile",
+    "feedback",
 ];
 
 pub const MEMORY_ACTIONS_DISPLAY: &str =
-    "remember, recall, expand, forget, update, focus, reflect, profile, feedback";
+    "remember, recall, inventory, expand, forget, update, focus, reflect, profile, feedback";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryAction {
     Remember,
     Recall,
+    Inventory,
     Expand,
     Forget,
     Update,
@@ -26,6 +36,7 @@ impl MemoryAction {
         match self {
             Self::Remember => "remember",
             Self::Recall => "recall",
+            Self::Inventory => "inventory",
             Self::Expand => "expand",
             Self::Forget => "forget",
             Self::Update => "update",
@@ -56,6 +67,7 @@ pub fn memory_action_from_args(args: &Value) -> Result<MemoryAction, String> {
         Some(Value::String(action)) if !action.trim().is_empty() => match action.as_str() {
             "remember" => Ok(MemoryAction::Remember),
             "recall" => Ok(MemoryAction::Recall),
+            "inventory" => Ok(MemoryAction::Inventory),
             "expand" => Ok(MemoryAction::Expand),
             "forget" => Ok(MemoryAction::Forget),
             "update" => Ok(MemoryAction::Update),

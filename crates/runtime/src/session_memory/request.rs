@@ -8,7 +8,6 @@ use astra_turn_types::session_facts::SessionFacts;
 /// cross a `tokio::spawn` boundary without borrowing from turn state.
 #[derive(Debug, Clone)]
 pub struct ExtractionRequest {
-    pub user_id: String,
     pub session_id: String,
     pub messages: Vec<Value>,
     pub session_facts: SessionFacts,

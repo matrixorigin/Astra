@@ -72,6 +72,7 @@ pub(crate) fn drop_unattributed_memory_recalls_at_turn_end(session_id: Option<&s
 
 #[derive(Clone)]
 struct JournalPromptTurn {
+    model_id: String,
     snapshot: astra_turn_core::cache_diagnostics::PromptStateSnapshot,
     usage: astra_runtime::turn::token_usage::TokenUsage,
 }
@@ -142,17 +143,21 @@ pub(crate) fn build_bridge_pipeline_journal_events(
                 && event.event_type == session_journal::JournalEventType::PipelineFeedback
         })
         .filter_map(|event| {
-            event
-                .metadata
-                .as_ref()
-                .and_then(|meta| meta.get("cache_hit_ratio"))
-                .and_then(serde_json::Value::as_f64)
+            let metadata = event.metadata.as_ref()?;
+            (metadata.get("model_id").and_then(serde_json::Value::as_str) == Some(model_id))
+                .then(|| {
+                    metadata
+                        .get("cache_hit_ratio")
+                        .and_then(serde_json::Value::as_f64)
+                })
+                .flatten()
         })
         .collect();
     let prior_ratios = if prior_feedback_ratios.is_empty() {
         turns
             .iter()
             .take(turns.len().saturating_sub(1))
+            .filter(|turn| turn.model_id == model_id)
             .filter_map(|turn| {
                 let total_input = turn
                     .usage
@@ -171,11 +176,15 @@ pub(crate) fn build_bridge_pipeline_journal_events(
     } else {
         prior_ratios.iter().sum::<f64>() / prior_ratios.len() as f64
     };
-    let stats = astra_turn_core::pipeline_stats::PipelineStats {
+    let mut stats = astra_turn_core::pipeline_stats::PipelineStats {
         turns_executed: prior_ratios.len() as u32,
         avg_cache_hit_ratio,
         ..Default::default()
     };
+    for ratio in &prior_ratios {
+        stats.record_cache_read_share_observation(model_id, *ratio);
+    }
+    stats.record_cache_read_share_observation(model_id, feedback.cache_hit_ratio);
 
     let feedback_evt = astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
         turn, model_id, &feedback,
@@ -191,6 +200,7 @@ pub(crate) fn build_bridge_pipeline_journal_events(
 
     for alert in astra_turn_core::trace_alert::evaluate_alerts(
         turn,
+        model_id,
         &feedback,
         &stats,
         &astra_turn_core::recovery_state::RecoveryState::default(),
@@ -341,7 +351,11 @@ fn journal_prompt_turns(events: &[session_journal::JournalEvent]) -> Vec<Journal
                     continue;
                 };
                 snapshot.provider = provider;
-                turns.push(JournalPromptTurn { snapshot, usage });
+                turns.push(JournalPromptTurn {
+                    model_id: model,
+                    snapshot,
+                    usage,
+                });
             }
             _ => {}
         }

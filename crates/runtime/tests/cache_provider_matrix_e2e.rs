@@ -844,37 +844,22 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
         let mut state = make_test_loop_state();
         state.max_turn_input_tokens = 200_000;
 
-        // Shape mimics session 05e63cac t5 snapshot: user q, assistant a,
-        // several tool_health warnings as user msgs, final current user.
+        // Runtime-owned data enters through the typed volatile lane. It must
+        // not be persisted as conversational history, because that would
+        // churn the provider cache prefix on every turn.
         state
             .messages
             .push(json!({"role": "user", "content": "q1"}));
         state
             .messages
             .push(json!({"role": "assistant", "content": "a1"}));
-        for i in 1..=3 {
-            state.messages.push(json!({
-                "role": "user",
-                "content": format!(
-                    "⚠ The following tools have failed 3 or more times \
-                     consecutively: [str_replace]. [iter {i}]"
-                )
-            }));
-            state
-                .messages
-                .push(json!({"role": "assistant", "content": format!("a{i}+")}));
-        }
-        state.messages.push(json!({
-            "role": "system",
-            "content": "[working-set:v1]\ngoal: test"
-        }));
-        state.messages.push(json!({
-            "role": "system",
-            "content": "## Already Fetched\nfoo.rs"
-        }));
         state
             .messages
             .push(json!({"role": "user", "content": "latest question"}));
+        state.push_volatile(
+            astra_runtime::turn::agentic_loop::host::VolatileKind::AlreadyFetched,
+            "## Already Fetched\nfoo.rs",
+        );
 
         host.run_one_mock_turn_for_test(&mut state).await.unwrap();
 
@@ -900,37 +885,19 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
         // Typed volatile injections may be folded into the last wire user
         // message, but they must never become persisted mid-history turns.
         let last_idx = cap.messages.len().saturating_sub(1);
-        let mid_history_with_pattern = |starts_with: &str| -> usize {
-            cap.messages
-                .iter()
-                .enumerate()
-                .filter(|(i, m)| {
-                    // Skip the last message — consolidation legitimately
-                    // prepends volatile there.
-                    *i != last_idx && content_text(m).starts_with(starts_with)
-                })
-                .count()
-        };
+        let mid_history_with_runtime_text = cap
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(i, message)| {
+                *i != last_idx && content_text(message).contains("## Already Fetched")
+            })
+            .count();
         assert_eq!(
-            mid_history_with_pattern("⚠ The following tools have failed"),
+            mid_history_with_runtime_text,
             0,
-            "[{label}] mid-history tool_health_warning duplicates must be \
-             consolidated out (5d48887e regression); captured messages={:#?}",
+            "[{label}] typed runtime data must not enter mid-history; captured messages={:#?}",
             cap.messages,
-            label = case.label,
-        );
-        assert_eq!(
-            mid_history_with_pattern("[working-set:v1]"),
-            0,
-            "[{label}] mid-history working-set block must be consolidated out \
-             (5d48887e).",
-            label = case.label,
-        );
-        assert_eq!(
-            mid_history_with_pattern("## Already Fetched"),
-            0,
-            "[{label}] mid-history Already-Fetched block must be consolidated out \
-             (5d48887e).",
             label = case.label,
         );
         let last_text = cap.messages.last().map(content_text).unwrap_or_default();
@@ -942,23 +909,15 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
         );
         if suppresses_volatile {
             assert!(
-                !last_text.contains("⚠ The following tools have failed")
-                    && !last_text.contains("[working-set:v1]")
-                    && !last_text.contains("## Already Fetched"),
-                "[{label}] strict-history providers must suppress consolidated volatile injections entirely; got {:?}",
+                !last_text.contains("## Already Fetched"),
+                "[{label}] strict-history providers must suppress ordinary volatile injections; got {:?}",
                 last_text,
                 label = case.label,
             );
         } else {
-            // At least one of the consolidated volatile patterns should be
-            // folded into the last user msg (proves consolidation happened,
-            // not that nothing was injected).
             assert!(
-                last_text.contains("⚠ The following tools have failed")
-                    || last_text.contains("[working-set:v1]")
-                    || last_text.contains("## Already Fetched"),
-                "[{label}] at least one consolidated volatile must be folded into \
-                 the last user msg; got {:?}",
+                last_text.contains("## Already Fetched"),
+                "[{label}] volatile runtime evidence must be delivered at the current tail; got {:?}",
                 last_text,
                 label = case.label,
             );

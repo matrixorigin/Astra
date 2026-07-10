@@ -9647,8 +9647,6 @@ async fn delegation_tracker_get_children() {
     assert!(children.is_empty());
 }
 
-/// P0-C: The agentic loop spawn must check token budget before starting.
-
 /// P0-C: drain_background_tasks returns true when no tasks are running.
 #[tokio::test]
 async fn drain_background_tasks_returns_immediately_when_idle() {

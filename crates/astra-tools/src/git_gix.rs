@@ -111,6 +111,61 @@ impl ToolExecutionOutcome {
             is_error: true,
         }
     }
+
+    pub fn error_with_evidence(output: String, evidence: astra_core::ToolFailureEvidence) -> Self {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "error_kind".to_string(),
+            serde_json::Value::String(evidence.kind.as_str().to_string()),
+        );
+        fields.insert(
+            "disposition".to_string(),
+            serde_json::Value::String("rejected".to_string()),
+        );
+        if let Ok(value) = serde_json::to_value(evidence) {
+            fields.insert("recovery_evidence".to_string(), value);
+        }
+        Self {
+            output,
+            tool_result_fields: Some(fields),
+            is_error: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRequestValidationError {
+    pub message: String,
+    pub evidence: astra_core::ToolFailureEvidence,
+}
+
+impl GitRequestValidationError {
+    fn invalid_arguments(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            evidence: astra_core::ToolFailureEvidence::new(
+                astra_core::ErrorKind::ToolInvalidArgs,
+                astra_core::ToolFailureCause::InvalidArguments,
+                false,
+                vec![astra_core::ToolRecoveryAction::CorrectArguments],
+            ),
+        }
+    }
+
+    fn missing_path(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            evidence: astra_core::ToolFailureEvidence::new(
+                astra_core::ErrorKind::ToolInvalidArgs,
+                astra_core::ToolFailureCause::ResourceMissing,
+                false,
+                vec![
+                    astra_core::ToolRecoveryAction::SearchBeforeRead,
+                    astra_core::ToolRecoveryAction::CorrectArguments,
+                ],
+            ),
+        }
+    }
 }
 
 /// Simple word tokenizer for search scoring.
@@ -228,6 +283,125 @@ fn reject_shell_meta(ref_str: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn optional_exact_string<'a>(
+    args: &'a Value,
+    field: &str,
+) -> Result<Option<&'a str>, GitRequestValidationError> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str() else {
+        return Err(GitRequestValidationError::invalid_arguments(format!(
+            "Error: git field `{field}` must be a string"
+        )));
+    };
+    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+        return Err(GitRequestValidationError::invalid_arguments(format!(
+            "Error: git field `{field}` must be a non-empty exact string"
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn required_exact_string<'a>(
+    args: &'a Value,
+    field: &str,
+    action: crate::git_tool_contract::GitAction,
+) -> Result<&'a str, GitRequestValidationError> {
+    optional_exact_string(args, field)?.ok_or_else(|| {
+        GitRequestValidationError::invalid_arguments(format!(
+            "Error: git(action={}) requires `{field}`",
+            action.as_str()
+        ))
+    })
+}
+
+/// Structural validation shared by CLI/Edge and Server execution paths.
+///
+/// This validates request shape and repository-relative path safety before a
+/// git implementation emits plain text. Callers receive typed failure evidence
+/// and never need to classify error prose to decide whether an execution ran.
+pub fn validate_git_request(
+    project_root: &Path,
+    args: &Value,
+) -> Result<crate::git_tool_contract::GitAction, GitRequestValidationError> {
+    let action = crate::git_tool_contract::git_action_from_args(args)
+        .map_err(|error| GitRequestValidationError::invalid_arguments(format!("Error: {error}")))?;
+
+    let path = optional_exact_string(args, "path")?;
+    let file = optional_exact_string(args, "file")?;
+    for candidate in [path, file].into_iter().flatten() {
+        reject_path_traversal(candidate, project_root)
+            .map_err(GitRequestValidationError::invalid_arguments)?;
+    }
+
+    for field in [
+        "ref",
+        "base_ref",
+        "revision",
+        "commit_sha",
+        "remote",
+        "branch",
+    ] {
+        if let Some(value) = optional_exact_string(args, field)? {
+            reject_shell_meta(value).map_err(GitRequestValidationError::invalid_arguments)?;
+        }
+    }
+
+    match action {
+        crate::git_tool_contract::GitAction::Diff => {
+            if args.get("staged").and_then(Value::as_bool) == Some(true)
+                && args.get("ref").is_some()
+            {
+                return Err(GitRequestValidationError::invalid_arguments(
+                    "Error: git(action=diff) accepts either `staged=true` or `ref`, not both",
+                ));
+            }
+            if let Some(path) = path {
+                validate_diff_path_exists(project_root, path)
+                    .map_err(GitRequestValidationError::missing_path)?;
+            }
+        }
+        crate::git_tool_contract::GitAction::Blame => {
+            let path = required_exact_string(args, "path", action)?;
+            if !project_root.join(path).is_file() {
+                return Err(GitRequestValidationError::missing_path(format!(
+                    "Error: git(action=blame) path `{path}` is not a readable file in the repository"
+                )));
+            }
+        }
+        crate::git_tool_contract::GitAction::FileHistory => {
+            required_exact_string(args, "file", action)?;
+        }
+        crate::git_tool_contract::GitAction::Commit => {
+            required_exact_string(args, "message", action)?;
+        }
+        crate::git_tool_contract::GitAction::RevertCommit => {
+            required_exact_string(args, "commit_sha", action)?;
+        }
+        crate::git_tool_contract::GitAction::LogSearch => {
+            required_exact_string(args, "query", action)?;
+        }
+        crate::git_tool_contract::GitAction::Stash
+        | crate::git_tool_contract::GitAction::Worktree => {
+            required_exact_string(args, "sub_action", action)?;
+        }
+        crate::git_tool_contract::GitAction::CheckoutFile => {
+            required_exact_string(args, "path", action)?;
+            required_exact_string(args, "ref", action)?;
+        }
+        crate::git_tool_contract::GitAction::Push => {
+            required_exact_string(args, "remote", action)?;
+            required_exact_string(args, "branch", action)?;
+        }
+        crate::git_tool_contract::GitAction::Status
+        | crate::git_tool_contract::GitAction::Log
+        | crate::git_tool_contract::GitAction::Show
+        | crate::git_tool_contract::GitAction::Contributors => {}
+    }
+    Ok(action)
 }
 
 fn reject_stash_selector(selector: &str) -> Result<(), String> {
@@ -2616,9 +2790,11 @@ pub fn push(project_root: &Path, args: &Value) -> String {
 /// (push, apply, pop, list, drop) to avoid collision with the top-level
 /// `action` field.
 pub fn git_dispatch(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
-    let action = match crate::git_tool_contract::git_action_from_args(args) {
+    let action = match validate_git_request(project_root, args) {
         Ok(action) => action,
-        Err(error) => return ToolExecutionOutcome::error(format!("Error: {error}")),
+        Err(error) => {
+            return ToolExecutionOutcome::error_with_evidence(error.message, error.evidence);
+        }
     };
     match action {
         crate::git_tool_contract::GitAction::Status => {
@@ -2652,11 +2828,8 @@ pub fn git_dispatch(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
         crate::git_tool_contract::GitAction::Stash => {
             // Remap: read `sub_action` and set it as `action` for the
             // inner stash function which expects action ∈ {push,apply,pop,list,drop}.
-            let stash_action = args
-                .get("sub_action")
-                .or_else(|| args.get("stash_action"))
-                .and_then(Value::as_str);
-            let remapped_args = if let Some(sa) = stash_action {
+            let stash_sub_action = args.get("sub_action").and_then(Value::as_str);
+            let remapped_args = if let Some(sa) = stash_sub_action {
                 let mut map = args.as_object().cloned().unwrap_or_default();
                 map.insert("action".to_string(), Value::String(sa.to_string()));
                 Value::Object(map)
@@ -2693,6 +2866,55 @@ mod tests {
         assert!(reject_path_traversal("", root).is_err());
         assert!(reject_path_traversal("../outside", root).is_err());
         assert!(reject_path_traversal("foo/../../etc/passwd", root).is_err());
+    }
+
+    #[test]
+    fn git_request_validation_classifies_missing_path_as_typed_invalid_arguments() {
+        let dir = TempDir::new().expect("tempdir");
+        let error =
+            validate_git_request(dir.path(), &json!({"action": "diff", "path": "missing.rs"}))
+                .expect_err("missing diff path must fail before execution");
+
+        assert_eq!(error.evidence.kind, astra_core::ErrorKind::ToolInvalidArgs);
+        assert_eq!(
+            error.evidence.cause,
+            astra_core::ToolFailureCause::ResourceMissing
+        );
+        assert!(!error.evidence.retryable);
+        assert_eq!(
+            error.evidence.recovery_actions,
+            vec![
+                astra_core::ToolRecoveryAction::SearchBeforeRead,
+                astra_core::ToolRecoveryAction::CorrectArguments,
+            ]
+        );
+    }
+
+    #[test]
+    fn git_dispatch_preserves_validation_evidence_without_running_git() {
+        let dir = TempDir::new().expect("tempdir");
+        let outcome = git_dispatch(
+            dir.path(),
+            &json!({"action": "blame", "path": "../outside.rs"}),
+        );
+
+        assert!(outcome.is_error);
+        let fields = outcome.tool_result_fields.expect("structured evidence");
+        assert_eq!(fields["error_kind"], "tool_invalid_args");
+        assert_eq!(fields["recovery_evidence"]["cause"], "invalid_arguments");
+        assert_eq!(fields["recovery_evidence"]["retryable"], false);
+    }
+
+    #[test]
+    fn git_request_validation_accepts_existing_repo_relative_diff_path() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("tracked.rs"), "fn main() {}\n").unwrap();
+
+        let action =
+            validate_git_request(dir.path(), &json!({"action": "diff", "path": "tracked.rs"}))
+                .unwrap();
+
+        assert_eq!(action, crate::git_tool_contract::GitAction::Diff);
     }
 
     #[test]
@@ -4316,8 +4538,17 @@ mod tests {
     #[test]
     fn consolidated_git_edge_only_actions_return_executor_requirement() {
         let root = repo_root();
-        for action in ["checkout_file", "worktree"] {
-            let result = super::git_dispatch(&root, &json!({"action": action}));
+        for (action, args) in [
+            (
+                "checkout_file",
+                json!({"action": "checkout_file", "path": "Cargo.toml", "ref": "HEAD"}),
+            ),
+            (
+                "worktree",
+                json!({"action": "worktree", "sub_action": "list"}),
+            ),
+        ] {
+            let result = super::git_dispatch(&root, &args);
             assert!(result.is_error);
             assert!(
                 result.output.contains("requires a CLI/edge executor"),

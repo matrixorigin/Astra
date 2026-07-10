@@ -790,7 +790,7 @@ fn build_runtime_turn_evaluation_event(
 ) -> astra_services::session_journal::JournalEvent {
     let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
     let eval_thresholds = crate::pipeline::evaluation::current_evaluation_thresholds();
-    let mut eval = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
+    let eval = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
         &state.message,
         &state.recent_tools,
         &state.stall.tool_call_records,
@@ -798,11 +798,6 @@ fn build_runtime_turn_evaluation_event(
         verdict_warning,
         state.telemetry.first_budget_pressure,
         eval_thresholds,
-    );
-    crate::pipeline::evaluation::apply_final_answer_relevance(
-        &mut eval,
-        &state.message,
-        &state.final_text,
     );
     crate::pipeline::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),
@@ -3999,6 +3994,20 @@ impl AgenticRunLifecycleService {
         let edge_profile = edge_profile_override
             .cloned()
             .unwrap_or_else(|| edge_context.edge_profile.to_map());
+        let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
+            match svc.scoped_to_owner(user_id) {
+                Ok(scoped) => Some(scoped),
+                Err(error) => {
+                    tracing::error!(
+                        user_id,
+                        session_id,
+                        error = %error,
+                        "session-memory extraction disabled because the transport could not bind the authenticated owner"
+                    );
+                    None
+                }
+            }
+        });
         let skill_executor = build_server_skill_executor(
             &self.matrixone,
             &self.encryptor,
@@ -4016,7 +4025,7 @@ impl AgenticRunLifecycleService {
             session_id,
             self.edge_connection_pool.as_ref(),
             cancel_token,
-            self.memory_extraction_service.as_ref(),
+            memory_extraction_service.as_ref(),
             #[cfg(feature = "harness")]
             harness_sink_arc.as_ref(),
         );
@@ -4150,7 +4159,7 @@ impl AgenticRunLifecycleService {
             runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            memory_extraction_service: self.memory_extraction_service.clone(),
+            memory_extraction_service,
             observation_journal: Default::default(),
             observation_store: None,
             session_memory_state: Default::default(),
@@ -4692,13 +4701,12 @@ impl AgenticRunLifecycleService {
 fn build_shutdown_extraction_request(
     state: &AgenticLoopState,
 ) -> Option<crate::session_memory::ExtractionRequest> {
-    let user_id = state.context_manifest_user_id.clone()?;
+    state.context_manifest_user_id.as_ref()?;
     let runtime_decision_user_intent = state.runtime_decision_user_intent();
     state
         .current_session_id
         .as_ref()
         .map(|session_id| crate::session_memory::ExtractionRequest {
-            user_id,
             session_id: session_id.clone(),
             messages: state.messages.clone(),
             session_facts: state.session_facts.clone(),
@@ -8482,6 +8490,20 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let durable_user_id = config.user_id.clone();
         let durable_session_id = config.session_id.clone();
         let durable_run_id = config.run_id.clone();
+        let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
+            match svc.scoped_to_owner(&config.user_id) {
+                Ok(scoped) => Some(scoped),
+                Err(error) => {
+                    tracing::error!(
+                        user_id = %config.user_id,
+                        session_id = %config.session_id,
+                        error = %error,
+                        "sub-run session-memory extraction disabled because owner binding failed"
+                    );
+                    None
+                }
+            }
+        });
 
         // Build edge profile from agent's system prompt and metadata.
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
@@ -8726,7 +8748,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            memory_extraction_service: self.memory_extraction_service.clone(),
+            memory_extraction_service,
             observation_journal: Default::default(),
             observation_store: None,
             session_memory_state: Default::default(),
@@ -8965,7 +8987,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
-                    status: projected_status.to_string(),
+                    // Durable state projects a waiting subrun to paused, but
+                    // the parent agent protocol must retain Waiting(reason).
+                    // Collapsing it here loses execution-boundary causes such
+                    // as executor_offline and lets the parent continue.
+                    status: astra_core::STATUS_WAITING.to_string(),
                     output: Some(reason),
                     error: None,
                     prompt_tokens,

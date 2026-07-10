@@ -254,6 +254,8 @@ pub(crate) async fn prepare_intercepted_tool_round(
             result_full: Some(result.result.clone()),
             round,
             start_offset_ms,
+            error_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
             ..Default::default()
         });
     }
@@ -270,6 +272,15 @@ pub(crate) async fn prepare_intercepted_tool_round(
                 Some(meta) => (Some(meta.reentry_count), Some(meta.locked_out)),
                 None => (None, None),
             };
+        let disposition = if skill_locked_out == Some(true) {
+            astra_services::session_journal::ToolCallDisposition::Rejected
+        } else if skill_reentry_count.is_some() {
+            astra_services::session_journal::ToolCallDisposition::Suppressed
+        } else if result.result_class.is_some() {
+            astra_services::session_journal::ToolCallDisposition::Deferred
+        } else {
+            astra_services::session_journal::ToolCallDisposition::Executed
+        };
         state.stall.tool_call_records.push(ToolCallRecord {
             name: result.tool_name.clone(),
             ok: result.ok,
@@ -289,6 +300,9 @@ pub(crate) async fn prepare_intercepted_tool_round(
             skill_reentry_count,
             skill_locked_out: skill_locked_out.filter(|v| *v),
             result_class: result.result_class.clone(),
+            error_kind: (skill_locked_out == Some(true))
+                .then_some(astra_core::ErrorKind::ToolUnavailable),
+            disposition: Some(disposition),
             ..Default::default()
         });
     }
@@ -334,6 +348,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
             original_tool_name: original_name,
             round,
             start_offset_ms,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Suppressed),
             ..Default::default()
         });
     }

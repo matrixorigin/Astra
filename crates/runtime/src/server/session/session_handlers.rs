@@ -1413,7 +1413,7 @@ pub(crate) async fn resume_session_handler(
         return Err(internal_error("shared MatrixOne pool is not configured"));
     };
     let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
-    let restored = svc
+    let mut restored = svc
         .restore_session(&user_id, &session.session_id)
         .await
         .map_err(internal_error)?
@@ -1438,6 +1438,7 @@ pub(crate) async fn resume_session_handler(
             },
         )
         .await?;
+    restored.last_status = "active".to_string();
     Ok(Json(restored))
 }
 

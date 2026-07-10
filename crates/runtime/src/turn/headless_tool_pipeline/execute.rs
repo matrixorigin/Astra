@@ -4,8 +4,8 @@ use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::*;
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
 use astra_turn_core::headless_tool_postprocess::{
-    HeadlessOutputEnrichCtx, HeadlessOutputEnrichSignal, append_headless_result_quality_feedback,
-    enrich_headless_tool_output_for_errors_and_limits,
+    HeadlessOutputEnrichCtx, HeadlessOutputEnrichRequest, HeadlessOutputEnrichSignal,
+    append_headless_result_quality_feedback, enrich_headless_tool_output_for_errors_and_limits,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
     headless_stderr_resource_limit_in_output, headless_stderr_resource_limit_observed,
@@ -258,6 +258,19 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         )
         .await;
 
+        self.postprocess_execution(execution, idem_key, tool_start)
+    }
+
+    /// Apply the canonical execution-outcome semantics after a provider has
+    /// returned. Serial and concurrent tool paths both call this boundary so
+    /// error attribution, TurnGuard evidence, and journal disposition cannot
+    /// drift based on scheduling mode.
+    pub(super) fn postprocess_execution(
+        &mut self,
+        mut execution: super::HeadlessResolvedExecution,
+        idem_key: IdempotencyKey,
+        tool_start: Instant,
+    ) -> ExecutedExecution {
         // P1 (tool-design-gaps plan): use `classify_tool_error` so that
         // soft errors (read_file ENOENT, str_replace not-unique, grep
         // no-match) are NOT counted as ToolCallFailed. Only HardError
@@ -282,12 +295,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             turn_guard: self.ctx.turn_guard,
         };
         let resource_limit_recorded = enrich_headless_tool_output_for_errors_and_limits(
-            &execution.name,
-            &mut execution.result_str,
-            &mut is_err,
-            source_error_kind,
-            source_recovery_evidence.as_ref(),
-            tool_already_restricted,
+            HeadlessOutputEnrichRequest {
+                name: &execution.name,
+                result_str: &mut execution.result_str,
+                is_err: &mut is_err,
+                source_error_kind,
+                source_recovery_evidence: source_recovery_evidence.as_ref(),
+                tool_already_restricted,
+            },
             &mut enrich_ctx,
             |sig| {
                 if quiet {
@@ -342,6 +357,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             execution,
             idem_key,
             is_err,
+            error_kind: source_error_kind,
             executed_ms,
         }
     }

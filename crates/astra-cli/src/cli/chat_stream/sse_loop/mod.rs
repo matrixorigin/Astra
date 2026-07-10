@@ -163,7 +163,7 @@ fn step_recorder_for_cli_turn(
     if let Some(session_id) = session_id {
         StepRecorder::with_persistence(user_id, session_id, run_id)
     } else {
-        StepRecorder::new(user_id, "ephemeral", run_id)
+        StepRecorder::with_deferred_persistence(user_id, "ephemeral", run_id)
     }
 }
 

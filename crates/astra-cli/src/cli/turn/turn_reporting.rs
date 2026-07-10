@@ -38,6 +38,9 @@ pub(crate) fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord
     let mut files = Vec::new();
     let mut failed = Vec::new();
     for record in records {
+        if !record.was_executed() {
+            continue;
+        }
         if record.ok
             && let Some(file_path) = record.file_path.as_deref()
             && !files.contains(&file_path)
@@ -64,7 +67,13 @@ pub(crate) fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord
     if !failed.is_empty() {
         parts.push(format!("failed: {}", failed.join(", ")));
     }
-    parts.push(format!("tool_calls: {}", records.len()));
+    parts.push(format!(
+        "tool_calls: {}",
+        records
+            .iter()
+            .filter(|record| record.was_executed())
+            .count()
+    ));
 
     format!("\n\n[Turn context: {}]", parts.join(" | "))
 }

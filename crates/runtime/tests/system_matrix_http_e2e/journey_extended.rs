@@ -73,8 +73,8 @@ pub async fn run_session_cancel_then_delete() {
 }
 
 /// Unauthenticated `/sessions`, duplicate register, and bad password login (real DB + services).
-/// Memory proxy must overwrite spoofed `user_id` / `session_id` with the authenticated user (real
-/// `MemoriaForwarder` + JWT). Replaces stub `memory_contract` security coverage.
+/// Memory proxy must overwrite spoofed `user_id` and reject a session not owned by that user.
+/// An authorized durable session id remains distinct from the authenticated user id.
 pub async fn run_memory_proxy_user_isolation() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -108,7 +108,30 @@ pub async fn run_memory_proxy_user_isolation() {
         }),
     )
     .await;
-    assert_eq!(st_spoof, StatusCode::OK, "memory store: {j_spoof}");
+    assert_eq!(
+        st_spoof,
+        StatusCode::NOT_FOUND,
+        "unowned memory session must be rejected: {j_spoof}"
+    );
+    assert_eq!(
+        ctx.memoria.calls.lock().await.len(),
+        before,
+        "rejected session scope must not reach Memoria"
+    );
+
+    let (st_owned, j_owned) = post_json(
+        app,
+        "/memory/store",
+        Some(auth.as_str()),
+        json!({
+            "content": "owned scope probe",
+            "memory_type": "semantic",
+            "user_id": "victim-user-id",
+            "session_id": ctx.session_id
+        }),
+    )
+    .await;
+    assert_eq!(st_owned, StatusCode::OK, "owned memory store: {j_owned}");
 
     let calls = ctx.memoria.calls.lock().await;
     assert!(
@@ -123,8 +146,8 @@ pub async fn run_memory_proxy_user_isolation() {
     );
     assert_eq!(
         body["session_id"].as_str(),
-        Some(user_id),
-        "spoofed session_id must be replaced with authenticated user_id: {body}"
+        Some(ctx.session_id.as_str()),
+        "authorized durable session_id must be preserved: {body}"
     );
 
     ctx.pool.close().await;

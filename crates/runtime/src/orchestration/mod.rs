@@ -31,8 +31,8 @@ pub use agent_trace_status::{
     agent_trace_terminal_event_type, is_agent_trace_settled_event,
 };
 pub use astra_turn_core::orchestration_context_cache::{
-    AgentFindings, CacheStats, CachedFile, Finding, FindingCategory, Knowledge, SharedContextCache,
-    query_context_schema, share_context_schema,
+    CacheStats, CachedFile, Knowledge, SharedContextCache, query_context_schema,
+    share_context_schema,
 };
 pub use astra_turn_core::orchestration_progress::{
     AgentProgressEmitter, AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
