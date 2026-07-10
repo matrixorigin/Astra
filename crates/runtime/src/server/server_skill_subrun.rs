@@ -470,7 +470,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
-                    astra_turn_core::pipeline_config::PipelineConfig::default(),
+                    crate::turn::pipeline_env::env_pipeline_config(),
                     crate::turn::session_current_date::resolve_session_current_date(
                         &self.session_id,
                     ),

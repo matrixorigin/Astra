@@ -522,7 +522,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     // is the right lifecycle. Stats/recovery/latches all start at default.
     let mut session = PipelineSession::new(PipelineConfig {
         provider_policy: provider_policy.clone(),
-        ..Default::default()
+        ..crate::turn::pipeline_env::env_pipeline_config()
     });
     let input = AdaptiveTurnInput {
         statics: &statics,

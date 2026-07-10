@@ -318,7 +318,7 @@ mod tests {
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
-                astra_turn_core::pipeline_config::PipelineConfig::default(),
+                crate::turn::pipeline_env::env_pipeline_config(),
             )),
             message: message.to_string(),
             user_intent: message.to_string(),

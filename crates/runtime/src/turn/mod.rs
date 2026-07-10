@@ -27,6 +27,7 @@ pub mod memory_prefetch;
 pub mod observation_dispatcher;
 pub mod observation_store;
 pub mod permission_gate;
+pub mod pipeline_env;
 pub(crate) mod plan_mode_guard;
 pub mod prompt_cache;
 pub mod providers;
