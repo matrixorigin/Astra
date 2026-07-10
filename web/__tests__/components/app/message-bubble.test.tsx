@@ -142,7 +142,7 @@ describe("MessageBubble", () => {
       );
     });
     expect(
-      screen.getByRole("button", { name: "Response copied" }),
+      await screen.findByRole("button", { name: "Response copied" }),
     ).toBeInTheDocument();
   });
 
