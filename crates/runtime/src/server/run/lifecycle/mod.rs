@@ -46,7 +46,7 @@ use astra_services::runs::{
     RequestedTurnInteractionMode, RunInputData, RunInputRecord, RunLifecycleService, RunListCursor,
     RunListRecord, RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord,
     RunStatusRecord, RuntimeAuthRequest, RuntimeProfileRequest, SelectedModelRequest,
-    durable_run_status_kind,
+    durable_run_status_blocks_session, durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::session_restore::{
@@ -2166,6 +2166,7 @@ impl AgenticRunLifecycleService {
             llm_cancel_token: llm_cancel_token.clone(),
             live_tx: None,
             waiting_for: None,
+            execution_live: true,
         };
         (run_state, cancel_flag, pause_flag, llm_cancel_token)
     }
@@ -2186,6 +2187,56 @@ impl AgenticRunLifecycleService {
     fn session_has_blocking_run(runs: &HashMap<String, RunState>, session_id: &str) -> bool {
         runs.values()
             .any(|run| Self::blocks_new_session_run(run, session_id))
+    }
+
+    async fn run_execution_is_live(&self, durable: &DurableRunRecord) -> bool {
+        if let Some(run) = self.runs.read().await.get(&durable.run_id) {
+            return run.execution_live;
+        }
+        durable_run_owner_lease_is_live(durable)
+    }
+
+    async fn reconcile_orphaned_execution_for_session_continuation(
+        &self,
+        durable: &DurableRunRecord,
+        requested_operation: &'static str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        if !durable_run_status_blocks_session(&durable.status, durable.waiting_for.as_deref()) {
+            return Ok(false);
+        }
+        let interruption_event = json!({
+            "event_type": "run_interrupted",
+            "data": {
+                "kind": "executor_not_live",
+                "previous_status": durable.status,
+                "requested_operation": requested_operation,
+                "resumable": true,
+                "resume_strategy": "session_continuation",
+                "releases_session_slot": true,
+            }
+        });
+        let updated = self
+            .run_engine
+            .transition_status_with_event_if_current(
+                &durable.user_id,
+                &durable.run_id,
+                &[durable.status.as_str()],
+                STATUS_PAUSED,
+                None,
+                None,
+                interruption_event.clone(),
+            )
+            .await
+            .map_err(|error| Self::durable_persist_error("orphan recovery transition", error))?;
+        if updated && let Some(run) = self.runs.write().await.get_mut(&durable.run_id) {
+            run.status = RunStatus::Paused;
+            run.waiting_for = None;
+            run.execution_live = false;
+            run.pause_flag.store(false, Ordering::SeqCst);
+            run.live_tx = None;
+            run.events.push(interruption_event);
+        }
+        Ok(updated)
     }
 
     fn configure_loop_state_runtime_controls(
@@ -2410,9 +2461,22 @@ impl AgenticRunLifecycleService {
                     let msg = format!("waiting: {w}");
                     events.push(json!({
                         "event_type": "run_waiting",
-                        "data": {"reason": msg.clone()}
+                        "data": {
+                            "reason": msg,
+                            "resumable": true,
+                            "resume_strategy": "session_continuation",
+                            "execution_live": false,
+                        }
                     }));
-                    (RunStatus::Waiting, Some(msg))
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": {
+                            "interrupted": true,
+                            "resumable": true,
+                            "resume_strategy": "session_continuation",
+                        }
+                    }));
+                    (RunStatus::Paused, None)
                 }
                 Err(err) => {
                     let msg = err.to_string();
@@ -5796,6 +5860,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let mut persist_terminal_events = true;
 
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                    run.execution_live = false;
                     if run.status == RunStatus::Cancelled {
                         persist_status_update = false;
                         persist_terminal_events = false;
@@ -5974,6 +6039,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         }
                     }
                 }
+
+                // The execution is no longer resumable once its durable final
+                // state has been reconciled. Release cross-pod ownership before
+                // slower observability, memory, and workspace cleanup so those
+                // side effects do not extend the executor's apparent lifetime.
+                drop(_owner_lease_heartbeat);
 
                 if persist_terminal_events {
                     flush_turn_observability(&mut loop_state, &bg_session_id, false);
@@ -6718,6 +6789,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let mut persist_status_update = true;
                 let mut persist_streaming_events = true;
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                    run.execution_live = false;
                     if run.status == RunStatus::Cancelled {
                         persist_status_update = false;
                         persist_streaming_events = false;
@@ -6904,6 +6976,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         }
                     }
                 }
+
+                // Keep the owner lease through terminal CAS/event repair, then
+                // release it before client fanout and post-loop cleanup. These
+                // side effects must not advertise a live resume/input consumer.
+                drop(_owner_lease_heartbeat);
 
                 for event in missing_lifecycle_events {
                     if event_tx.send(event).await.is_err() {
@@ -7261,6 +7338,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
         }
 
+        if !self.run_execution_is_live(&durable).await {
+            self.reconcile_orphaned_execution_for_session_continuation(&durable, "submit_input")
+                .await?;
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "This run no longer has a live input consumer. Continue the session to start a new run instead of queueing input to an orphaned execution.",
+                "run_input_consumer_not_live",
+            ));
+        }
+
         durable_status
             .try_transition(&RunStatus::InputQueued)
             .map_err(|_| Self::run_state_conflict("submit input to", &durable.status))?;
@@ -7487,6 +7574,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             return Err(Self::run_state_conflict("pause", &durable.status));
         }
 
+        if !self.run_execution_is_live(&durable).await {
+            if self
+                .reconcile_orphaned_execution_for_session_continuation(&durable, "pause")
+                .await?
+            {
+                return Ok(RunMutationRecord {
+                    run_id,
+                    status: STATUS_PAUSED.to_string(),
+                    previous_status: durable.status,
+                });
+            }
+            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            return Err(Self::run_state_conflict("pause", &current.status));
+        }
+
         let pause_event = json!({"event_type": "run_paused", "data": {}});
         // Always write to DB first — the source of truth for cross-pod control.
         let status_updated = self
@@ -7583,6 +7685,37 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 status: STATUS_COMPLETED.to_string(),
                 previous_status: durable.status,
             });
+        }
+
+        if !self.run_execution_is_live(&durable).await {
+            self.reconcile_orphaned_execution_for_session_continuation(&durable, "resume")
+                .await?;
+            if self
+                .run_engine
+                .find_blocking_session_run(&user_id, &durable.session_id)
+                .await
+                .map_err(|error| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Failed to verify session execution slot: {error}"),
+                    )
+                })?
+                .is_some_and(|blocker| blocker.run_id != run_id)
+            {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "session already has an active run".to_string(),
+                ));
+            }
+            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            if current.status != STATUS_PAUSED {
+                return Err(Self::run_state_conflict("resume", &current.status));
+            }
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "This run no longer has a live executor. Continue the session to create a new run from restored history and checkpoint evidence.",
+                "run_execution_not_live",
+            ));
         }
 
         let resume_event = json!({"event_type": "run_resumed", "data": {}});
@@ -7886,9 +8019,8 @@ fn server_subrun_live_termination(
             AgentLiveTermination::Interrupted
         }
         Ok(AgenticLoopOutcome::Completed) => AgentLiveTermination::Completed,
-        Ok(AgenticLoopOutcome::Cancelled | AgenticLoopOutcome::Waiting(_)) => {
-            AgentLiveTermination::Cancelled
-        }
+        Ok(AgenticLoopOutcome::Cancelled) => AgentLiveTermination::Cancelled,
+        Ok(AgenticLoopOutcome::Waiting(_)) => AgentLiveTermination::Interrupted,
         Ok(AgenticLoopOutcome::Error(_)) | Err(_) => AgentLiveTermination::Failed,
     }
 }
@@ -7908,6 +8040,18 @@ fn server_subrun_live_reason(
         Ok(AgenticLoopOutcome::Waiting(reason)) => Some(reason.clone()),
         Ok(AgenticLoopOutcome::Error(error)) => Some(error.clone()),
         Err(error) => Some(error.to_string()),
+    }
+}
+
+fn server_subrun_outcome_status(
+    outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    loop_state: &AgenticLoopState,
+) -> &'static str {
+    match outcome {
+        Ok(AgenticLoopOutcome::Completed) => server_subrun_completed_status(loop_state),
+        Ok(AgenticLoopOutcome::Cancelled) => STATUS_CANCELLED,
+        Ok(AgenticLoopOutcome::Waiting(_)) => STATUS_PAUSED,
+        Ok(AgenticLoopOutcome::Error(_)) | Err(_) => STATUS_FAILED,
     }
 }
 
@@ -8764,65 +8908,21 @@ impl SubRunExecutor for ServerSubRunExecutor {
         );
 
         let prompt_tokens = loop_state.provider_input_tokens();
-        match &outcome {
-            Ok(AgenticLoopOutcome::Completed) => {
-                let status = server_subrun_completed_status(&loop_state);
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    status,
-                    None,
-                    None,
-                )
-                .await;
-            }
-            Ok(AgenticLoopOutcome::Cancelled) => {
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    STATUS_PAUSED,
-                    None,
-                    None,
-                )
-                .await;
-            }
-            Ok(AgenticLoopOutcome::Waiting(reason)) => {
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    STATUS_WAITING,
-                    Some(reason.as_str()),
-                    None,
-                )
-                .await;
-            }
-            Ok(AgenticLoopOutcome::Error(err)) => {
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    STATUS_FAILED,
-                    None,
-                    Some(err.as_str()),
-                )
-                .await;
-            }
-            Err(err) => {
-                let error = err.to_string();
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    STATUS_FAILED,
-                    None,
-                    Some(error.as_str()),
-                )
-                .await;
-            }
-        }
+        let projected_status = server_subrun_outcome_status(&outcome, &loop_state);
+        let durable_error = match &outcome {
+            Ok(AgenticLoopOutcome::Error(error)) => Some(error.clone()),
+            Err(error) => Some(error.to_string()),
+            _ => None,
+        };
+        self.persist_durable_subrun_terminal_status(
+            &durable_user_id,
+            &durable_session_id,
+            &durable_run_id,
+            projected_status,
+            None,
+            durable_error.as_deref(),
+        )
+        .await;
         self.persist_durable_subrun_usage(
             &durable_user_id,
             &durable_session_id,
@@ -8833,46 +8933,39 @@ impl SubRunExecutor for ServerSubRunExecutor {
         )
         .await;
         match outcome {
-            Ok(AgenticLoopOutcome::Completed) => {
-                let status = server_subrun_completed_status(&loop_state);
-                Ok(astra_services::coordination::AgentResult {
-                    agent_id: config.agent_profile.agent_id,
-                    run_id: config.run_id,
-                    status: status.to_string(),
-                    output: if loop_state.final_text.is_empty() {
-                        None
-                    } else {
-                        Some(loop_state.final_text)
-                    },
-                    error: None,
-                    prompt_tokens,
-                    completion_tokens: loop_state.total_completion,
-                    tool_calls: loop_state.total_tool_calls,
-                })
-            }
-            Ok(AgenticLoopOutcome::Cancelled) => {
-                // Cancelled via pause_flag — report as "paused" so the
-                // delegation engine can distinguish from hard errors.
-                Ok(astra_services::coordination::AgentResult {
-                    agent_id: config.agent_profile.agent_id,
-                    run_id: config.run_id,
-                    status: STATUS_PAUSED.to_string(),
-                    output: if loop_state.final_text.is_empty() {
-                        None
-                    } else {
-                        Some(loop_state.final_text)
-                    },
-                    error: None,
-                    prompt_tokens,
-                    completion_tokens: loop_state.total_completion,
-                    tool_calls: loop_state.total_tool_calls,
-                })
-            }
+            Ok(AgenticLoopOutcome::Completed) => Ok(astra_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: projected_status.to_string(),
+                output: if loop_state.final_text.is_empty() {
+                    None
+                } else {
+                    Some(loop_state.final_text)
+                },
+                error: None,
+                prompt_tokens,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
+            Ok(AgenticLoopOutcome::Cancelled) => Ok(astra_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: projected_status.to_string(),
+                output: if loop_state.final_text.is_empty() {
+                    None
+                } else {
+                    Some(loop_state.final_text)
+                },
+                error: None,
+                prompt_tokens,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
             Ok(AgenticLoopOutcome::Waiting(reason)) => {
                 Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
-                    status: STATUS_WAITING.to_string(),
+                    status: projected_status.to_string(),
                     output: Some(reason),
                     error: None,
                     prompt_tokens,
@@ -8883,7 +8976,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             Ok(AgenticLoopOutcome::Error(err)) => Ok(astra_services::coordination::AgentResult {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
-                status: STATUS_FAILED.to_string(),
+                status: projected_status.to_string(),
                 output: None,
                 error: Some(err),
                 prompt_tokens,
@@ -8893,7 +8986,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             Err(err) => Ok(astra_services::coordination::AgentResult {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
-                status: STATUS_FAILED.to_string(),
+                status: projected_status.to_string(),
                 output: None,
                 error: Some(err.to_string()),
                 prompt_tokens,

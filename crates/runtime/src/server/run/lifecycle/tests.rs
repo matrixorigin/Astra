@@ -1583,6 +1583,64 @@ fn server_subrun_empty_completion_remains_paused_regardless_of_task_board() {
 }
 
 #[test]
+fn server_subrun_waiting_without_live_task_is_interrupted_not_cancelled() {
+    let svc = test_service();
+    let request = test_request("subrun waits for external input");
+    let state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "child-run-waiting",
+        None,
+        None,
+        None,
+    );
+    let outcome = Ok(AgenticLoopOutcome::Waiting("approval".to_string()));
+
+    assert_eq!(
+        server_subrun_live_termination(&outcome, &state),
+        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
+    );
+    assert_eq!(
+        server_subrun_live_reason(&outcome, &state).as_deref(),
+        Some("approval")
+    );
+    assert_eq!(
+        server_subrun_outcome_status(&outcome, &state),
+        STATUS_PAUSED
+    );
+}
+
+#[test]
+fn server_subrun_cancel_is_terminal_across_live_and_durable_projections() {
+    let svc = test_service();
+    let request = test_request("cancel subrun");
+    let state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "child-run-cancelled",
+        None,
+        None,
+        None,
+    );
+    let outcome = Ok(AgenticLoopOutcome::Cancelled);
+
+    assert_eq!(
+        server_subrun_live_termination(&outcome, &state),
+        astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled
+    );
+    assert_eq!(
+        server_subrun_live_reason(&outcome, &state).as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(
+        server_subrun_outcome_status(&outcome, &state),
+        STATUS_CANCELLED
+    );
+}
+
+#[test]
 fn server_subrun_requires_intervention_from_interruption_not_task_board() {
     let svc = test_service();
     let request = test_request("subrun paused task board");
@@ -2334,6 +2392,24 @@ fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycle
         engine,
     )
     .with_model_service(Arc::new(ActiveTestModelService))
+}
+
+async fn install_live_run_state(
+    svc: &AgenticRunLifecycleService,
+    user_id: &str,
+    run_id: &str,
+    session_id: &str,
+    status: RunStatus,
+    waiting_for: Option<&str>,
+) {
+    let (mut run_state, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        run_id.to_string(),
+        session_id.to_string(),
+        user_id.to_string(),
+    );
+    run_state.status = status;
+    run_state.waiting_for = waiting_for.map(ToString::to_string);
+    svc.runs.write().await.insert(run_id.to_string(), run_state);
 }
 
 async fn setup_lifecycle_run_db_it() -> SharedPool {
@@ -5140,6 +5216,7 @@ fn active_run_live_event_projection_is_bounded() {
         llm_cancel_token: Arc::new(CancellationToken::new()),
         live_tx: None,
         waiting_for: None,
+        execution_live: true,
     };
 
     for idx in 0..(MAX_ACTIVE_RUN_LIVE_EVENTS + 5) {
@@ -5408,6 +5485,7 @@ fn merge_cancelled_run_events_preserves_order_and_usage() {
         llm_cancel_token: cancel_token,
         live_tx: None,
         waiting_for: None,
+        execution_live: false,
     };
 
     merge_cancelled_run_events(
@@ -8181,6 +8259,18 @@ async fn resume_run_stale_read_does_not_overwrite_cancelled() {
         )
         .await
         .unwrap();
+    let (mut live, _, pause_flag, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        "run-resume-race".to_string(),
+        "sess-1".to_string(),
+        "user-1".to_string(),
+    );
+    live.status = RunStatus::Paused;
+    live.waiting_for = Some("user_resume".to_string());
+    pause_flag.store(true, Ordering::SeqCst);
+    svc.runs
+        .write()
+        .await
+        .insert("run-resume-race".to_string(), live);
 
     let e = err(svc
         .resume_run("run-resume-race".into(), "user-1".into())
@@ -8204,7 +8294,7 @@ async fn resume_run_stale_read_does_not_overwrite_cancelled() {
 }
 
 #[tokio::test]
-async fn pause_run_running_succeeds_via_db() {
+async fn pause_run_orphaned_running_reconciles_to_session_continuation() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
@@ -8213,10 +8303,23 @@ async fn pause_run_running_succeeds_via_db() {
     assert_eq!(result.status, STATUS_PAUSED);
     let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
     assert_eq!(durable.status, STATUS_PAUSED);
+    assert!(durable.waiting_for.is_none());
+    assert_eq!(
+        durable.events.last().unwrap()["event_type"],
+        "run_interrupted"
+    );
+    assert_eq!(
+        durable.events.last().unwrap()["data"]["resume_strategy"],
+        "session_continuation"
+    );
+    engine
+        .start_run("run-2", "user-1", "sess-1")
+        .await
+        .expect("orphan reconciliation must release the session slot");
 }
 
 #[tokio::test]
-async fn resume_run_paused_succeeds_via_db() {
+async fn resume_run_paused_without_live_executor_requires_session_continuation() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
@@ -8225,10 +8328,23 @@ async fn resume_run_paused_succeeds_via_db() {
         .await
         .unwrap();
 
-    let result = ok(svc.resume_run("run-1".into(), "user-1".into()).await);
-    assert_eq!(result.status, STATUS_RUNNING);
+    let error = err(svc.resume_run("run-1".into(), "user-1".into()).await);
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("run_execution_not_live")
+    );
     let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
-    assert_eq!(durable.status, STATUS_RUNNING);
+    assert_eq!(durable.status, STATUS_PAUSED);
+    assert!(durable.waiting_for.is_none());
+    assert_eq!(
+        durable.events.last().unwrap()["data"]["requested_operation"],
+        "resume"
+    );
+    engine
+        .start_run("run-2", "user-1", "sess-1")
+        .await
+        .expect("failed same-run resume must still enable session continuation");
 }
 
 #[tokio::test]
@@ -8343,6 +8459,15 @@ async fn durable_resume_succeeds_when_current_paused_run_is_only_blocker() {
         )
         .await
         .unwrap();
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-solo-resume",
+        "sess-solo-resume",
+        RunStatus::Paused,
+        Some("user_resume"),
+    )
+    .await;
 
     let result = ok(svc
         .resume_run("run-solo-resume".into(), "user-1".into())
@@ -8441,11 +8566,10 @@ async fn durable_resume_promotes_buffered_completion_even_when_session_has_block
     assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
 }
 
-/// Concurrent mutation of two runs in the same session must leave durable
-/// state consistent. Pause and cancel are idempotent and neither is gated
-/// by session exclusivity — both must succeed.
+/// Concurrent mutation of two durable-only runs in the same session must
+/// classify the orphaned running row honestly while cancelling its sibling.
 #[tokio::test]
-async fn concurrent_pause_and_cancel_in_same_session_state_consistent() {
+async fn concurrent_orphan_pause_and_cancel_release_session_slot_consistently() {
     let svc = test_service();
     let engine = &svc.run_engine;
     let session_id = "sess-pause-cancel-conc";
@@ -8465,7 +8589,9 @@ async fn concurrent_pause_and_cancel_in_same_session_state_consistent() {
         .await
         .unwrap();
 
-    // Concurrent: pause run-b, cancel run-a
+    // Concurrent: a pause request discovers that run-b has no executor while
+    // run-a is cancelled. Both operations must converge without inventing a
+    // resumable same-run task.
     let (result_pause_b, result_cancel_a) = tokio::join!(
         svc.pause_run("run-b".into(), "user-1".into()),
         svc.cancel_run("run-a".into(), "user-1".into()),
@@ -8491,17 +8617,19 @@ async fn concurrent_pause_and_cancel_in_same_session_state_consistent() {
     ));
 
     assert_eq!(durable_b.status, STATUS_PAUSED, "run-b paused");
+    assert!(durable_b.waiting_for.is_none());
     assert_eq!(
-        durable_b.waiting_for.as_deref(),
-        Some("user_resume"),
-        "run-b waiting for user resume"
+        durable_b.events.last().unwrap()["event_type"],
+        "run_interrupted"
     );
-    assert!(
-        durable_b
-            .events
-            .iter()
-            .any(|e| e["event_type"] == "run_paused")
+    assert_eq!(
+        durable_b.events.last().unwrap()["data"]["resume_strategy"],
+        "session_continuation"
     );
+    engine
+        .start_run("run-c", "user-1", session_id)
+        .await
+        .expect("concurrent orphan recovery and cancel must release the session slot");
 }
 
 #[tokio::test]
@@ -8639,13 +8767,22 @@ async fn stream_run_cache_miss_replays_durable_text_done() {
 }
 
 #[tokio::test]
-async fn submit_run_input_uses_durable_idempotency_on_cache_miss() {
+async fn submit_run_input_uses_durable_idempotency_when_live_cache_has_no_input_event() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine
         .start_run("run-input", "user-1", "session-1")
         .await
         .unwrap();
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-input",
+        "session-1",
+        RunStatus::Running,
+        None,
+    )
+    .await;
 
     let first = ok(svc
         .submit_run_input(
@@ -8700,6 +8837,15 @@ async fn submit_run_input_transition_failure_does_not_commit_status_or_events() 
         .start_run("run-input-fail", "user-1", "session-1")
         .await
         .unwrap();
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-input-fail",
+        "session-1",
+        RunStatus::Running,
+        None,
+    )
+    .await;
 
     let e = err(svc
         .submit_run_input(
@@ -8733,6 +8879,51 @@ async fn submit_run_input_transition_failure_does_not_commit_status_or_events() 
         ),
         "failed input transition must not append run_input_queued"
     );
+}
+
+#[tokio::test]
+async fn submit_run_input_rejects_orphaned_execution_without_persisting_false_acceptance() {
+    let svc = test_service();
+    let engine = &svc.run_engine;
+    engine
+        .start_run("run-orphaned-input", "user-1", "session-1")
+        .await
+        .unwrap();
+
+    let error = err(svc
+        .submit_run_input(
+            "run-orphaned-input".into(),
+            "user-1".into(),
+            RunInputData {
+                idempotency_key: "key-orphaned".into(),
+                input: json!({"answer": "nobody can consume this"}),
+            },
+        )
+        .await);
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("run_input_consumer_not_live")
+    );
+
+    let durable = engine
+        .load_run("user-1", "run-orphaned-input")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_PAUSED);
+    assert!(durable.waiting_for.is_none());
+    assert!(durable.events.iter().all(|event| {
+        event.get("idempotency_key").and_then(Value::as_str) != Some("key-orphaned")
+    }));
+    assert_eq!(
+        durable.events.last().unwrap()["data"]["requested_operation"],
+        "submit_input"
+    );
+    engine
+        .start_run("run-input-continuation", "user-1", "session-1")
+        .await
+        .expect("rejected orphan input must not leave the session blocked");
 }
 
 #[tokio::test]
@@ -8779,6 +8970,15 @@ async fn submit_run_input_accepts_repeated_queueing_while_input_already_queued()
         )
         .await
         .unwrap();
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-queued-input",
+        "session-1",
+        RunStatus::InputQueued,
+        Some("user_input"),
+    )
+    .await;
 
     let result = svc
         .submit_run_input(
@@ -9632,9 +9832,11 @@ fn run_status_live_semantics_align_with_durable_owner() {
     );
 }
 
-/// P1-A: finalize_run_events must preserve Waiting as a non-error status.
+/// A waiting outcome has no live task after finalization, so it must release
+/// the execution slot and advertise session continuation instead of leaving an
+/// unconsumable durable input queue.
 #[test]
-fn finalize_run_events_preserves_waiting_without_error_event() {
+fn finalize_run_events_routes_waiting_to_session_continuation() {
     let svc = test_service();
     let request = test_request("wait");
     let state = svc.build_initial_state(
@@ -9653,11 +9855,14 @@ fn finalize_run_events_preserves_waiting_without_error_event() {
         &state,
     );
 
-    assert_eq!(status, RunStatus::Waiting);
-    assert_eq!(error.as_deref(), Some("waiting: tool_approval"));
-    assert_eq!(events.len(), 1);
+    assert_eq!(status, RunStatus::Paused);
+    assert!(error.is_none());
+    assert_eq!(events.len(), 2);
     assert_eq!(events[0]["event_type"], "run_waiting");
     assert_eq!(events[0]["data"]["reason"], "waiting: tool_approval");
+    assert_eq!(events[0]["data"]["resume_strategy"], "session_continuation");
+    assert_eq!(events[1]["event_type"], "run_finished");
+    assert_eq!(events[1]["data"]["interrupted"], true);
 }
 
 /// P1-F: stream_chat must persist usage unconditionally.

@@ -51,7 +51,8 @@ pub use permission_sync::{
 };
 pub use spawner::{
     AgentHistoryRecord, AgentStatus, DynamicAgentSpawner, InheritedChildPrefix, PermissionSummary,
-    SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunConfig, SpawnRunResult, SpawnedAgentInfo,
-    SpawnedAgentMetrics, SpawnedAgentState, WaitForAgentOutcome,
+    SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunConfig, SpawnRunResult,
+    SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics, SpawnedAgentState,
+    WaitForAgentOutcome, project_subrun_status_to_spawn,
     spawn_completion_status_from_finish_reason,
 };

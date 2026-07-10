@@ -52,8 +52,8 @@ use astra_services::{BubbleUpTarget, DatabaseStateProjectionStore, LlmTokenServi
 
 pub use astra_core::SubRunState;
 use astra_core::{
-    InvalidTransition, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED,
-    STATUS_RUNNING, STATUS_VERIFICATION_FAILED,
+    InvalidTransition, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED,
+    STATUS_PAUSED, STATUS_RUNNING, STATUS_VERIFICATION_FAILED, STATUS_WAITING,
 };
 
 use crate::server::run::engine::RunEngine;
@@ -3926,31 +3926,101 @@ impl DelegationEngine {
 
     // ── Pause / Resume API ──────────────────────────────────────────────────
 
+    async fn pause_live_sub_run(&self, user_id: &str, run_id: &str, waiting_for: &str) -> bool {
+        if self.tracker.get_pause_flag(run_id).await.is_none()
+            || self
+                .tracker
+                .get_sub_run_state(run_id)
+                .await
+                .is_none_or(|state| state.is_terminal())
+        {
+            return false;
+        }
+        let event = serde_json::json!({
+            "event_type": "run_paused",
+            "data": {"source": waiting_for},
+        });
+        match self
+            .run_engine
+            .transition_status_with_event_if_current(
+                user_id,
+                run_id,
+                &[STATUS_RUNNING, STATUS_WAITING, STATUS_INPUT_QUEUED],
+                STATUS_PAUSED,
+                Some(waiting_for),
+                None,
+                event,
+            )
+            .await
+        {
+            Ok(true) => self.tracker.pause_sub_run(run_id).await,
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::delegation",
+                    run_id,
+                    error = %error,
+                    "failed to durably pause live sub-run"
+                );
+                false
+            }
+        }
+    }
+
+    async fn resume_live_sub_run(&self, user_id: &str, run_id: &str, source: &str) -> bool {
+        if !self.tracker.is_paused(run_id).await
+            || self
+                .tracker
+                .get_sub_run_state(run_id)
+                .await
+                .is_none_or(|state| state.is_terminal())
+        {
+            return false;
+        }
+        let event = serde_json::json!({
+            "event_type": "run_resumed",
+            "data": {"source": source},
+        });
+        match self
+            .run_engine
+            .transition_status_with_event_if_current(
+                user_id,
+                run_id,
+                &[STATUS_PAUSED],
+                STATUS_RUNNING,
+                None,
+                None,
+                event,
+            )
+            .await
+        {
+            Ok(true) => self.tracker.resume_sub_run(run_id).await,
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::delegation",
+                    run_id,
+                    error = %error,
+                    "failed to durably resume live sub-run"
+                );
+                false
+            }
+        }
+    }
+
     /// Pause all sub-runs belonging to a delegation.
     ///
     /// Sets cooperative pause flags — sub-runs check these between turns and
     /// yield with status "paused" at the next turn boundary.
     pub async fn pause_delegation(&self, user_id: &str, delegation_id: &str) -> usize {
-        let count = self.tracker.pause_delegation(delegation_id).await;
-        // Persist pause status only for non-terminal sub-runs
+        let mut count = 0;
         for record in self.tracker.get_sub_runs(delegation_id).await {
-            if record.state.is_terminal() {
-                continue;
+            if self
+                .pause_live_sub_run(user_id, &record.run_id, "delegation_pause")
+                .await
+            {
+                count += 1;
             }
-            astra_core::log_persist!(
-                self.run_engine
-                    .persist_status(
-                        user_id,
-                        &record.run_id,
-                        STATUS_PAUSED,
-                        Some("delegation_pause"),
-                        None
-                    )
-                    .await,
-                "delegation",
-                &record.run_id,
-                "pause"
-            );
         }
         count
     }
@@ -3959,85 +4029,42 @@ impl DelegationEngine {
     ///
     /// Clears cooperative pause flags so sub-runs continue executing.
     pub async fn resume_delegation(&self, user_id: &str, delegation_id: &str) -> usize {
-        let count = self.tracker.resume_delegation(delegation_id).await;
+        let mut count = 0;
         for record in self.tracker.get_sub_runs(delegation_id).await {
-            if record.state.is_terminal() {
-                continue;
+            if self
+                .resume_live_sub_run(user_id, &record.run_id, "delegation_resume")
+                .await
+            {
+                count += 1;
             }
-            astra_core::log_persist!(
-                self.run_engine
-                    .persist_status(
-                        user_id,
-                        &record.run_id,
-                        STATUS_RUNNING,
-                        Some("delegation_resume"),
-                        None
-                    )
-                    .await,
-                "delegation",
-                &record.run_id,
-                "resume"
-            );
         }
         count
     }
 
     /// Pause all sub-runs spawned by a parent run (across all delegations).
     pub async fn pause_children_of(&self, user_id: &str, parent_run_id: &str) -> usize {
-        let count = self.tracker.pause_children_of(parent_run_id).await;
+        let mut count = 0;
         for child_id in self.tracker.get_children(parent_run_id).await {
             if self
-                .tracker
-                .get_sub_run_state(&child_id)
+                .pause_live_sub_run(user_id, &child_id, "parent_pause")
                 .await
-                .map_or(false, |s| s.is_terminal())
             {
-                continue;
+                count += 1;
             }
-            astra_core::log_persist!(
-                self.run_engine
-                    .persist_status(
-                        user_id,
-                        &child_id,
-                        STATUS_PAUSED,
-                        Some("parent_pause"),
-                        None
-                    )
-                    .await,
-                "delegation",
-                &child_id,
-                "pause"
-            );
         }
         count
     }
 
     /// Resume all sub-runs spawned by a parent run.
     pub async fn resume_children_of(&self, user_id: &str, parent_run_id: &str) -> usize {
-        let count = self.tracker.resume_children_of(parent_run_id).await;
+        let mut count = 0;
         for child_id in self.tracker.get_children(parent_run_id).await {
             if self
-                .tracker
-                .get_sub_run_state(&child_id)
+                .resume_live_sub_run(user_id, &child_id, "parent_resume")
                 .await
-                .map_or(false, |s| s.is_terminal())
             {
-                continue;
+                count += 1;
             }
-            astra_core::log_persist!(
-                self.run_engine
-                    .persist_status(
-                        user_id,
-                        &child_id,
-                        STATUS_RUNNING,
-                        Some("parent_resume"),
-                        None,
-                    )
-                    .await,
-                "delegation",
-                &child_id,
-                "resume"
-            );
         }
         count
     }
@@ -5436,7 +5463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_children_of_sets_flags_but_preserves_terminal_status() {
+    async fn pause_children_of_ignores_terminal_sub_runs() {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
@@ -5445,11 +5472,11 @@ mod tests {
 
         // Pause all children of parent-1 (sub-runs are already completed)
         let paused = de.pause_children_of("user-1", "parent-1").await;
-        assert_eq!(paused, 2);
+        assert_eq!(paused, 0);
 
-        // Cooperative flags are set (for use if sub-runs were still running)
+        // A terminal task cannot observe cooperative flags.
         for ar in &result.agent_results {
-            assert!(tracker.is_paused(&ar.run_id).await);
+            assert!(!tracker.is_paused(&ar.run_id).await);
         }
 
         // Durable status is NOT overwritten for terminal sub-runs
@@ -5462,27 +5489,27 @@ mod tests {
             assert_eq!(run.status, "completed");
         }
 
-        // Resume clears flags
+        // Resume does not claim to revive completed work.
         let resumed = de.resume_children_of("user-1", "parent-1").await;
-        assert_eq!(resumed, 2);
+        assert_eq!(resumed, 0);
         for ar in &result.agent_results {
             assert!(!tracker.is_paused(&ar.run_id).await);
         }
     }
 
     #[tokio::test]
-    async fn pause_delegation_by_id_sets_flags_preserves_terminal_status() {
+    async fn pause_delegation_by_id_ignores_terminal_sub_runs() {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
         de.execute(req, "orch", None).await.unwrap();
 
         let paused = de.pause_delegation("user-1", "del-1").await;
-        assert_eq!(paused, 2);
+        assert_eq!(paused, 0);
 
         let subs = tracker.get_sub_runs("del-1").await;
         for sub in &subs {
-            assert!(tracker.is_paused(&sub.run_id).await);
+            assert!(!tracker.is_paused(&sub.run_id).await);
             // Durable status preserved — terminal sub-runs not overwritten
             let run = engine
                 .load_run("user-1", &sub.run_id)
@@ -5493,10 +5520,61 @@ mod tests {
         }
 
         let resumed = de.resume_delegation("user-1", "del-1").await;
-        assert_eq!(resumed, 2);
+        assert_eq!(resumed, 0);
         for sub in &subs {
             assert!(!tracker.is_paused(&sub.run_id).await);
         }
+    }
+
+    #[tokio::test]
+    async fn live_sub_run_pause_resume_commits_status_and_event_before_flag() {
+        let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+        engine
+            .start_run_ext(
+                "sub-live",
+                "user-1",
+                "session-live",
+                Some("parent-live"),
+                Some("delegation-live"),
+                Some("coder"),
+                None,
+            )
+            .await
+            .unwrap();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "sub-live".into(),
+                parent_run_id: "parent-live".into(),
+                delegation_id: "delegation-live".into(),
+                agent_id: "coder".into(),
+                depth: 1,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+        tracker.register_pause_flag("sub-live").await;
+
+        assert_eq!(de.pause_children_of("user-1", "parent-live").await, 1);
+        assert!(tracker.is_paused("sub-live").await);
+        let paused = engine
+            .load_run("user-1", "sub-live")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.status, STATUS_PAUSED);
+        assert_eq!(paused.waiting_for.as_deref(), Some("parent_pause"));
+        assert_eq!(paused.events.last().unwrap()["event_type"], "run_paused");
+
+        assert_eq!(de.resume_children_of("user-1", "parent-live").await, 1);
+        assert!(!tracker.is_paused("sub-live").await);
+        let resumed = engine
+            .load_run("user-1", "sub-live")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.status, STATUS_RUNNING);
+        assert!(resumed.waiting_for.is_none());
+        assert_eq!(resumed.events.last().unwrap()["event_type"], "run_resumed");
     }
 
     // ─── Verification Gate Tests ────────────────────────────────────────────
@@ -5762,7 +5840,11 @@ mod tests {
         assert_eq!(chain.len(), 2);
         assert!(tracker.get_pause_flag(&chain[0]).await.is_some());
         assert!(tracker.get_pause_flag(&chain[1]).await.is_some());
-        assert_eq!(de.pause_delegation("user-1", "del-1").await, 2);
+        assert_eq!(
+            de.pause_delegation("user-1", "del-1").await,
+            0,
+            "completed retry attempts must not be advertised as cooperatively paused"
+        );
     }
 
     #[tokio::test]

@@ -84,6 +84,23 @@ fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
     ]
 }
 
+fn restart_session_continuation_event(
+    previous_status: &str,
+    checkpoint_available: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event_type": "run_interrupted_after_restart",
+        "data": {
+            "previous_status": previous_status,
+            "reason_kind": "execution_process_restarted",
+            "checkpoint_available": checkpoint_available,
+            "resumable": true,
+            "resume_strategy": "session_continuation",
+            "releases_session_slot": true,
+        }
+    })
+}
+
 /// Durable run execution engine.
 ///
 /// Wraps a [`RunStateStore`] and provides high-level operations for
@@ -100,7 +117,7 @@ pub struct RunEngine {
 
 pub(crate) struct RunOwnerLeaseHeartbeat {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    join: tokio::task::JoinHandle<()>,
+    _join: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for RunOwnerLeaseHeartbeat {
@@ -108,7 +125,9 @@ impl Drop for RunOwnerLeaseHeartbeat {
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
-        self.join.abort();
+        // Dropping a JoinHandle detaches the task. Let it observe `stop_tx`
+        // and release the durable lease; aborting here would preserve a stale
+        // owner until TTL expiry after every graceful executor exit.
     }
 }
 
@@ -409,11 +428,20 @@ impl RunEngine {
                     }
                 }
             }
+
+            if let Err(error) = engine.store.release_owner_lease(&user_id, &run_id).await {
+                tracing::warn!(
+                    target: "astra_runtime::run_engine",
+                    run_id = %run_id,
+                    error = %error,
+                    "failed to release run owner lease after executor exit"
+                );
+            }
         });
 
         Some(RunOwnerLeaseHeartbeat {
             stop_tx: Some(stop_tx),
-            join,
+            _join: join,
         })
     }
 
@@ -1132,11 +1160,16 @@ impl RunEngine {
 
     /// Recover active runs after a crash/restart.
     ///
-    /// - `waiting` runs: returned for the caller to resume.
-    /// - `running` runs with graceful checkpoint_v1: moved to `waiting` and
-    ///   annotated with `run_resumed_after_restart` for exactly-once replay.
-    /// - other `running` runs: were in-flight when the process died; marked
-    ///   `failed` with crash-recovery terminal events.
+    /// A durable status is not proof that an execution task survived. The
+    /// current shutdown checkpoint records detection metadata, not enough
+    /// state to reconstruct an agent loop safely across processes.
+    ///
+    /// - orphaned `waiting` / blocking `paused` runs are moved to non-blocking
+    ///   `paused` and direct the caller to continue the session with a new run;
+    /// - `running` runs with a graceful checkpoint use the same honest
+    ///   session-continuation fallback;
+    /// - other `running` / `input_queued` runs are marked failed because their
+    ///   in-flight effects cannot be proven replay-safe.
     pub async fn recover_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let active = match self.store.find_recoverable_active_runs().await {
             Ok(active) => {
@@ -1150,11 +1183,6 @@ impl RunEngine {
         };
         let mut recovered = Vec::with_capacity(active.len());
         for run in active {
-            if run.status == STATUS_WAITING {
-                record_recovery_run(self.metrics_registry.as_ref(), "preserve_waiting", "ok");
-                recovered.push(run);
-                continue;
-            }
             if let Some(recovered_run) = self.recover_active_run(run).await {
                 recovered.push(recovered_run);
             }
@@ -1164,51 +1192,48 @@ impl RunEngine {
 
     async fn recover_active_run(&self, mut run: DurableRunRecord) -> Option<DurableRunRecord> {
         let expected_status = run.status.clone();
-        if has_graceful_resume_checkpoint(self, &run).await {
-            let event = serde_json::json!({
-                "event_type": "run_resumed_after_restart",
-                "data": {"checkpoint_version": "checkpoint_v1"}
-            });
+        let checkpoint_available = has_graceful_resume_checkpoint(self, &run).await;
+        let continue_via_session =
+            matches!(run.status.as_str(), STATUS_WAITING | STATUS_PAUSED) || checkpoint_available;
+        if continue_via_session {
+            let event = restart_session_continuation_event(&expected_status, checkpoint_available);
             match self
                 .store
                 .update_run_status_with_event_if_current(
                     &run.user_id,
                     &run.run_id,
                     &[expected_status.as_str()],
-                    STATUS_WAITING,
-                    Some("restart_resume"),
+                    STATUS_PAUSED,
                     None,
-                    event,
+                    None,
+                    event.clone(),
                 )
                 .await
             {
                 Ok(true) => {
                     record_recovery_run(
                         self.metrics_registry.as_ref(),
-                        "resume_checkpoint",
+                        "session_continuation",
                         "committed",
                     );
-                    run.status = STATUS_WAITING.to_string();
-                    run.waiting_for = Some("restart_resume".to_string());
+                    run.status = STATUS_PAUSED.to_string();
+                    run.waiting_for = None;
                     run.last_event_idx += 1;
-                    run.events.push(serde_json::json!({
-                        "event_type": "run_resumed_after_restart",
-                        "data": {"checkpoint_version": "checkpoint_v1"}
-                    }));
+                    run.events.push(event);
                     Some(run)
                 }
                 Ok(false) => self.recovery_conflict_current_run(&run).await,
                 Err(e) => {
                     record_recovery_run(
                         self.metrics_registry.as_ref(),
-                        "resume_checkpoint",
+                        "session_continuation",
                         "error",
                     );
                     tracing::warn!(
                         target: "astra_runtime::run_engine",
                         run_id = %run.run_id,
                         error = %e,
-                        "failed to atomically mark graceful run waiting during recovery"
+                        "failed to atomically release orphaned run for session continuation"
                     );
                     None
                 }
@@ -1531,6 +1556,16 @@ impl RunInputProvider for RunEngine {
 }
 
 async fn has_graceful_resume_checkpoint(engine: &RunEngine, run: &DurableRunRecord) -> bool {
+    // `save_checkpoint` updates the agent_runs snapshot in the same transaction,
+    // so the recovery scan already carries the common-case checkpoint. Avoid
+    // one extra query per active run; fall back to the typed history table only
+    // for legacy/incomplete rows.
+    if checkpoint_is_graceful_resume(
+        run.checkpoint_version.as_deref().unwrap_or_default(),
+        run.checkpoint_json.as_deref().unwrap_or_default(),
+    ) {
+        return true;
+    }
     if let Ok(Some(checkpoint)) = engine
         .load_latest_checkpoint(&run.user_id, &run.run_id, Some("resume"))
         .await
@@ -1540,10 +1575,7 @@ async fn has_graceful_resume_checkpoint(engine: &RunEngine, run: &DurableRunReco
             &checkpoint.checkpoint_json,
         );
     }
-    checkpoint_is_graceful_resume(
-        run.checkpoint_version.as_deref().unwrap_or_default(),
-        run.checkpoint_json.as_deref().unwrap_or_default(),
-    )
+    false
 }
 
 fn checkpoint_is_graceful_resume(checkpoint_version: &str, checkpoint_json: &str) -> bool {
@@ -1655,7 +1687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_lease_heartbeat_renews_until_guard_drops() {
+    async fn owner_lease_heartbeat_renews_and_releases_when_guard_drops() {
         let store = Arc::new(
             FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
                 .with_owner_lease_heartbeat(Duration::from_millis(5)),
@@ -1675,12 +1707,21 @@ mod tests {
         );
 
         drop(guard);
-        let renewals_after_drop = store.lease_renewals();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        while store.lease_releases() == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            store.lease_releases(),
+            1,
+            "dropping the heartbeat guard must release durable ownership"
+        );
+        let renewals_after_release = store.lease_renewals();
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert_eq!(
             store.lease_renewals(),
-            renewals_after_drop,
-            "dropping the heartbeat guard must stop renewal"
+            renewals_after_release,
+            "released ownership must not continue renewing"
         );
     }
 
@@ -1700,6 +1741,7 @@ mod tests {
         recoverable_active_queries: AtomicUsize,
         lease_renewal_interval: Option<Duration>,
         lease_renewals: AtomicUsize,
+        lease_releases: AtomicUsize,
         mode: BatchTransitionFailureMode,
     }
 
@@ -1713,6 +1755,7 @@ mod tests {
                 recoverable_active_queries: AtomicUsize::new(0),
                 lease_renewal_interval: None,
                 lease_renewals: AtomicUsize::new(0),
+                lease_releases: AtomicUsize::new(0),
                 mode,
             }
         }
@@ -1736,6 +1779,10 @@ mod tests {
 
         fn lease_renewals(&self) -> usize {
             self.lease_renewals.load(Ordering::SeqCst)
+        }
+
+        fn lease_releases(&self) -> usize {
+            self.lease_releases.load(Ordering::SeqCst)
         }
 
         fn should_fail_this_attempt(&self) -> bool {
@@ -2002,6 +2049,11 @@ mod tests {
             _expected_statuses: &[&str],
         ) -> Result<bool, String> {
             self.lease_renewals.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn release_owner_lease(&self, _user_id: &str, _run_id: &str) -> Result<bool, String> {
+            self.lease_releases.fetch_add(1, Ordering::SeqCst);
             Ok(true)
         }
 
@@ -2998,13 +3050,7 @@ mod tests {
         );
         assert!(
             rendered.contains(
-                "astra_run_recovery_runs_total{action=\"preserve_waiting\",outcome=\"ok\"} 1"
-            ),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains(
-                "astra_run_recovery_runs_total{action=\"resume_checkpoint\",outcome=\"committed\"} 1"
+                "astra_run_recovery_runs_total{action=\"session_continuation\",outcome=\"committed\"} 2"
             ),
             "{rendered}"
         );
@@ -3307,7 +3353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_active_runs_returns_waiting() {
+    async fn recover_active_runs_releases_orphaned_waiting_for_session_continuation() {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
         engine.start_run("run-2", "user-1", "sess-2").await.unwrap();
@@ -3322,6 +3368,16 @@ mod tests {
         let active = engine.recover_active_runs().await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].run_id, "run-1");
+        assert_eq!(active[0].status, STATUS_PAUSED);
+        assert!(active[0].waiting_for.is_none());
+        assert_eq!(
+            active[0].events.last().unwrap()["data"]["resume_strategy"],
+            "session_continuation"
+        );
+        engine
+            .start_run("run-continuation", "user-1", "sess-1")
+            .await
+            .expect("startup recovery must release the session execution slot");
     }
 
     #[tokio::test]
@@ -3362,12 +3418,9 @@ mod tests {
             0,
             "startup recovery must not separately query waiting runs outside the owner-scoped recovery path"
         );
-        assert!(
-            recovered.iter().any(|run| run.run_id == "run-waiting"
-                && run.status == STATUS_WAITING
-                && run.waiting_for.as_deref() == Some("user_resume")),
-            "waiting runs returned by the owner-scoped recovery query must be preserved"
-        );
+        assert!(recovered.iter().any(|run| {
+            run.run_id == "run-waiting" && run.status == STATUS_PAUSED && run.waiting_for.is_none()
+        }));
         let crashed = engine
             .load_run("user-1", "run-crashed")
             .await
@@ -3378,7 +3431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_active_runs_does_not_fail_paused_runs() {
+    async fn recover_active_runs_releases_orphaned_blocking_pause() {
         let engine = test_engine();
         engine
             .start_run("run-paused", "user-1", "sess-paused")
@@ -3397,29 +3450,23 @@ mod tests {
 
         let recovered = engine.recover_active_runs().await.unwrap();
 
-        assert!(
-            recovered.iter().all(|run| run.run_id != "run-paused"),
-            "paused runs are user-held/resumable state, not crash-recovery candidates"
-        );
+        assert!(recovered.iter().any(|run| run.run_id == "run-paused"));
         let durable = engine
             .load_run("user-1", "run-paused")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(durable.status, STATUS_PAUSED);
-        assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
+        assert!(durable.waiting_for.is_none());
         assert!(durable.error_code.is_none());
-        assert!(
-            durable
-                .events
-                .iter()
-                .all(|event| event["event_type"] != "run_error"),
-            "startup recovery must not append crash-recovery errors to paused runs"
+        assert_eq!(
+            durable.events.last().unwrap()["event_type"],
+            "run_interrupted_after_restart"
         );
     }
 
     #[tokio::test]
-    async fn recover_active_runs_promotes_graceful_resume_checkpoint_to_waiting() {
+    async fn recover_active_runs_releases_graceful_checkpoint_for_session_continuation() {
         let engine = test_engine();
         engine
             .start_run("run-resume", "user-1", "sess-resume")
@@ -3439,18 +3486,22 @@ mod tests {
             .into_iter()
             .find(|run| run.run_id == "run-resume")
             .expect("graceful checkpointed run should be recoverable");
-        assert_eq!(resumed.status, "waiting");
-        assert_eq!(resumed.waiting_for.as_deref(), Some("restart_resume"));
+        assert_eq!(resumed.status, STATUS_PAUSED);
+        assert!(resumed.waiting_for.is_none());
         let durable = engine
             .load_run("user-1", "run-resume")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(durable.status, "waiting");
-        assert_eq!(durable.waiting_for.as_deref(), Some("restart_resume"));
+        assert_eq!(durable.status, STATUS_PAUSED);
+        assert!(durable.waiting_for.is_none());
         assert_eq!(
             durable.events.last().unwrap()["event_type"],
-            "run_resumed_after_restart"
+            "run_interrupted_after_restart"
+        );
+        assert_eq!(
+            durable.events.last().unwrap()["data"]["checkpoint_available"],
+            true
         );
     }
 
@@ -3509,8 +3560,8 @@ mod tests {
             .into_iter()
             .find(|run| run.run_id == "run-legacy")
             .expect("legacy checkpointed run should still resume");
-        assert_eq!(resumed.status, "waiting");
-        assert_eq!(resumed.waiting_for.as_deref(), Some("restart_resume"));
+        assert_eq!(resumed.status, STATUS_PAUSED);
+        assert!(resumed.waiting_for.is_none());
     }
 
     #[tokio::test]
@@ -3617,7 +3668,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Insert a waiting run (should be returned for resume, not failed)
+        // Insert an orphaned waiting run. With no surviving consumer it must
+        // release the session for a continuation run.
         engine
             .start_run("run-wait", "user-1", "sess-2")
             .await
@@ -3670,15 +3722,17 @@ mod tests {
         );
         assert_eq!(run_finished["data"]["error_code"], "crash_recovery");
 
-        // The waiting run must remain waiting
+        // The orphaned waiting run becomes a non-blocking paused continuation.
         let waiting = engine
             .load_run("user-1", "run-wait")
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(waiting.status, STATUS_PAUSED);
+        assert!(waiting.waiting_for.is_none());
         assert_eq!(
-            waiting.status, "waiting",
-            "waiting run must remain waiting for resume"
+            waiting.events.last().unwrap()["data"]["resume_strategy"],
+            "session_continuation"
         );
     }
 

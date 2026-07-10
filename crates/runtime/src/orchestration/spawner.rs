@@ -76,13 +76,13 @@ pub fn spawn_completion_status_from_finish_reason(finish_reason: Option<&str>) -
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SpawnStatusProjection {
+pub struct SpawnStatusProjection {
     pub status: &'static str,
     pub finish_reason: &'static str,
     pub error: Option<String>,
 }
 
-pub(crate) fn project_subrun_status_to_spawn(
+pub fn project_subrun_status_to_spawn(
     subrun_status: &str,
     error: Option<String>,
 ) -> SpawnStatusProjection {
@@ -3683,11 +3683,19 @@ mod tests {
     }
 
     #[test]
-    fn subrun_status_projection_maps_paused_and_unknown_via_spawn_owner() {
+    fn subrun_status_projection_maps_interruption_cancel_and_unknown_via_spawn_owner() {
         let paused = project_subrun_status_to_spawn(astra_core::STATUS_PAUSED, None);
         assert_eq!(paused.status, SPAWN_STATUS_INTERRUPTED);
         assert_eq!(paused.finish_reason, SPAWN_STATUS_INTERRUPTED);
         assert!(paused.error.is_none());
+
+        let waiting = project_subrun_status_to_spawn(astra_core::STATUS_WAITING, None);
+        assert_eq!(waiting.status, SPAWN_STATUS_WAITING);
+        assert_eq!(waiting.finish_reason, SPAWN_STATUS_WAITING);
+
+        let cancelled = project_subrun_status_to_spawn(astra_core::STATUS_CANCELLED, None);
+        assert_eq!(cancelled.status, SPAWN_STATUS_CANCELLED);
+        assert_eq!(cancelled.finish_reason, SPAWN_STATUS_CANCELLED);
 
         let unknown = project_subrun_status_to_spawn("mystery", None);
         assert_eq!(unknown.status, SPAWN_STATUS_FAILED);

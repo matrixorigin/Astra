@@ -691,11 +691,11 @@ async fn l2_graceful_checkpoint_recovers_as_waiting() {
     let recovered = engine.recover_active_runs().await.unwrap();
     assert!(recovered.iter().any(|run| run.run_id == run_id));
     let loaded = engine.load_run(&user_id, &run_id).await.unwrap().unwrap();
-    assert_eq!(loaded.status, "waiting");
-    assert_eq!(loaded.waiting_for.as_deref(), Some("restart_resume"));
+    assert_eq!(loaded.status, "paused");
+    assert!(loaded.waiting_for.is_none());
     assert!(loaded.events.iter().any(|event| {
         event.get("event_type").and_then(serde_json::Value::as_str)
-            == Some("run_resumed_after_restart")
+            == Some("run_interrupted_after_restart")
     }));
 }
 

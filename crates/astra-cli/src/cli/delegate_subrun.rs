@@ -552,7 +552,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 Ok(AgentResult {
                     agent_id,
                     run_id,
-                    status: "paused".to_string(),
+                    status: "cancelled".to_string(),
                     output: partial_output(),
                     error: None,
                     prompt_tokens,
@@ -564,7 +564,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 Ok(AgentResult {
                     agent_id,
                     run_id,
-                    status: "waiting".to_string(),
+                    status: "paused".to_string(),
                     output: Some(reason),
                     error: None,
                     prompt_tokens,

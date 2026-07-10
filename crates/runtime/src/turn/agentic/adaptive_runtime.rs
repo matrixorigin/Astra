@@ -134,8 +134,13 @@ pub(crate) fn record_loop_completion_feedback(
                 .with_turn(&turn_id),
             ));
         }
-        Ok(AgenticLoopOutcome::Waiting(_)) => {
-            // No signal for waiting — the loop will resume.
+        Ok(AgenticLoopOutcome::Waiting(reason)) => {
+            hub.record_feedback(enrich_signal(
+                FeedbackSignal::new(SignalType::Interruption)
+                    .with_turn(&turn_id)
+                    .with_context("resume_strategy", serde_json::json!("caller_reinvoke"))
+                    .with_context("waiting_reason", serde_json::json!(reason)),
+            ));
         }
     }
 

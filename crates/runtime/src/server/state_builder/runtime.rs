@@ -152,9 +152,11 @@ async fn recover_active_runs(run_engine: &crate::server::run::engine::RunEngine)
     match run_engine.recover_active_runs().await {
         Ok(recovered_runs) => {
             if !recovered_runs.is_empty() {
-                let waiting = recovered_runs
+                let continuation_ready = recovered_runs
                     .iter()
-                    .filter(|run| run.status == astra_core::STATUS_WAITING)
+                    .filter(|run| {
+                        run.status == astra_core::STATUS_PAUSED && run.waiting_for.is_none()
+                    })
                     .count();
                 let failed = recovered_runs
                     .iter()
@@ -163,9 +165,9 @@ async fn recover_active_runs(run_engine: &crate::server::run::engine::RunEngine)
                 tracing::warn!(
                     target: "astra_runtime::state_builder",
                     recovered_total = recovered_runs.len(),
-                    recovered_waiting = waiting,
+                    recovered_for_session_continuation = continuation_ready,
                     recovered_failed = failed,
-                    "recovered durable active runs during startup"
+                    "classified orphaned durable runs during startup"
                 );
             }
         }

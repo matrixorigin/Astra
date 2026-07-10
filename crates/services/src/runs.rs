@@ -1094,6 +1094,14 @@ pub trait RunStateStore: Send + Sync {
     /// Find runs in RUNNING status.
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
 
+    /// Find paused runs that still claim an execution wait and therefore need
+    /// startup recovery to release their session slot when no live owner
+    /// remains. Stores without durable owner tracking may return every paused
+    /// run with `waiting_for` set.
+    async fn find_recoverable_paused_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        Ok(Vec::new())
+    }
+
     /// Find active runs this store owner may recover after startup.
     ///
     /// Implementations backed by shared durable storage must not return rows
@@ -1105,13 +1113,14 @@ pub trait RunStateStore: Send + Sync {
 
     /// Find all active runs this store owner may recover after startup.
     ///
-    /// This includes stable waiting runs plus running/input-queued runs that
-    /// need recovery classification. Shared durable stores must apply the same
-    /// owner-lease boundary to every returned status so a restarting pod cannot
-    /// resume or fail work still leased by another live pod.
+    /// This includes waiting, running/input-queued, and blocking paused runs
+    /// that need recovery classification. Shared durable stores must apply the
+    /// same owner-lease boundary to every returned status so a restarting pod
+    /// cannot resume or interrupt work still leased by another live pod.
     async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let mut active = self.find_waiting_runs().await?;
         active.extend(self.find_recoverable_running_runs().await?);
+        active.extend(self.find_recoverable_paused_runs().await?);
         Ok(active)
     }
 
@@ -1133,6 +1142,15 @@ pub trait RunStateStore: Send + Sync {
         _run_id: &str,
         _expected_statuses: &[&str],
     ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Release this store owner's lease when the process-local executor exits.
+    ///
+    /// A graceful task exit should not make other runtimes wait for the lease
+    /// TTL before they can distinguish durable history from a live executor.
+    /// Shared stores must fence this update by their own owner identity.
+    async fn release_owner_lease(&self, _user_id: &str, _run_id: &str) -> Result<bool, String> {
         Ok(false)
     }
 
@@ -1260,8 +1278,31 @@ fn reconcile_in_memory_execution_slot_for_session(
     runs: &std::collections::HashMap<String, DurableRunRecord>,
     user_id: &str,
     session_id: &str,
+    scan_if_missing: bool,
 ) -> Result<(), String> {
     let key = (user_id.to_string(), session_id.to_string());
+
+    // `execution_slots` is maintained under the same lock order as `runs`, so
+    // an absent slot is authoritative for non-blocking mutations. A blocking
+    // acquisition may request a defensive scan, while a present invalid owner
+    // always triggers repair. Scanning on every completed-history insert made
+    // bounded in-memory retention O(n²).
+    match slots.get(&key) {
+        None if !scan_if_missing => return Ok(()),
+        None => {}
+        Some(owner)
+            if runs.get(owner).is_some_and(|run| {
+                run.user_id == user_id
+                    && run.session_id == session_id
+                    && run_record_owns_session_execution_slot(run)
+                    && durable_run_status_blocks_session(&run.status, run.waiting_for.as_deref())
+            }) =>
+        {
+            return Ok(());
+        }
+        Some(_) => {}
+    }
+
     let mut owner: Option<&str> = None;
     for run in runs.values().filter(|run| {
         run.user_id == user_id
@@ -1508,6 +1549,8 @@ impl RunStateStore for InMemoryRunStateStore {
             &runs,
             &record.user_id,
             &record.session_id,
+            run_requires_session_exclusive_start(&record)
+                && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref()),
         )?;
         sync_in_memory_execution_slot(
             &mut slots,
@@ -1537,15 +1580,23 @@ impl RunStateStore for InMemoryRunStateStore {
                 evicted_ids.push(id);
             }
         }
+        for id in &evicted_ids {
+            slots.retain(|_, owner| owner != id);
+        }
         drop(runs);
+        drop(slots);
         if !evicted_ids.is_empty() {
-            let mut projections = self.projections.write().await;
-            let mut checkpoints = self.checkpoints.write().await;
-            let mut slots = self.execution_slots.write().await;
-            for id in evicted_ids {
-                projections.remove(&id);
-                checkpoints.remove(&id);
-                slots.retain(|_, owner| owner != &id);
+            {
+                let mut projections = self.projections.write().await;
+                for id in &evicted_ids {
+                    projections.remove(id);
+                }
+            }
+            {
+                let mut checkpoints = self.checkpoints.write().await;
+                for id in &evicted_ids {
+                    checkpoints.remove(id);
+                }
             }
         }
         self.sync_projection(&inserted, Some("run_started".to_string()), None)
@@ -1585,6 +1636,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     &runs,
                     user_id,
                     &run.session_id,
+                    durable_run_status_blocks_session(status, waiting_for),
                 )?;
             }
             if let Some(run) = runs.get_mut(run_id) {
@@ -1637,6 +1689,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     &runs,
                     user_id,
                     &run.session_id,
+                    durable_run_status_blocks_session(status, waiting_for),
                 )?;
             }
             if let Some(run) = runs.get_mut(run_id) {
@@ -1695,6 +1748,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     &runs,
                     user_id,
                     &run.session_id,
+                    durable_run_status_blocks_session(status, waiting_for),
                 )?;
             }
             if let Some(run) = runs.get_mut(run_id) {
@@ -1752,7 +1806,13 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let mut slots = self.execution_slots.write().await;
             let mut runs = self.runs.write().await;
-            reconcile_in_memory_execution_slot_for_session(&mut slots, &runs, user_id, session_id)?;
+            reconcile_in_memory_execution_slot_for_session(
+                &mut slots,
+                &runs,
+                user_id,
+                session_id,
+                durable_run_status_blocks_session(status, waiting_for),
+            )?;
             let slot_key = (user_id.to_string(), session_id.to_string());
             if slots
                 .get(&slot_key)
@@ -1819,6 +1879,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     &runs,
                     user_id,
                     &run.session_id,
+                    durable_run_status_blocks_session(status, waiting_for),
                 )?;
             }
             if let Some(run) = runs.get_mut(run_id) {
@@ -2095,6 +2156,18 @@ impl RunStateStore for InMemoryRunStateStore {
             .collect())
     }
 
+    async fn find_recoverable_paused_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        let runs = self.runs.read().await;
+        Ok(runs
+            .values()
+            .filter(|run| {
+                durable_run_status_kind(&run.status) == DurableRunStatusKind::Paused
+                    && run.waiting_for.is_some()
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn find_blocking_session_run(
         &self,
         user_id: &str,
@@ -2348,8 +2421,13 @@ impl DatabaseRunStateStore {
                             .try_get::<Option<chrono::NaiveDateTime>, _>(
                                 "owner_lease_expires_at",
                             )?;
+                        // A missing lease is stronger evidence of no live
+                        // executor than an expired one. The runtime clears
+                        // ownership on graceful task exit; after the slot's
+                        // stale window that abandoned status must be
+                        // reclaimable even if terminal persistence failed.
                         let owner_lease_expired = owner_lease_expires_at
-                            .is_some_and(|expires_at| expires_at < chrono::Utc::now().naive_utc());
+                            .is_none_or(|expires_at| expires_at < chrono::Utc::now().naive_utc());
                         Ok::<_, sqlx::Error>(session_execution_slot_owner_reclaimable(
                             &status,
                             waiting_for.as_deref(),
@@ -4595,7 +4673,7 @@ impl RunStateStore for DatabaseRunStateStore {
     async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let sql = format!(
             "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
-             WHERE status IN (?, ?, ?)
+             WHERE (status IN (?, ?, ?) OR (status = ? AND waiting_for IS NOT NULL))
                AND (
                    owner_pod_id IS NULL
                    OR owner_pod_id = ?
@@ -4608,6 +4686,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(STATUS_WAITING)
             .bind(STATUS_RUNNING)
             .bind(STATUS_INPUT_QUEUED)
+            .bind(STATUS_PAUSED)
             .bind(&self.owner_pod_id)
             .fetch_all(self.pool.get())
             .await
@@ -4657,6 +4736,21 @@ impl RunStateStore for DatabaseRunStateStore {
             .execute(self.pool.get())
             .await
             .map_err(|source| db_error("renew_owner_lease", run_id, source).to_string())?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn release_owner_lease(&self, user_id: &str, run_id: &str) -> Result<bool, String> {
+        let result = sqlx::query(
+            "UPDATE agent_runs
+             SET owner_pod_id = NULL, owner_lease_expires_at = NULL
+             WHERE user_id = ? AND run_id = ? AND owner_pod_id = ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(&self.owner_pod_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("release_owner_lease", run_id, source).to_string())?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -7014,6 +7108,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_blocking_start_repairs_missing_slot_before_admission() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("live-owner"))
+            .await
+            .unwrap();
+        store
+            .execution_slots
+            .write()
+            .await
+            .remove(&("u1".to_string(), "s1".to_string()));
+
+        store
+            .insert_run(durable_run_record("must-not-start"))
+            .await
+            .expect_err("run truth must prevent admission when its slot index is missing");
+
+        assert_eq!(
+            store
+                .execution_slots
+                .read()
+                .await
+                .get(&("u1".to_string(), "s1".to_string()))
+                .map(String::as_str),
+            Some("live-owner")
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_guarded_resume_allows_only_one_root_run_per_session() {
         let store = std::sync::Arc::new(InMemoryRunStateStore::new());
         for run_id in ["paused-a", "paused-b"] {
@@ -7925,48 +8048,54 @@ mod tests {
         let store = InMemoryRunStateStore::new();
         let max = InMemoryRunStateStore::MAX_RUNS;
 
-        // Fill to capacity + 10 with completed runs
-        for i in 0..max + 10 {
-            let record = DurableRunRecord {
-                run_id: format!("run-{i}"),
-                session_id: "s1".into(),
-                user_id: "u1".into(),
-                status: "completed".into(),
-                parent_run_id: None,
-                root_run_id: None,
-                ancestor_path: None,
-                depth: 0,
-                delegation_id: None,
-                agent_id: None,
-                retry_of: None,
-                retry_scope: None,
-                waiting_for: None,
-                owner_pod_id: None,
-                owner_lease_expires_at: None,
-                run_generation: 0,
-                last_event_idx: -1,
-                checkpoint_version: None,
-                checkpoint_json: None,
-                error_code: None,
-                error_message: None,
-                retry_count: 0,
-                total_prompt_tokens: 0,
-                total_completion_tokens: 0,
-                total_tool_calls: 0,
-                agent_binding_id: None,
-                agent_binding_name: None,
-                agent_binding_schema_version: None,
-                selected_model_json: None,
-                selected_model_name: None,
-                selected_model_gateway: None,
-                capability_server_refs_json: None,
-                runtime_profile: None,
-                events: vec![],
-                created_at: chrono::Utc::now().to_rfc3339(),
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            };
-            store.insert_run(record).await.unwrap();
-        }
+        // Fill to capacity + 10 with completed runs. The timeout guards the
+        // lock/liveness contract: eviction must not recursively acquire the
+        // execution-slot write lock or regress to per-insert history scans.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for i in 0..max + 10 {
+                let record = DurableRunRecord {
+                    run_id: format!("run-{i}"),
+                    session_id: "s1".into(),
+                    user_id: "u1".into(),
+                    status: "completed".into(),
+                    parent_run_id: None,
+                    root_run_id: None,
+                    ancestor_path: None,
+                    depth: 0,
+                    delegation_id: None,
+                    agent_id: None,
+                    retry_of: None,
+                    retry_scope: None,
+                    waiting_for: None,
+                    owner_pod_id: None,
+                    owner_lease_expires_at: None,
+                    run_generation: 0,
+                    last_event_idx: -1,
+                    checkpoint_version: None,
+                    checkpoint_json: None,
+                    error_code: None,
+                    error_message: None,
+                    retry_count: 0,
+                    total_prompt_tokens: 0,
+                    total_completion_tokens: 0,
+                    total_tool_calls: 0,
+                    agent_binding_id: None,
+                    agent_binding_name: None,
+                    agent_binding_schema_version: None,
+                    selected_model_json: None,
+                    selected_model_name: None,
+                    selected_model_gateway: None,
+                    capability_server_refs_json: None,
+                    runtime_profile: None,
+                    events: vec![],
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                };
+                store.insert_run(record).await.unwrap();
+            }
+        })
+        .await
+        .expect("bounded in-memory retention must complete without lock starvation");
 
         // Store must not exceed max capacity
         let runs = store.runs.read().await;

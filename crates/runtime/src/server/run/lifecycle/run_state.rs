@@ -17,7 +17,10 @@ use astra_core::{
     STATUS_RUNNING, STATUS_WAITING,
 };
 use astra_runtime_env::CleanupReason as RuntimeCleanupReason;
-use astra_services::runs::{DurableRunStatusKind, durable_run_status_kind};
+use astra_services::runs::{
+    DurableRunRecord, DurableRunStatusKind, durable_run_status_blocks_session,
+    durable_run_status_kind,
+};
 
 use super::MAX_ACTIVE_RUN_LIVE_EVENTS;
 use crate::server::run::engine::RunEngine;
@@ -215,6 +218,46 @@ pub fn has_buffered_terminal_completion(events: &[Value]) -> bool {
         .rev()
         .find(|event| is_run_finished_event(event))
         .is_some_and(is_completed_run_finished_event)
+}
+
+/// Whether another live process can still observe a durable pause/resume
+/// transition. A stored owner id without an unexpired lease is historical
+/// metadata, not evidence that an executor exists.
+pub fn durable_run_owner_lease_is_live(run: &DurableRunRecord) -> bool {
+    durable_execution_fields_are_live(
+        &run.status,
+        run.waiting_for.as_deref(),
+        run.owner_pod_id.as_deref(),
+        run.owner_lease_expires_at.as_deref(),
+    )
+}
+
+fn durable_execution_fields_are_live(
+    status: &str,
+    waiting_for: Option<&str>,
+    owner_pod_id: Option<&str>,
+    owner_lease_expires_at: Option<&str>,
+) -> bool {
+    if !durable_run_status_blocks_session(status, waiting_for) {
+        return false;
+    }
+    owner_lease_fields_are_live(owner_pod_id, owner_lease_expires_at)
+}
+
+fn owner_lease_fields_are_live(owner_pod_id: Option<&str>, expires_at: Option<&str>) -> bool {
+    if owner_pod_id.is_none_or(|owner| owner.trim().is_empty()) {
+        return false;
+    }
+    let Some(expires_at) = expires_at else {
+        return false;
+    };
+    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|value| value.and_utc())
+        });
+    expires_at.is_ok_and(|expires_at| expires_at > chrono::Utc::now())
 }
 
 pub fn should_preserve_manual_pause_on_completion(
@@ -586,11 +629,59 @@ pub struct RunState {
     /// Live fanout for clients that reattach to an active run after navigating away.
     pub live_tx: Option<broadcast::Sender<Value>>,
     pub waiting_for: Option<String>,
+    /// True only while an execution task still exists and can observe a pause
+    /// flag or queued input. A resumable durable status alone is not proof that
+    /// the process-local executor survived.
+    pub execution_live: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_execution_liveness_requires_blocking_state_and_live_owner_lease() {
+        let future = (chrono::Utc::now() + chrono::Duration::minutes(2)).to_rfc3339();
+        let expired = (chrono::Utc::now() - chrono::Duration::minutes(2))
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S%.f")
+            .to_string();
+
+        assert!(owner_lease_fields_are_live(Some("pod-a"), Some(&future)));
+        assert!(!owner_lease_fields_are_live(None, Some(&future)));
+        assert!(!owner_lease_fields_are_live(Some(" "), Some(&future)));
+        assert!(!owner_lease_fields_are_live(Some("pod-a"), None));
+        assert!(!owner_lease_fields_are_live(
+            Some("pod-a"),
+            Some("not-a-timestamp")
+        ));
+        assert!(!owner_lease_fields_are_live(Some("pod-a"), Some(&expired)));
+
+        assert!(durable_execution_fields_are_live(
+            STATUS_RUNNING,
+            None,
+            Some("pod-a"),
+            Some(&future)
+        ));
+        assert!(durable_execution_fields_are_live(
+            STATUS_PAUSED,
+            Some("user_resume"),
+            Some("pod-a"),
+            Some(&future)
+        ));
+        assert!(!durable_execution_fields_are_live(
+            STATUS_PAUSED,
+            None,
+            Some("pod-a"),
+            Some(&future)
+        ));
+        assert!(!durable_execution_fields_are_live(
+            STATUS_COMPLETED,
+            None,
+            Some("pod-a"),
+            Some(&future)
+        ));
+    }
 
     #[test]
     fn run_status_transition_matrix_is_exhaustive() {
