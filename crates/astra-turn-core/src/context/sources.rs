@@ -133,6 +133,11 @@ impl ChannelAssembler {
 /// of treating recall as one opaque text blob.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryEntry {
+    /// Stable backend identity. Prompt-facing runtime recall must preserve it
+    /// across process boundaries for traceability and deduplication.
+    pub memory_id: Option<String>,
+    /// Backend memory classification (`semantic`, `episodic`, `profile`, ...).
+    pub memory_type: Option<String>,
     pub content: String,
     pub relevance_score: f64,
     pub source: Option<String>,
@@ -153,6 +158,8 @@ impl MemoryEntry {
         let token_estimate = crate::section_types::estimate_text_tokens(&content);
         let content_hash = stable_content_hash(&content);
         Self {
+            memory_id: None,
+            memory_type: None,
             content,
             relevance_score,
             source: None,
@@ -165,6 +172,17 @@ impl MemoryEntry {
     #[must_use]
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_memory_identity(
+        mut self,
+        memory_id: impl Into<String>,
+        memory_type: impl Into<String>,
+    ) -> Self {
+        self.memory_id = Some(memory_id.into());
+        self.memory_type = Some(memory_type.into());
         self
     }
 

@@ -1,4 +1,4 @@
-//! Pieces of `/chat` `edge_profile` built on the CLI edge (cwd, memoria, git branch, active skills).
+//! Pieces of `/chat` `edge_profile` built on the CLI edge (cwd, git branch, active skills).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -10,8 +10,8 @@ use serde_json::{Map, Value, json};
 pub const EDGE_PROFILE_KEY_SKILL_LISTING_TEXT: &str = "skill_listing_text";
 
 /// Protocol key for dynamic text supplied by external/session sources, such as
-/// background-job notifications, external task snapshots, or request binding
-/// facts. Runtime-owned policy, guardrail, and telemetry signals must use
+/// external task snapshots or request-binding facts. Runtime-owned state,
+/// policy, guardrail, and telemetry signals must use
 /// [`EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS`] instead.
 pub const EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS: &str = "runtime_volatile_texts";
 
@@ -207,10 +207,17 @@ pub fn read_git_branch_abbrev() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Memoria URL + API key from environment (same semantics as CLI `chat_stream`).
-pub fn memoria_env_for_edge_profile() -> (String, String) {
+/// Runtime memory-provider binding for the cross-process request envelope.
+/// This is transport configuration, not prompt context, so callers must keep
+/// it outside `edge_profile`.
+pub fn build_runtime_memory_binding_value() -> Value {
     let mem = astra_core::MemoriaSettings::from_env();
-    (mem.base_url, mem.master_key.unwrap_or_default())
+    json!({
+        "provider": "memoria",
+        "base_url": mem.base_url,
+        "api_key": mem.master_key.unwrap_or_default(),
+        "retrieval_top_k": retrieval_top_k_from_env(),
+    })
 }
 
 /// Retrieval top_k from environment (same semantics as RuntimeConfig).
@@ -227,9 +234,6 @@ pub fn build_base_edge_profile_value(
     git_branch: Option<String>,
     workspace: Value,
 ) -> Value {
-    let (memoria_url, memoria_key) = memoria_env_for_edge_profile();
-    let retrieval_top_k = retrieval_top_k_from_env();
-
     // Environment context split into two lanes for prompt caching:
     //   * `environment_static`  → Platform/Shell/CWD/Home (stable for
     //     the session, safe to sit inside the cached Session prefix).
@@ -243,9 +247,6 @@ pub fn build_base_edge_profile_value(
     json!({
         "cwd": cwd,
         "git_branch": git_branch,
-        "memoria_url": memoria_url,
-        "memoria_key": memoria_key,
-        "retrieval_top_k": retrieval_top_k,
         "workspace": workspace,
         "environment_static": env_static,
         "environment_volatile": env_volatile,
@@ -283,8 +284,9 @@ mod tests {
         let v = build_base_edge_profile_value("/proj", Some("main".into()), json!({"k": 1}));
         assert_eq!(v["cwd"], "/proj");
         assert_eq!(v["git_branch"], "main");
-        assert!(v.get("memoria_url").is_some());
-        assert!(v.get("memoria_key").is_some());
+        assert!(v.get("memoria_url").is_none());
+        assert!(v.get("memoria_key").is_none());
+        assert!(v.get("retrieval_top_k").is_none());
         assert_eq!(v["workspace"]["k"], 1);
         // Static environment (cache-safe) and volatile environment
         // (post-cache) are exposed as separate fields so the bridge can
@@ -302,11 +304,6 @@ mod tests {
         // environment_volatile may be empty outside a git repo but must
         // be present as a typed field so downstream can always read it.
         assert!(v.get("environment_volatile").is_some());
-        // retrieval_top_k is included (default 5 unless ASTRA_RETRIEVAL_TOP_K set)
-        assert!(
-            v.get("retrieval_top_k").is_some(),
-            "should include retrieval_top_k"
-        );
     }
 
     #[test]

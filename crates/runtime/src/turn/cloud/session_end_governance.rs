@@ -2,11 +2,12 @@
 //!
 //! At session end we:
 //!
-//! 1. **Purge working memory** tied to the session.
-//! 2. **Write an `episodic` memory** summarising what happened — derived
-//!    from [`SessionFacts`] (deterministic, no LLM call). Replaces the
-//!    blocked L1b narrative protocol.
-//! 3. **Trigger reflection** so Memoria's graph-consolidation picks up
+//! 1. **Read the final canonical session snapshot** while it still exists.
+//! 2. **Write an `episodic` memory** summarising goals, outcomes, corrections,
+//!    learnings, and structured [`SessionFacts`] (deterministic, no LLM call).
+//! 3. **Purge working memory** tied to the session only after the episode is
+//!    durable or the write was attempted.
+//! 4. **Trigger reflection** so Memoria's graph-consolidation picks up
 //!    recent memories into scene nodes. Respects the backend's cooldown
 //!    (v1 defaults to 1h), so hot sessions won't thrash.
 //!
@@ -15,33 +16,7 @@
 
 use astra_turn_types::session_facts::SessionFacts;
 
-/// Knowledge extracted from a session for cross-session persistence.
-#[derive(Debug, Clone, Default)]
-pub struct SessionKnowledge {
-    /// User corrections (highest priority — explicit preferences).
-    pub corrections: Vec<String>,
-    /// Learnings (patterns, gotchas, conventions).
-    pub learnings: Vec<String>,
-    /// Key decisions with rationale.
-    pub decisions: Vec<String>,
-    /// Error patterns to avoid (from facts).
-    pub error_patterns: Vec<String>,
-}
-
-/// Extract reusable knowledge from session facts.
-pub fn extract_session_knowledge(facts: &SessionFacts) -> SessionKnowledge {
-    let mut knowledge = SessionKnowledge::default();
-
-    if facts.error_state.total_errors > 0
-        && let Some(err) = &facts.error_state.last_error
-    {
-        knowledge
-            .error_patterns
-            .push(format!("Error encountered: {err}"));
-    }
-
-    knowledge
-}
+use crate::session_memory::runner::SessionNarrative;
 
 /// Build the episodic summary content for a finished session. Pure
 /// function — deterministic, no LLM call. ~200-500 chars.
@@ -54,15 +29,42 @@ pub fn extract_session_knowledge(facts: &SessionFacts) -> SessionKnowledge {
 /// Errors: <last_error>
 /// ```
 pub fn build_episode_overview(facts: &SessionFacts) -> Option<String> {
+    build_episode_overview_with_narrative(facts, None)
+}
+
+/// Build a cross-session episode from the final working snapshot plus
+/// deterministic runtime facts. Working state answers "where were we?";
+/// episodes answer "what happened and what is worth reconstructing later?".
+/// Keeping the conversion deterministic prevents a second summarizer from
+/// inventing long-term facts at the most durable boundary.
+pub fn build_episode_overview_with_narrative(
+    facts: &SessionFacts,
+    narrative: Option<&SessionNarrative>,
+) -> Option<String> {
     // Skip trivial sessions (nothing happened worth remembering).
-    if facts.turn == 0 && facts.active_files.is_empty() && facts.recent_tool_calls.is_empty() {
+    if facts.turn == 0
+        && facts.active_files.is_empty()
+        && facts.recent_tool_calls.is_empty()
+        && narrative.is_none_or(session_narrative_is_empty)
+    {
         return None;
     }
 
     let mut s = String::with_capacity(512);
-    s.push_str("[episode] ");
+    if let Some(narrative) = narrative {
+        let goal = if !narrative.task_spec.trim().is_empty() {
+            narrative.task_spec.as_str()
+        } else {
+            narrative.session_title.as_str()
+        };
+        push_episode_scalar(&mut s, "Goal", goal, 320);
+        push_episode_items(&mut s, "Outcome/state", &narrative.current_state, 3, 220);
+        push_episode_items(&mut s, "Open loops", &narrative.pending_todos, 3, 180);
+        push_episode_items(&mut s, "Corrections", &narrative.corrections, 3, 220);
+        push_episode_items(&mut s, "Learnings", &narrative.learnings, 3, 220);
+    }
     s.push_str(&format!(
-        "turn={}, ~{}K tokens\n",
+        "Runtime: turn={}, ~{}K tokens\n",
         facts.turn,
         facts.estimated_tokens / 1000
     ));
@@ -135,10 +137,56 @@ pub fn build_episode_overview(facts: &SessionFacts) -> Option<String> {
     if s.trim().is_empty() { None } else { Some(s) }
 }
 
+fn session_narrative_is_empty(narrative: &SessionNarrative) -> bool {
+    narrative.session_title.trim().is_empty()
+        && narrative.task_spec.trim().is_empty()
+        && narrative.current_state.is_empty()
+        && narrative.active_goals.is_empty()
+        && narrative.pending_todos.is_empty()
+        && narrative.corrections.is_empty()
+        && narrative.learnings.is_empty()
+}
+
+fn push_episode_scalar(out: &mut String, label: &str, value: &str, char_cap: usize) {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.is_empty() {
+        return;
+    }
+    let value = value.chars().take(char_cap).collect::<String>();
+    out.push_str(label);
+    out.push_str(": ");
+    out.push_str(&value);
+    out.push('\n');
+}
+
+fn push_episode_items(
+    out: &mut String,
+    label: &str,
+    items: &[String],
+    item_cap: usize,
+    char_cap: usize,
+) {
+    let items = items
+        .iter()
+        .filter_map(|item| {
+            let item = item.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!item.is_empty()).then(|| item.chars().take(char_cap).collect::<String>())
+        })
+        .take(item_cap)
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return;
+    }
+    out.push_str(label);
+    out.push_str(": ");
+    out.push_str(&items.join("; "));
+    out.push('\n');
+}
+
 /// Full session-end governance:
 ///
-/// 1. Purge working memory tied to this session.
-/// 2. Persist an `episodic` memory with a deterministic overview.
+/// 1. Read the final working snapshot and persist a deterministic episode.
+/// 2. Purge session-scoped working memory after consolidation input is read.
 /// 3. Trigger Memoria reflection (cooldown-respecting).
 pub async fn run_session_end_governance(
     facts: &SessionFacts,
@@ -147,18 +195,17 @@ pub async fn run_session_end_governance(
 ) -> Result<SessionEndReport, String> {
     let mut report = SessionEndReport::default();
 
-    // ── 1. Purge working memory ────────────────────────────────────
-    match client.purge_working(session_id).await {
-        Ok(n) => {
-            report.working_purged = n;
-            eprintln!("[session-end] Purged {n} working memories for session {session_id}");
-        }
-        Err(e) => {
-            eprintln!("[session-end] Failed to purge working memory: {e}");
-        }
-    }
-    // ── 2. Persist episodic summary ────────────────────────────────
-    if let Some(overview) = build_episode_overview(facts) {
+    // Read before purge: the canonical narrative is the most valuable
+    // consolidation input and working-memory cleanup must not destroy it.
+    let snapshot =
+        crate::session_memory::runner::load_current_session_memory_snapshot(client, session_id)
+            .await;
+
+    // ── 1. Persist episodic summary ────────────────────────────────
+    let mut safe_to_purge_working = true;
+    if let Some(overview) =
+        build_episode_overview_with_narrative(facts, snapshot.as_ref().map(|s| &s.narrative))
+    {
         match client.store_episode(session_id, &overview).await {
             Ok(memory_id) if !memory_id.is_empty() => {
                 report.episode_memory_id = Some(memory_id);
@@ -174,9 +221,28 @@ pub async fn run_session_end_governance(
                 report.episode_chars = overview.chars().count();
             }
             Err(e) => {
+                safe_to_purge_working = false;
+                report.working_retained_due_to_episode_failure = true;
                 eprintln!("[session-end] store_episode failed: {e}");
             }
         }
+    }
+
+    // ── 2. Purge working memory ────────────────────────────────────
+    if safe_to_purge_working {
+        match client.purge_working(session_id).await {
+            Ok(n) => {
+                report.working_purged = n;
+                eprintln!("[session-end] Purged {n} working memories for session {session_id}");
+            }
+            Err(e) => {
+                eprintln!("[session-end] Failed to purge working memory: {e}");
+            }
+        }
+    } else {
+        eprintln!(
+            "[session-end] Retained working memory for session {session_id} because episode persistence failed"
+        );
     }
 
     // ── 3. Reflect + forward-feed scene candidates ─────────────────
@@ -220,8 +286,10 @@ pub async fn run_session_end_governance(
 /// Report from session-end governance.
 #[derive(Debug, Clone, Default)]
 pub struct SessionEndReport {
-    pub learnings_stored: usize,
     pub working_purged: u64,
+    /// True when an episode was worth writing but failed to persist, so the
+    /// working snapshot was intentionally retained for a future retry.
+    pub working_retained_due_to_episode_failure: bool,
     /// Memoria memory_id of the persisted episode, if any.
     pub episode_memory_id: Option<String>,
     /// Characters written to the episode content (0 = no episode stored).
@@ -240,29 +308,6 @@ pub struct SessionEndReport {
 mod tests {
     use super::*;
     use astra_turn_types::session_facts::{ErrorFact, FileEntry, ToolFact};
-
-    #[test]
-    fn extract_knowledge_includes_error_patterns() {
-        let mut facts = SessionFacts::default();
-        facts.error_state = ErrorFact {
-            total_errors: 3,
-            last_error: Some("sqlx column not found".to_string()),
-            last_error_turn: Some(5),
-        };
-        let knowledge = extract_session_knowledge(&facts);
-        assert_eq!(knowledge.error_patterns.len(), 1);
-        assert!(knowledge.error_patterns[0].contains("sqlx"));
-    }
-
-    #[test]
-    fn extract_knowledge_empty_session() {
-        let facts = SessionFacts::default();
-        let knowledge = extract_session_knowledge(&facts);
-        assert!(knowledge.corrections.is_empty());
-        assert!(knowledge.learnings.is_empty());
-        assert!(knowledge.decisions.is_empty());
-        assert!(knowledge.error_patterns.is_empty());
-    }
 
     #[test]
     fn episode_overview_none_for_trivial_session() {
@@ -312,7 +357,7 @@ mod tests {
             blocked_tools: vec![],
         };
         let overview = build_episode_overview(&facts).expect("non-trivial session");
-        assert!(overview.starts_with("[episode]"));
+        assert!(overview.starts_with("Runtime:"));
         assert!(overview.contains("turn=3"));
         assert!(overview.contains("~12K tokens"));
         assert!(overview.contains("src/main.rs"));
@@ -320,6 +365,34 @@ mod tests {
         assert!(overview.contains("read_file:2ok"));
         assert!(overview.contains("bash:1fail"));
         assert!(overview.contains("cargo build failed"));
+    }
+
+    #[test]
+    fn episode_consolidates_resumable_narrative_instead_of_only_runtime_telemetry() {
+        let facts = SessionFacts {
+            turn: 7,
+            estimated_tokens: 8_000,
+            ..Default::default()
+        };
+        let narrative = SessionNarrative {
+            session_title: "Memory lifecycle review".into(),
+            task_spec: "Make session and long-term memory form one typed lifecycle".into(),
+            current_state: vec!["Typed episode storage is implemented".into()],
+            active_goals: vec!["Complete lifecycle validation".into()],
+            pending_todos: vec!["Run deployment-path behavior tests".into()],
+            corrections: vec!["Do not treat policy evidence as a command".into()],
+            learnings: vec!["Consolidation must read working state before purge".into()],
+        };
+
+        let overview = build_episode_overview_with_narrative(&facts, Some(&narrative))
+            .expect("narrative episode");
+
+        assert!(overview.starts_with("Goal: Make session and long-term memory"));
+        assert!(overview.contains("Outcome/state: Typed episode storage is implemented"));
+        assert!(overview.contains("Open loops: Run deployment-path behavior tests"));
+        assert!(overview.contains("Corrections: Do not treat policy evidence as a command"));
+        assert!(overview.contains("Learnings: Consolidation must read working state before purge"));
+        assert!(overview.contains("Runtime: turn=7"));
     }
 
     #[test]
@@ -523,5 +596,117 @@ mod tests {
             .expect("governance ok");
         assert_eq!(report.scenes_stored, 0);
         assert!(client.scenes.lock().unwrap().is_empty());
+    }
+
+    #[derive(Default)]
+    struct LifecycleOrderClient {
+        operations: Mutex<Vec<String>>,
+        episode: Mutex<Option<String>>,
+        fail_episode: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::memoria_compact::MemoriaClient for LifecycleOrderClient {
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<super::super::memoria_compact::MemoriaMemory>, String> {
+            self.operations.lock().unwrap().push("retrieve".into());
+            Ok(vec![super::super::memoria_compact::MemoriaMemory {
+                memory_id: "working-final".into(),
+                content: crate::session_memory::runner::encode_session_memory_entry(
+                    "session-lifecycle",
+                    "# Session Memory\n\n## Task Specification\nBuild durable memory\n\n## Current State\n- Typed lifecycle complete\n\n## Learnings\n- Read working state before purge",
+                ),
+                memory_type: "working".into(),
+                session_id: Some("session-lifecycle".into()),
+                ..Default::default()
+            }])
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            Ok("unused".into())
+        }
+
+        async fn store_episode(&self, _session_id: &str, overview: &str) -> Result<String, String> {
+            self.operations.lock().unwrap().push("store_episode".into());
+            *self.episode.lock().unwrap() = Some(overview.to_string());
+            if self.fail_episode {
+                Err("episode store unavailable".into())
+            } else {
+                Ok("episode-1".into())
+            }
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            self.operations.lock().unwrap().push("purge".into());
+            Ok(1)
+        }
+
+        async fn reflect_session(
+            &self,
+            _session_id: &str,
+            _force: bool,
+        ) -> Result<super::super::memoria_compact::ReflectSummary, String> {
+            self.operations.lock().unwrap().push("reflect".into());
+            Ok(Default::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn governance_consolidates_final_narrative_before_purging_working_state() {
+        let client = LifecycleOrderClient::default();
+        let facts = SessionFacts {
+            turn: 9,
+            estimated_tokens: 4_000,
+            ..Default::default()
+        };
+
+        let report = run_session_end_governance(&facts, "session-lifecycle", &client)
+            .await
+            .expect("governance");
+
+        assert_eq!(
+            client.operations.lock().unwrap().as_slice(),
+            ["retrieve", "store_episode", "purge", "reflect"]
+        );
+        let episode = client.episode.lock().unwrap().clone().expect("episode");
+        assert!(episode.contains("Goal: Build durable memory"));
+        assert!(episode.contains("Outcome/state: Typed lifecycle complete"));
+        assert!(episode.contains("Learnings: Read working state before purge"));
+        assert_eq!(report.working_purged, 1);
+        assert_eq!(report.episode_memory_id.as_deref(), Some("episode-1"));
+    }
+
+    #[tokio::test]
+    async fn governance_retains_working_snapshot_when_episode_persistence_fails() {
+        let client = LifecycleOrderClient {
+            fail_episode: true,
+            ..Default::default()
+        };
+        let facts = SessionFacts {
+            turn: 3,
+            ..Default::default()
+        };
+
+        let report = run_session_end_governance(&facts, "session-lifecycle", &client)
+            .await
+            .expect("best-effort governance");
+
+        assert_eq!(
+            client.operations.lock().unwrap().as_slice(),
+            ["retrieve", "store_episode", "reflect"]
+        );
+        assert_eq!(report.working_purged, 0);
+        assert!(report.working_retained_due_to_episode_failure);
     }
 }

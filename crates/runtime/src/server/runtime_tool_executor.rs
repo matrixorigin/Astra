@@ -458,15 +458,6 @@ impl RuntimeToolExecutor {
         );
     }
 
-    pub async fn close_pending_memory_feedback_at_turn_end(
-        &self,
-        context_prefix: &str,
-    ) -> astra_tools::memoria::FeedbackDrainReport {
-        self.memoria_client
-            .feedback_pending_recalls(&self.session_id, "useful", context_prefix)
-            .await
-    }
-
     // ── Session tool wrappers (delegate to extracted module functions) ──────
 
     pub(super) fn adjust_config(&self, args: &Value) -> String {

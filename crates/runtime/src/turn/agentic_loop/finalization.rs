@@ -621,7 +621,7 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) {
     finalize_turn_trace(state).await;
-    close_pending_memory_feedback_at_turn_end(state).await;
+    drop_unattributed_memory_recalls_at_turn_end(state);
 
     // Background session-memory extraction. Fire-and-forget; service
     // handles LLM vs. rule-based decision, event emission, UX broker,
@@ -1027,41 +1027,27 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     // Total context size the model actually sees — uncached prompt +
     // cache reads + cache creation. Using `total_prompt` alone here
     // was a semantic bug: on prompt-cache-heavy sessions 90% of the
-    // context is cached hits, so `total_prompt` stayed in the 1K
-    // range even after 50K+ tokens of real conversation. Gate
-    // evaluated `current_tokens=1K` against `min_tokens_to_init=10K`
-    // and always reported `below_init_gate`, so extraction never
-    // fired on the happy path. See `cli_loop_host.rs` for the same
-    // `total_in` formula used by the UI.
-    let current_tokens = state
-        .total_prompt
-        .saturating_add(state.total_cache_read)
-        .saturating_add(state.total_cache_creation) as usize;
-
     let runtime_decision_user_intent = state.runtime_decision_user_intent();
     let req = crate::session_memory::ExtractionRequest {
         user_id,
         session_id,
         messages: state.messages.clone(),
         session_facts: state.session_facts.clone(),
-        current_tokens,
-        current_tool_calls: state.total_tool_calls as usize,
         had_error,
         had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(
             &runtime_decision_user_intent,
         ),
         turn_number,
-        config: astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
-        ),
     };
 
     match svc.maybe_spawn(req) {
         crate::session_memory::SpawnDecision::Spawned => {}
+        crate::session_memory::SpawnDecision::Queued => {}
         crate::session_memory::SpawnDecision::Skipped => {}
     }
 }
 
-async fn close_pending_memory_feedback_at_turn_end(state: &mut AgenticLoopState) {
+fn drop_unattributed_memory_recalls_at_turn_end(state: &mut AgenticLoopState) {
     let Some(session_id) = state
         .current_session_id
         .as_deref()
@@ -1069,25 +1055,12 @@ async fn close_pending_memory_feedback_at_turn_end(state: &mut AgenticLoopState)
     else {
         return;
     };
-    if astra_tools::memoria::MemoriaClient::pending_recall_count(session_id) == 0 {
-        return;
-    }
-    let report = if let Some(executor) = state.runtime_tool_executor.as_deref() {
-        executor
-            .close_pending_memory_feedback_at_turn_end("server-turn-end")
-            .await
-    } else {
-        astra_tools::memoria::MemoriaClient::new(None, None)
-            .feedback_pending_recalls(session_id, "useful", "server-turn-end")
-            .await
-    };
-    if report.attempted > 0 {
+    let dropped = astra_tools::memoria::MemoriaClient::drain_recalls(session_id, None).len();
+    if dropped > 0 {
         tracing::debug!(
             session_id = %session_id,
-            attempted = report.attempted,
-            succeeded = report.succeeded,
-            failed = report.failed,
-            "closed pending recall feedback at server turn end"
+            dropped,
+            "dropped unattributed memory recalls without changing their rank"
         );
     }
 }
@@ -2223,7 +2196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_skips_below_init_gate_and_emits_skip_event() {
+    async fn finalize_and_render_skips_low_information_turn_and_emits_typed_reason() {
         let sid = format!(
             "finalize-skips-{}",
             std::time::SystemTime::now()
@@ -2240,7 +2213,6 @@ mod tests {
         state
             .messages
             .push(serde_json::json!({"role": "user", "content": "clean turn"}));
-        state.total_prompt = 3_000; // below 10K init gate
         let (mut rx, memoria) = attach_memory_extraction_service(&mut state);
 
         finalize_and_render(&mut host, &mut state).await;
@@ -2249,23 +2221,22 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             memoria.stored.lock().unwrap().is_empty(),
-            "no extraction should run below init gate"
+            "a low-information turn should not create session memory"
         );
 
-        // One skip event emitted with reason=below_init_gate.
-        let mut saw_below_init_gate = false;
+        let mut saw_low_information = false;
         while let Ok(evt) = rx.try_recv() {
             if evt.event_type != "session_memory_extraction" {
                 continue;
             }
             let meta = evt.metadata.as_ref().unwrap();
-            if meta["outcome"] == "skipped" && meta["reason"] == "below_init_gate" {
-                saw_below_init_gate = true;
+            if meta["outcome"] == "skipped" && meta["reason"] == "low_information" {
+                saw_low_information = true;
             }
         }
         assert!(
-            saw_below_init_gate,
-            "expected a skipped{{below_init_gate}} event"
+            saw_low_information,
+            "expected a typed skipped{{low_information}} event"
         );
     }
 
@@ -2314,50 +2285,6 @@ mod tests {
     // extraction through a dedicated service that fires on its own
     // schedule, not synchronously from finalize. Re-add equivalent
     // coverage when the new service surfaces a synchronous hook.
-
-    // ── I13: clean turn below init gate → no write ──────────────────────
-    //
-    // Ensures the runner's debounce (tokens < 10K init gate, no error)
-    // actually prevents a write on a fresh session that hasn't grown
-    // enough yet. Guards against a regression where the gate is
-    // bypassed and every turn writes.
-    #[tokio::test]
-    async fn finalize_and_render_skips_below_init_gate() {
-        use astra_services::SessionArtifactStore;
-
-        let _tmp = tempfile::TempDir::new().unwrap();
-        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(_tmp.path());
-
-        let sid = format!(
-            "finalize-skips-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.current_session_id = Some(sid.clone());
-        state.error_recovery.consecutive_same_error = 0; // no error
-        state
-            .messages
-            .push(serde_json::json!({"role": "user", "content": "clean turn"}));
-        state.total_prompt = 3_000; // well below the 10K init gate
-
-        finalize_and_render(&mut host, &mut state).await;
-
-        // Give any misbehaving spawn a moment to fire, then assert nothing
-        // was written.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let path = astra_services::local_session_artifact_store()
-            .session_path(&sid, "session-memory.md")
-            .unwrap();
-        assert!(
-            !path.exists(),
-            "no extraction should run when below the init gate and no error"
-        );
-    }
 
     #[tokio::test]
     async fn error_triggered_l1_sets_error_state_and_builds_l1() {

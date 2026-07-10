@@ -1420,7 +1420,6 @@ pub enum JournalEventType {
 #[serde(rename_all = "snake_case")]
 pub enum SessionMemoryExtractionSkipReason {
     NoSessionId,
-    BelowInitGate,
     NoGrowth,
     LowInformation,
     InFlight,

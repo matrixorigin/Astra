@@ -2431,7 +2431,7 @@ mod tests {
         use super::super::model::ContextSnapshot;
         let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
         t.system_prompt.context_signals = PromptContextSignals {
-            memoria_insights: true,
+            memory_signal_detected: true,
             learned_feedback_rules: true,
             ..PromptContextSignals::default()
         };
@@ -2447,9 +2447,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(collapsed.contains("3 active"));
-        assert!(collapsed.contains("memoria_insights"));
+        assert!(collapsed.contains("memory_signal_detected"));
         assert!(
-            !collapsed.contains("cross-session"),
+            !collapsed.contains("Retrieval found"),
             "description must stay hidden when collapsed: {collapsed}"
         );
 
@@ -2466,7 +2466,7 @@ mod tests {
             .join(" ");
         assert!(expanded.contains("Context"), "sub-header: {expanded}");
         assert!(expanded.contains("Guidance"), "sub-header: {expanded}");
-        assert!(expanded.contains("cross-session"), "desc: {expanded}");
+        assert!(expanded.contains("Retrieval found"), "desc: {expanded}");
     }
 
     #[test]

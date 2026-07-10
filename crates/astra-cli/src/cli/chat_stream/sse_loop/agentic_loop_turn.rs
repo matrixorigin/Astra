@@ -142,7 +142,6 @@ struct CrossSessionMemoryProjection {
     ranked: Vec<(String, f64)>,
     preferred_repos: Vec<String>,
     feedback_ids: Vec<String>,
-    digest: Option<String>,
 }
 
 fn project_cross_session_memory_hits(
@@ -165,16 +164,11 @@ fn project_cross_session_memory_hits(
         .iter()
         .filter_map(|hit| hit.memory_id.clone())
         .collect();
-    let digest = (!contents.is_empty())
-        .then(|| astra_runtime::memory_hooks::insights::render_digest(&contents))
-        .flatten();
-
     CrossSessionMemoryProjection {
         contents,
         ranked,
         preferred_repos,
         feedback_ids,
-        digest,
     }
 }
 
@@ -569,7 +563,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let semantic_query_str = memory_retrieval_decision.query();
     let mut boost_terms =
         astra_turn_core::retrieval::extract_boost_terms_from_pairs(ctx.history, semantic_query_str);
-    let mut memoria_insights_text: Option<String> = None;
     {
         match memory_retrieval_decision {
             astra_turn_core::retrieval::CrossSessionMemoryDecision::Skip { query, reason } => {
@@ -606,7 +599,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                         query,
                         &projection.ranked,
                     );
-                    memoria_insights_text = projection.digest;
                     // Send "useful" feedback for retrieved memories (fire-and-forget)
                     ctx.executor.memory_feedback_useful(projection.feedback_ids);
                 }
@@ -1022,14 +1014,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         && let Some(ep_obj) = ep.as_object_mut()
     {
         ep_obj.insert("recent_arg_hints_text".to_string(), json!(hints_text));
-    }
-    // ─── Memoria insights: inject recall digest into edge_profile ───
-    if let Some(ref insights) = memoria_insights_text
-        && let Some(root) = payload.as_object_mut()
-        && let Some(ep) = root.get_mut("edge_profile")
-        && let Some(ep_obj) = ep.as_object_mut()
-    {
-        ep_obj.insert("memoria_insights_text".to_string(), json!(insights));
     }
     // ─── Lessons: inject bootstrapped session lessons into edge_profile ───
     // Fixes the "signal channel blank" bug where lessons were loaded from
@@ -2096,7 +2080,6 @@ mod tests {
         assert!(projection.ranked.is_empty());
         assert!(projection.preferred_repos.is_empty());
         assert!(projection.feedback_ids.is_empty());
-        assert!(projection.digest.is_none());
     }
 
     #[test]

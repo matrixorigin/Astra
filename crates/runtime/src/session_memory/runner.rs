@@ -13,8 +13,7 @@ use astra_turn_core::cloud_session_memory_extract::{
     SESSION_MEMORY_TEMPLATE, build_extraction_prompt, extract_section,
 };
 use astra_turn_types::{
-    has_durable_correction_directive, is_runtime_scaffolding_message,
-    is_transient_runtime_status_text, is_user_correction_signal, session_facts::SessionFacts,
+    is_runtime_scaffolding_message, is_transient_runtime_status_text, session_facts::SessionFacts,
 };
 
 use crate::memory_hooks::relevance::LlmConnParams;
@@ -43,17 +42,72 @@ pub struct SessionNarrative {
     #[serde(default)]
     pub pending_todos: Vec<String>,
     #[serde(default)]
-    pub completed: Vec<String>,
-    #[serde(default)]
-    pub files_and_functions: Vec<String>,
-    #[serde(default)]
-    pub workflow: Vec<String>,
-    #[serde(default)]
     pub corrections: Vec<String>,
     #[serde(default)]
     pub learnings: Vec<String>,
+}
+
+/// Sparse semantic update returned by the extraction model. Missing fields
+/// preserve the current narrative; an explicitly empty string/list clears a
+/// field. This keeps the model focused on facts that changed this turn instead
+/// of regenerating a large markdown document and accidentally reviving stale
+/// closed-loop history.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SessionNarrativePatch {
     #[serde(default)]
-    pub worklog: Vec<String>,
+    session_title: Option<String>,
+    #[serde(default)]
+    task_spec: Option<String>,
+    #[serde(default)]
+    current_state: Option<Vec<String>>,
+    #[serde(default)]
+    active_goals: Option<Vec<String>>,
+    #[serde(default)]
+    pending_todos: Option<Vec<String>>,
+    #[serde(default)]
+    corrections: Option<Vec<String>>,
+    #[serde(default)]
+    learnings: Option<Vec<String>>,
+}
+
+impl SessionNarrativePatch {
+    fn is_empty(&self) -> bool {
+        self.session_title.is_none()
+            && self.task_spec.is_none()
+            && self.current_state.is_none()
+            && self.active_goals.is_none()
+            && self.pending_todos.is_none()
+            && self.corrections.is_none()
+            && self.learnings.is_none()
+    }
+}
+
+impl SessionNarrative {
+    fn apply_patch(&mut self, patch: SessionNarrativePatch) {
+        if let Some(value) = patch.session_title {
+            self.session_title = value;
+        }
+        if let Some(value) = patch.task_spec {
+            self.task_spec = value;
+        }
+        if let Some(value) = patch.current_state {
+            self.current_state = value;
+        }
+        if let Some(value) = patch.active_goals {
+            self.active_goals = value;
+        }
+        if let Some(value) = patch.pending_todos {
+            self.pending_todos = value;
+        }
+        if let Some(value) = patch.corrections {
+            self.corrections = value;
+        }
+        if let Some(value) = patch.learnings {
+            self.learnings = value;
+        }
+        normalize_narrative(self);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +118,16 @@ pub struct SessionMemorySnapshot {
     #[serde(default)]
     pub facts: SessionFacts,
     pub narrative: SessionNarrative,
+}
+
+/// Prompt-facing current-session snapshot with its real freshness boundary.
+/// `updated_turn` is optional only for a local artifact whose metadata is
+/// missing; callers must not replace an unknown snapshot turn with the current
+/// turn, because that would make stale state appear freshly verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedSessionMemory {
+    pub content: String,
+    pub updated_turn: Option<u32>,
 }
 
 fn default_stable_memory_epoch() -> u32 {
@@ -123,18 +187,13 @@ impl SessionMemorySnapshot {
             current_state: extract_list_section(content, "Current State"),
             active_goals: extract_list_section(content, "Active Goals"),
             pending_todos: extract_list_section(content, "Pending Todos"),
-            completed: extract_list_section(content, "Completed"),
-            files_and_functions: extract_list_section(content, "Files and Functions"),
-            workflow: extract_list_section(content, "Workflow"),
             corrections: extract_list_section(content, "Errors & Corrections"),
             learnings: extract_list_section(content, "Learnings"),
-            worklog: extract_list_section(content, "Worklog"),
         };
         if narrative_is_empty(&narrative) {
             let fallback = single_line(&fallback_body_text(content));
             if !fallback.is_empty() {
-                narrative.current_state.push(fallback.clone());
-                narrative.worklog.push(fallback);
+                narrative.current_state.push(fallback);
             }
         }
         normalize_narrative(&mut narrative);
@@ -184,7 +243,6 @@ impl SessionMemorySnapshot {
             4,
         );
         push_capped_section(&mut sections, "Corrections", &self.narrative.corrections, 4);
-        push_capped_section(&mut sections, "Completed", &self.narrative.completed, 3);
         push_capped_section(&mut sections, "Learnings", &self.narrative.learnings, 3);
         let facts = self.facts.to_injection();
         if !facts.trim().is_empty() {
@@ -214,7 +272,6 @@ impl SessionMemorySnapshot {
             4,
         );
         push_capped_section(&mut sections, "Corrections", &self.narrative.corrections, 4);
-        push_capped_section(&mut sections, "Completed", &self.narrative.completed, 3);
         push_capped_section(&mut sections, "Learnings", &self.narrative.learnings, 3);
         sections.join("\n")
     }
@@ -232,17 +289,14 @@ impl SessionMemorySnapshot {
     }
 
     fn to_markdown(&self) -> String {
-        let files_from_facts = if self.facts.active_files.is_empty() {
-            self.narrative.files_and_functions.clone()
-        } else {
-            self.facts
-                .active_files
-                .iter()
-                .rev()
-                .take(10)
-                .map(|f| format!("{} {} (t{})", f.last_action, f.path, f.turn))
-                .collect()
-        };
+        let files_from_facts = self
+            .facts
+            .active_files
+            .iter()
+            .rev()
+            .take(10)
+            .map(|f| format!("{} {} (t{})", f.last_action, f.path, f.turn))
+            .collect::<Vec<_>>();
         let corrections = if let Some(last_error) = &self.facts.error_state.last_error {
             let mut out = self.narrative.corrections.clone();
             if !out.iter().any(|line| line.contains(last_error)) {
@@ -255,26 +309,32 @@ impl SessionMemorySnapshot {
         } else {
             self.narrative.corrections.clone()
         };
-        format!(
-            "# Session Memory\n\n## Session Title\n{title}\n\n## Active Goals\n{active_goals}\n\n## Pending Todos\n{pending_todos}\n\n## Completed\n{completed}\n\n## Current State\n{current_state}\n\n## Task Specification\n{task_spec}\n\n## Files and Functions\n{files_and_functions}\n\n## Workflow\n{workflow}\n\n## Errors & Corrections\n{corrections}\n\n## Learnings\n{learnings}\n\n## Worklog\n{worklog}",
-            title = render_scalar(&self.narrative.session_title, "Current session"),
-            active_goals = render_list(
-                &self.narrative.active_goals,
-                "- No explicit active goals captured."
-            ),
-            pending_todos = render_list(&self.narrative.pending_todos, "- No open loops recorded."),
-            completed = render_list(&self.narrative.completed, "- No completed work recorded."),
-            current_state = render_list(
-                &self.narrative.current_state,
-                "- No current state recorded."
-            ),
-            task_spec = render_scalar(&self.narrative.task_spec, "No task specification recorded."),
-            files_and_functions = render_list(&files_from_facts, "- No active files captured."),
-            workflow = render_list(&self.narrative.workflow, "- No workflow recorded."),
-            corrections = render_list(&corrections, "- No corrections recorded."),
-            learnings = render_list(&self.narrative.learnings, "- No learnings recorded."),
-            worklog = render_list(&self.narrative.worklog, "- No worklog recorded."),
-        )
+        let mut sections = vec!["# Session Memory".to_string()];
+        push_scalar_markdown_section(
+            &mut sections,
+            "Session Title",
+            &self.narrative.session_title,
+        );
+        push_list_markdown_section(&mut sections, "Active Goals", &self.narrative.active_goals);
+        push_list_markdown_section(
+            &mut sections,
+            "Pending Todos",
+            &self.narrative.pending_todos,
+        );
+        push_list_markdown_section(
+            &mut sections,
+            "Current State",
+            &self.narrative.current_state,
+        );
+        push_scalar_markdown_section(
+            &mut sections,
+            "Task Specification",
+            &self.narrative.task_spec,
+        );
+        push_list_markdown_section(&mut sections, "Files and Functions", &files_from_facts);
+        push_list_markdown_section(&mut sections, "Errors & Corrections", &corrections);
+        push_list_markdown_section(&mut sections, "Learnings", &self.narrative.learnings);
+        sections.join("\n\n")
     }
 }
 
@@ -332,7 +392,6 @@ pub(crate) async fn run_extraction(
     session_id: &str,
     messages: &[Value],
     turn_number: usize,
-    current_tokens: usize,
     current_memory: &str,
     session_facts: &SessionFacts,
     memory_model_params: &[LlmConnParams],
@@ -346,7 +405,7 @@ pub(crate) async fn run_extraction(
     } else {
         current_memory.to_string()
     };
-    let fallback = build_rule_fallback_memory(&base_memory, messages, turn_number, current_tokens);
+    let fallback = build_rule_fallback_memory(&base_memory, messages, turn_number);
 
     if memory_model_params.is_empty() {
         let fallback = canonicalize_session_memory_markdown(
@@ -486,13 +545,7 @@ fn session_memory_extraction_messages(messages: &[Value]) -> Vec<Value> {
 
 fn is_ephemeral_message_for_session_memory(msg: &Value) -> bool {
     is_runtime_scaffolding_message(msg)
-        || is_vague_reanchor_message(msg)
         || message_text(msg).is_some_and(is_transient_runtime_status_text)
-}
-
-fn is_vague_reanchor_message(msg: &Value) -> bool {
-    msg.get("role").and_then(Value::as_str) == Some("user")
-        && message_text(msg).is_some_and(is_vague_reanchor_for_session_memory)
 }
 
 pub fn encode_session_memory_entry(session_id: &str, content: &str) -> String {
@@ -519,6 +572,27 @@ pub async fn load_current_session_memory(
     memoria: &dyn MemoriaClient,
     session_id: &str,
 ) -> Option<String> {
+    load_current_session_memory_with_freshness(memoria, session_id)
+        .await
+        .map(|loaded| loaded.content)
+}
+
+pub async fn load_current_session_memory_with_freshness(
+    memoria: &dyn MemoriaClient,
+    session_id: &str,
+) -> Option<LoadedSessionMemory> {
+    load_current_session_memory_snapshot(memoria, session_id)
+        .await
+        .map(|snapshot| LoadedSessionMemory {
+            content: snapshot.to_markdown(),
+            updated_turn: Some(snapshot.updated_turn),
+        })
+}
+
+pub(crate) async fn load_current_session_memory_snapshot(
+    memoria: &dyn MemoriaClient,
+    session_id: &str,
+) -> Option<SessionMemorySnapshot> {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return None;
@@ -534,7 +608,7 @@ pub async fn load_current_session_memory(
         )
         .await
     {
-        Ok(memories) => select_latest_session_memory(&memories, session_id),
+        Ok(memories) => select_latest_session_memory_snapshot(&memories, session_id),
         Err(e) => {
             tracing::warn!(
                 session_id = %session_id,
@@ -590,26 +664,55 @@ pub async fn load_current_session_memory_preferring_local(
     memoria: &dyn MemoriaClient,
     session_id: &str,
 ) -> Option<String> {
-    if let Some(local) = load_local_session_memory_artifact(session_id) {
-        return Some(local);
-    }
-    load_current_session_memory(memoria, session_id).await
+    load_current_session_memory_preferring_local_with_freshness(memoria, session_id)
+        .await
+        .map(|loaded| loaded.content)
 }
 
-fn select_latest_session_memory(memories: &[MemoriaMemory], session_id: &str) -> Option<String> {
-    let mut latest_active: Option<(u32, String)> = None;
+pub async fn load_current_session_memory_preferring_local_with_freshness(
+    memoria: &dyn MemoriaClient,
+    session_id: &str,
+) -> Option<LoadedSessionMemory> {
+    let local = load_local_session_memory_artifact(session_id);
+    let local_turn = load_local_session_memory_metadata(session_id)
+        .and_then(|metadata| metadata.last_extracted_turn);
+    let remote = load_current_session_memory_snapshot(memoria, session_id).await;
+
+    match (local, local_turn, remote) {
+        (Some(local), Some(local_turn), Some(remote)) if local_turn >= remote.updated_turn => {
+            Some(LoadedSessionMemory {
+                content: local,
+                updated_turn: Some(local_turn),
+            })
+        }
+        (_, _, Some(remote)) => Some(LoadedSessionMemory {
+            content: remote.to_markdown(),
+            updated_turn: Some(remote.updated_turn),
+        }),
+        (Some(local), local_turn, None) => Some(LoadedSessionMemory {
+            content: local,
+            updated_turn: local_turn,
+        }),
+        (None, _, None) => None,
+    }
+}
+
+fn select_latest_session_memory_snapshot(
+    memories: &[MemoriaMemory],
+    session_id: &str,
+) -> Option<SessionMemorySnapshot> {
+    let mut latest_active: Option<SessionMemorySnapshot> = None;
     for memory in memories {
         if let Some(snapshot) = decode_session_memory_snapshot(&memory.content, session_id) {
-            let markdown = snapshot.to_markdown();
             if latest_active
                 .as_ref()
-                .is_none_or(|(best_turn, _)| snapshot.updated_turn >= *best_turn)
+                .is_none_or(|best| snapshot.updated_turn >= best.updated_turn)
             {
-                latest_active = Some((snapshot.updated_turn, markdown));
+                latest_active = Some(snapshot);
             }
         }
     }
-    latest_active.map(|(_, markdown)| markdown)
+    latest_active
 }
 
 pub fn decode_session_memory_overview(raw: &str, session_id: &str) -> Option<String> {
@@ -628,8 +731,9 @@ pub fn decode_session_memory_prompt(
     let entry = MemoryEntry::parse(raw.trim())?;
     let facts = facts_override.unwrap_or(&snapshot.facts);
     let mut parts = vec![format!(
-        "## Session State\nLatest state: {}",
-        entry.compact_view()
+        "## Session State\nSnapshot provenance: updated through session turn {}.\nLatest state: {}",
+        snapshot.updated_turn,
+        entry.compact_view(),
     )];
     let facts_text = facts.to_injection();
     if !facts_text.trim().is_empty() {
@@ -694,88 +798,6 @@ fn parse_section_lines(section: &str) -> Vec<String> {
     out
 }
 
-fn normalize_goal_placeholder(value: &str) -> String {
-    value
-        .trim()
-        .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-}
-
-fn normalize_placeholder_text(value: &str) -> String {
-    value
-        .trim()
-        .trim_start_matches("- ")
-        .trim_start_matches("* ")
-        .trim()
-        .trim_matches(|c: char| {
-            matches!(
-                c,
-                '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '.' | '!' | ':'
-            )
-        })
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-}
-
-fn is_effectively_empty_list_item(value: &str) -> bool {
-    matches!(
-        normalize_placeholder_text(value).as_str(),
-        "" | "none"
-            | "n/a"
-            | "na"
-            | "none explicitly stated"
-            | "not explicitly stated"
-            | "none recorded"
-            | "no pending todos"
-            | "no pending todo"
-            | "no open loops"
-            | "no open loops recorded"
-            | "no completed work"
-            | "no completed work recorded"
-            | "no learnings"
-            | "no learnings recorded"
-    )
-}
-
-pub fn is_effectively_empty_active_goal(value: &str) -> bool {
-    let normalized = normalize_goal_placeholder(value);
-    matches!(
-        normalized.as_str(),
-        "" | "none"
-            | "n/a"
-            | "na"
-            | "none explicitly stated"
-            | "not explicitly stated"
-            | "no explicit goals"
-            | "no active goals"
-            | "no explicit active goals captured"
-    ) || normalized.starts_with("none remaining")
-        || normalized == "task completed"
-        || normalized == "task complete"
-}
-
-pub fn is_terminal_current_state(value: &str) -> bool {
-    let normalized = normalize_placeholder_text(value);
-    normalized == "all done"
-        || normalized == "done"
-        || normalized == "session idle"
-        || normalized == "the session is idle"
-        || normalized.contains("session is idle")
-        || normalized.contains("no issues remain")
-        || normalized.contains("no further action needed")
-        || (normalized.contains("user's request") && normalized.contains("complete"))
-        || (normalized.contains("users request") && normalized.contains("complete"))
-        || (normalized.contains("user request") && normalized.contains("complete"))
-        || (normalized.contains("request")
-            && normalized.contains("complete")
-            && normalized.contains("verified"))
-}
-
 fn seed_active_goal(narrative: &SessionNarrative) -> Option<String> {
     [
         narrative.task_spec.as_str(),
@@ -783,22 +805,21 @@ fn seed_active_goal(narrative: &SessionNarrative) -> Option<String> {
     ]
     .into_iter()
     .map(single_line)
-    .find(|candidate| !candidate.is_empty() && !is_effectively_empty_active_goal(candidate))
+    .find(|candidate| !candidate.is_empty())
 }
 
 fn normalize_narrative(narrative: &mut SessionNarrative) {
+    narrative.session_title = truncate_chars(&single_line(&narrative.session_title), 200);
+    narrative.task_spec = truncate_chars(&single_line(&narrative.task_spec), 1_000);
     narrative
         .active_goals
-        .retain(|goal| !is_effectively_empty_active_goal(goal));
+        .retain(|goal| !goal.trim().is_empty());
     narrative
         .pending_todos
-        .retain(|pending| !is_effectively_empty_list_item(pending));
+        .retain(|pending| !pending.trim().is_empty());
     narrative
-        .completed
-        .retain(|done| !is_effectively_empty_list_item(done));
-    narrative.current_state.retain(|state| {
-        !is_terminal_current_state(state) && !is_effectively_empty_list_item(state)
-    });
+        .current_state
+        .retain(|state| !state.trim().is_empty());
     dedup_preserve_order(&mut narrative.active_goals);
     if narrative.active_goals.is_empty()
         && let Some(goal) = seed_active_goal(narrative)
@@ -806,17 +827,13 @@ fn normalize_narrative(narrative: &mut SessionNarrative) {
         narrative.active_goals.push(goal);
     }
     dedup_preserve_order(&mut narrative.pending_todos);
-    dedup_preserve_order(&mut narrative.completed);
-    dedup_preserve_order(&mut narrative.files_and_functions);
-    dedup_preserve_order(&mut narrative.workflow);
     dedup_preserve_order(&mut narrative.corrections);
     dedup_preserve_order(&mut narrative.learnings);
-    dedup_preserve_order(&mut narrative.worklog);
-    narrative.pending_todos.retain(|pending| {
-        !narrative.completed.iter().any(|done| {
-            done.eq_ignore_ascii_case(pending) || single_line(done) == single_line(pending)
-        })
-    });
+    narrative.current_state.truncate(8);
+    narrative.active_goals.truncate(8);
+    narrative.pending_todos.truncate(8);
+    narrative.corrections.truncate(8);
+    narrative.learnings.truncate(8);
 }
 
 fn narrative_is_empty(narrative: &SessionNarrative) -> bool {
@@ -825,12 +842,8 @@ fn narrative_is_empty(narrative: &SessionNarrative) -> bool {
         && narrative.current_state.is_empty()
         && narrative.active_goals.is_empty()
         && narrative.pending_todos.is_empty()
-        && narrative.completed.is_empty()
-        && narrative.files_and_functions.is_empty()
-        && narrative.workflow.is_empty()
         && narrative.corrections.is_empty()
         && narrative.learnings.is_empty()
-        && narrative.worklog.is_empty()
 }
 
 fn fallback_body_text(content: &str) -> String {
@@ -868,24 +881,23 @@ fn push_capped_section(out: &mut Vec<String>, label: &str, items: &[String], cap
     out.push(format!("{label}: {rendered}{suffix}"));
 }
 
-fn render_scalar(value: &str, fallback: &str) -> String {
-    if value.trim().is_empty() {
-        fallback.to_string()
-    } else {
-        value.trim().to_string()
+fn push_scalar_markdown_section(out: &mut Vec<String>, name: &str, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        out.push(format!("## {name}\n{value}"));
     }
 }
 
-fn render_list(items: &[String], fallback: &str) -> String {
+fn push_list_markdown_section(out: &mut Vec<String>, name: &str, items: &[String]) {
     if items.is_empty() {
-        fallback.to_string()
-    } else {
-        items
-            .iter()
-            .map(|item| format!("- {}", item.trim()))
-            .collect::<Vec<_>>()
-            .join("\n")
+        return;
     }
+    let body = items
+        .iter()
+        .map(|item| format!("- {}", item.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push(format!("## {name}\n{body}"));
 }
 
 fn single_line(text: &str) -> String {
@@ -1010,7 +1022,37 @@ async fn update_memory_with_llm(
             detail: None,
         });
     }
-    Ok(content.to_string())
+    let patch = parse_session_narrative_patch(content).map_err(|error| LlmExtractionFailure {
+        reason: SessionMemoryExtractionErrorReason::LlmError,
+        detail: Some(summarize_llm_detail(&format!(
+            "invalid session-memory patch: {error}"
+        ))),
+    })?;
+    if patch.is_empty() {
+        return Err(LlmExtractionFailure {
+            reason: SessionMemoryExtractionErrorReason::EmptyResponse,
+            detail: Some("session-memory patch contained no canonical fields".to_string()),
+        });
+    }
+    let mut snapshot = SessionMemorySnapshot::from_markdown(
+        "__llm_update__",
+        current_memory,
+        0,
+        SessionFacts::default(),
+    );
+    snapshot.narrative.apply_patch(patch);
+    Ok(snapshot.to_markdown())
+}
+
+fn parse_session_narrative_patch(raw: &str) -> Result<SessionNarrativePatch, serde_json::Error> {
+    let trimmed = raw.trim();
+    let json = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|body| body.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    serde_json::from_str(json)
 }
 
 fn summarize_llm_detail(text: &str) -> String {
@@ -1041,12 +1083,6 @@ async fn store_session_memory(
     session_facts: &SessionFacts,
     content: &str,
 ) -> Result<(u64, u32), StoreSessionMemoryFailure> {
-    purge_prior_session_memory_entries(memoria, session_id)
-        .await
-        .map_err(|reason| StoreSessionMemoryFailure {
-            reason,
-            detail: None,
-        })?;
     let encoded = SessionMemorySnapshot::from_markdown(
         session_id,
         content,
@@ -1067,7 +1103,19 @@ async fn store_session_memory(
             )
             .await
         {
-            Ok(_) => return Ok((encoded.len() as u64, attempt)),
+            Ok(memory_id) => {
+                if let Err(reason) =
+                    cleanup_prior_session_memory_entries(memoria, session_id, &memory_id, &encoded)
+                        .await
+                {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        ?reason,
+                        "new session-memory snapshot is durable but stale snapshot cleanup was incomplete"
+                    );
+                }
+                return Ok((encoded.len() as u64, attempt));
+            }
             Err(error) => {
                 last_detail = Some(summarize_llm_detail(&error));
                 if attempt == 2 {
@@ -1173,24 +1221,40 @@ pub fn persist_local_session_memory_metadata(
     Ok(())
 }
 
-async fn purge_prior_session_memory_entries(
+async fn cleanup_prior_session_memory_entries(
     memoria: &Arc<dyn MemoriaClient>,
     session_id: &str,
+    current_memory_id: &str,
+    current_encoded: &str,
 ) -> Result<(), SessionMemoryExtractionErrorReason> {
-    // Loop until no decodable session-memory entries remain. A single
-    // top_k=16 query can leave duplicates behind when retries or scoring
-    // edge-cases push extras past the page boundary; the next write would
-    // see them rank ahead of the fresh entry. Cap iterations to avoid an
-    // infinite loop if `delete` is silently a no-op upstream.
+    // The new snapshot is already durable. Cleanup is deliberately
+    // best-effort: duplicate stale snapshots are safe because readers select
+    // the highest `updated_turn`; deleting the only valid snapshot is not.
+    // Loop until no stale decodable entries remain, with a cap for backends
+    // whose delete endpoint silently does nothing.
     const PAGE_SIZE: usize = 16;
     const MAX_PAGES: usize = 8;
     let mut seen_memory_ids = std::collections::HashSet::new();
     for _ in 0..MAX_PAGES {
         let memories = retrieve_prior_session_memory_page(memoria, session_id, PAGE_SIZE).await?;
 
-        let to_delete: Vec<String> = memories
+        let stale_candidates: Vec<&MemoriaMemory> = memories
             .iter()
             .filter(|memory| decode_session_memory_snapshot(&memory.content, session_id).is_some())
+            .filter(|memory| {
+                if !current_memory_id.is_empty() {
+                    memory.memory_id != current_memory_id
+                } else {
+                    memory.content != current_encoded
+                }
+            })
+            .collect();
+        if stale_candidates.is_empty() {
+            return Ok(());
+        }
+
+        let to_delete: Vec<String> = stale_candidates
+            .into_iter()
             .filter_map(|memory| {
                 let id = memory.memory_id.as_str();
                 if id.is_empty() {
@@ -1204,7 +1268,7 @@ async fn purge_prior_session_memory_entries(
             .collect();
 
         if to_delete.is_empty() {
-            return Ok(());
+            return Err(SessionMemoryExtractionErrorReason::PurgeFailed);
         }
         for id in &to_delete {
             memoria
@@ -1216,7 +1280,14 @@ async fn purge_prior_session_memory_entries(
     let remaining = retrieve_prior_session_memory_page(memoria, session_id, PAGE_SIZE).await?;
     if !remaining
         .iter()
-        .any(|memory| decode_session_memory_snapshot(&memory.content, session_id).is_some())
+        .filter(|memory| decode_session_memory_snapshot(&memory.content, session_id).is_some())
+        .any(|memory| {
+            if !current_memory_id.is_empty() {
+                memory.memory_id != current_memory_id
+            } else {
+                memory.content != current_encoded
+            }
+        })
     {
         return Ok(());
     }
@@ -1250,103 +1321,31 @@ fn build_rule_fallback_memory(
     current_memory: &str,
     messages: &[Value],
     turn_number: usize,
-    current_tokens: usize,
 ) -> String {
-    let recent = render_recent_messages(messages, 8, 240);
     let first_user = first_user_message(messages).unwrap_or("Current session");
     let last_user = last_user_message(messages).unwrap_or(first_user);
-    let last_assistant =
-        last_assistant_message(messages).unwrap_or_else(|| "No assistant summary yet.".to_string());
     let errors = collect_error_lines(messages);
-    let prior_snapshot = SessionMemorySnapshot::from_markdown(
+    let mut snapshot = SessionMemorySnapshot::from_markdown(
         "__fallback__",
         current_memory,
-        0,
+        turn_number as u32,
         SessionFacts::default(),
     );
-    let mut active_goals = prior_snapshot.narrative.active_goals;
-    active_goals.extend(recent_user_messages(messages, 3, 240));
-    dedup_preserve_order(&mut active_goals);
-    let mut pending_todos = prior_snapshot.narrative.pending_todos;
-    if pending_todos.is_empty() {
-        pending_todos.push(format!("Continue: {}", truncate(last_user, 180)));
+    if snapshot.narrative.session_title.is_empty() {
+        snapshot.narrative.session_title = truncate(first_user, 180).to_string();
     }
-    let completed = prior_snapshot.narrative.completed;
-    let mut current_state = prior_snapshot.narrative.current_state;
-    current_state.push(format!("Turn {turn_number}"));
-    current_state.push(format!("Approximate context size: {current_tokens} tokens"));
-    current_state.push(format!("Latest user focus: {}", truncate(last_user, 200)));
-    current_state.push(format!(
-        "Latest assistant state: {}",
-        truncate(&last_assistant, 200)
-    ));
-    dedup_preserve_order(&mut current_state);
-    format!(
-        "# Session Memory\n\n## Session Title\n{first_user}\n\n## Active Goals\n{active_goals}\n\n## Pending Todos\n{pending_todos}\n\n## Completed\n{completed}\n\n## Current State\n{current_state}\n\n## Task Specification\n{task_spec}\n\n## Files and Functions\n{files}\n\n## Workflow\n{workflow}\n\n## Errors & Corrections\n{errors}\n\n## Learnings\n{learnings}\n\n## Worklog\n{worklog}",
-        active_goals = render_list(&active_goals, &format!("- {}", truncate(last_user, 180))),
-        pending_todos = render_list(&pending_todos, "- Continue the current session task."),
-        completed = render_list(&completed, "- No completed work recorded."),
-        current_state = render_list(&current_state, "- No current state recorded."),
-        task_spec = render_scalar(&prior_snapshot.narrative.task_spec, first_user),
-        files = detect_file_mentions(messages),
-        workflow = if recent.is_empty() {
-            "- No recent conversation captured.".to_string()
-        } else {
-            recent
-                .iter()
-                .map(|line| format!("- {line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        },
-        errors = if errors.is_empty() {
-            "- No explicit errors captured.".to_string()
-        } else {
-            errors
-                .iter()
-                .map(|line| format!("- {line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        },
-        learnings = render_list(
-            &prior_snapshot.narrative.learnings,
-            "- No learnings recorded."
-        ),
-        worklog = if current_memory.trim().is_empty() {
-            "- Initialized session memory document.".to_string()
-        } else {
-            format!(
-                "- Refreshed existing session memory.\n- {}",
-                recent
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "No recent conversation captured.".to_string())
-            )
-        },
-    )
-}
-
-fn render_recent_messages(messages: &[Value], take: usize, max_len: usize) -> Vec<String> {
-    messages
-        .iter()
-        .rev()
-        .filter_map(|msg| {
-            if is_ephemeral_message_for_session_memory(msg) {
-                return None;
-            }
-            let role = msg.get("role").and_then(Value::as_str)?;
-            match role {
-                "user" | "assistant" | "tool" => {
-                    let text = message_text_or_summary(msg)?;
-                    Some(format!("{role}: {}", truncate(&text, max_len)))
-                }
-                _ => None,
-            }
-        })
-        .take(take)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+    if snapshot.narrative.task_spec.is_empty() {
+        snapshot.narrative.task_spec = truncate(first_user, 400).to_string();
+    }
+    // A deterministic fallback cannot reliably infer goal closure, decisions,
+    // or durable learnings. Preserve the existing canonical narrative and
+    // update only the directly observed latest user focus plus structured
+    // errors. The next successful selector can make semantic changes.
+    snapshot.narrative.current_state =
+        vec![format!("Latest user focus: {}", truncate(last_user, 300))];
+    snapshot.narrative.corrections.extend(errors);
+    normalize_narrative(&mut snapshot.narrative);
+    snapshot.to_markdown()
 }
 
 fn first_user_message(messages: &[Value]) -> Option<&str> {
@@ -1363,37 +1362,6 @@ fn last_user_message(messages: &[Value]) -> Option<&str> {
         (msg.get("role").and_then(Value::as_str) == Some("user")
             && !is_ephemeral_message_for_session_memory(msg))
         .then(|| message_text(msg))
-        .flatten()
-    })
-}
-
-fn recent_user_messages(messages: &[Value], take: usize, max_len: usize) -> Vec<String> {
-    messages
-        .iter()
-        .rev()
-        .filter_map(|msg| {
-            (msg.get("role").and_then(Value::as_str) == Some("user")
-                && !is_ephemeral_message_for_session_memory(msg))
-            .then(|| message_text(msg))
-            .flatten()
-            .map(|text| truncate(text, max_len).to_string())
-        })
-        .take(take)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
-fn is_vague_reanchor_for_session_memory(text: &str) -> bool {
-    is_user_correction_signal(text) && !has_durable_correction_directive(text)
-}
-
-fn last_assistant_message(messages: &[Value]) -> Option<String> {
-    messages.iter().rev().find_map(|msg| {
-        (msg.get("role").and_then(Value::as_str) == Some("assistant")
-            && !is_ephemeral_message_for_session_memory(msg))
-        .then(|| message_text_or_summary(msg))
         .flatten()
     })
 }
@@ -1452,40 +1420,6 @@ fn compact_json_value(value: &Value) -> String {
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| value.to_string())
-}
-
-fn detect_file_mentions(messages: &[Value]) -> String {
-    let mut seen = std::collections::BTreeSet::new();
-    for msg in messages {
-        if is_ephemeral_message_for_session_memory(msg) {
-            continue;
-        }
-        let Some(text) = message_text_or_summary(msg) else {
-            continue;
-        };
-        for token in text.split_whitespace() {
-            let cleaned = token.trim_matches(|c: char| {
-                matches!(c, ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
-            });
-            if cleaned.contains('/')
-                || cleaned.ends_with(".rs")
-                || cleaned.ends_with(".ts")
-                || cleaned.ends_with(".tsx")
-                || cleaned.ends_with(".py")
-            {
-                seen.insert(cleaned.to_string());
-            }
-        }
-    }
-    if seen.is_empty() {
-        "- No file paths referenced.".to_string()
-    } else {
-        seen.into_iter()
-            .take(8)
-            .map(|item| format!("- {item}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
 }
 
 fn message_text(msg: &Value) -> Option<&str> {
@@ -1551,6 +1485,7 @@ mod tests {
         stored: Mutex<Vec<(String, String, Option<String>)>>,
         retrieve_results: Mutex<Vec<MemoriaMemory>>,
         deleted: Mutex<Vec<String>>,
+        operations: Mutex<Vec<String>>,
     }
 
     #[derive(Default)]
@@ -1595,6 +1530,7 @@ mod tests {
             session_id: Option<&str>,
             _trust_tier: Option<&str>,
         ) -> Result<String, String> {
+            self.operations.lock().unwrap().push("store".to_string());
             self.stored.lock().unwrap().push((
                 content.to_string(),
                 memory_type.to_string(),
@@ -1608,6 +1544,10 @@ mod tests {
         }
 
         async fn delete(&self, memory_id: &str) -> Result<(), String> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("delete:{memory_id}"));
             self.deleted.lock().unwrap().push(memory_id.to_string());
             Ok(())
         }
@@ -1833,8 +1773,8 @@ mod tests {
     }
 
     #[test]
-    fn rule_fallback_records_user_state_not_persistence_in_completed() {
-        let content = build_rule_fallback_memory("", &sample_messages(), 3, 12_345);
+    fn rule_fallback_records_only_live_resumable_state() {
+        let content = build_rule_fallback_memory("", &sample_messages(), 3);
 
         assert!(
             content.contains("Latest user focus: Fix crates/runtime/src/session_memory/runner.rs")
@@ -1847,49 +1787,27 @@ mod tests {
             !content.contains("Keep session memory synchronized when the session grows"),
             "fallback Learnings must not invent generic advice: {content}"
         );
-        assert!(
-            content.contains("## Completed\n- No completed work recorded."),
-            "fallback should be explicit when no completed user work is known: {content}"
-        );
+        assert!(!content.contains("## Completed"));
+        assert!(!content.contains("## Worklog"));
     }
 
     #[test]
-    fn rule_fallback_skips_vague_reanchor_user_messages() {
+    fn rule_fallback_preserves_latest_user_evidence_without_wording_classification() {
         let messages = vec![
             json!({"role": "user", "content": "Implement durable session memory refresh"}),
             json!({"role": "assistant", "content": "I will patch the immediate case."}),
             json!({"role": "user", "content": "我要的是长久健康运行，不是临时补丁"}),
         ];
 
-        let content = build_rule_fallback_memory("", &messages, 4, 9_000);
+        let content = build_rule_fallback_memory("", &messages, 4);
 
         assert!(
             content.contains("Implement durable session memory refresh"),
             "original task focus should remain: {content}"
         );
         assert!(
-            !content.contains("长久健康运行"),
-            "vague reanchor should not become L1 session memory: {content}"
-        );
-        assert!(
-            !content.contains("临时补丁"),
-            "vague reanchor should not leak through workflow/current state: {content}"
-        );
-    }
-
-    #[test]
-    fn rule_fallback_keeps_reanchor_with_concrete_directive() {
-        let messages = vec![
-            json!({"role": "user", "content": "Improve session memory"}),
-            json!({"role": "assistant", "content": "I will patch this single path."}),
-            json!({"role": "user", "content": "我重新说一次，不要用case-by-case修补"}),
-        ];
-
-        let content = build_rule_fallback_memory("", &messages, 4, 9_000);
-
-        assert!(
-            content.contains("不要用case-by-case修补"),
-            "concrete directive should remain eligible for L1 session memory: {content}"
+            content.contains("我要的是长久健康运行，不是临时补丁"),
+            "latest user evidence should become current state without a phrase classifier: {content}"
         );
     }
 
@@ -1898,17 +1816,15 @@ mod tests {
         let messages = vec![
             json!({"role": "user", "content": "Improve stable long-running sessions"}),
             json!({"role": "assistant", "content": "I am updating the memory path."}),
-            json!({"role": "user", "content": "[Active task attachment]\nResume hidden task board state"}),
             json!({"role": "assistant", "content": "✓ Previous round: 3 tools executed in parallel"}),
             json!({"role": "user", "content": "## Already Fetched (do NOT re-read)\ncrates/runtime/src/session_memory/runner.rs"}),
             json!({"role": "user", "content": "Continue with the memory cleanup"}),
         ];
 
-        let content = build_rule_fallback_memory("", &messages, 5, 11_000);
+        let content = build_rule_fallback_memory("", &messages, 5);
 
         assert!(content.contains("Improve stable long-running sessions"));
         assert!(content.contains("Continue with the memory cleanup"));
-        assert!(!content.contains("Active task attachment"));
         assert!(!content.contains("Previous round"));
         assert!(!content.contains("Already Fetched"));
         assert!(!content.contains("do NOT re-read"));
@@ -1924,7 +1840,7 @@ mod tests {
             json!({"role": "user", "content": "Preserve explicit durable session goals"}),
         ];
 
-        let content = build_rule_fallback_memory("", &messages, 6, 14_000);
+        let content = build_rule_fallback_memory("", &messages, 6);
 
         assert!(content.contains("Keep long-running sessions healthy"));
         assert!(content.contains("Preserve explicit durable session goals"));
@@ -1942,7 +1858,6 @@ mod tests {
             "sess-1",
             &sample_messages(),
             3,
-            12_345,
             "",
             &SessionFacts::default(),
             &[],
@@ -1972,7 +1887,7 @@ mod tests {
             json!({
                 "choices": [{
                     "message": {
-                        "content": "# Session Memory\n\n## Session Title\nLLM Result"
+                        "content": "{\"session_title\":\"LLM Result\"}"
                     }
                 }]
             }),
@@ -1994,7 +1909,6 @@ mod tests {
             "sess-openai",
             &sample_messages(),
             1,
-            20_000,
             "",
             &SessionFacts::default(),
             std::slice::from_ref(&params),
@@ -2016,12 +1930,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_extraction_selector_prompt_filters_vague_reanchor() {
+    async fn run_extraction_selector_prompt_keeps_user_corrections_as_evidence() {
         let (server_url, server_handle) = spawn_json_server(
             Arc::new(|request: &str| {
                 assert!(
-                    !request.contains("durable fix, not a workaround"),
-                    "vague reanchor must not be sent to selector prompt: {request}"
+                    request.contains("durable fix, not a workaround"),
+                    "user correction must remain visible to the selector: {request}"
                 );
                 assert!(
                     request.contains("never use mocks in integration tests"),
@@ -2031,7 +1945,7 @@ mod tests {
             json!({
                 "choices": [{
                     "message": {
-                        "content": "# Session Memory\n\n## Session Title\nFiltered LLM Result"
+                        "content": "{\"session_title\":\"Filtered LLM Result\"}"
                     }
                 }]
             }),
@@ -2060,7 +1974,6 @@ mod tests {
             "sess-filtered-selector",
             &messages,
             4,
-            20_000,
             "",
             &SessionFacts::default(),
             std::slice::from_ref(&params),
@@ -2086,10 +1999,6 @@ mod tests {
         let (server_url, server_handle) = spawn_json_server(
             Arc::new(|request: &str| {
                 assert!(
-                    !request.contains("Active task attachment"),
-                    "active task scaffolding must not reach selector prompt: {request}"
-                );
-                assert!(
                     !request.contains("Already Fetched"),
                     "already-fetched inventory must not reach selector prompt: {request}"
                 );
@@ -2105,7 +2014,7 @@ mod tests {
             json!({
                 "choices": [{
                     "message": {
-                        "content": "# Session Memory\n\n## Session Title\nScaffolding Filtered"
+                        "content": "{\"session_title\":\"Scaffolding Filtered\"}"
                     }
                 }]
             }),
@@ -2114,7 +2023,6 @@ mod tests {
 
         let messages = vec![
             json!({"role": "user", "content": "Improve long-running memory hygiene"}),
-            json!({"role": "user", "content": "[Active task attachment]\nResume hidden task board state"}),
             json!({"role": "assistant", "content": "✓ Previous round: 3 tools executed in parallel"}),
             json!({"role": "user", "content": "## Already Fetched (do NOT re-read)\ncrates/runtime/src/session_memory/runner.rs"}),
         ];
@@ -2134,7 +2042,6 @@ mod tests {
             "sess-filtered-scaffolding",
             &messages,
             4,
-            20_000,
             "",
             &SessionFacts::default(),
             std::slice::from_ref(&params),
@@ -2179,7 +2086,7 @@ mod tests {
             json!({
                 "choices": [{
                     "message": {
-                        "content": "# Session Memory\n\n## Session Title\nTransient Filtered"
+                        "content": "{\"session_title\":\"Transient Filtered\"}"
                     }
                 }]
             }),
@@ -2208,7 +2115,6 @@ mod tests {
             "sess-filtered-transient-status",
             &messages,
             4,
-            20_000,
             "",
             &SessionFacts::default(),
             std::slice::from_ref(&params),
@@ -2240,7 +2146,7 @@ mod tests {
             }),
             json!({
                 "content": [
-                    { "type": "text", "text": "# Session Memory\n\n## Session Title\nAnthropic Result" }
+                    { "type": "text", "text": "{\"session_title\":\"Anthropic Result\"}" }
                 ]
             }),
         )
@@ -2261,7 +2167,6 @@ mod tests {
             "sess-anthropic",
             &sample_messages(),
             1,
-            20_000,
             "",
             &SessionFacts::default(),
             std::slice::from_ref(&params),
@@ -2290,7 +2195,7 @@ mod tests {
                 "output": {
                     "message": {
                         "content": [
-                            { "text": "# Session Memory\n\n## Session Title\nBedrock Result" }
+                            { "text": "{\"session_title\":\"Bedrock Result\"}" }
                         ]
                     }
                 }
@@ -2313,7 +2218,6 @@ mod tests {
             "sess-bedrock",
             &sample_messages(),
             1,
-            20_000,
             "",
             &SessionFacts::default(),
             std::slice::from_ref(&params),
@@ -2362,7 +2266,6 @@ mod tests {
             "sess-double-fail",
             &sample_messages(),
             1,
-            20_000,
             "",
             &SessionFacts::default(),
             std::slice::from_ref(&params),
@@ -2424,7 +2327,6 @@ mod tests {
             "sess-http-detail",
             &sample_messages(),
             1,
-            20_000,
             "",
             &SessionFacts::default(),
             std::slice::from_ref(&params),
@@ -2472,7 +2374,7 @@ mod tests {
             json!({
                 "choices": [{
                     "message": {
-                        "content": "# Session Memory\n\n## Session Title\nRecovered on candidate two"
+                        "content": "{\"session_title\":\"Recovered on candidate two\"}"
                     }
                 }]
             }),
@@ -2503,7 +2405,6 @@ mod tests {
             "sess-retry",
             &sample_messages(),
             1,
-            20_000,
             "",
             &SessionFacts::default(),
             &[first.clone(), second.clone()],
@@ -2537,7 +2438,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_extraction_deletes_prior_session_memory_entries_before_store() {
+    async fn run_extraction_stores_new_snapshot_before_cleaning_prior_entries() {
         let memoria = Arc::new(CapturingMemoria::default());
         memoria.retrieve_results.lock().unwrap().extend([
             MemoriaMemory {
@@ -2562,7 +2463,6 @@ mod tests {
             "sess-1",
             &sample_messages(),
             3,
-            12_345,
             "",
             &SessionFacts::default(),
             &[],
@@ -2590,10 +2490,15 @@ mod tests {
             SESSION_MEMORY_MEMORIA_TYPE,
             "authoritative session memory should use the supported working memoria type"
         );
+        assert_eq!(
+            memoria.operations.lock().unwrap().as_slice(),
+            ["store", "delete:mem-old-session"],
+            "a cleanup failure must never erase the last valid snapshot before replacement"
+        );
     }
 
     #[tokio::test]
-    async fn run_extraction_returns_purge_failed_when_prior_delete_fails() {
+    async fn run_extraction_keeps_success_when_stale_snapshot_cleanup_fails() {
         let memoria = Arc::new(DeleteFailMemoria {
             retrieve_results: vec![MemoriaMemory {
                 memory_id: "mem-old-session".to_string(),
@@ -2608,7 +2513,6 @@ mod tests {
             "sess-1",
             &sample_messages(),
             3,
-            12_345,
             "",
             &SessionFacts::default(),
             &[],
@@ -2617,26 +2521,14 @@ mod tests {
         )
         .await;
 
-        match artifacts {
-            ExtractionArtifacts::PersistFailed {
-                error_reason,
-                llm_error_reason,
-                llm_error_detail,
-                ..
-            } => {
-                assert_eq!(
-                    error_reason,
-                    SessionMemoryExtractionErrorReason::PurgeFailed
-                );
-                assert_eq!(llm_error_reason, None);
-                assert_eq!(llm_error_detail, None);
-            }
-            _ => panic!("expected purge failure"),
-        }
+        assert!(
+            matches!(artifacts, ExtractionArtifacts::Persisted { .. }),
+            "the new durable snapshot remains successful even if stale cleanup fails"
+        );
     }
 
     #[tokio::test]
-    async fn run_extraction_returns_purge_failed_when_prior_entries_exceed_page_cap() {
+    async fn run_extraction_keeps_success_when_stale_cleanup_hits_page_cap() {
         let memoria = Arc::new(OverflowingMemoria {
             next_id: Mutex::new(0),
         }) as Arc<dyn MemoriaClient>;
@@ -2645,7 +2537,6 @@ mod tests {
             "sess-overflow",
             &sample_messages(),
             3,
-            12_345,
             "",
             &SessionFacts::default(),
             &[],
@@ -2654,22 +2545,10 @@ mod tests {
         )
         .await;
 
-        match artifacts {
-            ExtractionArtifacts::PersistFailed {
-                error_reason,
-                llm_error_reason,
-                llm_error_detail,
-                ..
-            } => {
-                assert_eq!(
-                    error_reason,
-                    SessionMemoryExtractionErrorReason::PurgeFailed
-                );
-                assert_eq!(llm_error_reason, None);
-                assert_eq!(llm_error_detail, None);
-            }
-            _ => panic!("expected purge failure when page cap is exceeded"),
-        }
+        assert!(
+            matches!(artifacts, ExtractionArtifacts::Persisted { .. }),
+            "page-capped cleanup must not roll back the new snapshot"
+        );
     }
 
     #[tokio::test]
@@ -2684,7 +2563,6 @@ mod tests {
             "sess-bounded",
             &sample_messages(),
             3,
-            12_345,
             "",
             &SessionFacts::default(),
             &[],
@@ -2700,7 +2578,7 @@ mod tests {
         assert_eq!(
             *memoria.remaining.lock().unwrap(),
             0,
-            "all prior entries should be deleted before store"
+            "all prior entries should eventually be cleaned after store"
         );
         assert_eq!(
             memoria.stored.lock().unwrap().len(),
@@ -2717,6 +2595,38 @@ mod tests {
         assert!(decoded.contains("## Current State"));
         assert!(decoded.contains("- hello"));
         assert!(decode_session_memory_entry(&encoded, "other").is_none());
+    }
+
+    #[test]
+    fn sparse_narrative_patch_preserves_omitted_fields_and_clears_explicit_empty_lists() {
+        let mut snapshot = SessionMemorySnapshot::from_markdown(
+            "sess-patch",
+            "# Session Memory\n\n## Task Specification\nPreserve typed runtime context\n\n## Current State\n- old state\n\n## Pending Todos\n- stale todo\n",
+            3,
+            SessionFacts::default(),
+        );
+        let patch = parse_session_narrative_patch(
+            r#"{"current_state":["typed lane is wired"],"pending_todos":[]}"#,
+        )
+        .expect("valid sparse patch");
+
+        snapshot.narrative.apply_patch(patch);
+        let canonical = snapshot.to_markdown();
+
+        assert!(canonical.contains("Preserve typed runtime context"));
+        assert!(canonical.contains("typed lane is wired"));
+        assert!(!canonical.contains("stale todo"));
+        assert!(!canonical.contains("## Pending Todos"));
+    }
+
+    #[test]
+    fn narrative_patch_rejects_unknown_fields_and_distinguishes_empty_patch() {
+        assert!(parse_session_narrative_patch(r#"{"workflow":["legacy"]}"#).is_err());
+        assert!(
+            parse_session_narrative_patch("{}")
+                .expect("empty JSON object is structurally valid")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2908,7 +2818,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_session_memory_markdown_strips_terminal_current_state_noise() {
+    fn canonicalize_session_memory_markdown_does_not_classify_narrative_wording() {
         let canonical = canonicalize_session_memory_markdown(
             "sess-42",
             "# Session Memory\n\n## Session Title\nReview uncommitted changes in the session memory feature.\n\n## Active Goals\nNone.\n\n## Pending Todos\nNone.\n\n## Completed\n- Ran tests\n\n## Current State\nThe user's request is complete. No issues remain. The session is idle.\n",
@@ -2919,11 +2829,11 @@ mod tests {
         assert!(canonical.contains("## Session Title"));
         assert!(canonical.contains("Review uncommitted changes in the session memory feature."));
         assert!(canonical.contains("## Active Goals"));
-        assert!(canonical.contains("Review uncommitted changes in the session memory feature"));
-        assert!(canonical.contains("## Pending Todos\n- No open loops recorded."));
-        assert!(!canonical.contains("The user's request is complete"));
-        assert!(!canonical.contains("session is idle"));
-        assert!(!canonical.contains("No issues remain"));
+        assert!(canonical.contains("- None."));
+        assert!(canonical.contains("## Pending Todos"));
+        assert!(canonical.contains("The user's request is complete"));
+        assert!(canonical.contains("session is idle"));
+        assert!(canonical.contains("No issues remain"));
     }
 
     #[test]
@@ -2946,11 +2856,11 @@ mod tests {
 
         assert!(!canonical.contains("System observed"));
         assert!(!canonical.contains("7 errors"));
-        assert!(canonical.contains("## Errors & Corrections\n- No corrections recorded."));
+        assert!(!canonical.contains("## Errors & Corrections"));
     }
 
     #[tokio::test]
-    async fn load_current_session_memory_preferring_local_uses_local_artifact_first() {
+    async fn load_current_session_memory_preferring_local_chooses_the_newest_snapshot() {
         use astra_services::SessionArtifactStore;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2965,28 +2875,60 @@ mod tests {
             "# Session Memory\n\n## Current State\n- local snapshot wins\n",
         )
         .unwrap();
+        persist_local_session_memory_metadata(
+            session_id,
+            &SessionMemoryArtifactMetadata {
+                session_id: session_id.to_string(),
+                last_extracted_turn: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let memoria = CapturingMemoria {
             retrieve_results: Mutex::new(vec![MemoriaMemory {
-                content: encode_session_memory_entry(
+                memory_type: SESSION_MEMORY_MEMORIA_TYPE.to_string(),
+                content: SessionMemorySnapshot::from_markdown(
                     session_id,
                     "# Session Memory\n\n## Current State\n- remote snapshot",
-                ),
+                    1,
+                    SessionFacts::default(),
+                )
+                .to_memory_entry()
+                .encode(),
                 ..Default::default()
             }]),
             ..Default::default()
         };
 
-        let loaded = load_current_session_memory_preferring_local(&memoria, session_id)
-            .await
-            .expect("local session-memory artifact should load");
+        let loaded =
+            load_current_session_memory_preferring_local_with_freshness(&memoria, session_id)
+                .await
+                .expect("local session-memory artifact should load");
 
-        assert!(loaded.contains("- local snapshot wins"));
-        assert!(!loaded.contains("- remote snapshot"));
+        assert!(loaded.content.contains("- local snapshot wins"));
+        assert!(!loaded.content.contains("- remote snapshot"));
+        assert_eq!(loaded.updated_turn, Some(2));
+
+        memoria.retrieve_results.lock().unwrap()[0].content = SessionMemorySnapshot::from_markdown(
+            session_id,
+            "# Session Memory\n\n## Current State\n- newer remote snapshot wins",
+            3,
+            SessionFacts::default(),
+        )
+        .to_memory_entry()
+        .encode();
+        let loaded =
+            load_current_session_memory_preferring_local_with_freshness(&memoria, session_id)
+                .await
+                .expect("newer remote snapshot");
+        assert!(loaded.content.contains("- newer remote snapshot wins"));
+        assert!(!loaded.content.contains("- local snapshot wins"));
+        assert_eq!(loaded.updated_turn, Some(3));
     }
 
     #[test]
-    fn from_markdown_replaces_placeholder_goal_with_explicit_task() {
+    fn from_markdown_does_not_infer_goal_semantics_from_wording() {
         let snapshot = SessionMemorySnapshot::from_markdown(
             "sess-42",
             "# Session Memory
@@ -3006,16 +2948,22 @@ review uncommitted changes
 
         assert_eq!(
             snapshot.narrative.active_goals,
-            vec!["review uncommitted changes".to_string()]
+            vec!["(None explicitly stated)".to_string()]
         );
     }
 
     #[test]
-    fn empty_active_goal_helper_treats_terminal_phrase_as_empty() {
-        assert!(is_effectively_empty_active_goal(
-            "None remaining; task completed."
-        ));
-        assert!(is_effectively_empty_active_goal("task completed"));
+    fn current_state_preserves_explicit_completion_facts() {
+        let snapshot = SessionMemorySnapshot::from_markdown(
+            "sess-42",
+            "# Session Memory\n\n## Current State\n- task completed\n",
+            2,
+            SessionFacts::default(),
+        );
+        assert_eq!(
+            snapshot.narrative.current_state,
+            vec!["task completed".to_string()]
+        );
     }
 
     #[test]
@@ -3063,46 +3011,5 @@ review uncommitted changes
         assert!(!joined.contains("[session-resume:v1]"));
         assert!(!joined.contains("<skill-loaded"));
         assert!(!joined.contains("skill-auto-route"));
-    }
-
-    #[test]
-    fn render_recent_messages_includes_tool_heavy_web_agent_rounds() {
-        let messages = vec![
-            json!({"role": "user", "content": "open the homepage"}),
-            json!({
-                "role": "assistant",
-                "content": serde_json::Value::Null,
-                "tool_calls": [{
-                    "function": {"name": "web_fetch"}
-                }]
-            }),
-            json!({"role": "tool", "content": "Fetched https://example.com", "tool_call_id": "c1"}),
-        ];
-
-        assert_eq!(
-            render_recent_messages(&messages, 8, 240),
-            vec![
-                "user: open the homepage".to_string(),
-                "assistant: [called: web_fetch]".to_string(),
-                "tool: Fetched https://example.com".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn last_assistant_message_synthesizes_tool_call_summary() {
-        let messages = vec![json!({
-            "role": "assistant",
-            "content": serde_json::Value::Null,
-            "tool_calls": [
-                {"function": {"name": "web_fetch"}},
-                {"function": {"name": "bash"}}
-            ]
-        })];
-
-        assert_eq!(
-            last_assistant_message(&messages).as_deref(),
-            Some("[called: web_fetch, bash]")
-        );
     }
 }

@@ -187,7 +187,6 @@ impl ObservabilitySession {
         let BridgeInjectionPreviews {
             lessons,
             volatile,
-            memoria_insights,
             memoria_prefetch,
             self_awareness,
             feedback_rules,
@@ -213,7 +212,6 @@ impl ObservabilitySession {
         // (below) for the hash/bytes. Tracked here so we know not to
         // double-observe.
         let cli_passthrough: &[(InjectionChannel, &str)] = &[
-            (InjectionChannel::MemoriaInsights, memoria_insights),
             (InjectionChannel::RecentArgHints, recent_arg_hints),
             (InjectionChannel::SkillListing, skill_listing),
         ];

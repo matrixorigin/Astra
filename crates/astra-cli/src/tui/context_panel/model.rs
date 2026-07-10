@@ -863,11 +863,6 @@ fn build_prompt_signals(trace: &ContextAssemblyTrace) -> Vec<SignalItem> {
             "Retrieval found a memory worth surfacing this turn",
         ),
         ctx(
-            cs.memoria_insights,
-            "memoria_insights",
-            "Memoria MCP provided cross-session insights",
-        ),
-        ctx(
             cs.system_prompt_override,
             "system_prompt_override",
             "User/config overrode the default system prompt",

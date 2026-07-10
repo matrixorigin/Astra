@@ -804,7 +804,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         //   2. Bridge-supplied opaque fingerprints for the 5 bridge-internal
         //      channels (memoria_prefetch, feedback_rules, implicit_feedback,
         //      tool_round_guidance, volatile_pending) and the 3 CLI-visible
-        //      channels the bridge echoes (memoria_insights, recent_arg_hints,
+        //      channels the bridge echoes (recent_arg_hints,
         //      skill_listing) whose source strings the CLI doesn't have
         //      trivial post-turn access to. Wire carries only
         //      hash+bytes+is_empty — no raw text leaves the bridge.

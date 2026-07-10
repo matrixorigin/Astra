@@ -410,7 +410,6 @@ fn prompt_signals_flip_matches_trace_flags() {
     let mut t = trace(100_000, 1_000, 0, 0, 0, 0);
     t.system_prompt.context_signals = PromptContextSignals {
         memory_signal_detected: true,
-        memoria_insights: true,
         ..PromptContextSignals::default()
     };
     t.system_prompt.guidance_signals = PromptGuidanceSignals {
@@ -420,9 +419,8 @@ fn prompt_signals_flip_matches_trace_flags() {
     let b = ContextBreakdown::from_trace(&t);
     let names: Vec<&str> = b.prompt_signals.iter().map(|s| s.name).collect();
     assert!(names.contains(&"memory_signal_detected"));
-    assert!(names.contains(&"memoria_insights"));
     assert!(names.contains(&"parallel_batching_nudge"));
-    assert_eq!(names.len(), 3, "only set flags should appear: {names:?}");
+    assert_eq!(names.len(), 2, "only set flags should appear: {names:?}");
 }
 
 #[test]

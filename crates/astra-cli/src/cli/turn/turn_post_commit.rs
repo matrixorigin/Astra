@@ -9,7 +9,7 @@ use crate::cli::session::session_projection::{
     rebuild_continuation_anchor_from_live_state,
 };
 use crate::cli::session::session_runtime;
-use crate::cli::session::session_side_effects::close_pending_memory_feedback_at_turn_end;
+use crate::cli::session::session_side_effects::drop_unattributed_memory_recalls_at_turn_end;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
 
@@ -22,30 +22,12 @@ pub(crate) async fn run_turn_post_commit_tasks(
     turn_start: Instant,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
 ) {
-    let cloud_base = match crate::cli::config_manager::resolve_api_url(None) {
-        Ok(base) => Some(base),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "skipping pending recall feedback close because API URL configuration is invalid"
-            );
-            None
-        }
-    };
-    let report = close_pending_memory_feedback_at_turn_end(
-        state.session_id.as_deref(),
-        cloud_base,
-        session_runtime::current_access_token(profile),
-        "cli-turn-end",
-    )
-    .await;
-    if report.attempted > 0 {
+    let dropped = drop_unattributed_memory_recalls_at_turn_end(state.session_id.as_deref());
+    if dropped > 0 {
         tracing::debug!(
             session_id = ?state.session_id,
-            attempted = report.attempted,
-            succeeded = report.succeeded,
-            failed = report.failed,
-            "closed pending recall feedback at turn end"
+            dropped,
+            "dropped unattributed memory recalls without changing their rank"
         );
     }
 
@@ -212,7 +194,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn run_turn_post_commit_tasks_drains_pending_recall_feedback_before_returning() {
+    async fn turn_commit_drops_unattributed_recall_without_positive_feedback() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let server = MockServer::start().await;
         let _api_url = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
@@ -221,7 +203,7 @@ mod tests {
             .and(path("/memory/feedback/m1"))
             .and(header("authorization", "Bearer token"))
             .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -239,7 +221,7 @@ mod tests {
             None,
             Vec::new(),
             extract_csl_fields_from_result(&crate::tests::stub_stream_result(
-                "Used the recalled memory.",
+                "The turn completed without attributable memory usage.",
             )),
             Instant::now(),
             &mut ui,
@@ -249,7 +231,7 @@ mod tests {
         assert_eq!(
             astra_tools::memoria::MemoriaClient::pending_recall_count(session_id),
             0,
-            "turn completion must synchronously drain recall feedback so cleanup cannot race it"
+            "turn completion must synchronously drop unattributed recall state"
         );
     }
 

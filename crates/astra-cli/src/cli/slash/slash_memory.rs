@@ -1138,9 +1138,6 @@ fn humanize_session_memory_skip(turn: &str, reason: &str) -> String {
         "in_flight" => format!(
             "Session memory extraction was already running before {turn}, so this turn did not start a duplicate run."
         ),
-        "below_init_gate" => format!(
-            "Session memory has not started yet because the conversation had not accumulated enough meaningful context by {turn}."
-        ),
         "no_growth" => format!(
             "Session memory was not refreshed on {turn} because the conversation had not changed enough since the last snapshot."
         ),
@@ -1263,17 +1260,7 @@ fn session_memory_headline_from_body(body: &str) -> Option<String> {
             content
                 .lines()
                 .map(str::trim)
-                .find(|line| {
-                    !(line.is_empty()
-                        || (section == "Current State"
-                            && astra_runtime::session_memory::runner::is_terminal_current_state(
-                                line,
-                            ))
-                        || (section == "Active Goals"
-                            && astra_runtime::session_memory::runner::is_effectively_empty_active_goal(
-                                line,
-                            )))
-                })
+                .find(|line| !line.is_empty())
                 .map(str::to_string)
         })
     })
@@ -1455,7 +1442,7 @@ fn update_manual_session_memory_sync_metadata(
 /// Returns content between the header and the next `##` header (exclusive).
 fn extract_md_section(md: &str, section_name: &str) -> Option<String> {
     let (_, content_start, section_end) = find_md_section_bounds(md, section_name)?;
-    sanitize_md_section_content(section_name, &md[content_start..section_end])
+    sanitize_md_section_content(&md[content_start..section_end])
 }
 
 /// Replace (or append) a `## SectionName` block in a markdown string.
@@ -1489,7 +1476,7 @@ fn normalize_section_content(content: &str) -> String {
     }
 }
 
-fn sanitize_md_section_content(section_name: &str, content: &str) -> Option<String> {
+fn sanitize_md_section_content(content: &str) -> Option<String> {
     let section_body = content.trim();
     if section_body.is_empty()
         || (section_body.starts_with("<!--")
@@ -1506,30 +1493,6 @@ fn sanitize_md_section_content(section_name: &str, content: &str) -> Option<Stri
     } else {
         section_body
     };
-    if section_name == "Active Goals" {
-        let lines: Vec<&str> = stripped
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .filter(|line| {
-                let semantic = line
-                    .trim_start_matches("- ")
-                    .trim_start_matches("* ")
-                    .trim();
-                !astra_runtime::session_memory::runner::is_effectively_empty_active_goal(semantic)
-            })
-            .collect();
-        return (!lines.is_empty()).then(|| lines.join("\n"));
-    }
-    if section_name == "Current State" {
-        let lines: Vec<&str> = stripped
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .filter(|line| !astra_runtime::session_memory::runner::is_terminal_current_state(line))
-            .collect();
-        return (!lines.is_empty()).then(|| lines.join("\n"));
-    }
     (!stripped.is_empty()).then(|| stripped.to_string())
 }
 
@@ -2167,12 +2130,12 @@ mod tests {
     }
 
     #[test]
-    fn format_session_memory_display_hides_completed_terminal_active_goal() {
+    fn format_session_memory_display_preserves_explicit_completion_goal() {
         let body =
             "## Active Goals\n- None remaining; task completed.\n\n## Completed\n- Finished work\n";
         let result = strip_ansi(&format_session_memory_display(body, None, None));
-        assert!(!result.contains("🎯 Active Goals"));
-        assert!(!result.contains("None remaining; task completed."));
+        assert!(result.contains("🎯 Active Goals"));
+        assert!(result.contains("None remaining; task completed."));
         assert!(result.contains("✅ Completed"));
         assert!(result.contains("Finished work"));
     }
@@ -2200,22 +2163,24 @@ mod tests {
     }
 
     #[test]
-    fn session_memory_headline_skips_terminal_current_state_handoff() {
+    fn session_memory_headline_preserves_current_state_without_text_classification() {
         let body = "## Session Title\nReview uncommitted changes in the session memory feature.\n\n## Current State\nThe user's request is complete. No issues remain. The session is idle.\n\n## Completed\n- Ran tests\n";
         let headline = session_memory_headline_from_body(body).expect("headline");
         assert_eq!(
             headline,
-            "Review uncommitted changes in the session memory feature."
+            "The user's request is complete. No issues remain. The session is idle."
         );
     }
 
     #[test]
-    fn sanitize_current_state_hides_terminal_idle_handoff_text() {
+    fn sanitize_current_state_preserves_nonempty_text() {
         let result = sanitize_md_section_content(
-            "Current State",
             "The user's request is complete. No issues remain. The session is idle.",
         );
-        assert!(result.is_none());
+        assert_eq!(
+            result.as_deref(),
+            Some("The user's request is complete. No issues remain. The session is idle.")
+        );
     }
 
     #[test]
@@ -2611,10 +2576,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_md_section_treats_terminal_active_goal_phrase_as_empty() {
+    fn extract_md_section_preserves_nonempty_active_goal_wording() {
         let body =
             "## Active Goals\n- None remaining; task completed.\n\n## Completed\n- Finished work\n";
-        assert!(extract_md_section(body, "Active Goals").is_none());
+        assert_eq!(
+            extract_md_section(body, "Active Goals").as_deref(),
+            Some("- None remaining; task completed.")
+        );
     }
 
     #[test]

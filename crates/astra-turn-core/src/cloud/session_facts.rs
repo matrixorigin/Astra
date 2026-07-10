@@ -25,7 +25,14 @@ pub fn update_from_journal_event(facts: &mut SessionFacts, event: &JournalEvent)
             if tc.is_synthetic_placeholder() {
                 continue;
             }
-            if let Some(path) = extract_file_path(tc) {
+            // Only successful file operations are evidence that a path was
+            // actually observed or mutated. Failed calls commonly contain a
+            // directory, a misspelled path, or arguments rejected before any
+            // I/O; recording those as active files makes the facts layer less
+            // reliable than the raw journal it is derived from.
+            if tc.ok
+                && let Some(path) = extract_file_path(tc)
+            {
                 upsert_file(facts, path, action_for_tool(&tc.name), facts.turn);
             }
             facts.recent_tool_calls.push(ToolFact {
@@ -176,6 +183,26 @@ mod tests {
         assert_eq!(facts.active_files[0].last_action, "read");
         assert_eq!(facts.active_files[1].path, "src/lib.rs");
         assert_eq!(facts.active_files[1].last_action, "write");
+    }
+
+    #[test]
+    fn failed_file_call_is_not_promoted_to_active_file() {
+        let mut facts = SessionFacts::default();
+        let event = make_event(
+            1,
+            vec![make_tc(
+                "read_file",
+                false,
+                Some("/workspace/a-directory"),
+                None,
+            )],
+        );
+
+        update_from_journal_event(&mut facts, &event);
+
+        assert!(facts.active_files.is_empty());
+        assert_eq!(facts.recent_tool_calls.len(), 1);
+        assert!(!facts.recent_tool_calls[0].ok);
     }
 
     #[test]

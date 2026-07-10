@@ -118,10 +118,10 @@ pub enum CompactTrigger {
     Auto,
 }
 
-/// Metadata about a compaction event, injected as a boundary marker.
+/// Metadata about a compaction event.
 ///
-/// This allows post-compaction context (LLM, debugging, analytics) to understand
-/// what happened and what was preserved.
+/// This remains out-of-band for diagnostics and analytics. It is not converted
+/// into a synthetic prompt-history message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactBoundary {
     /// What triggered the compaction.
@@ -197,33 +197,6 @@ impl CompactBoundary {
         self.discovered_tools = tools;
         self
     }
-
-    /// Convert to a system message for injection into the message stream.
-    pub fn to_system_message(&self) -> Value {
-        serde_json::json!({
-            "role": "system",
-            "content": self.format_content(),
-            "compact_metadata": self,
-        })
-    }
-
-    /// Format human-readable content for the boundary message.
-    fn format_content(&self) -> String {
-        let trigger_str = match self.trigger {
-            CompactTrigger::Manual => "manually",
-            CompactTrigger::Auto => "automatically",
-        };
-        let tier_str = match self.tier {
-            CompactionTier::Normal => "normal",
-            CompactionTier::TrimSchemas => "trim-schemas",
-            CompactionTier::CompactHistory => "compact-history",
-            CompactionTier::AggressivePrune => "aggressive-prune",
-        };
-        format!(
-            "[Conversation compacted {} (tier: {}, {} → {} messages)]",
-            trigger_str, tier_str, self.messages_before, self.messages_after
-        )
-    }
 }
 
 /// Result of a compaction operation.
@@ -238,6 +211,9 @@ pub struct CompactResult {
     /// Structured current-session memory routed separately through the
     /// context pipeline instead of being injected as a synthetic history blob.
     pub session_memory_context: Option<String>,
+    /// Required per-compaction runtime context routed through the volatile
+    /// system lane, never persisted as user/assistant/tool history.
+    pub runtime_contexts: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +287,7 @@ pub(crate) fn compact_tiered_impl(
             boundary: None,
             tier,
             session_memory_context: None,
+            runtime_contexts: Vec::new(),
         };
     }
 
@@ -347,6 +324,7 @@ pub(crate) fn compact_tiered_impl(
             boundary: None,
             tier,
             session_memory_context: None,
+            runtime_contexts: Vec::new(),
         };
     }
 
@@ -484,6 +462,7 @@ pub(crate) fn compact_tiered_impl(
         boundary: Some(boundary),
         tier,
         session_memory_context: None,
+        runtime_contexts: Vec::new(),
     }
 }
 
@@ -576,20 +555,6 @@ mod tests {
             result.boundary.is_none(),
             "Under-budget should produce no boundary"
         );
-    }
-
-    #[test]
-    fn boundary_to_system_message() {
-        let boundary =
-            CompactBoundary::new(CompactTrigger::Manual, CompactionTier::AggressivePrune)
-                .with_pre_metrics(12000, 10)
-                .with_post_count(4);
-        let msg = boundary.to_system_message();
-        assert_eq!(msg["role"].as_str().unwrap(), "system");
-        let content = msg["content"].as_str().unwrap();
-        assert!(content.contains("manually"));
-        assert!(content.contains("aggressive-prune"));
-        assert!(content.contains("10 → 4"));
     }
 
     #[test]
@@ -1224,18 +1189,6 @@ mod tests {
     fn compact_tier_empty_string_deserialization() {
         let result: Result<CompactionTier, _> = serde_json::from_str(r#""""#);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn compact_boundary_to_system_message_roundtrip() {
-        let boundary = CompactBoundary::new(CompactTrigger::Auto, CompactionTier::CompactHistory)
-            .with_pre_metrics(5000, 10)
-            .with_post_count(6);
-        let msg = boundary.to_system_message();
-        assert_eq!(msg["role"], "system");
-        // Content should contain embedded JSON
-        let content = msg["content"].as_str().unwrap();
-        assert!(content.contains("compact-history"));
     }
 
     #[test]

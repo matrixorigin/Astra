@@ -15,8 +15,8 @@ pub(crate) struct FinalizedInput {
     pub(crate) user_intent: String,
     /// External/session-recovery context required for the next turn.
     pub(crate) runtime_required_texts: Vec<String>,
-    /// Dynamic text from external session sources (background jobs and task
-    /// board snapshots). Runtime policy/guardrail signals use the typed lane.
+    /// Dynamic text from external session sources such as task-board
+    /// snapshots. Internal runtime state uses required/typed lanes.
     pub(crate) runtime_volatile_texts: Vec<String>,
 }
 
@@ -41,7 +41,7 @@ pub(crate) async fn finalize_effective_line(
             .drain(..)
             .collect::<Vec<_>>()
             .join("\n");
-        runtime_volatile_texts.push(format!(
+        runtime_required_texts.push(format!(
             "Background task updates since your last turn:\n{notifications}"
         ));
     }
@@ -499,18 +499,18 @@ mod tests {
         .await;
 
         assert_eq!(finalized.user_message, "continue");
-        assert_eq!(
-            finalized.runtime_required_texts,
-            vec!["Resume the interrupted task."]
-        );
-        assert_eq!(finalized.runtime_volatile_texts.len(), 1);
+        assert_eq!(finalized.runtime_required_texts.len(), 2);
         assert!(
-            finalized.runtime_volatile_texts[0]
+            finalized.runtime_required_texts[0]
                 .contains("Background task updates since your last turn:")
         );
-        assert!(!finalized.runtime_volatile_texts[0].contains("Background command updates"));
-        assert!(finalized.runtime_volatile_texts[0].contains("bg-shell-1 completed"));
-        assert!(finalized.runtime_volatile_texts[0].contains("bg-shell-2 failed"));
+        assert!(finalized.runtime_required_texts[0].contains("bg-shell-1 completed"));
+        assert!(finalized.runtime_required_texts[0].contains("bg-shell-2 failed"));
+        assert_eq!(
+            finalized.runtime_required_texts[1],
+            "Resume the interrupted task."
+        );
+        assert!(finalized.runtime_volatile_texts.is_empty());
         assert!(!finalized.user_message.contains("<system-reminder>"));
         assert!(state.pending_bg_notifications.is_empty());
         assert!(state.diagnostics_context.is_none());

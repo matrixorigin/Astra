@@ -409,100 +409,73 @@ async fn run_post_loop_memory_cleanup_work(
     // session or the TUI issues follow-up turns). Running governance
     // per run would write one episode per turn and hammer reflect.
     // The debouncer allows one governance per session per window.
-    let mut episode_was_written = false;
-    if let Some(ref memoria_client) =
-        crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env()
-    {
-        let debouncer = crate::turn::session_end_debounce::global();
-        if matches!(
-            debouncer.should_run(&session_id),
-            crate::turn::session_end_debounce::DebounceDecision::Run
-        ) {
-            match crate::turn::cloud::session_end_governance::run_session_end_governance(
-                &session_facts,
-                &session_id,
-                memoria_client,
+    let debouncer = crate::turn::session_end_debounce::global();
+    if matches!(
+        debouncer.should_run(&session_id),
+        crate::turn::session_end_debounce::DebounceDecision::Run
+    ) {
+        let report = if let Some(svc) = extraction_service.as_ref() {
+            Some(
+                svc.run_session_end_governance(&session_facts, &session_id)
+                    .await,
             )
-            .await
-            {
-                Ok(report) => {
-                    episode_was_written = report.episode_chars > 0;
-                    if episode_was_written
-                        || report.working_purged > 0
-                        || report.reflect_candidates > 0
-                        || report.scenes_stored > 0
-                    {
-                        tracing::info!(
-                            session_id = %session_id,
-                            learnings = report.learnings_stored,
-                            purged = report.working_purged,
-                            episode_chars = report.episode_chars,
-                            reflect_candidates = report.reflect_candidates,
-                            reflect_synthesized = report.reflect_synthesized,
-                            scenes_stored = report.scenes_stored,
-                            "session-end governance complete"
-                        );
-                    }
-                    debouncer.record(&session_id);
-                }
-                Err(e) => {
-                    tracing::warn!(
+        } else if let Some(memoria_client) =
+            crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env()
+        {
+            Some(
+                crate::turn::cloud::session_end_governance::run_session_end_governance(
+                    &session_facts,
+                    &session_id,
+                    &memoria_client,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+        match report {
+            Some(Ok(report)) => {
+                if report.episode_chars > 0
+                    || report.working_purged > 0
+                    || report.working_retained_due_to_episode_failure
+                    || report.reflect_candidates > 0
+                    || report.scenes_stored > 0
+                {
+                    tracing::info!(
                         session_id = %session_id,
-                        error = %e,
-                        "session-end governance failed"
+                        purged = report.working_purged,
+                        working_retained = report.working_retained_due_to_episode_failure,
+                        episode_chars = report.episode_chars,
+                        reflect_candidates = report.reflect_candidates,
+                        reflect_synthesized = report.reflect_synthesized,
+                        scenes_stored = report.scenes_stored,
+                        "session-end governance complete"
                     );
                 }
+                debouncer.record(&session_id);
             }
-        } else {
-            tracing::debug!(
+            Some(Err(error)) => tracing::warn!(
                 session_id = %session_id,
-                "session-end governance skipped by debounce"
-            );
+                error = %error,
+                "session-end governance failed"
+            ),
+            None => tracing::debug!(
+                session_id = %session_id,
+                "session-end governance skipped because no memory provider is configured"
+            ),
         }
-
-        // ── Close the recall → outcome feedback loop ──────────────
-        //
-        // Every LLM-driven `memory(action=recall)` pushed its returned
-        // memory_ids onto the process-global recall ledger. Drain them
-        // here and route a feedback signal to Memoria. Conservative
-        // heuristic:
-        //   • episode was written (session did substantive work)
-        //       → signal `useful` — the recall was at least surfaced
-        //         into a productive session
-        //   • trivial session (no episode)
-        //       → drop without scoring — not enough evidence
-        //
-        // A richer attribution (per-tool-call outcome mapping) needs
-        // the tool dispatch layer to report success/failure per recall,
-        // which is a bigger refactor. The episode-level heuristic is
-        // the smallest step that closes the loop in production.
-        let snapshots = astra_tools::memoria::MemoriaClient::drain_recalls(&session_id, None);
-        if !snapshots.is_empty() && episode_was_written {
-            use crate::turn::cloud::memoria_compact::MemoriaClient as ServerMemoriaClient;
-            for snap in &snapshots {
-                for id in &snap.memory_ids {
-                    let ctx = format!("session-end: turn {} productive session", snap.turn);
-                    if let Err(e) =
-                        ServerMemoriaClient::feedback(memoria_client, id, "useful", Some(&ctx))
-                            .await
-                    {
-                        tracing::debug!(memory_id = %id, error = %e, "feedback push failed");
-                    }
-                }
-            }
-            tracing::info!(
-                session_id = %session_id,
-                snapshots = snapshots.len(),
-                "closed recall → useful feedback loop"
-            );
-        } else if !snapshots.is_empty() {
-            tracing::debug!(
-                session_id = %session_id,
-                snapshots = snapshots.len(),
-                "session trivial; dropped recall snapshots without scoring"
-            );
-        }
+    } else {
+        tracing::debug!(
+            session_id = %session_id,
+            "session-end governance skipped by debounce"
+        );
     }
+
+    // Unattributed recall is not positive evidence. A productive session may
+    // have ignored or worked around a bad memory, so session end never marks
+    // every surfaced item `useful`. Tool/user outcome paths send feedback only
+    // when they can attribute useful/outdated/wrong to a concrete memory id.
     reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
     record_post_loop_memory_cleanup_worker_metrics(metrics_registry.as_ref(), "completed");
 }
@@ -4657,28 +4630,20 @@ fn build_shutdown_extraction_request(
 ) -> Option<crate::session_memory::ExtractionRequest> {
     let user_id = state.context_manifest_user_id.clone()?;
     let runtime_decision_user_intent = state.runtime_decision_user_intent();
-    state.current_session_id.as_ref().map(|session_id| {
-        crate::session_memory::ExtractionRequest {
+    state
+        .current_session_id
+        .as_ref()
+        .map(|session_id| crate::session_memory::ExtractionRequest {
             user_id,
             session_id: session_id.clone(),
             messages: state.messages.clone(),
             session_facts: state.session_facts.clone(),
-            current_tokens: state
-                .total_prompt
-                .saturating_add(state.total_cache_read)
-                .saturating_add(state.total_cache_creation)
-                as usize,
-            current_tool_calls: state.total_tool_calls as usize,
             had_error: state.error_recovery.consecutive_same_error > 0,
             had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(
                 &runtime_decision_user_intent,
             ),
             turn_number: state.current_session_turn_number(),
-            config:
-                astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
-                ),
-        }
-    })
+        })
 }
 
 fn exact_runtime_string(

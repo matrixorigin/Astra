@@ -1156,6 +1156,12 @@ pub struct ServerAgenticLoopHost {
     /// Bounded task-board digest loaded before the turn starts. This is a
     /// scan hint, not an instruction to create or update tasks every turn.
     task_board_resume_hint: Option<String>,
+    /// Runtime-owned memory provider used consistently for prompt recall,
+    /// current-session snapshots, compaction, and server-only/subrun paths.
+    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>>,
+    /// Typed recall latched for one user turn so every tool round observes the
+    /// same evidence and the dynamic prompt bytes do not churn mid-turn.
+    prompt_memory_recall_cache: Option<PromptMemoryRecallCache>,
 
     // ── Tool execution ──
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
@@ -1257,6 +1263,13 @@ pub struct ServerAgenticLoopHost {
 }
 
 #[derive(Clone)]
+struct PromptMemoryRecallCache {
+    session_turn: u32,
+    user_content: String,
+    entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
+}
+
+#[derive(Clone)]
 struct AgentLiveMirror {
     agent_id: String,
     sink: SharedAgentLiveEventSink,
@@ -1286,6 +1299,7 @@ pub struct ServerAgenticLoopHostBuilder {
     plan_resume_hint: Option<String>,
     plan_authoring_active: bool,
     task_board_resume_hint: Option<String>,
+    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>>,
     server_service_tool_catalog_enabled: bool,
     control_plane_tool_catalog_enabled: bool,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -1341,6 +1355,11 @@ impl ServerAgenticLoopHostBuilder {
             plan_resume_hint: None,
             plan_authoring_active: false,
             task_board_resume_hint: None,
+            memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env().map(
+                |client| {
+                    Arc::new(client) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>
+                },
+            ),
             server_service_tool_catalog_enabled: true,
             control_plane_tool_catalog_enabled: true,
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -1737,6 +1756,8 @@ impl ServerAgenticLoopHostBuilder {
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
             plan_authoring_active: Arc::new(std::sync::RwLock::new(self.plan_authoring_active)),
             task_board_resume_hint: self.task_board_resume_hint,
+            memoria_client: self.memoria_client,
+            prompt_memory_recall_cache: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -1767,6 +1788,14 @@ impl ServerAgenticLoopHostBuilder {
         capabilities: astra_turn_core::capability::CapabilitySet,
     ) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_memoria_client(
+        mut self,
+        memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>>,
+    ) -> Self {
+        self.memoria_client = memoria_client;
         self
     }
 
@@ -4040,6 +4069,58 @@ impl ServerAgenticLoopHost {
     /// tracing, the breakdown, the selected compaction tier, and the tier-pruned
     /// tool schemas. Callers that only want the system text can discard the
     /// extra fields.
+    async fn prompt_memory_entries_for_turn(
+        &mut self,
+        session_turn: u32,
+        user_content: &str,
+    ) -> Vec<astra_turn_core::context_sources::MemoryEntry> {
+        if let Some(cached) = self.prompt_memory_recall_cache.as_ref().filter(|cached| {
+            cached.session_turn == session_turn && cached.user_content == user_content
+        }) {
+            return cached.entries.clone();
+        }
+
+        let entries = if let Some(client) = self.memoria_client.as_deref() {
+            let top_k = std::env::var("ASTRA_RETRIEVAL_TOP_K")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(5);
+            let (prefetched, session_start) = tokio::join!(
+                crate::turn::memory_prefetch::prefetch_memories_with_client(
+                    client,
+                    user_content,
+                    &self.user_id,
+                    &self.session_id,
+                    top_k,
+                ),
+                async {
+                    if session_turn <= 1 {
+                        crate::turn::memory_prefetch::prefetch_session_start_memories_with_client(
+                            client,
+                            &self.user_id,
+                            &self.session_id,
+                        )
+                        .await
+                        .entries
+                    } else {
+                        Vec::new()
+                    }
+                }
+            );
+            let mut entries = session_start;
+            entries.extend(prefetched.entries);
+            crate::turn::memory_prefetch::admit_prompt_memory_entries(&self.session_id, entries)
+        } else {
+            Vec::new()
+        };
+        self.prompt_memory_recall_cache = Some(PromptMemoryRecallCache {
+            session_turn,
+            user_content: user_content.to_string(),
+            entries: entries.clone(),
+        });
+        entries
+    }
+
     fn run_turn_pipeline(
         &mut self,
         state: &mut AgenticLoopState,
@@ -4056,6 +4137,7 @@ impl ServerAgenticLoopHost {
             None,
             None,
             None,
+            &[],
             user_content,
         )
     }
@@ -4069,6 +4151,7 @@ impl ServerAgenticLoopHost {
         model_context_window: Option<u32>,
         cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
+        memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
@@ -4114,6 +4197,10 @@ impl ServerAgenticLoopHost {
                     plan_hint,
                 )
                 .with_extra_sections(&[], &lifecycle_sections)
+                .with_memory_entries(memory_entries)
+                .with_memory_provider_source(
+                    self.memoria_client.is_some().then_some("server_config"),
+                )
                 .with_session_memory_entry(session_memory_entry),
                 cache_cfg: &cache_cfg,
                 provider,
@@ -4151,29 +4238,16 @@ impl ServerAgenticLoopHost {
             completions_url_override: llm_cfg.completions_url_override.clone(),
             request_timeout: llm_cfg.request_timeout,
         };
-        let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
-
-        // Observatory is owned by the memory_extraction_service; clone the
-        // Arc so both extraction (service) and injection (compaction) write
-        // into the same ring set.
-        let observatory = state
-            .memory_extraction_service
-            .as_ref()
-            .and_then(|svc| svc.observatory().cloned());
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
             model_name: &llm_cfg.model_name,
             context_window: llm_cfg.context_window,
-            memoria_client: memoria_client
-                .as_ref()
-                .map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
+            memoria_client: self.memoria_client.as_deref(),
             summary_client: Some(
                 &summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
             ),
             tier,
             session_facts: None,
-            turn_number: state.llm_rounds_completed,
-            observatory,
         };
         ctx.compact(&state.messages, system_messages, visible_tools)
             .await
@@ -4556,17 +4630,30 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         //   * compaction tier selection
         //   * tier-pruned tool schemas
         // Runtime no longer re-derives any of these.
-        let initial_session_memory_entry =
-            if let Some(svc) = state.memory_extraction_service.as_ref() {
-                svc.current_session_memory_entry_for_pipeline(
-                    &self.session_id,
-                    state.session_turn,
-                    &user_content,
-                )
+        let memoria_client = self.memoria_client.clone();
+        let memoria_prefetch_entries = self
+            .prompt_memory_entries_for_turn(state.session_turn, &user_content)
+            .await;
+        let initial_session_memory_entry = if let Some(svc) =
+            state.memory_extraction_service.as_ref()
+        {
+            svc.current_session_memory_entry_for_pipeline(&self.session_id)
                 .await
-            } else {
-                None
-            };
+        } else if let Some(client) = memoria_client.as_deref() {
+            let loaded = crate::session_memory::runner::load_current_session_memory_preferring_local_with_freshness(
+                    client,
+                    &self.session_id,
+                )
+                .await;
+            loaded.as_ref().and_then(|loaded| {
+                crate::turn::wire_assembly::session_memory_entry_for_user_turn(
+                    Some(&loaded.content),
+                    loaded.updated_turn,
+                )
+            })
+        } else {
+            None
+        };
         let turn_pipeline = self.run_turn_pipeline_with_cache_capability_and_session_memory(
             state,
             &visible_tools,
@@ -4575,6 +4662,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             llm_cfg.context_window,
             llm_cfg.cache_capability,
             initial_session_memory_entry.clone(),
+            &memoria_prefetch_entries,
             &user_content,
         )?;
         let PipelineTurnOutcome {
@@ -4619,8 +4707,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry_for_user_turn(
                 compact_result.session_memory_context.as_deref(),
                 initial_session_memory_entry.as_ref(),
-                state.session_turn,
-                &user_content,
+                None,
                 |session_memory_entry| {
                     self.run_turn_pipeline_with_cache_capability_and_session_memory(
                         state,
@@ -4630,6 +4717,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         llm_cfg.context_window,
                         llm_cfg.cache_capability,
                         Some(session_memory_entry),
+                        &memoria_prefetch_entries,
                         &user_content,
                     )
                 },
@@ -4644,6 +4732,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             final_manifest_trace = rerun.manifest_trace;
             state.last_llm_context_manifest_trace = Some(final_manifest_trace.to_json());
         }
+        final_volatile_preamble.extend(compact_result.runtime_contexts.iter().filter_map(
+            |context| crate::turn::wire_assembly::required_runtime_preamble_message(context),
+        ));
         // Parity with the bridge path: when Memoria returned a boundary, the
         // conversation was trimmed mid-task, so nudge the model to resume
         // instead of asking the user a follow-up question.
@@ -5975,6 +6066,106 @@ mod tests {
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
         // Use a valid Fernet key for testing
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
+    }
+
+    #[derive(Default)]
+    struct ServerOnlyPromptMemory {
+        calls: std::sync::atomic::AtomicUsize,
+        scopes: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::turn::cloud::memoria_compact::MemoriaClient for ServerOnlyPromptMemory {
+        async fn retrieve_for_prompt(
+            &self,
+            _query: &str,
+            user_id: &str,
+            session_id: &str,
+            _top_k: usize,
+        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.scopes
+                .lock()
+                .expect("scopes")
+                .push((user_id.to_string(), session_id.to_string()));
+            Ok(vec![crate::turn::cloud::memoria_compact::MemoriaMemory {
+                memory_id: "server-memory-1".into(),
+                content: astra_prompts::memory_proto::MemoryEntry::new(
+                    astra_prompts::memory_proto::NS_KNOWLEDGE,
+                    astra_prompts::memory_proto::ST_ACTIVE,
+                    "Server-only recall uses the same typed dynamic memory lane",
+                )
+                .encode(),
+                memory_type: "semantic".into(),
+                retrieval_score: Some(0.9),
+                ..Default::default()
+            }])
+        }
+
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+            panic!("server prompt recall must use retrieve_for_prompt")
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn server_only_prompt_recall_needs_no_edge_profile_and_is_latched_per_turn() {
+        let provider = Arc::new(ServerOnlyPromptMemory::default());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "server-user".into(),
+            "server-session".into(),
+        )
+        .with_memoria_client(Some(
+            Arc::clone(&provider) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>
+        ))
+        .build();
+        assert!(host.edge_profile.is_empty());
+
+        let first = host
+            .prompt_memory_entries_for_turn(2, "review astra memory #42")
+            .await;
+        let same_turn = host
+            .prompt_memory_entries_for_turn(2, "review astra memory #42")
+            .await;
+        assert_eq!(first, same_turn);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].memory_id.as_deref(), Some("server-memory-1"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        let next_turn = host
+            .prompt_memory_entries_for_turn(3, "review astra memory #42")
+            .await;
+        assert_eq!(next_turn.len(), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+        assert!(
+            provider
+                .scopes
+                .lock()
+                .expect("scopes")
+                .iter()
+                .all(|(user, session)| user == "server-user" && session == "server-session")
+        );
     }
 
     fn test_dispatch_identity(

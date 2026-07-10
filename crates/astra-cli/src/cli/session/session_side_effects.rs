@@ -48,23 +48,14 @@ pub(crate) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journa
     enqueue_ingestion(state, event);
 }
 
-pub(crate) async fn close_pending_memory_feedback_at_turn_end(
-    session_id: Option<&str>,
-    cloud_base: Option<String>,
-    cloud_token: Option<String>,
-    context_prefix: &str,
-) -> astra_tools::memoria::FeedbackDrainReport {
+pub(crate) fn drop_unattributed_memory_recalls_at_turn_end(session_id: Option<&str>) -> usize {
     let Some(session_id) = session_id.filter(|sid| !sid.trim().is_empty()) else {
-        return astra_tools::memoria::FeedbackDrainReport::default();
+        return 0;
     };
-    crate::edge_tools::memoria::close_pending_recall_feedback_with_proxy(
-        session_id,
-        "useful",
-        context_prefix,
-        cloud_base,
-        cloud_token,
-    )
-    .await
+    // A completed turn is not proof that a surfaced memory helped. Successful
+    // tool-result hooks already close causally adjacent recalls; anything left
+    // here is unattributed and must be dropped without reinforcing its rank.
+    astra_tools::memoria::MemoriaClient::drain_recalls(session_id, None).len()
 }
 
 #[derive(Clone)]
@@ -392,7 +383,7 @@ fn journal_prompt_snapshot_from_messages(
 mod tests {
     use super::{
         append_one_shot_journal_events, build_bridge_pipeline_journal_events,
-        close_pending_memory_feedback_at_turn_end,
+        drop_unattributed_memory_recalls_at_turn_end,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -400,23 +391,15 @@ mod tests {
 
     use astra_services::session_journal;
 
-    #[tokio::test]
-    async fn close_pending_memory_feedback_at_turn_end_drains_recall_queue() {
+    #[test]
+    fn turn_end_drops_unattributed_recalls_without_sending_positive_feedback() {
         let session_id = "chat-turn-close-feedback";
         astra_tools::memoria::MemoriaClient::reset_recall_ledger(session_id);
         astra_tools::memoria::MemoriaClient::record_recall(session_id, 4, vec!["m1".into()]);
 
-        let report = close_pending_memory_feedback_at_turn_end(
-            Some(session_id),
-            Some("http://127.0.0.1:9".to_string()),
-            Some("token".to_string()),
-            "unit-test",
-        )
-        .await;
+        let dropped = drop_unattributed_memory_recalls_at_turn_end(Some(session_id));
 
-        assert_eq!(report.attempted, 1);
-        assert_eq!(report.failed, 1);
-        assert_eq!(report.succeeded, 0);
+        assert_eq!(dropped, 1);
         assert_eq!(
             astra_tools::memoria::MemoriaClient::pending_recall_count(session_id),
             0

@@ -357,21 +357,6 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_strips_obsolete_active_task_attachment_garbage() {
-        let msgs = vec![
-            json!({"role": "user", "content": "review code"}),
-            json!({"role": "user", "content": "[Active task attachment]\nResume the active task/thread below unless the user explicitly changes topic.\n[User follow-up]\n继续"}),
-            json!({"role": "assistant", "content": "Here is the review..."}),
-        ];
-
-        let result = super::sanitize_continuation_messages(msgs);
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0]["content"], "review code");
-        assert_eq!(result[1]["content"], "Here is the review...");
-    }
-
-    #[test]
     fn sanitize_strips_runtime_injected_array_format_messages() {
         let msgs = vec![
             json!({"role": "user", "content": "hello"}),

@@ -10,10 +10,29 @@ use crate::cli::{
 };
 use astra_runtime::prompts;
 use astra_runtime::turn::cloud::compaction_engine::{CompactionEngine, TokenBudget};
-use astra_runtime::turn::cloud::memoria_compact::build_compaction_layered_body;
 use astra_services::session_journal;
 use crossterm::style::Stylize;
 use std::sync::Arc;
+
+fn manual_compaction_memory_entry(summary: &str) -> prompts::memory_proto::MemoryEntry {
+    let one_line = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let abstract_line = if one_line.chars().count() < prompts::memory_proto::ABSTRACT_MIN_CHARS {
+        format!("Manual conversation compaction summary: {one_line}")
+    } else {
+        one_line
+    };
+    let abstract_line = abstract_line
+        .chars()
+        .take(prompts::memory_proto::ABSTRACT_MAX_CHARS)
+        .collect::<String>();
+    prompts::memory_proto::MemoryEntry::new_layered(
+        prompts::memory_proto::NS_EPISODE,
+        prompts::memory_proto::ST_SUMMARY,
+        &abstract_line,
+        None,
+        Some(summary.trim()),
+    )
+}
 
 pub(crate) struct StateCommandContext<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
@@ -824,17 +843,7 @@ pub(crate) async fn handle_state_command(
                         prompts::memory_proto::SRC_COMPACT,
                         prompts::memory_proto::TIER_INFERRED,
                     );
-                    // Build layered body (matching auto-compaction format for consistent retrieval)
-                    let summary_body = state
-                        .session_id
-                        .as_deref()
-                        .and_then(|sid| build_compaction_layered_body(sid, &summary))
-                        .unwrap_or_else(|| summary.clone());
-                    let entry = prompts::memory_proto::MemoryEntry::new(
-                        prompts::memory_proto::NS_EPISODE,
-                        prompts::memory_proto::ST_SUMMARY,
-                        &summary_body,
-                    );
+                    let entry = manual_compaction_memory_entry(&summary);
                     match api
                         .post_memory_store_json(tok, &entry.to_store_payload_with_meta(&meta))
                         .await
@@ -2325,7 +2334,8 @@ mod tests {
 mod compact_tests {
     use super::{
         CompactArgs, CompactCtx, ManualCompactPlan, build_swap_memory_body, cap_swap_body,
-        compact_mem_note, parse_compact_args, plan_manual_compaction,
+        compact_mem_note, manual_compaction_memory_entry, parse_compact_args,
+        plan_manual_compaction,
     };
     use crate::cli::permission_manager::PermissionManager;
     use crate::cli::session::session_state::SessionState;
@@ -2341,6 +2351,23 @@ mod compact_tests {
                 no_memoria: false,
             }
         );
+    }
+
+    #[test]
+    fn manual_compaction_stores_one_layered_episode_without_nested_wire_envelope() {
+        let summary = "The runtime now routes compaction state through one typed volatile lane while preserving real conversation history.";
+        let entry = manual_compaction_memory_entry(summary);
+        let encoded = entry.encode();
+        let parsed = astra_runtime::prompts::memory_proto::MemoryEntry::parse(&encoded)
+            .expect("canonical memory entry");
+
+        assert_eq!(parsed.ns, astra_runtime::prompts::memory_proto::NS_EPISODE);
+        assert_eq!(
+            parsed.status,
+            astra_runtime::prompts::memory_proto::ST_SUMMARY
+        );
+        assert_eq!(parsed.detail_layer(), Some(summary));
+        assert!(!parsed.detail_layer().unwrap().starts_with("[@episode/"));
     }
 
     #[test]

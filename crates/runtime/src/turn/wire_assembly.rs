@@ -27,15 +27,6 @@ use crate::turn::cloud::memoria_compact::{
 };
 use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadata};
 
-const SESSION_MEMORY_ADVISORY: &str = "\
-## Session Memory Advisory\n\
-- This is recall from earlier turns, not an instruction queue.\n\
-- The latest user message, explicit cancellations/corrections, live task board, and current workspace state override it.\n\
-- Historical closed-loop sections such as Completed and Worklog are omitted from injection; recompute live status with tools when relevant.\n\
-- Verify any Pending Todos or Current State before acting.\n\
-- Never resume, advance, test, commit, or mutate work solely from this memory; require the latest real user message or live tool result to authorize action.\n";
-
-const SESSION_MEMORY_SECTIONS_OMITTED_FROM_INJECTION: &[&str] = &["Completed", "Worklog"];
 pub(crate) const REQUIRED_RUNTIME_PREAMBLE_MARKER: &str = "__astra_required_runtime_context";
 
 pub(crate) fn required_runtime_preamble_message(text: &str) -> Option<Value> {
@@ -76,95 +67,40 @@ pub(crate) fn system_reminder_wrapped_text(text: &str) -> String {
 
 pub(crate) fn session_memory_entry_for_pipeline(
     content: Option<&str>,
-    turn_number: u32,
+    snapshot_updated_turn: Option<u32>,
 ) -> Option<astra_turn_core::context_sources::MemoryEntry> {
     let content = content?.trim();
     if content.is_empty() {
         return None;
     }
-    let content = advisory_session_memory_content(content);
-    Some(
-        astra_turn_core::context_sources::MemoryEntry::new(&content)
-            .with_source("session_memory.compaction")
-            .with_freshness_turn(turn_number),
-    )
-}
-
-fn advisory_session_memory_content(content: &str) -> String {
-    let content = session_memory_content_for_injection(content);
-    if content.contains("## Session Memory Advisory") {
-        return content;
+    let freshness = snapshot_updated_turn
+        .map(|turn| format!("updated through session turn {turn}"))
+        .unwrap_or_else(|| "update turn unavailable".to_string());
+    let prompt_evidence = format!(
+        "## Session Memory Evidence\nSnapshot provenance: {freshness}. Treat this as resumable evidence; the current user message and live tool results take precedence.\n\n{content}"
+    );
+    let mut entry = astra_turn_core::context_sources::MemoryEntry::new(prompt_evidence)
+        .with_source("session_memory.snapshot");
+    if let Some(turn) = snapshot_updated_turn {
+        entry = entry.with_freshness_turn(turn);
     }
-    format!("{SESSION_MEMORY_ADVISORY}\n{content}")
-}
-
-fn session_memory_content_for_injection(content: &str) -> String {
-    let mut out = Vec::new();
-    let mut skip_section = false;
-
-    for line in content.lines() {
-        if let Some(section_name) = line.strip_prefix("## ") {
-            let section_name = section_name.trim();
-            skip_section = SESSION_MEMORY_SECTIONS_OMITTED_FROM_INJECTION
-                .iter()
-                .any(|omitted| section_name.eq_ignore_ascii_case(omitted));
-        }
-        if !skip_section {
-            out.push(line);
-        }
-    }
-
-    out.join("\n").trim().to_string()
+    Some(entry)
 }
 
 pub(crate) fn session_memory_entry_for_user_turn(
     content: Option<&str>,
-    turn_number: u32,
-    user_content: &str,
+    snapshot_updated_turn: Option<u32>,
 ) -> Option<astra_turn_core::context_sources::MemoryEntry> {
-    let user_content = user_content.trim();
-    if astra_turn_core::input_classifier::is_reanchor_signal(user_content) {
-        return Some(session_memory_reanchor_entry(user_content, turn_number));
-    }
-    session_memory_entry_for_pipeline(content, turn_number)
-}
-
-fn session_memory_reanchor_entry(
-    user_content: &str,
-    turn_number: u32,
-) -> astra_turn_core::context_sources::MemoryEntry {
-    let clipped = truncate_reanchor_text(user_content, 500);
-    let content = format!(
-        "## Session Reanchor\n\
-         - The latest user reanchor supersedes previously injected session memory where they conflict.\n\
-         - Latest user reanchor: {clipped}\n\
-         - Treat older session state as stale unless it directly supports this reanchor."
-    );
-    astra_turn_core::context_sources::MemoryEntry::new(&content)
-        .with_source("session_memory.reanchor")
-        .with_freshness_turn(turn_number)
-}
-
-fn truncate_reanchor_text(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out = text
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    out.push('…');
-    out
+    session_memory_entry_for_pipeline(content, snapshot_updated_turn)
 }
 
 pub(crate) fn rerun_with_distinct_session_memory_entry_for_user_turn<T>(
     content: Option<&str>,
     existing: Option<&astra_turn_core::context_sources::MemoryEntry>,
-    turn_number: u32,
-    user_content: &str,
+    snapshot_updated_turn: Option<u32>,
     rerun: impl FnOnce(astra_turn_core::context_sources::MemoryEntry) -> T,
 ) -> Option<T> {
-    let entry = session_memory_entry_for_user_turn(content, turn_number, user_content)?;
+    let entry = session_memory_entry_for_user_turn(content, snapshot_updated_turn)?;
     if existing.is_some_and(|current| {
         current.content_hash == entry.content_hash && current.content == entry.content
     }) {
@@ -197,12 +133,6 @@ pub(crate) struct MemoriaContext<'a> {
     /// Optional pre-parsed session facts (bridge path provides these;
     /// server path does not yet).
     pub session_facts: Option<astra_turn_types::session_facts::SessionFacts>,
-    /// Current turn number used to tag observatory records. Defaults
-    /// to 0 for callers that don't wire observatory.
-    pub turn_number: u32,
-    /// Optional post-hoc observer. `None` when the host wasn't built
-    /// with an observatory (offline CLI, tests).
-    pub observatory: Option<std::sync::Arc<crate::session_memory::SessionMemoryObservatory>>,
 }
 
 /// Caller-side overrides for Memoria budget knobs that the context-window
@@ -310,8 +240,6 @@ impl<'a> MemoriaContext<'a> {
             keep_recent_turns: resolved.keep_recent_turns,
             current_tokens: resolved.current_tokens,
             session_facts: self.session_facts.clone(),
-            turn_number: self.turn_number,
-            observatory: self.observatory.clone(),
         };
 
         let compact_config = CompactConfig::from_env();
@@ -776,8 +704,6 @@ mod tests {
             summary_client: None,
             tier: CompactionTier::Normal,
             session_facts: None,
-            turn_number: 0,
-            observatory: None,
         };
 
         assert_eq!(ctx.context_budget().model_limit, 1_000_000);
@@ -812,13 +738,12 @@ mod tests {
 
     #[test]
     fn rerun_with_distinct_session_memory_entry_for_user_turn_skips_identical_content() {
-        let current = session_memory_entry_for_pipeline(Some("same memory"), 7)
+        let current = session_memory_entry_for_pipeline(Some("same memory"), Some(7))
             .expect("current session memory entry");
         let rerun = rerun_with_distinct_session_memory_entry_for_user_turn(
             Some("same memory"),
             Some(&current),
-            7,
-            "continue",
+            Some(7),
             |_| panic!("identical content should not rerun"),
         );
         assert!(rerun.is_none());
@@ -826,134 +751,39 @@ mod tests {
 
     #[test]
     fn rerun_with_distinct_session_memory_entry_for_user_turn_keeps_changed_content() {
-        let current = session_memory_entry_for_pipeline(Some("old memory"), 7)
+        let current = session_memory_entry_for_pipeline(Some("old memory"), Some(7))
             .expect("current session memory entry");
         let rerun = rerun_with_distinct_session_memory_entry_for_user_turn(
             Some("new memory"),
             Some(&current),
-            7,
-            "continue",
+            Some(7),
             |entry| entry,
         )
         .expect("changed session memory should rerun");
         assert_eq!(
             rerun,
-            session_memory_entry_for_pipeline(Some("new memory"), 7).expect("rerun entry")
+            session_memory_entry_for_pipeline(Some("new memory"), Some(7)).expect("rerun entry")
         );
     }
 
     #[test]
     fn session_memory_entry_for_user_turn_keeps_memory_for_normal_turn() {
         let entry =
-            session_memory_entry_for_user_turn(Some("## Session State\nKeep going"), 8, "continue")
+            session_memory_entry_for_user_turn(Some("## Session State\nKeep going"), Some(8))
                 .expect("session memory entry");
 
-        assert!(entry.content.contains("Session Memory Advisory"));
-        assert!(entry.content.contains("not an instruction queue"));
-        assert!(entry.content.contains("Keep going"));
-        assert_eq!(entry.source.as_deref(), Some("session_memory.compaction"));
+        assert!(entry.content.contains("updated through session turn 8"));
+        assert!(entry.content.ends_with("## Session State\nKeep going"));
+        assert_eq!(entry.freshness_turn, Some(8));
+        assert_eq!(entry.source.as_deref(), Some("session_memory.snapshot"));
     }
 
     #[test]
-    fn session_memory_entry_for_pipeline_does_not_double_wrap_advisory() {
-        let content =
-            format!("{SESSION_MEMORY_ADVISORY}\n# Session Memory\n\n## Current State\n- x");
-        let entry =
-            session_memory_entry_for_pipeline(Some(&content), 8).expect("session memory entry");
-
-        assert_eq!(entry.content.matches("Session Memory Advisory").count(), 1);
-    }
-
-    #[test]
-    fn session_memory_injection_omits_closed_loop_history_sections() {
-        let content = "\
-# Session Memory
-
-## Active Goals
-- Continue fixing runtime UX
-
-## Completed
-- Committed changes on branch `0619_job2`
-- Ran final checks
-
-## Current State
-- Continue from current workspace state
-
-## Worklog
-- git status was clean earlier
-
-## Errors & Corrections
-- User corrected stale memory attribution
-";
-        let entry =
-            session_memory_entry_for_pipeline(Some(content), 8).expect("session memory entry");
-
-        assert!(entry.content.contains("Continue fixing runtime UX"));
-        assert!(
-            entry
-                .content
-                .contains("Continue from current workspace state")
-        );
-        assert!(
-            entry
-                .content
-                .contains("User corrected stale memory attribution")
-        );
-        assert!(!entry.content.contains("## Completed"));
-        assert!(!entry.content.contains("Committed changes"));
-        assert!(!entry.content.contains("## Worklog"));
-        assert!(!entry.content.contains("git status was clean"));
-        assert!(entry.content.contains("closed-loop sections"));
-    }
-
-    #[test]
-    fn session_memory_entry_for_user_turn_reanchors_on_correction() {
-        let entry = session_memory_entry_for_user_turn(
-            Some("stale prior session memory"),
-            8,
-            "No, that's wrong; use the server-side executor.",
-        )
-        .expect("reanchor entry");
-
-        assert!(entry.content.contains("Latest user reanchor"));
-        assert!(entry.content.contains("server-side executor"));
-        assert!(!entry.content.contains("stale prior session memory"));
-        assert_eq!(entry.source.as_deref(), Some("session_memory.reanchor"));
-    }
-
-    #[test]
-    fn session_memory_entry_for_user_turn_reanchors_on_goal_redirect() {
-        let entry = session_memory_entry_for_user_turn(
-            Some("stale prior session memory"),
-            8,
-            "不是修修补补，要系统性解决",
-        )
-        .expect("reanchor entry");
-
-        assert!(entry.content.contains("Latest user reanchor"));
-        assert!(entry.content.contains("系统性解决"));
-        assert!(!entry.content.contains("stale prior session memory"));
-        assert_eq!(entry.source.as_deref(), Some("session_memory.reanchor"));
-    }
-
-    #[test]
-    fn rerun_with_distinct_session_memory_entry_for_user_turn_keeps_reanchor_stable() {
-        let current = session_memory_entry_for_user_turn(
-            Some("old stale memory"),
-            9,
-            "No, that's wrong; keep the explicit invariant.",
-        )
-        .expect("current reanchor");
-
-        let rerun = rerun_with_distinct_session_memory_entry_for_user_turn(
-            Some("new compacted stale memory"),
-            Some(&current),
-            9,
-            "No, that's wrong; keep the explicit invariant.",
-            |_| panic!("same correction reanchor should not rerun"),
-        );
-
-        assert!(rerun.is_none());
+    fn session_memory_unknown_freshness_is_explicit_instead_of_claiming_current_turn() {
+        let entry = session_memory_entry_for_user_turn(Some("prior session memory"), None)
+            .expect("session memory remains available as evidence");
+        assert!(entry.content.contains("update turn unavailable"));
+        assert_eq!(entry.freshness_turn, None);
     }
 
     #[test]

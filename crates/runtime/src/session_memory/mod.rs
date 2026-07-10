@@ -14,17 +14,11 @@
 pub mod activity;
 pub mod gate;
 pub mod health;
-pub mod observatory;
 pub mod request;
 pub mod runner;
 pub mod service;
 
 pub use activity::{BackgroundActivity, BackgroundActivityBroker};
-pub use observatory::{
-    ExtractionOutcome, ExtractionRecord, ExtractionSource, ExtractionTrigger, FactsSummary,
-    InjectionLevel as ObservatoryInjectionLevel, InjectionRecord, RetrievedMemoryRef,
-    SessionMemoryObservatory, StalenessSignals,
-};
 pub use request::{ExtractionRequest, SpawnDecision};
 pub use service::{
     ConstSelectorResolver, EXTRACTION_MAX_OUTPUT_TOKENS, LLM_TIMEOUT, MemoryExtractionService,

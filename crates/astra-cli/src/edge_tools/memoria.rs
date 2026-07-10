@@ -309,26 +309,6 @@ pub async fn memoria_consolidate_fire_and_forget() {
     .await;
 }
 
-pub async fn close_pending_recall_feedback_with_proxy(
-    session_id: &str,
-    signal: &str,
-    context_prefix: &str,
-    cloud_base: Option<String>,
-    cloud_token: Option<String>,
-) -> astra_tools::memoria::FeedbackDrainReport {
-    let session_id = session_id.trim();
-    if session_id.is_empty() || signal.trim().is_empty() {
-        return astra_tools::memoria::FeedbackDrainReport::default();
-    }
-    let (Some(cloud_base), Some(cloud_token)) = (cloud_base, cloud_token) else {
-        return astra_tools::memoria::FeedbackDrainReport::default();
-    };
-    let client = astra_tools::memoria::MemoriaClient::new(Some(cloud_base), Some(cloud_token));
-    client
-        .feedback_pending_recalls(session_id, signal, context_prefix)
-        .await
-}
-
 impl ToolExecutor {
     pub(super) async fn memoria_call(&self, op: &str, args: &Value) -> String {
         self.memoria_call_with_timeout(op, args, Duration::from_secs(10))
