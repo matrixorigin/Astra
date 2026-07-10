@@ -15,7 +15,7 @@ use std::time::Instant;
 use astra_turn_core::context_sources::MemoryEntry as ContextMemoryEntry;
 use astra_turn_types::RankableMemory;
 
-use super::cloud::memoria_compact::{MemoriaClient, MemoriaMemory};
+use super::cloud::memoria_compact::{MemoriaMemory, MemoriaPort};
 
 /// Result of a memory prefetch operation.
 #[derive(Debug, Default)]
@@ -29,9 +29,9 @@ pub struct MemoryPrefetchResult {
 /// Prefetch memories relevant to the user message via hybrid retrieval.
 /// Sends two queries (full message + entity tokens), merges and deduplicates.
 /// Provider-neutral prompt recall. All deployment forms route through this
-/// function; only the `MemoriaClient` implementation differs.
+/// function; only the `MemoriaPort` implementation differs.
 pub async fn prefetch_memories_with_client(
-    client: &dyn MemoriaClient,
+    client: &dyn MemoriaPort,
     user_msg: &str,
     user_id: &str,
     session_id: &str,
@@ -92,7 +92,7 @@ pub async fn prefetch_memories_with_client(
 }
 
 async fn retrieve_rankable(
-    client: &dyn MemoriaClient,
+    client: &dyn MemoriaPort,
     query: &str,
     user_id: &str,
     session_id: &str,
@@ -145,7 +145,7 @@ pub struct SessionStartPrefetchResult {
 /// Both fetches run in parallel; any fetch failure is treated as "no
 /// memory" so a degraded Memoria never blocks the turn.
 pub async fn prefetch_session_start_memories_with_client(
-    client: &dyn MemoriaClient,
+    client: &dyn MemoriaPort,
     user_id: &str,
     session_id: &str,
 ) -> SessionStartPrefetchResult {
@@ -228,7 +228,7 @@ pub fn admit_prompt_memory_entries(
         .collect::<Vec<_>>();
     let new_keys = collect_seen_contents(&admitted);
     if !new_keys.is_empty() {
-        astra_tools::memoria::MemoriaClient::record_seen(session_id, new_keys);
+        astra_tools::memoria::MemoriaToolGateway::record_seen(session_id, new_keys);
     }
     admitted
 }
@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MemoriaClient for ScriptedClient {
+    impl MemoriaPort for ScriptedClient {
         async fn retrieve_for_prompt(
             &self,
             query: &str,

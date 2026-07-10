@@ -1,0 +1,13 @@
+[package]
+name = "astra-sync-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Versioned edge/cloud sync wire contract"
+
+[dependencies]
+astra-core.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+

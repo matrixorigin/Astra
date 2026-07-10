@@ -160,6 +160,7 @@ fn status_style(status: &TaskStatus) -> Style {
     match status {
         TaskStatus::Running => Style::default().fg(Color::Yellow),
         TaskStatus::Completed => Style::default().fg(Color::Green),
+        TaskStatus::Interrupted => Style::default().fg(Color::Yellow),
         TaskStatus::Failed => Style::default().fg(Color::Red),
     }
 }
@@ -190,6 +191,7 @@ fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
     let status_text = match cell.status {
         TaskStatus::Running => "Running",
         TaskStatus::Completed => "Completed",
+        TaskStatus::Interrupted => "Interrupted",
         TaskStatus::Failed if interrupted_wait => "Interrupted",
         TaskStatus::Failed => "Failed",
     };

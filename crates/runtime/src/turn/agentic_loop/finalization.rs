@@ -1055,7 +1055,7 @@ fn drop_unattributed_memory_recalls_at_turn_end(state: &mut AgenticLoopState) {
     else {
         return;
     };
-    let dropped = astra_tools::memoria::MemoriaClient::drain_recalls(session_id, None).len();
+    let dropped = astra_tools::memoria::MemoriaToolGateway::drain_recalls(session_id, None).len();
     if dropped > 0 {
         tracing::debug!(
             session_id = %session_id,
@@ -2128,7 +2128,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::turn::cloud::memoria_compact::MemoriaClient for CapturingMemoriaForFinalize {
+    impl crate::turn::cloud::memoria_compact::MemoriaPort for CapturingMemoriaForFinalize {
         async fn retrieve_ext(
             &self,
             _q: &str,
@@ -2169,7 +2169,7 @@ mod tests {
         let svc = Arc::new(
             crate::session_memory::MemoryExtractionService::new(
                 Arc::new(crate::session_memory::ConstSelectorResolver(None)),
-                Arc::clone(&memoria) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>,
+                Arc::clone(&memoria) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>,
                 ingestion,
                 "test-user",
                 Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
@@ -2264,8 +2264,8 @@ mod tests {
             None,
             None,
         );
-        astra_tools::memoria::MemoriaClient::reset_recall_ledger(&session_id);
-        astra_tools::memoria::MemoriaClient::record_recall(&session_id, 1, vec!["m1".into()]);
+        astra_tools::memoria::MemoriaToolGateway::reset_recall_ledger(&session_id);
+        astra_tools::memoria::MemoriaToolGateway::record_recall(&session_id, 1, vec!["m1".into()]);
         state.current_session_id = Some(session_id.clone());
         state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
         state.final_text = "Done.".into();
@@ -2273,7 +2273,7 @@ mod tests {
         finalize_and_render(&mut host, &mut state).await;
 
         assert_eq!(
-            astra_tools::memoria::MemoriaClient::pending_recall_count(&session_id),
+            astra_tools::memoria::MemoriaToolGateway::pending_recall_count(&session_id),
             0,
             "server finalization must drain pending recall feedback on memory-only turns"
         );

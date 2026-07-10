@@ -211,8 +211,8 @@ mod tests {
         let mut state = SessionState::default();
         let session_id = "sess-memory-drain";
         state.session_id = Some(session_id.to_string());
-        astra_tools::memoria::MemoriaClient::reset_recall_ledger(session_id);
-        astra_tools::memoria::MemoriaClient::record_recall(session_id, 1, vec!["m1".into()]);
+        astra_tools::memoria::MemoriaToolGateway::reset_recall_ledger(session_id);
+        astra_tools::memoria::MemoriaToolGateway::record_recall(session_id, 1, vec!["m1".into()]);
         let mut ui = crate::tests::TestUi::default();
 
         run_turn_post_commit_tasks(
@@ -229,7 +229,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            astra_tools::memoria::MemoriaClient::pending_recall_count(session_id),
+            astra_tools::memoria::MemoriaToolGateway::pending_recall_count(session_id),
             0,
             "turn completion must synchronously drop unattributed recall state"
         );

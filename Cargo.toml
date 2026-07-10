@@ -14,6 +14,7 @@ members = [
     "crates/astra-turn-types",
     "crates/astra-skills",
     "crates/astra-sandbox",
+    "crates/astra-sync-protocol",
     "crates/astra-server-types",
     "crates/astra-turn-core",
     "crates/astra-messaging",
@@ -24,6 +25,7 @@ members = [
     "crates/astra-harness",
     "crates/astra-credentials",
     "crates/astra-mcp",
+    "crates/astra-memoria",
 ]
 resolver = "2"
 
@@ -44,6 +46,7 @@ astra-plan = { path = "crates/astra-plan" }
 astra-prompts = { path = "crates/astra-prompts" }
 astra-runtime-env = { path = "crates/astra-runtime-env" }
 astra-sandbox = { path = "crates/astra-sandbox" }
+astra-sync-protocol = { path = "crates/astra-sync-protocol" }
 astra-server-types = { path = "crates/astra-server-types", default-features = false }
 astra-turn-core = { path = "crates/astra-turn-core" }
 astra-turn-types = { path = "crates/astra-turn-types" }
@@ -52,6 +55,7 @@ astra-tools = { path = "crates/astra-tools" }
 astra-services = { path = "crates/services" }
 astra-runtime = { path = "crates/runtime", default-features = false }
 astra-mcp = { path = "crates/astra-mcp" }
+astra-memoria = { path = "crates/astra-memoria" }
 astra-thin-client = { path = "crates/astra-thin-client" }
 async-stream = "0.3.6"
 async-trait = "0.1.89"

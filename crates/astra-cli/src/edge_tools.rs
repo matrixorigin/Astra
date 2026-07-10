@@ -4939,7 +4939,7 @@ impl ToolExecutor {
             && !cli_tool_output_is_error(&output)
             && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
         {
-            let client = astra_tools::memoria::MemoriaClient::new(
+            let client = astra_tools::memoria::MemoriaToolGateway::new(
                 self.cloud_base.clone(),
                 self.cloud_token(),
             );

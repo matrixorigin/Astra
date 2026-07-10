@@ -9,14 +9,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
 pub mod canonical_names;
 #[cfg(any(test, feature = "dev-defaults"))]
 pub mod test_paths;
-
-pub const SYNC_OUTBOX_SIGNATURE_HEADER: &str = "x-astra-sync-outbox-signature";
 
 pub fn canonical_json_string(value: &serde_json::Value) -> String {
     fn write(value: &serde_json::Value, out: &mut String) {
@@ -63,59 +60,16 @@ pub fn canonical_json_string(value: &serde_json::Value) -> String {
     out
 }
 
-pub fn sync_outbox_request_signature(token: &str, body: &serde_json::Value) -> String {
-    format!(
-        "sha256={}",
-        hmac_sha256_hex(token.as_bytes(), canonical_json_string(body).as_bytes())
-    )
-}
-
-fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
-    const BLOCK_SIZE: usize = 64;
-    let mut key_block = [0u8; BLOCK_SIZE];
-    if key.len() > BLOCK_SIZE {
-        key_block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-    let mut inner_pad = [0x36u8; BLOCK_SIZE];
-    let mut outer_pad = [0x5cu8; BLOCK_SIZE];
-    for index in 0..BLOCK_SIZE {
-        inner_pad[index] ^= key_block[index];
-        outer_pad[index] ^= key_block[index];
-    }
-    let mut inner = Sha256::new();
-    inner.update(inner_pad);
-    inner.update(message);
-    let inner_hash = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(outer_pad);
-    outer.update(inner_hash);
-    outer
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 #[cfg(test)]
-mod sync_outbox_signature_tests {
+mod canonical_json_tests {
     use super::*;
 
     #[test]
-    fn sync_outbox_signature_uses_canonical_json_and_token() {
+    fn canonical_json_sorts_object_keys() {
         let left = serde_json::json!({"b":2,"a":1});
         let right = serde_json::json!({"a":1,"b":2});
 
         assert_eq!(canonical_json_string(&left), canonical_json_string(&right));
-        assert_eq!(
-            sync_outbox_request_signature("token-a", &left),
-            sync_outbox_request_signature("token-a", &right)
-        );
-        assert_ne!(
-            sync_outbox_request_signature("token-a", &left),
-            sync_outbox_request_signature("token-b", &left)
-        );
     }
 }
 
@@ -505,8 +459,9 @@ pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{
-    ClassifiedError, ErrorKind, classify_llm_error_message,
-    classify_model_resolution_error_message, classify_tool_output, is_llm_context_window_error,
+    ClassifiedError, ErrorKind, ToolFailureCause, ToolFailureEvidence, ToolRecoveryAction,
+    classify_llm_error_message, classify_model_resolution_error_message, classify_tool_output,
+    is_llm_context_window_error,
 };
 pub use observation::{
     ErrorStreak, EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,

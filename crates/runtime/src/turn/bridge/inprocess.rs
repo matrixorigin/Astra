@@ -188,10 +188,10 @@ impl CachedSessionStartMemory {
 }
 
 fn resolve_bridge_memory_provider(
-    server_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaClient>,
+    server_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
     request_binding: &Map<String, Value>,
 ) -> (
-    Option<crate::turn::cloud::memoria_compact::HttpMemoriaClient>,
+    Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
     Option<&'static str>,
 ) {
     if let Some(client) = server_client {
@@ -217,7 +217,7 @@ fn resolve_bridge_memory_provider(
         return (None, None);
     };
     (
-        Some(crate::turn::cloud::memoria_compact::HttpMemoriaClient::new(
+        Some(crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
             base_url.to_string(),
             api_key.to_string(),
         )),
@@ -1376,11 +1376,28 @@ fn record_turn_guard_tool_results(
     }
 }
 
-fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[Value]) -> Value {
+fn turn_complete_event(
+    messages: &[Value],
+    assistant_text: &str,
+    tool_calls: &[Value],
+    round_boundaries: &[(usize, usize)],
+) -> Value {
+    let mut tool_signatures = Vec::with_capacity(round_boundaries.len());
+    for (start, count) in round_boundaries {
+        let Some(round) = tool_calls.get(*start..start.saturating_add(*count)) else {
+            continue;
+        };
+        astra_turn_core::stall::record_server_tool_signatures(
+            &mut tool_signatures,
+            round,
+            round_boundaries.len().max(1),
+        );
+    }
+    let completion_facts =
+        astra_turn_core::complete::TurnCompletionFacts::from_tool_signatures(&tool_signatures);
     let mut event = astra_turn_core::complete::build_turn_complete_event(
         !tool_calls.is_empty(),
-        false,
-        &astra_turn_core::stall::DivergenceStatus::Healthy,
+        &completion_facts,
         None,
         Some(assistant_text),
     );
@@ -1419,7 +1436,7 @@ pub struct InProcessChatTurnBridge {
     /// and injects them into subsequent turn system prompts.
     pub feedback_store: Arc<astra_pipeline::feedback_store::FeedbackStore>,
     /// Cached Memoria client — created once, reused across turns.
-    pub memoria_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaClient>,
+    pub memoria_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
     /// First-turn session-start memory snapshot, latched per session so repeated
     /// round re-entries don't refetch and churn the cached prompt prefix.
     session_start_memory_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedSessionStartMemory>>>,
@@ -1439,7 +1456,7 @@ impl InProcessChatTurnBridge {
             shared_pool: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feedback_store: Arc::new(astra_pipeline::feedback_store::FeedbackStore::new()),
-            memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env(),
+            memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env(),
             session_start_memory_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             session_facts: Arc::new(std::sync::Mutex::new(Default::default())),
             persist_tracker: None,
@@ -1980,7 +1997,7 @@ impl InProcessChatTurnBridge {
             // becomes a rendered stable-prefix block.
             let is_first_turn = trace_turn <= 1;
             // Single canonical "already surfaced" store for the process
-            // lives on `astra_tools::memoria::MemoriaClient`. The bridge
+            // lives on `astra_tools::memoria::MemoriaToolGateway`. The bridge
             // writes content-dedup keys to it; the tool-side `recall`
             // decorator writes memory_ids. Both paths share the same
             // snapshot so automatic and explicit recall share admission.
@@ -2154,7 +2171,7 @@ impl InProcessChatTurnBridge {
                         // Closes the reflect→memory loop: correction detected in
                         // this turn → stored durably → recalled in future sessions.
                         if let Some(ref mc) = memoria_client_owned {
-                            use crate::turn::cloud::memoria_compact::MemoriaClient;
+                            use crate::turn::cloud::memoria_compact::MemoriaPort;
                             if let Some(lesson) =
                                 crate::learning::synthesizer::feedback_rule_to_lesson(&fb)
                             {
@@ -2505,7 +2522,7 @@ impl InProcessChatTurnBridge {
                     model_name: &model_name,
                     context_window: model_context_window,
                     memoria_client: memoria_client.as_ref().map(|c| {
-                        c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient
+                        c as &dyn crate::turn::cloud::memoria_compact::MemoriaPort
                     }),
                     summary_client: Some(
                         &summary_client
@@ -3105,7 +3122,7 @@ impl InProcessChatTurnBridge {
                                 model_name: &model_name,
                                 context_window: model_context_window,
                                 memoria_client: memoria_client.as_ref().map(|c| {
-                                    c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient
+                                    c as &dyn crate::turn::cloud::memoria_compact::MemoriaPort
                                 }),
                                 summary_client: Some(
                                     &summary_client
@@ -4636,7 +4653,12 @@ impl InProcessChatTurnBridge {
 
             // turn_complete
             mark_disconnect_capture_finalized(&disconnect_capture_state);
-            yield render_sse(&turn_complete_event(&messages, &llm_content, &all_round_tool_calls));
+            yield render_sse(&turn_complete_event(
+                &messages,
+                &llm_content,
+                &all_round_tool_calls,
+                &round_boundaries,
+            ));
         };
 
         let cancel_on_drop = CancelOnDrop(client_cancel.clone());
@@ -5128,7 +5150,7 @@ mod tests {
         assert!(request_client.is_some());
         assert_eq!(request_source, Some("request_binding"));
 
-        let server_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::new(
+        let server_client = crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
             "http://server-memory".into(),
             "server-key".into(),
         );
@@ -7000,7 +7022,7 @@ mod tests {
             json!({"role": "assistant", "content": "intermediate"}),
             json!({"role": "user", "content": "继续处理"}),
         ];
-        let event = turn_complete_event(&messages, "Should I continue?", &[]);
+        let event = turn_complete_event(&messages, "Should I continue?", &[], &[]);
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["has_tool_calls"], false);
         assert_eq!(event["assistant_text"], "Should I continue?");
@@ -7018,9 +7040,34 @@ mod tests {
             }
         })];
 
-        let event = turn_complete_event(&messages, "Committed the changes.", &tool_calls);
+        let event = turn_complete_event(&messages, "Committed the changes.", &tool_calls, &[]);
 
         assert_eq!(event["followup_suggestion"], "push it");
+    }
+
+    #[test]
+    fn turn_complete_event_projects_observed_multi_round_stall() {
+        let tool_calls = (0..3)
+            .map(|index| {
+                json!({
+                    "id": format!("call-{index}"),
+                    "function": {
+                        "name": "read_file",
+                        "arguments": r#"{"path":"src/lib.rs"}"#
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let event = turn_complete_event(
+            &[json!({"role": "user", "content": "inspect"})],
+            "Observed a repeated read pattern.",
+            &tool_calls,
+            &[(0, 1), (1, 1), (2, 1)],
+        );
+
+        assert_eq!(event["stall_detected"], true);
+        assert_eq!(event["divergence_detected"], true);
+        assert_eq!(event["exploration_rounds"], 3);
     }
 
     #[test]

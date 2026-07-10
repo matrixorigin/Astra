@@ -2,7 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use crate::guardrails::error_recovery::{ErrorCategory, build_recovery_message, classify_error};
+use crate::guardrails::error_recovery::{
+    ErrorCategory, build_recovery_message_with_evidence, classify_error,
+};
 use crate::guardrails::turn_guard::TurnGuard;
 use crate::headless_tool_assembly::{HeadlessRoundToolIdx, headless_timeout_aborted_tool_names};
 use crate::result_quality::ResultQuality;
@@ -34,6 +36,7 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
     result_str: &mut String,
     is_err: &mut bool,
     source_error_kind: Option<ErrorCategory>,
+    source_recovery_evidence: Option<&astra_core::ToolFailureEvidence>,
     tool_already_restricted: bool,
     ctx: &mut HeadlessOutputEnrichCtx<'_>,
     mut on_signal: impl FnMut(HeadlessOutputEnrichSignal),
@@ -57,8 +60,13 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         }
 
         let avoidance_advised = ctx.turn_guard.health.health_avoidance_tools();
-        let recovery_msg =
-            build_recovery_message(name, result_str.as_str(), category, &avoidance_advised);
+        let recovery_msg = build_recovery_message_with_evidence(
+            name,
+            result_str.as_str(),
+            category,
+            &avoidance_advised,
+            source_recovery_evidence,
+        );
         result_str.push_str(&format!("\n{recovery_msg}"));
     }
 
@@ -260,6 +268,7 @@ mod tests {
             &mut out,
             &mut is_err,
             None,
+            None,
             false,
             &mut ctx,
             |s| signals.push(s),
@@ -289,6 +298,7 @@ mod tests {
             &mut out,
             &mut is_err,
             None,
+            None,
             false,
             &mut ctx,
             |s| signals.push(s),
@@ -317,6 +327,7 @@ mod tests {
             &mut out,
             &mut is_err,
             None,
+            None,
             false,
             &mut ctx,
             |s| signals.push(s),
@@ -329,6 +340,36 @@ mod tests {
                 tool: "bash".into()
             }]
         );
+    }
+
+    #[test]
+    fn source_authored_large_input_evidence_drives_targeted_recovery() {
+        let mut turn_guard = TurnGuard::new();
+        let mut output = "opaque external failure".to_string();
+        let mut is_error = true;
+        let mut context = HeadlessOutputEnrichCtx {
+            turn_guard: &mut turn_guard,
+        };
+        let evidence = astra_core::ToolFailureEvidence::new(
+            astra_core::ErrorKind::ToolInvalidArgs,
+            astra_core::ToolFailureCause::InputTooLarge,
+            false,
+            vec![astra_core::ToolRecoveryAction::ReadTargetedRange],
+        );
+
+        enrich_headless_tool_output_for_errors_and_limits(
+            "read_file",
+            &mut output,
+            &mut is_error,
+            Some(astra_core::ErrorKind::ToolInvalidArgs),
+            Some(&evidence),
+            false,
+            &mut context,
+            |_| {},
+        );
+
+        assert!(output.contains("targeted line/range read"), "{output}");
+        assert!(!output.contains("retry the same tool"), "{output}");
     }
 
     #[test]

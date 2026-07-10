@@ -13,7 +13,6 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::compaction::CompactResult;
@@ -150,319 +149,9 @@ pub fn claude_code_session_memory_path(cwd: &str, session_id: &str) -> PathBuf {
         .join("summary.md")
 }
 
-// ---------------------------------------------------------------------------
-// Memoria Client Trait
-// ---------------------------------------------------------------------------
-
-/// Trait for Memoria HTTP operations (allows mocking in tests).
-#[async_trait::async_trait]
-pub trait MemoriaClient: Send + Sync {
-    /// Retrieve prompt-facing memories for one authenticated user and active
-    /// session without enforcing strict session isolation.
-    ///
-    /// `user_id` is an ownership/tenant boundary; `session_id` is retrieval
-    /// context used to prefer current-session matches. Keeping them separate
-    /// avoids the old bridge behaviour that populated `session_id` with a
-    /// user id merely to make server-side retrieval work.
-    async fn retrieve_for_prompt(
-        &self,
-        query: &str,
-        _user_id: &str,
-        session_id: &str,
-        top_k: usize,
-    ) -> Result<Vec<MemoriaMemory>, String> {
-        self.retrieve(
-            query,
-            (!session_id.trim().is_empty()).then_some(session_id),
-            top_k,
-        )
-        .await
-    }
-
-    /// Retrieve memories (cross-session). Delegates to [`retrieve_ext`] with `filter_session=false`.
-    async fn retrieve(
-        &self,
-        query: &str,
-        session_id: Option<&str>,
-        top_k: usize,
-    ) -> Result<Vec<MemoriaMemory>, String> {
-        self.retrieve_ext(query, session_id, top_k, false).await
-    }
-
-    /// Retrieve with explicit filter_session control.
-    async fn retrieve_ext(
-        &self,
-        query: &str,
-        session_id: Option<&str>,
-        top_k: usize,
-        filter_session: bool,
-    ) -> Result<Vec<MemoriaMemory>, String>;
-
-    /// Retrieve one session's memories with an optional exact `memory_types`
-    /// filter.
-    ///
-    /// The default implementation keeps mocks and legacy transports
-    /// lightweight by using strict-session retrieval, but it still enforces the
-    /// typed contract locally. Callers that ask for typed memories must never
-    /// observe untyped results as a silent fallback.
-    async fn retrieve_scoped_typed(
-        &self,
-        query: &str,
-        session_id: &str,
-        top_k: usize,
-        memory_types: &[&str],
-    ) -> Result<Vec<MemoriaMemory>, String> {
-        let memories = self
-            .retrieve_ext(query, Some(session_id), top_k, true)
-            .await?;
-        if memory_types.is_empty() {
-            return Ok(memories);
-        }
-        Ok(memories
-            .into_iter()
-            .filter(|memory| memory_types.contains(&memory.memory_type.as_str()))
-            .collect())
-    }
-
-    /// Store a memory with optional trust tier for confidence decay.
-    async fn store(
-        &self,
-        content: &str,
-        memory_type: &str,
-        session_id: Option<&str>,
-        trust_tier: Option<&str>,
-    ) -> Result<String, String>;
-
-    /// Purge working memories for a session.
-    async fn purge_working(&self, session_id: &str) -> Result<u64, String>;
-
-    /// Purge an exact set of memory types for a session. Default is a benign
-    /// no-op so tests that only care about retrieval/storage don't need extra
-    /// boilerplate.
-    async fn purge_memory_types(
-        &self,
-        _session_id: &str,
-        _memory_types: &[&str],
-    ) -> Result<u64, String> {
-        Ok(0)
-    }
-
-    /// Delete a single memory by ID.
-    /// Default: no-op. Override for clients that support deletion.
-    async fn delete(&self, _memory_id: &str) -> Result<(), String> {
-        Ok(())
-    }
-
-    // ── Cognitive verbs (Phase 3) ────────────────────────────────────
-    //
-    // These mirror the v2 `memory(action=…)` LLM surface but on the
-    // runtime side so orchestration code (session-end, turn-start,
-    // auto-focus, feedback loop) can call them without routing through
-    // the tool dispatcher. The default impls return benign no-ops so
-    // mock clients in tests don't need to care about v2 verbs they
-    // haven't opted in to.
-
-    /// Persist an episodic session summary. `overview` is the condensed
-    /// (~300-500 char) post-session narrative.
-    async fn store_episode(&self, _session_id: &str, _overview: &str) -> Result<String, String> {
-        Ok(String::new())
-    }
-
-    /// Persist a reflect scene candidate as a cross-session `semantic`
-    /// memory tagged `astra:scene` so next-session prewarm picks it up.
-    /// Default: no-op. Real clients emit a POST /v1/memories.
-    async fn store_scene(
-        &self,
-        _session_id: &str,
-        _signal: &str,
-        _summary: &str,
-    ) -> Result<String, String> {
-        Ok(String::new())
-    }
-
-    /// Trigger Memoria's cross-memory reflection for the given session.
-    /// The backend respects a cooldown (≥1h v1 default); callers that
-    /// want to bypass it should pass `force=true`.
-    async fn reflect_session(
-        &self,
-        _session_id: &str,
-        _force: bool,
-    ) -> Result<ReflectSummary, String> {
-        Ok(ReflectSummary::default())
-    }
-
-    /// Persist a focus hint client-side (session-scoped, TTL-bounded).
-    /// Subsequent `recall`s consult the store and add `boost_*` fields
-    /// to the request body. Memoria v1 ignores them; v2 will honor.
-    async fn focus(
-        &self,
-        _session_id: &str,
-        _focus_type: &str,
-        _value: &str,
-        _boost: Option<f64>,
-        _ttl_secs: Option<i64>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Record an explicit quality signal (useful / irrelevant /
-    /// outdated / wrong) on a previously-recalled memory. Shapes the
-    /// ranking of that memory in future recalls.
-    async fn feedback(
-        &self,
-        _memory_id: &str,
-        _signal: &str,
-        _context: Option<&str>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-/// Summary returned by [`MemoriaClient::reflect_session`].
-#[derive(Debug, Clone, Default)]
-pub struct ReflectSummary {
-    /// Whether the backend actually synthesized new scene nodes (v2
-    /// reflect returns true); v1 always reports `false` here but
-    /// still triggers graph consolidation.
-    pub synthesized: bool,
-    /// Number of scene / cluster candidates produced.
-    pub candidates: u64,
-    /// Candidate scene summaries the client can forward-feed (store as
-    /// `astra:scene`-tagged memories for next-session prewarm). Empty
-    /// when the backend ran in `internal` mode (LLM synthesis already
-    /// stored scenes server-side) or when no clusters were found.
-    pub candidate_payloads: Vec<ReflectCandidate>,
-    /// Raw v1 response body for diagnostics (first 200 chars).
-    pub diagnostics: String,
-}
-
-/// A single cluster-level scene candidate returned by Memoria's reflect
-/// endpoint in `mode=candidates`. Contents are compact enough to bake
-/// into one `astra:scene` memory so the next session's prewarm picks
-/// it up via the episode + scene query.
-#[derive(Debug, Clone, Default)]
-pub struct ReflectCandidate {
-    /// Signal / label the backend attached to the cluster.
-    pub signal: String,
-    /// Importance score (arbitrary units, backend-defined).
-    pub importance: f64,
-    /// Compact summary of the cluster's contributing memories, joined
-    /// by newlines. Suitable for direct inclusion in a stored memory's
-    /// `content` field.
-    pub summary: String,
-}
-
-/// Parse `{"candidates": [...]}` from Memoria's reflect response into
-/// the strongly-typed list. Each entry in the backend's payload has
-/// `{signal, importance, memories: [{memory_id, content}]}`; we flatten
-/// `memories[*].content` into a single newline-joined `summary` so it
-/// slots directly into one Memoria memory's `content`.
-///
-/// Pure — tested in isolation.
-pub fn parse_reflect_candidates(data: &Value) -> Vec<ReflectCandidate> {
-    let Some(arr) = data.get("candidates").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for entry in arr {
-        let signal = entry
-            .get("signal")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let importance = entry
-            .get("importance")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let memories = entry
-            .get("memories")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut lines = Vec::with_capacity(memories.len());
-        for m in memories {
-            if let Some(c) = m.get("content").and_then(Value::as_str) {
-                let t = c.trim();
-                if !t.is_empty() {
-                    lines.push(format!("- {t}"));
-                }
-            }
-        }
-        let summary = lines.join("\n");
-        if summary.is_empty() && signal.is_empty() {
-            continue;
-        }
-        out.push(ReflectCandidate {
-            signal,
-            importance,
-            summary,
-        });
-    }
-    out
-}
-
-/// A memory record from Memoria.
-///
-/// Carries the freshness-critical fields (`observed_at`, `updated_at`,
-/// `trust_tier`) so the caller can render an LLM-visible staleness
-/// caveat without a second round-trip. See [`MemoriaMemory::freshness_suffix`]
-/// for the canonical formatter.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MemoriaMemory {
-    pub memory_id: String,
-    pub content: String,
-    pub memory_type: String,
-    #[serde(default)]
-    pub retrieval_score: Option<f64>,
-    /// RFC3339 timestamp of when the memory was first observed (i.e.
-    /// the fact was stated). Decay half-life is measured from this.
-    #[serde(default)]
-    pub observed_at: Option<String>,
-    /// RFC3339 timestamp of the most recent update (e.g. via `update`).
-    #[serde(default)]
-    pub updated_at: Option<String>,
-    /// Trust tier string (`T1`-`T4`) — drives default half-life.
-    #[serde(default)]
-    pub trust_tier: Option<String>,
-    /// Session id tag, if the memory was scoped to one at write time.
-    #[serde(default)]
-    pub session_id: Option<String>,
-}
-
-impl MemoriaMemory {
-    /// Days elapsed since `observed_at` (or `updated_at` as fallback).
-    /// `None` when neither timestamp is available.
-    pub fn age_days(&self) -> Option<i64> {
-        let ts = self.observed_at.as_deref().or(self.updated_at.as_deref())?;
-        let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
-        let age = chrono::Utc::now() - dt.with_timezone(&chrono::Utc);
-        Some(age.num_days().max(0))
-    }
-
-    /// Human-readable age label (`today`, `yesterday`, `3 days ago`).
-    /// Returns `None` when timestamp info is missing.
-    pub fn age_label(&self) -> Option<String> {
-        match self.age_days()? {
-            0 => Some("today".into()),
-            1 => Some("yesterday".into()),
-            n => Some(format!("{n} days ago")),
-        }
-    }
-
-    /// Append-friendly freshness marker for compact memory renderings.
-    ///
-    /// Routes through [`astra_turn_types::freshness_suffix_for`] so the
-    /// runtime-side and types-side renderings stay byte-for-byte
-    /// identical. Bucketed (`(this week)` / `(within the month)` /
-    /// `(stale — verify first)`) rather than exact-day to keep prompt
-    /// cache stable across midnight UTC; see the helper's rustdoc.
-    pub fn freshness_suffix(&self) -> String {
-        let Some(days) = self.age_days() else {
-            return String::new();
-        };
-        astra_turn_types::freshness_suffix_for(days, self.trust_tier.as_deref())
-    }
-}
+pub use astra_memoria::{
+    MemoriaMemory, MemoriaPort, ReflectCandidate, ReflectSummary, parse_reflect_candidates,
+};
 
 fn cross_session_abstract(prefix: &str, evidence: &str) -> String {
     let evidence = evidence
@@ -525,31 +214,15 @@ fn encode_scene_memory(signal: &str, summary: &str) -> String {
 // HTTP Client Implementation
 // ---------------------------------------------------------------------------
 
-/// A single active focus hint: boost a topic / tag / memory_id for a
-/// finite window. Shared backing for `HttpMemoriaClient::focus` and
-/// consulted during `retrieve_ext` so the recall payload picks it up.
-#[derive(Debug, Clone)]
-struct RuntimeFocusHint {
-    focus_type: String,
-    value: String,
-    boost: f64,
-    expires_at: std::time::Instant,
-}
-
 /// HTTP-based Memoria client.
 #[derive(Clone)]
-pub struct HttpMemoriaClient {
+pub struct HttpMemoriaPort {
     base_url: String,
     api_key: String,
     http: reqwest::Client,
-    /// Session-scoped focus store (runtime side). Mirrors the tool-side
-    /// store in `astra_tools::memoria` so orchestration and LLM-driven
-    /// focus hints are unified at retrieval time.
-    focus_store:
-        std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, Vec<RuntimeFocusHint>>>>,
 }
 
-impl HttpMemoriaClient {
+impl HttpMemoriaPort {
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
             base_url,
@@ -560,9 +233,6 @@ impl HttpMemoriaClient {
                     .timeout(std::time::Duration::from_secs(60)),
                 "memoria compact client",
             ),
-            focus_store: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
         }
     }
 
@@ -575,22 +245,10 @@ impl HttpMemoriaClient {
     /// Read back active focus hints for a session (side-effect:
     /// evicts expired entries). Public so test code can introspect.
     pub fn active_focus_hints(&self, session_id: &str) -> Vec<(String, String, f64)> {
-        let now = std::time::Instant::now();
-        let key = if session_id.is_empty() {
-            "_global"
-        } else {
-            session_id
-        };
-        let Ok(mut store) = self.focus_store.write() else {
-            return Vec::new();
-        };
-        let Some(bucket) = store.get_mut(key) else {
-            return Vec::new();
-        };
-        bucket.retain(|h| h.expires_at > now);
-        bucket
+        astra_memoria::memoria_runtime_state()
+            .active_focus(session_id)
             .iter()
-            .map(|h| (h.focus_type.clone(), h.value.clone(), h.boost))
+            .map(|hint| (hint.focus_type.clone(), hint.value.clone(), hint.boost))
             .collect()
     }
 
@@ -658,7 +316,7 @@ fn parse_retrieved_memories(data: &Value) -> Vec<MemoriaMemory> {
 }
 
 #[async_trait::async_trait]
-impl MemoriaClient for HttpMemoriaClient {
+impl MemoriaPort for HttpMemoriaPort {
     async fn retrieve_for_prompt(
         &self,
         query: &str,
@@ -1087,35 +745,13 @@ impl MemoriaClient for HttpMemoriaClient {
         boost: Option<f64>,
         ttl_secs: Option<i64>,
     ) -> Result<(), String> {
-        if !matches!(focus_type, "topic" | "tag" | "memory_id" | "session") {
-            return Err(format!(
-                "invalid focus_type {focus_type:?}; expected topic/tag/memory_id/session"
-            ));
-        }
-        let value = value.trim();
-        if value.is_empty() {
-            return Err("focus: empty value".into());
-        }
-        let boost = boost.unwrap_or(1.5);
-        let ttl = ttl_secs.unwrap_or(3600).max(1) as u64;
-        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl);
-        let key = if session_id.is_empty() {
-            "_global".to_string()
-        } else {
-            session_id.to_string()
-        };
-        let Ok(mut store) = self.focus_store.write() else {
-            return Err("focus store poisoned".into());
-        };
-        let bucket = store.entry(key).or_default();
-        bucket.retain(|h| !(h.focus_type == focus_type && h.value == value));
-        bucket.push(RuntimeFocusHint {
-            focus_type: focus_type.to_string(),
-            value: value.to_string(),
-            boost,
-            expires_at,
-        });
-        Ok(())
+        astra_memoria::memoria_runtime_state().set_focus(
+            session_id,
+            focus_type,
+            value,
+            boost.unwrap_or(1.5),
+            ttl_secs.unwrap_or(3600).max(1) as u64,
+        )
     }
 
     async fn feedback(
@@ -1339,7 +975,7 @@ pub async fn compact_with_memoria(
     session_id: Option<&str>,
     config: &MemoriaCompactConfig,
     params: &MemoriaCompactParams,
-    client: Option<&dyn MemoriaClient>,
+    client: Option<&dyn MemoriaPort>,
     compact_config: Option<&CompactConfig>,
     summary_client: Option<&dyn SummaryLlmClient>,
 ) -> CompactResult {
@@ -1537,11 +1173,11 @@ mod tests {
         assert_eq!(memories[0].memory_id, "m1");
     }
 
-    struct MockMemoriaClient {
+    struct MockMemoriaPort {
         memories: Mutex<Vec<MemoriaMemory>>,
     }
 
-    impl MockMemoriaClient {
+    impl MockMemoriaPort {
         fn new(memories: Vec<MemoriaMemory>) -> Self {
             Self {
                 memories: Mutex::new(memories),
@@ -1550,7 +1186,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MemoriaClient for MockMemoriaClient {
+    impl MemoriaPort for MockMemoriaPort {
         async fn retrieve_ext(
             &self,
             _query: &str,
@@ -1797,7 +1433,7 @@ mod tests {
             min_tokens_for_retrieval: 10_000,
             ..Default::default()
         };
-        let mock = MockMemoriaClient::new(vec![]);
+        let mock = MockMemoriaPort::new(vec![]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
             keep_chars: 2000,
@@ -1832,7 +1468,7 @@ mod tests {
             min_tokens_for_retrieval: 100,
             ..Default::default()
         };
-        let mock = MockMemoriaClient::new(vec![MemoriaMemory {
+        let mock = MockMemoriaPort::new(vec![MemoriaMemory {
             memory_id: "m1".to_string(),
             content: crate::session_memory::runner::encode_session_memory_entry(
                 "sess1",
@@ -1925,7 +1561,7 @@ mod tests {
             min_tokens_for_retrieval: 100,
             ..Default::default()
         };
-        let mock = MockMemoriaClient::new(vec![MemoriaMemory {
+        let mock = MockMemoriaPort::new(vec![MemoriaMemory {
             memory_id: "m1".to_string(),
             content: "Working on auth module".to_string(),
             memory_type: "working".to_string(),
@@ -1976,7 +1612,7 @@ mod tests {
             min_tokens_for_retrieval: 100,
             ..Default::default()
         };
-        let mock = MockMemoriaClient::new(vec![]);
+        let mock = MockMemoriaPort::new(vec![]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
             keep_chars: 2000,
@@ -2022,7 +1658,7 @@ mod tests {
             min_tokens_for_retrieval: 100,
             ..Default::default()
         };
-        let mock = MockMemoriaClient::new(vec![]);
+        let mock = MockMemoriaPort::new(vec![]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
             keep_chars: 2000,
@@ -2068,7 +1704,7 @@ mod tests {
             min_tokens_for_retrieval: 100,
             ..Default::default()
         };
-        let mock = MockMemoriaClient::new(vec![]);
+        let mock = MockMemoriaPort::new(vec![]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
             keep_chars: 2000,
@@ -2290,7 +1926,7 @@ mod tests {
             let _ = sock.shutdown().await;
         });
 
-        let client = HttpMemoriaClient::new(format!("http://{addr}"), "test-key".to_string());
+        let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string());
         let purged = client
             .purge_working("8ae95566-f123-4abc-9def-0123456789ab")
             .await
@@ -2320,7 +1956,7 @@ mod tests {
 
     #[tokio::test]
     async fn purge_working_rejects_empty_session_id() {
-        let client = HttpMemoriaClient::new("http://127.0.0.1:1".into(), "key".into());
+        let client = HttpMemoriaPort::new("http://127.0.0.1:1".into(), "key".into());
         let err = client.purge_working("").await.unwrap_err();
         assert!(
             err.contains("non-empty"),
@@ -2330,7 +1966,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_retrieve_scoped_typed_filters_memory_types_locally() {
-        let client = MockMemoriaClient::new(vec![
+        let client = MockMemoriaPort::new(vec![
             MemoriaMemory {
                 memory_id: "working-1".to_string(),
                 content: "keep".to_string(),
@@ -2420,7 +2056,7 @@ mod tests {
             socket.write_all(payload).await.unwrap();
         });
 
-        let client = HttpMemoriaClient::new(format!("http://{addr}"), "test-key".into());
+        let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".into());
         let memories = client
             .retrieve_for_prompt("typed recall", "user-7", "session-9", 6)
             .await
@@ -2484,7 +2120,7 @@ mod tests {
             let _ = sock.shutdown().await;
         });
 
-        let client = HttpMemoriaClient::new(format!("http://{addr}"), "test-key".to_string());
+        let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string());
         client
             .retrieve_scoped_typed(
                 "session memory",
@@ -2536,9 +2172,35 @@ mod tests {
             let _ = sock.shutdown().await;
         });
 
-        let client = HttpMemoriaClient::new(format!("http://{addr}"), "test-key".to_string());
+        let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string());
         client.health_check().await.expect("health should pass");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn tool_gateway_focus_is_visible_to_direct_runtime_port() {
+        let session_id = "shared-focus-tool-to-runtime";
+        astra_memoria::memoria_runtime_state().reset_session(session_id);
+        let gateway = astra_tools::memoria::MemoriaToolGateway::new(None, None);
+        let response = gateway.focus_set(
+            session_id,
+            &serde_json::json!({
+                "focus_type": "topic",
+                "focus_value": "session-memory",
+                "boost": 2.0,
+            }),
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["status"],
+            "completed"
+        );
+
+        let port = HttpMemoriaPort::new("http://127.0.0.1:9".into(), "test-key".into());
+        assert_eq!(
+            port.active_focus_hints(session_id),
+            vec![("topic".into(), "session-memory".into(), 2.0)]
+        );
+        astra_memoria::memoria_runtime_state().reset_session(session_id);
     }
 
     #[tokio::test]
@@ -2561,7 +2223,7 @@ mod tests {
             let _ = sock.shutdown().await;
         });
 
-        let client = HttpMemoriaClient::new(format!("http://{addr}"), "test-key".to_string());
+        let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string());
         let err = client.health_check().await.unwrap_err();
         assert!(err.contains("503"), "expected status in error: {err}");
         server.await.unwrap();

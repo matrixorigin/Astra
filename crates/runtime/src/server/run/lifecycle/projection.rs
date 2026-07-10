@@ -228,6 +228,7 @@ pub(super) fn agent_live_event_to_work_surface_sse(
             let termination = match termination {
                 AgentLiveTermination::Completed => "completed",
                 AgentLiveTermination::Failed => "failed",
+                AgentLiveTermination::Interrupted => "interrupted",
                 AgentLiveTermination::Cancelled => "cancelled",
             };
             json!({

@@ -20,6 +20,8 @@ pub struct AgentLiveEvent {
 pub enum AgentLiveTermination {
     Completed,
     Failed,
+    /// Execution stopped with resumable state and may continue later.
+    Interrupted,
     Cancelled,
 }
 

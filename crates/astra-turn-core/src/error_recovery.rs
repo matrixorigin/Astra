@@ -122,6 +122,31 @@ pub fn build_recovery_message(
     category: ErrorCategory,
     avoidance_advised: &[&str],
 ) -> String {
+    build_recovery_message_with_evidence(tool_name, error_str, category, avoidance_advised, None)
+}
+
+pub fn build_recovery_message_with_evidence(
+    tool_name: &str,
+    error_str: &str,
+    category: ErrorCategory,
+    avoidance_advised: &[&str],
+    evidence: Option<&astra_core::ToolFailureEvidence>,
+) -> String {
+    if let Some(evidence) = evidence {
+        match evidence.cause {
+            astra_core::ToolFailureCause::InputTooLarge => {
+                return format!(
+                    "⚠ {tool_name} rejected an oversized input. Use a targeted line/range read, narrow the path or query, or search for the relevant location before reading full content. This is structured recovery evidence; do not repeat the identical call."
+                );
+            }
+            astra_core::ToolFailureCause::ScopeTooBroad => {
+                return format!(
+                    "⚠ {tool_name} could not complete the requested scope. Narrow the directory, file type, query, or target and then make a corrected call."
+                );
+            }
+            _ => {}
+        }
+    }
     let alternatives = suggest_alternatives(tool_name, avoidance_advised);
     let ask_user_invalid_args = tool_name == "ask_user"
         && matches!(

@@ -435,34 +435,28 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
             client.post_sync_outbox_event_json(Some(token.as_str()), &body),
         )
         .await;
-        match delivery {
-            Ok(Ok(response)) if event_response_ack_matches(&record, &response) => {
-                settlements.push(SyncOutboxDeliverySettlement::Ack {
-                    record_id: record.record_id,
-                    payload_hash: record.payload_hash,
-                });
-            }
-            Ok(Ok(response)) => {
-                settlements.push(SyncOutboxDeliverySettlement::Failed {
-                    record_id: record.record_id,
-                    error: format!("cloud ack mismatch for sync outbox record: {response}"),
-                });
-            }
-            Ok(Err(error)) => {
-                settlements.push(SyncOutboxDeliverySettlement::Failed {
-                    record_id: record.record_id,
-                    error: error.to_string(),
-                });
-            }
-            Err(_) => {
-                settlements.push(SyncOutboxDeliverySettlement::Failed {
-                    record_id: record.record_id,
-                    error: format!(
-                        "cloud event delivery timed out after {}ms",
-                        SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT.as_millis()
-                    ),
-                });
-            }
+        let delivery_error = match delivery {
+            Ok(Ok(ack)) if ack.confirms(&record.record_id, &record.payload_hash) => None,
+            Ok(Ok(ack)) => Some(format!("cloud returned an uncorrelated sync ack: {ack:?}")),
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some(format!(
+                "cloud event delivery timed out after {}ms",
+                SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT.as_millis()
+            )),
+        };
+        let delivery_confirmed = delivery_error.is_none()
+            || reconcile_sync_outbox_delivery(&client, &token, &record).await;
+        if delivery_confirmed {
+            settlements.push(SyncOutboxDeliverySettlement::Ack {
+                record_id: record.record_id,
+                payload_hash: record.payload_hash,
+            });
+        } else {
+            settlements.push(SyncOutboxDeliverySettlement::Failed {
+                record_id: record.record_id,
+                error: delivery_error
+                    .unwrap_or_else(|| "cloud delivery could not be reconciled".to_string()),
+            });
         }
     }
     if !settlements.is_empty() {
@@ -552,7 +546,19 @@ fn event_body_from_outbox_record(record: &SyncOutboxRecord) -> Value {
     })
 }
 
-fn event_response_ack_matches(record: &SyncOutboxRecord, response: &Value) -> bool {
+async fn reconcile_sync_outbox_delivery(
+    client: &astra_thin_client::ThinClient,
+    token: &str,
+    record: &SyncOutboxRecord,
+) -> bool {
+    client
+        .get_event_json(Some(token), &record.record_id)
+        .await
+        .ok()
+        .is_some_and(|event| stored_event_matches_outbox_record(record, &event))
+}
+
+fn stored_event_matches_outbox_record(record: &SyncOutboxRecord, response: &Value) -> bool {
     response.get("event_id").and_then(Value::as_str) == Some(record.record_id.as_str())
         && response
             .get("metadata")

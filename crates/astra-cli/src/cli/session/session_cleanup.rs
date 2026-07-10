@@ -292,7 +292,7 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
                 "dropped unattributed memory recalls during session cleanup"
             );
         }
-        astra_tools::memoria::MemoriaClient::reset_session_process_state(sid);
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(sid);
     }
     // 5. Clear panic guard
     clear_panic_guard();

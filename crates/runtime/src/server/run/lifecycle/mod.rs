@@ -420,7 +420,7 @@ async fn run_post_loop_memory_cleanup_work(
                     .await,
             )
         } else if let Some(memoria_client) =
-            crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env()
+            crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env()
         {
             Some(
                 crate::turn::cloud::session_end_governance::run_session_end_governance(
@@ -492,7 +492,7 @@ fn reset_post_loop_memory_process_state(
     // and the recall ledger are clean even if
     // governance didn't run (e.g. no memoria client configured, or drain
     // was conditional on an episode being written).
-    astra_tools::memoria::MemoriaClient::reset_session_process_state(session_id);
+    astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
 
     // ── Always: release extraction service's per-session debounce ──
     if let Some(svc) = extraction_service {
@@ -6921,11 +6921,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // Failed/cancelled/waiting turns terminate via their run lifecycle
                 // event (`run_error`, `run_finished`, `run_waiting`) instead.
                 if should_emit_stream_turn_complete(&final_status) {
+                    let mut completion_facts =
+                        astra_turn_core::complete::TurnCompletionFacts::from_tool_signatures(
+                            &state.stall.turn_sigs,
+                        );
+                    completion_facts.stall_detected |= !state.stall.events.is_empty();
                     let _ = event_tx
                         .send(build_run_turn_complete_event_with_interruption(
                             state.total_tool_calls,
                             &state.final_text,
                             state.interruption.as_ref(),
+                            &completion_facts,
                         ))
                         .await;
                 }
@@ -7877,7 +7883,7 @@ fn server_subrun_live_termination(
         Ok(AgenticLoopOutcome::Completed)
             if server_subrun_completed_status(loop_state) == STATUS_PAUSED =>
         {
-            AgentLiveTermination::Cancelled
+            AgentLiveTermination::Interrupted
         }
         Ok(AgenticLoopOutcome::Completed) => AgentLiveTermination::Completed,
         Ok(AgenticLoopOutcome::Cancelled | AgenticLoopOutcome::Waiting(_)) => {

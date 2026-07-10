@@ -92,6 +92,63 @@ pub enum ErrorKind {
     Unknown,
 }
 
+/// Source-authored cause of a tool failure. This is evidence, not an execution
+/// command: downstream runtimes may render it for the model but must not turn
+/// advisory recovery actions into hidden retries, tool suppression, or aborts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFailureCause {
+    InvalidArguments,
+    InputTooLarge,
+    ScopeTooBroad,
+    ResourceMissing,
+    PermissionBoundary,
+    CapabilityUnavailable,
+    TransientTransport,
+    ResourceExhausted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRecoveryAction {
+    CorrectArguments,
+    ReadTargetedRange,
+    NarrowScope,
+    SearchBeforeRead,
+    VerifyResource,
+    RefreshCredentials,
+    SelectAvailableCapability,
+    WaitAndRetry,
+    ReduceResourcePressure,
+    InspectStructuredFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolFailureEvidence {
+    pub kind: ErrorKind,
+    pub cause: ToolFailureCause,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_actions: Vec<ToolRecoveryAction>,
+}
+
+impl ToolFailureEvidence {
+    pub fn new(
+        kind: ErrorKind,
+        cause: ToolFailureCause,
+        retryable: bool,
+        recovery_actions: Vec<ToolRecoveryAction>,
+    ) -> Self {
+        Self {
+            kind,
+            cause,
+            retryable,
+            recovery_actions,
+        }
+    }
+}
+
 impl ErrorKind {
     /// Stable string tag for journal/serialization.
     #[must_use]

@@ -2212,6 +2212,7 @@ pub(crate) fn build_run_turn_complete_event_with_interruption(
     total_tool_calls: u32,
     final_text: &str,
     interruption: Option<&astra_turn_core::interruption::InterruptionRecord>,
+    completion_facts: &astra_turn_core::complete::TurnCompletionFacts,
 ) -> Value {
     let execution_state = interruption.map(|record| {
         serde_json::json!({
@@ -2229,8 +2230,7 @@ pub(crate) fn build_run_turn_complete_event_with_interruption(
     });
     Value::Object(astra_turn_core::complete::build_turn_complete_event(
         total_tool_calls > 0,
-        false,
-        &astra_turn_core::stall::DivergenceStatus::Healthy,
+        completion_facts,
         execution_state,
         (!final_text.is_empty()).then_some(final_text),
     ))

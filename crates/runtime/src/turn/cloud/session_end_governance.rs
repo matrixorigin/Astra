@@ -191,7 +191,7 @@ fn push_episode_items(
 pub async fn run_session_end_governance(
     facts: &SessionFacts,
     session_id: &str,
-    client: &dyn super::memoria_compact::MemoriaClient,
+    client: &dyn super::memoria_compact::MemoriaPort,
 ) -> Result<SessionEndReport, String> {
     let mut report = SessionEndReport::default();
 
@@ -482,7 +482,7 @@ mod tests {
     // ── P7: reflect candidates forward-fed as scene memories ───────────
 
     use super::super::memoria_compact::{
-        MemoriaClient, MemoriaMemory, ReflectCandidate, ReflectSummary,
+        MemoriaMemory, MemoriaPort, ReflectCandidate, ReflectSummary,
     };
     use std::sync::{Arc, Mutex};
 
@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MemoriaClient for SceneCaptureClient {
+    impl MemoriaPort for SceneCaptureClient {
         async fn retrieve_ext(
             &self,
             _q: &str,
@@ -606,7 +606,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl super::super::memoria_compact::MemoriaClient for LifecycleOrderClient {
+    impl super::super::memoria_compact::MemoriaPort for LifecycleOrderClient {
         async fn retrieve_ext(
             &self,
             _query: &str,

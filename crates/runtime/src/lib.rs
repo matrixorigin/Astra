@@ -343,8 +343,8 @@ pub use turn::{
         },
         compaction::{CompactBoundary, CompactCircuitBreaker, CompactResult, CompactTrigger},
         memoria_compact::{
-            HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,
-            MemoriaMemory, claude_code_session_memory_path, compact_with_memoria,
+            HttpMemoriaPort, MemoriaCompactConfig, MemoriaCompactParams, MemoriaMemory,
+            MemoriaPort, claude_code_session_memory_path, compact_with_memoria,
             memoria_compact_retrieve_query, sanitize_path_for_claude_projects,
         },
     },

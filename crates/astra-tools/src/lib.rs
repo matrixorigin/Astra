@@ -105,6 +105,22 @@ impl ToolResult {
         }
     }
 
+    /// Attach source-authored structured recovery evidence. Consumers surface
+    /// this to the model as advisory context; it does not authorize retries or
+    /// tool-surface mutation.
+    pub fn with_failure_evidence(mut self, evidence: astra_core::ToolFailureEvidence) -> Self {
+        self.is_error = true;
+        let metadata = self.metadata.get_or_insert_with(serde_json::Map::new);
+        metadata.insert(
+            "error_kind".to_string(),
+            Value::String(evidence.kind.as_str().to_string()),
+        );
+        if let Ok(value) = serde_json::to_value(evidence) {
+            metadata.insert("recovery_evidence".to_string(), value);
+        }
+        self
+    }
+
     /// Attach exit-code semantics while preserving the existing output/error shape.
     pub fn with_exit_semantics(mut self, semantics: exit_semantics::ExitSemantics) -> Self {
         self.exit_semantics = Some(semantics);

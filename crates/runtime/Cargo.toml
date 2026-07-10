@@ -40,6 +40,7 @@ fastrand = "2"
 percent-encoding = "2.3"
 unicode-normalization.workspace = true
 astra-logging.workspace = true
+astra-memoria.workspace = true
 astra-config.workspace = true
 astra-core.workspace = true
 astra-messaging.workspace = true
@@ -50,6 +51,7 @@ astra-prompts.workspace = true
 astra-runtime-env.workspace = true
 astra-sandbox.workspace = true
 astra-server-types = { workspace = true, features = ["server"] }
+astra-sync-protocol.workspace = true
 astra-mcp.workspace = true
 astra-skills = { workspace = true, features = ["crash-recovery"] }
 astra-turn-core = { workspace = true, features = ["db-store"] }

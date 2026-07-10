@@ -23,7 +23,7 @@ use serde_json::Value;
 use crate::prompts::{CompactConfig, CompactionTier};
 use crate::turn::cloud::compaction::CompactResult;
 use crate::turn::cloud::memoria_compact::{
-    MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams, compact_with_memoria,
+    MemoriaCompactConfig, MemoriaCompactParams, MemoriaPort, compact_with_memoria,
 };
 use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadata};
 
@@ -125,7 +125,7 @@ pub(crate) struct MemoriaContext<'a> {
     pub context_window: Option<u32>,
     /// Optional HTTP client for Memoria retrieval. `None` = skip retrieval,
     /// fall back to pure truncation.
-    pub memoria_client: Option<&'a dyn MemoriaClient>,
+    pub memoria_client: Option<&'a dyn MemoriaPort>,
     /// Optional summary LLM client. `None` = skip LLM summarization tier.
     pub summary_client: Option<&'a dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
     /// Pipeline-selected compaction tier (authoritative — do NOT re-derive).

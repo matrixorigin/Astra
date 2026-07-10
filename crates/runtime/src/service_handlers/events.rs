@@ -1,7 +1,11 @@
 use astra_services::events::*;
 
 use crate::AppState;
-use astra_core::{ErrorResponse, SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
+use astra_core::ErrorResponse;
+use astra_sync_protocol::{
+    SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, SyncOutboxIngestionStatus,
+    sync_outbox_request_signature,
+};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -21,7 +25,7 @@ pub async fn create_sync_outbox_event_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<(StatusCode, Json<EventResponse>), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(StatusCode, Json<SyncOutboxAck>), (StatusCode, Json<ErrorResponse>)> {
     require_sync_outbox_signature(&headers, &body)?;
     let request = serde_json::from_value::<EventCreateRequest>(body).map_err(|error| {
         astra_core::error_response(
@@ -29,7 +33,41 @@ pub async fn create_sync_outbox_event_handler(
             format!("Invalid sync outbox event request: {error}"),
         )
     })?;
-    create_event_with_source(state, headers, request, EventIngestionSource::SyncOutbox).await
+    let outcome =
+        create_event_outcome(state, headers, request, EventIngestionSource::SyncOutbox).await?;
+    let (status, ack) = sync_outbox_ack_from_outcome(outcome)?;
+    Ok((status, Json(ack)))
+}
+
+fn sync_outbox_ack_from_outcome(
+    outcome: EventCreateOutcome,
+) -> Result<(StatusCode, SyncOutboxAck), (StatusCode, Json<ErrorResponse>)> {
+    let payload_hash = outcome
+        .record
+        .metadata
+        .get("sync_outbox")
+        .and_then(|sync| sync.get("payload_hash"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            astra_core::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Stored sync outbox event is missing its payload hash",
+            )
+        })?;
+    let status = if outcome.idempotent_replay {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let ingestion_status = if outcome.idempotent_replay {
+        SyncOutboxIngestionStatus::IdempotentReplay
+    } else {
+        SyncOutboxIngestionStatus::Created
+    };
+    Ok((
+        status,
+        SyncOutboxAck::new(outcome.record.event_id, payload_hash, ingestion_status),
+    ))
 }
 
 async fn create_event_with_source(
@@ -38,6 +76,21 @@ async fn create_event_with_source(
     request: EventCreateRequest,
     ingestion_source: EventIngestionSource,
 ) -> Result<(StatusCode, Json<EventResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let outcome = create_event_outcome(state, headers, request, ingestion_source).await?;
+    let status = if outcome.idempotent_replay {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(EventResponse::from(outcome.record))))
+}
+
+async fn create_event_outcome(
+    state: AppState,
+    headers: HeaderMap,
+    request: EventCreateRequest,
+    ingestion_source: EventIngestionSource,
+) -> Result<EventCreateOutcome, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let outcome = state
         .event_service
@@ -58,12 +111,7 @@ async fn create_event_with_source(
             },
         )
         .await?;
-    let status = if outcome.idempotent_replay {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
-    };
-    Ok((status, Json(EventResponse::from(outcome.record))))
+    Ok(outcome)
 }
 
 fn require_sync_outbox_signature(
@@ -220,5 +268,44 @@ mod tests {
             require_sync_outbox_signature(&headers, &received_body),
             Err((StatusCode::UNAUTHORIZED, _))
         ));
+    }
+
+    #[test]
+    fn sync_outbox_ack_is_explicit_for_created_and_replayed_events() {
+        fn record() -> EventRecord {
+            EventRecord {
+                event_id: "record-1".to_string(),
+                user_id: "user-1".to_string(),
+                session_id: "session-1".to_string(),
+                event_type: "sync_marker".to_string(),
+                content: "{}".to_string(),
+                agent_id: Some("edge_sync".to_string()),
+                agent_version: Some("test".to_string()),
+                parent_event_id: None,
+                parent_event_ids: Vec::new(),
+                causal_chain_id: None,
+                metadata: serde_json::json!({
+                    "sync_outbox": {"payload_hash": "sha256:abc"}
+                }),
+                created_at: "2026-07-10T00:00:00Z".to_string(),
+            }
+        }
+
+        let (created_status, created_ack) =
+            sync_outbox_ack_from_outcome(EventCreateOutcome::created(record())).unwrap();
+        assert_eq!(created_status, StatusCode::CREATED);
+        assert!(created_ack.confirms("record-1", "sha256:abc"));
+        assert_eq!(
+            created_ack.ingestion_status,
+            SyncOutboxIngestionStatus::Created
+        );
+
+        let (replay_status, replay_ack) =
+            sync_outbox_ack_from_outcome(EventCreateOutcome::replayed(record())).unwrap();
+        assert_eq!(replay_status, StatusCode::OK);
+        assert_eq!(
+            replay_ack.ingestion_status,
+            SyncOutboxIngestionStatus::IdempotentReplay
+        );
     }
 }

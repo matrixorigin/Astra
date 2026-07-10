@@ -341,7 +341,7 @@ impl ToolExecutor {
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
         }
 
-        // Delegate to the shared MemoriaClient (single source of truth for
+        // Delegate to the shared MemoriaPort (single source of truth for
         // build_direct_request, type normalization, and HTTP method routing).
         let cloud_token = self.cloud_token();
         if cloud_token.is_none() {
@@ -351,7 +351,8 @@ impl ToolExecutor {
             })
             .to_string();
         }
-        let client = astra_tools::memoria::MemoriaClient::new(self.cloud_base.clone(), cloud_token);
+        let client =
+            astra_tools::memoria::MemoriaToolGateway::new(self.cloud_base.clone(), cloud_token);
         let result = client.call_with_timeout(op, args, timeout).await;
 
         // CLI-specific: update circuit breaker + user notification
@@ -477,12 +478,12 @@ impl ToolExecutor {
     }
 }
 
-// HttpMethod + build_direct_request moved to astra_tools::memoria::MemoriaClient
+// HttpMethod + build_direct_request moved to astra_tools::memoria::MemoriaToolGateway
 // (single source of truth for CLI and server).
 use astra_tools::memoria::HttpMethod;
 
 fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value, HttpMethod) {
-    astra_tools::memoria::MemoriaClient::build_direct_request(base, op, args)
+    astra_tools::memoria::MemoriaToolGateway::build_direct_request(base, op, args)
 }
 
 // Old build_direct_request body (120 lines) removed.

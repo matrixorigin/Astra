@@ -640,6 +640,16 @@ pub fn read_file(workspace_root: &Path, args: &Value) -> ToolResult {
         return ToolResult::error(format!(
             "Error: file is too large ({} bytes). Use offset/limit to read a specific range, or outline=true.",
             metadata.len()
+        ))
+        .with_failure_evidence(astra_core::ToolFailureEvidence::new(
+            astra_core::ErrorKind::ToolInvalidArgs,
+            astra_core::ToolFailureCause::InputTooLarge,
+            false,
+            vec![
+                astra_core::ToolRecoveryAction::ReadTargetedRange,
+                astra_core::ToolRecoveryAction::SearchBeforeRead,
+                astra_core::ToolRecoveryAction::NarrowScope,
+            ],
         ));
     }
 
@@ -2930,6 +2940,22 @@ mod tests {
             result.output.contains("too large"),
             "got: {}",
             result.output
+        );
+        let evidence = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("recovery_evidence"))
+            .cloned()
+            .and_then(|value| serde_json::from_value::<astra_core::ToolFailureEvidence>(value).ok())
+            .expect("large-file rejection must preserve structured recovery evidence");
+        assert_eq!(evidence.cause, astra_core::ToolFailureCause::InputTooLarge);
+        assert_eq!(
+            evidence.recovery_actions,
+            vec![
+                astra_core::ToolRecoveryAction::ReadTargetedRange,
+                astra_core::ToolRecoveryAction::SearchBeforeRead,
+                astra_core::ToolRecoveryAction::NarrowScope,
+            ]
         );
     }
 

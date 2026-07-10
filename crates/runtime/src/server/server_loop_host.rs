@@ -1158,7 +1158,7 @@ pub struct ServerAgenticLoopHost {
     task_board_resume_hint: Option<String>,
     /// Runtime-owned memory provider used consistently for prompt recall,
     /// current-session snapshots, compaction, and server-only/subrun paths.
-    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>>,
+    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
     /// Typed recall latched for one user turn so every tool round observes the
     /// same evidence and the dynamic prompt bytes do not churn mid-turn.
     prompt_memory_recall_cache: Option<PromptMemoryRecallCache>,
@@ -1299,7 +1299,7 @@ pub struct ServerAgenticLoopHostBuilder {
     plan_resume_hint: Option<String>,
     plan_authoring_active: bool,
     task_board_resume_hint: Option<String>,
-    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>>,
+    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
     server_service_tool_catalog_enabled: bool,
     control_plane_tool_catalog_enabled: bool,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -1355,9 +1355,9 @@ impl ServerAgenticLoopHostBuilder {
             plan_resume_hint: None,
             plan_authoring_active: false,
             task_board_resume_hint: None,
-            memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env().map(
+            memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env().map(
                 |client| {
-                    Arc::new(client) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>
+                    Arc::new(client) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
                 },
             ),
             server_service_tool_catalog_enabled: true,
@@ -1793,7 +1793,7 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_memoria_client(
         mut self,
-        memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>>,
+        memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
     ) -> Self {
         self.memoria_client = memoria_client;
         self
@@ -6075,7 +6075,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::turn::cloud::memoria_compact::MemoriaClient for ServerOnlyPromptMemory {
+    impl crate::turn::cloud::memoria_compact::MemoriaPort for ServerOnlyPromptMemory {
         async fn retrieve_for_prompt(
             &self,
             _query: &str,
@@ -6137,7 +6137,7 @@ mod tests {
             "server-session".into(),
         )
         .with_memoria_client(Some(
-            Arc::clone(&provider) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>
+            Arc::clone(&provider) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
         ))
         .build();
         assert!(host.edge_profile.is_empty());

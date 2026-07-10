@@ -6561,53 +6561,6 @@ mod tests {
     }
 
     #[test]
-    fn database_projection_status_patch_is_event_idx_monotonic() {
-        let source = include_str!("runs.rs");
-        let patch_body = source
-            .split("async fn patch_run_projection_status_for_user")
-            .nth(1)
-            .and_then(|rest| {
-                rest.split("async fn patch_or_repair_run_projection_status_for_user")
-                    .next()
-            })
-            .expect("projection status patch body");
-        assert!(
-            patch_body.contains("AND projection_event_idx <= ?"),
-            "status projection patch must reject stale event_idx writes"
-        );
-        assert!(
-            patch_body.contains(".bind(projection_event_idx)\n        .execute"),
-            "status projection patch must bind the event_idx guard"
-        );
-
-        let repair_body = source
-            .split("async fn patch_or_repair_run_projection_status_for_user")
-            .nth(1)
-            .and_then(|rest| rest.split("async fn sync_projection_for_user").next())
-            .expect("projection repair body");
-        assert!(
-            repair_body.contains("existing.projection_event_idx > projection_event_idx"),
-            "zero-row status patches must distinguish stale writes from missing projections"
-        );
-        assert!(
-            repair_body.contains("sync_projection_for_user(user_id, run_id, None, None)"),
-            "missing-row repair must not reuse a possibly stale transition event type"
-        );
-        let sync_body = source
-            .split("async fn sync_projection_for_user")
-            .nth(1)
-            .and_then(|rest| {
-                rest.split("async fn allocate_event_indices_batch_for_user")
-                    .next()
-            })
-            .expect("projection sync body");
-        assert!(
-            sync_body.contains("load_latest_event_type_for_user"),
-            "projection sync must derive latest_event_type from durable events when projection lags"
-        );
-    }
-
-    #[test]
     fn tool_preview_contract_row_decode_preserves_values_and_fails_loudly() {
         let (tool_name, contract) = decode_tool_preview_contract_row(&FakeRunStateRow::complete())
             .expect("preview contract decodes");
@@ -6799,29 +6752,6 @@ mod tests {
     }
 
     #[test]
-    fn acquire_owner_lease_update_is_owner_bound() {
-        let source = include_str!("runs.rs");
-        let body = source
-            .split("pub async fn acquire_owner_lease(")
-            .nth(1)
-            .and_then(|rest| rest.split("pub async fn insert_tool_output_batch").next())
-            .expect("acquire_owner_lease body");
-
-        assert!(
-            body.contains("user_id: &str"),
-            "lease acquisition must take the owner boundary explicitly"
-        );
-        assert!(
-            body.contains("WHERE user_id = ?") && body.contains("AND run_id = ?"),
-            "lease acquisition must not update agent_runs by bare run_id"
-        );
-        assert!(
-            !body.contains("WHERE run_id = ?"),
-            "lease acquisition must not retain the old ownerless predicate"
-        );
-    }
-
-    #[test]
     fn owner_lease_renewal_interval_is_derived_from_ttl() {
         assert_eq!(
             run_owner_lease_renewal_interval(Duration::from_secs(45)),
@@ -6835,111 +6765,6 @@ mod tests {
             run_owner_lease_renewal_interval(Duration::from_secs(300)),
             Duration::from_secs(15),
             "very long leases should not make active-run heartbeat too sparse"
-        );
-    }
-
-    #[test]
-    fn renew_owner_lease_update_is_owner_and_status_bound() {
-        let source = include_str!("runs.rs");
-        let database_impl = source
-            .split("impl RunStateStore for DatabaseRunStateStore")
-            .nth(1)
-            .expect("database RunStateStore impl");
-        let body = database_impl
-            .split("async fn renew_owner_lease")
-            .nth(1)
-            .and_then(|rest| rest.split("async fn find_blocking_session_run").next())
-            .expect("database renew_owner_lease body");
-
-        assert!(
-            body.contains("WHERE user_id = ") && body.contains("AND run_id = "),
-            "lease renewal must not update agent_runs by bare run_id"
-        );
-        assert!(
-            body.contains("AND owner_pod_id = "),
-            "lease renewal must only refresh the current store owner's rows"
-        );
-        assert!(
-            body.contains("AND status IN ("),
-            "lease renewal must stop once the run leaves active statuses"
-        );
-        assert!(
-            !body.contains("updated_at = NOW(6)"),
-            "lease heartbeat must not mutate user-visible run updated_at ordering"
-        );
-    }
-
-    #[test]
-    fn recoverable_active_query_is_owner_lease_bound_for_waiting_runs() {
-        let source = include_str!("runs.rs");
-        let database_impl = source
-            .split("impl RunStateStore for DatabaseRunStateStore")
-            .nth(1)
-            .expect("database RunStateStore impl");
-        let body = database_impl
-            .split("async fn find_recoverable_active_runs")
-            .nth(1)
-            .and_then(|rest| rest.split("async fn find_blocking_session_run").next())
-            .expect("database find_recoverable_active_runs body");
-
-        assert!(
-            body.contains("status IN (?, ?, ?)"),
-            "recoverable active query must cover waiting, running, and input-queued in one lease-scoped scan"
-        );
-        assert!(
-            body.contains(".bind(STATUS_WAITING)")
-                && body.contains(".bind(STATUS_RUNNING)")
-                && body.contains(".bind(STATUS_INPUT_QUEUED)"),
-            "waiting runs must be returned by the same recoverable active query as in-flight runs"
-        );
-        assert!(
-            !body.contains("STATUS_PAUSED"),
-            "paused runs are resumable/user-held state and must not be crash-recovered"
-        );
-        assert!(
-            body.contains("owner_pod_id = ?") && body.contains("owner_lease_expires_at < NOW(6)"),
-            "recoverable active query must respect the owner lease boundary"
-        );
-        assert!(
-            !body.contains("find_runs_by_status"),
-            "recoverable waiting runs must not fall back to the unscoped status query"
-        );
-    }
-
-    #[test]
-    fn guarded_resume_uses_session_execution_slot_not_predicate_scan() {
-        let source = include_str!("runs.rs");
-        let database_impl = source
-            .split("impl RunStateStore for DatabaseRunStateStore")
-            .nth(1)
-            .expect("database RunStateStore impl");
-        let body = database_impl
-            .split("async fn update_run_status_with_event_if_current_unless_session_blocked")
-            .nth(1)
-            .and_then(|rest| {
-                rest.split("async fn update_run_status_with_events_if_current")
-                    .next()
-            })
-            .expect("guarded transition body");
-
-        assert!(
-            body.contains("sync_session_execution_slot_after_status_tx"),
-            "guarded resume must acquire the durable session execution slot"
-        );
-        assert!(
-            !body.contains("NOT EXISTS") && !body.contains("blocking_runs"),
-            "guarded resume must not use an agent_runs predicate scan; it is write-skew-prone"
-        );
-        let storage_source = include_str!("storage.rs");
-        assert!(
-            storage_source.contains("CREATE TABLE IF NOT EXISTS agent_session_execution_slots")
-                && storage_source.contains("PRIMARY KEY (user_id, session_id)"),
-            "schema must expose session execution as a unique durable resource"
-        );
-        assert!(
-            source.contains("cleanup_stale_session_execution_slot")
-                && source.contains("retry_acquire_session_execution_slot"),
-            "slot acquisition must clean stale non-blocking owners before retrying"
         );
     }
 

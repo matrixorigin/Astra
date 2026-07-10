@@ -17,7 +17,7 @@ use astra_turn_types::{
 };
 
 use crate::memory_hooks::relevance::LlmConnParams;
-use crate::turn::cloud::memoria_compact::{MemoriaClient, MemoriaMemory};
+use crate::turn::cloud::memoria_compact::{MemoriaMemory, MemoriaPort};
 use crate::turn::llm::client::{
     apply_provider_auth, build_provider_request_body_with_overrides, global_llm_client,
     llm_request_url_for_provider, parse_nonstream_response_for_provider,
@@ -388,7 +388,7 @@ pub(crate) struct LlmCandidateFailure {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_extraction(
-    memoria: &Arc<dyn MemoriaClient>,
+    memoria: &Arc<dyn MemoriaPort>,
     session_id: &str,
     messages: &[Value],
     turn_number: usize,
@@ -569,7 +569,7 @@ pub fn canonicalize_session_memory_markdown(
 }
 
 pub async fn load_current_session_memory(
-    memoria: &dyn MemoriaClient,
+    memoria: &dyn MemoriaPort,
     session_id: &str,
 ) -> Option<String> {
     load_current_session_memory_with_freshness(memoria, session_id)
@@ -578,7 +578,7 @@ pub async fn load_current_session_memory(
 }
 
 pub async fn load_current_session_memory_with_freshness(
-    memoria: &dyn MemoriaClient,
+    memoria: &dyn MemoriaPort,
     session_id: &str,
 ) -> Option<LoadedSessionMemory> {
     load_current_session_memory_snapshot(memoria, session_id)
@@ -590,7 +590,7 @@ pub async fn load_current_session_memory_with_freshness(
 }
 
 pub(crate) async fn load_current_session_memory_snapshot(
-    memoria: &dyn MemoriaClient,
+    memoria: &dyn MemoriaPort,
     session_id: &str,
 ) -> Option<SessionMemorySnapshot> {
     let session_id = session_id.trim();
@@ -661,7 +661,7 @@ pub fn load_local_session_memory_metadata(
 }
 
 pub async fn load_current_session_memory_preferring_local(
-    memoria: &dyn MemoriaClient,
+    memoria: &dyn MemoriaPort,
     session_id: &str,
 ) -> Option<String> {
     load_current_session_memory_preferring_local_with_freshness(memoria, session_id)
@@ -670,7 +670,7 @@ pub async fn load_current_session_memory_preferring_local(
 }
 
 pub async fn load_current_session_memory_preferring_local_with_freshness(
-    memoria: &dyn MemoriaClient,
+    memoria: &dyn MemoriaPort,
     session_id: &str,
 ) -> Option<LoadedSessionMemory> {
     let local = load_local_session_memory_artifact(session_id);
@@ -1077,7 +1077,7 @@ fn extract_llm_error_detail_from_json(payload: &Value) -> String {
 }
 
 async fn store_session_memory(
-    memoria: &Arc<dyn MemoriaClient>,
+    memoria: &Arc<dyn MemoriaPort>,
     session_id: &str,
     turn_number: u32,
     session_facts: &SessionFacts,
@@ -1222,7 +1222,7 @@ pub fn persist_local_session_memory_metadata(
 }
 
 async fn cleanup_prior_session_memory_entries(
-    memoria: &Arc<dyn MemoriaClient>,
+    memoria: &Arc<dyn MemoriaPort>,
     session_id: &str,
     current_memory_id: &str,
     current_encoded: &str,
@@ -1302,7 +1302,7 @@ async fn cleanup_prior_session_memory_entries(
 }
 
 async fn retrieve_prior_session_memory_page(
-    memoria: &Arc<dyn MemoriaClient>,
+    memoria: &Arc<dyn MemoriaPort>,
     session_id: &str,
     page_size: usize,
 ) -> Result<Vec<MemoriaMemory>, SessionMemoryExtractionErrorReason> {
@@ -1512,7 +1512,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MemoriaClient for CapturingMemoria {
+    impl MemoriaPort for CapturingMemoria {
         async fn retrieve_ext(
             &self,
             _query: &str,
@@ -1554,7 +1554,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MemoriaClient for FailingMemoria {
+    impl MemoriaPort for FailingMemoria {
         async fn retrieve_ext(
             &self,
             _query: &str,
@@ -1585,7 +1585,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MemoriaClient for DeleteFailMemoria {
+    impl MemoriaPort for DeleteFailMemoria {
         async fn retrieve_ext(
             &self,
             _query: &str,
@@ -1616,7 +1616,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MemoriaClient for OverflowingMemoria {
+    impl MemoriaPort for OverflowingMemoria {
         async fn retrieve_ext(
             &self,
             _query: &str,
@@ -1659,7 +1659,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MemoriaClient for FiniteDeleteMemoria {
+    impl MemoriaPort for FiniteDeleteMemoria {
         async fn retrieve_ext(
             &self,
             _query: &str,
@@ -1705,7 +1705,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MemoriaClient for TopKMemoria {
+    impl MemoriaPort for TopKMemoria {
         async fn retrieve_ext(
             &self,
             _query: &str,
@@ -1852,7 +1852,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_extraction_without_selector_persists_rule_fallback() {
-        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria,
             "sess-1",
@@ -1894,7 +1894,7 @@ mod tests {
         )
         .await;
 
-        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = LlmConnParams {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
@@ -1958,7 +1958,7 @@ mod tests {
             json!({"role": "user", "content": "What I asked for is a durable fix, not a workaround"}),
             json!({"role": "user", "content": "wrong, never use mocks in integration tests"}),
         ];
-        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = LlmConnParams {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
@@ -2026,7 +2026,7 @@ mod tests {
             json!({"role": "assistant", "content": "✓ Previous round: 3 tools executed in parallel"}),
             json!({"role": "user", "content": "## Already Fetched (do NOT re-read)\ncrates/runtime/src/session_memory/runner.rs"}),
         ];
-        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = LlmConnParams {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
@@ -2099,7 +2099,7 @@ mod tests {
             json!({"role": "assistant", "content": "Tool web_search timed out while waiting for the server"}),
             json!({"role": "assistant", "content": "Sensitive path requires explicit opt-in in Auto mode"}),
         ];
-        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = LlmConnParams {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
@@ -2152,7 +2152,7 @@ mod tests {
         )
         .await;
 
-        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = LlmConnParams {
             base_url: server_url,
             api_key: "anthropic-key".to_string(),
@@ -2203,7 +2203,7 @@ mod tests {
         )
         .await;
 
-        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = LlmConnParams {
             base_url: server_url,
             api_key: "bedrock-key".to_string(),
@@ -2251,7 +2251,7 @@ mod tests {
         )
         .await;
 
-        let memoria = Arc::new(FailingMemoria) as Arc<dyn MemoriaClient>;
+        let memoria = Arc::new(FailingMemoria) as Arc<dyn MemoriaPort>;
         let params = LlmConnParams {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
@@ -2312,7 +2312,7 @@ mod tests {
         )
         .await;
 
-        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let params = LlmConnParams {
             base_url: format!("{server_url}/v1"),
             api_key: "test-key".to_string(),
@@ -2381,7 +2381,7 @@ mod tests {
         )
         .await;
 
-        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
         let first = LlmConnParams {
             base_url: format!("{failing_url}/v1"),
             api_key: "test-key".to_string(),
@@ -2456,7 +2456,7 @@ mod tests {
                 ..Default::default()
             },
         ]);
-        let memoria_dyn = Arc::clone(&memoria) as Arc<dyn MemoriaClient>;
+        let memoria_dyn = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
 
         let artifacts = run_extraction(
             &memoria_dyn,
@@ -2507,7 +2507,7 @@ mod tests {
                 session_id: Some("sess-1".to_string()),
                 ..Default::default()
             }],
-        }) as Arc<dyn MemoriaClient>;
+        }) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria,
             "sess-1",
@@ -2531,7 +2531,7 @@ mod tests {
     async fn run_extraction_keeps_success_when_stale_cleanup_hits_page_cap() {
         let memoria = Arc::new(OverflowingMemoria {
             next_id: Mutex::new(0),
-        }) as Arc<dyn MemoriaClient>;
+        }) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria,
             "sess-overflow",
@@ -2557,7 +2557,7 @@ mod tests {
             remaining: Mutex::new(8),
             stored: Mutex::new(Vec::new()),
         });
-        let memoria_dyn = Arc::clone(&memoria) as Arc<dyn MemoriaClient>;
+        let memoria_dyn = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
         let artifacts = run_extraction(
             &memoria_dyn,
             "sess-bounded",

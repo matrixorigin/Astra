@@ -171,7 +171,7 @@ pub(crate) fn spawn_memory_recall_feedback_after_success(
     session_id: &str,
     name: &str,
     result: &astra_tools::ToolResult,
-    memoria_client: &astra_tools::memoria::MemoriaClient,
+    memoria_client: &astra_tools::memoria::MemoriaToolGateway,
 ) -> bool {
     if name == "memory" || result.is_error {
         return false;
@@ -179,7 +179,7 @@ pub(crate) fn spawn_memory_recall_feedback_after_success(
 
     let session_id = session_id.to_string();
     let context = format!("server-tool:{name}");
-    let client = astra_tools::memoria::MemoriaClient::new(
+    let client = astra_tools::memoria::MemoriaToolGateway::new(
         memoria_client.cloud_base.clone(),
         memoria_client.cloud_token.clone(),
     );
@@ -216,7 +216,7 @@ pub(crate) fn spawn_memory_recall_feedback_after_success(
 pub(crate) struct LocalToolExecutionLifecycle<'a> {
     pub(crate) session_id: &'a str,
     pub(crate) aggregate_output_bytes: &'a AtomicUsize,
-    pub(crate) memoria_client: &'a astra_tools::memoria::MemoriaClient,
+    pub(crate) memoria_client: &'a astra_tools::memoria::MemoriaToolGateway,
     pub(crate) progress_callback: Option<&'a dyn astra_tools::ToolProgressCallback>,
     pub(crate) exactly_once_executor: Option<&'a tool_exactly_once::ExactlyOnceState>,
 }
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn memory_recall_feedback_skips_memory_tool_and_errors() {
-        let client = astra_tools::memoria::MemoriaClient::new(None, None);
+        let client = astra_tools::memoria::MemoriaToolGateway::new(None, None);
         let ok_memory = astra_tools::ToolResult::text("ok".to_string());
         let failed = astra_tools::ToolResult::error("Error: denied".to_string());
 

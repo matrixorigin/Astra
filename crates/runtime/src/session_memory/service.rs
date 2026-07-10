@@ -13,7 +13,7 @@
 //!
 //! Ownership model:
 //!
-//! * [`SelectorParamsResolver`] + [`Arc<dyn MemoriaClient>`] are the
+//! * [`SelectorParamsResolver`] + [`Arc<dyn MemoriaPort>`] are the
 //!   only production dependencies. Both are injected at construction.
 //!   Tests swap in [`ConstSelectorResolver`] and a minimal capturing
 //!   mock client.
@@ -40,7 +40,7 @@ use astra_turn_core::cloud_session_memory_extract::SessionMemoryState;
 use astra_turn_types::{is_runtime_scaffolding_message, is_transient_runtime_status_text};
 
 use crate::memory_hooks::relevance::LlmConnParams;
-use crate::turn::cloud::memoria_compact::MemoriaClient;
+use crate::turn::cloud::memoria_compact::MemoriaPort;
 
 use super::activity::{BackgroundActivity, BackgroundActivityBroker};
 use super::gate::{GateDecision, evaluate};
@@ -102,7 +102,7 @@ impl SelectorParamsResolver for ConstSelectorResolver {
 /// [`crate::turn::agentic_loop::host::AgenticLoopState`].
 pub struct MemoryExtractionService {
     selector_resolver: Arc<dyn SelectorParamsResolver>,
-    memoria_client: Arc<dyn MemoriaClient>,
+    memoria_client: Arc<dyn MemoriaPort>,
     ingestion: IngestionSender,
     user_id: Arc<str>,
     health: Arc<SelectorHealth>,
@@ -149,7 +149,7 @@ impl MemoryExtractionService {
     /// `AgenticLoopState::memory_extraction_service = None`.
     pub fn new(
         selector_resolver: Arc<dyn SelectorParamsResolver>,
-        memoria_client: Arc<dyn MemoriaClient>,
+        memoria_client: Arc<dyn MemoriaPort>,
         ingestion: IngestionSender,
         user_id: impl Into<Arc<str>>,
         broker: Arc<BackgroundActivityBroker>,
@@ -1077,7 +1077,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl MemoriaClient for CapturingMemoria {
+    impl MemoriaPort for CapturingMemoria {
         async fn retrieve_ext(
             &self,
             _query: &str,
@@ -1147,7 +1147,7 @@ mod tests {
         let memoria = Arc::new(CapturingMemoria::default());
         let svc = Arc::new(MemoryExtractionService::new(
             Arc::new(ConstSelectorResolver(selector)),
-            Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+            Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
             ingestion,
             "test-user",
             broker,
@@ -1162,7 +1162,7 @@ mod tests {
         let svc = Arc::new(
             MemoryExtractionService::new(
                 Arc::new(ConstSelectorResolver(selector)),
-                Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+                Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
                 ingestion,
                 "test-user",
                 broker,
@@ -1556,7 +1556,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl MemoriaClient for BlockingFirstRetrieve {
+        impl MemoriaPort for BlockingFirstRetrieve {
             async fn retrieve_ext(
                 &self,
                 _: &str,
@@ -1599,7 +1599,7 @@ mod tests {
             stored: Mutex::new(Vec::new()),
         });
         let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaPort>);
         let sid = format!("queued-latest-worker-{}", nanos());
         let first = sample_req(&sid, 1_000, false);
         assert_eq!(svc.maybe_spawn(first.clone()), SpawnDecision::Spawned);
@@ -1632,7 +1632,7 @@ mod tests {
         struct PanickingMemoria;
 
         #[async_trait]
-        impl MemoriaClient for PanickingMemoria {
+        impl MemoriaPort for PanickingMemoria {
             async fn retrieve_ext(
                 &self,
                 _: &str,
@@ -1662,7 +1662,7 @@ mod tests {
         let broker = Arc::new(BackgroundActivityBroker::new());
         let svc = Arc::new(MemoryExtractionService::new(
             Arc::new(ConstSelectorResolver(None)),
-            Arc::new(PanickingMemoria) as Arc<dyn MemoriaClient>,
+            Arc::new(PanickingMemoria) as Arc<dyn MemoriaPort>,
             ingestion,
             "panic-cleanup-test",
             broker,
@@ -1715,7 +1715,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl MemoriaClient for ScriptedMemoria {
+    impl MemoriaPort for ScriptedMemoria {
         async fn retrieve_ext(
             &self,
             _q: &str,
@@ -1754,7 +1754,7 @@ mod tests {
 
     fn build_ctx_with_memoria(
         selector: Option<LlmConnParams>,
-        memoria: Arc<dyn MemoriaClient>,
+        memoria: Arc<dyn MemoriaPort>,
     ) -> (
         Arc<MemoryExtractionService>,
         tokio::sync::mpsc::Receiver<IngestionEvent>,
@@ -1788,7 +1788,7 @@ mod tests {
 
     fn build_ctx_with_resolver(
         resolver: Arc<dyn SelectorParamsResolver>,
-        memoria: Arc<dyn MemoriaClient>,
+        memoria: Arc<dyn MemoriaPort>,
     ) -> (
         Arc<MemoryExtractionService>,
         tokio::sync::mpsc::Receiver<IngestionEvent>,
@@ -1813,7 +1813,7 @@ mod tests {
             ..ScriptedMemoria::new()
         });
         let (svc, mut rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaPort>);
         let sid = format!("store-fail-{}", nanos());
         let req = sample_req(&sid, 50_000, false);
         assert_eq!(svc.maybe_spawn(req), SpawnDecision::Spawned);
@@ -1845,7 +1845,7 @@ mod tests {
             ..ScriptedMemoria::new()
         });
         let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaPort>);
         let sid = format!("retry-after-fail-{}", nanos());
         let req = sample_req(&sid, 50_000, false);
 
@@ -1867,7 +1867,7 @@ mod tests {
     async fn wait_for_pending_returns_zero_immediately_when_nothing_spawned() {
         let (svc, _rx, _broker) = build_ctx_with_memoria(
             None,
-            Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>,
+            Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>,
         );
         let started = Instant::now();
         let leftover = svc.wait_for_pending(Duration::from_secs(10)).await;
@@ -1895,7 +1895,7 @@ mod tests {
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, mut rx, _broker) = build_ctx_with_memoria(
             Some(selector_params.clone()),
-            Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+            Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
         );
         // Pre-populate the health map with a recent failure so the
         // next attempt finds the selector unhealthy without us having
@@ -1978,7 +1978,7 @@ mod tests {
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, mut rx, _broker) = build_ctx_with_resolver(
             Arc::new(OrderedSelectorResolver(vec![first.clone(), second.clone()])),
-            Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+            Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
         );
         svc.health.mark_failed(&first.model_name);
 
@@ -2021,7 +2021,7 @@ mod tests {
     async fn debounce_state_is_per_session() {
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaPort>);
         let sid_a = format!("iso-a-{}", nanos());
         let sid_b = format!("iso-b-{}", nanos());
 
@@ -2053,7 +2053,7 @@ mod tests {
     async fn forget_session_clears_debounce_state() {
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, _rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaPort>);
         let sid = format!("forget-{}", nanos());
 
         let req = sample_req(&sid, 20_000, false);
@@ -2088,7 +2088,7 @@ mod tests {
     ) {
         struct FailingMemoria;
         #[async_trait]
-        impl MemoriaClient for FailingMemoria {
+        impl MemoriaPort for FailingMemoria {
             async fn retrieve_ext(
                 &self,
                 _: &str,
@@ -2118,7 +2118,7 @@ mod tests {
         // test can exercise the Open → HalfOpen transition.
         let mut svc = MemoryExtractionService::new(
             Arc::new(ConstSelectorResolver(None)),
-            Arc::new(FailingMemoria) as Arc<dyn MemoriaClient>,
+            Arc::new(FailingMemoria) as Arc<dyn MemoriaPort>,
             ingestion,
             "breaker-test",
             Arc::clone(&broker),
@@ -2233,7 +2233,7 @@ mod tests {
         let broker = Arc::new(BackgroundActivityBroker::new());
         let mut svc = MemoryExtractionService::new(
             Arc::new(ConstSelectorResolver(Some(selector_params.clone()))),
-            Arc::clone(&memoria) as Arc<dyn MemoriaClient>,
+            Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
             ingestion,
             "probe-leak-test",
             Arc::clone(&broker),
@@ -2336,7 +2336,7 @@ mod tests {
     async fn skip_event_carries_messages_count_but_no_attempt() {
         let memoria = Arc::new(CapturingMemoria::default());
         let (svc, mut rx, _broker) =
-            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaClient>);
+            build_ctx_with_memoria(None, Arc::clone(&memoria) as Arc<dyn MemoriaPort>);
         let sid = format!("bc-skip-{}", nanos());
         // One-character input is rejected by the semantic-information gate.
         let req = ExtractionRequest {

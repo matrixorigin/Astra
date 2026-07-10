@@ -361,13 +361,13 @@ impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemoryS
 }
 
 #[derive(Debug)]
-struct CliSessionMemoryMemoriaClient {
+struct CliSessionMemoryMemoriaPort {
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
     working_ids: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
-impl CliSessionMemoryMemoriaClient {
+impl CliSessionMemoryMemoriaPort {
     fn new(api: astra_thin_client::ThinClient, profile: Option<&str>) -> Self {
         Self {
             api,
@@ -414,7 +414,7 @@ impl CliSessionMemoryMemoriaClient {
 }
 
 #[async_trait::async_trait]
-impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMemoryMemoriaClient {
+impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemoryMemoriaPort {
     async fn retrieve_ext(
         &self,
         query: &str,
@@ -628,8 +628,8 @@ async fn build_cli_session_memory_extractor(
         api: api.clone(),
         profile: profile.map(str::to_string),
     });
-    let memoria = std::sync::Arc::new(CliSessionMemoryMemoriaClient::new(api.clone(), profile))
-        as std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaClient>;
+    let memoria = std::sync::Arc::new(CliSessionMemoryMemoriaPort::new(api.clone(), profile))
+        as std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>;
     let ingestion = astra_services::event_ingestion::IngestionSender::disconnected();
     let broker =
         std::sync::Arc::new(astra_runtime::session_memory::BackgroundActivityBroker::new());

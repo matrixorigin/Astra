@@ -3,7 +3,9 @@
 use std::pin::Pin;
 use std::time::Duration;
 
-use astra_core::{SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
+use astra_sync_protocol::{
+    SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, sync_outbox_request_signature,
+};
 use async_stream::stream;
 use futures_util::{Stream, StreamExt};
 use reqwest::{
@@ -1416,7 +1418,7 @@ impl ThinClient {
         &self,
         bearer_override: Option<&str>,
         body: &Value,
-    ) -> Result<Value, ThinClientError> {
+    ) -> Result<SyncOutboxAck, ThinClientError> {
         let url = self.url(paths::SYNC_OUTBOX_EVENTS)?;
         let mut headers = self.auth_headers_for(bearer_override);
         if let Some(token) = self.resolved_bearer_token(bearer_override) {
@@ -1433,6 +1435,23 @@ impl ThinClient {
             .post(url)
             .headers(headers)
             .json(body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
+    /// Read back one authoritative event for delivery reconciliation.
+    pub async fn get_event_json(
+        &self,
+        bearer_override: Option<&str>,
+        event_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::event(event_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override))
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
@@ -2234,12 +2253,10 @@ mod tests {
                 sync_outbox_request_signature("tok", &body),
             ))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "event_id": "sync_evt_1",
-                "metadata": {
-                    "sync_outbox": {
-                        "payload_hash": "sha256:abc"
-                    }
-                }
+                "schema_version": 1,
+                "record_id": "sync_evt_1",
+                "payload_hash": "sha256:abc",
+                "ingestion_status": "created"
             })))
             .mount(&srv)
             .await;
@@ -2249,8 +2266,7 @@ mod tests {
             .post_sync_outbox_event_json(Some("tok"), &body)
             .await
             .unwrap();
-        assert_eq!(v["event_id"], "sync_evt_1");
-        assert_eq!(v["metadata"]["sync_outbox"]["payload_hash"], "sha256:abc");
+        assert!(v.confirms("sync_evt_1", "sha256:abc"));
     }
 
     #[tokio::test]

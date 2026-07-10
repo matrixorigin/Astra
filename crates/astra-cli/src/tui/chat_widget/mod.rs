@@ -568,6 +568,11 @@ impl ChatWidget {
             crate::tui::history_cell::task::TaskStatus::Completed
         ) {
             AgentRowStatus::Completed
+        } else if matches!(
+            cell.status,
+            crate::tui::history_cell::task::TaskStatus::Interrupted
+        ) {
+            AgentRowStatus::Interrupted
         } else if self.cancelling_task_ids.contains(id) {
             AgentRowStatus::Cancelling
         } else {
@@ -1495,6 +1500,7 @@ impl ChatWidget {
                     let status_str = match termination {
                         AgentLiveTermination::Completed => "completed",
                         AgentLiveTermination::Failed => "failed",
+                        AgentLiveTermination::Interrupted => "interrupted",
                         AgentLiveTermination::Cancelled => "cancelled",
                     };
                     let summary = reason.clone();
@@ -1949,6 +1955,7 @@ fn task_status_to_agent_row_status(
     match status {
         crate::tui::history_cell::task::TaskStatus::Running => AgentRowStatus::Live,
         crate::tui::history_cell::task::TaskStatus::Completed => AgentRowStatus::Completed,
+        crate::tui::history_cell::task::TaskStatus::Interrupted => AgentRowStatus::Interrupted,
         crate::tui::history_cell::task::TaskStatus::Failed => AgentRowStatus::Failed,
     }
 }
@@ -4391,6 +4398,40 @@ mod tests {
             target.status,
             AgentRowStatus::Failed,
             "drilldown row must report failed status"
+        );
+    }
+
+    #[test]
+    fn agent_terminated_interrupted_preserves_resumable_status() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
+        };
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+            agent_id: "reviewer@paused".into(),
+            kind: AgentLiveEventKind::OutputDelta("partial findings".into()),
+        })));
+        widget.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+            agent_id: "reviewer@paused".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: AgentLiveTermination::Interrupted,
+                duration_ms: 500,
+                reason: Some("paused".into()),
+            },
+        })));
+
+        let row = widget
+            .agent_run_cell("reviewer@paused")
+            .expect("interrupted row remains inspectable");
+        assert_eq!(
+            row.status,
+            crate::tui::history_cell::task::TaskStatus::Interrupted
+        );
+        assert!(!widget.agent_is_cancelled("reviewer@paused"));
+        assert_eq!(
+            widget.agents_drilldown_rows(5)[0].status,
+            AgentRowStatus::Interrupted
         );
     }
 

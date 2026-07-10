@@ -55,7 +55,7 @@ pub(crate) fn drop_unattributed_memory_recalls_at_turn_end(session_id: Option<&s
     // A completed turn is not proof that a surfaced memory helped. Successful
     // tool-result hooks already close causally adjacent recalls; anything left
     // here is unattributed and must be dropped without reinforcing its rank.
-    astra_tools::memoria::MemoriaClient::drain_recalls(session_id, None).len()
+    astra_tools::memoria::MemoriaToolGateway::drain_recalls(session_id, None).len()
 }
 
 #[derive(Clone)]
@@ -394,14 +394,14 @@ mod tests {
     #[test]
     fn turn_end_drops_unattributed_recalls_without_sending_positive_feedback() {
         let session_id = "chat-turn-close-feedback";
-        astra_tools::memoria::MemoriaClient::reset_recall_ledger(session_id);
-        astra_tools::memoria::MemoriaClient::record_recall(session_id, 4, vec!["m1".into()]);
+        astra_tools::memoria::MemoriaToolGateway::reset_recall_ledger(session_id);
+        astra_tools::memoria::MemoriaToolGateway::record_recall(session_id, 4, vec!["m1".into()]);
 
         let dropped = drop_unattributed_memory_recalls_at_turn_end(Some(session_id));
 
         assert_eq!(dropped, 1);
         assert_eq!(
-            astra_tools::memoria::MemoriaClient::pending_recall_count(session_id),
+            astra_tools::memoria::MemoriaToolGateway::pending_recall_count(session_id),
             0
         );
     }

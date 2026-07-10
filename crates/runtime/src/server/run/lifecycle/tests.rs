@@ -1324,7 +1324,12 @@ fn extract_prev_assistant_text_skips_empty_assistant_bodies() {
 
 #[test]
 fn build_run_turn_complete_event_carries_authoritative_assistant_text() {
-    let event = build_run_turn_complete_event_with_interruption(0, "recovered final answer", None);
+    let event = build_run_turn_complete_event_with_interruption(
+        0,
+        "recovered final answer",
+        None,
+        &astra_turn_core::complete::TurnCompletionFacts::default(),
+    );
     assert_eq!(event["type"], "turn_complete");
     assert_eq!(event["assistant_text"], "recovered final answer");
     assert_eq!(event["has_tool_calls"], false);
@@ -1332,7 +1337,12 @@ fn build_run_turn_complete_event_carries_authoritative_assistant_text() {
 
 #[test]
 fn build_run_turn_complete_event_omits_empty_assistant_text() {
-    let event = build_run_turn_complete_event_with_interruption(1, "", None);
+    let event = build_run_turn_complete_event_with_interruption(
+        1,
+        "",
+        None,
+        &astra_turn_core::complete::TurnCompletionFacts::default(),
+    );
     assert_eq!(event["type"], "turn_complete");
     assert_eq!(event["has_tool_calls"], true);
     assert!(event.get("assistant_text").is_none());
@@ -1564,7 +1574,7 @@ fn server_subrun_empty_completion_remains_paused_regardless_of_task_board() {
     let outcome = Ok(AgenticLoopOutcome::Completed);
     assert_eq!(
         server_subrun_live_termination(&outcome, &state),
-        astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled
+        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
     );
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),
@@ -1608,7 +1618,7 @@ fn server_subrun_requires_intervention_from_interruption_not_task_board() {
     let outcome = Ok(AgenticLoopOutcome::Completed);
     assert_eq!(
         server_subrun_live_termination(&outcome, &state),
-        astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled
+        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
     );
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),
@@ -1756,6 +1766,7 @@ fn build_run_turn_complete_event_marks_interrupted_turns() {
         7,
         "[Round budget hard-limit reached]",
         Some(&interruption),
+        &astra_turn_core::complete::TurnCompletionFacts::default(),
     );
 
     assert_eq!(event["type"], "turn_complete");

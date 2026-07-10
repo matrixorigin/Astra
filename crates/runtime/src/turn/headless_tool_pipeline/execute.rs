@@ -147,6 +147,15 @@ fn execution_error_kind(
         .or_else(|| structured_output_error_kind(result_str))
 }
 
+fn execution_recovery_evidence(
+    tool_result_fields: Option<&Map<String, Value>>,
+) -> Option<astra_core::ToolFailureEvidence> {
+    tool_result_fields
+        .and_then(|fields| fields.get("recovery_evidence"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 fn structured_output_error_kind(result_str: &str) -> Option<astra_core::ErrorKind> {
     serde_json::from_str::<Value>(result_str)
         .ok()
@@ -264,6 +273,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         );
         let source_error_kind =
             execution_error_kind(&execution.result_str, execution.tool_result_fields.as_ref());
+        let source_recovery_evidence =
+            execution_recovery_evidence(execution.tool_result_fields.as_ref());
         let tool_already_restricted = self.ctx.restricted_tools.contains(&execution.name);
         let quiet = self.ctx.quiet;
         let term = &mut self.ctx.term;
@@ -275,6 +286,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &mut execution.result_str,
             &mut is_err,
             source_error_kind,
+            source_recovery_evidence.as_ref(),
             tool_already_restricted,
             &mut enrich_ctx,
             |sig| {

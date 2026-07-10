@@ -8,9 +8,9 @@ use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::slash::{slash_health, slash_router::handle_slash_command};
 use crate::tests::isolate_credentials;
-use astra_core::{SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
 use astra_services::SyncOutboxStore;
 use astra_services::session_journal::{self, JournalDirGuard};
+use astra_sync_protocol::{SYNC_OUTBOX_SIGNATURE_HEADER, sync_outbox_request_signature};
 use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -399,6 +399,96 @@ async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
         .and(header("authorization", "Bearer token"))
         .and(header(SYNC_OUTBOX_SIGNATURE_HEADER, expected_signature))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "schema_version": 1,
+            "record_id": record.record_id,
+            "payload_hash": record.payload_hash,
+            "ingestion_status": "created"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let report = cloud_sync::try_drain_sync_outbox(10).await;
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.acked, 1);
+    assert_eq!(report.failed, 0);
+    let status = SyncOutboxStore::local().status().expect("status");
+    assert_eq!(status.acked, 1);
+    assert_eq!(status.pending, 0);
+    assert_eq!(status.ack_watermark, 1);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_ack() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _guard = JournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+
+    let sid = format!("test-cloud-drain-reconcile-{}", uuid::Uuid::new_v4());
+    let state = SessionState {
+        session_id: Some(sid.clone()),
+        ..Default::default()
+    };
+    append_cloud_pull_sync_journal(
+        &state,
+        "default",
+        "post_login",
+        &CloudPullResult {
+            cloud_reachable: true,
+        },
+        &[],
+    );
+
+    let record = SyncOutboxStore::local()
+        .ready_records(1)
+        .expect("ready records")
+        .into_iter()
+        .next()
+        .expect("outbox record");
+    let mut metadata = record
+        .payload
+        .get("metadata")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    metadata.insert(
+        "sync_outbox".to_string(),
+        json!({
+            "schema_version": record.schema_version,
+            "record_id": record.record_id,
+            "sequence": record.sequence,
+            "payload_hash": record.payload_hash,
+            "event_ts": record.event_ts,
+        }),
+    );
+    let expected_body = json!({
+        "event_id": record.record_id,
+        "session_id": record.session_id,
+        "event_type": record.event_type,
+        "content": record.canonical_payload_json(),
+        "agent_id": "edge_sync",
+        "agent_version": env!("CARGO_PKG_VERSION"),
+        "metadata": Value::Object(metadata),
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events"))
+        .and(header(
+            SYNC_OUTBOX_SIGNATURE_HEADER,
+            sync_outbox_request_signature("token", &expected_body),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "event_id": record.record_id
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/events/{}", record.record_id)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "event_id": record.record_id,
             "user_id": "user-a",
             "session_id": sid,
@@ -420,12 +510,11 @@ async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
         .await;
 
     let report = cloud_sync::try_drain_sync_outbox(10).await;
-    assert_eq!(report.attempted, 1);
     assert_eq!(report.acked, 1);
     assert_eq!(report.failed, 0);
     let status = SyncOutboxStore::local().status().expect("status");
     assert_eq!(status.acked, 1);
-    assert_eq!(status.pending, 0);
+    assert_eq!(status.poisoned, 0);
     assert_eq!(status.ack_watermark, 1);
 }
 
