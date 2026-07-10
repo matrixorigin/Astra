@@ -1,5 +1,6 @@
 use astra_config::user_profile::TurnIntent;
 use astra_services::{TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError};
+use std::time::Instant;
 
 /// Judge the user's turn using the supplied LLM judge, falling back to the
 /// absence of explicit intent on failure (transport, malformed response, or
@@ -19,6 +20,7 @@ pub(crate) async fn judge_turn_intent_with_llm(
     recent_tools: &[String],
     has_prior_assistant_turn: bool,
 ) -> Option<TurnIntent> {
+    let started_at = Instant::now();
     let ctx = TurnIntentJudgeContext {
         message: message.to_string(),
         turn_count,
@@ -27,9 +29,14 @@ pub(crate) async fn judge_turn_intent_with_llm(
     };
     match judge.judge(&ctx).await {
         Ok(intent) => {
-            tracing::debug!(
+            tracing::info!(
                 target: "astra::turn_intent",
+                operation = "turn_intent.judge",
                 source = "llm_judge",
+                status = "success",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                turn_count,
+                has_prior_assistant_turn,
                 requested = ?intent.requested_scenario,
                 continuation = ?intent.continuation_mode,
                 reanchors = intent.reanchors_current_objective,
@@ -38,6 +45,7 @@ pub(crate) async fn judge_turn_intent_with_llm(
             Some(intent)
         }
         Err(error) => {
+            let duration_ms = started_at.elapsed().as_millis() as u64;
             // Match the error class to the right severity. Transport errors
             // are operational signal. Malformed responses indicate prompt
             // drift / model regression (raw text is already truncated by the
@@ -46,22 +54,37 @@ pub(crate) async fn judge_turn_intent_with_llm(
             match &error {
                 TurnIntentJudgeError::Transport(detail) => tracing::warn!(
                     target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
                     source = "llm_judge",
+                    status = "error",
                     error_kind = "transport",
+                    duration_ms,
+                    turn_count,
+                    has_prior_assistant_turn,
                     detail = %detail,
                     "turn intent judge transport failure; proceeding without explicit turn intent"
                 ),
                 TurnIntentJudgeError::Malformed { raw } => tracing::warn!(
                     target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
                     source = "llm_judge",
+                    status = "error",
                     error_kind = "malformed",
+                    duration_ms,
+                    turn_count,
+                    has_prior_assistant_turn,
                     raw = %raw,
                     "turn intent judge returned malformed response; proceeding without explicit turn intent"
                 ),
                 TurnIntentJudgeError::Rejected(detail) => tracing::info!(
                     target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
                     source = "llm_judge",
+                    status = "error",
                     error_kind = "rejected",
+                    duration_ms,
+                    turn_count,
+                    has_prior_assistant_turn,
                     detail = %detail,
                     "turn intent judge rejected request; proceeding without explicit turn intent"
                 ),

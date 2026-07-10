@@ -7,6 +7,7 @@ use crate::server::{
     },
     run::handlers::transform_stream_run_events_for_client,
 };
+use axum::Extension;
 use axum::extract::rejection::JsonRejection;
 
 fn chat_request_json_rejection_to_error(
@@ -178,6 +179,7 @@ pub(super) async fn chat_handler(
 
 pub(super) async fn chat_stream_handler(
     State(state): State<AppState>,
+    trace: Option<Extension<RequestTrace>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -205,6 +207,12 @@ pub(super) async fn chat_stream_handler(
 
     let mut chat_data = chat_request_into_data(request);
     chat_data.forward_headers = collect_forward_headers(&headers);
+    if let Some(Extension(trace)) = trace {
+        chat_data
+            .forward_headers
+            .entry("x-request-id".to_string())
+            .or_insert(trace.request_id);
+    }
     let resolved = match resolve_or_create_chat_session(
         &state,
         &user,
@@ -1764,10 +1772,24 @@ mod chat_stream_lifecycle_tests {
             .expect("response should be returned");
 
         assert_eq!(resp.status(), StatusCode::OK);
+        let response_request_id = resp
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("request trace middleware must return x-request-id")
+            .to_string();
         let requests = lifecycle.recorded_requests().await;
         assert_eq!(requests.len(), 1, "one stream request expected");
         assert!(requests[0].full_llm_capture);
         assert_eq!(requests[0].session_id.as_deref(), Some("capture-session"));
+        assert_eq!(
+            requests[0]
+                .forward_headers
+                .get("x-request-id")
+                .map(String::as_str),
+            Some(response_request_id.as_str()),
+            "generated request id must reach the background runtime request"
+        );
     }
 
     #[tokio::test]

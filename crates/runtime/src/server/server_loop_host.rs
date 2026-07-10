@@ -4193,25 +4193,67 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
 
         if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
-            tracing::debug!(
+            tracing::info!(
                 target: "astra::turn_intent",
+                operation = "turn_intent.phase",
+                status = "skipped",
                 policy = auxiliary_llm_policy_label(),
                 reason,
+                duration_ms = 0_u64,
                 "turn intent judge skipped by capacity policy"
             );
             return None;
         }
 
-        let client = self.turn_intent_summary_client(state).await?;
+        let phase_started_at = Instant::now();
+        let model_resolution_started_at = Instant::now();
+        let Some(client) = self.turn_intent_summary_client(state).await else {
+            let duration_ms = phase_started_at.elapsed().as_millis() as u64;
+            tracing::info!(
+                target: "astra::turn_intent",
+                operation = "turn_intent.phase",
+                status = "skipped",
+                reason = "model_resolution_unavailable",
+                model_resolution_ms = model_resolution_started_at.elapsed().as_millis() as u64,
+                duration_ms,
+                "turn intent phase completed"
+            );
+            return None;
+        };
+        let model_resolution_ms = model_resolution_started_at.elapsed().as_millis() as u64;
+        let (model_name, provider) = self
+            .resolved_llm_config
+            .as_ref()
+            .map(|config| (config.model_name.clone(), config.provider.clone()))
+            .or_else(|| {
+                self.resolved_llm_params
+                    .as_ref()
+                    .map(|params| (params.model_name.clone(), params.provider.clone()))
+            })
+            .unwrap_or_default();
         let judge = SummaryClientTurnIntentJudge { client };
-        crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
+        let result = crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
             &judge,
             &state.message,
             turn_count,
             &state.recent_tools,
             has_prior_assistant_turn,
         )
-        .await
+        .await;
+        let duration_ms = phase_started_at.elapsed().as_millis() as u64;
+        let judge_ms = duration_ms.saturating_sub(model_resolution_ms);
+        tracing::info!(
+            target: "astra::turn_intent",
+            operation = "turn_intent.phase",
+            status = if result.is_some() { "success" } else { "no_intent" },
+            model = %model_name,
+            provider = %provider,
+            model_resolution_ms,
+            judge_ms,
+            duration_ms,
+            "turn intent phase completed"
+        );
+        result
     }
 
     async fn judge_factual_retry_fallback(
@@ -4622,6 +4664,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut attempt_in_round = 0_u32;
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
+        let mut first_stream_update_turn_ms: Option<u64> = None;
+        let mut first_visible_text_turn_ms: Option<u64> = None;
         let result = loop {
             let attempt_label = llm_main_attempt_label(attempt_in_round);
             let admission_estimated_tokens = crate::prompts::estimate_tokens(
@@ -4705,12 +4749,27 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             state.step_recorder.begin_llm_round(&llm_cfg.model_name);
             let llm_round_start = std::time::Instant::now();
+            let turn_prepare_ms = llm_round_start.duration_since(turn_started).as_millis() as u64;
             let llm_cancel = llm_cancel_for_state(state);
+            let mut attempt_first_stream_update_ms: Option<u64> = None;
+            let mut attempt_first_visible_text_ms: Option<u64> = None;
             let r = {
                 let mut attempt_text = String::new();
                 let mut attempt_reasoning = String::new();
                 let mut on_stream_update = |update: LlmStreamUpdate| match update {
                     LlmStreamUpdate::TextDelta(content) => {
+                        if !content.is_empty() {
+                            attempt_first_stream_update_ms.get_or_insert_with(|| {
+                                llm_round_start.elapsed().as_millis() as u64
+                            });
+                            attempt_first_visible_text_ms.get_or_insert_with(|| {
+                                llm_round_start.elapsed().as_millis() as u64
+                            });
+                            first_stream_update_turn_ms
+                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
+                            first_visible_text_turn_ms
+                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
+                        }
                         attempt_text.push_str(&content);
                         if streamed_text.starts_with(&attempt_text) {
                             return;
@@ -4732,6 +4791,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         }
                     }
                     LlmStreamUpdate::ReasoningDelta(content) => {
+                        if !content.is_empty() {
+                            attempt_first_stream_update_ms.get_or_insert_with(|| {
+                                llm_round_start.elapsed().as_millis() as u64
+                            });
+                            first_stream_update_turn_ms
+                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
+                        }
                         attempt_reasoning.push_str(&content);
                         if streamed_reasoning.starts_with(&attempt_reasoning) {
                             return;
@@ -4773,6 +4839,63 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 )
                 .await
             };
+            let provider_duration_ms = llm_round_start.elapsed().as_millis() as u64;
+            match &r {
+                Ok(result) => {
+                    let usage =
+                        crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
+                    tracing::info!(
+                        target: "astra::llm_timing",
+                        operation = "main_llm.call",
+                        status = "success",
+                        run_id = %state.current_run_id.as_deref().unwrap_or(""),
+                        session_id = %self.session_id,
+                        turn = state.session_turn,
+                        round = prompt_round,
+                        attempt = attempt_in_round,
+                        model = %llm_cfg.model_name,
+                        actual_model = %result.model_used,
+                        provider = %llm_cfg.provider,
+                        turn_prepare_ms,
+                        provider_duration_ms,
+                        provider_ttft_ms = ?attempt_first_stream_update_ms,
+                        visible_ttft_ms = ?attempt_first_visible_text_ms,
+                        turn_ttft_ms = ?first_stream_update_turn_ms,
+                        turn_visible_ttft_ms = ?first_visible_text_turn_ms,
+                        finish_reason = ?result.finish_reason,
+                        estimated_tokens = admission_estimated_tokens,
+                        input_tokens = usage.input_tokens,
+                        output_tokens = usage.output_tokens,
+                        cached_input_tokens = usage.cached_input_tokens,
+                        cache_creation_tokens = usage.cache_creation_tokens,
+                        text_chars = result.full_text.chars().count(),
+                        reasoning_chars = result.reasoning.chars().count(),
+                        tool_calls = result.tool_calls.len(),
+                        "main LLM call completed"
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    target: "astra::llm_timing",
+                    operation = "main_llm.call",
+                    status = "error",
+                    run_id = %state.current_run_id.as_deref().unwrap_or(""),
+                    session_id = %self.session_id,
+                    turn = state.session_turn,
+                    round = prompt_round,
+                    attempt = attempt_in_round,
+                    model = %llm_cfg.model_name,
+                    provider = %llm_cfg.provider,
+                    turn_prepare_ms,
+                    provider_duration_ms,
+                    provider_ttft_ms = ?attempt_first_stream_update_ms,
+                    visible_ttft_ms = ?attempt_first_visible_text_ms,
+                    turn_ttft_ms = ?first_stream_update_turn_ms,
+                    turn_visible_ttft_ms = ?first_visible_text_turn_ms,
+                    error_kind = error.kind.as_str(),
+                    estimated_tokens = admission_estimated_tokens,
+                    "main LLM call completed"
+                ),
+            }
 
             // Context-window errors flow through the accum so the agentic loop's
             // Fatal handler can trigger auto-compaction + retry.
@@ -4857,7 +4980,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         context_manifest_trace: state.last_llm_context_manifest_trace.clone(),
                         ..Default::default()
                     };
-                    let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
+                    let ttft_ms = Some(
+                        first_stream_update_turn_ms
+                            .unwrap_or_else(|| turn_started.elapsed().as_millis() as u64),
+                    );
                     return Ok(HostTurnResult {
                         accum,
                         ttft_ms,
@@ -5095,7 +5221,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .await;
 
         // ── 6. Build turn result ────────────────────────────────────────
-        let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
+        let ttft_ms = Some(
+            first_stream_update_turn_ms
+                .unwrap_or_else(|| turn_started.elapsed().as_millis() as u64),
+        );
         let mut accum = Self::result_to_accum(&result);
         accum.system_prompt_tokens = Some(final_system_prompt_breakdown.total_tokens);
         accum.system_prompt_breakdown = serde_json::to_value(&final_system_prompt_breakdown).ok();

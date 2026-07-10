@@ -29,6 +29,7 @@ use futures_util::FutureExt;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, RwLock, broadcast, mpsc, oneshot};
+use tracing::Instrument;
 
 use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
@@ -5881,14 +5882,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        let request_started_at = Instant::now();
         let request = Self::prepare_chat_request(request)?;
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
         let mut request = self.prepare_model_gateway_invocation(request).await?;
         Self::install_agent_binding_runtime_forward_headers(&mut request)?;
+        let correlation_request_id = request
+            .forward_headers
+            .get("x-request-id")
+            .map(String::as_str)
+            .unwrap_or("")
+            .to_string();
+        let request_resolution_ms = request_started_at.elapsed().as_millis() as u64;
 
         // ── Resource governance check ────────────────────────────────
+        let governance_started_at = Instant::now();
         if let Some(ref gov) = self.resource_governor {
             if let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
                 gov.check_run_start(&user_id).await
@@ -5896,6 +5906,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(per_user_run_quota_response(limit, reason));
             }
         }
+        let governance_ms = governance_started_at.elapsed().as_millis() as u64;
 
         let run_id = Uuid::new_v4().to_string();
         let session_id = request
@@ -5904,6 +5915,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let agent_binding_mode = request.agent_binding.is_some();
+        let capability_resolution_started_at = Instant::now();
         let edge_context = Self::extract_edge_context(&request)?;
         let edge_tools = edge_context.edge_tools.clone();
         let server_service_tool_catalog_enabled =
@@ -5922,9 +5934,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         );
+        let capability_resolution_ms =
+            capability_resolution_started_at.elapsed().as_millis() as u64;
 
         // Provision explicit workspace bindings early so build_initial_state
         // and durable run_started metadata use the same execution boundary.
+        let workspace_started_at = Instant::now();
         let cloud_workspace_record = self
             .provision_cloud_workspace_record(&user_id, &session_id, &request, &run_id)
             .await?;
@@ -5970,9 +5985,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .server_agent_spawner_for_session(&session_id)
             .await
             .spawner;
+        let workspace_ms = workspace_started_at.elapsed().as_millis() as u64;
 
         // Create bounded live channels. If a client cannot keep up, the host
         // detaches that live stream without cancelling the server-side run.
+        let state_restore_started_at = Instant::now();
         const SSE_CHANNEL_CAPACITY: usize = 512;
         let (client_event_tx, event_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let (event_tx, mut fanout_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
@@ -6122,9 +6139,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone());
         }
+        let state_restore_ms = state_restore_started_at.elapsed().as_millis() as u64;
 
         // Guard: reject if this session already has a blocking run.
         // Hold write lock across check+insert to prevent TOCTOU race.
+        let durable_run_started_at = Instant::now();
         {
             let mut runs = self.runs.write().await;
             let has_active = Self::session_has_blocking_run(&runs, &session_id);
@@ -6218,7 +6237,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             };
             persist_session_transcript_items(pool, &user_id, &session_id, &[user_transcript]).await;
         }
+        let durable_run_ms = durable_run_started_at.elapsed().as_millis() as u64;
 
+        let runtime_wiring_started_at = Instant::now();
         self.configure_loop_state_runtime_controls(
             &mut state,
             &cancel_flag,
@@ -6364,6 +6385,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await;
             wire_executor_into_state(executor, &mut state);
         }
+        let runtime_wiring_ms = runtime_wiring_started_at.elapsed().as_millis() as u64;
 
         // Clone handles for the background task.
         let runs = self.runs_handle();
@@ -6397,6 +6419,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── Global admission control: limit concurrent agentic loop tasks ──
         // Wait for a configured interval before returning a structured 503.
+        let admission_started_at = Instant::now();
         let permit = match self.acquire_run_permit(run_admission_timeout()).await {
             Ok(permit) => permit,
             Err(error) => {
@@ -6424,14 +6447,46 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(run_admission_capacity_response(error));
             }
         };
+        let admission_ms = admission_started_at.elapsed().as_millis() as u64;
 
         // Background task tracking (same pattern as the create_run spawn above).
         // Spawn the agentic loop in a background task. Events are pushed
         // through event_tx incrementally; the HTTP handler streams them.
         let bg_task_count_2 = Arc::clone(&self.background_task_count);
         bg_task_count_2.fetch_add(1, Ordering::Release);
+        let request_prepare_ms = request_started_at.elapsed().as_millis() as u64;
+        tracing::info!(
+            target: "astra_runtime::timing",
+            operation = "stream_chat.prepare",
+            status = "success",
+            request_id = %correlation_request_id,
+            run_id = %run_id,
+            session_id = %session_id,
+            user_id = %user_id,
+            agent_id = %request.agent_id.as_deref().unwrap_or(""),
+            model = %request.model.as_deref().unwrap_or(""),
+            request_resolution_ms,
+            governance_ms,
+            capability_resolution_ms,
+            workspace_ms,
+            state_restore_ms,
+            durable_run_ms,
+            runtime_wiring_ms,
+            admission_ms,
+            duration_ms = request_prepare_ms,
+            "stream chat run prepared"
+        );
+        let run_span = tracing::info_span!(
+            target: "astra_runtime::timing",
+            "astra.run",
+            request_id = %correlation_request_id,
+            run_id = %run_id,
+            session_id = %session_id,
+            user_id = %user_id,
+        );
         spawn_observed(
             async move {
+                let background_started_at = Instant::now();
                 let _permit = permit; // RAII: released when this task completes
                 struct TaskCountGuard(Arc<AtomicUsize>);
                 impl Drop for TaskCountGuard {
@@ -6486,6 +6541,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 .await;
                             }
                         }
+                        tracing::warn!(
+                            target: "astra_runtime::timing",
+                            operation = "stream_chat.run",
+                            status = "quota_rejected",
+                            duration_ms = background_started_at.elapsed().as_millis() as u64,
+                            "streaming run completed"
+                        );
                         drop(event_tx);
                         return;
                     }
@@ -6498,8 +6560,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     bg_pause_flag.clone(),
                     bg_llm_cancel_token.clone(),
                 );
+                let agentic_loop_started_at = Instant::now();
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
+                let agentic_loop_ms = agentic_loop_started_at.elapsed().as_millis() as u64;
                 let loop_success = loop_result.is_ok();
 
                 // Best-effort post-loop persistence (core events, tool events,
@@ -6773,12 +6837,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         .await;
                 }
 
+                let stream_duration_ms = background_started_at.elapsed().as_millis() as u64;
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    operation = "stream_chat.run",
+                    status = persisted_status.as_str(),
+                    duration_ms = stream_duration_ms,
+                    agentic_loop_ms,
+                    finalization_ms = stream_duration_ms.saturating_sub(agentic_loop_ms),
+                    prompt_tokens = state.total_prompt,
+                    completion_tokens = state.total_completion,
+                    tool_calls = state.total_tool_calls,
+                    "streaming run completed"
+                );
+
                 // Drop event_tx — signals end-of-stream to the HTTP handler.
                 drop(event_tx);
 
                 // Post-loop memory cleanup — identical to `create_run`. Runs
                 // AFTER event_tx drops; default async mode schedules external
                 // Memoria work without holding the run permit on governance RTT.
+                let cleanup_started_at = Instant::now();
                 post_loop_memory_cleanup(
                     state.current_session_id.as_deref().unwrap_or(""),
                     &state.session_facts,
@@ -6799,7 +6878,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     )
                     .await;
                 }
-            },
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    operation = "stream_chat.cleanup",
+                    status = "completed",
+                    duration_ms = cleanup_started_at.elapsed().as_millis() as u64,
+                    total_background_ms = background_started_at.elapsed().as_millis() as u64,
+                    "streaming run cleanup completed"
+                );
+            }
+            .instrument(run_span),
             "agentic_loop_stream_chat",
         );
 
