@@ -1182,6 +1182,8 @@ async fn close_pending_memory_feedback_at_turn_end(state: &mut AgenticLoopState)
 
 #[cfg(test)]
 mod tests {
+    use crate::server::runtime_tool_executor::RuntimeToolExecutor;
+    use crate::server::tool_transport::{ExecutorBinding, WorkspaceBinding};
     use crate::turn::agentic_loop::host::tests::{
         MockHost, edge_tool_result, make_edge_tool, make_state, text_result,
     };
@@ -1207,6 +1209,19 @@ mod tests {
                 astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
             ),
         );
+        let workspace = std::env::temp_dir();
+        let mut executor = RuntimeToolExecutor::new(
+            workspace.clone(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        executor.set_execution_bindings(
+            WorkspaceBinding::server_sandbox(&workspace),
+            ExecutorBinding::server_local(),
+        );
+        state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
     }
 
     #[test]

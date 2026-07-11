@@ -325,6 +325,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let mut tool_results: Vec<EdgeToolExecResult> = Vec::new();
     let mut approval_results: Vec<EdgeApprovalResult> = Vec::new();
     let mut abort: Option<SseAbortReason> = None;
+    let mut abort_message: Option<String> = None;
     let mut first_sse_frame_seen = false;
     let mut reported_session_id: Option<String> = None;
 
@@ -389,7 +390,17 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             abort = Some(astra_core::ErrorKind::StreamTransport);
             break;
         };
-        for event_str in framer.push_lossy_bytes(&bytes) {
+        let event_blocks = match framer.push_bytes(&bytes) {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                abort = Some(astra_core::ErrorKind::StreamTransport);
+                abort_message = Some(format!(
+                    "Error: invalid UTF-8 in model SSE response: {error}"
+                ));
+                break;
+            }
+        };
+        for event_str in event_blocks {
             let _ = process_sse_event_block(
                 &event_str,
                 host,
@@ -433,7 +444,17 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 Ok(bytes) => {
                     let mut saw_event = false;
                     let mut all_events_extended_batch = true;
-                    for event_str in framer.push_lossy_bytes(&bytes) {
+                    let event_blocks = match framer.push_bytes(&bytes) {
+                        Ok(blocks) => blocks,
+                        Err(error) => {
+                            abort = Some(astra_core::ErrorKind::StreamTransport);
+                            abort_message = Some(format!(
+                                "Error: invalid UTF-8 in model SSE response: {error}"
+                            ));
+                            break;
+                        }
+                    };
+                    for event_str in event_blocks {
                         saw_event = true;
                         all_events_extended_batch &= process_sse_event_block(
                             &event_str,
@@ -496,16 +517,29 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 )
             }
             Some(astra_core::ErrorKind::Cancelled) => "Cancelled by user".to_string(),
-            Some(astra_core::ErrorKind::StreamTransport) => {
+            Some(astra_core::ErrorKind::StreamTransport) => abort_message.unwrap_or_else(|| {
                 "Error: stream transport ended while reading model response".to_string()
-            }
+            }),
             _ => "Unknown abort".to_string(),
         };
         accum.error_message = Some(msg);
         host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner]);
     }
 
-    let tail = framer.take_trailing_dispatch_blob();
+    let tail = match framer.take_trailing_dispatch_blob() {
+        Ok(tail) => tail,
+        Err(error) => {
+            accum.full_text.clear();
+            accum.reasoning_content.clear();
+            accum.tool_calls.clear();
+            pending.clear();
+            accum.error_message = Some(format!(
+                "Error: invalid UTF-8 in model SSE response: {error}"
+            ));
+            host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner]);
+            String::new()
+        }
+    };
     let ttft_ms = framer.ttft_ms;
     if abort.is_none() && !tail.trim().is_empty() {
         let _ = process_sse_event_block(
@@ -1457,6 +1491,40 @@ mod tests {
             "transport abort tombstones partial text so pending frames cannot be mistaken for a complete turn"
         );
         assert!(result.accum.error_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_aborts_before_tool_execution() {
+        let chunks: Vec<Result<Vec<u8>, String>> = vec![
+            Ok(sse_event("text_delta", ",\"content\":\"partial\"").into_bytes()),
+            Ok(b"data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"tool\":\"bash\",\"args\":{\"x\":\"\xff\"}}\n\n".to_vec()),
+        ];
+        let mut stream = stream::iter(chunks);
+        let mut host = RecordingSseStreamHost::new();
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+        assert!(
+            result.accum.full_text.is_empty(),
+            "partial text must be tombstoned"
+        );
+        assert!(
+            result.tool_results.is_empty(),
+            "invalid bytes must not reach tools"
+        );
+        assert!(
+            result
+                .accum
+                .error_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("invalid UTF-8")
+        );
     }
 
     #[tokio::test]

@@ -1135,6 +1135,35 @@ impl Drop for ActiveRunControlWatcher {
     }
 }
 
+struct ClientStreamDisconnectWatcher {
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ClientStreamDisconnectWatcher {
+    fn drop(&mut self) {
+        self.join.abort();
+    }
+}
+
+fn start_client_stream_disconnect_watcher(
+    run_id: String,
+    client_event_tx: mpsc::Sender<Value>,
+    cancel_flag: Arc<AtomicBool>,
+    cancel_token: Arc<CancellationToken>,
+) -> ClientStreamDisconnectWatcher {
+    let join = tokio::spawn(async move {
+        client_event_tx.closed().await;
+        cancel_flag.store(true, Ordering::SeqCst);
+        cancel_token.cancel();
+        tracing::info!(
+            target: "astra_runtime::run_lifecycle",
+            run_id = %run_id,
+            "client SSE stream disconnected; cancelling active run"
+        );
+    });
+    ClientStreamDisconnectWatcher { join }
+}
+
 fn start_active_run_control_watcher(
     run_control: Option<Arc<dyn RunControlProvider>>,
     user_id: String,
@@ -3348,10 +3377,26 @@ impl AgenticRunLifecycleService {
                         | "knowledge_base_names"
                         | "agent_md"
                 ),
+                Some("open_candidate") => matches!(
+                    normalized.as_str(),
+                    "agent_id" | "candidate_version" | "config"
+                ),
+                Some("config") => matches!(
+                    normalized.as_str(),
+                    "agent_id"
+                        | "name"
+                        | "description"
+                        | "model_name"
+                        | "model_config_ref"
+                        | "tool_names"
+                        | "skill_names"
+                        | "knowledge_base_names"
+                        | "agent_md"
+                ),
                 Some("authoring_context") => {
                     matches!(
                         normalized.as_str(),
-                        "schema_version" | "recent_chat_context"
+                        "schema_version" | "recent_chat_context" | "open_candidate"
                     )
                 }
                 Some("recent_chat_context") => matches!(
@@ -3412,6 +3457,9 @@ impl AgenticRunLifecycleService {
             [field] if matches!(field.as_str(), "current_agent" | "authoring_context") => {
                 value.is_object()
             }
+            [root, field] if root == "authoring_context" && field == "open_candidate" => {
+                value.is_object()
+            }
             [root, field]
                 if root == "current_agent"
                     && matches!(
@@ -3428,6 +3476,53 @@ impl AgenticRunLifecycleService {
                     value,
                     Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
                 )
+            }
+            [root, candidate, field]
+                if root == "authoring_context"
+                    && candidate == "open_candidate"
+                    && matches!(field.as_str(), "agent_id" | "candidate_version") =>
+            {
+                matches!(
+                    value,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            }
+            [root, candidate, field]
+                if root == "authoring_context"
+                    && candidate == "open_candidate"
+                    && field == "config" =>
+            {
+                value.is_object()
+            }
+            [root, candidate, config, field]
+                if root == "authoring_context"
+                    && candidate == "open_candidate"
+                    && config == "config"
+                    && matches!(
+                        field.as_str(),
+                        "agent_id"
+                            | "name"
+                            | "description"
+                            | "model_name"
+                            | "model_config_ref"
+                            | "agent_md"
+                    ) =>
+            {
+                matches!(
+                    value,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            }
+            [root, candidate, config, field]
+                if root == "authoring_context"
+                    && candidate == "open_candidate"
+                    && config == "config"
+                    && matches!(
+                        field.as_str(),
+                        "tool_names" | "skill_names" | "knowledge_base_names"
+                    ) =>
+            {
+                value.is_array()
             }
             [root, field]
                 if root == "current_agent"
@@ -3486,6 +3581,14 @@ impl AgenticRunLifecycleService {
         match path {
             [field] if field == "raw_advice" => None,
             [root, _] if root == "current_agent" => None,
+            [root, candidate, config, field]
+                if root == "authoring_context"
+                    && candidate == "open_candidate"
+                    && config == "config"
+                    && field == "agent_md" =>
+            {
+                None
+            }
             [root, context, messages, field]
                 if root == "authoring_context"
                     && context == "recent_chat_context"
@@ -3502,6 +3605,17 @@ impl AgenticRunLifecycleService {
         match path {
             [root, field]
                 if root == "current_agent"
+                    && matches!(
+                        field.as_str(),
+                        "tool_names" | "skill_names" | "knowledge_base_names"
+                    ) =>
+            {
+                None
+            }
+            [root, candidate, config, field]
+                if root == "authoring_context"
+                    && candidate == "open_candidate"
+                    && config == "config"
                     && matches!(
                         field.as_str(),
                         "tool_names" | "skill_names" | "knowledge_base_names"
@@ -3699,6 +3813,7 @@ impl AgenticRunLifecycleService {
         .with_edge_profile(edge_profile)
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
         .with_interaction_mode(request.interaction_mode)
+        .with_turn_intent_policy(request.execution_policy.turn_intent)
         .with_interactive_client(request.interactive_client)
         .with_plan_resume_hint(plan_resume_hint)
         .with_plan_authoring_active(plan_authoring_active)
@@ -6817,6 +6932,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_cancel_flag = cancel_flag.clone();
         let bg_pause_flag = pause_flag.clone();
         let bg_llm_cancel_token = llm_cancel_token.clone();
+        let bg_client_event_tx = client_event_tx.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -6976,11 +7092,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     bg_pause_flag.clone(),
                     bg_llm_cancel_token.clone(),
                 );
+                let client_disconnect_watcher = start_client_stream_disconnect_watcher(
+                    bg_run_id.clone(),
+                    bg_client_event_tx,
+                    bg_cancel_flag.clone(),
+                    bg_llm_cancel_token.clone(),
+                );
                 let agentic_loop_started_at = Instant::now();
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
                 let agentic_loop_ms = agentic_loop_started_at.elapsed().as_millis() as u64;
                 let loop_success = loop_result.is_ok();
+                drop(client_disconnect_watcher);
 
                 // Best-effort post-loop persistence (core events, tool events,
                 // hook DB, observer, session-end hooks, promotion events).

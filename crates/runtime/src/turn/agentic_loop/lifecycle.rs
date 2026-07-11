@@ -1506,6 +1506,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 apply_structured_user_reanchor(state);
             }
         }
+        TurnIntentJudgeOutcome::FixedDefault => {
+            // The baseline profile is constructed once from deterministic
+            // request heuristics. Do not retain or synthesize an LLM intent.
+            state.turn_intent = None;
+        }
         TurnIntentJudgeOutcome::Unavailable => {
             tracing::debug!("turn intent judge unavailable; preserving current runtime profile");
         }

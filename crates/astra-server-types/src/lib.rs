@@ -132,6 +132,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub execution_budget: Option<astra_services::runs::ExecutionBudget>,
     #[serde(default)]
+    pub execution_policy: astra_services::runs::ExecutionPolicyRequest,
+    #[serde(default)]
     pub explain: bool,
     #[serde(default)]
     pub interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
@@ -1218,6 +1220,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         capabilities: request.capabilities,
         forward_headers: std::collections::HashMap::new(),
         execution_budget: request.execution_budget,
+        execution_policy: request.execution_policy,
         explain: request.explain,
         interaction_mode: request.interaction_mode,
         interactive_client: request.interactive_client,

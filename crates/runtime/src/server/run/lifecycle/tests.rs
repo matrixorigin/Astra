@@ -2671,6 +2671,7 @@ fn test_request(message: &str) -> ChatRequestData {
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         execution_budget: None,
+        execution_policy: Default::default(),
         explain: false,
         interaction_mode: None,
         interactive_client: false,
@@ -5910,6 +5911,52 @@ async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
 }
 
 #[tokio::test]
+async fn client_stream_disconnect_watcher_cancels_active_run() {
+    let (client_event_tx, client_event_rx) = mpsc::channel::<Value>(1);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancel_token = Arc::new(CancellationToken::new());
+    let _watcher = start_client_stream_disconnect_watcher(
+        "run-1".to_string(),
+        client_event_tx,
+        cancel_flag.clone(),
+        cancel_token.clone(),
+    );
+
+    drop(client_event_rx);
+    cancel_token.cancelled().await;
+
+    assert!(cancel_flag.load(Ordering::Acquire));
+    assert!(cancel_token.is_cancelled());
+}
+
+#[tokio::test]
+async fn client_stream_disconnect_watcher_does_not_cancel_on_backpressure() {
+    let (client_event_tx, _client_event_rx) = mpsc::channel::<Value>(1);
+    client_event_tx
+        .try_send(json!({"type": "buffered"}))
+        .expect("pre-fill client channel");
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancel_token = Arc::new(CancellationToken::new());
+    let _watcher = start_client_stream_disconnect_watcher(
+        "run-1".to_string(),
+        client_event_tx,
+        cancel_flag.clone(),
+        cancel_token.clone(),
+    );
+
+    tokio::task::yield_now().await;
+
+    assert!(
+        !cancel_flag.load(Ordering::Acquire),
+        "a full client channel is backpressure, not a disconnect"
+    );
+    assert!(
+        !cancel_token.is_cancelled(),
+        "a full client channel must not cancel active work"
+    );
+}
+
+#[tokio::test]
 async fn cancel_session_runs_cancels_active_run_for_that_session_only() {
     let svc = test_service();
     let mut session_a = test_request("task a");
@@ -6268,6 +6315,7 @@ fn extract_edge_tools_from_context() {
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         execution_budget: None,
+        execution_policy: Default::default(),
         explain: false,
         interaction_mode: None,
         interactive_client: false,
@@ -6437,6 +6485,7 @@ fn extract_edge_profile_from_context() {
         capabilities: Vec::new(),
         forward_headers: HashMap::new(),
         execution_budget: None,
+        execution_policy: Default::default(),
         explain: false,
         interaction_mode: None,
         interactive_client: false,
@@ -6724,7 +6773,24 @@ fn agent_binding_prompt_context_preserves_moi_authoring_contract() {
             "secret": "must-not-appear"
         },
         "authoring_context": {
-            "schema_version": "moi.zero_authoring_context.v1",
+            "schema_version": "moi.zero_authoring_context.v2",
+            "open_candidate": {
+                "agent_id": "agent_current",
+                "candidate_version": "0.2.0",
+                "config": {
+                    "agent_id": "agent_current",
+                    "name": "Current Agent Draft",
+                    "description": "Current draft description",
+                    "model_name": "qwen3.7-max",
+                    "model_config_ref": "model_ref_1",
+                    "tool_names": ["Search"],
+                    "skill_names": ["Artifacts"],
+                    "knowledge_base_names": ["Handbook"],
+                    "agent_md": agent_md,
+                    "secret": "must-not-appear"
+                },
+                "secret": "must-not-appear"
+            },
             "recent_chat_context": {
                 "limit_turns": 10,
                 "max_characters": 12000,
@@ -6775,7 +6841,15 @@ fn agent_binding_prompt_context_preserves_moi_authoring_contract() {
         visible["current_agent"]["agent_md"].as_str(),
         Some(agent_md.as_str())
     );
-    assert!(text.contains("\"schema_version\":\"moi.zero_authoring_context.v1\""));
+    assert!(text.contains("\"schema_version\":\"moi.zero_authoring_context.v2\""));
+    assert_eq!(
+        visible["authoring_context"]["open_candidate"]["config"]["agent_md"].as_str(),
+        Some(agent_md.as_str())
+    );
+    assert_eq!(
+        visible["authoring_context"]["open_candidate"]["candidate_version"].as_str(),
+        Some("0.2.0")
+    );
     assert!(text.contains("\"content\":\"Older user request\""));
     assert!(!text.contains("must-not-appear"));
     assert!(!text.contains("[truncated]"));

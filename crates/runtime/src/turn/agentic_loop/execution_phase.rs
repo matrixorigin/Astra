@@ -2154,14 +2154,22 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
     if state.final_text.trim().is_empty() {
         return None;
     }
-    if state.task_profile.mutates_workspace {
+    if state.task_profile.mutates_workspace && workspace_mutation_is_executable(state) {
         // Mutating-profile tasks need either a concrete workspace mutation or
-        // a single corrective retry. The mutating profile is only produced
-        // from structured judge output (`workspace_mutation=must_mutate`), not
-        // from natural-language keyword matching.
+        // a single corrective retry when the current tool surface can perform
+        // that mutation. The mutating profile is only produced from structured
+        // judge output (`workspace_mutation=must_mutate`), not from
+        // natural-language keyword matching.
         return Some(ExecutionRetryReason::MissingMutation);
     }
     None
+}
+
+fn workspace_mutation_is_executable(state: &AgenticLoopState) -> bool {
+    state
+        .runtime_tool_executor
+        .as_deref()
+        .is_some_and(|executor| executor.has_visible_workspace_mutation_tool())
 }
 
 fn missing_browser_verification_evidence(state: &AgenticLoopState) -> bool {
@@ -3060,7 +3068,7 @@ pub(crate) fn should_escalate_execution(state: &AgenticLoopState) -> bool {
     if state.stall.forced_parallel_batching {
         return false;
     }
-    if !state.task_profile.mutates_workspace {
+    if !state.task_profile.mutates_workspace || !workspace_mutation_is_executable(state) {
         return false;
     }
     if has_concrete_workspace_mutation(state) {
@@ -3444,6 +3452,8 @@ mod tests {
 
     use super::*;
     use crate::observability::ObservabilityHub;
+    use crate::server::runtime_tool_executor::RuntimeToolExecutor;
+    use crate::server::tool_transport::{ExecutorBinding, WorkspaceBinding};
     use crate::turn::agentic_loop::host::tests::{MockHost, make_state, text_result};
     use crate::turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, DeferredUserInputRecord, VolatileKind,
@@ -3469,6 +3479,19 @@ mod tests {
                 astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
             ),
         );
+        let workspace = std::env::temp_dir();
+        let mut executor = RuntimeToolExecutor::new(
+            workspace.clone(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        executor.set_execution_bindings(
+            WorkspaceBinding::server_sandbox(&workspace),
+            ExecutorBinding::server_local(),
+        );
+        state.runtime_tool_executor = Some(Arc::new(executor));
     }
 
     fn require_browser_verification(state: &mut AgenticLoopState) {
@@ -4161,6 +4184,23 @@ mod tests {
         });
 
         assert!(should_force_execution_retry(&state));
+    }
+
+    #[test]
+    fn execution_retry_skips_mutation_when_no_workspace_write_tool_is_available() {
+        let mut state = make_state();
+        state.task_profile = structured_mutating_profile();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default().with_workspace_mutation(
+                astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+            ),
+        );
+        state.message = "update the configuration".into();
+        state.user_intent = state.message.clone();
+        state.final_text = "I cannot modify the configuration in this environment.".into();
+
+        assert_eq!(execution_retry_reason(&state), None);
+        assert!(!should_escalate_execution(&state));
     }
 
     #[test]

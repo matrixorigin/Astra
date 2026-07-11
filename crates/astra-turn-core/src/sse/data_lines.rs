@@ -199,8 +199,8 @@ mod tests {
 
     #[test]
     fn json_events_from_block_matches_openai_framing() {
-        let mut buf = "data: {\"a\":1}\n\n".to_string();
-        let blocks = drain_complete_sse_event_blocks(&mut buf);
+        let mut buf = b"data: {\"a\":1}\n\n".to_vec();
+        let blocks = drain_complete_sse_event_blocks(&mut buf).unwrap();
         assert!(buf.is_empty());
         assert_eq!(blocks.len(), 1);
         let d = json_events_from_sse_event_block(&blocks[0]);
@@ -210,8 +210,8 @@ mod tests {
 
     #[test]
     fn json_events_from_block_crlf_inside_block() {
-        let mut buf = "data: {\"x\":2}\r\n\r\n".to_string();
-        let blocks = drain_complete_sse_event_blocks(&mut buf);
+        let mut buf = b"data: {\"x\":2}\r\n\r\n".to_vec();
+        let blocks = drain_complete_sse_event_blocks(&mut buf).unwrap();
         let d = json_events_from_sse_event_block(&blocks[0]);
         assert_eq!(d.events, vec![json!({"x": 2})]);
     }

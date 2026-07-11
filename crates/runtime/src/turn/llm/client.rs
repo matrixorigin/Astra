@@ -4321,7 +4321,14 @@ pub(crate) fn parse_openai_sse_json_stream(
                     return;
                 }
             };
-            for block in sse_in.push_lossy_bytes(&bytes) {
+            let blocks = match sse_in.push_bytes(&bytes) {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
+                    return;
+                }
+            };
+            for block in blocks {
                 if let Err(error) = validate_sse_event_block_json(&block) {
                     yield Err(error);
                     return;
@@ -4335,7 +4342,13 @@ pub(crate) fn parse_openai_sse_json_stream(
                 }
             }
         }
-        let mut buf = sse_in.into_inner();
+        let mut buf = match sse_in.into_inner() {
+            Ok(buf) => buf,
+            Err(error) => {
+                yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
+                return;
+            }
+        };
         let tail = match validated_drain_sse_data_lines(&mut buf, "") {
             Ok(value) => value,
             Err(error) => {
@@ -4895,6 +4908,34 @@ mod tests {
         tokio::pin!(st);
         let ev = st.next().await.unwrap().unwrap();
         assert_eq!(ev, json!({"t": 1}));
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_preserves_utf8_split_across_chunks() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(b"data: {\"text\":\"\xe6")),
+            Ok(Bytes::from_static(b"\x88")),
+            Ok(Bytes::from_static(b"\x91\"}\n\n")),
+        ];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(st.next().await.unwrap().unwrap(), json!({"text": "我"}));
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_rejects_invalid_utf8() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from_static(b"data: {\"text\":\"\xff\"}\n\n"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        let error = st
+            .next()
+            .await
+            .expect("invalid UTF-8 item")
+            .expect_err("invalid UTF-8 must fail");
+        assert!(error.contains("invalid UTF-8"), "{error}");
         assert!(st.next().await.is_none());
     }
 

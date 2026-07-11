@@ -61,7 +61,7 @@ use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
 use astra_services::multi_agent::EdgeDispatchService;
-use astra_services::runs::RequestedTurnInteractionMode;
+use astra_services::runs::{RequestedTurnInteractionMode, TurnIntentExecutionPolicy};
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, SharedAgentLiveEventSink,
@@ -1140,6 +1140,8 @@ pub struct ServerAgenticLoopHost {
     interactive_client: bool,
     /// Optional request-level interaction policy override.
     interaction_mode: Option<RequestedTurnInteractionMode>,
+    /// Request-scoped policy for Astra's auxiliary TurnIntent LLM.
+    turn_intent_policy: TurnIntentExecutionPolicy,
     /// `true` when this session explicitly requests full LLM request/response capture.
     full_llm_capture: bool,
     /// Whether tool-call validation should admit Astra's static tool catalog
@@ -1293,6 +1295,7 @@ pub struct ServerAgenticLoopHostBuilder {
     progress_root_run_id: Option<String>,
     interactive_client: bool,
     interaction_mode: Option<RequestedTurnInteractionMode>,
+    turn_intent_policy: TurnIntentExecutionPolicy,
     full_llm_capture: bool,
     static_tool_catalog_admissible: bool,
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
@@ -1348,6 +1351,7 @@ impl ServerAgenticLoopHostBuilder {
             progress_root_run_id: None,
             interactive_client: false,
             interaction_mode: None,
+            turn_intent_policy: TurnIntentExecutionPolicy::Auto,
             full_llm_capture: false,
             static_tool_catalog_admissible: true,
             event_tx: None,
@@ -1514,6 +1518,11 @@ impl ServerAgenticLoopHostBuilder {
         interaction_mode: Option<RequestedTurnInteractionMode>,
     ) -> Self {
         self.interaction_mode = interaction_mode;
+        self
+    }
+
+    pub fn with_turn_intent_policy(mut self, policy: TurnIntentExecutionPolicy) -> Self {
+        self.turn_intent_policy = policy;
         self
     }
 
@@ -1716,6 +1725,7 @@ impl ServerAgenticLoopHostBuilder {
             control_plane_provider_catalog_enabled: self.control_plane_tool_catalog_enabled,
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
+            turn_intent_policy: self.turn_intent_policy,
             full_llm_capture: self.full_llm_capture,
             static_tool_catalog_admissible: self.static_tool_catalog_admissible,
             always_load_tool_names,
@@ -4357,6 +4367,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
     ) -> crate::turn::agentic_loop::host::TurnIntentJudgeOutcome {
+        if self.turn_intent_policy == TurnIntentExecutionPolicy::FixedDefault {
+            tracing::info!(
+                target: "astra::turn_intent",
+                operation = "turn_intent.phase",
+                status = "skipped",
+                policy = "fixed_default",
+                reason = "request_execution_policy",
+                duration_ms = 0_u64,
+                "turn intent judge skipped by request execution policy"
+            );
+            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault;
+        }
         let has_prior_assistant_turn = state
             .messages
             .iter()
@@ -4437,6 +4459,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             operation = "turn_intent.phase",
             status = match &outcome {
                 crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(_) => "success",
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault => "skipped",
                 crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable => "no_intent",
             },
             model = %model_name,
@@ -13283,6 +13306,7 @@ mod tests {
     mod turn_intent_judge_wiring {
         use super::*;
         use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
+        use astra_services::runs::TurnIntentExecutionPolicy;
         use astra_services::{
             LlmTokenServiceConfig, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
             SkillAutoRouteJudgeError, TurnIntentJudge, TurnIntentJudgeContext,
@@ -13381,6 +13405,22 @@ mod tests {
             host
         }
 
+        fn host_with_turn_intent_policy_and_judge(
+            policy: TurnIntentExecutionPolicy,
+            judge: Arc<dyn TurnIntentJudge>,
+        ) -> ServerAgenticLoopHost {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .with_turn_intent_policy(policy)
+            .build();
+            host.set_turn_intent_judge(judge);
+            host
+        }
+
         fn host_with_skill_route_judge(
             judge: Arc<dyn SkillAutoRouteJudge>,
         ) -> ServerAgenticLoopHost {
@@ -13458,6 +13498,27 @@ mod tests {
             assert!(
                 call.has_prior_assistant_turn,
                 "must surface the prior-assistant signal so the judge can detect follow-ups"
+            );
+        }
+
+        #[tokio::test]
+        async fn fixed_default_turn_intent_policy_skips_even_an_injected_judge() {
+            let judge = ScriptedJudge::ok(
+                TurnIntent::default().with_requested_scenario(Scenario::CodeReview),
+            );
+            let mut host = host_with_turn_intent_policy_and_judge(
+                TurnIntentExecutionPolicy::FixedDefault,
+                judge.clone() as Arc<dyn TurnIntentJudge>,
+            );
+            let state = crate::turn::agentic_loop::host::tests::make_state();
+
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault
+            );
+            assert!(
+                judge.calls().is_empty(),
+                "fixed policy must not invoke the intent LLM"
             );
         }
 

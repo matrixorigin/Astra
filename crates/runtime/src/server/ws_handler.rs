@@ -1429,6 +1429,7 @@ fn build_ws_chat_request(
         capabilities: Vec::new(),
         forward_headers: std::collections::HashMap::new(),
         execution_budget,
+        execution_policy: Default::default(),
         explain,
         interaction_mode,
         interactive_client: true,

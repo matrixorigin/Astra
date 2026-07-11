@@ -207,6 +207,7 @@ pub(crate) fn run_start_context_from_request(
     RunStartContext {
         interaction_mode: request.interaction_mode,
         interactive_client: Some(request.interactive_client),
+        turn_intent_policy: request.execution_policy.turn_intent,
         execution_metadata: execution_bindings
             .map(|snapshot| binding_event_fields(&snapshot.workspace, &snapshot.executor)),
         agent_binding_id: agent_binding.map(|binding| binding.id.clone()).or_else(|| {
@@ -557,6 +558,7 @@ mod tests {
             capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
+            execution_policy: Default::default(),
             explain: false,
             interaction_mode: None,
             interactive_client: false,

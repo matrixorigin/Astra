@@ -9,7 +9,7 @@ use astra_thin_client::ApprovalKind;
 use serde_json::Value;
 use std::time::Instant;
 
-use super::sse_blocks::SseBlankLineUtf8Buf;
+use super::sse_blocks::{SseBlankLineUtf8Buf, SseUtf8Error};
 
 /// Per-channel fingerprint emitted by the bridge via the
 /// `injection_freshness` SSE event. Carries only opaque metadata
@@ -612,21 +612,21 @@ impl ChatTurnSseFramer {
         }
     }
 
-    /// Append one HTTP chunk; returns every **complete** SSE event block (may be empty).
-    pub fn push_lossy_bytes(&mut self, bytes: &[u8]) -> Vec<String> {
-        let blocks = self.sse.push_lossy_bytes(bytes);
+    /// Append one HTTP chunk; returns every **complete** UTF-8 SSE event block (may be empty).
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<String>, SseUtf8Error> {
+        let blocks = self.sse.push_bytes(bytes)?;
         for b in &blocks {
             self.note_ttft_from_raw_event_text(b);
         }
-        blocks
+        Ok(blocks)
     }
 
     /// After the byte stream ends: run TTFT detection on any trailing bytes, then take the buffer
     /// for a final [`dispatch_chat_turn_sse_event_block`] pass (partial event without `\n\n` yet).
-    pub fn take_trailing_dispatch_blob(&mut self) -> String {
-        let tail = self.sse.take_buf();
+    pub fn take_trailing_dispatch_blob(&mut self) -> Result<String, SseUtf8Error> {
+        let tail = self.sse.take_buf()?;
         self.note_ttft_from_raw_event_text(&tail);
-        tail
+        Ok(tail)
     }
 }
 
@@ -645,20 +645,25 @@ pub struct ParsedChatTurnSseBody {
     pub ttft_ms: Option<u64>,
 }
 
-/// Parse an entire response body as UTF-8 (valid `str` — use [`String::from_utf8_lossy`] at the boundary if needed).
+/// Parse an entire response body as UTF-8.
 pub fn parse_chat_turn_sse_utf8_body(body: &str) -> ParsedChatTurnSseBody {
     let mut framer = ChatTurnSseFramer::new();
     let mut accum = ChatTurnSseAccum::default();
     let mut pending = Vec::new();
     let mut render_effects = Vec::new();
-    for block in framer.push_lossy_bytes(body.as_bytes()) {
+    for block in framer
+        .push_bytes(body.as_bytes())
+        .expect("a Rust str must produce valid UTF-8 SSE blocks")
+    {
         render_effects.extend(dispatch_chat_turn_sse_event_block(
             &block,
             &mut accum,
             &mut pending,
         ));
     }
-    let tail = framer.take_trailing_dispatch_blob();
+    let tail = framer
+        .take_trailing_dispatch_blob()
+        .expect("a Rust str must produce valid UTF-8 SSE tail");
     if !tail.trim().is_empty() {
         render_effects.extend(dispatch_chat_turn_sse_event_block(
             &tail,
@@ -1150,8 +1155,8 @@ mod tests {
         let ev = sse("session_info", ",\"session_id\":\"split-id\"");
         let mid = ev.find("session").unwrap();
         let mut f = ChatTurnSseFramer::new();
-        assert!(f.push_lossy_bytes(&ev.as_bytes()[..mid]).is_empty());
-        let blocks = f.push_lossy_bytes(&ev.as_bytes()[mid..]);
+        assert!(f.push_bytes(&ev.as_bytes()[..mid]).unwrap().is_empty());
+        let blocks = f.push_bytes(&ev.as_bytes()[mid..]).unwrap();
         assert_eq!(blocks.len(), 1);
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(&blocks[0], &mut a, &mut vec![]);
@@ -1186,7 +1191,7 @@ mod tests {
         ];
         for (event_type, extra) in cases {
             let mut f = ChatTurnSseFramer::new();
-            let _ = f.push_lossy_bytes(sse(event_type, extra).as_bytes());
+            let _ = f.push_bytes(sse(event_type, extra).as_bytes()).unwrap();
             assert!(
                 f.ttft_ms.is_some(),
                 "ttft must be set when first SSE event is {event_type}"
@@ -1199,7 +1204,7 @@ mod tests {
         // usage events alone should not trigger ttft
         let block = sse("usage", ",\"input_tokens\":100,\"output_tokens\":5");
         let mut f = ChatTurnSseFramer::new();
-        let _ = f.push_lossy_bytes(block.as_bytes());
+        let _ = f.push_bytes(block.as_bytes()).unwrap();
         assert!(f.ttft_ms.is_none(), "usage-only event must not set ttft");
     }
 
@@ -1535,7 +1540,7 @@ mod tests {
     #[test]
     fn framer_handles_empty_bytes() {
         let mut f = ChatTurnSseFramer::new();
-        let blocks = f.push_lossy_bytes(&[]);
+        let blocks = f.push_bytes(&[]).unwrap();
         assert!(blocks.is_empty());
         assert!(f.ttft_ms.is_none());
     }
@@ -1543,19 +1548,17 @@ mod tests {
     #[test]
     fn framer_trailing_blob_on_empty_returns_empty_string() {
         let mut f = ChatTurnSseFramer::new();
-        let tail = f.take_trailing_dispatch_blob();
+        let tail = f.take_trailing_dispatch_blob().unwrap();
         assert_eq!(tail, "");
     }
 
     #[test]
-    fn framer_invalid_utf8_lossy_converts() {
+    fn framer_invalid_utf8_is_rejected() {
         let mut f = ChatTurnSseFramer::new();
         // Invalid UTF-8 sequence: 0xFF is never valid
         let data = b"data: {\"type\":\"text_delta\",\"content\":\"hi\xff\"}\n\n";
-        let blocks = f.push_lossy_bytes(data);
-        assert_eq!(blocks.len(), 1);
-        // Lossy conversion replaces invalid bytes with U+FFFD
-        assert!(blocks[0].contains('\u{FFFD}') || blocks[0].contains("hi"));
+        let error = f.push_bytes(data).expect_err("invalid UTF-8 must fail");
+        assert!(error.to_string().contains("invalid UTF-8"));
     }
 
     #[test]

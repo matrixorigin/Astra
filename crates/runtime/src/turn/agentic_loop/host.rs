@@ -162,6 +162,9 @@ pub struct SkillAutoRouteJudgeContext<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnIntentJudgeOutcome {
     Intent(TurnIntent),
+    /// The caller explicitly selected the request's deterministic baseline
+    /// profile instead of Astra's auxiliary TurnIntent LLM.
+    FixedDefault,
     Unavailable,
 }
 

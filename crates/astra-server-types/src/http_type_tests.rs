@@ -1,5 +1,5 @@
 use super::*;
-use astra_services::runs::ExecutionBudget;
+use astra_services::runs::{ExecutionBudget, ExecutionPolicyRequest, TurnIntentExecutionPolicy};
 use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 
@@ -61,6 +61,7 @@ fn deserialization_applies_defaults() {
     assert!(!req.explain);
     assert!(req.session_id.is_none());
     assert!(req.agent_id.is_none());
+    assert_eq!(req.execution_policy, ExecutionPolicyRequest::default());
 
     // SessionListQuery
     let q: SessionListQuery = serde_json::from_str("{}").unwrap();
@@ -137,6 +138,7 @@ fn chat_request_all_fields() {
         ],
         "context": {"key": "value"},
         "execution_budget": {"initial_turns": 10, "hard_turn_limit": 18},
+        "execution_policy": {"turn_intent": "fixed_default"},
         "explain": true
     });
     let req: ChatRequest = serde_json::from_value(input).unwrap();
@@ -187,6 +189,10 @@ fn chat_request_all_fields() {
         })
     );
     assert!(req.explain);
+    assert_eq!(
+        req.execution_policy.turn_intent,
+        TurnIntentExecutionPolicy::FixedDefault
+    );
     let ctx = req.context.unwrap();
     assert_eq!(ctx.get("key").unwrap(), "value");
 }
@@ -277,6 +283,25 @@ fn chat_request_execution_budget_roundtrip() {
             initial_turns: Some(4),
             hard_turn_limit: Some(9),
         })
+    );
+}
+
+#[test]
+fn chat_request_execution_policy_rejects_unknown_fields() {
+    let result = serde_json::from_str::<ChatRequest>(
+        r#"{"message":"hello","execution_policy":{"turn_intent":"fixed_default","extra":true}}"#,
+    );
+    assert!(
+        result.is_err(),
+        "execution_policy must remain a closed contract"
+    );
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unknown field `extra`"),
+        "unexpected error"
     );
 }
 
@@ -1168,6 +1193,9 @@ fn chat_request_into_data_maps_all_fields() {
             initial_turns: Some(3),
             hard_turn_limit: Some(7),
         }),
+        execution_policy: ExecutionPolicyRequest {
+            turn_intent: TurnIntentExecutionPolicy::FixedDefault,
+        },
         explain: true,
         interaction_mode: Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
         interactive_client: true,
@@ -1216,6 +1244,10 @@ fn chat_request_into_data_maps_all_fields() {
     );
     assert!(data.explain);
     assert_eq!(
+        data.execution_policy.turn_intent,
+        TurnIntentExecutionPolicy::FixedDefault
+    );
+    assert_eq!(
         data.interaction_mode,
         Some(astra_services::runs::RequestedTurnInteractionMode::Auto)
     );
@@ -1240,6 +1272,7 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.edge_executor_id.is_none());
     assert!(data.capabilities.is_empty());
     assert!(data.execution_budget.is_none());
+    assert_eq!(data.execution_policy, ExecutionPolicyRequest::default());
     assert!(!data.explain);
     assert!(data.interaction_mode.is_none());
     assert!(!data.interactive_client);
@@ -1273,6 +1306,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         edge_executor_id: None,
         capabilities: Vec::new(),
         execution_budget: None,
+        execution_policy: ExecutionPolicyRequest::default(),
         explain: false,
         interaction_mode: None,
         interactive_client: false,

@@ -3519,6 +3519,7 @@ impl InProcessChatTurnBridge {
                     let mut sse_buf = SseBlankLineUtf8Buf::new();
                     let mut saw_inprocess_summary = false;
                     let mut terminal_error_event: Option<Value> = None;
+                    let mut stream_parse_error: Option<String> = None;
                     // Keepalive interval: emit SSE comments while waiting on
                     // the LLM so client disconnects are detected promptly
                     // instead of only on long stall boundaries.
@@ -3539,7 +3540,16 @@ impl InProcessChatTurnBridge {
                             item = llm_stream.next() => {
                                 keepalive_deadline = tokio::time::Instant::now() + keepalive;
                                 let Some(bytes) = item else { break };
-                                for block in sse_buf.push_lossy_bytes(&bytes) {
+                                let blocks = match sse_buf.push_bytes(&bytes) {
+                                    Ok(blocks) => blocks,
+                                    Err(error) => {
+                                        stream_parse_error = Some(format!(
+                                            "invalid UTF-8 in model SSE response: {error}"
+                                        ));
+                                        break;
+                                    }
+                                };
+                                for block in blocks {
                                     match extend_forward_from_validated_sse_block(
                                         &block,
                                         &mut saw_inprocess_summary,
@@ -3721,17 +3731,25 @@ impl InProcessChatTurnBridge {
                         return;
                     }
 
-                    let mut tail = sse_buf.into_inner();
-                    match flush_tail_buf_into_llm_forward(
-                        &mut tail,
-                        &mut saw_inprocess_summary,
-                        &mut loop_text,
-                        &mut loop_reasoning,
-                        &mut loop_reasoning_signature,
-                        &mut loop_tool_calls,
-                        &mut usage,
-                        &mut resolved_model,
-                    ) {
+                    let tail_result = match stream_parse_error {
+                        Some(error) => Err(error),
+                        None => match sse_buf.into_inner() {
+                            Ok(mut tail) => flush_tail_buf_into_llm_forward(
+                                &mut tail,
+                                &mut saw_inprocess_summary,
+                                &mut loop_text,
+                                &mut loop_reasoning,
+                                &mut loop_reasoning_signature,
+                                &mut loop_tool_calls,
+                                &mut usage,
+                                &mut resolved_model,
+                            ),
+                            Err(error) => Err(format!(
+                                "invalid UTF-8 in model SSE response: {error}"
+                            )),
+                        },
+                    };
+                    match tail_result {
                         Ok(chunks) => {
                             for b in chunks {
                                 if terminal_error_event.is_none() {

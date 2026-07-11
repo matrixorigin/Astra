@@ -234,6 +234,25 @@ pub struct ExecutionBudget {
     pub hard_turn_limit: Option<u32>,
 }
 
+/// Request-scoped execution controls. The default preserves Astra's native
+/// behavior; callers must opt in explicitly to change a policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPolicyRequest {
+    #[serde(default)]
+    pub turn_intent: TurnIntentExecutionPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnIntentExecutionPolicy {
+    #[default]
+    Auto,
+    /// Do not call Astra's auxiliary TurnIntent LLM. The request keeps the
+    /// deterministic baseline profile selected when its loop state is built.
+    FixedDefault,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestedTurnInteractionMode {
@@ -504,6 +523,7 @@ pub struct ChatRequestData {
     pub capabilities: Vec<String>,
     pub forward_headers: std::collections::HashMap<String, String>,
     pub execution_budget: Option<ExecutionBudget>,
+    pub execution_policy: ExecutionPolicyRequest,
     pub explain: bool,
     pub interaction_mode: Option<RequestedTurnInteractionMode>,
     pub interactive_client: bool,
@@ -569,6 +589,7 @@ impl std::fmt::Debug for ChatRequestData {
                 &RedactedForwardHeadersDebug(&self.forward_headers),
             )
             .field("execution_budget", &self.execution_budget)
+            .field("execution_policy", &self.execution_policy)
             .field("explain", &self.explain)
             .field("interaction_mode", &self.interaction_mode)
             .field("interactive_client", &self.interactive_client)
@@ -4829,6 +4850,9 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 if let Some(interactive_client) = data.get("interactive_client").cloned() {
                     obj.insert("interactive_client".to_string(), interactive_client);
                 }
+                if let Some(turn_intent_policy) = data.get("turn_intent_policy").cloned() {
+                    obj.insert("turn_intent_policy".to_string(), turn_intent_policy);
+                }
                 if let Some(workspace) = data.get("workspace").cloned() {
                     obj.insert("workspace".to_string(), workspace);
                 }
@@ -6444,6 +6468,7 @@ mod tests {
                 "interaction_mode": "auto",
                 "suppressed_loop_nudges": true,
                 "interactive_client": true,
+                "turn_intent_policy": "fixed_default",
                 "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
                 "executor": {"kind": "server_local", "status": "online"},
                 "transport": "server_local"
@@ -6455,6 +6480,7 @@ mod tests {
         assert_eq!(started["interaction_mode"], "auto");
         assert_eq!(started["suppressed_loop_nudges"], true);
         assert_eq!(started["interactive_client"], true);
+        assert_eq!(started["turn_intent_policy"], "fixed_default");
         assert_eq!(started["workspace"]["kind"], "server_sandbox");
         assert_eq!(started["workspace"]["cwd"], "/tmp/astra-workspaces/run-1");
         assert_eq!(started["executor"]["kind"], "server_local");
@@ -6839,6 +6865,7 @@ mod tests {
                 initial_turns: Some(10),
                 hard_turn_limit: Some(18),
             }),
+            execution_policy: Default::default(),
             full_llm_capture: false,
             explain: false,
             interaction_mode: None,
@@ -6904,6 +6931,7 @@ mod tests {
             capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
+            execution_policy: Default::default(),
             full_llm_capture: false,
             explain: false,
             interaction_mode: None,
@@ -6988,6 +7016,7 @@ mod tests {
                         initial_turns: Some(25),
                         hard_turn_limit: Some(40),
                     }),
+                    execution_policy: Default::default(),
                     full_llm_capture: false,
                     explain: false,
                     interaction_mode: None,
