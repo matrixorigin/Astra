@@ -5,8 +5,8 @@
 //! Well-performing agents never see any intervention.
 //!
 //! State machine:
-//!   Closed (normal) → Open (stall detected, inject correction) → HalfOpen
-//!   (one more chance after correction) → terminal abort if still stalled.
+//!   Closed (normal) → Open (pattern observed) → HalfOpen
+//!   (observe whether the pattern changes) → stronger advisory evidence.
 
 use std::collections::BTreeSet;
 
@@ -32,9 +32,9 @@ pub struct RoundSignal {
 pub enum BreakerState {
     /// Normal operation — no intervention.
     Closed,
-    /// Stall/regression detected — inject correction message.
+    /// A stall/regression pattern was observed.
     Open,
-    /// Correction was injected, observing whether agent recovers.
+    /// The observation was acknowledged; monitoring whether the pattern changes.
     HalfOpen,
 }
 
@@ -60,16 +60,19 @@ impl BreakerState {
 pub enum BreakerAction {
     /// Continue normally — no intervention needed.
     Continue,
-    /// Periodic self-reflection prompt. Injected every N consecutive read-only
-    /// rounds. Tools remain enabled — the model decides whether to continue.
+    /// Periodic self-reflection evidence, emitted every N consecutive read-only
+    /// rounds. Tools remain enabled and the model decides whether to continue.
     Introspect { consecutive_read_only: usize },
     /// Suggest that the next model round should stop unless it can identify
     /// concrete remaining work. Tools remain enabled.
-    SoftStop,
-    /// Inject a correction message (stall detected, tools disabled next round).
-    InjectCorrection,
-    /// Hard abort — agent did not recover after correction.
-    Abort,
+    CompletionObserved,
+    /// A repeated behavior pattern was detected. Advisory only.
+    PatternObserved,
+    /// The observed behavior pattern persisted past its configured patience.
+    /// Advisory only; this does not own termination authority.
+    AdvisoryThresholdReached,
+    /// The infrastructure round ceiling was reached.
+    HardRoundLimitReached { rounds: usize, limit: usize },
 }
 
 /// Configuration for the loop circuit breaker.
@@ -117,7 +120,7 @@ pub struct BreakerConfig {
     /// going through `effective_circuit_breaker_max_introspect_emissions()` first,
     /// as that would turn a user's "use default" (0) into "unbounded".
     pub max_introspect_emissions: usize,
-    /// Max rounds in HalfOpen before aborting.
+    /// Max rounds in HalfOpen before raising advisory evidence strength.
     pub half_open_patience: usize,
     /// Hard ceiling (pure infrastructure guard, prevents infinite loops from bugs).
     pub absolute_max_rounds: usize,
@@ -171,10 +174,10 @@ pub struct LoopCircuitBreaker {
     introspect_emissions_since_last_write: usize,
     /// Tool signatures observed in the trip-time tail window. Frozen at the
     /// moment of `Closed → Open` transition. HalfOpen recovery checks
-    /// whether the post-correction round introduces signatures OUTSIDE this
+    /// whether the post-observation round introduces signatures OUTSIDE this
     /// set — which is the precise question "did the agent break the pattern
     /// that got it killed?" Re-running the full window detectors during
-    /// HalfOpen overweights pre-correction stale rounds and Aborts agents
+    /// HalfOpen overweights pre-observation stale rounds and over-escalates agents
     /// that genuinely pivoted (root cause of session 3d5ded08 overkill).
     trip_tail_signatures: BTreeSet<String>,
 }
@@ -267,17 +270,21 @@ impl LoopCircuitBreaker {
 
         self.rounds.push(signal);
 
-        // Infrastructure hard ceiling — always abort regardless of state.
+        // Infrastructure hard ceiling — an actual budget boundary, distinct
+        // from all behavioral pattern observations.
         if self.rounds.len() >= self.config.absolute_max_rounds {
             self.state = BreakerState::Open;
-            return BreakerAction::Abort;
+            return BreakerAction::HardRoundLimitReached {
+                rounds: self.rounds.len(),
+                limit: self.config.absolute_max_rounds,
+            };
         }
 
         if self.rounds.last().is_some_and(|round| round.task_completed) {
             self.state = BreakerState::Closed;
             self.half_open_rounds = 0;
             self.consecutive_read_only = 0;
-            return BreakerAction::SoftStop;
+            return BreakerAction::CompletionObserved;
         }
 
         match self.state {
@@ -309,15 +316,17 @@ impl LoopCircuitBreaker {
             BreakerState::HalfOpen => self.evaluate_half_open(),
             BreakerState::Open => {
                 // Idempotent: if observe() is called while still Open (caller
-                // hasn't called correction_injected() yet), repeat the
-                // InjectCorrection signal rather than escalating to Abort.
-                BreakerAction::InjectCorrection
+                // hasn't called acknowledge_pattern_observation() yet), repeat the
+                // PatternObserved signal rather than escalating to AdvisoryThresholdReached.
+                BreakerAction::PatternObserved
             }
         }
     }
 
-    /// Acknowledge that a correction was injected. Transitions Open → HalfOpen.
-    pub fn correction_injected(&mut self) {
+    /// Acknowledge that the caller recorded the pattern observation.
+    /// Transitions Open → HalfOpen so subsequent rounds can be compared with
+    /// the trip-time pattern.
+    pub fn acknowledge_pattern_observation(&mut self) {
         if self.state == BreakerState::Open {
             self.state = BreakerState::HalfOpen;
             self.half_open_rounds = 0;
@@ -331,7 +340,7 @@ impl LoopCircuitBreaker {
         {
             self.state = BreakerState::Open;
             self.trip_tail_signatures = self.collect_trip_tail_signatures();
-            BreakerAction::InjectCorrection
+            BreakerAction::PatternObserved
         } else {
             BreakerAction::Continue
         }
@@ -339,7 +348,7 @@ impl LoopCircuitBreaker {
 
     /// Snapshot the union of tool signatures across the tail window that
     /// caused the trip. Used by HalfOpen to decide recovery without
-    /// re-running window detectors over pre-correction stale rounds.
+    /// re-running window detectors over pre-observation stale rounds.
     fn collect_trip_tail_signatures(&self) -> BTreeSet<String> {
         // Use the widest detector window (read_only_stall_threshold) so we
         // capture every signature the agent was cycling through.
@@ -368,8 +377,8 @@ impl LoopCircuitBreaker {
         //   2. answered with text only (no tool calls)
         //   3. introduced a tool signature outside the trip-time stale set
         // We deliberately do NOT re-run the window detectors here — those
-        // include N-1 pre-correction stale rounds and would falsely
-        // condemn a single post-correction round that genuinely pivoted.
+        // include N-1 pre-observation stale rounds and would falsely
+        // condemn a single post-observation round that genuinely pivoted.
         let broke_pattern = latest.produced_mutation
             || latest.tool_count == 0
             || latest
@@ -384,7 +393,7 @@ impl LoopCircuitBreaker {
             self.trip_tail_signatures.clear();
             BreakerAction::Continue
         } else if self.half_open_rounds >= self.config.half_open_patience {
-            BreakerAction::Abort
+            BreakerAction::AdvisoryThresholdReached
         } else {
             BreakerAction::Continue
         }
@@ -550,15 +559,18 @@ mod tests {
     }
 
     #[test]
-    fn completion_signal_emits_soft_stop_without_opening_breaker() {
+    fn completion_signal_emits_observation_without_opening_breaker() {
         let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
 
-        assert_eq!(cb.observe(completion_signal()), BreakerAction::SoftStop);
+        assert_eq!(
+            cb.observe(completion_signal()),
+            BreakerAction::CompletionObserved
+        );
         assert_eq!(cb.state(), BreakerState::Closed);
     }
 
     #[test]
-    fn completion_signal_takes_precedence_over_repetition_correction() {
+    fn completion_signal_takes_precedence_over_repetition_observation() {
         let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
 
         assert_eq!(
@@ -572,18 +584,14 @@ mod tests {
         let mut done = completion_signal();
         done.tool_signatures = sig(&["read_file:same.rs"]);
 
-        assert_eq!(cb.observe(done), BreakerAction::SoftStop);
+        assert_eq!(cb.observe(done), BreakerAction::CompletionObserved);
         assert_eq!(cb.state(), BreakerState::Closed);
     }
 
     #[test]
     fn mutating_objective_keeps_read_only_stall_threshold_relaxed() {
-        let profile = TaskExecutionProfile::from_structured_intent(
-            true,
-            false,
-            TaskComplexity::Standard,
-            true,
-        );
+        let profile =
+            TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard);
         assert!(profile.mutates_workspace);
 
         let cfg = BreakerConfig {
@@ -600,12 +608,8 @@ mod tests {
 
     #[test]
     fn read_only_review_keeps_wider_exploration_threshold() {
-        let profile = TaskExecutionProfile::from_structured_intent(
-            false,
-            true,
-            TaskComplexity::Standard,
-            true,
-        );
+        let profile =
+            TaskExecutionProfile::from_structured_intent(false, true, TaskComplexity::Standard);
         assert!(!profile.mutates_workspace);
 
         let cfg = BreakerConfig {
@@ -640,7 +644,7 @@ mod tests {
         // Round 6 hits the threshold — all read-only and no novel signatures.
         assert_eq!(
             cb.observe(signal(&[patterns[5 % 3]], false)),
-            BreakerAction::InjectCorrection
+            BreakerAction::PatternObserved
         );
         assert_eq!(cb.state(), BreakerState::Open);
     }
@@ -681,7 +685,7 @@ mod tests {
         );
         assert_eq!(
             cb.observe(signal(&["read_file:same.rs"], false)),
-            BreakerAction::InjectCorrection
+            BreakerAction::PatternObserved
         );
         assert_eq!(cb.state(), BreakerState::Open);
     }
@@ -723,7 +727,7 @@ mod tests {
         // Round 3 is the 3rd consecutive identical → repetition stall trips.
         assert_eq!(
             cb.observe(signal(&["read_file:a.rs"], false)),
-            BreakerAction::InjectCorrection
+            BreakerAction::PatternObserved
         );
     }
 
@@ -755,14 +759,14 @@ mod tests {
         );
         assert_eq!(
             cb.observe(signal(&["read_file:b.rs"], false)),
-            BreakerAction::InjectCorrection
+            BreakerAction::PatternObserved
         );
     }
 
-    // ─── Recovery after correction ──────────────────────────────────────
+    // ─── Recovery after observation ──────────────────────────────────────
 
     #[test]
-    fn recovery_after_correction_returns_to_closed() {
+    fn recovery_after_observation_returns_to_closed() {
         let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
         // Trip the breaker.
         cb.observe(signal(&["read_file:x"], false));
@@ -770,8 +774,8 @@ mod tests {
         cb.observe(signal(&["read_file:x"], false));
         assert_eq!(cb.state(), BreakerState::Open);
 
-        // Correction injected.
-        cb.correction_injected();
+        // Pattern observation acknowledged.
+        cb.acknowledge_pattern_observation();
         assert_eq!(cb.state(), BreakerState::HalfOpen);
 
         // Agent recovers with a mutation.
@@ -781,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn abort_if_no_recovery_after_correction() {
+    fn persistent_pattern_reaches_advisory_threshold() {
         let mut cb = LoopCircuitBreaker::new(BreakerConfig {
             half_open_patience: 2,
             ..Default::default()
@@ -790,7 +794,7 @@ mod tests {
         cb.observe(signal(&["read_file:x"], false));
         cb.observe(signal(&["read_file:x"], false));
         cb.observe(signal(&["read_file:x"], false));
-        cb.correction_injected();
+        cb.acknowledge_pattern_observation();
 
         // Still stalling in HalfOpen.
         assert_eq!(
@@ -799,14 +803,14 @@ mod tests {
         );
         assert_eq!(
             cb.observe(signal(&["read_file:x"], false)),
-            BreakerAction::Abort
+            BreakerAction::AdvisoryThresholdReached
         );
     }
 
     // ─── Absolute max rounds (infrastructure guard) ─────────────────────
 
     #[test]
-    fn absolute_max_rounds_aborts_even_if_healthy() {
+    fn absolute_max_rounds_emits_typed_hard_boundary_even_if_healthy() {
         let mut cb = LoopCircuitBreaker::new(BreakerConfig {
             absolute_max_rounds: 5,
             ..Default::default()
@@ -820,7 +824,10 @@ mod tests {
         // Round 5 hits the ceiling.
         assert_eq!(
             cb.observe(signal(&["write_file:f5"], true)),
-            BreakerAction::Abort
+            BreakerAction::HardRoundLimitReached {
+                rounds: 5,
+                limit: 5,
+            }
         );
     }
 
@@ -861,7 +868,7 @@ mod tests {
         // Only on the 3rd consecutive does it trip again.
         assert_eq!(
             cb.observe(signal(&["read_file:a"], false)),
-            BreakerAction::InjectCorrection
+            BreakerAction::PatternObserved
         );
     }
 
@@ -872,7 +879,7 @@ mod tests {
         cb.observe(signal(&["read_file:x"], false));
         cb.observe(signal(&["read_file:x"], false));
         cb.observe(signal(&["read_file:x"], false));
-        cb.correction_injected();
+        cb.acknowledge_pattern_observation();
 
         // Agent changes pattern (different tool) but no mutation — still recovery.
         let action = cb.observe(signal(&["grep:new_pattern"], false));
@@ -920,7 +927,7 @@ mod tests {
         // Round 6 after mutation trips (6 consecutive read-only with no novel sigs).
         assert_eq!(
             cb.observe(signal(&[patterns[5 % 2]], false)),
-            BreakerAction::InjectCorrection
+            BreakerAction::PatternObserved
         );
     }
 
@@ -960,8 +967,7 @@ mod tests {
 
     // ─── Progress-aware read_only_stall ───────────────────────────────
 
-    /// BreakerAction has exactly 5 variants. Introspect/SoftStop are soft
-    /// interventions; InjectCorrection is the hard stall correction.
+    /// Behavioral actions are distinct from the typed hard round boundary.
     #[test]
     fn breaker_action_variants_are_exhaustively_handled() {
         let actions = [
@@ -969,17 +975,22 @@ mod tests {
             BreakerAction::Introspect {
                 consecutive_read_only: 12,
             },
-            BreakerAction::SoftStop,
-            BreakerAction::InjectCorrection,
-            BreakerAction::Abort,
+            BreakerAction::CompletionObserved,
+            BreakerAction::PatternObserved,
+            BreakerAction::AdvisoryThresholdReached,
+            BreakerAction::HardRoundLimitReached {
+                rounds: 100,
+                limit: 100,
+            },
         ];
         for a in &actions {
             match a {
                 BreakerAction::Continue => {}
-                BreakerAction::InjectCorrection => {}
+                BreakerAction::PatternObserved => {}
                 BreakerAction::Introspect { .. } => {}
-                BreakerAction::SoftStop => {}
-                BreakerAction::Abort => {}
+                BreakerAction::CompletionObserved => {}
+                BreakerAction::AdvisoryThresholdReached => {}
+                BreakerAction::HardRoundLimitReached { .. } => {}
             }
         }
     }
@@ -1078,9 +1089,9 @@ mod tests {
         }
         assert_eq!(
             cb.observe(signal(&["grep:repeat"], false)),
-            BreakerAction::InjectCorrection
+            BreakerAction::PatternObserved
         );
-        cb.correction_injected();
+        cb.acknowledge_pattern_observation();
 
         assert_eq!(
             cb.observe(signal(&["read_file:recovered.rs"], false)),
@@ -1144,7 +1155,7 @@ mod tests {
         // Round 12: trips
         assert_eq!(
             cb.observe(signal(&[patterns[11 % 3]], false)),
-            BreakerAction::InjectCorrection
+            BreakerAction::PatternObserved
         );
     }
 
@@ -1242,13 +1253,13 @@ mod tests {
         assert_eq!(cfg.max_introspect_emissions, 3);
     }
 
-    // ─── HalfOpen recovery: judge the post-correction round only ─────────
+    // ─── HalfOpen recovery: judge the post-observation round only ─────────
     //
-    // Root cause of overkill aborts (session 3d5ded08):
+    // Root cause of overkill raises a strong advisory (session 3d5ded08):
     // `evaluate_half_open` re-runs the full N-round window detectors. The
-    // first 1-2 post-correction rounds are drowned by N-1 stale rounds from
+    // first 1-2 post-observation rounds are drowned by N-1 stale rounds from
     // before the trip, so even a clean novel signature can't lift the
-    // window's verdict. Patience expires → Abort despite genuine recovery.
+    // window's verdict. Patience expires → AdvisoryThresholdReached despite genuine recovery.
     //
     // Fix: HalfOpen judges the LATEST round against the trip-time stall
     // pattern only. Mutation, empty (text-only) round, or any signature
@@ -1257,7 +1268,7 @@ mod tests {
     /// HalfOpen with one novel signature in latest round must recover.
     /// Pre-fix bug: detect_prolonged_read_only_stall sees N-1 stale rounds
     /// and 1 novel round; the lone novel sig is a subset-failure relative to
-    /// the prior window so the detector still says "stalling" → Abort.
+    /// the prior window so the detector still says "stalling" → AdvisoryThresholdReached.
     #[test]
     fn half_open_recovers_when_latest_round_breaks_trip_pattern() {
         let mut cb = LoopCircuitBreaker::new(BreakerConfig {
@@ -1272,14 +1283,14 @@ mod tests {
             cb.observe(signal(&[stale[i % 3]], false));
         }
         assert_eq!(cb.state(), BreakerState::Open);
-        cb.correction_injected();
+        cb.acknowledge_pattern_observation();
 
-        // Post-correction: a single completely novel signature.
+        // Post-observation: a single completely novel signature.
         let action = cb.observe(signal(&["read_file:newly_focused.rs"], false));
         assert_eq!(
             action,
             BreakerAction::Continue,
-            "novel sig after correction is genuine recovery, not a stall"
+            "novel sig after observation is genuine recovery, not a stall"
         );
         assert_eq!(cb.state(), BreakerState::Closed);
     }
@@ -1298,7 +1309,7 @@ mod tests {
         for i in 0..6 {
             cb.observe(signal(&[stale[i % 3]], false));
         }
-        cb.correction_injected();
+        cb.acknowledge_pattern_observation();
 
         let empty = RoundSignal {
             tool_signatures: BTreeSet::new(),
@@ -1310,10 +1321,10 @@ mod tests {
         assert_eq!(cb.state(), BreakerState::Closed);
     }
 
-    /// HalfOpen still aborts if model keeps hitting only the trip-time
+    /// HalfOpen still raises a strong advisory if model keeps hitting only the trip-time
     /// stale signatures. underkill protection.
     #[test]
-    fn half_open_aborts_when_latest_repeats_trip_stale_pattern() {
+    fn half_open_reaches_advisory_threshold_when_latest_repeats_stale_pattern() {
         let mut cb = LoopCircuitBreaker::new(BreakerConfig {
             read_only_stall_threshold: 6,
             stall_threshold: 100,
@@ -1324,7 +1335,7 @@ mod tests {
         for i in 0..6 {
             cb.observe(signal(&[stale[i % 3]], false));
         }
-        cb.correction_injected();
+        cb.acknowledge_pattern_observation();
 
         // Two more rounds that only call the same stale signatures.
         assert_eq!(
@@ -1333,14 +1344,14 @@ mod tests {
         );
         assert_eq!(
             cb.observe(signal(&["grep:b"], false)),
-            BreakerAction::Abort,
-            "patience expired with zero novel work — must abort"
+            BreakerAction::AdvisoryThresholdReached,
+            "patience expired with zero novel work — must raise a strong advisory"
         );
     }
 
     /// Real-world scenario from session 3d5ded08: 89 rounds of mostly read-only
-    /// exploration. After breaker trips and injects correction, the model
-    /// shifts to a different file. With the bug this aborts; post-fix it
+    /// exploration. After the breaker records an observation, the model
+    /// shifts to a different file. With the bug this raises a strong advisory; post-fix it
     /// recovers. Uses default thresholds.
     #[test]
     fn session_3d5ded08_reproduction_recovers_post_fix() {
@@ -1352,18 +1363,18 @@ mod tests {
             let action = cb.observe(signal(&[cycle[i % 4]], false));
             // Last round trips.
             if i == 11 {
-                assert_eq!(action, BreakerAction::InjectCorrection);
+                assert_eq!(action, BreakerAction::PatternObserved);
             }
         }
-        cb.correction_injected();
+        cb.acknowledge_pattern_observation();
 
-        // Model honors the correction by reading a genuinely new file.
+        // Model honors the observation by reading a genuinely new file.
         // Pre-fix: this gets eaten by the 12-round window and patience burns down.
         // Post-fix: novel sig → immediate recovery.
         assert_eq!(
             cb.observe(signal(&["read_file:e_new"], false)),
             BreakerAction::Continue,
-            "genuine pivot after correction must not be killed by stale-window logic"
+            "genuine pivot after observation must not be killed by stale-window logic"
         );
         assert_eq!(cb.state(), BreakerState::Closed);
     }

@@ -172,7 +172,7 @@ fn schemas_include_consolidated_tools() {
 // now handled at the execution layer, not advertised per-schema.
 
 #[test]
-fn git_schema_has_stash_action() {
+fn git_schema_exposes_stash_operation() {
     let schemas = all_tool_schemas();
     let git_schema = schemas
         .iter()

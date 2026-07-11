@@ -5,7 +5,9 @@ edition.workspace = true
 description = "Stateless HTTP + SSE client for the Astra thin client protocol"
 
 [dependencies]
+astra-core.workspace = true
 astra-runtime-env.workspace = true
+astra-sync-protocol.workspace = true
 async-stream = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }

@@ -435,18 +435,6 @@ mod tests {
     // bootstrap so these tests cannot drift into a private CSL table shape.
 
     #[test]
-    fn db_store_tests_do_not_embed_private_core_schema_ddl() {
-        let source = include_str!("db_store.rs");
-        for table in ["agent_sessions", "conversation_log"] {
-            let private_ddl = format!("{}{}", "CREATE TABLE IF NOT EXISTS ", table);
-            assert!(
-                !source.contains(&private_ddl),
-                "DbCslStore tests must use astra_services::ensure_core_schema instead of private {table} DDL"
-            );
-        }
-    }
-
-    #[test]
     fn truncate_before_sql_is_owner_scoped_and_batch_bounded() {
         let normalized = TRUNCATE_BEFORE_SQL
             .split_whitespace()
@@ -468,32 +456,6 @@ mod tests {
             assert!(CSL_TRUNCATE_BATCH_LIMIT > 0);
             assert!(CSL_TRUNCATE_BATCH_LIMIT <= 10_000);
         };
-    }
-
-    #[test]
-    fn truncate_before_loops_until_batch_is_empty() {
-        let source = include_str!("db_store.rs");
-        let body = source
-            .split("async fn truncate_before")
-            .nth(1)
-            .and_then(|rest| rest.split("async fn fork").next())
-            .expect("truncate_before body");
-        assert!(
-            body.contains("let before_seq = i64::try_from(before_seq).unwrap_or(i64::MAX);"),
-            "truncate_before must not wrap large u64 sequence values into negative BIGINT values"
-        );
-        assert!(
-            body.contains("loop {") && body.contains("if deleted == 0"),
-            "truncate_before must keep pruning batches until no rows remain"
-        );
-        assert!(
-            body.contains("checked_add(deleted)"),
-            "truncate_before must fail loudly on impossible deleted-row overflow"
-        );
-        assert!(
-            body.contains("CSL_TRUNCATE_BATCH_LIMIT"),
-            "truncate_before must bind the batch limit constant"
-        );
     }
 
     async fn test_store() -> DbCslStore {

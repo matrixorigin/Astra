@@ -48,11 +48,12 @@ impl TokenAccounting {
         self.total_input().min(u32::MAX as u64) as u32
     }
 
-    /// Cache hit ratio: cache_read / (cache_read + cache_creation).
-    /// Returns 0.0 if both are zero.
+    /// Share of all input tokens served by prompt-cache reads:
+    /// `cache_read / (prompt + cache_read + cache_creation)`.
+    /// Returns 0.0 when the request has no input tokens.
     #[must_use]
     pub fn cache_hit_ratio(&self) -> f64 {
-        let denom = self.cache_read + self.cache_creation;
+        let denom = self.total_input();
         if denom == 0 {
             return 0.0;
         }
@@ -105,12 +106,24 @@ mod tests {
     #[test]
     fn cache_hit_ratio_computed_correctly() {
         let t = TokenAccounting {
-            prompt: 0,
+            prompt: 100,
             cache_read: 800,
-            cache_creation: 200,
+            cache_creation: 100,
             completion: 0,
         };
         assert!((t.cache_hit_ratio() - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_hit_ratio_includes_fresh_prompt_in_denominator() {
+        let t = TokenAccounting {
+            prompt: 800,
+            cache_read: 100,
+            cache_creation: 100,
+            completion: 0,
+        };
+
+        assert!((t.cache_hit_ratio() - 0.1).abs() < 1e-9);
     }
 
     #[test]

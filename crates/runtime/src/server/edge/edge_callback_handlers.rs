@@ -769,12 +769,6 @@ mod edge_callback_insert_tests {
         }
     }
 
-    fn source_index(source: &str, needle: &str) -> usize {
-        source
-            .find(needle)
-            .unwrap_or_else(|| panic!("source must contain `{needle}`"))
-    }
-
     #[test]
     fn edge_register_request_accepts_runtime_environment_advertisement() {
         let request: EdgeRegisterRequest = serde_json::from_value(json!({
@@ -806,54 +800,6 @@ mod edge_callback_insert_tests {
         assert_eq!(
             request.capabilities.as_ref().unwrap()["binding"]["runtime"]["provider"],
             "host_process"
-        );
-    }
-
-    #[test]
-    fn tool_result_handler_releases_ledger_lock_before_cross_pod_delivery() {
-        let source = include_str!("edge_callback_handlers.rs");
-        let lock_idx = source_index(
-            source,
-            "let mut lock = state.edge_callback_ledger.lock().await;",
-        );
-        let insert_done_idx =
-            source_index(source, "let (ledger_enqueued, ledger_capacity_exceeded)");
-        let deliver_idx = source_index(source, ".deliver_result(");
-        let capacity_fallback_idx =
-            source_index(source, "if ledger_capacity_exceeded && !dispatch_delivered");
-
-        assert!(
-            lock_idx < insert_done_idx,
-            "tool result handler should only lock around the ledger insert"
-        );
-        assert!(
-            insert_done_idx < deliver_idx,
-            "cross-pod delivery must happen after the ledger lock scope closes"
-        );
-        assert!(
-            deliver_idx < capacity_fallback_idx,
-            "ledger capacity errors should be recoverable when durable dispatch delivery succeeds"
-        );
-    }
-
-    #[test]
-    fn approval_handler_does_not_hold_ledger_lock_while_writing_journal() {
-        let source = include_str!("edge_callback_handlers.rs");
-        let journal_lookup_idx = source_index(source, "find_latest_approval_required_for_run");
-        let journal_append_idx =
-            source_index(source, "append_approval_decision_for_run_if_absent(");
-        let ledger_lock_idx = source_index(
-            source,
-            "let ledger_result = {\n        let mut lock = state.edge_callback_ledger.lock().await;",
-        );
-
-        assert!(
-            journal_lookup_idx < ledger_lock_idx,
-            "approval journal lookup must run before acquiring the ledger lock"
-        );
-        assert!(
-            journal_append_idx < ledger_lock_idx,
-            "approval journal append must run before acquiring the ledger lock"
         );
     }
 

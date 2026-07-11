@@ -9,8 +9,14 @@
 //! - Repeated tool calls (retry loops)
 //! - Correction patterns in user follow-up
 
+use crate::orchestration::agent_result_wire::{
+    AGENT_RESULT_CLASS_AGENT_INCOMPLETE as RESULT_CLASS_AGENT_INCOMPLETE,
+    AGENT_RESULT_CLASS_FANOUT_INCOMPLETE as RESULT_CLASS_FANOUT_INCOMPLETE,
+    agent_fanout_result_looks_like, agent_fanout_structured_result_class,
+    agent_tool_result_looks_like, agent_tool_structured_result_class,
+};
 use astra_services::session_journal::{JournalEvent, ToolCallRecord};
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// Signals detected during evaluation.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,64 +84,48 @@ pub enum EvalSignal {
     },
     /// A tool command completed at the transport/execution layer but its
     /// classified outcome still represents an unresolved task failure
-    /// (`test_failure`, `env_failure`, `execution_error`). Carries the
-    /// normalized result class and number of unresolved streams.
+    /// (`test_failure`, `env_failure`, `execution_error`, or a structured
+    /// orchestration incomplete class). Carries the normalized result class and
+    /// number of unresolved streams.
     ToolOutcomeFailure { class: String, count: usize },
     /// One or more tool calls were rejected before execution by policy or
     /// runtime admission. They are not material `tools_used`, but they are
     /// still user-visible failed tool attempts and must not be evaluated as
     /// healthy execution.
     BlockedToolCall { count: usize },
-    /// The final answer had no lexical overlap with the latest user request,
-    /// so tool success alone is not enough to call the turn successful.
-    FinalAnswerOffTarget {
-        matched_terms: usize,
-        required_terms: usize,
-    },
 }
 
 /// Default threshold for [`EvalSignal::RedundantOverlappingReads`]: minimum
 /// count of redundant read events needed before flagging the turn. Calibrated
-/// against 14k real sessions: at ≥3, the signal flags ~15% of `rounds≥8`
-/// turns and catches all confirmed-waste fixtures (c49bc4a3 t2 = 38,
-/// eafda07e t2 = 19, 8ba9d165 t2 = 19, 4178c6a7 t2 = 19, bbf46ab2 t3 = 11,
-/// bbf46ab2 t4 = 7) while leaving healthy short turns silent.
+/// against production journals: at this level the signal catches repeated
+/// context re-reads while leaving healthy short turns silent.
 pub const REDUNDANT_OVERLAPPING_READS_THRESHOLD: usize = 3;
 
 /// Default threshold for [`EvalSignal::SearchFanout`]: minimum count of
 /// grep/rg/find-like tool calls in a turn before flagging passive search
-/// fan-out. Calibrated against 15k real sessions: among 68 long turns
-/// (`llm_rounds >= 8`), threshold 8 flags 10 (14.7%), including known waste
-/// fixtures c49bc4a3 t1/t2, bbf46ab2 t3/t4, 8ba9d165 t2, 03945541 t2.
-/// False-positive risk is higher than redundant-reads because some healthy
-/// investigative turns also fan out search, so this remains post-mortem only
-/// and carries a milder quality penalty.
+/// fan-out. False-positive risk is higher than redundant reads because some
+/// healthy investigative turns also fan out search, so this remains
+/// post-mortem only and carries a milder quality penalty.
 pub const SEARCH_FANOUT_THRESHOLD: usize = 8;
 
 /// Default threshold for [`EvalSignal::RedundantValidationRetries`]:
 /// redundant retries of the SAME heavy validation prefix within a no-mutation
 /// window before flagging the turn. Carries retry count (runs after the first).
-/// Calibrated against 15k real sessions: among 68 long turns (`llm_rounds >= 8`)
-/// threshold 2 flags 2 turns (2.9%) with high precision:
-/// - 80ca74de turn 8: `npm test --prefix tmp/reimbursement-system` retried 3x
-///   with no intervening edit
-/// - 1d21375d turn 3: `cargo check -p astra-tools` retried 2x with no
-///   intervening edit
+/// Kept conservative because validation retries may be legitimate when there
+/// was an intervening mutation or configuration change.
 pub const REDUNDANT_VALIDATION_RETRIES_THRESHOLD: usize = 2;
 
 /// Default threshold for [`EvalSignal::LlmRoundChurn`]: user turns that need
 /// 8+ LLM rounds are usually in trouble unless they are doing something very
-/// deliberate. Calibrated from recent forensic sessions where healthy turns
-/// typically finish within <=4 rounds while wasteful review/investigation turns
-/// balloon to 8+.
+/// deliberate.
 pub const LLM_ROUND_CHURN_THRESHOLD: usize = 8;
 pub const EXPLORATION_FAMILY_CHURN_THRESHOLD: usize = 3;
+pub const ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE: usize = 2;
 pub const PROMPT_GROWTH_CHURN_MIN_ROUNDS: u32 = 4;
 pub const PROMPT_GROWTH_CHURN_MIN_DELTA_TOKENS: u64 = 8_000;
 pub const PROMPT_GROWTH_CHURN_MIN_RATIO_NUMERATOR: u64 = 2;
 pub const PROMPT_GROWTH_CHURN_MIN_RATIO_DENOMINATOR: u64 = 1;
 const HIGH_COST_TOOL_CALL_THRESHOLD: usize = 16;
-
 /// Post-mortem evaluation thresholds. Defaults mirror the calibrated compile-
 /// time constants above, but runtime callers may override them from config so
 /// passive eval signals can be tuned without a rebuild.
@@ -168,6 +158,75 @@ pub struct TurnEvaluationTelemetry {
     pub max_round_prompt_tokens: Option<u64>,
 }
 
+/// Conservative mid-loop progress policy.
+///
+/// This is intentionally narrower than post-mortem turn evaluation: it does
+/// not infer task intent from user prose, does not parse tool output text, and
+/// never hard-stops a turn. It only recommends low-risk advisory evidence when
+/// structured observations show repeated low-yield work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OnlineProgressPolicy {
+    pub redundant_overlapping_reads_threshold: usize,
+    pub min_tool_calls_before_nudge: usize,
+}
+
+impl Default for OnlineProgressPolicy {
+    fn default() -> Self {
+        Self {
+            redundant_overlapping_reads_threshold: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
+            min_tool_calls_before_nudge: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OnlineProgressSignals {
+    pub tool_calls: usize,
+    pub redundant_overlapping_reads: usize,
+    pub stronger_advisory_emitted: bool,
+    pub advisory_already_emitted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnlineProgressDecision {
+    Continue,
+    ReuseKnownContext { redundant_overlapping_reads: usize },
+}
+
+impl OnlineProgressDecision {
+    const fn continue_turn() -> Self {
+        Self::Continue
+    }
+}
+
+pub fn decide_online_progress(
+    signals: OnlineProgressSignals,
+    policy: OnlineProgressPolicy,
+) -> OnlineProgressDecision {
+    if signals.stronger_advisory_emitted || signals.advisory_already_emitted {
+        return OnlineProgressDecision::continue_turn();
+    }
+
+    if signals.tool_calls < policy.min_tool_calls_before_nudge {
+        return OnlineProgressDecision::continue_turn();
+    }
+
+    if threshold_reached(
+        signals.redundant_overlapping_reads,
+        policy.redundant_overlapping_reads_threshold,
+    ) {
+        return OnlineProgressDecision::ReuseKnownContext {
+            redundant_overlapping_reads: signals.redundant_overlapping_reads,
+        };
+    }
+
+    OnlineProgressDecision::continue_turn()
+}
+
+const fn threshold_reached(count: usize, threshold: usize) -> bool {
+    threshold > 0 && count >= threshold
+}
+
 /// Result of evaluating a turn's success and quality.
 #[derive(Debug, Clone)]
 pub struct TurnEvaluation {
@@ -182,8 +241,6 @@ pub struct TurnEvaluation {
     /// Thresholds used when deriving configurable passive eval signals.
     pub thresholds: EvaluationThresholds,
 }
-
-pub const TURN_EVALUATION_INCOMPLETE_MARKER: &str = "[Turn evaluation: incomplete.";
 
 pub fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
     let outcome_failures = eval
@@ -232,22 +289,6 @@ pub fn turn_evaluation_signal_reason(signal: &EvalSignal) -> Option<&'static str
         EvalSignal::ExplorationFamilyChurn { .. } => Some("exploration stayed in one tool family"),
         _ => None,
     }
-}
-
-pub fn build_turn_evaluation_annotated_text(
-    full_text: &str,
-    evaluation: &TurnEvaluation,
-) -> String {
-    if evaluation.success || full_text.contains(TURN_EVALUATION_INCOMPLETE_MARKER) {
-        return full_text.to_string();
-    }
-    let notice = turn_evaluation_status_notice(evaluation).unwrap_or_else(|| {
-        format!(
-            "Turn evaluation marked this turn incomplete (quality {:.2}).",
-            evaluation.quality
-        )
-    });
-    format!("{full_text}\n\n{TURN_EVALUATION_INCOMPLETE_MARKER} {notice}]")
 }
 
 /// Per-tool-call record for evaluation (matches ToolCallRecord shape).
@@ -449,14 +490,12 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     thresholds: EvaluationThresholds,
     telemetry: TurnEvaluationTelemetry,
 ) -> TurnEvaluation {
-    // Synthetic placeholders (skill skipped/deferred, surgically removed
-    // parallel tool calls) are audit-only records that do NOT represent real
-    // tool execution. Blocked calls are different: they did not execute, but
-    // they are real user-visible failed tool attempts and must contribute to
-    // tool_error_rate so health cannot claim all tools were healthy.
+    // Execution health is computed only from calls that reached an executor.
+    // Rejected, reused, suppressed, and deferred requests remain available as
+    // typed audit evidence but must not be mislabeled as execution failures.
     let tool_calls = tool_call_records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder() || counts_as_noop_metric_record(record))
+        .filter(|record| record_was_executed(record) || counts_as_noop_metric_record(record))
         .map(|record| ToolCallInfo {
             name: record.name.clone(),
             // Prefer the *untruncated* args for the repeat-key. `args_preview`
@@ -613,305 +652,21 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     eval
 }
 
-pub fn apply_final_answer_relevance(
-    eval: &mut TurnEvaluation,
-    latest_user_message: &str,
-    final_answer: &str,
-) {
-    let Some(signal) = final_answer_relevance_signal(latest_user_message, final_answer) else {
-        return;
-    };
-    eval.signals
-        .retain(|signal| !matches!(signal, EvalSignal::AllToolsHealthy));
-    eval.signals.push(signal);
-    eval.success = false;
-    eval.quality = eval.quality.min(0.25);
-    eval.confidence = eval.confidence.max(0.75);
-}
-
-pub fn final_answer_relevance_signal(
-    latest_user_message: &str,
-    final_answer: &str,
-) -> Option<EvalSignal> {
-    let required = relevance_terms(latest_user_message);
-    if required.len() < 2 || final_answer.trim().is_empty() {
-        return None;
-    }
-    let answer_terms = relevance_terms(final_answer);
-    if answer_starts_with_direct_response(final_answer)
-        || answer_is_concise_work_status(&answer_terms)
-    {
-        return None;
-    }
-    if !answer_has_stale_work_artifact(final_answer, &answer_terms) {
-        return None;
-    }
-    let matched = required
-        .iter()
-        .filter(|term| answer_terms.contains(*term))
-        .count();
-    if matched == 0 {
-        Some(EvalSignal::FinalAnswerOffTarget {
-            matched_terms: matched,
-            required_terms: required.len(),
-        })
-    } else {
-        None
-    }
-}
-
-fn answer_is_concise_work_status(answer_terms: &std::collections::HashSet<String>) -> bool {
-    // Lexical relevance is a high-precision old-answer detector, not a
-    // semantic judge. A short status/completion answer after tool work
-    // ("Done.", "Reported to parent.", "Fan-out complete.") is too small to
-    // prove task drift, so forcing another LLM round is overkill and commonly
-    // burns the remaining scripted/real turn budget. Keep flagging contentful
-    // off-target syntheses such as stale diffs, line counts, or summaries.
-    const MAX_CONCISE_STATUS_TERMS: usize = 8;
-    const WORK_STATUS_TERMS: &[&str] = &[
-        "analyzed",
-        "analysed",
-        "complete",
-        "completed",
-        "done",
-        "finished",
-        "fixed",
-        "following",
-        "implemented",
-        "passed",
-        "read",
-        "recovered",
-        "reported",
-        "updated",
-        "written",
-    ];
-
-    !answer_terms.is_empty()
-        && answer_terms.len() <= MAX_CONCISE_STATUS_TERMS
-        && WORK_STATUS_TERMS
-            .iter()
-            .any(|term| answer_terms.contains(*term))
-}
-
-fn answer_has_stale_work_artifact(
-    final_answer: &str,
-    answer_terms: &std::collections::HashSet<String>,
-) -> bool {
-    // This guard is intentionally conservative: lexical non-overlap is not
-    // enough to prove drift. Only force a retry when the answer looks like a
-    // concrete stale work artifact from another turn (diff stats, commits,
-    // file/line counts, build/test failure summaries, etc.) or a runtime
-    // scaffolding fallback ("session context unavailable", "awaiting your
-    // next instruction") that clearly did not answer the user. Generic short
-    // synthesis like "Here is my summary." or "Final answer from skill output."
-    // may be low quality, but it is not a reliable stale-answer signal.
-    const STALE_WORK_ARTIFACT_TERMS: &[&str] = &[
-        "branch",
-        "branches",
-        "build",
-        "changed",
-        "commit",
-        "commits",
-        "coverage",
-        "delete",
-        "deleted",
-        "deletions",
-        "diff",
-        "error",
-        "errors",
-        "fail",
-        "failed",
-        "failures",
-        "file",
-        "files",
-        "insertions",
-        "line",
-        "lines",
-        "patch",
-        "test",
-        "tests",
-        "workspace",
-    ];
-
-    if final_answer.chars().any(|ch| ch.is_ascii_digit()) {
-        return true;
-    }
-    if answer_has_runtime_scaffolding_artifact(answer_terms) {
-        return true;
-    }
-    STALE_WORK_ARTIFACT_TERMS
-        .iter()
-        .filter(|term| answer_terms.contains(**term))
-        .take(2)
-        .count()
-        >= 2
-}
-
-fn answer_has_runtime_scaffolding_artifact(
-    answer_terms: &std::collections::HashSet<String>,
-) -> bool {
-    const RUNTIME_CONTEXT_TERMS: &[&str] = &[
-        "context",
-        "executor",
-        "history",
-        "prompt",
-        "resume",
-        "runtime",
-        "session",
-        "workspace",
-    ];
-    const NON_ANSWER_TERMS: &[&str] = &[
-        "awaiting",
-        "bound",
-        "degraded",
-        "incomplete",
-        "instruction",
-        "prior",
-        "restored",
-        "unavailable",
-    ];
-
-    let context_terms = RUNTIME_CONTEXT_TERMS
-        .iter()
-        .filter(|term| answer_terms.contains(**term))
-        .take(2)
-        .count();
-    let has_non_answer_term = NON_ANSWER_TERMS
-        .iter()
-        .any(|term| answer_terms.contains(*term));
-
-    context_terms >= 2 && has_non_answer_term
-}
-
 fn counts_as_noop_metric_record(record: &ToolCallRecord) -> bool {
     record.ok
-        && matches!(
-            record.error.as_deref(),
-            Some("cached_cross_turn" | "duplicate_within_turn")
-        )
         && record.is_noop_or_cached_result()
+        && matches!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Reused
+                | astra_services::session_journal::ToolCallDisposition::Suppressed
+        )
+        && record.surgically_removed != Some(true)
+        && record.skill_reentry_count.is_none()
+        && record.skill_locked_out != Some(true)
 }
 
-fn relevance_terms(text: &str) -> std::collections::HashSet<String> {
-    let mut terms = std::collections::HashSet::new();
-    let mut ascii = String::new();
-    let mut cjk_run = String::new();
-
-    fn flush_ascii(buf: &mut String, terms: &mut std::collections::HashSet<String>) {
-        if buf.len() >= 3 && !is_relevance_stop_word(buf) {
-            terms.insert(buf.clone());
-        }
-        buf.clear();
-    }
-
-    fn flush_cjk(buf: &mut String, terms: &mut std::collections::HashSet<String>) {
-        let chars = buf.chars().collect::<Vec<_>>();
-        if chars.len() >= 2 {
-            for window in chars.windows(2) {
-                terms.insert(window.iter().collect::<String>());
-            }
-            for ch in chars {
-                if !is_cjk_stop_char(ch) {
-                    terms.insert(ch.to_string());
-                }
-            }
-        }
-        buf.clear();
-    }
-
-    for ch in text.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            flush_cjk(&mut cjk_run, &mut terms);
-            ascii.push(ch);
-        } else if is_cjk(ch) {
-            flush_ascii(&mut ascii, &mut terms);
-            cjk_run.push(ch);
-        } else {
-            flush_ascii(&mut ascii, &mut terms);
-            flush_cjk(&mut cjk_run, &mut terms);
-        }
-    }
-    flush_ascii(&mut ascii, &mut terms);
-    flush_cjk(&mut cjk_run, &mut terms);
-    terms
-}
-
-fn is_cjk(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF | 0x2A700..=0x2B73F
-    )
-}
-
-fn is_relevance_stop_word(word: &str) -> bool {
-    matches!(
-        word,
-        "the"
-            | "and"
-            | "for"
-            | "you"
-            | "are"
-            | "can"
-            | "could"
-            | "would"
-            | "should"
-            | "what"
-            | "why"
-            | "how"
-            | "this"
-            | "that"
-            | "with"
-            | "from"
-            | "into"
-            | "about"
-            | "please"
-    )
-}
-
-fn is_cjk_stop_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '的' | '了'
-            | '是'
-            | '在'
-            | '我'
-            | '你'
-            | '他'
-            | '她'
-            | '它'
-            | '这'
-            | '那'
-            | '和'
-            | '与'
-            | '或'
-            | '及'
-            | '吗'
-            | '呢'
-            | '啊'
-            | '吧'
-    )
-}
-
-fn answer_starts_with_direct_response(final_answer: &str) -> bool {
-    let trimmed = final_answer
-        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '-' | '*' | '#'))
-        .to_ascii_lowercase();
-    matches!(
-        trimmed.as_str(),
-        s if s.starts_with("yes")
-            || s.starts_with("no")
-            || s.starts_with("not yet")
-            || s.starts_with("it is")
-            || s.starts_with("it isn't")
-            || s.starts_with("it is not")
-            || s.starts_with("是")
-            || s.starts_with("不是")
-            || s.starts_with("否")
-            || s.starts_with("不够")
-            || s.starts_with("够")
-            || s.starts_with("可以")
-            || s.starts_with("不能")
-    )
+fn record_was_executed(record: &ToolCallRecord) -> bool {
+    record.effective_disposition() == astra_services::session_journal::ToolCallDisposition::Executed
 }
 
 fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
@@ -932,7 +687,6 @@ fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
             | EvalSignal::HighCostLowYield { .. }
             | EvalSignal::ToolOutcomeFailure { .. }
             | EvalSignal::BlockedToolCall { .. }
-            | EvalSignal::FinalAnswerOffTarget { .. }
     )
 }
 
@@ -1049,7 +803,14 @@ fn calibrate_confidence_after_quality_penalties(eval: &mut TurnEvaluation) {
 }
 
 fn result_class_is_outcome_failure(class: &str) -> bool {
-    matches!(class, "test_failure" | "env_failure" | "execution_error")
+    matches!(
+        class,
+        "test_failure"
+            | "env_failure"
+            | "execution_error"
+            | RESULT_CLASS_AGENT_INCOMPLETE
+            | RESULT_CLASS_FANOUT_INCOMPLETE
+    )
 }
 
 fn result_class_resolves_outcome_failure(class: &str) -> bool {
@@ -1065,8 +826,8 @@ fn hash_bounded_key(value: &str) -> String {
 }
 
 fn outcome_resolution_key(record: &ToolCallRecord) -> Option<String> {
-    let class = record.result_class.as_deref()?.trim();
-    if !result_class_is_outcome_failure(class) && !result_class_resolves_outcome_failure(class) {
+    let class = effective_tool_result_class(record)?;
+    if !result_class_is_outcome_failure(&class) && !result_class_resolves_outcome_failure(&class) {
         return None;
     }
 
@@ -1093,19 +854,19 @@ fn unresolved_tool_outcome_failure_counts(
     let mut unresolved_by_key = std::collections::BTreeMap::<String, String>::new();
 
     for record in records {
-        if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
+        if !record_was_executed(record) {
             continue;
         }
-        let Some(class) = record.result_class.as_deref().map(str::trim) else {
+        let Some(class) = effective_tool_result_class(record) else {
             continue;
         };
         let Some(key) = outcome_resolution_key(record) else {
             continue;
         };
 
-        if result_class_is_outcome_failure(class) {
-            unresolved_by_key.insert(key, class.to_string());
-        } else if result_class_resolves_outcome_failure(class) {
+        if result_class_is_outcome_failure(&class) {
+            unresolved_by_key.insert(key, class);
+        } else if result_class_resolves_outcome_failure(&class) {
             unresolved_by_key.remove(&key);
         }
     }
@@ -1115,6 +876,40 @@ fn unresolved_tool_outcome_failure_counts(
         *counts.entry(class.clone()).or_insert(0) += 1;
     }
     counts
+}
+
+fn effective_tool_result_class(record: &ToolCallRecord) -> Option<String> {
+    if let Some(class) = record
+        .result_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|class| !class.is_empty())
+    {
+        return Some(class.to_string());
+    }
+
+    structured_tool_result_class(record).map(str::to_string)
+}
+
+fn structured_tool_result_class(record: &ToolCallRecord) -> Option<&'static str> {
+    let value = parse_structured_tool_result(record)?;
+    if record.name == "agent_fanout" || agent_fanout_result_looks_like(&value) {
+        return agent_fanout_structured_result_class(&value);
+    }
+    if record.name == "agent" || agent_tool_result_looks_like(&value) {
+        return agent_tool_structured_result_class(&value);
+    }
+    None
+}
+
+fn parse_structured_tool_result(record: &ToolCallRecord) -> Option<Value> {
+    [
+        record.result_full.as_deref(),
+        record.result_preview.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|raw| serde_json::from_str::<Value>(raw).ok())
 }
 
 fn apply_blocked_tool_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
@@ -1136,7 +931,7 @@ fn apply_blocked_tool_failures(eval: &mut TurnEvaluation, records: &[ToolCallRec
 
     let real_call_count = records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder())
+        .filter(|record| record_was_executed(record) || record.was_blocked_by_policy())
         .count()
         .max(1);
     if blocked == real_call_count || blocked.saturating_mul(2) >= real_call_count {
@@ -1234,7 +1029,7 @@ fn longest_exploration_family_round_streak(
 
     let mut per_round: BTreeMap<u32, RoundState> = BTreeMap::new();
     for record in records {
-        if record.is_synthetic_placeholder() || record.was_blocked_by_policy() {
+        if !record_was_executed(record) {
             continue;
         }
         let Some(round) = record.round else { continue };
@@ -1334,7 +1129,7 @@ fn is_search_like_tool_call(name: &str, args: &str) -> bool {
 pub fn count_search_fanout(records: &[ToolCallRecord]) -> usize {
     records
         .iter()
-        .filter(|rec| !rec.is_synthetic_placeholder() && !rec.was_blocked_by_policy())
+        .filter(|rec| record_was_executed(rec))
         .filter(|rec| is_search_like_tool_call(&rec.name, rec.args_full.as_deref().unwrap_or("")))
         .count()
 }
@@ -1397,7 +1192,7 @@ fn max_redundant_validation_retries(records: &[ToolCallRecord]) -> usize {
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut best = 0usize;
     for rec in records {
-        if rec.is_synthetic_placeholder() || rec.was_blocked_by_policy() {
+        if !record_was_executed(rec) {
             continue;
         }
         let args = rec.args_full.as_deref().unwrap_or("");
@@ -1571,7 +1366,7 @@ fn mutation_target_file(name: &str, args: &str) -> Option<String> {
 
 /// Count redundant overlapping reads — see `EvalSignal::RedundantOverlappingReads`.
 ///
-/// Public so the runtime can call it mid-loop for a corrective intervention,
+/// Public so the runtime can call it mid-loop for an advisory observation,
 /// not just post-mortem. The runtime uses a slightly higher threshold than
 /// the eval-signal threshold to err on the side of underkill for the
 /// behavioral intervention.
@@ -1580,7 +1375,7 @@ pub fn count_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
     let mut per_file: HashMap<String, Vec<ReadRange>> = HashMap::new();
     let mut redundant = 0usize;
     for rec in records {
-        if rec.is_synthetic_placeholder() || rec.was_blocked_by_policy() {
+        if !record_was_executed(rec) {
             continue;
         }
         let args = rec.args_full.as_deref().unwrap_or("");
@@ -1745,15 +1540,6 @@ pub fn eval_signal_to_json_with_thresholds(
             "count": count,
             "message": format!("Detected {count} blocked tool call(s)"),
         }),
-        EvalSignal::FinalAnswerOffTarget {
-            matched_terms,
-            required_terms,
-        } => json!({
-            "kind": "final_answer_off_target",
-            "matched_terms": matched_terms,
-            "required_terms": required_terms,
-            "message": "Final answer did not lexically overlap with the latest user request; tool activity alone cannot mark the turn successful",
-        }),
     }
 }
 pub fn eval_signals_to_json_with_thresholds(
@@ -1790,11 +1576,11 @@ pub fn build_turn_evaluation_journal_event(
         budget_pressure,
         stall_count,
         verdict_warning,
-        // Exclude synthetic placeholders (surgical removals, skipped skills) from
-        // the user-visible tool_call_count — they are audit-only records.
+        // Count only calls that reached an executor. Admission/cache/suppression
+        // dimensions are persisted separately in the turn outcome ledger.
         tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
+            .filter(|r| record_was_executed(r))
             .count(),
         eval_signals_to_json_with_thresholds(&eval.signals, eval.thresholds),
     )
@@ -1856,172 +1642,15 @@ mod tests {
     }
 
     #[test]
-    fn annotated_text_marks_failed_turn_once() {
-        let eval = TurnEvaluation {
-            success: false,
-            quality: 0.2,
-            confidence: 0.9,
-            signals: vec![EvalSignal::ToolErrorRate(1.0)],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        let annotated = build_turn_evaluation_annotated_text("Done.", &eval);
-        let annotated_again = build_turn_evaluation_annotated_text(&annotated, &eval);
-
-        assert!(annotated.contains(TURN_EVALUATION_INCOMPLETE_MARKER));
-        assert!(annotated.contains("tool error rate is high"));
-        assert_eq!(annotated_again, annotated);
-    }
-
-    #[test]
-    fn annotated_text_leaves_successful_turn_unchanged() {
-        let eval = TurnEvaluation {
-            success: true,
-            quality: 0.8,
-            confidence: 0.7,
-            signals: vec![EvalSignal::AllToolsHealthy],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        assert_eq!(
-            build_turn_evaluation_annotated_text("Done.", &eval),
-            "Done."
-        );
-        assert!(turn_evaluation_status_notice(&eval).is_none());
-    }
-
-    #[test]
-    fn final_answer_relevance_flags_old_answer_to_new_question() {
-        let signal = final_answer_relevance_signal(
-            "相关的测试够硬核吗？",
-            "148 files changed, +9498 / -2335 lines, 11 commits.",
-        );
-
-        assert!(
-            matches!(signal, Some(EvalSignal::FinalAnswerOffTarget { .. })),
-            "obvious old-answer synthesis must be flagged: {signal:?}"
-        );
-    }
-
-    #[test]
-    fn final_answer_relevance_accepts_answer_covering_latest_question() {
-        let signal = final_answer_relevance_signal(
-            "相关的测试够硬核吗？",
-            "测试覆盖了 provider routing、edge offline、prompt cache 和 unhappy path，但还缺一次全量在线回归。",
-        );
-
-        assert_eq!(signal, None);
-    }
-
-    #[test]
-    fn final_answer_relevance_accepts_direct_short_answers() {
-        assert_eq!(
-            final_answer_relevance_signal("相关的测试够硬核吗？", "不够，还缺全量在线回归。"),
-            None
-        );
-        assert_eq!(
-            final_answer_relevance_signal("are the tests robust enough?", "No, not yet."),
-            None
-        );
-    }
-
-    #[test]
-    fn final_answer_relevance_accepts_concise_work_status_answers() {
-        for answer in [
-            "Done.",
-            "Reported to parent.",
-            "Read the file.",
-            "Fan-out complete.",
-            "Mixed delegation + tool complete.",
-            "Done! Tests written based on delegation results.",
-        ] {
-            assert_eq!(
-                final_answer_relevance_signal("test query", answer),
-                None,
-                "concise work status should not force another LLM round: {answer}"
-            );
-        }
-    }
-
-    #[test]
-    fn final_answer_relevance_accepts_generic_short_synthesis() {
-        for answer in [
-            "Here is my summary.",
-            "Compacted result.",
-            "Final answer from skill output.",
-        ] {
-            assert_eq!(
-                final_answer_relevance_signal("analyze code", answer),
-                None,
-                "generic synthesis is not a high-confidence stale answer: {answer}"
-            );
-        }
-    }
-
-    #[test]
-    fn final_answer_relevance_accepts_concise_tool_result_summaries() {
-        assert_eq!(
-            final_answer_relevance_signal("git status", "Workspace is clean."),
-            None
-        );
-    }
-
-    #[test]
-    fn final_answer_relevance_flags_runtime_scaffolding_instead_of_answer() {
-        let signal = final_answer_relevance_signal(
-            "有哪些子目录",
-            "Session context was unavailable or incomplete in this runtime \
-             (degraded resume — no prior prompt-facing history restored). \
-             Workspace is bound and ready with the executor online.\n\n\
-             Awaiting your next instruction.",
-        );
-
-        assert!(
-            matches!(signal, Some(EvalSignal::FinalAnswerOffTarget { .. })),
-            "runtime scaffolding fallback must be treated as off-target: {signal:?}"
-        );
-    }
-
-    #[test]
-    fn apply_final_answer_relevance_downgrades_tool_success_when_answer_is_off_target() {
-        let mut eval = TurnEvaluation {
-            success: true,
-            quality: 0.8,
-            confidence: 0.6,
-            signals: vec![EvalSignal::AllToolsHealthy],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        apply_final_answer_relevance(
-            &mut eval,
-            "are the tests robust enough?",
-            "148 files changed, +9498 / -2335 lines, 11 commits.",
-        );
-
-        assert!(!eval.success);
-        assert!(eval.quality <= 0.25);
-        assert!(eval.confidence >= 0.75);
-        assert!(
-            eval.signals
-                .iter()
-                .any(|signal| matches!(signal, EvalSignal::FinalAnswerOffTarget { .. }))
-        );
-        assert!(
-            !eval
-                .signals
-                .iter()
-                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
-            "tool success must not mask an off-target final answer"
-        );
-    }
-
-    #[test]
-    fn blocked_tool_calls_are_evaluation_failures_not_healthy_execution() {
+    fn blocked_tool_calls_fail_the_boundary_without_poisoning_execution_health() {
         let records = vec![ToolCallRecord {
             name: "memory".to_string(),
             ok: false,
             ms: 4,
             error: Some("blocked_tool: executor is unavailable: service_executor_required".into()),
+            result_class: Some(
+                astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS.to_string(),
+            ),
             ..Default::default()
         }];
 
@@ -2036,10 +1665,10 @@ mod tests {
 
         assert!(!eval.success);
         assert!(
-            eval.signals
+            !eval.signals
                 .iter()
                 .any(|signal| matches!(signal, EvalSignal::ToolErrorRate(rate) if (*rate - 1.0).abs() < f64::EPSILON)),
-            "blocked calls must contribute to tool_error_rate: {:?}",
+            "blocked calls did not execute and must not contribute to tool_error_rate: {:?}",
             eval.signals
         );
         assert!(
@@ -2070,7 +1699,7 @@ mod tests {
             &eval,
         );
         let metadata = event.metadata.expect("turn evaluation metadata");
-        assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["tool_call_count"], 0);
         assert!(
             metadata["signals"]
                 .as_array()
@@ -2295,6 +1924,8 @@ mod tests {
         let mut record = journal_ok_call("read_file");
         record.error = Some("cached_cross_turn".to_string());
         record.result_preview = Some("[cached_cross_turn: reused 200 bytes]".to_string());
+        record.result_class =
+            Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string());
 
         let eval = evaluate_tool_call_records("Summarize file", &[], &[record], 0, false, 0.2);
 
@@ -2307,6 +1938,85 @@ mod tests {
             "{:?}",
             eval.signals
         );
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_ignores_noop_human_text_without_structured_signal() {
+        let mut record = journal_ok_call("read_file");
+        record.result_preview = Some("[cached_cross_turn: reused 200 bytes]".to_string());
+
+        let eval = evaluate_tool_call_records("Summarize file", &[], &[record], 0, false, 0.2);
+
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::NoOpToolResults(_))),
+            "{:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn online_progress_continues_when_signal_is_below_threshold() {
+        let decision = decide_online_progress(
+            OnlineProgressSignals {
+                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
+                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD - 1,
+                ..OnlineProgressSignals::default()
+            },
+            OnlineProgressPolicy::default(),
+        );
+
+        assert_eq!(decision, OnlineProgressDecision::Continue);
+    }
+
+    #[test]
+    fn online_progress_requires_minimum_observation_volume() {
+        let decision = decide_online_progress(
+            OnlineProgressSignals {
+                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE - 1,
+                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
+                ..OnlineProgressSignals::default()
+            },
+            OnlineProgressPolicy::default(),
+        );
+
+        assert_eq!(decision, OnlineProgressDecision::Continue);
+    }
+
+    #[test]
+    fn online_progress_nudges_on_structured_redundant_reads_only_after_threshold() {
+        let decision = decide_online_progress(
+            OnlineProgressSignals {
+                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
+                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
+                ..OnlineProgressSignals::default()
+            },
+            OnlineProgressPolicy::default(),
+        );
+
+        assert_eq!(
+            decision,
+            OnlineProgressDecision::ReuseKnownContext {
+                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD
+            }
+        );
+    }
+
+    #[test]
+    fn online_progress_does_not_stack_on_existing_intervention() {
+        let decision = decide_online_progress(
+            OnlineProgressSignals {
+                tool_calls: 100,
+                redundant_overlapping_reads: 100,
+                stronger_advisory_emitted: true,
+                ..OnlineProgressSignals::default()
+            },
+            OnlineProgressPolicy::default(),
+        );
+
+        assert_eq!(decision, OnlineProgressDecision::Continue);
     }
 
     #[test]
@@ -2340,6 +2050,237 @@ mod tests {
             json.iter()
                 .any(|signal| signal["kind"] == "tool_outcome_failure"
                     && signal["class"] == "test_failure")
+        );
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_marks_structured_agent_interruptions_unsuccessful() {
+        let mut interrupted = journal_ok_call("agent");
+        interrupted.args_full = Some(
+            serde_json::json!({"action": "get_result", "agent_id": "reviewer@abc"}).to_string(),
+        );
+        interrupted.result_full = Some(
+            serde_json::json!({
+                "status": "interrupted",
+                "agent_id": "reviewer@abc",
+                "finish_reason": "response_guard_blocked",
+                "incomplete": true,
+                "result": "partial review"
+            })
+            .to_string(),
+        );
+
+        let eval =
+            evaluate_tool_call_records("review the branch", &[], &[interrupted], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == RESULT_CLASS_AGENT_INCOMPLETE && *count == 1
+        )));
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_marks_structured_active_agent_as_incomplete() {
+        let mut active = journal_ok_call("agent");
+        active.args_full = Some(
+            serde_json::json!({"action": "get_result", "agent_id": "reviewer@abc"}).to_string(),
+        );
+        active.result_full = Some(
+            serde_json::json!({
+                "status": "still_running",
+                "agent_id": "reviewer@abc"
+            })
+            .to_string(),
+        );
+
+        let eval =
+            evaluate_tool_call_records("collect child result", &[], &[active], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == RESULT_CLASS_AGENT_INCOMPLETE && *count == 1
+        )));
+    }
+
+    #[test]
+    fn later_structured_agent_completion_resolves_prior_interruption() {
+        let args =
+            serde_json::json!({"action": "get_result", "agent_id": "reviewer@abc"}).to_string();
+        let mut interrupted = journal_ok_call("agent");
+        interrupted.args_full = Some(args.clone());
+        interrupted.result_full = Some(
+            serde_json::json!({
+                "status": "interrupted",
+                "agent_id": "reviewer@abc",
+                "incomplete": true
+            })
+            .to_string(),
+        );
+        let mut completed = journal_ok_call("agent");
+        completed.args_full = Some(args);
+        completed.result_full = Some(
+            serde_json::json!({
+                "status": "completed",
+                "agent_id": "reviewer@abc",
+                "result": "done"
+            })
+            .to_string(),
+        );
+
+        let eval = evaluate_tool_call_records(
+            "continue the child agent",
+            &[],
+            &[interrupted, completed],
+            0,
+            false,
+            0.2,
+        );
+
+        assert!(eval.success, "{eval:?}");
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::ToolOutcomeFailure { .. })),
+            "{:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_marks_structured_fanout_issues_unsuccessful() {
+        let mut fanout = journal_ok_call("agent_fanout");
+        fanout.args_full =
+            Some(serde_json::json!({"action": "get_results", "group_id": "review"}).to_string());
+        fanout.result_full = Some(
+            serde_json::json!({
+                "status": "completed_with_issues",
+                "group_id": "review",
+                "interrupted": 1,
+                "results": [{
+                    "slot_index": 0,
+                    "agent_id": "reviewer@abc",
+                    "result": {
+                        "status": "interrupted",
+                        "agent_id": "reviewer@abc",
+                        "incomplete": true
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        let eval = evaluate_tool_call_records("review the branch", &[], &[fanout], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == RESULT_CLASS_FANOUT_INCOMPLETE && *count == 1
+        )));
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_marks_structured_active_fanout_as_incomplete() {
+        let mut fanout = journal_ok_call("agent_fanout");
+        fanout.args_full =
+            Some(serde_json::json!({"action": "get_results", "group_id": "review"}).to_string());
+        fanout.result_full = Some(
+            serde_json::json!({
+                "status": "incomplete",
+                "group_id": "review",
+                "results": [{
+                    "slot_index": 0,
+                    "agent_id": "reviewer@abc",
+                    "result": {
+                        "status": "still_running",
+                        "agent_id": "reviewer@abc"
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        let eval =
+            evaluate_tool_call_records("collect fanout results", &[], &[fanout], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == RESULT_CLASS_FANOUT_INCOMPLETE && *count == 1
+        )));
+    }
+
+    #[test]
+    fn structured_fanout_journal_record_produces_actionable_incomplete_notice() {
+        let mut fanout = journal_ok_call("agent_fanout");
+        fanout.args_full =
+            Some(serde_json::json!({"action": "get_results", "group_id": "review"}).to_string());
+        fanout.result_full = Some(
+            serde_json::json!({
+                "status": "incomplete",
+                "group_id": "review",
+                "recovery": {
+                    "resume_existing_work_before_rerun": true,
+                    "rerun_policy": "resume_existing_agents_or_report_incomplete; do_not_respawn_slots"
+                },
+                "results": [{
+                    "slot_index": 0,
+                    "agent_id": "reviewer@abc",
+                    "result": {
+                        "status": "still_running",
+                        "agent_id": "reviewer@abc"
+                    },
+                    "recovery": {
+                        "resume_existing_agent_id": "reviewer@abc",
+                        "rerun_policy": "resume_existing_agent_or_report_incomplete",
+                        "do_not_spawn_replacement": true
+                    }
+                }]
+            })
+            .to_string(),
+        );
+
+        let eval = evaluate_tool_call_records(
+            "collect fanout results",
+            &[],
+            std::slice::from_ref(&fanout),
+            0,
+            false,
+            0.2,
+        );
+        let event = build_turn_evaluation_journal_event(
+            Some("s1"),
+            Some(1),
+            "turn",
+            "collect fanout results",
+            &[],
+            &[fanout],
+            0,
+            false,
+            0.2,
+            &eval,
+        );
+
+        assert!(!eval.success, "{eval:?}");
+        assert_eq!(
+            turn_evaluation_status_notice(&eval).as_deref(),
+            Some(
+                "Turn finished with unresolved tool/runtime failure(s): fanout_incomplete x1. Treat the final answer as incomplete until validation passes or the provider surface changes."
+            )
+        );
+        let metadata = event.metadata.expect("turn evaluation metadata");
+        assert_eq!(metadata["success"], false);
+        assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["signals"][1]["kind"], "tool_outcome_failure");
+        assert_eq!(
+            metadata["signals"][1]["class"],
+            RESULT_CLASS_FANOUT_INCOMPLETE
         );
     }
 
@@ -2434,15 +2375,28 @@ mod tests {
         // deferred, surgically_removed). A naive counter would see
         // error_rate = 3/4 = 0.75 and quality collapse. With filtering,
         // only the real success is counted and the turn scores as healthy.
+        let mut surgical = rec(
+            SURGICAL_REMOVAL_TOOL_NAME,
+            true,
+            Some("(removed from context — skill covered this work)"),
+        );
+        surgical.surgically_removed = Some(true);
+
+        let mut skipped = rec("read_file", true, Some("Skipped: skill routed"));
+        skipped.result_class =
+            Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string());
+        skipped.skill_reentry_count = Some(1);
+
+        let mut deferred = rec("read_file", true, Some("Deferred: skill invoked"));
+        deferred.result_class =
+            Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string());
+        deferred.skill_locked_out = Some(true);
+
         let records = vec![
             rec("git", true, Some("diff contents here")),
-            rec(
-                SURGICAL_REMOVAL_TOOL_NAME,
-                true,
-                Some("(removed from context — skill covered this work)"),
-            ),
-            rec("read_file", false, Some("Skipped: skill routed")),
-            rec("read_file", false, Some("Deferred: skill invoked")),
+            surgical,
+            skipped,
+            deferred,
         ];
 
         let eval = evaluate_tool_call_records(
@@ -2728,7 +2682,7 @@ mod tests {
                 "read_file",
                 r#"{"path":"crates/runtime/src/server/run_lifecycle.rs"}"#,
             ),
-            record("grep", r#"/factual retry/ in crates/runtime/src"#),
+            record("grep", r#"/runtime context/ in crates/runtime/src"#),
             record("grep", r#"/ContinueLoop/ in crates/runtime/src"#),
             record("grep", r#"/TPM/ in crates/runtime/src"#),
             record(

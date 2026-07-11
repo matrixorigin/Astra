@@ -21,6 +21,8 @@ pub enum AgentLiveTermination {
     Completed,
     Delegated,
     Failed,
+    /// Execution stopped with resumable state and may continue later.
+    Interrupted,
     Cancelled,
 }
 

@@ -1234,6 +1234,7 @@ async fn cleanup_session_delete_fixture_for_owner(
         "agent_events",
         "harness_runs",
         "agent_tasks",
+        "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
     ] {
@@ -5105,6 +5106,8 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         .create_event(
             owner_user_id.clone(),
             EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
                 session_id: session_id.clone(),
                 event_type: "owner_evt".into(),
                 content: "owner visible".into(),
@@ -5138,7 +5141,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         .await
         .expect("owner can list session events");
     assert_eq!(owner_events.events.len(), 1);
-    assert_eq!(owner_events.events[0].event_id, owner_event.event_id);
+    assert_eq!(owner_events.events[0].event_id, owner_event.record.event_id);
 
     let other_session_result = event_service
         .get_session_events(session_id.clone(), other_user_id.clone(), 100, None)
@@ -5151,7 +5154,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
     );
 
     let other_get_result = event_service
-        .get_event(owner_event.event_id.clone(), other_user_id.clone())
+        .get_event(owner_event.record.event_id.clone(), other_user_id.clone())
         .await;
     assert_eq!(
         other_get_result
@@ -5161,7 +5164,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
     );
 
     let other_delete_result = event_service
-        .delete_event(owner_event.event_id.clone(), other_user_id.clone())
+        .delete_event(owner_event.record.event_id.clone(), other_user_id.clone())
         .await;
     assert_eq!(
         other_delete_result
@@ -5172,7 +5175,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
 
     let owner_event_still_exists =
         sqlx::query("SELECT COUNT(*) AS c FROM agent_events WHERE event_id = ? AND user_id = ?")
-            .bind(&owner_event.event_id)
+            .bind(&owner_event.record.event_id)
             .bind(&owner_user_id)
             .fetch_one(&pool)
             .await
@@ -5250,7 +5253,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         &pool,
         &owner_user_id,
         std::slice::from_ref(&session_id),
-        &[owner_event.event_id],
+        &[owner_event.record.event_id],
         &[],
     )
     .await;
@@ -6282,7 +6285,24 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .bind(format!("{{\"marker\":\"{marker}\"}}"))
         .execute(&pool)
         .await
-        .expect("insert skill evaluation");
+            .expect("insert skill evaluation");
+    }
+
+    for (user_id, run_id) in [
+        (&owner_user_id, &owner_run_id),
+        (&other_user_id, &foreign_run_id),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_session_execution_slots
+             (user_id, session_id, run_id, acquired_at, updated_at)
+             VALUES (?, ?, ?, NOW(6), NOW(6))",
+        )
+        .bind(user_id)
+        .bind(&session_id)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("insert session execution slot");
     }
 
     for (user_id, run_id, artifact_id, grant_id, marker) in [
@@ -6508,6 +6528,10 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         1
     );
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_events"), 1);
+    assert_eq!(
+        deleted_rows_for_table(&delete_audit, "agent_session_execution_slots"),
+        1
+    );
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_sessions"), 1);
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_tasks"), 1);
     assert_eq!(deleted_rows_for_table(&delete_audit, "harness_items"), 1);
@@ -6532,6 +6556,10 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     for (label, table) in [
         ("agent_sessions", "agent_sessions"),
         ("agent_events", "agent_events"),
+        (
+            "agent_session_execution_slots",
+            "agent_session_execution_slots",
+        ),
         ("conversation_log", "conversation_log"),
         ("session_artifacts_grants", "session_artifacts_grants"),
         ("session_artifacts", "session_artifacts"),
@@ -7074,6 +7102,203 @@ async fn skill_selection_version_update_is_owner_session_scoped_on_live_matrixon
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn sync_outbox_create_event_upserts_missing_session_header_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let mut journal_event = astra_services::session_journal::JournalEvent::config_change(
+        Some(session_id.as_str()),
+        "model",
+        "db-it",
+    );
+    journal_event.ts = "2026-07-08T00:00:00Z".to_string();
+    let content = serde_json::to_value(&journal_event).expect("journal content");
+    let payload_hash = astra_services::sync_outbox_canonical_payload_hash(&content);
+    let event_id = astra_services::sync_outbox_stable_event_id(&journal_event, &payload_hash)
+        .expect("stable sync outbox event id");
+    let event_service = DatabaseEventService::new(settings).with_pool(shared);
+
+    let created = event_service
+        .create_event(
+            user_id.clone(),
+            EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
+                event_id: Some(event_id),
+                session_id: session_id.clone(),
+                event_type: "config_change".into(),
+                content: content.to_string(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: Some(serde_json::json!({
+                    "sync_outbox": {
+                        "payload_hash": payload_hash
+                    }
+                })),
+            },
+        )
+        .await
+        .expect("sync outbox create event should upsert session header");
+
+    let row = sqlx::query(
+        "SELECT event_count, last_event_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load upserted session header");
+    assert_eq!(
+        row.try_get::<i64, _>("event_count")
+            .expect("decode event_count"),
+        1
+    );
+    assert_eq!(
+        row.try_get::<String, _>("last_event_id")
+            .expect("decode last_event_id"),
+        created.record.event_id
+    );
+
+    cleanup_agent_sessions_and_events_for_owner(
+        &pool,
+        &user_id,
+        std::slice::from_ref(&session_id),
+        &[created.record.event_id],
+        &[],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn sync_outbox_create_event_rejects_foreign_session_owner_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let owner_user_id = Uuid::new_v4().to_string();
+    let other_user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    astra_services::storage::add_agent_session_event_count_or_create(
+        &pool,
+        &session_id,
+        &owner_user_id,
+        0,
+        None,
+    )
+    .await
+    .expect("create owner session header");
+
+    let mut journal_event = astra_services::session_journal::JournalEvent::config_change(
+        Some(session_id.as_str()),
+        "model",
+        "foreign-owner-attempt",
+    );
+    journal_event.ts = "2026-07-08T00:00:01Z".to_string();
+    let content = serde_json::to_value(&journal_event).expect("journal content");
+    let payload_hash = astra_services::sync_outbox_canonical_payload_hash(&content);
+    let event_id = astra_services::sync_outbox_stable_event_id(&journal_event, &payload_hash)
+        .expect("stable sync outbox event id");
+    let event_service = DatabaseEventService::new(settings).with_pool(shared);
+
+    let error = event_service
+        .create_event(
+            other_user_id.clone(),
+            EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
+                event_id: Some(event_id.clone()),
+                session_id: session_id.clone(),
+                event_type: "config_change".into(),
+                content: content.to_string(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: Some(serde_json::json!({
+                    "sync_outbox": {
+                        "payload_hash": payload_hash
+                    }
+                })),
+            },
+        )
+        .await
+        .expect_err("foreign owner must not append to an existing session");
+    assert_eq!(error.0, axum::http::StatusCode::CONFLICT);
+
+    let owner_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count owner session rows");
+    let foreign_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&other_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count foreign session rows");
+    let foreign_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE event_id = ? AND user_id = ?")
+            .bind(&event_id)
+            .bind(&other_user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count foreign event rows");
+    assert_eq!(owner_rows, 1);
+    assert_eq!(foreign_rows, 0);
+    assert_eq!(foreign_events, 0);
+
+    cleanup_agent_sessions_and_events_for_owner(
+        &pool,
+        &owner_user_id,
+        std::slice::from_ref(&session_id),
+        &[],
+        &[],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn ordinary_create_event_requires_existing_session_header_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let event_service = DatabaseEventService::new(settings).with_pool(shared);
+
+    let error = event_service
+        .create_event(
+            user_id,
+            EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
+                session_id,
+                event_type: "it_requires_session_header".into(),
+                content: "ordinary events must not create sessions".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("ordinary create_event must require a pre-existing session");
+    assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn event_count_delta_service_context_state_paths_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -7100,6 +7325,8 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         .create_event(
             user_id.clone(),
             EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
                 session_id: service_session.clone(),
                 event_type: "it_create".into(),
                 content: "first".into(),
@@ -7117,6 +7344,8 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
         .create_event(
             user_id.clone(),
             EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
                 session_id: service_session.clone(),
                 event_type: "it_create".into(),
                 content: "second".into(),
@@ -7243,7 +7472,7 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
             .collect::<Vec<_>>();
     assert_eq!(state_event_ids.len(), 1);
 
-    let mut event_ids = vec![created_one.event_id, created_two.event_id];
+    let mut event_ids = vec![created_one.record.event_id, created_two.record.event_id];
     event_ids.extend(context_event_ids);
     event_ids.extend(state_event_ids);
     let _ = sqlx::query(

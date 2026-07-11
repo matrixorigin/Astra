@@ -266,10 +266,7 @@ fn fmt_git_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .map(|sha| truncate_str(sha, 16)),
             Some("stash") => {
-                let sub_action = obj
-                    .get("sub_action")
-                    .or_else(|| obj.get("stash_action"))
-                    .and_then(|v| v.as_str());
+                let sub_action = obj.get("sub_action").and_then(|v| v.as_str());
                 let stash_ref = obj.get("stash_ref").and_then(|v| v.as_str());
                 let index = obj.get("index").and_then(|v| v.as_i64());
                 match (sub_action, stash_ref, index) {

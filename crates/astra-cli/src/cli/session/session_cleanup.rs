@@ -15,9 +15,7 @@ use crossterm::style::Stylize;
 use std::time::Duration;
 
 use super::session_guard::{ShutdownSignal, clear_panic_guard};
-use crate::cli::cli_config::cli_utils::{
-    clear_profile_last_session_if_matches_or_warn, cli_user_id,
-};
+use crate::cli::cli_config::cli_utils::clear_profile_last_session_if_matches_or_warn;
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::cli::session::session_state::SessionState;
 use crate::edge_tools;
@@ -109,35 +107,22 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
     //    and the `session_memory_extraction` event never fires. 10s is
     //    generous — the worker's internal LLM_TIMEOUT is 30s but real
     //    selector calls return in well under 5s.
+    let mut typed_memory_governance_ran = false;
     if let Some(svc) = state.session_memory_extractor.as_ref() {
         if let Some(session_id) = state.session_id.as_deref().filter(|sid| !sid.is_empty()) {
-            let user_id = state
-                .ingestion_user_id
-                .as_deref()
-                .filter(|user_id| !user_id.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(cli_user_id);
-            let _ = svc.maybe_spawn_shutdown_flush(astra_runtime::session_memory::ExtractionRequest {
-                user_id,
-                session_id: session_id.to_string(),
-                messages: super::session_projection::history_as_messages(&state.history),
-                session_facts: shutdown_session_facts(state),
-                current_tokens: state
-                    .total_prompt_tokens
-                    .saturating_add(state.total_cache_read_tokens)
-                    .saturating_add(state.total_cache_creation_tokens) as usize,
-                current_tool_calls: 0,
-                had_error: state
-                    .last_turn_event
-                    .as_ref()
-                    .and_then(|event| event.error.as_ref())
-                    .is_some(),
-                had_user_correction: false,
-                turn_number: state.turn,
-                config:
-                    astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
-                    ),
-            });
+            let _ =
+                svc.maybe_spawn_shutdown_flush(astra_runtime::session_memory::ExtractionRequest {
+                    session_id: session_id.to_string(),
+                    messages: super::session_projection::history_as_messages(&state.history),
+                    session_facts: shutdown_session_facts(state),
+                    had_error: state
+                        .last_turn_event
+                        .as_ref()
+                        .and_then(|event| event.error.as_ref())
+                        .is_some(),
+                    had_user_correction: false,
+                    turn_number: state.turn,
+                });
         }
         let leftover = svc
             .wait_for_pending(std::time::Duration::from_secs(10))
@@ -150,6 +135,29 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
             );
         }
         if let Some(sid) = state.session_id.as_deref() {
+            if state.turn > 0 {
+                let facts = shutdown_session_facts(state);
+                match svc.run_session_end_governance(&facts, sid).await {
+                    Ok(report) => {
+                        typed_memory_governance_ran = true;
+                        tracing::info!(
+                            target: "session_cleanup",
+                            session_id = %sid,
+                            episode_chars = report.episode_chars,
+                            purged = report.working_purged,
+                            working_retained = report.working_retained_due_to_episode_failure,
+                            scenes_stored = report.scenes_stored,
+                            "typed session-memory governance complete"
+                        );
+                    }
+                    Err(error) => tracing::warn!(
+                        target: "session_cleanup",
+                        session_id = %sid,
+                        error = %error,
+                        "typed session-memory governance failed"
+                    ),
+                }
+            }
             svc.forget_session(sid);
         }
     }
@@ -171,8 +179,18 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
         }
     }
     // 3. Trigger Memoria governance + consolidation (best-effort with timeout)
-    let gov_handle = tokio::spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
-    let con_handle = tokio::spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
+    let (gov_handle, con_handle) = if typed_memory_governance_ran {
+        (None, None)
+    } else {
+        (
+            Some(tokio::spawn(
+                edge_tools::memoria::memoria_governance_fire_and_forget(),
+            )),
+            Some(tokio::spawn(
+                edge_tools::memoria::memoria_consolidate_fire_and_forget(),
+            )),
+        )
+    };
     // 3c. L3 knowledge backflow: promote tool/stall signal lessons to
     //     semantic T3 (mid-session copies were working T4).
     if state.turn > 0 {
@@ -247,45 +265,31 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
     }
     // 4. Await Memoria maintenance (bounded 5s so we don't hang on exit)
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        let _ = gov_handle.await;
-        let _ = con_handle.await;
+        if let Some(handle) = gov_handle {
+            let _ = handle.await;
+        }
+        if let Some(handle) = con_handle {
+            let _ = handle.await;
+        }
     })
     .await;
     if let Some(sid) = state.session_id.as_deref() {
-        let cloud_base = match crate::cli::config_manager::resolve_api_url(None) {
-            Ok(base) => Some(base),
-            Err(error) => {
-                tracing::warn!(
-                    session_id = %sid,
-                    error = %error,
-                    "skipping pending recall feedback close during cleanup because API URL configuration is invalid"
-                );
-                None
-            }
-        };
-        let report = super::session_side_effects::close_pending_memory_feedback_at_turn_end(
-            Some(sid),
-            cloud_base,
-            super::session_runtime::current_access_token(None),
-            "cli-session-end",
-        )
-        .await;
-        if report.attempted > 0 {
+        let dropped =
+            super::session_side_effects::drop_unattributed_memory_recalls_at_turn_end(Some(sid));
+        if dropped > 0 {
             tracing::debug!(
                 session_id = %sid,
-                attempted = report.attempted,
-                succeeded = report.succeeded,
-                failed = report.failed,
-                "closed pending recall feedback during session cleanup"
+                dropped,
+                "dropped unattributed memory recalls during session cleanup"
             );
         }
-        astra_tools::memoria::MemoriaClient::reset_session_process_state(sid);
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(sid);
     }
     // 5. Clear panic guard
     clear_panic_guard();
 }
 
-fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
+pub(crate) fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
     let estimated_tokens = state
         .total_prompt_tokens
         .saturating_add(state.total_cache_read_tokens)

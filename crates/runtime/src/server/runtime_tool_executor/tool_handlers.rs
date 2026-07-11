@@ -168,6 +168,41 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
                 return astra_tools::ToolResult::error(format!("Error: {error}"));
             }
         };
+        if action == astra_tools::memory_tool_contract::MemoryAction::Inventory {
+            let inventory = if let Some(shared_pool) = context.context_manifest_pool.as_ref() {
+                match astra_services::session_memory_inventory::load_database_session_memory_inventory(
+                    shared_pool.get(),
+                    &context.user_id,
+                    &context.session_id,
+                )
+                .await
+                {
+                    Ok(inventory) => inventory,
+                    Err(error) => {
+                        return astra_tools::ToolResult::error(format!(
+                            "Error: session memory inventory failed: {error}"
+                        ));
+                    }
+                }
+            } else {
+                match astra_services::session_memory_inventory::load_local_session_memory_inventory(
+                    &context.session_id,
+                ) {
+                    Ok(inventory) => inventory,
+                    Err(error) => {
+                        return astra_tools::ToolResult::error(format!(
+                            "Error: session memory inventory failed: {error}"
+                        ));
+                    }
+                }
+            };
+            return match serde_json::to_string(&inventory) {
+                Ok(output) => astra_tools::ToolResult::text(output),
+                Err(error) => astra_tools::ToolResult::error(format!(
+                    "Error: serialize session memory inventory: {error}"
+                )),
+            };
+        }
         let isolated_args = memory_args_with_context(
             args,
             &context.session_id,

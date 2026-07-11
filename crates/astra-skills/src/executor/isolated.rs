@@ -51,6 +51,50 @@ pub trait SkillSubRunExecutor: Send + Sync {
     ) -> Result<SubRunResult, String>;
 }
 
+/// Typed terminal outcome of an isolated skill sub-run.
+///
+/// This is deliberately separate from the textual output.  A child may have
+/// useful partial output while still being interrupted, cancelled, or failed;
+/// callers must not infer completion by inspecting that text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubRunOutcome {
+    /// The child produced its terminal deliverable.
+    Completed,
+    /// The child stopped at a resumable or otherwise incomplete boundary.
+    Interrupted { finish_reason: String },
+    /// The child was cancelled before producing a terminal deliverable.
+    Cancelled { reason: String },
+    /// The child ran but failed before producing a terminal deliverable.
+    Failed { error: String },
+}
+
+impl SubRunOutcome {
+    #[must_use]
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed)
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Interrupted { .. } => "interrupted",
+            Self::Cancelled { .. } => "cancelled",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Completed => None,
+            Self::Interrupted { finish_reason } => Some(finish_reason),
+            Self::Cancelled { reason } => Some(reason),
+            Self::Failed { error } => Some(error),
+        }
+    }
+}
+
 /// Result from a sub-run execution.
 #[derive(Clone, Debug)]
 pub struct SubRunResult {
@@ -60,6 +104,9 @@ pub struct SubRunResult {
     pub tokens_used: u32,
     /// Number of agentic loop turns.
     pub turns: u32,
+    /// Authoritative terminal outcome.  `output` may be partial for every
+    /// non-completed variant.
+    pub outcome: SubRunOutcome,
 }
 
 /// Executes skills in an isolated sub-agent loop via a [`SkillSubRunExecutor`].
@@ -155,7 +202,7 @@ impl SkillExecutor for IsolatedSkillExecutor {
         if let Some(ref mgr) = self.checkpoint_manager {
             let mut mgr = mgr.lock().await;
             match &result {
-                Ok(r) => {
+                Ok(r) if r.outcome.is_completed() => {
                     if let Err(e) = mgr.mark_completed(
                         &skill.manifest.name,
                         r.output.clone(),
@@ -163,6 +210,17 @@ impl SkillExecutor for IsolatedSkillExecutor {
                         r.tokens_used,
                     ) {
                         tracing::warn!(error = %e, "Failed to mark skill completed");
+                    }
+                }
+                Ok(r) => {
+                    let detail = r.outcome.detail().unwrap_or(r.outcome.label());
+                    if let Err(e) = mgr.mark_failed(
+                        &skill.manifest.name,
+                        format!("{}: {detail}", r.outcome.label()),
+                        r.turns,
+                        r.tokens_used,
+                    ) {
+                        tracing::warn!(error = %e, "Failed to mark incomplete skill outcome");
                     }
                 }
                 Err(err) => {
@@ -175,11 +233,33 @@ impl SkillExecutor for IsolatedSkillExecutor {
 
         let result = result.map_err(SkillError::ExecutionFailed)?;
 
+        let outcome_note = result.outcome.detail().map_or_else(String::new, |detail| {
+            format!(
+                "\n\n---\n**Sub-run outcome:** `{}` — {}",
+                result.outcome.label(),
+                detail
+            )
+        });
+        let success = result.outcome.is_completed();
+        let error_category = match result.outcome {
+            SubRunOutcome::Completed => None,
+            SubRunOutcome::Interrupted { .. } => {
+                Some(super::super::manifest::SkillErrorKind::Interrupted)
+            }
+            SubRunOutcome::Cancelled { .. } => {
+                Some(super::super::manifest::SkillErrorKind::Cancelled)
+            }
+            SubRunOutcome::Failed { .. } => {
+                Some(super::super::manifest::SkillErrorKind::ExecutionFailed)
+            }
+        };
+
         let formatted_output = format!(
-            "## Skill Result: {}\n\n{}\n\n---\n\
+            "## Skill Result: {}\n\n{}{}\n\n---\n\
              *Executed in isolated sub-run: {} turns, {} tokens{}*",
             skill.manifest.name,
             result.output,
+            outcome_note,
             result.turns,
             result.tokens_used,
             skill
@@ -195,9 +275,9 @@ impl SkillExecutor for IsolatedSkillExecutor {
             tokens_used: result.tokens_used,
             turns: result.turns,
             duration_ms,
-            success: true,
+            success,
             verification_results: Vec::new(),
-            error_category: None,
+            error_category,
         })
     }
 
@@ -281,6 +361,34 @@ mod tests {
                 output: format!("Result from {skill_name}: processed '{task_context}'"),
                 tokens_used: 500,
                 turns: 3,
+                outcome: SubRunOutcome::Completed,
+            })
+        }
+    }
+
+    struct InterruptedSubRunExecutor;
+
+    #[async_trait]
+    impl SkillSubRunExecutor for InterruptedSubRunExecutor {
+        async fn execute_skill_subrun(
+            &self,
+            _skill_name: &str,
+            _instructions: &str,
+            _task_context: &str,
+            _model: Option<&str>,
+            _max_tokens: Option<u32>,
+            _allowed_tools: &[String],
+            _parent_recursion_depth: u8,
+            _effort: Option<&str>,
+            _agent_type: Option<&str>,
+        ) -> Result<SubRunResult, String> {
+            Ok(SubRunResult {
+                output: "partial review".to_string(),
+                tokens_used: 240,
+                turns: 2,
+                outcome: SubRunOutcome::Interrupted {
+                    finish_reason: "budget_exhausted".to_string(),
+                },
             })
         }
     }
@@ -313,6 +421,36 @@ mod tests {
         assert!(result.output.contains("claude-sonnet-4-20250514"));
         assert_eq!(result.turns, 3);
         assert_eq!(result.tokens_used, 500);
+    }
+
+    #[tokio::test]
+    async fn interrupted_subrun_preserves_partial_output_without_claiming_success() {
+        let executor = IsolatedSkillExecutor::new(Arc::new(InterruptedSubRunExecutor));
+        let skill = LoadedSkill {
+            manifest: SkillManifest {
+                name: "deep-review".into(),
+                execution_context: ExecutionContext::Fork,
+                ..Default::default()
+            },
+            instructions: "Review everything.".into(),
+            instruction_tokens: 10,
+            resources: None,
+            skill_dir: None,
+        };
+        let context = SkillExecutionContext {
+            task: "Review auth module".into(),
+            arguments: HashMap::new(),
+            recursion_depth: 0,
+        };
+
+        let result = executor.execute(&skill, &context).await.unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error_category,
+            Some(crate::manifest::SkillErrorKind::Interrupted)
+        );
+        assert!(result.output.contains("partial review"));
     }
 
     #[tokio::test]
@@ -566,6 +704,7 @@ mod tests {
                 output: "done".into(),
                 tokens_used: 100,
                 turns: 1,
+                outcome: SubRunOutcome::Completed,
             })
         }
     }

@@ -29,11 +29,13 @@ Return a JSON object with two fields:
 - Each section must have at least one bullet (or empty array if truly nothing)
 
 ## Rules for facts
-- 3-8 facts maximum (fewer is better if summary is short)
+- 0-5 facts maximum; empty is preferable to a weak inference
 - Each fact must stand alone without the surrounding conversation
-- Prefer: user preferences, project conventions, decisions, recurring patterns
+- Extract only explicit durable user preferences/profile facts or stable project conventions that were confirmed or repeated
+- A requirement in the current request is not automatically a durable preference; do not rewrite it as "the user prefers..."
+- Keep current-task constraints, branch/repository state, one-off decisions, and pending work in the summary, not facts
 - DO NOT extract: transient errors, file contents, raw tool output, one-off commands
-- Types: "semantic" (general knowledge/preference), "profile" (user info), "procedural" (how-to / convention), "working" (transient project state)
+- Types: "semantic" (stable knowledge), "profile" (explicit user info/preference), "procedural" (stable convention)
 - If no facts are worth remembering, return empty array: []
 "##;
 
@@ -117,7 +119,7 @@ impl CompactResponse {
                     return None;
                 }
                 match f.fact_type.as_str() {
-                    "semantic" | "profile" | "procedural" | "working" => {
+                    "semantic" | "profile" | "procedural" => {
                         Some((fact.to_string(), f.fact_type.clone()))
                     }
                     unknown => {
@@ -373,8 +375,9 @@ Final: {"summary":{"goals":["final goal"],"decisions":[],"actions":[],"status":[
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].0, "a");
 
-        // Accepts all valid types
-        for t in &["semantic", "profile", "procedural", "working"] {
+        // Accepts only durable fact types. Working state belongs to the
+        // session-memory snapshot, not cross-session recall.
+        for t in &["semantic", "profile", "procedural"] {
             let resp = CompactResponse {
                 summary: base(),
                 facts: vec![CompactFact {
@@ -386,6 +389,14 @@ Final: {"summary":{"goals":["final goal"],"decisions":[],"actions":[],"status":[
             assert_eq!(facts.len(), 1, "failed for type: {t}");
             assert_eq!(facts[0].1, *t);
         }
+        let working = CompactResponse {
+            summary: base(),
+            facts: vec![CompactFact {
+                fact: "current branch is dirty".into(),
+                fact_type: "working".into(),
+            }],
+        };
+        assert!(working.valid_facts().is_empty());
 
         // Filters empty facts
         let resp = CompactResponse {

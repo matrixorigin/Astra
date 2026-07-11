@@ -435,6 +435,12 @@ pub enum SkillErrorKind {
     Timeout,
     /// Verification criteria failed after execution.
     VerificationFailed,
+    /// The isolated child stopped at an incomplete/resumable boundary.
+    Interrupted,
+    /// The isolated child was cancelled.
+    Cancelled,
+    /// The isolated child ran and failed.
+    ExecutionFailed,
     /// LLM produced unparseable or invalid output.
     OutputParsing,
     /// Internal/unexpected error.

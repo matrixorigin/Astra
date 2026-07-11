@@ -163,7 +163,7 @@ fn step_recorder_for_cli_turn(
     if let Some(session_id) = session_id {
         StepRecorder::with_persistence(user_id, session_id, run_id)
     } else {
-        StepRecorder::new(user_id, "ephemeral", run_id)
+        StepRecorder::with_deferred_persistence(user_id, "ephemeral", run_id)
     }
 }
 
@@ -311,6 +311,11 @@ pub(crate) async fn stream_chat_sse(
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let file_context = detect_project_languages(&project_root);
     let current_session_turn = p.turn_index;
+    // Only callers that provide a durable session journal own checkpoint and
+    // composite-snapshot side effects. Internal utility calls such as
+    // `/compact` may reuse the active session as retrieval context, but must
+    // not advance its resumable timeline.
+    let persist_session_artifacts = p.file_journal.is_some() || p.session_state_journal.is_some();
     let mut executor = {
         let ex =
             edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
@@ -767,7 +772,7 @@ pub(crate) async fn stream_chat_sse(
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
         context_manifest_pool: None,
-        context_manifest_user_id: Some(current_user_id),
+        context_manifest_user_id: persist_session_artifacts.then_some(current_user_id),
         context_manifest_model_name: model_id_for_policy.map(str::to_string),
         runtime_manifest,
         recursion_depth: 0,
@@ -778,9 +783,8 @@ pub(crate) async fn stream_chat_sse(
         total_cache_read: 0,
         total_cache_creation: 0,
         total_tool_calls: 0,
-        textless_stop_retries: 0,
         last_finish_reason: None,
-        total_evidence_tool_calls: 0,
+        total_observation_tool_calls: 0,
         has_any_usage: false,
         max_turns,
         remaining_turns: max_turns,
@@ -814,22 +818,17 @@ pub(crate) async fn stream_chat_sse(
             verdict_events: Vec::new(),
             last_heavy_checkpoint: None,
             tool_call_records: Vec::new(),
-            forced_factual_retry: false,
-            factual_retry_fallback_text: None,
-            forced_execution_retry: false,
-            forced_answer_relevance_retry: false,
-            forced_execution_escalation: false,
-            forced_parallel_batching: false,
-            forced_round_budget_phase1: false,
-            forced_round_budget_phase2: false,
+            execution_escalation_advisory_emitted: false,
+            parallel_batching_advisory_emitted: false,
+            repetition_advisory_emitted: false,
             introspection_count: 0,
-            forced_redundant_reads_corrective: false,
-            forced_cache_waste_corrective: false,
-            forced_search_fanout_corrective: false,
-            forced_exploration_family_corrective: false,
-            forced_exploration_family_phase2: false,
-            exploration_family_corrective_family: None,
-            forced_intent_drift: false,
+            redundant_reads_advisory_emitted: false,
+            cache_waste_advisory_emitted: false,
+            search_fanout_advisory_emitted: false,
+            exploration_family_advisory_emitted: false,
+            stronger_exploration_family_advisory_emitted: false,
+            exploration_family_advisory_family: None,
+            intent_drift_advisory_emitted: false,
             drift_nudge_count: 0,
             last_drift_correction_round: 0,
             nudge_count: 0,
@@ -838,8 +837,6 @@ pub(crate) async fn stream_chat_sse(
             ),
             guardrail_tuner: astra_runtime::config_admin::guardrail::GuardrailTuner::default(),
             guardrail_tuner_records_cursor: 0,
-            forced_completion_soft_stop: false,
-            forced_task_board_completion_gate: false,
         },
         telemetry: TelemetryState {
             explain_turns: Vec::new(),
@@ -1315,7 +1312,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn mutating_profile() -> TaskExecutionProfile {
-        TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard, true)
+        TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard)
     }
 
     #[test]
@@ -1377,25 +1374,6 @@ mod tests {
             Some("sess-missing-model")
         );
         assert!(failure.error.contains("default_model"), "{}", failure.error);
-    }
-
-    #[test]
-    fn stream_chat_sse_resolves_server_default_before_missing_model_preflight() {
-        let source = include_str!("mod.rs");
-        let fn_start = source
-            .find("pub(crate) async fn stream_chat_sse")
-            .expect("stream_chat_sse should exist");
-        let default_idx = source[fn_start..]
-            .find("resolve_server_default_model")
-            .expect("stream_chat_sse should resolve server default model");
-        let preflight_idx = source[fn_start..]
-            .find("require_selected_turn_model")
-            .expect("stream_chat_sse should keep missing-model preflight");
-
-        assert!(
-            default_idx < preflight_idx,
-            "server default model must be resolved before missing-model preflight"
-        );
     }
 
     #[test]

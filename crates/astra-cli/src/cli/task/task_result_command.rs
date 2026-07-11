@@ -62,7 +62,7 @@ pub(crate) async fn finalize_headless_task_result<T: astra_services::TaskService
             unreachable!("unfinished exit code is only valid for task result lookup")
         }
         ExitCode::ToolFailure
-        | ExitCode::ForceStop
+        | ExitCode::Cancelled
         | ExitCode::ApiError
         | ExitCode::PersistenceError => {
             let failure_reason = stream_result_failure_reason(exit_code, sr);

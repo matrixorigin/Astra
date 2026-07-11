@@ -10,10 +10,66 @@ use crate::cli::{
 };
 use astra_runtime::prompts;
 use astra_runtime::turn::cloud::compaction_engine::{CompactionEngine, TokenBudget};
-use astra_runtime::turn::cloud::memoria_compact::build_compaction_layered_body;
 use astra_services::session_journal;
 use crossterm::style::Stylize;
 use std::sync::Arc;
+
+fn manual_compaction_memory_entry(summary: &str) -> prompts::memory_proto::MemoryEntry {
+    let one_line = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let abstract_line = if one_line.chars().count() < prompts::memory_proto::ABSTRACT_MIN_CHARS {
+        format!("Manual conversation compaction summary: {one_line}")
+    } else {
+        one_line
+    };
+    let abstract_line = abstract_line
+        .chars()
+        .take(prompts::memory_proto::ABSTRACT_MAX_CHARS)
+        .collect::<String>();
+    prompts::memory_proto::MemoryEntry::new_layered(
+        prompts::memory_proto::NS_EPISODE,
+        prompts::memory_proto::ST_SUMMARY,
+        &abstract_line,
+        None,
+        Some(summary.trim()),
+    )
+}
+
+fn compact_fact_memory_entry(
+    fact: &str,
+    fact_type: &str,
+) -> Option<prompts::memory_proto::MemoryEntry> {
+    let namespace = match fact_type {
+        "semantic" => prompts::memory_proto::NS_FACT,
+        "profile" => prompts::memory_proto::NS_PREF,
+        "procedural" => prompts::memory_proto::NS_KNOWLEDGE,
+        // Working state belongs to the session snapshot. Promoting it into
+        // cross-session recall would turn a transient task constraint into a
+        // durable user fact.
+        "working" => return None,
+        _ => return None,
+    };
+    Some(prompts::memory_proto::MemoryEntry::new(
+        namespace,
+        prompts::memory_proto::ST_ACTIVE,
+        fact,
+    ))
+}
+
+async fn store_compact_memory_payload(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    let response = api
+        .post_memory_store_json(token, payload)
+        .await
+        .map_err(|error| format!("memory service unreachable: {error}"))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("memory store HTTP {}", response.status()))
+    }
+}
 
 pub(crate) struct StateCommandContext<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
@@ -113,8 +169,11 @@ impl<'a> CompactCtx<'a> {
             agent_spawner: self.state.agent_spawner.clone(),
             root_agent_id: Some("main"),
             root_mailbox_slot: Some(&mut self.state.root_mailbox),
-            observability_hub: self.state.observability_hub.clone(),
-            observability_session: self.state.observability_session.clone(),
+            // Compaction is a utility inference, not another user turn. Its
+            // traces must not mutate the active session's live observability
+            // state or resumable timeline.
+            observability_hub: None,
+            observability_session: None,
             file_journal: None,
             file_state: None,
             database_snapshot_journal: None,
@@ -289,7 +348,34 @@ async fn persist_history_edit_state(state: &mut SessionState, action: &str) -> R
             format!(
                 "{action} updated live context but failed to refresh resume/fork state: {error}"
             )
-        })
+        })?;
+
+    // Session memory is a projection of canonical history. Any successful
+    // undo/redo/compact invalidates that projection just as surely as a new
+    // user turn does, so enqueue a refresh immediately instead of waiting for
+    // an unrelated future turn or process shutdown.
+    if let (Some(service), Some(session_id)) = (
+        state.session_memory_extractor.as_ref(),
+        state
+            .session_id
+            .as_deref()
+            .filter(|session_id| !session_id.is_empty()),
+    ) {
+        let had_error = state
+            .last_turn_event
+            .as_ref()
+            .and_then(|event| event.error.as_ref())
+            .is_some();
+        let _ = service.maybe_spawn(astra_runtime::session_memory::ExtractionRequest {
+            session_id: session_id.to_string(),
+            messages: crate::cli::session::session_projection::history_as_messages(&state.history),
+            session_facts: crate::cli::session::session_cleanup::shutdown_session_facts(state),
+            had_error,
+            had_user_correction: matches!(action, "/undo" | "/redo"),
+            turn_number: state.turn,
+        });
+    }
+    Ok(())
 }
 
 fn append_history_edit_rollback_error(
@@ -824,30 +910,18 @@ pub(crate) async fn handle_state_command(
                         prompts::memory_proto::SRC_COMPACT,
                         prompts::memory_proto::TIER_INFERRED,
                     );
-                    // Build layered body (matching auto-compaction format for consistent retrieval)
-                    let summary_body = state
-                        .session_id
-                        .as_deref()
-                        .and_then(|sid| build_compaction_layered_body(sid, &summary))
-                        .unwrap_or_else(|| summary.clone());
-                    let entry = prompts::memory_proto::MemoryEntry::new(
-                        prompts::memory_proto::NS_EPISODE,
-                        prompts::memory_proto::ST_SUMMARY,
-                        &summary_body,
-                    );
-                    match api
-                        .post_memory_store_json(tok, &entry.to_store_payload_with_meta(&meta))
-                        .await
+                    let entry = manual_compaction_memory_entry(&summary);
+                    match store_compact_memory_payload(
+                        api,
+                        tok,
+                        &entry.to_store_payload_with_meta(&meta),
+                    )
+                    .await
                     {
-                        Ok(r) if r.status().is_success() => saved_to_memoria = true,
-                        Ok(r) => eprintln!(
-                            "{}",
-                            format!("  ⚠ Memory save failed ({})", r.status()).yellow()
-                        ),
-                        Err(e) => eprintln!(
-                            "{}",
-                            format!("  ⚠ Memory service unreachable: {e}").yellow()
-                        ),
+                        Ok(()) => saved_to_memoria = true,
+                        Err(error) => {
+                            eprintln!("{}", format!("  ⚠ Memory save failed: {error}").yellow())
+                        }
                     }
 
                     // Store facts directly from unified response (no second LLM call)
@@ -858,19 +932,24 @@ pub(crate) async fn handle_state_command(
                             prompts::memory_proto::SRC_EXTRACTED,
                             prompts::memory_proto::TIER_INFERRED,
                         );
-                        for (fact, mem_type) in &facts {
-                            let fact_entry = prompts::memory_proto::MemoryEntry::new(
-                                prompts::memory_proto::NS_FACT,
-                                mem_type,
-                                fact,
-                            );
-                            let _ = api
-                                .post_memory_store_json(
-                                    tok,
-                                    &fact_entry.to_store_payload_with_meta(&fact_meta),
-                                )
-                                .await;
-                            facts_stored += 1;
+                        for (fact, fact_type) in &facts {
+                            let Some(fact_entry) = compact_fact_memory_entry(fact, fact_type)
+                            else {
+                                continue;
+                            };
+                            match store_compact_memory_payload(
+                                api,
+                                tok,
+                                &fact_entry.to_store_payload_with_meta(&fact_meta),
+                            )
+                            .await
+                            {
+                                Ok(()) => facts_stored += 1,
+                                Err(error) => eprintln!(
+                                    "{}",
+                                    format!("  ⚠ Extracted fact was not saved: {error}").yellow()
+                                ),
+                            }
                         }
                     }
                 }
@@ -901,12 +980,19 @@ pub(crate) async fn handle_state_command(
                             prompts::memory_proto::SRC_COMPACT,
                             prompts::memory_proto::TIER_UNVERIFIED,
                         );
-                        let _ = api
-                            .post_memory_store_json(
-                                tok,
-                                &swap_entry.to_store_payload_with_meta(&swap_meta),
-                            )
-                            .await;
+                        if let Err(error) = store_compact_memory_payload(
+                            api,
+                            tok,
+                            &swap_entry.to_store_payload_with_meta(&swap_meta),
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "{}",
+                                format!("  ⚠ Compacted history archive was not saved: {error}")
+                                    .yellow()
+                            );
+                        }
                     }
                 }
             }
@@ -2325,12 +2411,15 @@ mod tests {
 mod compact_tests {
     use super::{
         CompactArgs, CompactCtx, ManualCompactPlan, build_swap_memory_body, cap_swap_body,
-        compact_mem_note, parse_compact_args, plan_manual_compaction,
+        compact_fact_memory_entry, compact_mem_note, manual_compaction_memory_entry,
+        parse_compact_args, plan_manual_compaction, store_compact_memory_payload,
     };
     use crate::cli::permission_manager::PermissionManager;
     use crate::cli::session::session_state::SessionState;
     use std::sync::Arc;
     use tempfile::tempdir;
+    use wiremock::matchers::{body_json, header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn parse_compact_args_defaults_to_full_memory_mode() {
@@ -2341,6 +2430,85 @@ mod compact_tests {
                 no_memoria: false,
             }
         );
+    }
+
+    #[test]
+    fn manual_compaction_stores_one_layered_episode_without_nested_wire_envelope() {
+        let summary = "The runtime now routes compaction state through one typed volatile lane while preserving real conversation history.";
+        let entry = manual_compaction_memory_entry(summary);
+        let encoded = entry.encode();
+        let parsed = astra_runtime::prompts::memory_proto::MemoryEntry::parse(&encoded)
+            .expect("canonical memory entry");
+
+        assert_eq!(parsed.ns, astra_runtime::prompts::memory_proto::NS_EPISODE);
+        assert_eq!(
+            parsed.status,
+            astra_runtime::prompts::memory_proto::ST_SUMMARY
+        );
+        assert_eq!(parsed.detail_layer(), Some(summary));
+        assert!(!parsed.detail_layer().unwrap().starts_with("[@episode/"));
+    }
+
+    #[test]
+    fn compact_facts_use_recallable_lifecycle_and_keep_working_state_session_scoped() {
+        let semantic = compact_fact_memory_entry("Rust is used by this project.", "semantic")
+            .expect("semantic fact");
+        assert_eq!(semantic.ns, astra_runtime::prompts::memory_proto::NS_FACT);
+        assert_eq!(
+            semantic.status,
+            astra_runtime::prompts::memory_proto::ST_ACTIVE
+        );
+        assert!(
+            astra_runtime::prompts::memory_proto::is_prompt_recallable_status(&semantic.status)
+        );
+
+        let profile = compact_fact_memory_entry("The user prefers concise output.", "profile")
+            .expect("profile fact");
+        assert_eq!(profile.ns, astra_runtime::prompts::memory_proto::NS_PREF);
+
+        let procedure =
+            compact_fact_memory_entry("Run focused tests before the full suite.", "procedural")
+                .expect("procedural fact");
+        assert_eq!(
+            procedure.ns,
+            astra_runtime::prompts::memory_proto::NS_KNOWLEDGE
+        );
+
+        assert!(
+            compact_fact_memory_entry("The current branch has five modified files.", "working")
+                .is_none(),
+            "transient working state must stay in session memory instead of durable recall"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_memory_store_requires_http_success() {
+        let server = MockServer::start().await;
+        let payload = serde_json::json!({"content": "remembered"});
+        Mock::given(method("POST"))
+            .and(path("/memory/store"))
+            .and(header_exists("authorization"))
+            .and(body_json(payload.clone()))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        store_compact_memory_payload(&api, "token", &payload)
+            .await
+            .expect("201 is a confirmed write");
+
+        let failing_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/store"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&failing_server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&failing_server.uri(), None).unwrap();
+        store_compact_memory_payload(&api, "token", &payload)
+            .await
+            .expect_err("a delivered request is not a durable write without server success");
     }
 
     #[test]
@@ -2506,6 +2674,10 @@ mod compact_tests {
         assert_eq!(params.history.len(), 1);
         assert!(params.pre_loaded_messages.is_none());
         assert!(params.incremental_state.is_none());
+        assert!(params.file_journal.is_none());
+        assert!(params.session_state_journal.is_none());
+        assert!(params.observability_hub.is_none());
+        assert!(params.observability_session.is_none());
     }
 
     #[test]

@@ -123,6 +123,33 @@ fn session_memory_injection(
     })
 }
 
+pub(crate) fn prompt_memory_injections(
+    entries: &[astra_turn_core::context_sources::MemoryEntry],
+) -> Vec<astra_turn_core::context_assembly_trace::MemoryInjection> {
+    entries
+        .iter()
+        .map(
+            |entry| astra_turn_core::context_assembly_trace::MemoryInjection {
+                memory_id: entry
+                    .memory_id
+                    .clone()
+                    .unwrap_or_else(|| format!("content-{:016x}", entry.content_hash)),
+                memory_type: entry
+                    .memory_type
+                    .clone()
+                    .or_else(|| entry.source.clone())
+                    .unwrap_or_else(|| "unknown".into()),
+                tokens: entry.token_estimate,
+                relevance_score: entry.relevance_score,
+                content_preview: astra_turn_core::context_assembly_trace::preview_snippet(
+                    &entry.content,
+                    100,
+                ),
+            },
+        )
+        .collect()
+}
+
 fn session_memory_relevance_score(source: &str) -> f64 {
     if source == "session_memory.reanchor" {
         1.0
@@ -213,6 +240,8 @@ pub(crate) struct RuntimeSignals<'a> {
     pub plan_resume_hint: Option<String>,
     pub extra_stable_sections: &'a [crate::prompts::PromptSection],
     pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
+    pub memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
+    pub memory_provider_source: Option<&'a str>,
     pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
 }
 
@@ -226,6 +255,8 @@ impl<'a> RuntimeSignals<'a> {
             plan_resume_hint,
             extra_stable_sections: &[],
             extra_volatile_sections: &[],
+            memory_entries: &[],
+            memory_provider_source: None,
             session_memory_entry: None,
         }
     }
@@ -245,6 +276,19 @@ impl<'a> RuntimeSignals<'a> {
         session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
     ) -> Self {
         self.session_memory_entry = session_memory_entry;
+        self
+    }
+
+    pub(crate) fn with_memory_entries(
+        mut self,
+        memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
+    ) -> Self {
+        self.memory_entries = memory_entries;
+        self
+    }
+
+    pub(crate) fn with_memory_provider_source(mut self, source: Option<&'a str>) -> Self {
+        self.memory_provider_source = source;
         self
     }
 }
@@ -293,6 +337,28 @@ impl LlmContextManifestTrace {
             "runtime_manifest": self.runtime_manifest.clone(),
         })
     }
+}
+
+fn runtime_manifest_with_memory_context(
+    mut manifest: Option<Value>,
+    provider_source: Option<&str>,
+    prompt_entry_count: usize,
+    session_snapshot_injected: bool,
+) -> Option<Value> {
+    if provider_source.is_none() && prompt_entry_count == 0 && !session_snapshot_injected {
+        return manifest;
+    }
+    let root = manifest.get_or_insert_with(|| json!({}));
+    if !root.is_object() {
+        *root = json!({});
+    }
+    root["memory_context"] = json!({
+        "provider_source": provider_source,
+        "prompt_entry_count": prompt_entry_count,
+        "session_snapshot_injected": session_snapshot_injected,
+        "delivery": "typed_runtime_dynamic",
+    });
+    manifest
 }
 
 pub(crate) fn context_meta_event(
@@ -433,6 +499,7 @@ pub(crate) struct BridgeRuntimeSignals<'a> {
     pub extra_stable_sections: &'a [crate::prompts::PromptSection],
     pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
     pub memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
+    pub memory_provider_source: Option<&'a str>,
     pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
     pub system_override: Option<&'a str>,
 }
@@ -449,9 +516,15 @@ impl<'a> BridgeRuntimeSignals<'a> {
             extra_stable_sections,
             extra_volatile_sections,
             memory_entries,
+            memory_provider_source: None,
             session_memory_entry,
             system_override,
         }
+    }
+
+    pub(crate) fn with_memory_provider_source(mut self, source: Option<&'a str>) -> Self {
+        self.memory_provider_source = source;
+        self
     }
 }
 
@@ -784,19 +857,24 @@ pub(crate) fn assemble_bridge_context(
             stable_system_message_count,
             volatile_preamble_count,
             tool_schema_count,
-            runtime_manifest: Some(json!({
-                "schema_version": "astra_runtime_manifest.v1",
-                "selected_model": {
-                    "model": input.session.model_id,
-                },
-                "model_resolution": {
-                    "source": "bridge_request",
-                    "model": input.session.model_id,
-                    "provider": input.session.provider,
-                    "resolved": true,
-                },
-                "runtime_profile": astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
-            })),
+            runtime_manifest: runtime_manifest_with_memory_context(
+                Some(json!({
+                    "schema_version": "astra_runtime_manifest.v1",
+                    "selected_model": {
+                        "model": input.session.model_id,
+                    },
+                    "model_resolution": {
+                        "source": "bridge_request",
+                        "model": input.session.model_id,
+                        "provider": input.session.provider,
+                        "resolved": true,
+                    },
+                    "runtime_profile": astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
+                })),
+                input.runtime_signals.memory_provider_source,
+                input.runtime_signals.memory_entries.len(),
+                input.runtime_signals.session_memory_entry.is_some(),
+            ),
         },
     }
 }
@@ -854,6 +932,9 @@ pub(crate) fn assemble_context_pipeline(
         input.runtime_signals.plan_resume_hint.as_deref(),
         Some(cache_cap),
     );
+    external
+        .memory_entries
+        .extend(input.runtime_signals.memory_entries.iter().cloned());
     external
         .extra_stable_sections
         .extend(input.runtime_signals.extra_stable_sections.iter().cloned());
@@ -958,6 +1039,7 @@ pub(crate) fn assemble_context_pipeline(
         .is_some_and(|text| !text.trim().is_empty());
     let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
         total_tokens: pipeline_output.metrics.sections,
+        repository_memories: prompt_memory_injections(&external.memory_entries),
         session_memory_injected: session_memory_injection(
             input.runtime_signals.session_memory_entry.as_ref(),
         ),
@@ -1019,12 +1101,24 @@ pub(crate) fn assemble_context_pipeline(
             (system, preamble)
         }
     };
-    if let Some(required_text) = astra_turn_core::chat_turn_edge_profile::edge_profile_joined_text(
+    let mut required_runtime_texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
         input.runtime_signals.edge_profile,
         astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
-    )
-    .and_then(|text| crate::turn::wire_assembly::required_runtime_preamble_message(&text))
-    {
+    );
+    required_runtime_texts.extend(
+        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+            input.runtime_signals.edge_profile,
+        )
+        .into_iter()
+        .filter(|injection| {
+            injection.delivery_class
+                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+        })
+        .filter_map(|injection| injection.render_for_prompt()),
+    );
+    if let Some(required_text) = crate::turn::wire_assembly::required_runtime_preamble_message(
+        &required_runtime_texts.join("\n\n"),
+    ) {
         volatile_preamble.push(required_text);
     }
     let stable_system_message_count = system_messages.len();
@@ -1051,7 +1145,12 @@ pub(crate) fn assemble_context_pipeline(
             stable_system_message_count,
             volatile_preamble_count,
             tool_schema_count,
-            runtime_manifest: state.runtime_manifest.clone(),
+            runtime_manifest: runtime_manifest_with_memory_context(
+                state.runtime_manifest.clone(),
+                input.runtime_signals.memory_provider_source,
+                external.memory_entries.len(),
+                input.runtime_signals.session_memory_entry.is_some(),
+            ),
         },
     })
 }
@@ -1172,9 +1271,9 @@ fn queue_active_turn_frame(state: &mut AgenticLoopState) {
         "round_id": state.llm_rounds_completed,
         "instruction": "Answer the latest user message first. History, memory, and tool results are evidence for this goal; do not finish with an answer to an older question."
     });
-    state.push_volatile(
+    state.push_volatile_payload(
         crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
-        format!("[active-turn-frame:v1]\n{frame}\n[/active-turn-frame]"),
+        frame,
     );
 }
 
@@ -1583,6 +1682,21 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn prompt_memory_trace_preserves_backend_identity_and_type() {
+        let entry = astra_turn_core::context_sources::MemoryEntry::scored(
+            "typed compact recall evidence",
+            0.87,
+        )
+        .with_memory_identity("memory-42", "semantic")
+        .with_source("memoria.prefetch");
+        let trace = prompt_memory_injections(&[entry]);
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].memory_id, "memory-42");
+        assert_eq!(trace[0].memory_type, "semantic");
+        assert_eq!(trace[0].relevance_score, 0.87);
+    }
+
+    #[test]
     fn pipeline_abort_journal_event_uses_session_turn() {
         let mut state = crate::turn::agentic_loop::host::tests::make_state();
         state.current_session_id = Some("session-1".to_string());
@@ -1986,7 +2100,7 @@ mod context_cache_contract_tests {
             "real user content must remain first: {tail_user}"
         );
         assert!(
-            tail_user.contains("[active-turn-frame:v1]"),
+            tail_user.contains("<runtime-required-context>"),
             "runtime goal frame must be visible in the protocol-valid tail suffix"
         );
         assert!(tail_user.contains("\"turn_id\":7"));
@@ -2005,7 +2119,7 @@ mod context_cache_contract_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            !system_text.contains("[active-turn-frame:v1]"),
+            !system_text.contains("<runtime-required-context>"),
             "active-turn runtime context must not mutate the stable system lane"
         );
         assert!(
@@ -2022,10 +2136,18 @@ mod context_cache_contract_tests {
         };
         let visible_tools: Vec<Value> = Vec::new();
         let restricted_tools = HashSet::new();
+        let memory_entries = vec![
+            astra_turn_core::context_sources::MemoryEntry::scored(
+                "typed bridge memory evidence",
+                0.9,
+            )
+            .with_memory_identity("bridge-memory-1", "semantic"),
+        ];
 
         let output = assemble_bridge_context(BridgeContextAssemblyInput {
             tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
-            runtime_signals: BridgeRuntimeSignals::new(&[], &[], &[], None, None),
+            runtime_signals: BridgeRuntimeSignals::new(&[], &[], &memory_entries, None, None)
+                .with_memory_provider_source(Some("request_binding")),
             session: BridgeSessionContextInput::new(
                 &cache_cfg,
                 None,
@@ -2049,6 +2171,15 @@ mod context_cache_contract_tests {
             output.manifest_trace.to_json()["runtime_manifest"]["runtime_profile"],
             astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
             "the /chat/turn adapter must surface CLI local capacity, not an implementation class name"
+        );
+        assert_eq!(
+            output.manifest_trace.to_json()["runtime_manifest"]["memory_context"],
+            json!({
+                "provider_source": "request_binding",
+                "prompt_entry_count": 1,
+                "session_snapshot_injected": false,
+                "delivery": "typed_runtime_dynamic",
+            })
         );
     }
 

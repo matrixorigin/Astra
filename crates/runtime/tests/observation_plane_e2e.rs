@@ -27,7 +27,7 @@ use astra_runtime::turn::observation_dispatcher::{
 };
 use astra_runtime::turn::observation_store::FileObservationStore;
 use astra_runtime::turn::providers::{LiveRuntimeProvider, ObservationProvider};
-use astra_runtime::turn::runtime_policy::{FrameworkAction, RuntimePolicy, TuningPolicy};
+use astra_runtime::turn::runtime_policy::{RuntimePolicy, RuntimePolicyEvidence, TuningPolicy};
 use astra_turn_core::introspect::{IntrospectSnapshot, StallSnapshotSummary};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -325,10 +325,10 @@ fn e2e_policy_decide_signals_context_pressure_on_high_token_pressure() {
 
     let has_pressure_signal = decisions
         .iter()
-        .any(|d| matches!(d, FrameworkAction::SignalContextPressure { .. }));
+        .any(|d| matches!(d, RuntimePolicyEvidence::ContextPressureObserved { .. }));
     assert!(
         has_pressure_signal,
-        "expected SignalContextPressure at 85% pressure, got: {:?}",
+        "expected ContextPressureObserved at 85% pressure, got: {:?}",
         decisions
     );
 }
@@ -353,7 +353,7 @@ fn e2e_policy_decide_aggressive_context_pressure_on_critical_pressure() {
     let has_aggressive = decisions.iter().any(|d| {
         matches!(
             d,
-            FrameworkAction::SignalContextPressure {
+            RuntimePolicyEvidence::ContextPressureObserved {
                 urgency: astra_runtime::turn::runtime_policy::ContextPressureUrgency::Aggressive
             }
         )
@@ -380,7 +380,7 @@ fn e2e_policy_decide_continue_when_healthy() {
 
     let has_aggressive = decisions
         .iter()
-        .any(|d| matches!(d, FrameworkAction::SignalContextPressure { .. }));
+        .any(|d| matches!(d, RuntimePolicyEvidence::ContextPressureObserved { .. }));
     assert!(
         !has_aggressive,
         "healthy state should not trigger aggressive actions: {:?}",
@@ -407,7 +407,7 @@ fn e2e_policy_decide_guidance_on_high_error_rate() {
 
     let has_guidance = decisions
         .iter()
-        .any(|d| matches!(d, FrameworkAction::InjectSignal { message } if message.contains("tool error rate")));
+        .any(|d| matches!(d, RuntimePolicyEvidence::Advisory { message } if message.contains("tool error rate")));
     assert!(
         has_guidance,
         "expected guidance signal for 45% error rate, got: {:?}",
@@ -433,7 +433,7 @@ fn e2e_policy_decide_guidance_on_read_only_streak() {
     let decisions = policy.decide(&facts);
 
     let has_guidance = decisions.iter().any(
-        |d| matches!(d, FrameworkAction::InjectSignal { message } if message.contains("read-only")),
+        |d| matches!(d, RuntimePolicyEvidence::Advisory { message } if message.contains("read-only")),
     );
     assert!(
         has_guidance,
@@ -461,14 +461,14 @@ fn e2e_policy_decide_transition_phase_on_completion() {
     let has_transition = decisions.iter().any(|d| {
         matches!(
             d,
-            FrameworkAction::TransitionPhase {
+            RuntimePolicyEvidence::PhaseTransitionSuggested {
                 target: astra_runtime::turn::runtime_policy::PhaseTarget::Completion
             }
         )
     });
     assert!(
         has_transition,
-        "expected TransitionPhase::Completion, got: {:?}",
+        "expected PhaseTransitionSuggested::Completion, got: {:?}",
         decisions
     );
 }
@@ -492,10 +492,10 @@ fn e2e_policy_decide_expand_budget_on_outcome_streak() {
 
     let has_expand = decisions
         .iter()
-        .any(|d| matches!(d, FrameworkAction::ExpandBudget { .. }));
+        .any(|d| matches!(d, RuntimePolicyEvidence::BudgetExpansionSuggested { .. }));
     assert!(
         has_expand,
-        "expected ExpandBudget for outcome streak with tight budget, got: {:?}",
+        "expected BudgetExpansionSuggested for outcome streak with tight budget, got: {:?}",
         decisions
     );
 }
@@ -898,7 +898,7 @@ fn e2e_policy_respects_context_pressure_policy_thresholds() {
     let decisions = policy.decide(&facts);
     let has_pressure_signal = decisions
         .iter()
-        .any(|d| matches!(d, FrameworkAction::SignalContextPressure { .. }));
+        .any(|d| matches!(d, RuntimePolicyEvidence::ContextPressureObserved { .. }));
     assert!(
         has_pressure_signal,
         "custom threshold 0.5 should trigger at 60%: {:?}",
@@ -929,7 +929,7 @@ fn e2e_policy_circuit_breaker_respects_custom_max_errors() {
 
     let decisions = policy.decide(&facts);
     let has_adjustment = decisions.iter().any(|d| {
-        matches!(d, FrameworkAction::InjectSignal { message } if message.contains("Circuit-breaker risk") || message.contains("error"))
+        matches!(d, RuntimePolicyEvidence::Advisory { message } if message.contains("Circuit-breaker risk") || message.contains("error"))
     });
     assert!(
         has_adjustment,

@@ -77,15 +77,14 @@ pub(crate) fn stream_result_completion_outcome(sr: &StreamResult) -> astra_servi
 }
 
 pub(crate) fn stream_result_exit_code(sr: &StreamResult) -> crate::cli::exit_code::ExitCode {
-    // Forced terminal stop always wins over softer failures because the user or
-    // turn guard explicitly ended execution.
-    if sr.verdict_events.iter().any(|v| v.force_stop) {
-        return crate::cli::exit_code::ExitCode::ForceStop;
-    }
-
     // Honor explicit exit semantics when present; a failing shell command like
     // `grep` with no matches is not a task failure, but an execution error is.
     let is_error = |r: &astra_services::session_journal::ToolCallRecord| -> bool {
+        if r.effective_disposition()
+            != astra_services::session_journal::ToolCallDisposition::Executed
+        {
+            return false;
+        }
         match r
             .exit_semantics
             .as_deref()
@@ -270,6 +269,22 @@ mod tests {
                 "{semantics}"
             );
         }
+    }
+
+    #[test]
+    fn stream_result_exit_code_does_not_treat_rejection_as_execution_failure() {
+        let result = StreamResult {
+            tool_call_records: vec![astra_services::session_journal::ToolCallRecord {
+                name: "git".into(),
+                ok: false,
+                error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(stream_result_exit_code(&result), ExitCode::Success);
     }
 
     #[test]

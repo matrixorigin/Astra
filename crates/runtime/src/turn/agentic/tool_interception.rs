@@ -157,6 +157,10 @@ fn intercept_disallowed_tool_calls(
             blocked.push(crate::turn::skill_tool::InterceptedToolResult {
                 tool_call_id,
                 tool_name: "<missing>".to_string(),
+                ok: false,
+                result_class: Some(
+                    astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS.to_string(),
+                ),
                 result: format!(
                     "BLOCKED: Tool name is missing or empty, so the call cannot bypass the active request/skill allowlist. Allowed tools: {allowed_display}. Use an allowed tool name or call `skill` to load a different workflow."
                 ),
@@ -177,6 +181,10 @@ fn intercept_disallowed_tool_calls(
         blocked.push(crate::turn::skill_tool::InterceptedToolResult {
             tool_call_id,
             tool_name: tool_name.clone(),
+            ok: false,
+            result_class: Some(
+                astra_services::session_journal::BLOCKED_TOOL_RESULT_CLASS.to_string(),
+            ),
             result: format!(
                 "BLOCKED: Tool '{tool_name}' is not allowed by the active request/skill allowlist. Allowed tools: {allowed_display}. Use the allowed tools or call `skill` to load a different workflow."
             ),
@@ -246,6 +254,8 @@ pub(crate) async fn prepare_intercepted_tool_round(
             result_full: Some(result.result.clone()),
             round,
             start_offset_ms,
+            error_kind: Some(astra_core::ErrorKind::ToolUnavailable),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
             ..Default::default()
         });
     }
@@ -262,13 +272,18 @@ pub(crate) async fn prepare_intercepted_tool_round(
                 Some(meta) => (Some(meta.reentry_count), Some(meta.locked_out)),
                 None => (None, None),
             };
+        let disposition = if skill_locked_out == Some(true) {
+            astra_services::session_journal::ToolCallDisposition::Rejected
+        } else if skill_reentry_count.is_some() {
+            astra_services::session_journal::ToolCallDisposition::Suppressed
+        } else if result.result_class.is_some() {
+            astra_services::session_journal::ToolCallDisposition::Deferred
+        } else {
+            astra_services::session_journal::ToolCallDisposition::Executed
+        };
         state.stall.tool_call_records.push(ToolCallRecord {
             name: result.tool_name.clone(),
-            ok: !result.result.starts_with("Unknown skill")
-                && !result.result.starts_with("Invalid skill")
-                && !result.result.starts_with("Skipped:")
-                && !result.result.starts_with("Deferred:")
-                && !result.result.starts_with("BLOCKED:"),
+            ok: result.ok,
             ms: 0,
             error: None,
             input_bytes: None,
@@ -284,6 +299,10 @@ pub(crate) async fn prepare_intercepted_tool_round(
             start_offset_ms,
             skill_reentry_count,
             skill_locked_out: skill_locked_out.filter(|v| *v),
+            result_class: result.result_class.clone(),
+            error_kind: (skill_locked_out == Some(true))
+                .then_some(astra_core::ErrorKind::ToolUnavailable),
+            disposition: Some(disposition),
             ..Default::default()
         });
     }
@@ -329,6 +348,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
             original_tool_name: original_name,
             round,
             start_offset_ms,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Suppressed),
             ..Default::default()
         });
     }
@@ -520,6 +540,11 @@ pub(crate) fn dedup_skill_calls(
                     crate::turn::skill_tool::InterceptedToolResult {
                         tool_call_id: call_id.to_string(),
                         tool_name: crate::turn::skill_tool::SKILL_TOOL_NAME.to_string(),
+                        ok: !locked_out,
+                        result_class: Some(
+                            astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS
+                                .to_string(),
+                        ),
                         result: message,
                     },
                     SkillShortCircuitMeta {
@@ -682,6 +707,10 @@ async fn intercept_skill_calls(
                 skill_results.push(crate::turn::skill_tool::InterceptedToolResult {
                     tool_call_id: call_id.to_string(),
                     tool_name: tool_name.to_string(),
+                    ok: false,
+                    result_class: Some(
+                        astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string(),
+                    ),
                     result: msg,
                 });
             }
@@ -859,11 +888,10 @@ pub(crate) fn extract_repo_name_from_url(url: &str) -> Option<String> {
     let path = url.trim_end_matches('/');
     let segment = if let Some(idx) = path.rfind('/') {
         &path[idx + 1..]
-    } else if let Some(idx) = path.rfind(':') {
+    } else {
+        let idx = path.rfind(':')?;
         let after_colon = &path[idx + 1..];
         after_colon.rsplit('/').next().unwrap_or(after_colon)
-    } else {
-        return None;
     };
     let name = segment.strip_suffix(".git").unwrap_or(segment);
     if name.is_empty() {

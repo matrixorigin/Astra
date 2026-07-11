@@ -54,6 +54,7 @@ pub(crate) enum ToolHiddenReason {
     UnknownTool,
     NoProvider,
     ProviderUnavailable,
+    RuntimeSurfaceDenied,
     SchemaConflict,
     ProviderRouteMismatch,
     UnsupportedRoute,
@@ -435,13 +436,29 @@ pub(crate) fn has_explicit_runtime_executor_provider(
             executor.status,
             ExecutorStatus::Online | ExecutorStatus::Degraded
         )
-        && runtime.is_none_or(|runtime| {
-            runtime.status == astra_runtime_env::RuntimeStatus::Ready
-                && runtime.isolation_backend != astra_runtime_env::RuntimeIsolationBackend::None
-        })
+        && runtime.is_none_or(runtime_binding_can_host_executor_provider)
         && !matches!(
             provider_type,
             astra_runtime_env::CapacityProviderType::Unknown
+        )
+}
+
+fn runtime_binding_can_host_executor_provider(runtime: &astra_runtime_env::RuntimeBinding) -> bool {
+    runtime.status == astra_runtime_env::RuntimeStatus::Ready
+        && !matches!(
+            runtime.session_manager,
+            astra_runtime_env::RuntimeSessionManager::None
+                | astra_runtime_env::RuntimeSessionManager::Unknown
+        )
+        && !matches!(
+            runtime.isolation_backend,
+            astra_runtime_env::RuntimeIsolationBackend::None
+                | astra_runtime_env::RuntimeIsolationBackend::Unknown
+        )
+        && !matches!(
+            runtime.launch_driver,
+            astra_runtime_env::RuntimeLaunchDriver::None
+                | astra_runtime_env::RuntimeLaunchDriver::Unknown
         )
 }
 

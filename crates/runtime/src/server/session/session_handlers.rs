@@ -1407,21 +1407,13 @@ pub(crate) async fn resume_session_handler(
     let user_id = user.user_id.clone();
     let session = state
         .session_service
-        .update_session(
-            session_id,
-            user_id.clone(),
-            SessionUpdateRequestData {
-                title: None,
-                metadata: None,
-                status: Some("active".to_string()),
-            },
-        )
+        .get_session(session_id.clone(), user_id.clone())
         .await?;
     let Some(shared_pool) = state.shared_pool.as_ref() else {
         return Err(internal_error("shared MatrixOne pool is not configured"));
     };
     let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
-    let restored = svc
+    let mut restored = svc
         .restore_session(&user_id, &session.session_id)
         .await
         .map_err(internal_error)?
@@ -1431,6 +1423,22 @@ pub(crate) async fn resume_session_handler(
                 format!("session {} has no resumable state", session.session_id),
             )
         })?;
+    // Activation is committed only after ownership and resumable state have
+    // both been validated. A malformed/missing snapshot must not leave the
+    // session falsely marked active.
+    state
+        .session_service
+        .update_session(
+            session_id,
+            user_id,
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                status: Some("active".to_string()),
+            },
+        )
+        .await?;
+    restored.last_status = "active".to_string();
     Ok(Json(restored))
 }
 
@@ -2368,6 +2376,29 @@ mod tests {
             HeaderValue::from_static("Bearer session-test-token"),
         );
         headers
+    }
+
+    #[tokio::test]
+    async fn resume_session_does_not_activate_before_restore_is_available() {
+        let session_service = Arc::new(RecordingSessionService::with_owned_session());
+        let state = build_state(Arc::new(RecordingAuthService), session_service.clone());
+
+        let error = resume_session_handler(
+            State(state),
+            Path("session-resume-order".to_string()),
+            auth_headers(),
+        )
+        .await
+        .expect_err("missing durable restore infrastructure must fail before activation");
+
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            session_service.get_session_calls.lock().await.as_slice(),
+            &[(
+                "session-resume-order".to_string(),
+                "artifact-owner".to_string()
+            )]
+        );
     }
 
     #[tokio::test]

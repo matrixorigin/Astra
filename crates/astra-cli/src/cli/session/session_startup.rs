@@ -361,17 +361,23 @@ impl astra_runtime::session_memory::SelectorParamsResolver for CliSessionMemoryS
 }
 
 #[derive(Debug)]
-struct CliSessionMemoryMemoriaClient {
+struct CliSessionMemoryMemoriaPort {
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
+    owner_user_id: String,
     working_ids: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
-impl CliSessionMemoryMemoriaClient {
-    fn new(api: astra_thin_client::ThinClient, profile: Option<&str>) -> Self {
+impl CliSessionMemoryMemoriaPort {
+    fn new(
+        api: astra_thin_client::ThinClient,
+        profile: Option<&str>,
+        owner_user_id: impl Into<String>,
+    ) -> Self {
         Self {
             api,
             profile: profile.map(str::to_string),
+            owner_user_id: owner_user_id.into(),
             working_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -414,7 +420,7 @@ impl CliSessionMemoryMemoriaClient {
 }
 
 #[async_trait::async_trait]
-impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMemoryMemoriaClient {
+impl astra_runtime::turn::cloud::memoria_compact::MemoriaPort for CliSessionMemoryMemoriaPort {
     async fn retrieve_ext(
         &self,
         query: &str,
@@ -426,6 +432,7 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMe
         let mut body = serde_json::json!({
             "query": query,
             "top_k": top_k,
+            "user_id": self.owner_user_id.as_str(),
         });
         if let Some(session_id) = session_id {
             body["session_id"] = serde_json::json!(session_id);
@@ -447,6 +454,17 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMe
             return Err(format!("memory retrieve HTTP {status}"));
         }
         let memories = Self::parse_memories(&payload);
+        if filter_session {
+            let session_id = session_id
+                .ok_or_else(|| "strict CLI memory retrieve requires a session_id".to_string())?;
+            let scope = astra_runtime::turn::cloud::memoria_compact::MemoryScope::new(
+                &self.owner_user_id,
+                session_id,
+            )?;
+            astra_runtime::turn::cloud::memoria_compact::validate_strict_memories(
+                &memories, &scope,
+            )?;
+        }
         if let Some(session_id) = session_id {
             self.track_working_id_from_memories(session_id, &memories);
         }
@@ -469,7 +487,7 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMe
                 .ok()
                 .and_then(|guard| guard.get(session_id).cloned())
         {
-            let path = format!("/memory/{memory_id}/correct");
+            let path = format!("/memory/correct/{memory_id}");
             let body = serde_json::json!({
                 "new_content": content,
                 "reason": "session memory update",
@@ -490,6 +508,7 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMe
         let mut body = serde_json::json!({
             "content": content,
             "memory_type": memory_type,
+            "user_id": self.owner_user_id.as_str(),
         });
         if let Some(session_id) = session_id {
             body["session_id"] = serde_json::json!(session_id);
@@ -534,31 +553,28 @@ impl astra_runtime::turn::cloud::memoria_compact::MemoriaClient for CliSessionMe
             return Ok(0);
         };
 
-        let token = self.fresh_token().await?;
-        let body = serde_json::json!({
-            "memory_ids": [memory_id],
-            "reason": "session memory purge",
-        });
-        let response = self
-            .api
-            .post_memory_purge_json(&token, &body)
-            .await
-            .map_err(|error| format!("memory purge failed: {error}"))?;
-        let status = response.status();
-        let payload: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| format!("memory purge parse failed: {error}"))?;
-        if !status.is_success() {
-            return Err(format!("memory purge HTTP {status}"));
-        }
+        self.delete(&memory_id).await?;
         if let Ok(mut guard) = self.working_ids.lock() {
             guard.remove(session_id);
         }
-        Ok(payload
-            .get("deleted_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0))
+        Ok(1)
+    }
+
+    async fn delete(&self, memory_id: &str) -> Result<(), String> {
+        let memory_id = memory_id.trim();
+        if memory_id.is_empty() {
+            return Err("memory delete requires a non-empty memory_id".to_string());
+        }
+        let token = self.fresh_token().await?;
+        let encoded_id = urlencoding::encode(memory_id);
+        self.api
+            .delete_bearer_path_text(&token, &format!("/memory/{encoded_id}"))
+            .await
+            .map_err(|error| format!("memory delete failed: {error}"))?;
+        if let Ok(mut guard) = self.working_ids.lock() {
+            guard.retain(|_, tracked_id| tracked_id != memory_id);
+        }
+        Ok(())
     }
 }
 
@@ -628,8 +644,12 @@ async fn build_cli_session_memory_extractor(
         api: api.clone(),
         profile: profile.map(str::to_string),
     });
-    let memoria = std::sync::Arc::new(CliSessionMemoryMemoriaClient::new(api.clone(), profile))
-        as std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaClient>;
+    let memoria = std::sync::Arc::new(CliSessionMemoryMemoriaPort::new(
+        api.clone(),
+        profile,
+        me.user_id.clone(),
+    ))
+        as std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>;
     let ingestion = astra_services::event_ingestion::IngestionSender::disconnected();
     let broker =
         std::sync::Arc::new(astra_runtime::session_memory::BackgroundActivityBroker::new());
@@ -833,12 +853,13 @@ pub(crate) async fn complete_session_startup(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_pending_adaptive_state, build_cli_session_memory_extractor, initialize_journal,
-        prune_stale_pending_recovery,
+        CliSessionMemoryMemoriaPort, apply_pending_adaptive_state,
+        build_cli_session_memory_extractor, initialize_journal, prune_stale_pending_recovery,
     };
     use crate::cli::session::session_state::SessionState;
+    use astra_runtime::turn::cloud::memoria_compact::MemoriaPort;
     use astra_services::session_journal;
-    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::matchers::{body_json, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn write_resumable_session(session_id: &str) {
@@ -1424,5 +1445,116 @@ mod tests {
             svc.is_none(),
             "missing auth identity should disable session memory extractor"
         );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_session_memory_port_updates_working_snapshot_through_server_contract() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("session-1");
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/memory/correct/memory-1"))
+            .and(header_exists("authorization"))
+            .and(body_json(serde_json::json!({
+                "new_content": "updated",
+                "reason": "session memory update",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "memory_id": "memory-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        port.working_ids
+            .lock()
+            .unwrap()
+            .insert("session-1".to_string(), "memory-1".to_string());
+
+        let id = port
+            .store("updated", "working", Some("session-1"), Some("T3"))
+            .await
+            .unwrap();
+        assert_eq!(id, "memory-1");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_session_memory_port_rejects_foreign_strict_recall_response() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("session-1");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/retrieve"))
+            .and(header_exists("authorization"))
+            .and(body_json(serde_json::json!({
+                "query": "session memory",
+                "top_k": 5,
+                "user_id": "user-1",
+                "session_id": "session-1",
+                "session_scope": "only",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "memory_id": "foreign-memory",
+                    "content": "must not be admitted",
+                    "memory_type": "working",
+                    "user_id": "user-1",
+                    "session_id": "session-2",
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        let error = port
+            .retrieve_ext("session memory", Some("session-1"), 5, true)
+            .await
+            .expect_err("foreign session result must fail closed");
+        assert!(error.starts_with("memory_scope_violation:"), "{error}");
+        assert!(port.working_ids.lock().unwrap().is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_session_memory_port_delete_requires_confirmed_remote_removal() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("session-1");
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/memory/memory-old"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        port.delete("memory-old").await.unwrap();
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cli_session_memory_port_delete_rejects_false_success() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        write_profile_with_token("session-1");
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/memory/memory-missing"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let port = CliSessionMemoryMemoriaPort::new(api, None, "user-1");
+        port.delete("memory-missing")
+            .await
+            .expect_err("404 must not be accepted as a completed delete");
     }
 }

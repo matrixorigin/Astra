@@ -6,10 +6,8 @@
 //! This module is shared between CLI and server — both use HTTP proxy
 //! calls to the Memoria service.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -26,6 +24,7 @@ pub enum HttpMethod {
 pub struct BoostSearchHit {
     pub memory_id: Option<String>,
     pub content: String,
+    pub score: Option<f64>,
 }
 
 /// Parse content strings from a Memoria search/retrieve response.
@@ -65,6 +64,7 @@ pub fn parse_memory_search_hits(raw: &str) -> Vec<BoostSearchHit> {
             return vec![BoostSearchHit {
                 memory_id: mid,
                 content: c.to_string(),
+                score: parse_memory_hit_score(&val),
             }];
         }
         return vec![];
@@ -87,9 +87,46 @@ pub fn parse_memory_search_hits(raw: &str) -> Vec<BoostSearchHit> {
             Some(BoostSearchHit {
                 memory_id,
                 content: content.to_string(),
+                score: parse_memory_hit_score(item),
             })
         })
         .collect()
+}
+
+fn parse_memory_hit_score(item: &Value) -> Option<f64> {
+    item.get("score")
+        .or_else(|| item.get("final_score"))
+        .or_else(|| item.get("relevance_score"))
+        .or_else(|| item.get("retrieval_score"))
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|raw| raw.parse::<f64>().ok()))
+        })
+        .filter(|score| score.is_finite())
+}
+
+#[cfg(test)]
+mod boost_search_hit_tests {
+    use super::parse_memory_search_hits;
+
+    #[test]
+    fn parse_memory_search_hits_preserves_relevance_scores() {
+        let hits = parse_memory_search_hits(
+            r#"{"memories":[
+                {"memory_id":"a","content":"alpha","score":0.9},
+                {"memory_id":"b","content":"beta","final_score":"0.42"},
+                {"memory_id":"c","content":"gamma","relevance_score":"NaN"},
+                {"memory_id":"d","content":"delta"}
+            ]}"#,
+        );
+
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].score, Some(0.9));
+        assert_eq!(hits[1].score, Some(0.42));
+        assert_eq!(hits[2].score, None);
+        assert_eq!(hits[3].score, None);
+    }
 }
 
 /// Return true when text appears to contain credentials or similarly
@@ -341,84 +378,17 @@ pub fn enrich_store_payload_with_views(payload: &mut Value) {
     }
 }
 
-/// A single `focus` hint: a session-scoped attention boost with TTL.
-///
-/// Stored in-process by [`MemoriaClient`]. On each `recall` call the
-/// client consults the hints whose `expires_at` is still in the future
-/// and forwards them to the backend as `boost_topics` / `boost_tags`
-/// hints. The hint is evicted on first access past its TTL.
-#[derive(Debug, Clone)]
-struct FocusHint {
-    /// `"topic" | "tag" | "memory_id" | "session"` (matches v2 FocusRequest).
-    focus_type: String,
-    value: String,
-    boost: f64,
-    expires_at: Instant,
-}
+pub use astra_memoria::RecallSnapshot;
 
-/// Memoria HTTP client with circuit breaker.
+/// Prompt-facing Memoria tool transport with a small failure circuit breaker.
 ///
-/// Used by both CLI (via ToolExecutor) and server (via ServerToolExecutor)
-/// to proxy memory operations to the Memoria service.
-///
-/// **Cognitive verbs**: the LLM-facing surface exposes v2 cognitive verbs
-/// (`remember`, `recall`, `forget`, `update`, `expand`, `focus`, `reflect`,
-/// `profile`, `feedback`). Those are translated to v1 HTTP endpoints by
-/// [`Self::build_direct_request`]. `focus` is handled in-process via the
-/// [`FocusHint`] store; subsequent `recall`s read it and forward boost
-/// hints to the backend.
-pub struct MemoriaClient {
-    /// Cloud API base URL for proxied calls.
+/// This gateway translates LLM cognitive verbs to the Memoria wire protocol.
+/// Runtime orchestration depends on [`astra_memoria::MemoriaPort`] instead; all
+/// ephemeral session state is owned by [`astra_memoria::MemoriaRuntimeState`].
+pub struct MemoriaToolGateway {
     pub cloud_base: Option<String>,
-    /// Auth token for cloud proxy calls.
     pub cloud_token: Option<String>,
-    /// Circuit breaker: skip after consecutive failures.
     fail_count: AtomicU32,
-}
-
-/// Process-global focus hints, keyed by session_id.
-///
-/// Tool executors construct `MemoriaClient` per tool call in several
-/// production paths. Keeping focus hints on the client instance made
-/// `memory(action=focus)` evaporate before the next `recall`. This store
-/// is the session-lifetime state for those hints.
-static FOCUS_STORE: OnceLock<RwLock<HashMap<String, Vec<FocusHint>>>> = OnceLock::new();
-
-fn focus_store() -> &'static RwLock<HashMap<String, Vec<FocusHint>>> {
-    FOCUS_STORE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// Process-global "already surfaced" set for memory entries, keyed by
-/// session_id. Holds a union of two kinds of dedup keys:
-///
-/// - **memory_id** (written by tool-side `decorate_recall_response`
-///   and by the runtime `MemoryOrchestrator::mark_surfaced`)
-/// - **normalized content dedup key** (written by the bridge when it
-///   injects `<session_memory>` + the per-turn recall block)
-///
-/// Both paths share one canonical store so a memory shown via
-/// `<session_memory>` won't re-appear in per-turn recall, and a memory
-/// returned from an LLM-driven `memory(action=recall)` won't re-appear
-/// in the next recall. Cleared at session-end by
-/// `post_loop_memory_cleanup`. `MemoriaClient` is constructed per-
-/// tool-call in production (see `server_tool_executor.rs`,
-/// `edge_tools/memoria.rs`), so a per-client store would reset every
-/// call — process-global is the minimum viable scope.
-static SEEN_STORE: std::sync::OnceLock<RwLock<HashMap<String, std::collections::HashSet<String>>>> =
-    std::sync::OnceLock::new();
-
-fn seen_store() -> &'static RwLock<HashMap<String, std::collections::HashSet<String>>> {
-    SEEN_STORE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-/// One recall awaiting outcome attribution. Populated by the `recall`
-/// verb post-processor; drained by the runtime's feedback observer.
-#[derive(Debug, Clone)]
-pub struct RecallSnapshot {
-    pub session_id: String,
-    pub memory_ids: Vec<String>,
-    pub turn: u32,
-    pub at: Instant,
 }
 
 /// Result of draining recall snapshots into Memoria feedback calls.
@@ -439,24 +409,32 @@ fn memoria_output_is_error(output: &str) -> bool {
         .is_some()
 }
 
-/// Process-global FIFO queue of recall snapshots per session. Mirror of
-/// `MemoryOrchestrator::recall_ledger`, but accessible from the tool
-/// layer (which doesn't depend on runtime) so `decorate_recall_response`
-/// can push without a cross-crate trait. The runtime observes and
-/// drains.
-static RECALL_LEDGER: std::sync::OnceLock<
-    RwLock<HashMap<String, std::collections::VecDeque<RecallSnapshot>>>,
-> = std::sync::OnceLock::new();
-
-const MAX_RECALL_LEDGER_PER_SESSION: usize = 16;
-
-fn recall_ledger() -> &'static RwLock<HashMap<String, std::collections::VecDeque<RecallSnapshot>>> {
-    RECALL_LEDGER.get_or_init(|| RwLock::new(HashMap::new()))
+fn validate_strict_recall_response(raw_text: &str, args: &Value) -> Result<(), String> {
+    if args.get("scope").and_then(Value::as_str) != Some("session")
+        || memoria_output_is_error(raw_text)
+    {
+        return Ok(());
+    }
+    let session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "memory_scope_violation: strict recall is missing session_id".to_string())?;
+    let payload = serde_json::from_str::<Value>(raw_text).map_err(|error| {
+        format!("memory_scope_violation: strict recall response is not valid JSON: {error}")
+    })?;
+    if let Some(user_id) = args.get("user_id").and_then(Value::as_str) {
+        let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
+        astra_memoria::validate_strict_recall_payload(&payload, &scope)
+    } else {
+        // Edge callers do not own the bearer identity. The authenticated
+        // server validates the full pair; retain a local session assertion.
+        astra_memoria::validate_strict_recall_session_payload(&payload, session_id)
+    }
 }
 
 const MAX_FAILS: u32 = 2;
 
-impl MemoriaClient {
+impl MemoriaToolGateway {
     pub fn new(cloud_base: Option<String>, cloud_token: Option<String>) -> Self {
         Self {
             cloud_base,
@@ -499,24 +477,14 @@ impl MemoriaClient {
             .and_then(Value::as_i64)
             .unwrap_or(3600)
             .max(1) as u64;
-        let expires_at = Instant::now() + Duration::from_secs(ttl_secs);
-        let hint = FocusHint {
-            focus_type: focus_type.clone(),
-            value: value.clone(),
+        if let Err(error) = astra_memoria::memoria_runtime_state().set_focus(
+            session_id,
+            &focus_type,
+            &value,
             boost,
-            expires_at,
-        };
-        if let Ok(mut store) = focus_store().write() {
-            let sid_key = if session_id.is_empty() {
-                "_global".to_string()
-            } else {
-                session_id.to_string()
-            };
-            let bucket = store.entry(sid_key).or_default();
-            // Evict any existing hint with the same (type, value) so the
-            // newest boost/ttl wins.
-            bucket.retain(|h| !(h.focus_type == focus_type && h.value == value));
-            bucket.push(hint);
+            ttl_secs,
+        ) {
+            return json!({"error": error}).to_string();
         }
         json!({
             "status": "completed",
@@ -530,20 +498,8 @@ impl MemoriaClient {
 
     /// Return active focus hints for a session. Expired entries are
     /// evicted as a side effect.
-    fn focus_active(&self, session_id: &str) -> Vec<FocusHint> {
-        let now = Instant::now();
-        let sid_key = if session_id.is_empty() {
-            "_global".to_string()
-        } else {
-            session_id.to_string()
-        };
-        if let Ok(mut store) = focus_store().write()
-            && let Some(bucket) = store.get_mut(&sid_key)
-        {
-            bucket.retain(|h| h.expires_at > now);
-            return bucket.clone();
-        }
-        Vec::new()
+    fn focus_active(&self, session_id: &str) -> Vec<astra_memoria::FocusHint> {
+        astra_memoria::memoria_runtime_state().active_focus(session_id)
     }
 
     /// Record memory_ids surfaced to the LLM in a given session
@@ -553,18 +509,7 @@ impl MemoriaClient {
     /// for the process. The runtime's `MemoryOrchestrator` is a
     /// delegating facade that calls this — no parallel store exists.
     pub fn record_seen(session_id: &str, ids: impl IntoIterator<Item = String>) {
-        if session_id.is_empty() {
-            return;
-        }
-        let Ok(mut store) = seen_store().write() else {
-            return;
-        };
-        let bucket = store.entry(session_id.to_string()).or_default();
-        for id in ids {
-            if !id.is_empty() {
-                bucket.insert(id);
-            }
-        }
+        astra_memoria::memoria_runtime_state().record_seen(session_id, ids);
     }
 
     /// Snapshot surfaced ids for a session (process-global store);
@@ -572,37 +517,20 @@ impl MemoriaClient {
     ///
     /// Public: see [`record_seen`].
     pub fn seen_snapshot(session_id: &str) -> std::collections::HashSet<String> {
-        if session_id.is_empty() {
-            return std::collections::HashSet::new();
-        }
-        seen_store()
-            .read()
-            .ok()
-            .and_then(|g| g.get(session_id).cloned())
-            .unwrap_or_default()
+        astra_memoria::memoria_runtime_state().seen_snapshot(session_id)
     }
 
     /// Clear the "already surfaced" set for a session. Intended for
     /// session-end cleanup. Public so the runtime's session-end path
     /// can keep tool-side state in lock-step with its own seen ledger.
     pub fn reset_seen(session_id: &str) {
-        if session_id.is_empty() {
-            return;
-        }
-        if let Ok(mut g) = seen_store().write() {
-            g.remove(session_id);
-        }
+        astra_memoria::memoria_runtime_state().reset_seen(session_id);
     }
 
     /// Clear focus hints for a session. Called at session-end cleanup so
     /// long-lived processes do not carry stale attention boosts forever.
     pub fn reset_focus(session_id: &str) {
-        if session_id.is_empty() {
-            return;
-        }
-        if let Ok(mut g) = focus_store().write() {
-            g.remove(session_id);
-        }
+        astra_memoria::memoria_runtime_state().reset_focus(session_id);
     }
 
     /// Record a recall snapshot for later outcome attribution.
@@ -614,22 +542,7 @@ impl MemoriaClient {
     /// evicted beyond the cap so an LLM that never closes the loop
     /// doesn't leak memory.
     pub fn record_recall(session_id: &str, turn: u32, memory_ids: Vec<String>) {
-        if session_id.is_empty() || memory_ids.is_empty() {
-            return;
-        }
-        let snap = RecallSnapshot {
-            session_id: session_id.to_string(),
-            memory_ids,
-            turn,
-            at: Instant::now(),
-        };
-        if let Ok(mut g) = recall_ledger().write() {
-            let q = g.entry(session_id.to_string()).or_default();
-            if q.len() >= MAX_RECALL_LEDGER_PER_SESSION {
-                q.pop_front();
-            }
-            q.push_back(snap);
-        }
+        astra_memoria::memoria_runtime_state().record_recall(session_id, turn, memory_ids);
     }
 
     /// Drain and return all recall snapshots for a session older than
@@ -637,42 +550,19 @@ impl MemoriaClient {
     /// are dropped (can no longer reliably attribute). Invoked by the
     /// runtime's feedback observer.
     pub fn drain_recalls(session_id: &str, max_age: Option<Duration>) -> Vec<RecallSnapshot> {
-        if session_id.is_empty() {
-            return Vec::new();
-        }
-        let Ok(mut g) = recall_ledger().write() else {
-            return Vec::new();
-        };
-        let Some(q) = g.remove(session_id) else {
-            return Vec::new();
-        };
-        q.into_iter()
-            .filter(|s| match max_age {
-                Some(max) => s.at.elapsed() <= max,
-                None => true,
-            })
-            .collect()
+        astra_memoria::memoria_runtime_state().drain_recalls(session_id, max_age)
     }
 
     /// Number of unconsumed recall snapshots for a session (tests +
     /// observability).
     pub fn pending_recall_count(session_id: &str) -> usize {
-        recall_ledger()
-            .read()
-            .ok()
-            .and_then(|g| g.get(session_id).map(|q| q.len()))
-            .unwrap_or(0)
+        astra_memoria::memoria_runtime_state().pending_recall_count(session_id)
     }
 
     /// Clear the recall ledger for a session. Called at session-end
     /// cleanup alongside `reset_seen`.
     pub fn reset_recall_ledger(session_id: &str) {
-        if session_id.is_empty() {
-            return;
-        }
-        if let Ok(mut g) = recall_ledger().write() {
-            g.remove(session_id);
-        }
+        astra_memoria::memoria_runtime_state().reset_recalls(session_id);
     }
 
     /// Clear all process-global memory state for a session. Long-lived CLI
@@ -680,9 +570,7 @@ impl MemoriaClient {
     /// memory ids, focus hints, and pending recall feedback cannot bleed into
     /// the next session.
     pub fn reset_session_process_state(session_id: &str) {
-        Self::reset_seen(session_id);
-        Self::reset_focus(session_id);
-        Self::reset_recall_ledger(session_id);
+        astra_memoria::memoria_runtime_state().reset_session(session_id);
     }
 
     /// Drain pending recalls and push one feedback signal for every
@@ -1136,6 +1024,21 @@ impl MemoriaClient {
         // carry the same signals as the bridge-side prefetch path.
         if op == "recall" {
             let session_id = args.get("session_id").and_then(Value::as_str).unwrap_or("");
+            if let Err(error) = validate_strict_recall_response(&raw_text, args) {
+                tracing::error!(
+                    target: "astra::memory::scope",
+                    session_id,
+                    error = %error,
+                    "strict memory recall response failed identity validation"
+                );
+                return json!({
+                    "error": {
+                        "code": "memory_scope_violation",
+                        "message": "memory backend violated the requested session scope"
+                    }
+                })
+                .to_string();
+            }
             let turn = args.get("turn").and_then(Value::as_u64).unwrap_or(0) as u32;
             let seen = Self::seen_snapshot(session_id);
             let mut newly_surfaced = Vec::new();
@@ -1234,10 +1137,9 @@ impl MemoriaClient {
             .and_then(|tail| tail.strip_suffix("/feedback"))
         {
             format!("{cloud_base}/memory/feedback/{memory_id}")
-        } else if let Some(memory_id) = direct_endpoint.strip_prefix("/v1/memories/") {
-            format!("{cloud_base}/memory/expand/{memory_id}")
         } else {
-            return None;
+            let memory_id = direct_endpoint.strip_prefix("/v1/memories/")?;
+            format!("{cloud_base}/memory/expand/{memory_id}")
         };
         Some((endpoint, payload, method))
     }
@@ -1920,7 +1822,7 @@ pub enum WriteDecision {
 /// whether the write should become a new row (`Store`) or an in-place
 /// correction (`Update`) of the top hit.
 ///
-/// Pure. Uses [`MemoriaClient::CONFLICT_SIMILARITY_FLOOR`] as the
+/// Pure. Uses [`MemoriaToolGateway::CONFLICT_SIMILARITY_FLOOR`] as the
 /// threshold; entries missing `retrieval_score` or `memory_id` are
 /// ignored. Highest-score hit wins.
 pub fn classify_write(candidates: &[Value]) -> WriteDecision {
@@ -1929,7 +1831,7 @@ pub fn classify_write(candidates: &[Value]) -> WriteDecision {
         let Some(score) = entry.get("retrieval_score").and_then(Value::as_f64) else {
             continue;
         };
-        if score < MemoriaClient::CONFLICT_SIMILARITY_FLOOR {
+        if score < MemoriaToolGateway::CONFLICT_SIMILARITY_FLOOR {
             continue;
         }
         let Some(id) = entry.get("memory_id").and_then(Value::as_str) else {
@@ -2290,7 +2192,7 @@ mod tests {
     #[test]
     fn store_maps_business_type_before_sending() {
         let args = json!({"content": "test", "memory_type": "feedback"});
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "remember", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "remember", &args);
         assert_eq!(
             pl["memory_type"], "semantic",
             "business type 'feedback' must be mapped to 'semantic' for Memoria V1"
@@ -2303,7 +2205,8 @@ mod tests {
             "content": "Integration tests must hit a real database.\n**Why:** mock drift hid a migration bug.\n**How to apply:** use online suites.",
             "memory_type": "feedback",
         });
-        let (_, payload, _) = MemoriaClient::build_direct_request("http://mem", "remember", &args);
+        let (_, payload, _) =
+            MemoriaToolGateway::build_direct_request("http://mem", "remember", &args);
         let source: Value = serde_json::from_str(
             payload["source"]
                 .as_str()
@@ -2339,7 +2242,7 @@ mod tests {
         });
 
         // retrieve
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
         assert_eq!(pl["query"], "rust patterns");
@@ -2349,7 +2252,7 @@ mod tests {
         );
 
         // search
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
 
@@ -2359,7 +2262,8 @@ mod tests {
             "session_id": "user-42",
             "user_id": "user-42"
         });
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "remember", &store_args);
+        let (_, pl, _) =
+            MemoriaToolGateway::build_direct_request("http://mem", "remember", &store_args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
 
@@ -2372,7 +2276,8 @@ mod tests {
             "session_id": "user-42",
             "user_id": "user-42"
         });
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &purge_args);
+        let (_, pl, _) =
+            MemoriaToolGateway::build_direct_request("http://mem", "forget", &purge_args);
         assert_eq!(pl["topic"], "old", "purge should use topic as the filter");
         assert!(
             pl.get("session_id").is_none() || pl.get("topic").is_some(),
@@ -2387,14 +2292,15 @@ mod tests {
             "session_id": "user-42",
             "user_id": "user-42"
         });
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "update", &correct_args);
+        let (_, pl, _) =
+            MemoriaToolGateway::build_direct_request("http://mem", "update", &correct_args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
 
         // profile
         let profile_args = json!({"session_id": "user-42", "user_id": "user-42"});
         let (_, pl, _) =
-            MemoriaClient::build_direct_request("http://mem", "profile", &profile_args);
+            MemoriaToolGateway::build_direct_request("http://mem", "profile", &profile_args);
         assert_eq!(pl["session_id"], "user-42");
         assert_eq!(pl["user_id"], "user-42");
     }
@@ -2402,7 +2308,7 @@ mod tests {
     #[test]
     fn build_direct_request_omits_identity_when_absent() {
         let args = json!({"query": "test"});
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         assert!(pl.get("session_id").is_none());
         assert!(pl.get("user_id").is_none());
         assert!(
@@ -2414,7 +2320,7 @@ mod tests {
     #[test]
     fn build_direct_request_retrieve_respects_explicit_min_confidence() {
         let args = json!({"query": "q", "min_confidence": 0.7});
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         assert_eq!(pl["min_confidence"], json!(0.7));
     }
 
@@ -2426,9 +2332,12 @@ mod tests {
             "session_id": "sess-1",
             "user_id": "user-1"
         });
-        let (endpoint, payload, method) =
-            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "remember", &args)
-                .expect("cloud remember route");
+        let (endpoint, payload, method) = MemoriaToolGateway::build_cloud_proxy_request(
+            "https://cloud.example",
+            "remember",
+            &args,
+        )
+        .expect("cloud remember route");
         assert_eq!(endpoint, "https://cloud.example/memory/store");
         assert!(matches!(method, HttpMethod::Post));
         assert_eq!(payload["content"], "prefers smoke tests");
@@ -2442,7 +2351,7 @@ mod tests {
             "user_id": "user-1"
         });
         let (endpoint, payload, method) =
-            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "recall", &args)
+            MemoriaToolGateway::build_cloud_proxy_request("https://cloud.example", "recall", &args)
                 .expect("cloud recall route");
         assert_eq!(endpoint, "https://cloud.example/memory/retrieve");
         assert!(matches!(method, HttpMethod::Post));
@@ -2457,7 +2366,7 @@ mod tests {
             "reason": "correction"
         });
         let (endpoint, payload, method) =
-            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "update", &args)
+            MemoriaToolGateway::build_cloud_proxy_request("https://cloud.example", "update", &args)
                 .expect("cloud update route");
         assert_eq!(endpoint, "https://cloud.example/memory/correct/mem-1");
         assert!(matches!(method, HttpMethod::Put));
@@ -2470,9 +2379,12 @@ mod tests {
             "memory_id": "mem-2",
             "signal": "useful"
         });
-        let (endpoint, payload, method) =
-            MemoriaClient::build_cloud_proxy_request("https://cloud.example", "feedback", &args)
-                .expect("cloud feedback route");
+        let (endpoint, payload, method) = MemoriaToolGateway::build_cloud_proxy_request(
+            "https://cloud.example",
+            "feedback",
+            &args,
+        )
+        .expect("cloud feedback route");
         assert_eq!(endpoint, "https://cloud.example/memory/feedback/mem-2");
         assert!(matches!(method, HttpMethod::Post));
         assert_eq!(payload["signal"], "useful");
@@ -2480,7 +2392,7 @@ mod tests {
 
     #[test]
     fn build_request_transport_requires_server_proxy_auth() {
-        let result = MemoriaClient::build_request_transport(
+        let result = MemoriaToolGateway::build_request_transport(
             None,
             None,
             "remember",
@@ -2499,13 +2411,13 @@ mod tests {
 
     #[test]
     fn empty_success_response_recall_returns_empty_array() {
-        let value = MemoriaClient::empty_success_response("recall", &json!({"query": "q"}));
+        let value = MemoriaToolGateway::empty_success_response("recall", &json!({"query": "q"}));
         assert_eq!(value, json!([]));
     }
 
     #[test]
     fn empty_success_response_remember_returns_ack() {
-        let value = MemoriaClient::empty_success_response(
+        let value = MemoriaToolGateway::empty_success_response(
             "remember",
             &json!({"content": "prefers smoke tests"}),
         );
@@ -2519,7 +2431,8 @@ mod tests {
     #[test]
     fn recall_scope_session_requires_session_id() {
         let args = json!({"query": "test", "top_k": 5, "scope": "session"});
-        let (endpoint, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (endpoint, pl, _) =
+            MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         assert!(
             endpoint.is_empty(),
             "scope=session without session_id must short-circuit to an error"
@@ -2541,10 +2454,63 @@ mod tests {
             "session_id": "sess-abc",
             "scope": "session",
         });
-        let (endpoint, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (endpoint, pl, _) =
+            MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
         assert_eq!(pl["session_id"], "sess-abc");
         assert_eq!(pl["session_scope"], "only");
+    }
+
+    #[test]
+    fn strict_recall_response_rejects_foreign_session_before_prompt_decoration() {
+        let args = json!({
+            "scope": "session",
+            "session_id": "session-1",
+            "user_id": "user-1"
+        });
+        let raw = json!([{
+            "memory_id": "foreign",
+            "content": "must never surface",
+            "session_id": "session-2",
+            "user_id": "user-1"
+        }])
+        .to_string();
+        let error = validate_strict_recall_response(&raw, &args)
+            .expect_err("foreign session content must fail closed");
+        assert!(error.starts_with("memory_scope_violation:"));
+        assert!(!error.contains("must never surface"));
+    }
+
+    #[test]
+    fn strict_recall_response_requires_owner_when_runtime_knows_owner() {
+        let args = json!({
+            "scope": "session",
+            "session_id": "session-1",
+            "user_id": "user-1"
+        });
+        let missing_owner = json!([{
+            "memory_id": "unproven",
+            "session_id": "session-1"
+        }])
+        .to_string();
+        assert!(validate_strict_recall_response(&missing_owner, &args).is_err());
+
+        let valid = json!([{
+            "memory_id": "owned",
+            "session_id": "session-1",
+            "user_id": "user-1"
+        }])
+        .to_string();
+        validate_strict_recall_response(&valid, &args).unwrap();
+    }
+
+    #[test]
+    fn edge_strict_recall_still_rejects_foreign_session_without_user_field() {
+        let args = json!({"scope": "session", "session_id": "session-1"});
+        let valid = json!([{"memory_id": "m1", "session_id": "session-1"}]).to_string();
+        validate_strict_recall_response(&valid, &args).unwrap();
+        let foreign = json!([{"memory_id": "m2", "session_id": "session-2"}]).to_string();
+        assert!(validate_strict_recall_response(&foreign, &args).is_err());
     }
 
     #[test]
@@ -2555,14 +2521,14 @@ mod tests {
             "session_id": "sess-abc",
             "scope": "all",
         });
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         assert!(pl.get("session_scope").is_none());
     }
 
     #[test]
     fn recall_omits_session_fields_when_absent() {
         let args = json!({"query": "test", "top_k": 10});
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         assert!(pl.get("session_id").is_none());
         assert!(pl.get("session_scope").is_none());
     }
@@ -2570,7 +2536,8 @@ mod tests {
     #[test]
     fn recall_routes_to_v1_retrieve_endpoint() {
         let args = json!({"query": "test", "top_k": 10});
-        let (endpoint, _, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (endpoint, _, _) =
+            MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
     }
 
@@ -2580,7 +2547,7 @@ mod tests {
     fn remember_defaults_to_private_no_team_tag() {
         let args = json!({"content": "private fact", "memory_type": "feedback"});
         let (endpoint, pl, _) =
-            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+            MemoriaToolGateway::build_direct_request("http://mem", "remember", &args);
         assert_eq!(endpoint, "http://mem/v1/memories");
         // Category tag is present but no team tag.
         let tags: Vec<&str> = pl["tags"]
@@ -2605,7 +2572,7 @@ mod tests {
             "team_id": "core-infra",
         });
         let (endpoint, pl, _) =
-            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+            MemoriaToolGateway::build_direct_request("http://mem", "remember", &args);
         assert_eq!(endpoint, "http://mem/v1/memories");
         let tags: Vec<&str> = pl["tags"]
             .as_array()
@@ -2625,7 +2592,7 @@ mod tests {
             "visibility": "team",
         });
         let (endpoint, pl, _) =
-            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+            MemoriaToolGateway::build_direct_request("http://mem", "remember", &args);
         assert!(endpoint.is_empty(), "must short-circuit without team_id");
         assert!(
             pl["error"].as_str().unwrap_or("").contains("team_id"),
@@ -2641,7 +2608,7 @@ mod tests {
             "visibility": "world",
         });
         let (endpoint, pl, _) =
-            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+            MemoriaToolGateway::build_direct_request("http://mem", "remember", &args);
         assert!(endpoint.is_empty());
         assert!(
             pl["error"]
@@ -2662,7 +2629,7 @@ mod tests {
             "tags": ["custom:tag", "astra:feedback"],  // include one duplicate
         });
         let (_endpoint, pl, _) =
-            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+            MemoriaToolGateway::build_direct_request("http://mem", "remember", &args);
         let tags: Vec<&str> = pl["tags"]
             .as_array()
             .unwrap()
@@ -2687,7 +2654,7 @@ mod tests {
             "visibility": "team",
             "team_id": "core-infra",
         });
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         let include_tags: Vec<&str> = pl["include_tags"]
             .as_array()
             .unwrap()
@@ -2705,7 +2672,7 @@ mod tests {
             "visibility": "team",
             "team_ids": ["t1", "t2"],
         });
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         let include_tags: Vec<&str> = pl["include_tags"]
             .as_array()
             .unwrap()
@@ -2718,7 +2685,7 @@ mod tests {
     #[test]
     fn recall_private_visibility_omits_include_tags() {
         let args = json!({"query": "q", "top_k": 5});
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "recall", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "recall", &args);
         assert!(pl.get("include_tags").is_none());
     }
 
@@ -2731,7 +2698,7 @@ mod tests {
             "reason": "obsolete project",
             "session_id": "sess-42"
         });
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         assert_eq!(pl["topic"], "NEPTUNE");
         assert!(
             pl.get("session_id").is_none(),
@@ -2742,7 +2709,7 @@ mod tests {
     #[test]
     fn purge_with_memory_ids() {
         let args = json!({"memory_ids": ["id1", "id2"], "reason": "user cleanup"});
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         assert!(pl["memory_ids"].is_array());
         assert!(pl.get("topic").is_none());
     }
@@ -2750,7 +2717,7 @@ mod tests {
     #[test]
     fn purge_with_memory_id_string_becomes_array() {
         let args = json!({"memory_id": "id1,id2", "reason": "batch cleanup"});
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         let ids = pl["memory_ids"].as_array().expect("should be array");
         assert_eq!(ids.len(), 2);
     }
@@ -2780,7 +2747,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = MemoriaClient::new(Some(server.uri()), Some("token".to_string()));
+        let client = MemoriaToolGateway::new(Some(server.uri()), Some("token".to_string()));
         let out = client
             .call_with_timeout(
                 "forget",
@@ -2809,7 +2776,7 @@ mod tests {
     #[test]
     fn forget_without_reason_rejected_loudly() {
         let args = json!({"memory_id": "m1"});
-        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        let (ep, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         assert!(ep.is_empty(), "no endpoint → runtime short-circuits");
         let err = pl["error"].as_str().unwrap();
         assert!(err.contains("reason"), "error mentions reason: {err}");
@@ -2819,7 +2786,7 @@ mod tests {
     #[test]
     fn forget_with_empty_reason_rejected() {
         let args = json!({"memory_id": "m1", "reason": "   "});
-        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        let (ep, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         assert!(ep.is_empty(), "whitespace-only reason is empty");
         assert!(pl["error"].as_str().unwrap().contains("reason"));
     }
@@ -2827,7 +2794,7 @@ mod tests {
     #[test]
     fn update_without_reason_rejected_loudly() {
         let args = json!({"memory_id": "m1", "new_content": "fixed"});
-        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "update", &args);
+        let (ep, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "update", &args);
         assert!(ep.is_empty());
         assert!(pl["error"].as_str().unwrap().contains("reason"));
     }
@@ -2835,7 +2802,7 @@ mod tests {
     #[test]
     fn update_with_empty_reason_rejected() {
         let args = json!({"memory_id": "m1", "new_content": "fixed", "reason": ""});
-        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "update", &args);
+        let (ep, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "update", &args);
         assert!(ep.is_empty());
         assert!(pl["error"].as_str().unwrap().contains("reason"));
     }
@@ -2847,7 +2814,7 @@ mod tests {
             "new_content": "fixed",
             "reason": "user said the tool name changed last week"
         });
-        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "update", &args);
+        let (ep, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "update", &args);
         assert!(ep.ends_with("/v1/memories/m1/correct"));
         assert_eq!(
             pl["reason"].as_str(),
@@ -2861,7 +2828,7 @@ mod tests {
             "memory_id": "m1",
             "reason": "memory is stale; user confirmed"
         });
-        let (ep, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        let (ep, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         assert!(ep.ends_with("/v1/memories/purge"));
         assert_eq!(
             pl["reason"].as_str(),
@@ -2879,7 +2846,7 @@ mod memoria_http_client_tests {
         // Memoria PurgeRequest only accepts memory_ids and topic.
         // session_id is NOT a valid filter — it would cause 422.
         let args = json!({"session_id": "sess-42"});
-        let (ep, _, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        let (ep, _, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         assert!(
             ep.is_empty(),
             "purge with only session_id must fail (not supported by Memoria)"
@@ -2889,7 +2856,7 @@ mod memoria_http_client_tests {
     #[test]
     fn purge_empty_filter_returns_error() {
         let args = json!({});
-        let (name, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        let (name, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         assert_eq!(name, "");
         assert!(pl.get("error").is_some());
         assert!(
@@ -2903,7 +2870,7 @@ mod memoria_http_client_tests {
     #[test]
     fn purge_topic_returns_topic_filter() {
         let args = json!({"topic": "NEPTUNE", "reason": "obsolete project"});
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         assert_eq!(pl["topic"], "NEPTUNE");
         assert!(pl.get("session_id").is_none());
         assert!(pl.get("memory_ids").is_none());
@@ -2912,7 +2879,7 @@ mod memoria_http_client_tests {
     #[test]
     fn purge_responses_are_not_empty() {
         let args = json!({"topic": "NEPTUNE", "reason": "project wound down"});
-        let (_, pl, _) = MemoriaClient::build_direct_request("http://mem", "forget", &args);
+        let (_, pl, _) = MemoriaToolGateway::build_direct_request("http://mem", "forget", &args);
         assert!(
             pl.is_object() && !pl.as_object().unwrap().contains_key("error"),
             "purge with valid filter must produce non-error payload, got: {pl}"
@@ -2923,7 +2890,7 @@ mod memoria_http_client_tests {
     fn purge_result_to_agent_response_delivers_message() {
         use super::*;
         let raw = json!({"deleted_count": 3});
-        let enriched = MemoriaClient::purge_result_to_agent_response(&raw, "topic:NEPTUNE");
+        let enriched = MemoriaToolGateway::purge_result_to_agent_response(&raw, "topic:NEPTUNE");
         assert_eq!(enriched["status"], "completed");
         assert_eq!(enriched["deleted_count"], 3);
         assert!(enriched["message"].as_str().unwrap().contains("3"));
@@ -2933,7 +2900,7 @@ mod memoria_http_client_tests {
     fn purge_result_to_agent_response_zero_deleted() {
         use super::*;
         let raw = json!({"deleted_count": 0});
-        let enriched = MemoriaClient::purge_result_to_agent_response(&raw, "session:abc");
+        let enriched = MemoriaToolGateway::purge_result_to_agent_response(&raw, "session:abc");
         assert_eq!(enriched["deleted_count"], 0);
         assert!(enriched["message"].as_str().unwrap().contains("0 deleted"));
     }
@@ -2997,7 +2964,7 @@ mod memoria_http_client_tests {
         .to_string();
         let seen = std::collections::HashSet::new();
         let mut newly = Vec::new();
-        let out = MemoriaClient::decorate_recall_response(&raw, &seen, &mut newly);
+        let out = MemoriaToolGateway::decorate_recall_response(&raw, &seen, &mut newly);
         let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(
@@ -3029,7 +2996,7 @@ mod memoria_http_client_tests {
         let mut seen = std::collections::HashSet::new();
         seen.insert("m-seen".to_string());
         let mut newly = Vec::new();
-        let out = MemoriaClient::decorate_recall_response(&raw, &seen, &mut newly);
+        let out = MemoriaToolGateway::decorate_recall_response(&raw, &seen, &mut newly);
         let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
         assert_eq!(arr.len(), 1, "seen id must be filtered");
         assert_eq!(arr[0]["memory_id"].as_str(), Some("m-new"));
@@ -3055,7 +3022,7 @@ mod memoria_http_client_tests {
         .to_string();
         let seen = std::collections::HashSet::new();
         let mut newly = Vec::new();
-        let out = MemoriaClient::decorate_recall_response_with_view(
+        let out = MemoriaToolGateway::decorate_recall_response_with_view(
             &raw,
             &seen,
             &mut newly,
@@ -3084,7 +3051,7 @@ mod memoria_http_client_tests {
             }
         })
         .to_string();
-        let overview = MemoriaClient::decorate_expand_response(&raw, Some("overview"));
+        let overview = MemoriaToolGateway::decorate_expand_response(&raw, Some("overview"));
         let parsed: Value = serde_json::from_str(&overview).unwrap();
         assert_eq!(
             parsed["content"].as_str(),
@@ -3190,7 +3157,7 @@ mod memoria_http_client_tests {
         let err = r#"{"error": "server down"}"#;
         let seen = std::collections::HashSet::new();
         let mut newly = Vec::new();
-        let out = MemoriaClient::decorate_recall_response(err, &seen, &mut newly);
+        let out = MemoriaToolGateway::decorate_recall_response(err, &seen, &mut newly);
         assert_eq!(out, err);
         assert!(newly.is_empty());
     }
@@ -3201,7 +3168,7 @@ mod memoria_http_client_tests {
         let bad = "not json at all";
         let seen = std::collections::HashSet::new();
         let mut newly = Vec::new();
-        let out = MemoriaClient::decorate_recall_response(bad, &seen, &mut newly);
+        let out = MemoriaToolGateway::decorate_recall_response(bad, &seen, &mut newly);
         assert_eq!(out, bad);
     }
 
@@ -3210,7 +3177,7 @@ mod memoria_http_client_tests {
         use super::*;
         let seen = std::collections::HashSet::new();
         let mut newly = Vec::new();
-        let out = MemoriaClient::decorate_recall_response("[]", &seen, &mut newly);
+        let out = MemoriaToolGateway::decorate_recall_response("[]", &seen, &mut newly);
         let arr: Vec<Value> = serde_json::from_str(&out).unwrap();
         assert!(arr.is_empty());
         assert!(newly.is_empty());
@@ -3288,27 +3255,27 @@ mod memoria_http_client_tests {
         use super::*;
         // Use unique session names so tests running concurrently don't
         // poison each other via the process-global store.
-        MemoriaClient::record_seen("p6-seen-isolation-a", ["m1".into()]);
-        assert!(MemoriaClient::seen_snapshot("p6-seen-isolation-a").contains("m1"));
-        assert!(MemoriaClient::seen_snapshot("p6-seen-isolation-b").is_empty());
-        MemoriaClient::reset_seen("p6-seen-isolation-a");
+        MemoriaToolGateway::record_seen("p6-seen-isolation-a", ["m1".into()]);
+        assert!(MemoriaToolGateway::seen_snapshot("p6-seen-isolation-a").contains("m1"));
+        assert!(MemoriaToolGateway::seen_snapshot("p6-seen-isolation-b").is_empty());
+        MemoriaToolGateway::reset_seen("p6-seen-isolation-a");
     }
 
     #[test]
     fn reset_seen_clears_session_state() {
         use super::*;
-        MemoriaClient::record_seen("p6-reset-sess", ["m1".into(), "m2".into()]);
-        MemoriaClient::reset_seen("p6-reset-sess");
-        assert!(MemoriaClient::seen_snapshot("p6-reset-sess").is_empty());
+        MemoriaToolGateway::record_seen("p6-reset-sess", ["m1".into(), "m2".into()]);
+        MemoriaToolGateway::reset_seen("p6-reset-sess");
+        assert!(MemoriaToolGateway::seen_snapshot("p6-reset-sess").is_empty());
     }
 
     #[test]
     fn focus_hints_survive_new_client_instances() {
         use super::*;
         let session_id = "p6-focus-global";
-        MemoriaClient::reset_focus(session_id);
-        let c1 = MemoriaClient::new(None, None);
-        let c2 = MemoriaClient::new(None, None);
+        MemoriaToolGateway::reset_focus(session_id);
+        let c1 = MemoriaToolGateway::new(None, None);
+        let c2 = MemoriaToolGateway::new(None, None);
         let response = c1.focus_set(
             session_id,
             &json!({
@@ -3323,7 +3290,7 @@ mod memoria_http_client_tests {
         c2.apply_focus_hints(session_id, &mut payload);
         assert_eq!(payload["boost_topics"][0]["value"], "memory-runtime");
         assert_eq!(payload["boost_topics"][0]["boost"], 2.0);
-        MemoriaClient::reset_focus(session_id);
+        MemoriaToolGateway::reset_focus(session_id);
     }
 
     #[test]
@@ -3334,7 +3301,7 @@ mod memoria_http_client_tests {
             "memory_type": "semantic",
         });
         let (endpoint, payload, _) =
-            MemoriaClient::build_direct_request("http://mem", "remember", &args);
+            MemoriaToolGateway::build_direct_request("http://mem", "remember", &args);
         assert!(
             endpoint.is_empty(),
             "secret-bearing memory must not be sent"
@@ -3350,7 +3317,8 @@ mod memoria_http_client_tests {
     #[tokio::test]
     async fn cloud_path_validates_destructive_args_before_network() {
         use super::*;
-        let client = MemoriaClient::new(Some("http://127.0.0.1:9".into()), Some("token".into()));
+        let client =
+            MemoriaToolGateway::new(Some("http://127.0.0.1:9".into()), Some("token".into()));
         let out = client
             .call_with_timeout(
                 "forget",
@@ -3366,35 +3334,35 @@ mod memoria_http_client_tests {
     #[test]
     fn record_recall_pushes_ids_onto_session_queue() {
         use super::*;
-        MemoriaClient::reset_recall_ledger("r5-single");
-        MemoriaClient::record_recall("r5-single", 3, vec!["m1".into(), "m2".into()]);
-        assert_eq!(MemoriaClient::pending_recall_count("r5-single"), 1);
-        let drained = MemoriaClient::drain_recalls("r5-single", None);
+        MemoriaToolGateway::reset_recall_ledger("r5-single");
+        MemoriaToolGateway::record_recall("r5-single", 3, vec!["m1".into(), "m2".into()]);
+        assert_eq!(MemoriaToolGateway::pending_recall_count("r5-single"), 1);
+        let drained = MemoriaToolGateway::drain_recalls("r5-single", None);
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].memory_ids, vec!["m1", "m2"]);
         assert_eq!(drained[0].turn, 3);
-        assert_eq!(MemoriaClient::pending_recall_count("r5-single"), 0);
+        assert_eq!(MemoriaToolGateway::pending_recall_count("r5-single"), 0);
     }
 
     #[test]
     fn record_recall_caps_queue_depth() {
         use super::*;
-        MemoriaClient::reset_recall_ledger("r5-cap");
+        MemoriaToolGateway::reset_recall_ledger("r5-cap");
         for i in 0..20 {
-            MemoriaClient::record_recall("r5-cap", i, vec![format!("m{i}")]);
+            MemoriaToolGateway::record_recall("r5-cap", i, vec![format!("m{i}")]);
         }
-        assert!(MemoriaClient::pending_recall_count("r5-cap") <= 16);
-        MemoriaClient::reset_recall_ledger("r5-cap");
+        assert!(MemoriaToolGateway::pending_recall_count("r5-cap") <= 16);
+        MemoriaToolGateway::reset_recall_ledger("r5-cap");
     }
 
     #[test]
     fn drain_recalls_respects_max_age() {
         use super::*;
-        MemoriaClient::reset_recall_ledger("r5-age");
-        MemoriaClient::record_recall("r5-age", 1, vec!["stale".into()]);
+        MemoriaToolGateway::reset_recall_ledger("r5-age");
+        MemoriaToolGateway::record_recall("r5-age", 1, vec!["stale".into()]);
         std::thread::sleep(Duration::from_millis(15));
-        MemoriaClient::record_recall("r5-age", 2, vec!["fresh".into()]);
-        let drained = MemoriaClient::drain_recalls("r5-age", Some(Duration::from_millis(5)));
+        MemoriaToolGateway::record_recall("r5-age", 2, vec!["fresh".into()]);
+        let drained = MemoriaToolGateway::drain_recalls("r5-age", Some(Duration::from_millis(5)));
         // Stale entry filtered out; fresh one survives.
         let ids: Vec<&str> = drained
             .iter()
@@ -3406,26 +3374,26 @@ mod memoria_http_client_tests {
     #[test]
     fn record_recall_empty_ids_is_noop() {
         use super::*;
-        MemoriaClient::reset_recall_ledger("r5-empty");
-        MemoriaClient::record_recall("r5-empty", 1, vec![]);
-        assert_eq!(MemoriaClient::pending_recall_count("r5-empty"), 0);
+        MemoriaToolGateway::reset_recall_ledger("r5-empty");
+        MemoriaToolGateway::record_recall("r5-empty", 1, vec![]);
+        assert_eq!(MemoriaToolGateway::pending_recall_count("r5-empty"), 0);
     }
 
     #[test]
     fn record_recall_empty_session_is_noop() {
         use super::*;
-        MemoriaClient::record_recall("", 1, vec!["m1".into()]);
-        assert!(MemoriaClient::drain_recalls("", None).is_empty());
+        MemoriaToolGateway::record_recall("", 1, vec!["m1".into()]);
+        assert!(MemoriaToolGateway::drain_recalls("", None).is_empty());
     }
 
     #[test]
     fn drain_recalls_fifo_order_preserved() {
         use super::*;
-        MemoriaClient::reset_recall_ledger("r5-fifo");
-        MemoriaClient::record_recall("r5-fifo", 1, vec!["first".into()]);
-        MemoriaClient::record_recall("r5-fifo", 2, vec!["second".into()]);
-        MemoriaClient::record_recall("r5-fifo", 3, vec!["third".into()]);
-        let drained = MemoriaClient::drain_recalls("r5-fifo", None);
+        MemoriaToolGateway::reset_recall_ledger("r5-fifo");
+        MemoriaToolGateway::record_recall("r5-fifo", 1, vec!["first".into()]);
+        MemoriaToolGateway::record_recall("r5-fifo", 2, vec!["second".into()]);
+        MemoriaToolGateway::record_recall("r5-fifo", 3, vec!["third".into()]);
+        let drained = MemoriaToolGateway::drain_recalls("r5-fifo", None);
         let turns: Vec<u32> = drained.iter().map(|s| s.turn).collect();
         assert_eq!(turns, vec![1, 2, 3]);
     }
@@ -3433,17 +3401,17 @@ mod memoria_http_client_tests {
     #[test]
     fn reset_recall_ledger_empties_session_state() {
         use super::*;
-        MemoriaClient::record_recall("r5-reset", 1, vec!["m1".into()]);
-        MemoriaClient::reset_recall_ledger("r5-reset");
-        assert_eq!(MemoriaClient::pending_recall_count("r5-reset"), 0);
+        MemoriaToolGateway::record_recall("r5-reset", 1, vec!["m1".into()]);
+        MemoriaToolGateway::reset_recall_ledger("r5-reset");
+        assert_eq!(MemoriaToolGateway::pending_recall_count("r5-reset"), 0);
     }
 
     #[test]
     fn reset_session_process_state_clears_all_memory_globals() {
         use super::*;
         let session_id = "r5-reset-all";
-        let client = MemoriaClient::new(None, None);
-        MemoriaClient::record_seen(session_id, ["seen-1".into()]);
+        let client = MemoriaToolGateway::new(None, None);
+        MemoriaToolGateway::record_seen(session_id, ["seen-1".into()]);
         client.focus_set(
             session_id,
             &json!({
@@ -3451,18 +3419,18 @@ mod memoria_http_client_tests {
                 "focus_value": "cleanup",
             }),
         );
-        MemoriaClient::record_recall(session_id, 4, vec!["recall-1".into()]);
+        MemoriaToolGateway::record_recall(session_id, 4, vec!["recall-1".into()]);
 
-        assert!(!MemoriaClient::seen_snapshot(session_id).is_empty());
-        assert_eq!(MemoriaClient::pending_recall_count(session_id), 1);
+        assert!(!MemoriaToolGateway::seen_snapshot(session_id).is_empty());
+        assert_eq!(MemoriaToolGateway::pending_recall_count(session_id), 1);
         let mut recall_payload = json!({"query": "cleanup"});
         client.apply_focus_hints(session_id, &mut recall_payload);
         assert!(recall_payload.get("boost_topics").is_some());
 
-        MemoriaClient::reset_session_process_state(session_id);
+        MemoriaToolGateway::reset_session_process_state(session_id);
 
-        assert!(MemoriaClient::seen_snapshot(session_id).is_empty());
-        assert_eq!(MemoriaClient::pending_recall_count(session_id), 0);
+        assert!(MemoriaToolGateway::seen_snapshot(session_id).is_empty());
+        assert_eq!(MemoriaToolGateway::pending_recall_count(session_id), 0);
         let mut after_reset_payload = json!({"query": "cleanup"});
         client.apply_focus_hints(session_id, &mut after_reset_payload);
         assert!(after_reset_payload.get("boost_topics").is_none());
@@ -3472,16 +3440,17 @@ mod memoria_http_client_tests {
     async fn feedback_pending_recalls_drains_queue_once() {
         use super::*;
         let session_id = "r5-feedback-drain";
-        MemoriaClient::reset_recall_ledger(session_id);
-        MemoriaClient::record_recall(session_id, 7, vec!["m1".into(), "m2".into()]);
-        let client = MemoriaClient::new(Some("http://127.0.0.1:9".into()), Some("token".into()));
+        MemoriaToolGateway::reset_recall_ledger(session_id);
+        MemoriaToolGateway::record_recall(session_id, 7, vec!["m1".into(), "m2".into()]);
+        let client =
+            MemoriaToolGateway::new(Some("http://127.0.0.1:9".into()), Some("token".into()));
         let attempted = client
             .feedback_pending_recalls(session_id, "useful", "unit-test")
             .await;
         assert_eq!(attempted.attempted, 2);
         assert_eq!(attempted.failed, 2);
         assert_eq!(attempted.succeeded, 0);
-        assert_eq!(MemoriaClient::pending_recall_count(session_id), 0);
+        assert_eq!(MemoriaToolGateway::pending_recall_count(session_id), 0);
         let attempted_again = client
             .feedback_pending_recalls(session_id, "useful", "unit-test")
             .await;

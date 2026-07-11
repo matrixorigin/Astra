@@ -80,6 +80,7 @@ pub(crate) enum AgentRowStatus {
     Live,
     Cancelling,
     Completed,
+    Interrupted,
     Failed,
     Cancelled,
 }
@@ -87,7 +88,9 @@ pub(crate) enum AgentRowStatus {
 impl AgentRowStatus {
     fn color(self) -> Color {
         match self {
-            AgentRowStatus::Live | AgentRowStatus::Cancelling => Color::Yellow,
+            AgentRowStatus::Live | AgentRowStatus::Cancelling | AgentRowStatus::Interrupted => {
+                Color::Yellow
+            }
             AgentRowStatus::Completed => Color::Green,
             AgentRowStatus::Failed => Color::Red,
             AgentRowStatus::Cancelled => Color::DarkGray,
@@ -107,6 +110,7 @@ impl AgentRowStatus {
             AgentRowStatus::Live => None,
             AgentRowStatus::Cancelling => Some("stopping"),
             AgentRowStatus::Completed => Some("done"),
+            AgentRowStatus::Interrupted => Some("interrupted"),
             AgentRowStatus::Failed => Some("failed"),
             AgentRowStatus::Cancelled => Some("stopped"),
         }
@@ -406,7 +410,7 @@ fn fanout_header(
             AgentRowStatus::Live | AgentRowStatus::Cancelling => header.running += 1,
             AgentRowStatus::Completed => header.done += 1,
             AgentRowStatus::Failed => header.failed += 1,
-            AgentRowStatus::Cancelled => header.stopped += 1,
+            AgentRowStatus::Interrupted | AgentRowStatus::Cancelled => header.stopped += 1,
         }
     }
 

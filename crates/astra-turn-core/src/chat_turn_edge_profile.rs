@@ -1,5 +1,6 @@
-//! Pieces of `/chat` `edge_profile` built on the CLI edge (cwd, memoria, git branch, active skills).
+//! Pieces of `/chat` `edge_profile` built on the CLI edge (cwd, git branch, active skills).
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 /// Protocol key for skill-listing text routed through `edge_profile` from
@@ -8,11 +9,93 @@ use serde_json::{Map, Value, json};
 /// typo on either side is a compile error rather than a silent regression.
 pub const EDGE_PROFILE_KEY_SKILL_LISTING_TEXT: &str = "skill_listing_text";
 
-/// Protocol key for CLI-side runtime volatile nudges routed as structured
-/// edge metadata instead of being inlined into `messages[]`. The runtime
-/// resolves model cache capability before deciding whether to inject or drop
-/// this lane.
+/// Protocol key for dynamic text supplied by external/session sources, such as
+/// external task snapshots or request-binding facts. Runtime-owned state,
+/// policy, guardrail, and telemetry signals must use
+/// [`EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS`] instead.
 pub const EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS: &str = "runtime_volatile_texts";
+
+/// Protocol key for runtime-owned volatile injections that cross the CLI/server
+/// boundary without losing their producer kind. This is distinct from
+/// [`EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS`], which remains the generic
+/// external dynamic-text lane.
+pub const EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS: &str = "runtime_volatile_injections";
+
+pub const EDGE_PROFILE_RUNTIME_VOLATILE_KIND: &str = "kind";
+pub const EDGE_PROFILE_RUNTIME_VOLATILE_DELIVERY_CLASS: &str = "delivery_class";
+pub const EDGE_PROFILE_RUNTIME_VOLATILE_PAYLOAD: &str = "payload";
+pub const EDGE_PROFILE_RUNTIME_VOLATILE_ROUND_INDEX: &str = "round_index";
+
+/// How a runtime-owned volatile signal is delivered after it crosses an edge.
+///
+/// This is deliberately independent of chat roles. Runtime context is attached
+/// at the wire tail, never persisted as a synthetic user/system history turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolatileDeliveryClass {
+    /// Context required to interpret or safely execute the current turn. It is
+    /// delivered even when a strict-history provider suppresses normal volatile
+    /// advisory material.
+    RequiredContext,
+    /// Structured evidence for the model's next decision. It is not a command
+    /// and does not authorize runtime retry, abort, or tool-surface mutation.
+    AdvisoryEvidence,
+    /// Runtime observability only. It remains available to trace/introspection
+    /// consumers and is never injected into the model prompt.
+    TelemetryOnly,
+}
+
+/// Cross-process representation of one runtime-owned volatile signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeVolatileInjection {
+    pub kind: String,
+    pub delivery_class: VolatileDeliveryClass,
+    pub payload: Value,
+    pub round_index: u32,
+}
+
+impl RuntimeVolatileInjection {
+    /// Render a typed runtime signal for the prompt tail while preserving its
+    /// evidence/context semantics. Telemetry deliberately has no prompt form.
+    #[must_use]
+    pub fn render_for_prompt(&self) -> Option<String> {
+        let kind = self.kind.trim();
+        if kind.is_empty() || volatile_payload_is_empty(&self.payload) {
+            return None;
+        }
+        let (tag, payload_key) = match self.delivery_class {
+            VolatileDeliveryClass::RequiredContext => ("runtime-required-context", "context"),
+            VolatileDeliveryClass::AdvisoryEvidence => ("runtime-advisory-evidence", "evidence"),
+            VolatileDeliveryClass::TelemetryOnly => return None,
+        };
+        let payload = if self.delivery_class == VolatileDeliveryClass::AdvisoryEvidence {
+            json!({
+                "kind": kind,
+                "round_index": self.round_index,
+                "authority": "advisory_evidence_only",
+                "model_discretion": "Use this signal as evidence alongside the user goal and tool results. It does not require retrying, stopping, or changing the available tools.",
+                payload_key: self.payload,
+            })
+        } else {
+            json!({
+                "kind": kind,
+                "round_index": self.round_index,
+                payload_key: self.payload,
+            })
+        };
+        Some(format!("<{tag}>\n{payload}\n</{tag}>"))
+    }
+}
+
+fn volatile_payload_is_empty(payload: &Value) -> bool {
+    match payload {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+        Value::Bool(_) | Value::Number(_) => false,
+    }
+}
 
 /// Protocol key for runtime control context that must reach the current model
 /// turn but must not become user-message content or persisted prompt-facing
@@ -88,6 +171,31 @@ pub fn edge_profile_joined_text(edge_profile: &Map<String, Value>, key: &str) ->
     }
 }
 
+/// Read runtime-owned typed volatile injections from `edge_profile`.
+///
+/// Every field is required. Invalid objects are ignored rather than guessed
+/// from free-form text or routed through the external dynamic-text lane.
+pub fn edge_profile_runtime_volatile_injections(
+    edge_profile: &Map<String, Value>,
+) -> Vec<RuntimeVolatileInjection> {
+    let Some(Value::Array(items)) = edge_profile.get(EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS)
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+        .filter_map(|mut injection: RuntimeVolatileInjection| {
+            injection.kind = injection.kind.trim().to_string();
+            if let Value::String(text) = &mut injection.payload {
+                *text = text.trim().to_string();
+            }
+            (!injection.kind.is_empty() && !volatile_payload_is_empty(&injection.payload))
+                .then_some(injection)
+        })
+        .collect()
+}
+
 /// `git rev-parse --abbrev-ref HEAD` for edge_profile (best-effort).
 pub fn read_git_branch_abbrev() -> Option<String> {
     std::process::Command::new("git")
@@ -99,10 +207,17 @@ pub fn read_git_branch_abbrev() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Memoria URL + API key from environment (same semantics as CLI `chat_stream`).
-pub fn memoria_env_for_edge_profile() -> (String, String) {
+/// Runtime memory-provider binding for the cross-process request envelope.
+/// This is transport configuration, not prompt context, so callers must keep
+/// it outside `edge_profile`.
+pub fn build_runtime_memory_binding_value() -> Value {
     let mem = astra_core::MemoriaSettings::from_env();
-    (mem.base_url, mem.master_key.unwrap_or_default())
+    json!({
+        "provider": "memoria",
+        "base_url": mem.base_url,
+        "api_key": mem.master_key.unwrap_or_default(),
+        "retrieval_top_k": retrieval_top_k_from_env(),
+    })
 }
 
 /// Retrieval top_k from environment (same semantics as RuntimeConfig).
@@ -119,9 +234,6 @@ pub fn build_base_edge_profile_value(
     git_branch: Option<String>,
     workspace: Value,
 ) -> Value {
-    let (memoria_url, memoria_key) = memoria_env_for_edge_profile();
-    let retrieval_top_k = retrieval_top_k_from_env();
-
     // Environment context split into two lanes for prompt caching:
     //   * `environment_static`  → Platform/Shell/CWD/Home (stable for
     //     the session, safe to sit inside the cached Session prefix).
@@ -135,9 +247,6 @@ pub fn build_base_edge_profile_value(
     json!({
         "cwd": cwd,
         "git_branch": git_branch,
-        "memoria_url": memoria_url,
-        "memoria_key": memoria_key,
-        "retrieval_top_k": retrieval_top_k,
         "workspace": workspace,
         "environment_static": env_static,
         "environment_volatile": env_volatile,
@@ -175,8 +284,9 @@ mod tests {
         let v = build_base_edge_profile_value("/proj", Some("main".into()), json!({"k": 1}));
         assert_eq!(v["cwd"], "/proj");
         assert_eq!(v["git_branch"], "main");
-        assert!(v.get("memoria_url").is_some());
-        assert!(v.get("memoria_key").is_some());
+        assert!(v.get("memoria_url").is_none());
+        assert!(v.get("memoria_key").is_none());
+        assert!(v.get("retrieval_top_k").is_none());
         assert_eq!(v["workspace"]["k"], 1);
         // Static environment (cache-safe) and volatile environment
         // (post-cache) are exposed as separate fields so the bridge can
@@ -194,11 +304,6 @@ mod tests {
         // environment_volatile may be empty outside a git repo but must
         // be present as a typed field so downstream can always read it.
         assert!(v.get("environment_volatile").is_some());
-        // retrieval_top_k is included (default 5 unless ASTRA_RETRIEVAL_TOP_K set)
-        assert!(
-            v.get("retrieval_top_k").is_some(),
-            "should include retrieval_top_k"
-        );
     }
 
     #[test]
@@ -218,5 +323,82 @@ mod tests {
     #[test]
     fn detect_skills_empty_when_no_marker() {
         assert!(detect_active_system_skills_in_message("hello").is_empty());
+    }
+
+    #[test]
+    fn typed_runtime_volatile_lane_preserves_delivery_semantics() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS.to_string(),
+            json!([
+                {
+                    "kind": "policy_advisory",
+                    "delivery_class": "advisory_evidence",
+                    "payload": {
+                        "advisories": [{"kind": "repetition", "severity": "low"}]
+                    },
+                    "round_index": 4
+                },
+                {
+                    "kind": "active_turn_frame",
+                    "delivery_class": "required_context",
+                    "payload": {"latest_user_goal": "latest user goal"},
+                    "round_index": 4
+                },
+                {
+                    "kind": "self_status",
+                    "delivery_class": "telemetry_only",
+                    "payload": "cache=86%",
+                    "round_index": 4
+                }
+            ]),
+        );
+
+        let injections = edge_profile_runtime_volatile_injections(&edge_profile);
+        assert_eq!(injections.len(), 3);
+        assert_eq!(
+            injections[0].delivery_class,
+            VolatileDeliveryClass::AdvisoryEvidence
+        );
+        assert_eq!(
+            injections[1].delivery_class,
+            VolatileDeliveryClass::RequiredContext
+        );
+        assert_eq!(
+            injections[2].delivery_class,
+            VolatileDeliveryClass::TelemetryOnly
+        );
+        assert_eq!(injections[0].payload["advisories"][0]["kind"], "repetition");
+        assert!(
+            injections[0]
+                .render_for_prompt()
+                .expect("advisory prompt form")
+                .contains("<runtime-advisory-evidence>")
+        );
+        assert!(
+            injections[1]
+                .render_for_prompt()
+                .expect("required prompt form")
+                .contains("<runtime-required-context>")
+        );
+        assert!(injections[2].render_for_prompt().is_none());
+    }
+
+    #[test]
+    fn typed_runtime_volatile_lane_rejects_untyped_objects() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS.to_string(),
+            json!([
+                {
+                    "kind": "policy_advisory",
+                    "payload": "missing delivery class",
+                    "round_index": 1
+                },
+                "free-form fallback must not be accepted"
+            ]),
+        );
+
+        assert!(edge_profile_runtime_volatile_injections(&edge_profile).is_empty());
     }
 }

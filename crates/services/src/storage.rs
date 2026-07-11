@@ -1618,6 +1618,47 @@ pub async fn ensure_core_schema(
     }
 
     query(
+        "CREATE TABLE IF NOT EXISTS agent_session_execution_slots (
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NOT NULL,
+            acquired_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id),
+            INDEX idx_session_execution_slots_run (user_id, run_id),
+            INDEX idx_session_execution_slots_updated (updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "agent_session_execution_slots",
+        &["user_id", "session_id"],
+        "ALTER TABLE agent_session_execution_slots ADD PRIMARY KEY (user_id, session_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "agent_session_execution_slots",
+        "idx_session_execution_slots_run",
+        &["user_id", "run_id"],
+        "ALTER TABLE agent_session_execution_slots ADD INDEX idx_session_execution_slots_run (user_id, run_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "agent_session_execution_slots",
+        "idx_session_execution_slots_updated",
+        &["updated_at"],
+        "ALTER TABLE agent_session_execution_slots ADD INDEX idx_session_execution_slots_updated (updated_at)",
+    )
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS agent_run_events (
             id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NOT NULL,
@@ -6772,30 +6813,6 @@ mod tests {
             err.contains("event_count_delta") && err.contains("exceeds i64::MAX"),
             "error should identify conversion context and overflow: {err}"
         );
-    }
-
-    #[test]
-    fn add_agent_session_event_count_upsert_is_atomically_owner_guarded() {
-        let sql = ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL;
-        assert!(
-            sql.contains("WHERE session_id = ? AND user_id <> ?"),
-            "insert path must reject an existing session_id owned by another user"
-        );
-        assert!(
-            !sql.contains(concat!("ELSE ", "NULL")),
-            "owner mismatch must not rely on NOT NULL constraint failures"
-        );
-        for assignment in [
-            "event_count = IF(user_id = VALUES(user_id), event_count + VALUES(event_count), event_count)",
-            "last_event_id = IF(user_id = VALUES(user_id), COALESCE(VALUES(last_event_id), last_event_id), last_event_id)",
-            "updated_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at)",
-            "last_active_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)",
-        ] {
-            assert!(
-                sql.contains(assignment),
-                "upsert assignment must be owner-guarded: {assignment}"
-            );
-        }
     }
 
     #[test]

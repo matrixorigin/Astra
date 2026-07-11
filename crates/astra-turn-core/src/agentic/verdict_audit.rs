@@ -14,7 +14,8 @@ pub struct AgenticVerdictAuditEvent {
     pub avoid_tools: Vec<String>,
     /// Exact tools currently under health avoidance from health tracking.
     pub health_avoidance_tools: Vec<String>,
-    pub force_stop: bool,
+    /// A strong behavioral-evidence threshold was reached. Advisory only.
+    pub advisory_threshold_reached: bool,
     pub nudge_count: usize,
     pub interaction_mode: String,
     pub suppressed_loop_nudges: bool,

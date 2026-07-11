@@ -44,8 +44,8 @@ use crate::server::tool_transport::{
 };
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
-    AgenticLoopHost, AgenticLoopState, FactualRetryFallbackJudgeContext, HostTurnResult,
-    SkillAutoRouteDecision, SkillAutoRouteJudgeContext, TurnInteractionMode, TurnInteractionPolicy,
+    AgenticLoopHost, AgenticLoopState, HostTurnResult, SkillAutoRouteDecision,
+    SkillAutoRouteJudgeContext, TurnInteractionMode, TurnInteractionPolicy,
     interaction_scoped_tool_restrictions,
 };
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
@@ -65,10 +65,6 @@ use astra_services::runs::{RequestedTurnInteractionMode, TurnIntentExecutionPoli
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, SharedAgentLiveEventSink,
-};
-use astra_turn_core::agentic_turn_ingest::{
-    FactualRetryFallbackDecision, FactualRetryFallbackJudgeInput,
-    factual_retry_fallback_judge_messages, parse_factual_retry_fallback_judge_response,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
@@ -1162,6 +1158,12 @@ pub struct ServerAgenticLoopHost {
     /// Bounded task-board digest loaded before the turn starts. This is a
     /// scan hint, not an instruction to create or update tasks every turn.
     task_board_resume_hint: Option<String>,
+    /// Runtime-owned memory provider used consistently for prompt recall,
+    /// current-session snapshots, compaction, and server-only/subrun paths.
+    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
+    /// Typed recall latched for one user turn so every tool round observes the
+    /// same evidence and the dynamic prompt bytes do not churn mid-turn.
+    prompt_memory_recall_cache: Option<PromptMemoryRecallCache>,
 
     // ── Tool execution ──
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
@@ -1272,6 +1274,13 @@ pub struct ServerAgenticLoopHost {
 }
 
 #[derive(Clone)]
+struct PromptMemoryRecallCache {
+    session_turn: u32,
+    user_content: String,
+    entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
+}
+
+#[derive(Clone)]
 struct AgentLiveMirror {
     agent_id: String,
     sink: SharedAgentLiveEventSink,
@@ -1302,6 +1311,7 @@ pub struct ServerAgenticLoopHostBuilder {
     plan_resume_hint: Option<String>,
     plan_authoring_active: bool,
     task_board_resume_hint: Option<String>,
+    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
     server_service_tool_catalog_enabled: bool,
     control_plane_tool_catalog_enabled: bool,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -1334,6 +1344,7 @@ impl ServerAgenticLoopHostBuilder {
         user_id: String,
         session_id: String,
     ) -> Self {
+        let memoria_owner_user_id = user_id.clone();
         Self {
             matrixone,
             encryptor,
@@ -1358,6 +1369,12 @@ impl ServerAgenticLoopHostBuilder {
             plan_resume_hint: None,
             plan_authoring_active: false,
             task_board_resume_hint: None,
+            memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env().map(
+                |client| {
+                    let client = client.with_owner_user_id(memoria_owner_user_id.clone());
+                    Arc::new(client) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
+                },
+            ),
             server_service_tool_catalog_enabled: true,
             control_plane_tool_catalog_enabled: true,
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -1764,6 +1781,8 @@ impl ServerAgenticLoopHostBuilder {
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
             plan_authoring_active: Arc::new(std::sync::RwLock::new(self.plan_authoring_active)),
             task_board_resume_hint: self.task_board_resume_hint,
+            memoria_client: self.memoria_client,
+            prompt_memory_recall_cache: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -1794,6 +1813,14 @@ impl ServerAgenticLoopHostBuilder {
         capabilities: astra_turn_core::capability::CapabilitySet,
     ) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_memoria_client(
+        mut self,
+        memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
+    ) -> Self {
+        self.memoria_client = memoria_client;
         self
     }
 
@@ -1864,18 +1891,15 @@ fn append_server_owned_tool_schemas_unique(
         };
         match spec.required.executor {
             astra_runtime_env::RequiredExecutor::RuntimeExecutor => continue,
-            astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor => {
-                if runtime_declared_tool_names.contains(name) {
-                    continue;
-                }
-                if seen.insert(name.to_string()) {
-                    surface.push(schema);
-                }
+            astra_runtime_env::RequiredExecutor::ServiceOrRuntimeExecutor
+                if runtime_declared_tool_names.contains(name) =>
+            {
                 continue;
             }
             _ => {}
         }
-        let admission = resolve_tool_admission_for_binding_with_context(
+        let admission =
+            crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
             name,
             &candidates,
             workspace,
@@ -1884,14 +1908,24 @@ fn append_server_owned_tool_schemas_unique(
             &registry,
             admission_context.clone(),
         );
-        if !matches!(
-            admission.selected_route(),
-            ToolExecutionRouteKind::ServerRuntime | ToolExecutionRouteKind::ServerControlPlane
-        ) {
+        if !admission.visible {
+            tracing::debug!(
+                tool_name = %name,
+                selected_route = ?admission.selected_route(),
+                hidden_reason = ?admission.hidden_reason,
+                "server-owned tool omitted from prompt surface by provider visibility decision"
+            );
             continue;
         }
-        if seen.insert(name.to_string()) {
-            surface.push(schema);
+        match admission.selected_route() {
+            ToolExecutionRouteKind::ServerRuntime
+            | ToolExecutionRouteKind::ServerControlPlane
+            | ToolExecutionRouteKind::ServerLocal
+                if seen.insert(name.to_string()) =>
+            {
+                surface.push(schema);
+            }
+            _ => {}
         }
     }
 }
@@ -2660,8 +2694,8 @@ impl ServerAgenticLoopHost {
         // payloads reflect what a real provider would see. Start from the
         // pipeline-pruned tool schemas so mock replay mirrors the real
         // wire. Route the history through the same `assemble_llm_messages`
-        // stitcher the real path uses so matrix tests see the output of
-        // volatile-preamble folding and `consolidate_mid_history_volatile_injections`.
+        // stitcher the real path uses so matrix tests see typed volatile-tail
+        // placement rather than a mock-only message shape.
         let mut annotated_tools = mock_pipeline.tool_schemas;
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut annotated_tools,
@@ -3746,7 +3780,7 @@ impl ServerAgenticLoopHost {
         tool_name: &str,
         registry: &astra_runtime_env::ToolRegistry,
     ) -> crate::server::tool_admission::ToolAdmissionDecision {
-        resolve_tool_admission_for_binding_with_context(
+        crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
             tool_name,
             &self.tool_schemas,
             &self.workspace_binding,
@@ -4109,23 +4143,14 @@ impl ServerAgenticLoopHost {
         if consume_widen {
             let _ = std::mem::take(&mut state.widen_selection_pending);
         }
-        // 2-5. layered restrictions from the merged base.
+        // 2-3. Layer hard restrictions from the merged base. Advisory
+        // boosting and dynamic activation must never override a capability or
+        // permission boundary already present in this set.
         let mut effective = state.restricted_tools.clone();
         effective.extend(self.runtime_allowlist_restrictions(state));
         effective.extend(interaction_scoped_tool_restrictions(
             self.turn_interaction_mode(),
         ));
-        // Boosted tools are never hidden, even if they landed in the restricted
-        // set earlier (e.g., via stall-based deprioritization).
-        for boosted in &state.boosted_tools {
-            effective.remove(boosted);
-        }
-        if let Some(executor) = state.runtime_tool_executor.as_deref() {
-            for name in executor.activated_deferred_tool_names() {
-                // Rescue activated deferred tools so they're visible this turn.
-                effective.remove(&name);
-            }
-        }
         effective
     }
 
@@ -4152,6 +4177,58 @@ impl ServerAgenticLoopHost {
     /// tracing, the breakdown, the selected compaction tier, and the tier-pruned
     /// tool schemas. Callers that only want the system text can discard the
     /// extra fields.
+    async fn prompt_memory_entries_for_turn(
+        &mut self,
+        session_turn: u32,
+        user_content: &str,
+    ) -> Vec<astra_turn_core::context_sources::MemoryEntry> {
+        if let Some(cached) = self.prompt_memory_recall_cache.as_ref().filter(|cached| {
+            cached.session_turn == session_turn && cached.user_content == user_content
+        }) {
+            return cached.entries.clone();
+        }
+
+        let entries = if let Some(client) = self.memoria_client.as_deref() {
+            let top_k = std::env::var("ASTRA_RETRIEVAL_TOP_K")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(5);
+            let (prefetched, session_start) = tokio::join!(
+                crate::turn::memory_prefetch::prefetch_memories_with_client(
+                    client,
+                    user_content,
+                    &self.user_id,
+                    &self.session_id,
+                    top_k,
+                ),
+                async {
+                    if session_turn <= 1 {
+                        crate::turn::memory_prefetch::prefetch_session_start_memories_with_client(
+                            client,
+                            &self.user_id,
+                            &self.session_id,
+                        )
+                        .await
+                        .entries
+                    } else {
+                        Vec::new()
+                    }
+                }
+            );
+            let mut entries = session_start;
+            entries.extend(prefetched.entries);
+            crate::turn::memory_prefetch::admit_prompt_memory_entries(&self.session_id, entries)
+        } else {
+            Vec::new()
+        };
+        self.prompt_memory_recall_cache = Some(PromptMemoryRecallCache {
+            session_turn,
+            user_content: user_content.to_string(),
+            entries: entries.clone(),
+        });
+        entries
+    }
+
     fn run_turn_pipeline(
         &mut self,
         state: &mut AgenticLoopState,
@@ -4168,6 +4245,7 @@ impl ServerAgenticLoopHost {
             None,
             None,
             None,
+            &[],
             user_content,
         )
     }
@@ -4181,6 +4259,7 @@ impl ServerAgenticLoopHost {
         model_context_window: Option<u32>,
         cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
+        memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
@@ -4226,6 +4305,10 @@ impl ServerAgenticLoopHost {
                     plan_hint,
                 )
                 .with_extra_sections(&[], &lifecycle_sections)
+                .with_memory_entries(memory_entries)
+                .with_memory_provider_source(
+                    self.memoria_client.is_some().then_some("server_config"),
+                )
                 .with_session_memory_entry(session_memory_entry),
                 cache_cfg: &cache_cfg,
                 provider,
@@ -4263,29 +4346,16 @@ impl ServerAgenticLoopHost {
             completions_url_override: llm_cfg.completions_url_override.clone(),
             request_timeout: llm_cfg.request_timeout,
         };
-        let memoria_client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
-
-        // Observatory is owned by the memory_extraction_service; clone the
-        // Arc so both extraction (service) and injection (compaction) write
-        // into the same ring set.
-        let observatory = state
-            .memory_extraction_service
-            .as_ref()
-            .and_then(|svc| svc.observatory().cloned());
         let ctx = crate::turn::wire_assembly::MemoriaContext {
             session_id: &self.session_id,
             model_name: &llm_cfg.model_name,
             context_window: llm_cfg.context_window,
-            memoria_client: memoria_client
-                .as_ref()
-                .map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
+            memoria_client: self.memoria_client.as_deref(),
             summary_client: Some(
                 &summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
             ),
             tier,
             session_facts: None,
-            turn_number: state.llm_rounds_completed,
-            observatory,
         };
         ctx.compact(&state.messages, system_messages, visible_tools)
             .await
@@ -4520,56 +4590,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
     }
 
-    async fn judge_factual_retry_fallback(
-        &mut self,
-        ctx: FactualRetryFallbackJudgeContext<'_>,
-    ) -> Option<FactualRetryFallbackDecision> {
-        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
-            tracing::debug!(
-                target: "astra::factual_retry_judge",
-                policy = auxiliary_llm_policy_label(),
-                reason,
-                "factual retry fallback judge skipped by capacity policy"
-            );
-            return None;
-        }
-
-        let client = self.summary_client()?;
-        let messages = factual_retry_fallback_judge_messages(FactualRetryFallbackJudgeInput {
-            original_query: ctx.original_query,
-            fallback_text: ctx.fallback_text,
-            retry_text: ctx.retry_text,
-        });
-        let response = match client.summarize(&messages).await {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra::factual_retry_judge",
-                    error = %error,
-                    "factual retry fallback judge unavailable; keeping retry output"
-                );
-                return None;
-            }
-        };
-        match parse_factual_retry_fallback_judge_response(response.text.as_str()) {
-            Ok(verdict) => Some(verdict.accepted_decision()),
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra::factual_retry_judge",
-                    error = %error,
-                    "factual retry fallback judge returned malformed output; keeping retry output"
-                );
-                None
-            }
-        }
-    }
-
     fn take_terminal_control_outcome(
         &mut self,
     ) -> Option<crate::turn::terminal_control::TerminalControlOutcome> {
         self.pending_terminal_control_outcome.take()
     }
-
     fn turn_start_lifecycle_summary(&self, state: &AgenticLoopState) -> String {
         if let Some(summary) = &self.turn_start_lifecycle_summary {
             let plan_hint = self.read_plan_resume_hint();
@@ -4774,17 +4799,30 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         //   * compaction tier selection
         //   * tier-pruned tool schemas
         // Runtime no longer re-derives any of these.
-        let initial_session_memory_entry =
-            if let Some(svc) = state.memory_extraction_service.as_ref() {
-                svc.current_session_memory_entry_for_pipeline(
-                    &self.session_id,
-                    state.session_turn,
-                    &user_content,
-                )
+        let memoria_client = self.memoria_client.clone();
+        let memoria_prefetch_entries = self
+            .prompt_memory_entries_for_turn(state.session_turn, &user_content)
+            .await;
+        let initial_session_memory_entry = if let Some(svc) =
+            state.memory_extraction_service.as_ref()
+        {
+            svc.current_session_memory_entry_for_pipeline(&self.session_id)
                 .await
-            } else {
-                None
-            };
+        } else if let Some(client) = memoria_client.as_deref() {
+            let loaded = crate::session_memory::runner::load_current_session_memory_preferring_local_with_freshness(
+                    client,
+                    &self.session_id,
+                )
+                .await;
+            loaded.as_ref().and_then(|loaded| {
+                crate::turn::wire_assembly::session_memory_entry_for_user_turn(
+                    Some(&loaded.content),
+                    loaded.updated_turn,
+                )
+            })
+        } else {
+            None
+        };
         let turn_pipeline = self.run_turn_pipeline_with_cache_capability_and_session_memory(
             state,
             &visible_tools,
@@ -4793,6 +4831,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             llm_cfg.context_window,
             llm_cfg.cache_capability,
             initial_session_memory_entry.clone(),
+            &memoria_prefetch_entries,
             &user_content,
         )?;
         let PipelineTurnOutcome {
@@ -4833,26 +4872,27 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg,
             )
             .await;
-        if let Some(rerun) =
-            crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry_for_user_turn(
-                compact_result.session_memory_context.as_deref(),
-                initial_session_memory_entry.as_ref(),
-                state.session_turn,
-                &user_content,
-                |session_memory_entry| {
-                    self.run_turn_pipeline_with_cache_capability_and_session_memory(
-                        state,
-                        &visible_tools,
-                        &llm_cfg.provider,
-                        &llm_cfg.model_name,
-                        llm_cfg.context_window,
-                        llm_cfg.cache_capability,
-                        Some(session_memory_entry),
-                        &user_content,
-                    )
-                },
-            )
-            .transpose()?
+        if let Some(rerun) = crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
+            compact_result.session_memory_context.as_deref(),
+            initial_session_memory_entry.as_ref(),
+            None,
+            &memoria_prefetch_entries,
+            &compact_result.retrieved_memory_entries,
+            |session_memory_entry, memory_entries| {
+                self.run_turn_pipeline_with_cache_capability_and_session_memory(
+                    state,
+                    &visible_tools,
+                    &llm_cfg.provider,
+                    &llm_cfg.model_name,
+                    llm_cfg.context_window,
+                    llm_cfg.cache_capability,
+                    session_memory_entry,
+                    memory_entries,
+                    &user_content,
+                )
+            },
+        )
+        .transpose()?
         {
             debug_assert_eq!(rerun.tier, tier);
             final_system_messages = rerun.system_messages;
@@ -4862,6 +4902,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             final_manifest_trace = rerun.manifest_trace;
             state.last_llm_context_manifest_trace = Some(final_manifest_trace.to_json());
         }
+        final_volatile_preamble.extend(compact_result.runtime_contexts.iter().filter_map(
+            |context| crate::turn::wire_assembly::required_runtime_preamble_message(context),
+        ));
         // Parity with the bridge path: when Memoria returned a boundary, the
         // conversation was trimmed mid-task, so nudge the model to resume
         // instead of asking the user a follow-up question.
@@ -5021,7 +5064,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             state.step_recorder.begin_llm_round(&llm_cfg.model_name);
             let llm_round_start = std::time::Instant::now();
-            let turn_prepare_ms = llm_round_start.duration_since(turn_started).as_millis() as u64;
             let llm_cancel = llm_cancel_for_state(state);
             let mut attempt_first_stream_update_ms: Option<u64> = None;
             let mut attempt_first_visible_text_ms: Option<u64> = None;
@@ -5084,13 +5126,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         }
                     }
                     LlmStreamUpdate::ReasoningDelta(content) => {
-                        if !content.is_empty() {
-                            attempt_first_stream_update_ms.get_or_insert_with(|| {
-                                llm_round_start.elapsed().as_millis() as u64
-                            });
-                            first_stream_update_turn_ms
-                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
-                        }
                         attempt_reasoning.push_str(&content);
                         if self.terminal_handoff_window.is_open() {
                             action_window_updates.push(LlmStreamUpdate::ReasoningDelta(content));
@@ -5159,63 +5194,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 )
                 .await
             };
-            let provider_duration_ms = llm_round_start.elapsed().as_millis() as u64;
-            match &r {
-                Ok(result) => {
-                    let usage =
-                        crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
-                    tracing::info!(
-                        target: "astra::llm_timing",
-                        operation = "main_llm.call",
-                        status = "success",
-                        run_id = %state.current_run_id.as_deref().unwrap_or(""),
-                        session_id = %self.session_id,
-                        turn = state.session_turn,
-                        round = prompt_round,
-                        attempt = attempt_in_round,
-                        model = %llm_cfg.model_name,
-                        actual_model = %result.model_used,
-                        provider = %llm_cfg.provider,
-                        turn_prepare_ms,
-                        provider_duration_ms,
-                        provider_ttft_ms = ?attempt_first_stream_update_ms,
-                        visible_ttft_ms = ?attempt_first_visible_text_ms,
-                        turn_ttft_ms = ?first_stream_update_turn_ms,
-                        turn_visible_ttft_ms = ?first_visible_text_turn_ms,
-                        finish_reason = ?result.finish_reason,
-                        estimated_tokens = admission_estimated_tokens,
-                        input_tokens = usage.input_tokens,
-                        output_tokens = usage.output_tokens,
-                        cached_input_tokens = usage.cached_input_tokens,
-                        cache_creation_tokens = usage.cache_creation_tokens,
-                        text_chars = result.full_text.chars().count(),
-                        reasoning_chars = result.reasoning.chars().count(),
-                        tool_calls = result.tool_calls.len(),
-                        "main LLM call completed"
-                    );
-                }
-                Err(error) => tracing::warn!(
-                    target: "astra::llm_timing",
-                    operation = "main_llm.call",
-                    status = "error",
-                    run_id = %state.current_run_id.as_deref().unwrap_or(""),
-                    session_id = %self.session_id,
-                    turn = state.session_turn,
-                    round = prompt_round,
-                    attempt = attempt_in_round,
-                    model = %llm_cfg.model_name,
-                    provider = %llm_cfg.provider,
-                    turn_prepare_ms,
-                    provider_duration_ms,
-                    provider_ttft_ms = ?attempt_first_stream_update_ms,
-                    visible_ttft_ms = ?attempt_first_visible_text_ms,
-                    turn_ttft_ms = ?first_stream_update_turn_ms,
-                    turn_visible_ttft_ms = ?first_visible_text_turn_ms,
-                    error_kind = error.kind.as_str(),
-                    estimated_tokens = admission_estimated_tokens,
-                    "main LLM call completed"
-                ),
-            }
 
             // Context-window errors flow through the accum so the agentic loop's
             // Fatal handler can trigger auto-compaction + retry.
@@ -5300,10 +5278,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         context_manifest_trace: state.last_llm_context_manifest_trace.clone(),
                         ..Default::default()
                     };
-                    let ttft_ms = Some(
-                        first_stream_update_turn_ms
-                            .unwrap_or_else(|| turn_started.elapsed().as_millis() as u64),
-                    );
+                    let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
                     return Ok(HostTurnResult {
                         accum,
                         ttft_ms,
@@ -5584,10 +5559,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
 
         // ── 6. Build turn result ────────────────────────────────────────
-        let ttft_ms = Some(
-            first_stream_update_turn_ms
-                .unwrap_or_else(|| turn_started.elapsed().as_millis() as u64),
-        );
+        let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
         let mut accum = Self::result_to_accum(&result);
         accum.system_prompt_tokens = Some(final_system_prompt_breakdown.total_tokens);
         accum.system_prompt_breakdown = serde_json::to_value(&final_system_prompt_breakdown).ok();
@@ -6382,6 +6354,106 @@ mod tests {
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
         // Use a valid Fernet key for testing
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
+    }
+
+    #[derive(Default)]
+    struct ServerOnlyPromptMemory {
+        calls: std::sync::atomic::AtomicUsize,
+        scopes: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::turn::cloud::memoria_compact::MemoriaPort for ServerOnlyPromptMemory {
+        async fn retrieve_for_prompt(
+            &self,
+            _query: &str,
+            user_id: &str,
+            session_id: &str,
+            _top_k: usize,
+        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.scopes
+                .lock()
+                .expect("scopes")
+                .push((user_id.to_string(), session_id.to_string()));
+            Ok(vec![crate::turn::cloud::memoria_compact::MemoriaMemory {
+                memory_id: "server-memory-1".into(),
+                content: astra_prompts::memory_proto::MemoryEntry::new(
+                    astra_prompts::memory_proto::NS_KNOWLEDGE,
+                    astra_prompts::memory_proto::ST_ACTIVE,
+                    "Server-only recall uses the same typed dynamic memory lane",
+                )
+                .encode(),
+                memory_type: "semantic".into(),
+                retrieval_score: Some(0.9),
+                ..Default::default()
+            }])
+        }
+
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+            panic!("server prompt recall must use retrieve_for_prompt")
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn server_only_prompt_recall_needs_no_edge_profile_and_is_latched_per_turn() {
+        let provider = Arc::new(ServerOnlyPromptMemory::default());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "server-user".into(),
+            "server-session".into(),
+        )
+        .with_memoria_client(Some(
+            Arc::clone(&provider) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
+        ))
+        .build();
+        assert!(host.edge_profile.is_empty());
+
+        let first = host
+            .prompt_memory_entries_for_turn(2, "review astra memory #42")
+            .await;
+        let same_turn = host
+            .prompt_memory_entries_for_turn(2, "review astra memory #42")
+            .await;
+        assert_eq!(first, same_turn);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].memory_id.as_deref(), Some("server-memory-1"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        let next_turn = host
+            .prompt_memory_entries_for_turn(3, "review astra memory #42")
+            .await;
+        assert_eq!(next_turn.len(), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+        assert!(
+            provider
+                .scopes
+                .lock()
+                .expect("scopes")
+                .iter()
+                .all(|(user, session)| user == "server-user" && session == "server-session")
+        );
     }
 
     fn test_dispatch_identity(
@@ -7318,33 +7390,6 @@ mod tests {
             .join("\n")
     }
 
-    #[test]
-    fn llm_request_dump_failures_are_not_silently_ignored() {
-        let source = include_str!("server_loop_host.rs");
-        // Use `find` (first occurrence) — rfind would find the test module itself
-        // if a nested `mod tests {` were ever added. First occurrence is always
-        // the production `mod tests {` opener.
-        let tests_start = source
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("cfg(test) + mod tests marker");
-        let production = &source[..tests_start];
-        for context in [
-            "server_loop_host context window dump persist failed",
-            "server_loop_host error dump persist failed",
-        ] {
-            let start = production
-                .find(context)
-                .expect("dump logging context should exist");
-            let window_start = start.saturating_sub(480);
-            let window = &production[window_start..production.len().min(start + 120)];
-            assert!(
-                window.contains("if let Err(error)")
-                    && window.contains("dump.persist_remote(&self.user_id, &artifact_store).await"),
-                "{context} should handle dump.persist_remote failures explicitly"
-            );
-        }
-    }
-
     /// Pin: after compaction, the server loop MUST re-inject invoked-skill
     /// instructions via `AttachmentBuilder::add_skill`. Without this, skills
     /// that were loaded before compaction lose their full content once history
@@ -7360,72 +7405,6 @@ mod tests {
     ///
     /// A silent refactor that drops either piece would break cross-turn skill
     /// persistence with no runtime error. This test pins both anchors.
-    #[test]
-    fn post_compaction_reinjects_invoked_skills() {
-        // Cross-file anchor: production code now lives in the shared
-        // `llm_context` + `wire_assembly` path. Both pieces must be present
-        // for the re-injection pipeline to work; a silent refactor that drops
-        // either is a cross-turn skill-loss bug waiting to happen.
-        let host_src = include_str!("server_loop_host.rs");
-        let host_tests_start = host_src
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("cfg(test) + mod tests marker");
-        let host_production = &host_src[..host_tests_start];
-        assert!(
-            host_production.contains("assemble_llm_messages("),
-            "server host must route final wire assembly through the shared helper"
-        );
-
-        let llm_context_src = include_str!("../turn/llm/context.rs");
-        let llm_context_tests_start = llm_context_src
-            .find("\n#[cfg(test)]\nmod ")
-            .expect("llm_context cfg(test) + mod marker");
-        let llm_context_production = &llm_context_src[..llm_context_tests_start];
-        assert!(
-            llm_context_production.contains("input.state.skills.invoked"),
-            "shared LLM assembly must consult state.skills.invoked to decide re-injection"
-        );
-        // Ordering guard: most-recently invoked skill first (so the oldest
-        // content sits closest to the model's current turn after to_messages
-        // reverses). If this sort key flips, cross-turn ordering will break.
-        assert!(
-            llm_context_production.contains("std::cmp::Reverse(skill.invoked_at_turn)"),
-            "invoked skills must be sorted most-recent-first before re-injection"
-        );
-
-        let shared_src = include_str!("../turn/wire_assembly.rs");
-        let shared_tests_start = shared_src
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("wire_assembly cfg(test) + mod tests marker");
-        let shared_production = &shared_src[..shared_tests_start];
-        assert!(
-            shared_production.contains("builder.add_skill(skill.name, skill.content)"),
-            "shared assembly must feed invoked skills into AttachmentBuilder::add_skill \
-             so full instructions survive compaction"
-        );
-    }
-
-    #[test]
-    fn llm_error_paths_publish_remote_llm_capture_artifacts() {
-        let source = include_str!("server_loop_host.rs");
-        let tests_start = source
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("cfg(test) + mod tests marker");
-        let production = &source[..tests_start];
-        for context in [
-            "server_loop_host context window capture",
-            "server_loop_host error capture",
-        ] {
-            let start = production
-                .find(context)
-                .expect("capture context should exist");
-            let window = &production[start..production.len().min(start + 220)];
-            assert!(
-                window.contains("Some(&artifact_store)"),
-                "{context} should publish a remote llm_capture artifact, not local-only capture"
-            );
-        }
-    }
 
     #[test]
     fn llm_capture_error_response_includes_partial_details() {
@@ -7622,44 +7601,6 @@ mod tests {
         assert!(
             response["usage"].get("input_tokens").is_none(),
             "total-only usage has no disjoint bucket evidence and must remain an unknown dialect",
-        );
-    }
-
-    #[test]
-    fn server_loop_error_captures_use_structured_error_response() {
-        let source = include_str!("server_loop_host.rs");
-        let tests_start = source
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("cfg(test) + mod tests marker");
-        let production = &source[..tests_start];
-        assert!(
-            production.contains("llm_capture_error_response(e)"),
-            "context-window captures should route through the structured error response helper"
-        );
-        assert!(
-            production.contains("llm_capture_error_response(&e)"),
-            "generic server-loop error captures should route through the structured error response helper"
-        );
-        assert!(
-            production.contains("llm_capture_error_response(&error)"),
-            "reflection error captures should route through the structured error response helper"
-        );
-    }
-
-    #[test]
-    fn server_loop_uses_shared_rate_limit_cooldown_singleton() {
-        let source = include_str!("server_loop_host.rs");
-        let tests_start = source
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("cfg(test) + mod tests marker");
-        let production = &source[..tests_start];
-        assert!(
-            production.contains("use crate::turn::bridge::llm_stream::rate_limit_cooldown;"),
-            "server-loop should reuse the shared llm_client/bridge rate-limit cooldown singleton"
-        );
-        assert!(
-            !production.contains("static COOLDOWN: OnceLock<PerModelCooldown>"),
-            "server-loop should not keep a separate cooldown singleton disconnected from llm_client"
         );
     }
 
@@ -9646,11 +9587,10 @@ mod tests {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
-            textless_stop_retries: 0,
             last_finish_reason: None,
             turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
@@ -9931,6 +9871,7 @@ mod tests {
 
         let mut state = create_test_state();
         state.restricted_tools.insert("read_file".to_string());
+        state.boosted_tools.insert("read_file".to_string());
         state
             .turn_guard
             .health
@@ -9948,6 +9889,10 @@ mod tests {
 
         assert!(visible_names.contains("bash"));
         assert!(!visible_names.contains("read_file"));
+        assert!(
+            state.boosted_tools.contains("read_file"),
+            "the advisory boost can remain observable without overriding the hard restriction"
+        );
         assert!(
             !state.restricted_tools.contains("bash"),
             "soft health must not mutate hard restricted_tools"
@@ -10338,6 +10283,37 @@ mod tests {
     }
 
     #[test]
+    fn disabled_shared_network_server_offer_is_not_in_initial_surface_or_valid_set() {
+        let disabled: HashSet<String> = ["web_fetch@server-builtin".to_string()]
+            .into_iter()
+            .collect();
+        let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
+
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_disabled_tool_offers(disabled_handle)
+        .build();
+
+        let tool_schema_names = schema_names(&host.tool_schemas);
+        assert!(
+            !tool_schema_names.contains("web_fetch"),
+            "initial prompt surface must use the same admission decision as visible_turn_tools"
+        );
+        assert!(
+            !host.valid_tools.contains("web_fetch"),
+            "hidden server offers must not remain callable through the internal valid_tools set"
+        );
+        assert!(
+            host.valid_tools.contains("web_search"),
+            "unrelated shared server tools should remain callable"
+        );
+    }
+
+    #[test]
     fn edge_visible_surface_gates_powershell_by_runtime_platform() {
         for (platform, expected_visible) in [
             (astra_runtime_env::RuntimePlatform::Unknown, false),
@@ -10422,7 +10398,7 @@ mod tests {
         .map(str::to_string)
         .collect::<Vec<_>>();
         assert_eq!(policy.visible_tool_names, expected_visible);
-        assert_eq!(policy.evidence_tool_names, expected_evidence);
+        assert_eq!(policy.observation_tool_names, expected_evidence);
         assert!(!policy.allow_ask_user);
     }
 
@@ -10487,7 +10463,7 @@ mod tests {
         let mut expected_visible = expected_visible_without_ask_user;
         expected_visible.insert(2, "ask_user".to_string());
         assert_eq!(policy.visible_tool_names, expected_visible);
-        assert_eq!(policy.evidence_tool_names, expected_evidence);
+        assert_eq!(policy.observation_tool_names, expected_evidence);
         assert!(policy.allow_ask_user);
     }
 
@@ -11820,166 +11796,6 @@ mod tests {
         assert_eq!(
             capture.path.lock().await.as_deref(),
             Some("/gateway/chat/completions")
-        );
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn factual_retry_fallback_judge_uses_llm_response_selection() {
-        use axum::{Router, extract::State, routing::post};
-        use tokio::net::TcpListener;
-
-        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
-
-        #[derive(Default)]
-        struct RequestCapture {
-            body: tokio::sync::Mutex<Option<Value>>,
-        }
-
-        async fn handler(
-            State(capture): State<Arc<RequestCapture>>,
-            request: axum::extract::Request,
-        ) -> axum::Json<Value> {
-            let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-                .await
-                .expect("read request body");
-            *capture.body.lock().await = Some(serde_json::from_slice(&bytes).expect("json body"));
-            axum::Json(json!({
-                "choices": [
-                    {
-                        "message": {
-                            "content": "{\"decision\":\"restore_fallback\",\"confidence\":0.94,\"reason\":\"candidate A answers the UI question\"}"
-                        },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-            }))
-        }
-
-        let capture = Arc::new(RequestCapture::default());
-        let app = Router::new()
-            .route("/gateway/chat/completions", post(handler))
-            .with_state(capture.clone());
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test server should run");
-        });
-
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "user-judge".to_string(),
-            "session-judge".to_string(),
-        )
-        .build();
-        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: "gpt-4o-mini".to_string(),
-            api_key: String::new(),
-            base_url: format!("http://{addr}/gateway"),
-            provider: "openai".to_string(),
-            max_output_tokens: 128,
-        });
-
-        let decision = host
-            .judge_factual_retry_fallback(FactualRetryFallbackJudgeContext {
-                original_query: "what do 59% and 117k mean?",
-                fallback_text: "59% is context usage; 117k is token count.",
-                retry_text: "I completed the requested work.",
-            })
-            .await;
-
-        assert_eq!(
-            decision,
-            Some(FactualRetryFallbackDecision::RestoreFallback)
-        );
-        let body = capture.body.lock().await.clone().expect("judge request");
-        let messages = body["messages"].as_array().expect("messages");
-        let prompt = messages[1]["content"].as_str().expect("user prompt");
-        assert!(prompt.contains("Candidate A"));
-        assert!(prompt.contains("Candidate B"));
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-    async fn factual_retry_fallback_judge_skips_gateway_when_provider_admission_is_enabled() {
-        use axum::{Router, routing::post};
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-        use tokio::net::TcpListener;
-
-        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
-        let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
-        let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
-
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let request_count_for_handler = request_count.clone();
-        let app = Router::new().route(
-            "/gateway/chat/completions",
-            post(move || {
-                let request_count = request_count_for_handler.clone();
-                async move {
-                    request_count.fetch_add(1, AtomicOrdering::SeqCst);
-                    axum::Json(json!({
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": "{\"decision\":\"restore_fallback\",\"confidence\":0.94,\"reason\":\"candidate A answers the UI question\"}"
-                                },
-                                "finish_reason": "stop"
-                            }
-                        ],
-                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-                    }))
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test server should run");
-        });
-
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "user-judge".to_string(),
-            "session-judge".to_string(),
-        )
-        .build();
-        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
-            model_name: "gpt-4o-mini".to_string(),
-            api_key: String::new(),
-            base_url: format!("http://{addr}/gateway"),
-            provider: "openai".to_string(),
-            max_output_tokens: 128,
-        });
-
-        let decision = host
-            .judge_factual_retry_fallback(FactualRetryFallbackJudgeContext {
-                original_query: "what do 59% and 117k mean?",
-                fallback_text: "59% is context usage; 117k is token count.",
-                retry_text: "I completed the requested work.",
-            })
-            .await;
-
-        assert_eq!(decision, None);
-        assert_eq!(
-            request_count.load(AtomicOrdering::SeqCst),
-            0,
-            "capacity-aware default must not spend provider RPM on factual retry judge"
         );
 
         server.abort();

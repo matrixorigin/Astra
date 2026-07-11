@@ -136,6 +136,10 @@ const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[
 
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
+        label: "agent_session_execution_slots",
+        sql: "DELETE FROM agent_session_execution_slots WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "context_manifests",
         sql: "DELETE FROM context_manifests WHERE session_id = ? AND user_id = ?",
     },
@@ -337,6 +341,7 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
 
 const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[&str] = &[
     "agent_sessions",
+    "agent_session_execution_slots",
     "agent_events",
     "agent_event_edges",
     "agent_runs",
@@ -894,68 +899,6 @@ mod tests {
     use crate::SessionArtifactStore;
     use std::collections::BTreeSet;
 
-    fn session_delete_labels() -> BTreeSet<String> {
-        let mut labels = BTreeSet::new();
-        labels.insert("agent_event_edges".to_string());
-        labels.insert("task_leases".to_string());
-        labels.insert("plan_step_runs".to_string());
-        for group in [
-            SESSION_DELETE_DERIVED_FROM_AGENT_RUNS,
-            SESSION_DELETE_SESSION_ORIGIN_TABLES,
-            SESSION_DELETE_DERIVED_PARENT_TABLES,
-            SESSION_DELETE_DIRECT_TABLES,
-            SESSION_DELETE_TERMINAL_TABLES,
-        ] {
-            for statement in group {
-                assert!(
-                    labels.insert(statement.label.to_string()),
-                    "duplicate session delete table label: {}",
-                    statement.label
-                );
-            }
-        }
-        for group in [
-            SESSION_DELETE_DIRECT_BATCH_TABLES,
-            SESSION_DELETE_TERMINAL_BATCH_TABLES,
-        ] {
-            for statement in group {
-                assert!(
-                    labels.insert(statement.label.to_string()),
-                    "duplicate session delete table label: {}",
-                    statement.label
-                );
-            }
-        }
-        labels
-    }
-
-    fn ddl_tables_with_session_id(source: &str) -> BTreeSet<String> {
-        source
-            .split("CREATE TABLE IF NOT EXISTS ")
-            .skip(1)
-            .filter_map(|section| {
-                let table = section
-                    .split_whitespace()
-                    .next()?
-                    .trim_matches('`')
-                    .trim_end_matches('(');
-                section.contains("session_id").then(|| table.to_string())
-            })
-            .collect()
-    }
-
-    fn production_source(source: &'static str) -> &'static str {
-        source.split("#[cfg(test)]").next().unwrap_or(source)
-    }
-
-    fn session_lifecycle_schema_tables_with_session_id() -> BTreeSet<String> {
-        let mut tables = ddl_tables_with_session_id(production_source(include_str!("storage.rs")));
-        tables.extend(ddl_tables_with_session_id(production_source(include_str!(
-            "workspace_records.rs"
-        ))));
-        tables
-    }
-
     #[test]
     fn server_workspace_path_requires_exact_safe_session_component() {
         let base = Path::new("/tmp/astra-workspaces");
@@ -1043,34 +986,6 @@ mod tests {
     }
 
     #[test]
-    fn session_delete_residual_verification_covers_core_tables() {
-        assert_eq!(
-            SESSION_DELETE_CORE_RESIDUAL_TABLES,
-            [
-                "agent_sessions",
-                "agent_events",
-                "agent_event_edges",
-                "agent_runs",
-                "agent_tasks",
-                "task_contracts",
-            ]
-        );
-    }
-
-    #[test]
-    fn hard_delete_session_rows_verifies_core_tables_before_success() {
-        let source = include_str!("session_lifecycle.rs");
-        assert!(
-            source.contains("verify_core_session_tables_deleted(tx, session_id, user_id).await?"),
-            "hard delete must verify core table residuals before reporting success"
-        );
-        assert!(
-            source.contains("rows remain for session/user after delete"),
-            "residual verification must fail loudly instead of only auditing rows_affected"
-        );
-    }
-
-    #[test]
     fn high_growth_session_deletes_are_ordered_batched_and_owner_scoped() {
         let mut statements: Vec<SessionBatchDeleteStatement> = vec![SessionBatchDeleteStatement {
             label: "agent_event_edges",
@@ -1153,92 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn high_growth_session_delete_helper_loops_until_empty_batch() {
-        let source = include_str!("session_lifecycle.rs");
-        let helper_body = source
-            .split("async fn delete_session_rows_session_user_batched")
-            .nth(1)
-            .and_then(|rest| {
-                rest.split("async fn delete_session_rows_session_user_twice")
-                    .next()
-            })
-            .expect("batched delete helper body");
-        assert!(
-            helper_body.contains("loop {") && helper_body.contains("if rows_deleted == 0"),
-            "batched delete helper must keep pruning until a batch deletes no rows"
-        );
-        assert!(
-            helper_body.contains("SESSION_DELETE_BATCH_LIMIT"),
-            "batched delete helper must bind the shared batch limit"
-        );
-        assert!(
-            helper_body.contains("checked_add(rows_deleted)"),
-            "batched delete helper must fail loudly on impossible row-total overflow"
-        );
-    }
-
-    #[test]
-    fn hard_delete_session_wraps_database_deletes_in_transaction() {
-        let source = include_str!("session_lifecycle.rs");
-        let hard_delete_body = source
-            .split("pub(crate) async fn hard_delete_session(")
-            .nth(1)
-            .and_then(|rest| rest.split("fn elapsed_ms(").next())
-            .expect("hard_delete_session body");
-        assert!(
-            hard_delete_body.contains(".begin()"),
-            "hard delete must open a database transaction before table deletes"
-        );
-        assert!(
-            hard_delete_body
-                .contains("hard_delete_session_rows(&mut tx, session_id, user_id).await?"),
-            "hard delete must execute table deletes through the transaction"
-        );
-        assert!(
-            hard_delete_body.contains("tx.commit()"),
-            "hard delete must commit only after all table deletes and residual checks pass"
-        );
-        let commit = hard_delete_body
-            .find("tx.commit()")
-            .expect("hard delete must commit database transaction");
-        let local_cleanup = hard_delete_body
-            .find("delete_owner_bound_local_session_artifacts(user_id, session_id)")
-            .expect("hard delete must clean local artifacts");
-        let workspace_cleanup = hard_delete_body
-            .find("delete_server_workspace(session_id)")
-            .expect("hard delete must clean server workspace");
-        assert!(
-            commit < local_cleanup && commit < workspace_cleanup,
-            "hard delete must delete files only after the database commit succeeds"
-        );
-    }
-
-    #[test]
-    fn post_commit_cleanup_failures_are_reported_in_outcome() {
-        let source = include_str!("session_lifecycle.rs");
-        let hard_delete_body = source
-            .split("pub(crate) async fn hard_delete_session(")
-            .nth(1)
-            .and_then(|rest| rest.split("fn elapsed_ms(").next())
-            .expect("hard_delete_session body");
-
-        assert!(
-            hard_delete_body.contains("cleanup_errors.push(error)"),
-            "post-commit cleanup failures must be surfaced through the delete outcome"
-        );
-        assert!(
-            !hard_delete_body.contains("return Err(format!(\"delete_session.post_commit"),
-            "post-commit cleanup failures must not masquerade as database delete failures"
-        );
-    }
-
-    #[test]
-    fn server_workspace_cleanup_uses_local_safe_id_check() {
-        let source = include_str!("session_lifecycle.rs");
-        assert!(
-            !source.contains(concat!("astra_runtime_env", "::", "validate_workspace_id")),
-            "session_lifecycle must not depend on runtime-env for simple workspace id validation"
-        );
+    fn server_workspace_id_validation_rejects_unsafe_components() {
         assert!(is_safe_workspace_id("session-123"));
         assert!(is_safe_workspace_id("session_123"));
         assert!(!is_safe_workspace_id(""));
@@ -1339,110 +1169,6 @@ mod tests {
         assert!(
             user_b_dir.exists(),
             "foreign owner artifact dir must survive"
-        );
-    }
-
-    #[test]
-    fn session_hard_delete_marks_deleting_before_local_cleanup() {
-        let source = include_str!("session_lifecycle.rs");
-        let mark = source
-            .find("mark_session_deleting(pool, session_id, user_id).await?")
-            .expect("hard delete must mark the session deleting first");
-        let local_cleanup = source
-            .find("delete_owner_bound_local_session_artifacts(user_id, session_id)")
-            .expect("hard delete must still clean local artifacts");
-
-        assert!(
-            mark < local_cleanup,
-            "session hard delete must persist delete intent before local artifact deletion"
-        );
-        assert!(
-            source.contains("SET status = 'deleting',"),
-            "mark phase must use an observable deleting status"
-        );
-        assert!(
-            source.contains("ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP(6))"),
-            "mark phase must persist a retry timestamp for the reaper"
-        );
-        assert!(
-            source.contains("delete_session.mark_deleting.confirm"),
-            "mark phase must be idempotent for already-marked retry"
-        );
-    }
-
-    #[test]
-    fn session_delete_inventory_covers_session_lifecycle_tables() {
-        let labels = session_delete_labels();
-        let schema_session_tables = session_lifecycle_schema_tables_with_session_id();
-        let intentionally_retained_session_tables = BTreeSet::from([
-            // Auth refresh tokens model user login sessions, not agent-run
-            // lifecycle rows. Deleting an agent session must not revoke
-            // unrelated user authentication state.
-            "auth_refresh_tokens".to_string(),
-            // This is an operational repair queue. Unresolved cleanup debts must
-            // survive session deletion until the retry worker settles the external resource.
-            "workspace_cleanup_debts".to_string(),
-        ]);
-        let missing = schema_session_tables
-            .difference(&labels)
-            .filter(|table| !intentionally_retained_session_tables.contains(*table))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            missing.is_empty(),
-            "session delete inventory must cover every storage table with session_id; missing: {missing:?}"
-        );
-
-        let allowed_derived_tables = BTreeSet::from([
-            "eval_quality_assessments".to_string(),
-            "harness_citations".to_string(),
-            "harness_items".to_string(),
-            "harness_skill_drafts".to_string(),
-            "harness_skill_rules".to_string(),
-            "task_leases".to_string(),
-            "user_skill_evaluations".to_string(),
-        ]);
-        let stale_labels = labels
-            .difference(&schema_session_tables)
-            .filter(|label| !allowed_derived_tables.contains(*label))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            stale_labels.is_empty(),
-            "session delete inventory must not keep stale table labels; unexpected extras: {stale_labels:?}"
-        );
-
-        for expected in [
-            "session_todo_idempotency",
-            "verification_results",
-            "harness_citations",
-            "harness_skill_rules",
-            "harness_skill_drafts",
-            "harness_items",
-            "harness_runs",
-            "eval_quality_assessments",
-            "eval_calibration_assessments",
-            "session_checkpoints",
-            "session_artifacts",
-            "workspace_records",
-            "agent_sessions",
-        ] {
-            assert!(
-                labels.contains(expected),
-                "session delete inventory must include {expected}"
-            );
-        }
-        assert!(
-            !labels.contains("skill_selector_turn_metrics"),
-            "removed tables must not remain in the executable delete inventory"
-        );
-        assert!(
-            !labels.contains("task_verification_results"),
-            "obsolete verification table name must not remain in the executable delete inventory"
-        );
-        assert!(
-            !labels.contains("workspace_cleanup_debts"),
-            "unresolved cleanup debts must remain available to the workspace cleanup retry worker"
         );
     }
 

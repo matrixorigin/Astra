@@ -13,32 +13,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # Compiled target artifacts are only safe to share within one workflow run.
-  # Branch-level target caches can leave Cargo fingerprints without the rlibs
-  # they point at, which surfaces as spurious E0463 "can't find crate" errors.
-  RUST_TEST_TARGET_CACHE_KEY: ci-test-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
-  # ── Stage 1: compile once, cache for all downstream jobs ───────────
-  build:
-    name: "Build & Cache"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/rust-setup
-        with:
-          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
-          save-cache: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      # Compile all test binaries (default + bridge-e2e-hooks) without running
-      - name: Compile test binaries
-        run: |
-          cargo nextest run --manifest-path Cargo.toml --workspace --no-run
-          cargo nextest run --manifest-path Cargo.toml -p astra-runtime --features bridge-e2e-hooks --no-run
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats || true
-
-  # ── Stage 2: parallel offline test shards (all need: build) ────────
+  # All shards start immediately. A previous compile-only job added a ~20 minute
+  # barrier, but rust-cache intentionally removes workspace binaries before
+  # saving, so the shards still had to compile and link their own test targets.
+  # Package-scoped compilation keeps each small runner bounded while sccache and
+  # the shared dependency cache avoid repeating dependency code generation.
   #
   # Shard balance (test counts):
   #   shard-a: astra-cli (split by edge_tools group) — shell tests need process isolation
@@ -56,34 +37,34 @@ jobs:
 
   shard-a:
     name: "Test: astra-cli (${{ matrix.segment }})"
-    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - segment: non-edge
             filter: "not test(/edge_tools::/)"
-            command_timeout: 15m
+            command_timeout: 25m
           - segment: edge-shell
             filter: "test(/edge_tools::shell::/)"
-            command_timeout: 20m
+            command_timeout: 30m
           - segment: edge-fs-tools
             filter: "test(/edge_tools::fs_tools::/)"
-            command_timeout: 15m
+            command_timeout: 25m
           - segment: edge-git-gix
             filter: "test(/edge_tools::git_gix::/)"
-            command_timeout: 15m
+            command_timeout: 25m
           - segment: edge-rest
             filter: "test(/edge_tools::/) and not test(/edge_tools::shell::/) and not test(/edge_tools::fs_tools::/) and not test(/edge_tools::git_gix::/)"
-            command_timeout: 15m
+            command_timeout: 25m
 
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
+          shared-key: ci-test
+          save-cache: ${{ github.event_name == 'push' && matrix.segment == 'non-edge' }}
       - name: Prebuild mock MCP server
         if: matrix.segment == 'non-edge'
         run: cargo build --manifest-path Cargo.toml -p astra-cli --bin mock_mcp_server
@@ -107,14 +88,13 @@ jobs:
 
   shard-b:
     name: "Test: astra-runtime"
-    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
+          shared-key: ci-test
       - name: Test astra-runtime
         run: >-
           cargo nextest run --manifest-path Cargo.toml -p astra-runtime
@@ -137,14 +117,13 @@ jobs:
 
   shard-c:
     name: "Test: turn-core + services + plan"
-    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
+          shared-key: ci-test
       - name: Test astra-turn-core + astra-services + astra-plan
         run: >-
           cargo nextest run --manifest-path Cargo.toml
@@ -154,14 +133,13 @@ jobs:
 
   shard-d:
     name: "Test: core crates + bridge hooks"
-    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
+          shared-key: ci-test
       - name: Test core crates
         run: >-
           cargo nextest run --manifest-path Cargo.toml
@@ -177,11 +155,16 @@ jobs:
           --features bridge-e2e-hooks --profile ci
           -E 'test(/bridge/) or test(/e2e/) or test(/phase_r5/) or test(/phase_r6/) or test(/phase_r7/) or test(/phase_j/) or test(/web_agent/) or test(/mock_llm/) or test(/cache_provider/)'
 
-  # ── Stage 3: online tests (needs DB, runs in parallel with offline) ──
+  # Online tests use their own two-thread profile and run beside the offline
+  # shards instead of waiting for an unrelated compile-only job.
   test-online:
-    name: "Test: online (DB)"
-    needs: [build]
+    name: "Test: online (${{ matrix.lane }})"
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [core, integration]
     env:
       MATRIXONE_HOST: localhost
       MATRIXONE_PORT: "6001"
@@ -199,6 +182,7 @@ jobs:
       MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
       MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL }}
       MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM }}
+      ASTRA_ONLINE_LANE: ${{ matrix.lane }}
     steps:
       - uses: actions/checkout@v4
       - name: Prepare dependency env
@@ -216,7 +200,7 @@ jobs:
         run: make dev-deps-up
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ${{ env.RUST_TEST_TARGET_CACHE_KEY }}
+          shared-key: ci-test
       - name: Wait for dependencies
         run: make dev-deps-wait
       - name: Run online tests

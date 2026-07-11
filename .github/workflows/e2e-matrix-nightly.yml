@@ -45,6 +45,7 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-e2e
+          install-nextest: false
       - name: Wait for dependencies
         run: make dev-deps-wait
 

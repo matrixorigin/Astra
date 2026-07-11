@@ -51,6 +51,7 @@ pub mod session_checkpoint;
 pub mod session_fork;
 pub mod session_journal;
 pub(crate) mod session_lifecycle;
+pub mod session_memory_inventory;
 pub mod session_reaper;
 pub mod session_restore;
 pub mod session_workspace;
@@ -62,6 +63,7 @@ pub mod state_projection;
 pub mod state_sync;
 pub mod storage;
 pub mod sync_engine;
+pub mod sync_outbox;
 pub mod task_orchestrator;
 pub mod team_persistence;
 pub mod triggers;
@@ -184,8 +186,8 @@ pub use durable_task::{
 pub use edge_context::{EdgeContext, EdgeProfile, EdgeSkillRef};
 pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
 pub use events::{
-    DatabaseEventService, EventCreateRequestData, EventListFilter, EventListRecord, EventRecord,
-    EventService, UnconfiguredEventService,
+    DatabaseEventService, EventCreateRequestData, EventIngestionSource, EventListFilter,
+    EventListRecord, EventRecord, EventService, UnconfiguredEventService,
 };
 pub use harness::{
     DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
@@ -326,6 +328,15 @@ pub use sync_engine::{
     CloudTransport, DomainAdapter, DomainSyncResult, MergeResult, NoopTransport, PayloadFormat,
     PullResult, PullTrigger, PushResult, PushTrigger, SyncDomain, SyncEnvelope, SyncError,
     SyncEvent, SyncOperation, SyncOrchestrator, SyncPayload, SyncPolicy, SyncState, SyncStats,
+};
+pub use sync_outbox::{
+    SYNC_OUTBOX_ACK_TOMBSTONE_RETAINED_RECORDS, SYNC_OUTBOX_ACKED_RETAINED_RECORDS,
+    SYNC_OUTBOX_IN_FLIGHT_LEASE_MS, SYNC_OUTBOX_MAX_ATTEMPTS, SYNC_OUTBOX_SCHEMA_VERSION,
+    SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS, SyncOutboxAckOutcome, SyncOutboxAckTombstone,
+    SyncOutboxDeliverySettlement, SyncOutboxEnqueueOutcome, SyncOutboxFile, SyncOutboxPoisonKind,
+    SyncOutboxRecord, SyncOutboxRecordState, SyncOutboxSettlementReport, SyncOutboxSkipKind,
+    SyncOutboxSkippedRecord, SyncOutboxStatus, SyncOutboxStore, sync_outbox_canonical_payload_hash,
+    sync_outbox_stable_event_id,
 };
 pub use task_orchestrator::{
     LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskClaimability,

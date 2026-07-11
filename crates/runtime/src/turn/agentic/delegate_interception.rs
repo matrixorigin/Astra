@@ -333,7 +333,12 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                 "⚠ Teammate-round verification…".to_string(),
             );
         }
-        state.messages.push(prompt);
+        if let Some(content) = prompt.get("content").and_then(Value::as_str) {
+            state.push_volatile(
+                crate::turn::agentic_loop::host::VolatileKind::StopHookEvidence,
+                content.to_string(),
+            );
+        }
     }
 
     DelegationInterceptionResult {

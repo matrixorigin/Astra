@@ -69,6 +69,8 @@ pub(crate) struct MultiAgentEntry {
     pub elapsed_ms: u64,
     pub live: bool,
     pub failed: bool,
+    /// Resumable pause/interruption. Distinct from failure and cancellation.
+    pub interrupted: bool,
     /// User-cancelled (via Ctrl+G x or Ctrl+C). Distinct from `failed`
     /// so the strip can render a different icon/color: a cancelled
     /// agent is the user's intent, not an error to alarm about.
@@ -99,8 +101,9 @@ pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
     let live = cells.iter().filter(|c| c.live).count();
     let cancelling = cells.iter().filter(|c| c.cancelling).count();
     let failed = cells.iter().filter(|c| c.failed).count();
+    let interrupted = cells.iter().filter(|c| c.interrupted).count();
     let cancelled = cells.iter().filter(|c| c.cancelled).count();
-    let done = total.saturating_sub(live + cancelling + failed + cancelled);
+    let done = total.saturating_sub(live + cancelling + failed + interrupted + cancelled);
 
     let mut breakdown = Vec::with_capacity(5);
     if live > 0 {
@@ -111,6 +114,9 @@ pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
     }
     if failed > 0 {
         breakdown.push(format!("{failed} failed"));
+    }
+    if interrupted > 0 {
+        breakdown.push(format!("{interrupted} interrupted"));
     }
     if cancelled > 0 {
         breakdown.push(format!("{cancelled} cancelled"));
@@ -201,6 +207,10 @@ pub(crate) fn active_viewport(
                         tc.status,
                         crate::tui::history_cell::task::TaskStatus::Running
                     );
+                    let raw_interrupted = matches!(
+                        tc.status,
+                        crate::tui::history_cell::task::TaskStatus::Interrupted
+                    );
                     // Cancellation is an overlay on the underlying
                     // status. A user-cancelled agent that came back as
                     // Failed renders as Cancelled (the underlying
@@ -218,6 +228,7 @@ pub(crate) fn active_viewport(
                             .unwrap_or_else(|| tc.started_at.elapsed().as_millis() as u64),
                         live: raw_running && !is_cancelling && !is_cancelled,
                         failed: raw_failed && !is_cancelled,
+                        interrupted: raw_interrupted && !is_cancelled,
                         cancelled: is_cancelled,
                         cancelling: is_cancelling && !is_cancelled,
                     }
@@ -351,7 +362,8 @@ pub(crate) fn active_viewport(
 fn should_show_multi_agent_strip(cells: &[MultiAgentEntry], any_recently_terminal: bool) -> bool {
     let any_live = cells.iter().any(|entry| entry.live || entry.cancelling);
     let any_failed = cells.iter().any(|entry| entry.failed);
-    any_live || any_failed || any_recently_terminal
+    let any_interrupted = cells.iter().any(|entry| entry.interrupted);
+    any_live || any_failed || any_interrupted || any_recently_terminal
 }
 
 /// Pure priority resolver. Priority: **Active > Status > NextHint >
@@ -509,6 +521,8 @@ pub(crate) fn do_draw(
                 ("⊘", ratatui::style::Color::Yellow)
             } else if entry.failed {
                 ("✗", ratatui::style::Color::Red)
+            } else if entry.interrupted {
+                ("Ⅱ", ratatui::style::Color::Yellow)
             } else if entry.live {
                 ("◦", ratatui::style::Color::Yellow)
             } else {
@@ -519,6 +533,8 @@ pub(crate) fn do_draw(
                 " · Cancelling…"
             } else if entry.cancelled {
                 " · Cancelled"
+            } else if entry.interrupted {
+                " · Interrupted"
             } else {
                 ""
             };
@@ -1090,6 +1106,7 @@ mod multi_agent_strip_tests {
             elapsed_ms: 0,
             live,
             failed,
+            interrupted: false,
             cancelled: false,
             cancelling: false,
         }
@@ -1279,6 +1296,7 @@ mod multi_agent_strip_tests {
             elapsed_ms: 12_000,
             live: true,
             failed: false,
+            interrupted: false,
             cancelled: false,
             cancelling: false,
         };

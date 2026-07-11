@@ -29,7 +29,6 @@ use futures_util::FutureExt;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, RwLock, broadcast, mpsc, oneshot};
-use tracing::Instrument;
 
 use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
@@ -47,7 +46,7 @@ use astra_services::runs::{
     RequestedTurnInteractionMode, RunInputData, RunInputRecord, RunLifecycleService, RunListCursor,
     RunListRecord, RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord,
     RunStatusRecord, RuntimeAuthRequest, RuntimeProfileRequest, SelectedModelRequest,
-    durable_run_status_kind,
+    durable_run_status_blocks_session, durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::session_restore::{
@@ -154,22 +153,21 @@ fn should_restore_prior_prompt_history(
     request_targets_existing_session && session_has_prior_prompt_history
 }
 
-fn is_non_blocking_task_board_settlement(
-    interruption: &astra_turn_core::interruption::InterruptionRecord,
-    task_board_snapshot: &crate::turn::agentic_loop::host::TaskBoardSnapshot,
-    loop_state: &AgenticLoopState,
-    waiting_for: Option<&str>,
-) -> bool {
-    matches!(interruption.kind, InterruptionKind::EmptyCompletion)
-        && matches!(
-            interruption.resume_action,
-            ResumeAction::ContinueImmediately
-        )
-        && matches!(interruption.resume_mode, ResumeMode::Settle)
-        && waiting_for.is_none()
-        && loop_state.final_text.trim().is_empty()
-        && task_board_snapshot.has_unfinished_tasks()
-        && !task_board_snapshot.requires_settlement_intervention()
+fn task_board_settlement_payload(
+    snapshot: &crate::turn::agentic_loop::host::TaskBoardSnapshot,
+) -> Option<Value> {
+    snapshot.has_unfinished_tasks().then(|| {
+        json!({
+            "summary": snapshot.short_summary(),
+            "tracked_count": snapshot.tracked_count,
+            "pending_count": snapshot.pending_count,
+            "in_progress_count": snapshot.in_progress_count,
+            "paused_count": snapshot.paused_count,
+            "blocked_count": snapshot.blocked_count,
+            "terminal_non_success_count": snapshot.terminal_non_success_count,
+            "active_tasks": snapshot.active_tasks,
+        })
+    })
 }
 
 /// Wire a freshly-constructed [`runtime_tool_executor::RuntimeToolExecutor`]
@@ -411,100 +409,73 @@ async fn run_post_loop_memory_cleanup_work(
     // session or the TUI issues follow-up turns). Running governance
     // per run would write one episode per turn and hammer reflect.
     // The debouncer allows one governance per session per window.
-    let mut episode_was_written = false;
-    if let Some(ref memoria_client) =
-        crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env()
-    {
-        let debouncer = crate::turn::session_end_debounce::global();
-        if matches!(
-            debouncer.should_run(&session_id),
-            crate::turn::session_end_debounce::DebounceDecision::Run
-        ) {
-            match crate::turn::cloud::session_end_governance::run_session_end_governance(
-                &session_facts,
-                &session_id,
-                memoria_client,
+    let debouncer = crate::turn::session_end_debounce::global();
+    if matches!(
+        debouncer.should_run(&session_id),
+        crate::turn::session_end_debounce::DebounceDecision::Run
+    ) {
+        let report = if let Some(svc) = extraction_service.as_ref() {
+            Some(
+                svc.run_session_end_governance(&session_facts, &session_id)
+                    .await,
             )
-            .await
-            {
-                Ok(report) => {
-                    episode_was_written = report.episode_chars > 0;
-                    if episode_was_written
-                        || report.working_purged > 0
-                        || report.reflect_candidates > 0
-                        || report.scenes_stored > 0
-                    {
-                        tracing::info!(
-                            session_id = %session_id,
-                            learnings = report.learnings_stored,
-                            purged = report.working_purged,
-                            episode_chars = report.episode_chars,
-                            reflect_candidates = report.reflect_candidates,
-                            reflect_synthesized = report.reflect_synthesized,
-                            scenes_stored = report.scenes_stored,
-                            "session-end governance complete"
-                        );
-                    }
-                    debouncer.record(&session_id);
-                }
-                Err(e) => {
-                    tracing::warn!(
+        } else if let Some(memoria_client) =
+            crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env()
+        {
+            Some(
+                crate::turn::cloud::session_end_governance::run_session_end_governance(
+                    &session_facts,
+                    &session_id,
+                    &memoria_client,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+        match report {
+            Some(Ok(report)) => {
+                if report.episode_chars > 0
+                    || report.working_purged > 0
+                    || report.working_retained_due_to_episode_failure
+                    || report.reflect_candidates > 0
+                    || report.scenes_stored > 0
+                {
+                    tracing::info!(
                         session_id = %session_id,
-                        error = %e,
-                        "session-end governance failed"
+                        purged = report.working_purged,
+                        working_retained = report.working_retained_due_to_episode_failure,
+                        episode_chars = report.episode_chars,
+                        reflect_candidates = report.reflect_candidates,
+                        reflect_synthesized = report.reflect_synthesized,
+                        scenes_stored = report.scenes_stored,
+                        "session-end governance complete"
                     );
                 }
+                debouncer.record(&session_id);
             }
-        } else {
-            tracing::debug!(
+            Some(Err(error)) => tracing::warn!(
                 session_id = %session_id,
-                "session-end governance skipped by debounce"
-            );
+                error = %error,
+                "session-end governance failed"
+            ),
+            None => tracing::debug!(
+                session_id = %session_id,
+                "session-end governance skipped because no memory provider is configured"
+            ),
         }
-
-        // ── Close the recall → outcome feedback loop ──────────────
-        //
-        // Every LLM-driven `memory(action=recall)` pushed its returned
-        // memory_ids onto the process-global recall ledger. Drain them
-        // here and route a feedback signal to Memoria. Conservative
-        // heuristic:
-        //   • episode was written (session did substantive work)
-        //       → signal `useful` — the recall was at least surfaced
-        //         into a productive session
-        //   • trivial session (no episode)
-        //       → drop without scoring — not enough evidence
-        //
-        // A richer attribution (per-tool-call outcome mapping) needs
-        // the tool dispatch layer to report success/failure per recall,
-        // which is a bigger refactor. The episode-level heuristic is
-        // the smallest step that closes the loop in production.
-        let snapshots = astra_tools::memoria::MemoriaClient::drain_recalls(&session_id, None);
-        if !snapshots.is_empty() && episode_was_written {
-            use crate::turn::cloud::memoria_compact::MemoriaClient as ServerMemoriaClient;
-            for snap in &snapshots {
-                for id in &snap.memory_ids {
-                    let ctx = format!("session-end: turn {} productive session", snap.turn);
-                    if let Err(e) =
-                        ServerMemoriaClient::feedback(memoria_client, id, "useful", Some(&ctx))
-                            .await
-                    {
-                        tracing::debug!(memory_id = %id, error = %e, "feedback push failed");
-                    }
-                }
-            }
-            tracing::info!(
-                session_id = %session_id,
-                snapshots = snapshots.len(),
-                "closed recall → useful feedback loop"
-            );
-        } else if !snapshots.is_empty() {
-            tracing::debug!(
-                session_id = %session_id,
-                snapshots = snapshots.len(),
-                "session trivial; dropped recall snapshots without scoring"
-            );
-        }
+    } else {
+        tracing::debug!(
+            session_id = %session_id,
+            "session-end governance skipped by debounce"
+        );
     }
+
+    // Unattributed recall is not positive evidence. A productive session may
+    // have ignored or worked around a bad memory, so session end never marks
+    // every surfaced item `useful`. Tool/user outcome paths send feedback only
+    // when they can attribute useful/outdated/wrong to a concrete memory id.
     reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
     record_post_loop_memory_cleanup_worker_metrics(metrics_registry.as_ref(), "completed");
 }
@@ -521,7 +492,7 @@ fn reset_post_loop_memory_process_state(
     // and the recall ledger are clean even if
     // governance didn't run (e.g. no memoria client configured, or drain
     // was conditional on an episode being written).
-    astra_tools::memoria::MemoriaClient::reset_session_process_state(session_id);
+    astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
 
     // ── Always: release extraction service's per-session debounce ──
     if let Some(svc) = extraction_service {
@@ -819,7 +790,7 @@ fn build_runtime_turn_evaluation_event(
 ) -> astra_services::session_journal::JournalEvent {
     let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
     let eval_thresholds = crate::pipeline::evaluation::current_evaluation_thresholds();
-    let mut eval = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
+    let eval = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
         &state.message,
         &state.recent_tools,
         &state.stall.tool_call_records,
@@ -827,11 +798,6 @@ fn build_runtime_turn_evaluation_event(
         verdict_warning,
         state.telemetry.first_budget_pressure,
         eval_thresholds,
-    );
-    crate::pipeline::evaluation::apply_final_answer_relevance(
-        &mut eval,
-        &state.message,
-        &state.final_text,
     );
     crate::pipeline::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),
@@ -1000,6 +966,8 @@ async fn persist_runtime_promotion_events(
             .create_event(
                 user_id.to_string(),
                 EventCreateRequestData {
+                    ingestion_source: astra_services::events::EventIngestionSource::Client,
+                    event_id: None,
                     session_id: session_id.to_string(),
                     event_type: RUNTIME_PROMOTION_EVENT_TYPE.to_string(),
                     content: promotion.summary.clone(),
@@ -2222,6 +2190,7 @@ impl AgenticRunLifecycleService {
             llm_cancel_token: llm_cancel_token.clone(),
             live_tx: None,
             waiting_for: None,
+            execution_live: true,
         };
         (run_state, cancel_flag, pause_flag, llm_cancel_token)
     }
@@ -2242,6 +2211,56 @@ impl AgenticRunLifecycleService {
     fn session_has_blocking_run(runs: &HashMap<String, RunState>, session_id: &str) -> bool {
         runs.values()
             .any(|run| Self::blocks_new_session_run(run, session_id))
+    }
+
+    async fn run_execution_is_live(&self, durable: &DurableRunRecord) -> bool {
+        if let Some(run) = self.runs.read().await.get(&durable.run_id) {
+            return run.execution_live;
+        }
+        durable_run_owner_lease_is_live(durable)
+    }
+
+    async fn reconcile_orphaned_execution_for_session_continuation(
+        &self,
+        durable: &DurableRunRecord,
+        requested_operation: &'static str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        if !durable_run_status_blocks_session(&durable.status, durable.waiting_for.as_deref()) {
+            return Ok(false);
+        }
+        let interruption_event = json!({
+            "event_type": "run_interrupted",
+            "data": {
+                "kind": "executor_not_live",
+                "previous_status": durable.status,
+                "requested_operation": requested_operation,
+                "resumable": true,
+                "resume_strategy": "session_continuation",
+                "releases_session_slot": true,
+            }
+        });
+        let updated = self
+            .run_engine
+            .transition_status_with_event_if_current(
+                &durable.user_id,
+                &durable.run_id,
+                &[durable.status.as_str()],
+                STATUS_PAUSED,
+                None,
+                None,
+                interruption_event.clone(),
+            )
+            .await
+            .map_err(|error| Self::durable_persist_error("orphan recovery transition", error))?;
+        if updated && let Some(run) = self.runs.write().await.get_mut(&durable.run_id) {
+            run.status = RunStatus::Paused;
+            run.waiting_for = None;
+            run.execution_live = false;
+            run.pause_flag.store(false, Ordering::SeqCst);
+            run.live_tx = None;
+            run.events.push(interruption_event);
+        }
+        Ok(updated)
     }
 
     fn configure_loop_state_runtime_controls(
@@ -2389,12 +2408,7 @@ impl AgenticRunLifecycleService {
                 Ok(AgenticLoopOutcome::Completed) => {
                     if let Some(interruption) = loop_state.interruption.as_ref() {
                         let task_board_snapshot = loop_state.hooks.task_board_snapshot.clone();
-                        let task_board_open = task_board_snapshot.has_unfinished_tasks();
-                        let task_board_requires_intervention =
-                            task_board_snapshot.requires_settlement_intervention();
-                        let waiting_for = if task_board_requires_intervention {
-                            Some("task_board_intervention".to_string())
-                        } else if matches!(
+                        let waiting_for = if matches!(
                             interruption.resume_action,
                             astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
                                 | astra_turn_core::interruption::ResumeAction::StartNewSession
@@ -2403,38 +2417,8 @@ impl AgenticRunLifecycleService {
                         } else {
                             None
                         };
-                        let task_board_payload = task_board_open.then(|| {
-                            json!({
-                                "summary": task_board_snapshot.short_summary(),
-                                "tracked_count": task_board_snapshot.tracked_count,
-                                "pending_count": task_board_snapshot.pending_count,
-                                "in_progress_count": task_board_snapshot.in_progress_count,
-                                "paused_count": task_board_snapshot.paused_count,
-                                "blocked_count": task_board_snapshot.blocked_count,
-                                "terminal_non_success_count": task_board_snapshot.terminal_non_success_count,
-                                "active_tasks": task_board_snapshot.active_tasks,
-                            })
-                        });
-                        if is_non_blocking_task_board_settlement(
-                            interruption,
-                            &task_board_snapshot,
-                            loop_state,
-                            waiting_for.as_deref(),
-                        ) {
-                            let mut finished = usage;
-                            finished["settled_interruption_kind"] =
-                                Value::String(interruption.kind.label().to_string());
-                            finished["resume_mode"] =
-                                Value::String(interruption.resume_mode.label().to_string());
-                            if let Some(task_board) = task_board_payload {
-                                finished["task_board"] = task_board;
-                            }
-                            events.push(json!({
-                                "event_type": "run_finished",
-                                "data": finished,
-                            }));
-                            return (events, RunStatus::Completed, None);
-                        }
+                        let task_board_payload =
+                            task_board_settlement_payload(&task_board_snapshot);
                         let mut interruption_json = interruption.to_json();
                         if let Some(obj) = interruption_json.as_object_mut() {
                             if let Some(waiting_for) = waiting_for.as_ref() {
@@ -2481,9 +2465,15 @@ impl AgenticRunLifecycleService {
                             "data": { "full_text": loop_state.final_text.clone() }
                             }));
                         }
+                        let mut finished = usage;
+                        if let Some(task_board) =
+                            task_board_settlement_payload(&loop_state.hooks.task_board_snapshot)
+                        {
+                            finished["task_board"] = task_board;
+                        }
                         events.push(json!({
                             "event_type": "run_finished",
-                            "data": usage,
+                            "data": finished,
                         }));
                         (RunStatus::Completed, None)
                     }
@@ -2524,9 +2514,22 @@ impl AgenticRunLifecycleService {
                     let msg = format!("waiting: {w}");
                     events.push(json!({
                         "event_type": "run_waiting",
-                        "data": {"reason": msg.clone()}
+                        "data": {
+                            "reason": msg,
+                            "resumable": true,
+                            "resume_strategy": "session_continuation",
+                            "execution_live": false,
+                        }
                     }));
-                    (RunStatus::Waiting, Some(msg))
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": {
+                            "interrupted": true,
+                            "resumable": true,
+                            "resume_strategy": "session_continuation",
+                        }
+                    }));
+                    (RunStatus::Paused, None)
                 }
                 Err(err) => {
                     let msg = err.to_string();
@@ -4299,6 +4302,20 @@ impl AgenticRunLifecycleService {
         let edge_profile = edge_profile_override
             .cloned()
             .unwrap_or_else(|| edge_context.edge_profile.to_map());
+        let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
+            match svc.scoped_to_owner(user_id) {
+                Ok(scoped) => Some(scoped),
+                Err(error) => {
+                    tracing::error!(
+                        user_id,
+                        session_id,
+                        error = %error,
+                        "session-memory extraction disabled because the transport could not bind the authenticated owner"
+                    );
+                    None
+                }
+            }
+        });
         let skill_executor = build_server_skill_executor(
             &self.matrixone,
             &self.encryptor,
@@ -4316,7 +4333,7 @@ impl AgenticRunLifecycleService {
             session_id,
             self.edge_connection_pool.as_ref(),
             cancel_token,
-            self.memory_extraction_service.as_ref(),
+            memory_extraction_service.as_ref(),
             #[cfg(feature = "harness")]
             harness_sink_arc.as_ref(),
         );
@@ -4342,9 +4359,8 @@ impl AgenticRunLifecycleService {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
-            textless_stop_retries: 0,
             last_finish_reason: None,
             max_turns,
             remaining_turns: max_turns,
@@ -4451,7 +4467,7 @@ impl AgenticRunLifecycleService {
             runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            memory_extraction_service: self.memory_extraction_service.clone(),
+            memory_extraction_service,
             observation_journal: Default::default(),
             observation_store: None,
             session_memory_state: Default::default(),
@@ -4993,30 +5009,21 @@ impl AgenticRunLifecycleService {
 fn build_shutdown_extraction_request(
     state: &AgenticLoopState,
 ) -> Option<crate::session_memory::ExtractionRequest> {
-    let user_id = state.context_manifest_user_id.clone()?;
+    state.context_manifest_user_id.as_ref()?;
     let runtime_decision_user_intent = state.runtime_decision_user_intent();
-    state.current_session_id.as_ref().map(|session_id| {
-        crate::session_memory::ExtractionRequest {
-            user_id,
+    state
+        .current_session_id
+        .as_ref()
+        .map(|session_id| crate::session_memory::ExtractionRequest {
             session_id: session_id.clone(),
             messages: state.messages.clone(),
             session_facts: state.session_facts.clone(),
-            current_tokens: state
-                .total_prompt
-                .saturating_add(state.total_cache_read)
-                .saturating_add(state.total_cache_creation)
-                as usize,
-            current_tool_calls: state.total_tool_calls as usize,
             had_error: state.error_recovery.consecutive_same_error > 0,
             had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(
                 &runtime_decision_user_intent,
             ),
             turn_number: state.current_session_turn_number(),
-            config:
-                astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
-                ),
-        }
-    })
+        })
 }
 
 fn exact_runtime_string(
@@ -6170,6 +6177,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let mut persist_terminal_events = true;
 
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                    run.execution_live = false;
                     if run.status == RunStatus::Cancelled {
                         persist_status_update = false;
                         persist_terminal_events = false;
@@ -6349,6 +6357,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
+                // The execution is no longer resumable once its durable final
+                // state has been reconciled. Release cross-pod ownership before
+                // slower observability, memory, and workspace cleanup so those
+                // side effects do not extend the executor's apparent lifetime.
+                drop(_owner_lease_heartbeat);
+
                 if persist_terminal_events {
                     flush_turn_observability(&mut loop_state, &bg_session_id, false);
                     persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &loop_state);
@@ -6412,23 +6426,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        let request_started_at = Instant::now();
         let request = Self::prepare_chat_request(request)?;
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
         let mut request = self.prepare_model_gateway_invocation(request).await?;
         Self::install_agent_binding_runtime_forward_headers(&mut request)?;
-        let correlation_request_id = request
-            .forward_headers
-            .get("x-request-id")
-            .map(String::as_str)
-            .unwrap_or("")
-            .to_string();
-        let request_resolution_ms = request_started_at.elapsed().as_millis() as u64;
 
         // ── Resource governance check ────────────────────────────────
-        let governance_started_at = Instant::now();
         if let Some(ref gov) = self.resource_governor {
             if let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
                 gov.check_run_start(&user_id).await
@@ -6436,7 +6441,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(per_user_run_quota_response(limit, reason));
             }
         }
-        let governance_ms = governance_started_at.elapsed().as_millis() as u64;
 
         let run_id = Uuid::new_v4().to_string();
         let session_id = request
@@ -6445,7 +6449,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let agent_binding_mode = request.agent_binding.is_some();
-        let capability_resolution_started_at = Instant::now();
         let edge_context = Self::extract_edge_context(&request)?;
         let edge_tools = edge_context.edge_tools.clone();
         let server_service_tool_catalog_enabled =
@@ -6464,12 +6467,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         );
-        let capability_resolution_ms =
-            capability_resolution_started_at.elapsed().as_millis() as u64;
 
         // Provision explicit workspace bindings early so build_initial_state
         // and durable run_started metadata use the same execution boundary.
-        let workspace_started_at = Instant::now();
         let cloud_workspace_record = self
             .provision_cloud_workspace_record(&user_id, &session_id, &request, &run_id)
             .await?;
@@ -6515,11 +6515,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .server_agent_spawner_for_session(&session_id)
             .await
             .spawner;
-        let workspace_ms = workspace_started_at.elapsed().as_millis() as u64;
 
         // Create bounded live channels. If a client cannot keep up, the host
         // detaches that live stream without cancelling the server-side run.
-        let state_restore_started_at = Instant::now();
         const SSE_CHANNEL_CAPACITY: usize = 512;
         let (client_event_tx, event_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let (event_tx, mut fanout_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
@@ -6670,11 +6668,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
         }
-        let state_restore_ms = state_restore_started_at.elapsed().as_millis() as u64;
 
         // Guard: reject if this session already has a blocking run.
         // Hold write lock across check+insert to prevent TOCTOU race.
-        let durable_run_started_at = Instant::now();
         {
             let mut runs = self.runs.write().await;
             let has_active = Self::session_has_blocking_run(&runs, &session_id);
@@ -6768,9 +6764,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             };
             persist_session_transcript_items(pool, &user_id, &session_id, &[user_transcript]).await;
         }
-        let durable_run_ms = durable_run_started_at.elapsed().as_millis() as u64;
 
-        let runtime_wiring_started_at = Instant::now();
         self.configure_loop_state_runtime_controls(
             &mut state,
             &cancel_flag,
@@ -6916,7 +6910,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await;
             wire_executor_into_state(executor, &mut state);
         }
-        let runtime_wiring_ms = runtime_wiring_started_at.elapsed().as_millis() as u64;
 
         // Clone handles for the background task.
         let runs = self.runs_handle();
@@ -6951,7 +6944,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── Global admission control: limit concurrent agentic loop tasks ──
         // Wait for a configured interval before returning a structured 503.
-        let admission_started_at = Instant::now();
         let permit = match self.acquire_run_permit(run_admission_timeout()).await {
             Ok(permit) => permit,
             Err(error) => {
@@ -6979,46 +6971,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(run_admission_capacity_response(error));
             }
         };
-        let admission_ms = admission_started_at.elapsed().as_millis() as u64;
 
         // Background task tracking (same pattern as the create_run spawn above).
         // Spawn the agentic loop in a background task. Events are pushed
         // through event_tx incrementally; the HTTP handler streams them.
         let bg_task_count_2 = Arc::clone(&self.background_task_count);
         bg_task_count_2.fetch_add(1, Ordering::Release);
-        let request_prepare_ms = request_started_at.elapsed().as_millis() as u64;
-        tracing::info!(
-            target: "astra_runtime::timing",
-            operation = "stream_chat.prepare",
-            status = "success",
-            request_id = %correlation_request_id,
-            run_id = %run_id,
-            session_id = %session_id,
-            user_id = %user_id,
-            agent_id = %request.agent_id.as_deref().unwrap_or(""),
-            model = %request.model.as_deref().unwrap_or(""),
-            request_resolution_ms,
-            governance_ms,
-            capability_resolution_ms,
-            workspace_ms,
-            state_restore_ms,
-            durable_run_ms,
-            runtime_wiring_ms,
-            admission_ms,
-            duration_ms = request_prepare_ms,
-            "stream chat run prepared"
-        );
-        let run_span = tracing::info_span!(
-            target: "astra_runtime::timing",
-            "astra.run",
-            request_id = %correlation_request_id,
-            run_id = %run_id,
-            session_id = %session_id,
-            user_id = %user_id,
-        );
         spawn_observed(
             async move {
-                let background_started_at = Instant::now();
                 let _permit = permit; // RAII: released when this task completes
                 struct TaskCountGuard(Arc<AtomicUsize>);
                 impl Drop for TaskCountGuard {
@@ -7073,13 +7033,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 .await;
                             }
                         }
-                        tracing::warn!(
-                            target: "astra_runtime::timing",
-                            operation = "stream_chat.run",
-                            status = "quota_rejected",
-                            duration_ms = background_started_at.elapsed().as_millis() as u64,
-                            "streaming run completed"
-                        );
                         drop(event_tx);
                         return;
                     }
@@ -7164,6 +7117,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let mut persist_status_update = true;
                 let mut persist_streaming_events = true;
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                    run.execution_live = false;
                     if run.status == RunStatus::Cancelled {
                         persist_status_update = false;
                         persist_streaming_events = false;
@@ -7351,6 +7305,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
+                // Keep the owner lease through terminal CAS/event repair, then
+                // release it before client fanout and post-loop cleanup. These
+                // side effects must not advertise a live resume/input consumer.
+                drop(_owner_lease_heartbeat);
+
                 for event in missing_lifecycle_events {
                     if event_tx.send(event).await.is_err() {
                         break;
@@ -7367,28 +7326,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // Failed/cancelled/waiting turns terminate via their run lifecycle
                 // event (`run_error`, `run_finished`, `run_waiting`) instead.
                 if should_emit_stream_turn_complete(&final_status) {
+                    let mut completion_facts =
+                        astra_turn_core::complete::TurnCompletionFacts::from_tool_signatures(
+                            &state.stall.turn_sigs,
+                        );
+                    completion_facts.stall_detected |= !state.stall.events.is_empty();
                     let _ = event_tx
                         .send(build_run_turn_complete_event_with_interruption(
                             state.total_tool_calls,
                             &state.final_text,
                             state.interruption.as_ref(),
+                            &completion_facts,
                         ))
                         .await;
                 }
-
-                let stream_duration_ms = background_started_at.elapsed().as_millis() as u64;
-                tracing::info!(
-                    target: "astra_runtime::timing",
-                    operation = "stream_chat.run",
-                    status = persisted_status.as_str(),
-                    duration_ms = stream_duration_ms,
-                    agentic_loop_ms,
-                    finalization_ms = stream_duration_ms.saturating_sub(agentic_loop_ms),
-                    prompt_tokens = state.total_prompt,
-                    completion_tokens = state.total_completion,
-                    tool_calls = state.total_tool_calls,
-                    "streaming run completed"
-                );
 
                 // Drop event_tx — signals end-of-stream to the HTTP handler.
                 drop(event_tx);
@@ -7396,7 +7347,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // Post-loop memory cleanup — identical to `create_run`. Runs
                 // AFTER event_tx drops; default async mode schedules external
                 // Memoria work without holding the run permit on governance RTT.
-                let cleanup_started_at = Instant::now();
                 post_loop_memory_cleanup(
                     state.current_session_id.as_deref().unwrap_or(""),
                     &state.session_facts,
@@ -7417,16 +7367,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     )
                     .await;
                 }
-                tracing::info!(
-                    target: "astra_runtime::timing",
-                    operation = "stream_chat.cleanup",
-                    status = "completed",
-                    duration_ms = cleanup_started_at.elapsed().as_millis() as u64,
-                    total_background_ms = background_started_at.elapsed().as_millis() as u64,
-                    "streaming run cleanup completed"
-                );
-            }
-            .instrument(run_span),
+            },
             "agentic_loop_stream_chat",
         );
 
@@ -7729,6 +7670,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
         }
 
+        if !self.run_execution_is_live(&durable).await {
+            self.reconcile_orphaned_execution_for_session_continuation(&durable, "submit_input")
+                .await?;
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "This run no longer has a live input consumer. Continue the session to start a new run instead of queueing input to an orphaned execution.",
+                "run_input_consumer_not_live",
+            ));
+        }
+
         durable_status
             .try_transition(&RunStatus::InputQueued)
             .map_err(|_| Self::run_state_conflict("submit input to", &durable.status))?;
@@ -7958,6 +7909,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             return Err(Self::run_state_conflict("pause", &durable.status));
         }
 
+        if !self.run_execution_is_live(&durable).await {
+            if self
+                .reconcile_orphaned_execution_for_session_continuation(&durable, "pause")
+                .await?
+            {
+                return Ok(RunMutationRecord {
+                    run_id,
+                    status: STATUS_PAUSED.to_string(),
+                    previous_status: durable.status,
+                });
+            }
+            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            return Err(Self::run_state_conflict("pause", &current.status));
+        }
+
         let pause_event = json!({"event_type": "run_paused", "data": {}});
         // Always write to DB first — the source of truth for cross-pod control.
         let status_updated = self
@@ -8007,6 +7973,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             return Err(Self::run_state_conflict("resume", &durable.status));
         }
 
+        // Buffered completion resume is completion promotion, not execution
+        // resumption. It deliberately bypasses the session execution slot so a
+        // paused run with an already-buffered terminal answer can be finalized
+        // even if another root turn later acquired the session slot.
         if has_buffered_terminal_completion(&durable.events) {
             let status_updated = self
                 .run_engine
@@ -8055,13 +8025,45 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
         }
 
+        if !self.run_execution_is_live(&durable).await {
+            self.reconcile_orphaned_execution_for_session_continuation(&durable, "resume")
+                .await?;
+            if self
+                .run_engine
+                .find_blocking_session_run(&user_id, &durable.session_id)
+                .await
+                .map_err(|error| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Failed to verify session execution slot: {error}"),
+                    )
+                })?
+                .is_some_and(|blocker| blocker.run_id != run_id)
+            {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "session already has an active run".to_string(),
+                ));
+            }
+            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            if current.status != STATUS_PAUSED {
+                return Err(Self::run_state_conflict("resume", &current.status));
+            }
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "This run no longer has a live executor. Continue the session to create a new run from restored history and checkpoint evidence.",
+                "run_execution_not_live",
+            ));
+        }
+
         let resume_event = json!({"event_type": "run_resumed", "data": {}});
         // Always write to DB first — the source of truth for cross-pod control.
-        let status_updated = self
+        let transition = self
             .run_engine
-            .transition_status_with_event_if_current(
+            .transition_status_with_event_if_current_unless_session_blocked(
                 &user_id,
                 &run_id,
+                &durable.session_id,
                 &[STATUS_PAUSED],
                 STATUS_RUNNING,
                 None,
@@ -8070,9 +8072,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await
             .map_err(|error| Self::durable_persist_error("resume transition", error))?;
-        if !status_updated {
-            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
-            return Err(Self::run_state_conflict("resume", &current.status));
+        match transition {
+            astra_services::runs::GuardedRunStatusTransition::Updated => {}
+            astra_services::runs::GuardedRunStatusTransition::SessionBlocked => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "session already has an active run".to_string(),
+                ));
+            }
+            astra_services::runs::GuardedRunStatusTransition::StatusConflict => {
+                let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+                return Err(Self::run_state_conflict("resume", &current.status));
+            }
         }
 
         {
@@ -8343,13 +8354,12 @@ fn server_subrun_live_termination(
         Ok(AgenticLoopOutcome::Completed)
             if server_subrun_completed_status(loop_state) == STATUS_PAUSED =>
         {
-            AgentLiveTermination::Cancelled
+            AgentLiveTermination::Interrupted
         }
         Ok(AgenticLoopOutcome::Completed) => AgentLiveTermination::Completed,
+        Ok(AgenticLoopOutcome::Cancelled) => AgentLiveTermination::Cancelled,
+        Ok(AgenticLoopOutcome::Waiting(_)) => AgentLiveTermination::Interrupted,
         Ok(AgenticLoopOutcome::Delegated) => AgentLiveTermination::Delegated,
-        Ok(AgenticLoopOutcome::Cancelled | AgenticLoopOutcome::Waiting(_)) => {
-            AgentLiveTermination::Cancelled
-        }
         Ok(AgenticLoopOutcome::Error(_) | AgenticLoopOutcome::ControlRejected(_)) | Err(_) => {
             AgentLiveTermination::Failed
         }
@@ -8378,32 +8388,26 @@ fn server_subrun_live_reason(
     }
 }
 
+fn server_subrun_outcome_status(
+    outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    loop_state: &AgenticLoopState,
+) -> &'static str {
+    match outcome {
+        Ok(AgenticLoopOutcome::Completed) => server_subrun_completed_status(loop_state),
+        Ok(AgenticLoopOutcome::Delegated) => STATUS_DELEGATED,
+        Ok(AgenticLoopOutcome::Cancelled) => STATUS_CANCELLED,
+        Ok(AgenticLoopOutcome::Waiting(_)) => STATUS_PAUSED,
+        Ok(AgenticLoopOutcome::Error(_) | AgenticLoopOutcome::ControlRejected(_)) | Err(_) => {
+            STATUS_FAILED
+        }
+    }
+}
+
 fn server_subrun_completed_status(loop_state: &AgenticLoopState) -> &'static str {
-    let Some(interruption) = loop_state.interruption.as_ref() else {
+    let Some(_interruption) = loop_state.interruption.as_ref() else {
         return STATUS_COMPLETED;
     };
-    let task_board_snapshot = &loop_state.hooks.task_board_snapshot;
-    let waiting_for = if task_board_snapshot.requires_settlement_intervention() {
-        Some("task_board_intervention")
-    } else if matches!(
-        interruption.resume_action,
-        astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
-            | astra_turn_core::interruption::ResumeAction::StartNewSession
-    ) {
-        Some("user_intervention")
-    } else {
-        None
-    };
-    if is_non_blocking_task_board_settlement(
-        interruption,
-        task_board_snapshot,
-        loop_state,
-        waiting_for,
-    ) {
-        STATUS_COMPLETED
-    } else {
-        STATUS_PAUSED
-    }
+    STATUS_PAUSED
 }
 
 #[async_trait]
@@ -8826,6 +8830,20 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let durable_user_id = config.user_id.clone();
         let durable_session_id = config.session_id.clone();
         let durable_run_id = config.run_id.clone();
+        let memory_extraction_service = self.memory_extraction_service.as_ref().and_then(|svc| {
+            match svc.scoped_to_owner(&config.user_id) {
+                Ok(scoped) => Some(scoped),
+                Err(error) => {
+                    tracing::error!(
+                        user_id = %config.user_id,
+                        session_id = %config.session_id,
+                        error = %error,
+                        "sub-run session-memory extraction disabled because owner binding failed"
+                    );
+                    None
+                }
+            }
+        });
 
         // Build edge profile from agent's system prompt and metadata.
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
@@ -8958,9 +8976,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
-            textless_stop_retries: 0,
             last_finish_reason: None,
             max_turns,
             remaining_turns: max_turns,
@@ -9071,7 +9088,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             runtime_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            memory_extraction_service: self.memory_extraction_service.clone(),
+            memory_extraction_service,
             observation_journal: Default::default(),
             observation_store: None,
             session_memory_state: Default::default(),
@@ -9253,87 +9270,24 @@ impl SubRunExecutor for ServerSubRunExecutor {
         );
 
         let prompt_tokens = loop_state.provider_input_tokens();
-        match &outcome {
-            Ok(AgenticLoopOutcome::Delegated) => {
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    STATUS_DELEGATED,
-                    None,
-                    None,
-                )
-                .await;
-            }
+        let projected_status = server_subrun_outcome_status(&outcome, &loop_state);
+        let durable_error = match &outcome {
+            Ok(AgenticLoopOutcome::Error(error)) => Some(error.clone()),
             Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    STATUS_FAILED,
-                    None,
-                    Some(rejection.message.as_str()),
-                )
-                .await;
+                Some(format!("{}: {}", rejection.code, rejection.message))
             }
-            Ok(AgenticLoopOutcome::Completed) => {
-                let status = server_subrun_completed_status(&loop_state);
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    status,
-                    None,
-                    None,
-                )
-                .await;
-            }
-            Ok(AgenticLoopOutcome::Cancelled) => {
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    STATUS_PAUSED,
-                    None,
-                    None,
-                )
-                .await;
-            }
-            Ok(AgenticLoopOutcome::Waiting(reason)) => {
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    STATUS_WAITING,
-                    Some(reason.as_str()),
-                    None,
-                )
-                .await;
-            }
-            Ok(AgenticLoopOutcome::Error(err)) => {
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    STATUS_FAILED,
-                    None,
-                    Some(err.as_str()),
-                )
-                .await;
-            }
-            Err(err) => {
-                let error = err.to_string();
-                self.persist_durable_subrun_terminal_status(
-                    &durable_user_id,
-                    &durable_session_id,
-                    &durable_run_id,
-                    STATUS_FAILED,
-                    None,
-                    Some(error.as_str()),
-                )
-                .await;
-            }
-        }
+            Err(error) => Some(error.to_string()),
+            _ => None,
+        };
+        self.persist_durable_subrun_terminal_status(
+            &durable_user_id,
+            &durable_session_id,
+            &durable_run_id,
+            projected_status,
+            None,
+            durable_error.as_deref(),
+        )
+        .await;
         self.persist_durable_subrun_usage(
             &durable_user_id,
             &durable_session_id,
@@ -9366,46 +9320,43 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     tool_calls: loop_state.total_tool_calls,
                 })
             }
-            Ok(AgenticLoopOutcome::Completed) => {
-                let status = server_subrun_completed_status(&loop_state);
-                Ok(astra_services::coordination::AgentResult {
-                    agent_id: config.agent_profile.agent_id,
-                    run_id: config.run_id,
-                    status: status.to_string(),
-                    output: if loop_state.final_text.is_empty() {
-                        None
-                    } else {
-                        Some(loop_state.final_text)
-                    },
-                    error: None,
-                    prompt_tokens,
-                    completion_tokens: loop_state.total_completion,
-                    tool_calls: loop_state.total_tool_calls,
-                })
-            }
-            Ok(AgenticLoopOutcome::Cancelled) => {
-                // Cancelled via pause_flag — report as "paused" so the
-                // delegation engine can distinguish from hard errors.
-                Ok(astra_services::coordination::AgentResult {
-                    agent_id: config.agent_profile.agent_id,
-                    run_id: config.run_id,
-                    status: STATUS_PAUSED.to_string(),
-                    output: if loop_state.final_text.is_empty() {
-                        None
-                    } else {
-                        Some(loop_state.final_text)
-                    },
-                    error: None,
-                    prompt_tokens,
-                    completion_tokens: loop_state.total_completion,
-                    tool_calls: loop_state.total_tool_calls,
-                })
-            }
+            Ok(AgenticLoopOutcome::Completed) => Ok(astra_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: projected_status.to_string(),
+                output: if loop_state.final_text.is_empty() {
+                    None
+                } else {
+                    Some(loop_state.final_text)
+                },
+                error: None,
+                prompt_tokens,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
+            Ok(AgenticLoopOutcome::Cancelled) => Ok(astra_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: projected_status.to_string(),
+                output: if loop_state.final_text.is_empty() {
+                    None
+                } else {
+                    Some(loop_state.final_text)
+                },
+                error: None,
+                prompt_tokens,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
             Ok(AgenticLoopOutcome::Waiting(reason)) => {
                 Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
-                    status: STATUS_WAITING.to_string(),
+                    // Durable state projects a waiting subrun to paused, but
+                    // the parent agent protocol must retain Waiting(reason).
+                    // Collapsing it here loses execution-boundary causes such
+                    // as executor_offline and lets the parent continue.
+                    status: astra_core::STATUS_WAITING.to_string(),
                     output: Some(reason),
                     error: None,
                     prompt_tokens,
@@ -9416,7 +9367,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             Ok(AgenticLoopOutcome::Error(err)) => Ok(astra_services::coordination::AgentResult {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
-                status: STATUS_FAILED.to_string(),
+                status: projected_status.to_string(),
                 output: None,
                 error: Some(err),
                 prompt_tokens,
@@ -9426,7 +9377,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             Err(err) => Ok(astra_services::coordination::AgentResult {
                 agent_id: config.agent_profile.agent_id,
                 run_id: config.run_id,
-                status: STATUS_FAILED.to_string(),
+                status: projected_status.to_string(),
                 output: None,
                 error: Some(err.to_string()),
                 prompt_tokens,

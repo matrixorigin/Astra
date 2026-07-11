@@ -122,6 +122,36 @@ pub(crate) fn isolate_credentials() -> CredentialsGuard {
     }
 }
 
+/// RAII guard for process environment mutations in serial tests.
+///
+/// Environment variables are process-global, so every test using this guard
+/// must also use `#[serial_test::serial]` when other tests read the same key.
+pub(crate) struct ProcessEnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl ProcessEnvGuard {
+    pub(crate) fn remove(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for ProcessEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 // ── Session Journal Isolation ──────────────────────────────────────────
 
 /// Create a temp dir on the workspace target filesystem, avoiding

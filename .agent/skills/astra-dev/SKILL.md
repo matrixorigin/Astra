@@ -34,6 +34,18 @@ The goal is to identify the owning crate, preserve the intent of existing edits,
 convert known facts into an executable checklist, change the smallest correct
 surface, and verify with the narrowest gate that proves the behavior.
 
+## Hard Rule: Structured Control Flow
+
+Do not add production control flow based on natural-language text matching.
+Safety, admission, routing, blocking, retry, recovery, evaluation, and state
+transitions must use typed facts: enums, `ErrorKind`, `result_class`,
+`exit_semantics`, structured tool-result JSON, protocol parsers, AST/token
+parsers, or exact machine-owned sentinel fields.
+
+Allowed text matching is rare: UI display/search, tests of rendered text, or
+legacy protocol fallback named with a `fallback` suffix. A fallback must not be
+the primary safety/admission/blocking/evaluation decision.
+
 ## Task
 
 $ARGUMENTS

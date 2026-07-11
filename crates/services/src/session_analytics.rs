@@ -56,14 +56,16 @@ pub fn compute_session_stats(session_id: &str, events: &[JournalEvent]) -> Sessi
                 stats.total_cache_read += event.cache_read_tokens.unwrap_or(0);
                 stats.total_cache_creation += event.cache_creation_tokens.unwrap_or(0);
                 stats.total_duration_ms += event.duration_ms.unwrap_or(0);
-                // Synthetic placeholders (skill skipped/deferred, surgically
-                // removed parallel calls) are not real tool executions — skip
-                // them from total + failed counts so tool_error_rate reflects
-                // actual tool reliability.
+                // Reliability counts only calls that reached an executor.
+                // Admission/cache/suppression outcomes are tracked by the
+                // turn's ToolOutcomeSummary instead of poisoning error rate.
                 if let Some(ref calls) = event.tool_calls {
                     let real_calls: Vec<_> = calls
                         .iter()
-                        .filter(|tc| !tc.is_synthetic_placeholder())
+                        .filter(|tc| {
+                            tc.effective_disposition()
+                                == crate::session_journal::ToolCallDisposition::Executed
+                        })
                         .collect();
                     stats.total_tool_calls += real_calls.len() as u32;
                     for tc in &real_calls {

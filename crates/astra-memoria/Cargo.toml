@@ -1,0 +1,13 @@
+[package]
+name = "astra-memoria"
+version.workspace = true
+edition.workspace = true
+description = "Canonical Memoria port, records, and per-session runtime state"
+
+[dependencies]
+astra-turn-types.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+

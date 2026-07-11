@@ -76,13 +76,13 @@ pub fn spawn_completion_status_from_finish_reason(finish_reason: Option<&str>) -
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SpawnStatusProjection {
+pub struct SpawnStatusProjection {
     pub status: &'static str,
     pub finish_reason: &'static str,
     pub error: Option<String>,
 }
 
-pub(crate) fn project_subrun_status_to_spawn(
+pub fn project_subrun_status_to_spawn(
     subrun_status: &str,
     error: Option<String>,
 ) -> SpawnStatusProjection {
@@ -141,10 +141,20 @@ fn spawn_run_result_to_agent_status(run_result: &SpawnRunResult) -> AgentStatus 
         SpawnRunStatusKind::Waiting => AgentStatus::Waiting {
             reason: run_result.output.clone().unwrap_or_default(),
         },
-        SpawnRunStatusKind::Completed => AgentStatus::Completed {
-            result: run_result.output.clone().unwrap_or_default(),
-            finish_reason: Some(run_result.finish_reason.clone()),
-        },
+        SpawnRunStatusKind::Completed => {
+            let result = run_result.output.clone().unwrap_or_default();
+            if agent_completion_is_interrupted(Some(run_result.finish_reason.as_str())) {
+                AgentStatus::Interrupted {
+                    partial_result: result,
+                    finish_reason: run_result.finish_reason.clone(),
+                }
+            } else {
+                AgentStatus::Completed {
+                    result,
+                    finish_reason: Some(run_result.finish_reason.clone()),
+                }
+            }
+        }
         SpawnRunStatusKind::Interrupted => AgentStatus::Interrupted {
             partial_result: run_result.output.clone().unwrap_or_default(),
             finish_reason: run_result.finish_reason.clone(),
@@ -1532,9 +1542,9 @@ impl DynamicAgentSpawner {
         let agent_name = input
             .name
             .clone()
-            .unwrap_or_else(|| format!("{}_{}", input.agent_type, &Uuid::new_v4().to_string()));
+            .unwrap_or_else(|| format!("{}_{}", input.agent_type, Uuid::new_v4()));
         let run_id = Uuid::new_v4().to_string();
-        let agent_id = format!("{}@{}", agent_name, &run_id);
+        let agent_id = format!("{}@{}", agent_name, run_id);
 
         // 3. Determine model and turns
         let model = input
@@ -3626,14 +3636,66 @@ mod tests {
             spawn_completion_status_from_finish_reason(Some("empty_completion")),
             "interrupted"
         );
+        assert_eq!(
+            spawn_completion_status_from_finish_reason(Some(
+                astra_turn_core::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON
+            )),
+            "interrupted"
+        );
     }
 
     #[test]
-    fn subrun_status_projection_maps_paused_and_unknown_via_spawn_owner() {
+    fn spawn_run_result_maps_response_guard_finish_reason_to_interrupted() {
+        let status = spawn_run_result_to_agent_status(&SpawnRunResult {
+            agent_id: "agent-1".into(),
+            run_id: "run-1".into(),
+            status: SPAWN_STATUS_COMPLETED.into(),
+            finish_reason: astra_turn_core::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON
+                .into(),
+            cancelled_by_user: None,
+            output: Some(astra_turn_core::response_guard::INTERNAL_PROTOCOL_FALLBACK.into()),
+            error: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+            permission_summary: None,
+            permission_requests: 0,
+            permission_requests_approved: 0,
+            tools_blocked: 0,
+        });
+
+        match status {
+            AgentStatus::Interrupted {
+                partial_result,
+                finish_reason,
+            } => {
+                assert_eq!(
+                    partial_result,
+                    astra_turn_core::response_guard::INTERNAL_PROTOCOL_FALLBACK
+                );
+                assert_eq!(
+                    finish_reason,
+                    astra_turn_core::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON
+                );
+            }
+            other => panic!("expected interrupted status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subrun_status_projection_maps_interruption_cancel_and_unknown_via_spawn_owner() {
         let paused = project_subrun_status_to_spawn(astra_core::STATUS_PAUSED, None);
         assert_eq!(paused.status, SPAWN_STATUS_INTERRUPTED);
         assert_eq!(paused.finish_reason, SPAWN_STATUS_INTERRUPTED);
         assert!(paused.error.is_none());
+
+        let waiting = project_subrun_status_to_spawn(astra_core::STATUS_WAITING, None);
+        assert_eq!(waiting.status, SPAWN_STATUS_WAITING);
+        assert_eq!(waiting.finish_reason, SPAWN_STATUS_WAITING);
+
+        let cancelled = project_subrun_status_to_spawn(astra_core::STATUS_CANCELLED, None);
+        assert_eq!(cancelled.status, SPAWN_STATUS_CANCELLED);
+        assert_eq!(cancelled.finish_reason, SPAWN_STATUS_CANCELLED);
 
         let unknown = project_subrun_status_to_spawn("mystery", None);
         assert_eq!(unknown.status, SPAWN_STATUS_FAILED);

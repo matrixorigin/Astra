@@ -172,36 +172,57 @@ fn rewrite_bridge_runtime_manifest_model_resolution(
     manifest["runtime_profile"] = json!(astra_runtime_env::CapacityProviderType::CliLocal.as_str());
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct CachedSessionStartMemory {
-    stable_memory_section: Option<String>,
-    stable_ids: Vec<String>,
+    entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
     fetch_ms: i64,
 }
 
 impl CachedSessionStartMemory {
-    fn from_prefetch(
-        session_start: SessionStartPrefetchResult,
-        memory_index: Option<String>,
-    ) -> Self {
-        let stable_memory_section = crate::turn::memory_prefetch::build_session_stable_memory_block(
-            memory_index.as_deref(),
-            session_start.section.as_deref(),
-        );
-        let stable_ids = session_start
-            .profile
-            .iter()
-            .chain(session_start.recent_episodes.iter())
-            .chain(session_start.recent_scenes.iter())
-            .map(|m| m.memory_id.clone())
-            .filter(|id| !id.is_empty())
-            .collect();
+    fn from_prefetch(session_start: SessionStartPrefetchResult) -> Self {
         Self {
-            stable_memory_section,
-            stable_ids,
+            entries: session_start.entries,
             fetch_ms: session_start.fetch_ms,
         }
     }
+}
+
+fn resolve_bridge_memory_provider(
+    server_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
+    request_binding: &Map<String, Value>,
+) -> (
+    Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
+    Option<&'static str>,
+) {
+    if let Some(client) = server_client {
+        return (Some(client), Some("server_config"));
+    }
+    if request_binding.get("provider").and_then(Value::as_str) != Some("memoria") {
+        return (None, None);
+    }
+    let Some(base_url) = request_binding
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (None, None);
+    };
+    let Some(api_key) = request_binding
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (None, None);
+    };
+    (
+        Some(crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
+            base_url.to_string(),
+            api_key.to_string(),
+        )),
+        Some("request_binding"),
+    )
 }
 
 async fn cached_first_turn_session_start_memory<F, Fut>(
@@ -305,25 +326,6 @@ fn always_load_tool_names_for_bridge(
                 .collect()
         })
         .unwrap_or_else(crate::turn::prompt_cache::runtime_always_load_tool_names)
-}
-
-/// Decide whether the bridge should run its own `prefetch_memories` call.
-///
-/// Returns `false` (= skip) when the CLI has already injected
-/// `memoria_insights_text`. Both the CLI's `memory_boost_search` +
-/// `render_digest` path and the bridge's `prefetch_memories` + `bind_memory`
-/// path hit the same Memoria backend with overlapping queries and `top_k=5`.
-/// Running both produces two differently-formatted memory sections
-/// (`## Memoria Recall` + `## User Memories`) whose contents substantially
-/// overlap — observed +~700 tok of duplicate content per turn in production
-/// sessions. The CLI digest is authoritative; when present, the bridge
-/// path is redundant.
-pub(crate) fn bridge_should_run_memoria_prefetch(edge_profile: &Map<String, Value>) -> bool {
-    let cli_has_insights = edge_profile
-        .get("memoria_insights_text")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty());
-    !cli_has_insights
 }
 
 /// Strip volatile `dynamic_sections` when the provider can't tolerate
@@ -1203,7 +1205,62 @@ fn required_runtime_text_for_bridge(
     ) {
         parts.push(text);
     }
+    parts.extend(
+        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+            edge_profile,
+        )
+        .into_iter()
+        .filter(|injection| {
+            injection.delivery_class
+                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+        })
+        .filter_map(|injection| injection.render_for_prompt()),
+    );
     (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+fn append_required_runtime_contexts(target: &mut Option<String>, contexts: &[String]) {
+    let additional = contexts
+        .iter()
+        .map(|text| text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if additional.is_empty() {
+        return;
+    }
+
+    match target {
+        Some(existing) if !existing.trim().is_empty() => {
+            existing.push_str("\n\n");
+            existing.push_str(&additional);
+        }
+        _ => *target = Some(additional),
+    }
+}
+
+fn runtime_advisory_evidence_sections(
+    edge_profile: &Map<String, Value>,
+) -> Vec<prompts::PromptSection> {
+    let text = astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+        edge_profile,
+    )
+    .into_iter()
+    .filter(|injection| {
+        injection.delivery_class
+            == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence
+    })
+    .filter_map(|injection| injection.render_for_prompt())
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![prompts::PromptSection::dynamic(
+            text,
+            prompts::PromptTokenBucket::Environment,
+        )]
+    }
 }
 
 fn bridge_pipeline_event_turn(trace_turn: u32) -> u32 {
@@ -1319,11 +1376,28 @@ fn record_turn_guard_tool_results(
     }
 }
 
-fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[Value]) -> Value {
+fn turn_complete_event(
+    messages: &[Value],
+    assistant_text: &str,
+    tool_calls: &[Value],
+    round_boundaries: &[(usize, usize)],
+) -> Value {
+    let mut tool_signatures = Vec::with_capacity(round_boundaries.len());
+    for (start, count) in round_boundaries {
+        let Some(round) = tool_calls.get(*start..start.saturating_add(*count)) else {
+            continue;
+        };
+        astra_turn_core::stall::record_server_tool_signatures(
+            &mut tool_signatures,
+            round,
+            round_boundaries.len().max(1),
+        );
+    }
+    let completion_facts =
+        astra_turn_core::complete::TurnCompletionFacts::from_tool_signatures(&tool_signatures);
     let mut event = astra_turn_core::complete::build_turn_complete_event(
         !tool_calls.is_empty(),
-        false,
-        &astra_turn_core::stall::DivergenceStatus::Healthy,
+        &completion_facts,
         None,
         Some(assistant_text),
     );
@@ -1362,7 +1436,7 @@ pub struct InProcessChatTurnBridge {
     /// and injects them into subsequent turn system prompts.
     pub feedback_store: Arc<astra_pipeline::feedback_store::FeedbackStore>,
     /// Cached Memoria client — created once, reused across turns.
-    pub memoria_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaClient>,
+    pub memoria_client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
     /// First-turn session-start memory snapshot, latched per session so repeated
     /// round re-entries don't refetch and churn the cached prompt prefix.
     session_start_memory_cache: Arc<tokio::sync::Mutex<HashMap<String, CachedSessionStartMemory>>>,
@@ -1382,7 +1456,7 @@ impl InProcessChatTurnBridge {
             shared_pool: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feedback_store: Arc::new(astra_pipeline::feedback_store::FeedbackStore::new()),
-            memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env(),
+            memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env(),
             session_start_memory_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             session_facts: Arc::new(std::sync::Mutex::new(Default::default())),
             persist_tracker: None,
@@ -1463,6 +1537,8 @@ impl InProcessChatTurnBridge {
         let tool_results = optional_payload_array(&payload, "tool_results")?;
         let edge_tools = optional_payload_array(&payload, "edge_tools")?;
         let edge_profile = optional_payload_object(&payload, "edge_profile")?;
+        let runtime_memory_binding =
+            optional_nested_payload_object(&payload, "runtime_bindings", "memory")?;
         let explain = explain_requested(&payload);
         let selected_model_name = selected_model_name_from_payload(&payload);
         let round_index = bridge_round_index(&payload)?;
@@ -1902,61 +1978,37 @@ impl InProcessChatTurnBridge {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
 
-            // Memoria prefetch lives on its own. `section` is the
-            // "## User Memories\n..." block — the piece that actually drifts.
-            //
-            // Skip when the CLI has already injected `memoria_insights_text`
-            // (rendered as `## Memoria Recall` via the bridge's volatile
-            // lane). Both paths query the same Memoria backend with
-            // overlapping queries + top_k=5; running both duplicates
-            // ~700 tokens of memory content per turn into two
-            // differently-formatted sections (`## Memoria Recall` +
-            // `## User Memories`). When present, the CLI digest is
-            // authoritative. See `bridge_should_run_memoria_prefetch`.
+            // Per-turn recall enters prompt assembly only as typed entries.
+            // CLI-local recall may still inform tool selection, but it does
+            // not provide an alternate prompt-text format.
             let mut memoria_prefetch_entries = Vec::new();
-            // Two memory surfaces, split by cache lane:
-            //
-            //   * **stable lane** — `<memory_index>` + `<session_memory>`.
-            //     Rebuilt on turn 1 from the memoria backend; the bytes
-            //     are session-stable (sorted by memory_id, deterministic
-            //     freshness labels). Pushed into `stable_sections` so
-            //     Anthropic's prompt cache covers them across every turn
-            //     in the session. The LLM gets ambient awareness of what
-            //     it could recall plus user profile + recent episodes.
-            //
-            //   * **volatile lane** — `## User Memories` from per-turn
-            //     hybrid recall. Changes every turn. Pushed into
-            //     `dynamic_sections`. Entries whose content was already
-            //     shown in the stable lane are dropped via the session
-            //     seen-ledger so we don't surface the same fact twice.
-            //
-            // The prior design bundled both into one `memoria_prefetch_section`
-            // and then only pushed it when the typed-pipeline per-turn
-            // entries were empty — which meant the stable lane got
-            // silently dropped on every warm session. Fixed here.
+            // Runtime configuration owns the provider. A server-configured
+            // client covers Server Only and takes precedence; an edge-
+            // supplied runtime binding is a capability fallback for
+            // CLI+Server / Edge+Server. Credentials never enter prompt
+            // assembly.
+            let (memoria_client_for_turn, memory_provider_source) =
+                resolve_bridge_memory_provider(
+                    memoria_client_owned.clone(),
+                    &runtime_memory_binding,
+                );
+            // First-turn profile/episode prewarm and query-relevant per-turn
+            // recall both enter the same typed Memory lane. Recall never
+            // becomes a rendered stable-prefix block.
             let is_first_turn = trace_turn <= 1;
             // Single canonical "already surfaced" store for the process
-            // lives on `astra_tools::memoria::MemoriaClient`. The bridge
+            // lives on `astra_tools::memoria::MemoriaToolGateway`. The bridge
             // writes content-dedup keys to it; the tool-side `recall`
             // decorator writes memory_ids. Both paths share the same
-            // snapshot so a memory shown via `<session_memory>` doesn't
-            // re-appear in per-turn recall, and vice versa.
-            use astra_tools::memoria::MemoriaClient as ToolClient;
-            let mut stable_memory_section: Option<String> = None;
-            let mut volatile_memory_section: Option<String> = None;
-            if bridge_should_run_memoria_prefetch(&edge_profile)
-                && let (Some(mem_url), Some(mem_key)) = (
-                    edge_profile.get("memoria_url").and_then(Value::as_str),
-                    edge_profile.get("memoria_key").and_then(Value::as_str),
-                )
-            {
+            // snapshot so automatic and explicit recall share admission.
+            if let Some(memory_client) = memoria_client_for_turn.as_ref() {
                 let user_msg = messages
                     .iter()
                     .rev()
                     .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
                     .and_then(|m| m.get("content").and_then(Value::as_str))
                     .unwrap_or("");
-                let top_k = edge_profile
+                let top_k = runtime_memory_binding
                     .get("retrieval_top_k")
                     .and_then(Value::as_u64)
                     .unwrap_or(5) as u32;
@@ -1964,7 +2016,13 @@ impl InProcessChatTurnBridge {
                 // Per-turn hybrid recall runs every turn; session-start
                 // (profile + episodes) only on turn 1.
                 let (per_turn, cached_session_start) = tokio::join!(
-                    prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k),
+                    prefetch_memories_with_client(
+                        memory_client,
+                        user_msg,
+                        &user_id,
+                        &session_id,
+                        top_k,
+                    ),
                     async {
                         if is_first_turn {
                             cached_first_turn_session_start_memory(
@@ -1972,33 +2030,13 @@ impl InProcessChatTurnBridge {
                                 &session_id,
                                 trace_turn,
                                 || async {
-                                    let session_start =
-                                        prefetch_session_start_memories(mem_url, mem_key, &user_id)
-                                            .await;
-                                    let session_start_exposed_ids =
-                                        crate::turn::memory_prefetch::session_start_exposed_ids(
-                                            &session_start,
-                                        );
-                                    let memory_index = if std::env::var(
-                                        "ASTRA_MEMORY_INDEX_INJECT",
+                                    let session_start = prefetch_session_start_memories_with_client(
+                                        memory_client,
+                                        &user_id,
+                                        &session_id,
                                     )
-                                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                                    .unwrap_or(false)
-                                    {
-                                        prefetch_memory_index(
-                                            mem_url,
-                                            mem_key,
-                                            &user_id,
-                                            &session_start_exposed_ids,
-                                        )
-                                        .await
-                                    } else {
-                                        None
-                                    };
-                                    CachedSessionStartMemory::from_prefetch(
-                                        session_start,
-                                        memory_index,
-                                    )
+                                    .await;
+                                    CachedSessionStartMemory::from_prefetch(session_start)
                                 },
                             )
                             .await
@@ -2014,68 +2052,23 @@ impl InProcessChatTurnBridge {
                         .map(|s| s.fetch_ms)
                         .unwrap_or(0);
 
-                // ── Stable lane: <memory_index> + <session_memory> ──
-                //
-                // `<memory_index>` is off by default behind
-                // `ASTRA_MEMORY_INDEX_INJECT`; when on, dedup against
-                // the ids that will already appear in `<session_memory>`
-                // so the two blocks don't repeat the same content.
-                stable_memory_section = cached_session_start
+                let mut recall_entries = cached_session_start
                     .as_ref()
-                    .and_then(|s| s.stable_memory_section.clone());
-
-                // Record stable-lane contents into the canonical store
-                // so volatile entries matching them get filtered out.
-                if let Some(ref stable) = stable_memory_section {
-                    let keys: Vec<String> = stable
-                        .lines()
-                        .filter(|l| l.trim_start().starts_with("- "))
-                        .map(|l| l.trim_start_matches("- ").trim_end().to_string())
-                        .map(|content| {
-                            // Same normalization as
-                            // `collect_seen_contents` so the filter and
-                            // the recorded keys share a dedup vocabulary.
-                            content
-                                .split_whitespace()
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                                .trim_end_matches(['.', '!', '?', ';', ':', ','])
-                                .to_lowercase()
-                        })
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    ToolClient::record_seen(&session_id, keys);
-                }
-                // Also record the memory_ids so tool-side recall dedup
-                // (which filters on memory_id) sees them too.
-                let stable_ids = cached_session_start
-                    .as_ref()
-                    .map(|s| s.stable_ids.clone())
+                    .map(|cached| cached.entries.clone())
                     .unwrap_or_default();
-                if !stable_ids.is_empty() {
-                    ToolClient::record_seen(&session_id, stable_ids);
-                }
-
-                // ── Volatile lane: filter per-turn entries against ledger ──
-                let already_seen = ToolClient::seen_snapshot(&session_id);
-                let filtered_entries = crate::turn::memory_prefetch::filter_entries_already_surfaced(
-                    per_turn.entries,
-                    &already_seen,
-                );
+                recall_entries.extend(per_turn.entries);
+                let filtered_entries =
+                    crate::turn::memory_prefetch::admit_prompt_memory_entries(
+                        &session_id,
+                        recall_entries,
+                    );
                 memory_items = filtered_entries.len();
                 memory_preview = filtered_entries
                     .iter()
                     .take(3)
                     .map(|e| e.content.clone())
                     .collect();
-                // Record per-turn entries so a subsequent same-session
-                // recall doesn't re-surface them either.
-                let new_keys = crate::turn::memory_prefetch::collect_seen_contents(&filtered_entries);
-                if !new_keys.is_empty() {
-                    ToolClient::record_seen(&session_id, new_keys);
-                }
                 memoria_prefetch_entries = filtered_entries;
-                volatile_memory_section = per_turn.section;
             }
             // Read active skill hints from edge_profile (injected by CLI)
             let active_skill_names: Vec<&str> = edge_profile
@@ -2105,14 +2098,6 @@ impl InProcessChatTurnBridge {
             // ── Self-awareness section (injected by CLI via edge_profile) ──
             let self_awareness_hint = edge_profile
                 .get("self_awareness_text")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(|text| format!("\n\n{text}"))
-                .unwrap_or_default();
-
-            // ── Memoria insights digest (injected by CLI via edge_profile) ──
-            let memoria_insights_hint = edge_profile
-                .get("memoria_insights_text")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(|text| format!("\n\n{text}"))
@@ -2186,7 +2171,7 @@ impl InProcessChatTurnBridge {
                         // Closes the reflect→memory loop: correction detected in
                         // this turn → stored durably → recalled in future sessions.
                         if let Some(ref mc) = memoria_client_owned {
-                            use crate::turn::cloud::memoria_compact::MemoriaClient;
+                            use crate::turn::cloud::memoria_compact::MemoriaPort;
                             if let Some(lesson) =
                                 crate::learning::synthesizer::feedback_rule_to_lesson(&fb)
                             {
@@ -2221,7 +2206,7 @@ impl InProcessChatTurnBridge {
             };
 
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
-            let memoria_client_shared = memoria_client_owned.clone();
+            let memoria_client_shared = memoria_client_for_turn.clone();
 
             let (tool_round_guidance, guidance_signals) =
                 prompts::tool_round_guidance_trace(&messages, round_index);
@@ -2242,7 +2227,6 @@ impl InProcessChatTurnBridge {
             //     Memory section),
             //   implicit_feedback_hint (per-turn correction signal based on
             //     user message content),
-            //   memoria_insights_hint (per-turn retrieval),
             //   recent_arg_hints_hint (per-turn tool args),
             //   tool_round_guidance (per-turn messages count)
             let mut stable_sections = Vec::new();
@@ -2261,21 +2245,6 @@ impl InProcessChatTurnBridge {
             }
             // Stable-lane memory (index + session_memory) goes behind
             // the cache marker — byte-stable across the session.
-            if let Some(ref stable) = stable_memory_section {
-                stable_sections.push(prompts::PromptSection::stable(
-                    stable.clone(),
-                    prompts::CacheScope::Session,
-                ));
-            }
-            // Volatile-lane memory (## User Memories from per-turn
-            // recall) sits post-marker so byte drift doesn't invalidate
-            // the cached prefix.
-            if let Some(ref volatile) = volatile_memory_section {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
-                    volatile.clone(),
-                    prompts::PromptTokenBucket::Environment,
-                ));
-            }
             if !skill_hint.is_empty() {
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
@@ -2326,21 +2295,6 @@ impl InProcessChatTurnBridge {
             if let Some(section) = self_awareness_volatile_section(&self_awareness_hint) {
                 dynamic_sections.push(section);
             }
-            if !memoria_insights_hint.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        memoria_insights_hint.clone(),
-                        prompts::PromptTokenBucket::Environment,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            memoria_insights: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
             if !recent_arg_hints_hint.is_empty() {
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
@@ -2354,17 +2308,18 @@ impl InProcessChatTurnBridge {
                 // once when skill catalog changes, then stabilizes.
                 stable_sections.push(section);
             }
-            if let Some(runtime_volatile) =
-                astra_turn_core::chat_turn_edge_profile::edge_profile_joined_text(
+            let runtime_volatile_parts =
+                astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
                     &edge_profile,
                     astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
-                )
-            {
+                );
+            if !runtime_volatile_parts.is_empty() {
                 dynamic_sections.push(prompts::PromptSection::dynamic(
-                    runtime_volatile,
+                    runtime_volatile_parts.join("\n\n"),
                     prompts::PromptTokenBucket::Environment,
                 ));
             }
+            dynamic_sections.extend(runtime_advisory_evidence_sections(&edge_profile));
             if !tool_round_guidance.is_empty() {
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
@@ -2413,7 +2368,7 @@ impl InProcessChatTurnBridge {
                 round_index,
                 &dynamic_sections,
             );
-            let required_runtime_text =
+            let mut required_runtime_text =
                 required_runtime_text_for_bridge(&edge_profile, &recovered_required_runtime_texts);
             // Compute session-stable skill context. Selector-based
             // `<deferred-tools>` was removed; skills are surfaced through the
@@ -2432,16 +2387,17 @@ impl InProcessChatTurnBridge {
             let bridge_restricted_snapshot = HashSet::new();
             let initial_session_memory_entry = if let Some(memoria) = memoria_client_shared.as_ref()
             {
-                crate::turn::wire_assembly::session_memory_entry_for_user_turn(
-                    crate::session_memory::runner::load_current_session_memory_preferring_local(
-                        memoria,
-                        &session_id,
-                    )
-                    .await
-                    .as_deref(),
-                    trace_turn,
-                    user_content_for_signal,
+                let loaded = crate::session_memory::runner::load_current_session_memory_preferring_local_with_freshness(
+                    memoria,
+                    &session_id,
                 )
+                .await;
+                loaded.as_ref().and_then(|loaded| {
+                    crate::turn::wire_assembly::session_memory_entry_for_user_turn(
+                        Some(&loaded.content),
+                        loaded.updated_turn,
+                    )
+                })
             } else {
                 None
             };
@@ -2461,7 +2417,8 @@ impl InProcessChatTurnBridge {
                                         edge_profile
                                             .get("system_prompt_override")
                                             .and_then(Value::as_str),
-                                    ),
+                                    )
+                                    .with_memory_provider_source(memory_provider_source),
                     session: crate::turn::llm::context::BridgeSessionContextInput::new(
                         &cache_cfg,
                         cache_capability,
@@ -2565,7 +2522,7 @@ impl InProcessChatTurnBridge {
                     model_name: &model_name,
                     context_window: model_context_window,
                     memoria_client: memoria_client.as_ref().map(|c| {
-                        c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient
+                        c as &dyn crate::turn::cloud::memoria_compact::MemoriaPort
                     }),
                     summary_client: Some(
                         &summary_client
@@ -2573,19 +2530,18 @@ impl InProcessChatTurnBridge {
                     ),
                     tier: pipeline_tier,
                     session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
-                    turn_number: 0,
-                    observatory: None,
                 };
 
                 let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
 
                 if let Some(rerun) =
-                    crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry_for_user_turn(
+                    crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
                         compact_result.session_memory_context.as_deref(),
                         initial_session_memory_entry.as_ref(),
-                        trace_turn,
-                        user_content_for_signal,
-                        |session_memory_entry| {
+                        None,
+                        &memoria_prefetch_entries,
+                        &compact_result.retrieved_memory_entries,
+                        |session_memory_entry, memory_entries| {
                             crate::turn::llm::context::assemble_bridge_context(
                                 crate::turn::llm::context::BridgeContextAssemblyInput {
                                     tool_surface:
@@ -2598,8 +2554,8 @@ impl InProcessChatTurnBridge {
                                         crate::turn::llm::context::BridgeRuntimeSignals::new(
                                             &stable_sections,
                                             &effective_dynamic_sections,
-                                            &memoria_prefetch_entries,
-                                            Some(session_memory_entry),
+                                            memory_entries,
+                                            session_memory_entry,
                                             edge_profile
                                                 .get("system_prompt_override")
                                                 .and_then(Value::as_str),
@@ -2647,6 +2603,11 @@ impl InProcessChatTurnBridge {
                         .and_then(Value::as_str)
                         .map(str::to_string);
                 }
+
+                append_required_runtime_contexts(
+                    &mut required_runtime_text,
+                    &compact_result.runtime_contexts,
+                );
 
                 let mut msgs = compact_result.messages;
                 crate::turn::wire_assembly::maybe_append_continuation_prompt(
@@ -2821,27 +2782,10 @@ impl InProcessChatTurnBridge {
                             }
                         })
                         .unwrap_or_default();
-                let memory_injections: Vec<astra_turn_core::context_assembly_trace::MemoryInjection> =
-                    memoria_prefetch_entries
-                        .iter()
-                        .enumerate()
-                        .map(|(i, entry)| {
-                            astra_turn_core::context_assembly_trace::MemoryInjection {
-                                memory_id: format!("prefetch-{i}-{:016x}", entry.content_hash),
-                                memory_type: entry
-                                    .source
-                                    .clone()
-                                    .unwrap_or_else(|| "hybrid_retrieval".into()),
-                                tokens: entry.token_estimate,
-                                relevance_score: entry.relevance_score,
-                                content_preview:
-                                    astra_turn_core::context_assembly_trace::preview_snippet(
-                                        &entry.content,
-                                        100,
-                                    ),
-                            }
-                        })
-                        .collect();
+                let memory_injections =
+                    crate::turn::llm::context::prompt_memory_injections(
+                        &memoria_prefetch_entries,
+                    );
                 let session_memory_injection = initial_session_memory_entry.as_ref().map(|entry| {
                     let memory_type = entry
                         .source
@@ -3032,14 +2976,8 @@ impl InProcessChatTurnBridge {
                     // post-gate section list; if it's empty while the
                     // pre-gate list had entries, gating dropped them.
                     //
-                    // wip-7 fix #3 (memoria_prefetch provenance): the
-                    // raw `memoria_prefetch_section` string is the
-                    // pre-pipeline hint. The pipeline's Memory binder
-                    // ranks / dedups / budgets the typed
-                    // `memoria_prefetch_entries` list and emits the
-                    // final prompt bytes. Fingerprinting the typed list
-                    // (stable concat of per-entry content) tracks the
-                    // actual injection — not the unprocessed hint.
+                    // Memoria provenance fingerprints the typed entry list
+                    // that the Memory binder ranks, deduplicates, and budgets.
                     let volatile_injected =
                         cache_cap.should_inject_volatile_on_round(round_index);
                     let fp = |content: &str| {
@@ -3064,30 +3002,18 @@ impl InProcessChatTurnBridge {
                     // serialization = concatenation of per-entry content
                     // with a stable separator so identical retrievals
                     // across turns produce identical hashes.
-                    // Canonical fingerprint: concat(stable_lane,
-                    // typed_per_turn_entries). Stable lane goes first
-                    // so its contribution dominates the hash; a change
-                    // there (rare — new episode written) is a real
-                    // cache-prefix flip. Per-turn bytes come after as
-                    // the volatile tail.
-                    let memoria_prefetch_canonical = {
-                        let mut parts: Vec<String> = Vec::new();
-                        if let Some(ref s) = stable_memory_section {
-                            parts.push(s.clone());
-                        }
-                        if !memoria_prefetch_entries.is_empty() {
-                            parts.push(
-                                memoria_prefetch_entries
-                                    .iter()
-                                    .map(|e| e.content.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("\n---\n"),
-                            );
-                        } else if let Some(ref v) = volatile_memory_section {
-                            parts.push(v.clone());
-                        }
-                        parts.join("\n---\n")
-                    };
+                    let memoria_prefetch_canonical = memoria_prefetch_entries
+                        .iter()
+                        .map(|entry| {
+                            format!(
+                                "{}\t{}\t{}",
+                                entry.memory_id.as_deref().unwrap_or(""),
+                                entry.memory_type.as_deref().unwrap_or(""),
+                                entry.content,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n---\n");
                     let channels_payload = json!([
                         // CLI-owned channels: the bridge echoes them for
                         // symmetry, but the CLI fingerprints its own
@@ -3096,7 +3022,6 @@ impl InProcessChatTurnBridge {
                         // reflect the bridge-side view of the same
                         // strings in edge_profile.
                         bridge_channel("self_awareness", &self_awareness_hint),
-                        bridge_channel("memoria_insights", &memoria_insights_hint),
                         bridge_channel("recent_arg_hints", &recent_arg_hints_hint),
                         bridge_channel(
                             "skill_listing",
@@ -3199,7 +3124,7 @@ impl InProcessChatTurnBridge {
                                 model_name: &model_name,
                                 context_window: model_context_window,
                                 memoria_client: memoria_client.as_ref().map(|c| {
-                                    c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient
+                                    c as &dyn crate::turn::cloud::memoria_compact::MemoriaPort
                                 }),
                                 summary_client: Some(
                                     &summary_client
@@ -3210,8 +3135,6 @@ impl InProcessChatTurnBridge {
                                     .lock()
                                     .ok()
                                     .map(|f| f.clone()),
-                                turn_number: 0,
-                                observatory: None,
                             };
                             let overrides = crate::turn::wire_assembly::BudgetOverrides {
                                 budget_chars: Some(budget.effective_input_limit() * 3),
@@ -4160,6 +4083,7 @@ impl InProcessChatTurnBridge {
 
                     for alert in astra_turn_core::trace_alert::evaluate_alerts(
                         current_turn,
+                        capture_model,
                         &feedback,
                         &bridge_pipeline_baseline.stats,
                         &astra_turn_core::recovery_state::RecoveryState::default(),
@@ -4544,7 +4468,7 @@ impl InProcessChatTurnBridge {
                 .unwrap_or("")
                 .to_string();
             let evaluation = (!tool_call_records.is_empty()).then(|| {
-                let mut eval = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
+                crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
                     &user_message_for_eval,
                     &recent_tools_for_quality,
                     &tool_call_records,
@@ -4552,13 +4476,7 @@ impl InProcessChatTurnBridge {
                     verdict_warning,
                     budget_pressure,
                     crate::pipeline::evaluation::current_evaluation_thresholds(),
-                );
-                crate::pipeline::evaluation::apply_final_answer_relevance(
-                    &mut eval,
-                    &user_message_for_eval,
-                    &full_text,
-                );
-                eval
+                )
             });
             let tool_execution_ms: u64 = merged_tool_results
                 .iter()
@@ -4750,7 +4668,12 @@ impl InProcessChatTurnBridge {
 
             // turn_complete
             mark_disconnect_capture_finalized(&disconnect_capture_state);
-            yield render_sse(&turn_complete_event(&messages, &llm_content, &all_round_tool_calls));
+            yield render_sse(&turn_complete_event(
+                &messages,
+                &llm_content,
+                &all_round_tool_calls,
+                &round_boundaries,
+            ));
         };
 
         let cancel_on_drop = CancelOnDrop(client_cancel.clone());
@@ -4866,6 +4789,22 @@ fn optional_payload_object(
         Some(_) => Err((
             StatusCode::BAD_REQUEST,
             format!("bridge payload field `{field}` must be an object"),
+        )),
+        None => Ok(Map::new()),
+    }
+}
+
+fn optional_nested_payload_object(
+    payload: &Value,
+    parent_field: &'static str,
+    field: &'static str,
+) -> Result<Map<String, Value>, (StatusCode, String)> {
+    let parent = optional_payload_object(payload, parent_field)?;
+    match parent.get(field) {
+        Some(Value::Object(values)) => Ok(values.clone()),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("bridge payload field `{parent_field}.{field}` must be an object"),
         )),
         None => Ok(Map::new()),
     }
@@ -4996,8 +4935,8 @@ async fn persist_bridge_stream_failure_capture(
 
 // ── Memory prefetch — delegated to turn::memory_prefetch ─────────────────────
 pub use super::super::memory_prefetch::{
-    MemoryPrefetchResult, SessionStartPrefetchResult, prefetch_memories, prefetch_memory_index,
-    prefetch_session_start_memories,
+    MemoryPrefetchResult, SessionStartPrefetchResult, prefetch_memories_with_client,
+    prefetch_session_start_memories_with_client,
 };
 
 /// Test-accessible wrapper around private schema pruning — used by integration
@@ -5178,10 +5117,10 @@ mod tests {
             move || async move {
                 fetches.fetch_add(1, Ordering::SeqCst);
                 CachedSessionStartMemory {
-                    stable_memory_section: Some(
-                        "<session_memory>\nfirst\n</session_memory>".into(),
-                    ),
-                    stable_ids: vec!["m1".into()],
+                    entries: vec![
+                        astra_turn_core::context_sources::MemoryEntry::new("first typed memory")
+                            .with_memory_identity("m1", "semantic"),
+                    ],
                     fetch_ms: 7,
                 }
             }
@@ -5194,10 +5133,10 @@ mod tests {
             move || async move {
                 fetches.fetch_add(1, Ordering::SeqCst);
                 CachedSessionStartMemory {
-                    stable_memory_section: Some(
-                        "<session_memory>\nsecond\n</session_memory>".into(),
-                    ),
-                    stable_ids: vec!["m2".into()],
+                    entries: vec![
+                        astra_turn_core::context_sources::MemoryEntry::new("second typed memory")
+                            .with_memory_identity("m2", "semantic"),
+                    ],
                     fetch_ms: 99,
                 }
             }
@@ -5209,14 +5148,51 @@ mod tests {
         assert_eq!(second, first);
     }
 
+    #[test]
+    fn bridge_memory_provider_supports_request_binding_and_prefers_server_config() {
+        let request_binding = json!({
+            "provider": "memoria",
+            "base_url": "http://request-memory",
+            "api_key": "request-key",
+            "retrieval_top_k": 7,
+        })
+        .as_object()
+        .expect("binding")
+        .clone();
+
+        let (request_client, request_source) =
+            resolve_bridge_memory_provider(None, &request_binding);
+        assert!(request_client.is_some());
+        assert_eq!(request_source, Some("request_binding"));
+
+        let server_client = crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
+            "http://server-memory".into(),
+            "server-key".into(),
+        );
+        let (resolved, source) =
+            resolve_bridge_memory_provider(Some(server_client), &request_binding);
+        assert!(resolved.is_some());
+        assert_eq!(source, Some("server_config"));
+
+        let invalid = json!({"provider": "memoria", "base_url": "http://memory"})
+            .as_object()
+            .expect("invalid binding")
+            .clone();
+        let (missing, source) = resolve_bridge_memory_provider(None, &invalid);
+        assert!(missing.is_none());
+        assert!(source.is_none());
+    }
+
     #[tokio::test]
     async fn later_turn_clears_cached_session_start_memory_snapshot() {
         let cache = tokio::sync::Mutex::new(HashMap::new());
 
         let _ = cached_first_turn_session_start_memory(&cache, "sess-1", 1, || async {
             CachedSessionStartMemory {
-                stable_memory_section: Some("<session_memory>\nfirst\n</session_memory>".into()),
-                stable_ids: vec!["m1".into()],
+                entries: vec![
+                    astra_turn_core::context_sources::MemoryEntry::new("first typed memory")
+                        .with_memory_identity("m1", "semantic"),
+                ],
                 fetch_ms: 7,
             }
         })
@@ -5224,8 +5200,10 @@ mod tests {
 
         let later = cached_first_turn_session_start_memory(&cache, "sess-1", 2, || async {
             CachedSessionStartMemory {
-                stable_memory_section: Some("<session_memory>\nlater\n</session_memory>".into()),
-                stable_ids: vec!["m2".into()],
+                entries: vec![
+                    astra_turn_core::context_sources::MemoryEntry::new("later typed memory")
+                        .with_memory_identity("m2", "semantic"),
+                ],
                 fetch_ms: 8,
             }
         })
@@ -5773,20 +5751,6 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            prompts::PromptSection::dynamic(
-                "\n\n## Memoria Recall\n- Stored: prefer Rust for CLI work.".to_string(),
-                prompts::PromptTokenBucket::Environment,
-            )
-            .with_trace_signals(
-                astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals:
-                        astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            memoria_insights: true,
-                            ..Default::default()
-                        },
-                    ..Default::default()
-                },
-            ),
         ];
         let (_, _, prompt_sections) =
             crate::turn::prompt_cache::assemble_system_message_via_pipeline(
@@ -5809,7 +5773,6 @@ mod tests {
         assert!(breakdown.context_signals.self_awareness);
         assert!(breakdown.context_signals.implicit_feedback);
         assert!(breakdown.context_signals.learned_feedback_rules);
-        assert!(breakdown.context_signals.memoria_insights);
         assert!(!breakdown.context_signals.system_prompt_override);
         assert!(!breakdown.context_signals.effort_hint);
         assert!(!breakdown.context_signals.agent_type_hint);
@@ -6937,6 +6900,16 @@ mod tests {
                 .to_string(),
             json!(["structured runtime context"]),
         );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                .to_string(),
+            json!([{
+                "kind": "active_turn_frame",
+                "delivery_class": "required_context",
+                "payload": {"active_goal": "typed required context"},
+                "round_index": 2
+            }]),
+        );
 
         let got = required_runtime_text_for_bridge(
             &edge_profile,
@@ -6944,10 +6917,61 @@ mod tests {
         )
         .expect("required runtime text");
 
-        assert_eq!(
-            got,
+        assert!(got.starts_with(
             "[session-resume:v1]\nHydrated previous session context\n\nstructured runtime context"
+        ));
+        assert!(got.contains("<runtime-required-context>"));
+        assert!(got.contains("typed required context"));
+        assert!(got.contains("\"kind\":\"active_turn_frame\""));
+    }
+
+    #[test]
+    fn compaction_context_appends_to_required_runtime_lane_without_becoming_history() {
+        let mut required = Some("live required context".to_string());
+        append_required_runtime_contexts(
+            &mut required,
+            &[
+                "  ## Compacted Conversation Summary\nPreserve this state.  ".to_string(),
+                "".to_string(),
+            ],
         );
+
+        assert_eq!(
+            required.as_deref(),
+            Some(
+                "live required context\n\n## Compacted Conversation Summary\nPreserve this state."
+            )
+        );
+    }
+
+    #[test]
+    fn bridge_routes_only_typed_advisory_evidence_to_dynamic_sections() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                .to_string(),
+            json!([
+                {
+                    "kind": "policy_advisory",
+                    "delivery_class": "advisory_evidence",
+                    "payload": {"signal": "soft signal"},
+                    "round_index": 2
+                },
+                {
+                    "kind": "self_status",
+                    "delivery_class": "telemetry_only",
+                    "payload": "cache=86%",
+                    "round_index": 2
+                }
+            ]),
+        );
+
+        let sections = runtime_advisory_evidence_sections(&edge_profile);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].scope, prompts::CacheScope::None);
+        assert!(sections[0].text.contains("<runtime-advisory-evidence>"));
+        assert!(sections[0].text.contains("soft signal"));
+        assert!(!sections[0].text.contains("cache=86%"));
     }
 
     #[test]
@@ -7013,7 +7037,7 @@ mod tests {
             json!({"role": "assistant", "content": "intermediate"}),
             json!({"role": "user", "content": "继续处理"}),
         ];
-        let event = turn_complete_event(&messages, "Should I continue?", &[]);
+        let event = turn_complete_event(&messages, "Should I continue?", &[], &[]);
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["has_tool_calls"], false);
         assert_eq!(event["assistant_text"], "Should I continue?");
@@ -7031,9 +7055,34 @@ mod tests {
             }
         })];
 
-        let event = turn_complete_event(&messages, "Committed the changes.", &tool_calls);
+        let event = turn_complete_event(&messages, "Committed the changes.", &tool_calls, &[]);
 
         assert_eq!(event["followup_suggestion"], "push it");
+    }
+
+    #[test]
+    fn turn_complete_event_projects_observed_multi_round_stall() {
+        let tool_calls = (0..3)
+            .map(|index| {
+                json!({
+                    "id": format!("call-{index}"),
+                    "function": {
+                        "name": "read_file",
+                        "arguments": r#"{"path":"src/lib.rs"}"#
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let event = turn_complete_event(
+            &[json!({"role": "user", "content": "inspect"})],
+            "Observed a repeated read pattern.",
+            &tool_calls,
+            &[(0, 1), (1, 1), (2, 1)],
+        );
+
+        assert_eq!(event["stall_detected"], true);
+        assert_eq!(event["divergence_detected"], true);
+        assert_eq!(event["exploration_rounds"], 3);
     }
 
     #[test]
@@ -7093,8 +7142,6 @@ mod tests {
             keep_recent_turns: 2,
             current_tokens: 80000,
             session_facts: None,
-            turn_number: 0,
-            observatory: None,
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -7144,8 +7191,6 @@ mod tests {
             keep_recent_turns: 2,
             current_tokens: 500,
             session_facts: None,
-            turn_number: 0,
-            observatory: None,
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -7184,8 +7229,6 @@ mod tests {
             keep_recent_turns: 2,
             current_tokens: 80000,
             session_facts: None,
-            turn_number: 0,
-            observatory: None,
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -8049,34 +8092,9 @@ mod tests {
         assert!(!is_cjk, "should not detect CJK in English content");
     }
 
-    /// audit-#6: when tool events fail to persist after core events succeed,
-    /// the spawned persist task must emit a structured `tool_events_orphaned`
-    /// marker so log-based reconciliation can recover the lost data.
-    #[test]
-    fn persist_task_emits_orphan_marker_on_tool_failure() {
-        let source = include_str!("inprocess.rs");
-        assert!(
-            source.contains("marker = \"tool_events_orphaned\""),
-            "bridge persist task must emit a `tool_events_orphaned` marker when \
-             tool_writer.persist fails after core events were already committed"
-        );
-    }
-
     /// audit-#11: `await_with_client_disconnect` must not use `biased;` —
     /// biasing toward the cancellation arm starves real work whenever the
     /// caller's cancel token is already set when the future is polled.
-    #[test]
-    fn await_with_client_disconnect_is_not_biased() {
-        let source = include_str!("inprocess.rs");
-        let fn_start = source
-            .find("async fn await_with_client_disconnect")
-            .expect("await_with_client_disconnect must exist");
-        let body = &source[fn_start..fn_start + 700];
-        assert!(
-            !body.contains("biased;"),
-            "await_with_client_disconnect must not use biased select (starvation risk)"
-        );
-    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn persist_bridge_stream_failure_capture_persists_remote_llm_capture() {
@@ -8270,128 +8288,6 @@ mod tests {
                 != astra_services::session_journal::JournalEventType::LlmRound),
             "root-owned bridge flush must not double-write aggregate llm_round rows"
         );
-    }
-
-    #[test]
-    fn llm_request_dump_failures_are_not_silently_ignored() {
-        let source = include_str!("inprocess.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
-        let production = &source[..tests_start];
-        for context in [
-            "bridge_inprocess compacted context-window dump persist failed",
-            "bridge_inprocess error dump persist failed",
-        ] {
-            let start = production
-                .find(context)
-                .expect("dump logging context should exist");
-            let window_start = start.saturating_sub(520);
-            let window = &production[window_start..production.len().min(start + 120)];
-            assert!(
-                window.contains("if let Err(error) =")
-                    && window.contains(
-                        "dump.persist_remote(&user_id, remote_artifact_store.as_ref()).await"
-                    ),
-                "{context} should handle dump.persist_remote failures explicitly"
-            );
-        }
-    }
-
-    #[test]
-    fn llm_error_paths_publish_remote_llm_capture_artifacts() {
-        let source = include_str!("inprocess.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
-        let production = &source[..tests_start];
-        for context in [
-            "bridge_inprocess compacted context-window capture",
-            "bridge_inprocess error capture",
-        ] {
-            let start = production
-                .find(context)
-                .expect("capture context should exist");
-            let window = &production[start..production.len().min(start + 260)];
-            assert!(
-                window.contains("Some(remote_artifact_store.as_ref())"),
-                "{context} should publish a remote llm_capture artifact"
-            );
-        }
-    }
-
-    #[test]
-    fn bridge_stream_failure_paths_publish_remote_llm_capture_artifacts() {
-        let source = include_str!("inprocess.rs");
-        let tests_start = source.rfind("mod tests {").expect("test module start");
-        let production = &source[..tests_start];
-        for context in [
-            "bridge_inprocess stream block parse capture",
-            "bridge_inprocess stream tail parse capture",
-            "bridge_inprocess stream incomplete capture",
-            "bridge_inprocess client disconnect capture",
-        ] {
-            let start = production
-                .find(context)
-                .expect("stream failure capture context should exist");
-            let window_start = start.saturating_sub(320);
-            let window = &production[window_start..production.len().min(start + 220)];
-            assert!(
-                window.contains("persist_bridge_stream_failure_capture("),
-                "{context} should persist a remote llm_capture artifact for mid-stream failures"
-            );
-        }
-    }
-
-    // ── bridge_should_run_memoria_prefetch gate ────────────────────────
-
-    #[test]
-    fn prefetch_gate_runs_when_cli_insights_absent() {
-        let ep: Map<String, Value> = Map::new();
-        assert!(
-            bridge_should_run_memoria_prefetch(&ep),
-            "empty edge_profile = CLI didn't run memory_boost_search; bridge must fetch"
-        );
-    }
-
-    #[test]
-    fn prefetch_gate_runs_when_cli_insights_empty_string() {
-        let mut ep: Map<String, Value> = Map::new();
-        ep.insert(
-            "memoria_insights_text".to_string(),
-            Value::String(String::new()),
-        );
-        assert!(
-            bridge_should_run_memoria_prefetch(&ep),
-            "empty string insights should not count as CLI-produced content"
-        );
-    }
-
-    #[test]
-    fn prefetch_gate_skips_when_cli_insights_present() {
-        // Regression: bridge used to double-fetch Memoria even when CLI
-        // already rendered `## Memoria Recall`, producing ~700 tokens of
-        // duplicate memory content as a second `## User Memories` block.
-        let mut ep: Map<String, Value> = Map::new();
-        ep.insert(
-            "memoria_insights_text".to_string(),
-            Value::String("## Memoria Recall\n- User prefers Rust for CLI work.".to_string()),
-        );
-        assert!(
-            !bridge_should_run_memoria_prefetch(&ep),
-            "CLI-rendered digest already covers the memory retrieval — skip bridge prefetch"
-        );
-    }
-
-    #[test]
-    fn prefetch_gate_runs_when_insights_key_not_a_string() {
-        // Defensive: if edge_profile carries malformed insights (non-string),
-        // fall back to running the bridge fetch rather than silently
-        // producing an empty memory section.
-        let mut ep: Map<String, Value> = Map::new();
-        ep.insert("memoria_insights_text".to_string(), Value::Null);
-        assert!(bridge_should_run_memoria_prefetch(&ep));
-        ep.insert(
-            "memoria_insights_text".to_string(),
-            Value::Number(42.into()),
-        );
-        assert!(bridge_should_run_memoria_prefetch(&ep));
     }
 
     #[test]

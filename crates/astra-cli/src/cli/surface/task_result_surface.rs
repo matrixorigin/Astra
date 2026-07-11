@@ -254,7 +254,7 @@ pub(crate) fn task_result_lookup_exit_code(task: &TaskRecord) -> crate::cli::exi
             crate::cli::exit_code::ExitCode::Partial
         }
         (astra_services::TaskStatus::Completed, _) => crate::cli::exit_code::ExitCode::Success,
-        (astra_services::TaskStatus::Cancelled, _) => crate::cli::exit_code::ExitCode::ForceStop,
+        (astra_services::TaskStatus::Cancelled, _) => crate::cli::exit_code::ExitCode::Cancelled,
         (astra_services::TaskStatus::Failed, _) => crate::cli::exit_code::ExitCode::ToolFailure,
         _ => unreachable!("non-terminal statuses return Unfinished above"),
     }

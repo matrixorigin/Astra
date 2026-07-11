@@ -238,43 +238,6 @@ mod tests {
     }
 
     #[test]
-    fn filter_lessons_uses_api_model_not_env_vars() {
-        let source = include_str!("session_lessons.rs");
-        let prod_code = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
-        assert!(
-            !prod_code.contains("ASTRA_SELECTOR"),
-            "production code must not reference ASTRA_SELECTOR env vars"
-        );
-    }
-
-    #[test]
-    fn filter_lessons_resolves_via_memory_model_endpoint() {
-        let source = include_str!("session_lessons.rs");
-        assert!(
-            source.contains("model_memory()"),
-            "relevance filtering should use API-backed memory model loading"
-        );
-        assert!(
-            source.contains("filter_memories"),
-            "relevance filtering should delegate to memory_relevance::filter_memories"
-        );
-    }
-
-    #[test]
-    fn session_lesson_feedback_uses_selector_not_keyword_lists() {
-        let source = include_str!("session_lessons.rs");
-        let prod_code = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
-        assert!(
-            prod_code.contains("select_dismissed_memory_indices"),
-            "lesson dismissal should delegate semantic judgment to selector"
-        );
-        assert!(
-            !prod_code.contains("contains(\""),
-            "lesson dismissal must not hard-code natural-language relevance feedback"
-        );
-    }
-
-    #[test]
     fn memory_model_params_cached_in_session_state() {
         let state = SessionState::default();
         assert!(

@@ -137,15 +137,37 @@ async fn memory_proxy_call(
     body: serde_json::Value,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(headers).await?;
-    let user_id = user.user_id.clone();
-    let inject_identity = should_inject_memory_proxy_identity(endpoint);
-    let body = apply_memory_proxy_identity(body, &user_id, inject_identity, endpoint);
+    memory_proxy_call_for_user(state, &user.user_id, method, endpoint, body).await
+}
 
-    state
+async fn memory_proxy_call_for_user(
+    state: &AppState,
+    user_id: &str,
+    method: reqwest::Method,
+    endpoint: &str,
+    body: serde_json::Value,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let requested_scope = memory_proxy_scope(&body, user_id)?;
+    if let Some(scope) = requested_scope.as_ref() {
+        ensure_memory_proxy_session_owner(state, scope).await?;
+    }
+    let strict_recall_scope = if is_strict_session_recall(endpoint, &body) {
+        Some(requested_scope.clone().ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "strict session memory recall requires an owned session_id",
+            )
+        })?)
+    } else {
+        None
+    };
+    let inject_identity = should_inject_memory_proxy_identity(endpoint);
+    let body = apply_memory_proxy_identity(body, user_id, inject_identity, endpoint);
+
+    let response = state
         .memoria_forwarder
         .forward(method, endpoint, body)
         .await
-        .map(Json)
         .map_err(|error| {
             tracing::warn!(
                 target: "astra_runtime::auth",
@@ -160,7 +182,107 @@ async fn memory_proxy_call(
             } else {
                 internal_error(&error)
             }
-        })
+        })?;
+
+    if let Some(scope) = strict_recall_scope.as_ref()
+        && let Err(error) = astra_memoria::validate_strict_recall_payload(&response, scope)
+    {
+        tracing::error!(
+            target: "astra_runtime::auth",
+            user_id = %scope.user_id,
+            session_id = %scope.session_id,
+            endpoint,
+            error = %error,
+            "Memoria returned content outside the authenticated session scope"
+        );
+        return Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "memory backend violated the requested session scope",
+        ));
+    }
+
+    Ok(Json(response))
+}
+
+fn is_strict_session_recall(endpoint: &str, body: &serde_json::Value) -> bool {
+    endpoint.ends_with("/retrieve")
+        && body
+            .get("session_scope")
+            .and_then(serde_json::Value::as_str)
+            == Some("only")
+}
+
+fn memory_proxy_scope(
+    body: &serde_json::Value,
+    user_id: &str,
+) -> Result<Option<astra_memoria::MemoryScope>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(session_id_value) = body.get("session_id") else {
+        return Ok(None);
+    };
+    let Some(session_id) = session_id_value.as_str() else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "memory session_id must be an exact string",
+        ));
+    };
+    astra_memoria::MemoryScope::new(user_id, session_id)
+        .map(Some)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))
+}
+
+async fn ensure_memory_proxy_session_owner(
+    state: &AppState,
+    scope: &astra_memoria::MemoryScope,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(shared_pool) = state.shared_pool.as_ref() else {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session ownership storage is unavailable for scoped memory operations",
+        ));
+    };
+    let owned = astra_services::storage::agent_session_exists_for_user(
+        shared_pool.get(),
+        &scope.session_id,
+        &scope.user_id,
+    )
+    .await
+    .map_err(|error| internal_error(format!("memory session ownership check failed: {error}")))?;
+    if !owned {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "memory session was not found for the authenticated user",
+        ));
+    }
+    Ok(())
+}
+
+fn exact_memory_ids_for_user_purge(body: &serde_json::Value) -> Result<Vec<String>, &'static str> {
+    const MAX_IDS: usize = 64;
+    if body.get("topic").is_some() {
+        return Err(
+            "topic purge is not available through the multi-tenant user endpoint; delete exact memory_ids instead",
+        );
+    }
+    let Some(ids) = body.get("memory_ids").and_then(serde_json::Value::as_array) else {
+        return Err("memory purge requires a non-empty memory_ids array");
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut exact = Vec::new();
+    for id in ids {
+        let Some(id) = id.as_str().map(str::trim).filter(|id| !id.is_empty()) else {
+            return Err("memory_ids must contain only non-empty strings");
+        };
+        if seen.insert(id.to_string()) {
+            exact.push(id.to_string());
+        }
+    }
+    if exact.is_empty() {
+        return Err("memory purge requires a non-empty memory_ids array");
+    }
+    if exact.len() > MAX_IDS {
+        return Err("memory purge accepts at most 64 distinct memory_ids");
+    }
+    Ok(exact)
 }
 
 fn parse_memoria_forward_status(error: &str) -> Option<StatusCode> {
@@ -173,6 +295,11 @@ fn should_inject_memory_proxy_identity(endpoint: &str) -> bool {
     !endpoint.ends_with("/purge")
 }
 
+fn encode_memoria_memory_id(memory_id: &str) -> String {
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+    utf8_percent_encode(memory_id, NON_ALPHANUMERIC).to_string()
+}
+
 fn apply_memory_proxy_identity(
     mut body: serde_json::Value,
     user_id: &str,
@@ -180,12 +307,9 @@ fn apply_memory_proxy_identity(
     endpoint: &str,
 ) -> serde_json::Value {
     if inject_identity && let Some(obj) = body.as_object_mut() {
-        // Force-overwrite both ownership fields so clients cannot spoof either
-        // another user's identity or a foreign session scope inside Memoria.
-        obj.insert(
-            "session_id".to_string(),
-            serde_json::Value::String(user_id.to_string()),
-        );
+        // Authentication owns `user_id`; the durable session id remains a
+        // separate, caller-selected identity that was authorized against the
+        // session store before this function runs.
         obj.insert(
             "user_id".to_string(),
             serde_json::Value::String(user_id.to_string()),
@@ -267,38 +391,26 @@ pub(super) async fn memory_proxy_purge_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let filter = body
-        .as_object()
-        .and_then(|o| {
-            o.get("topic")
-                .or(o.get("session_id"))
-                .or(o.get("memory_ids"))
-        })
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let result = memory_proxy_call(
-        &state,
-        &headers,
-        reqwest::Method::POST,
-        "/v1/memories/purge",
-        body,
-    )
-    .await?;
-    let deleted = result
-        .get("deleted_count")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let message = if deleted == 0 {
-        format!("memory_purge: no entries matched filter [{filter}] (0 deleted)")
-    } else {
-        format!("memory_purge: deleted {deleted} entries matching [{filter}]")
-    };
+    let user = state.auth_service.current_user(&headers).await?;
+    let memory_ids = exact_memory_ids_for_user_purge(&body)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+    let mut deleted = 0_u64;
+    for memory_id in memory_ids {
+        let memory_id = encode_memoria_memory_id(&memory_id);
+        let _deleted_response = memory_proxy_call_for_user(
+            &state,
+            &user.user_id,
+            reqwest::Method::DELETE,
+            &format!("/v1/memories/{memory_id}"),
+            serde_json::json!({}),
+        )
+        .await?;
+        deleted = deleted.saturating_add(1);
+    }
     let enriched = serde_json::json!({
         "status": "ok",
         "deleted_count": deleted,
-        "message": message,
+        "message": format!("memory_purge: deleted {deleted} exact entries"),
     });
     Ok(Json(enriched))
 }
@@ -308,6 +420,7 @@ pub(super) async fn memory_proxy_expand_handler(
     headers: HeaderMap,
     Path(memory_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let memory_id = encode_memoria_memory_id(&memory_id);
     memory_proxy_call(
         &state,
         &headers,
@@ -339,6 +452,7 @@ pub(super) async fn memory_proxy_correct_by_id_handler(
     Path(memory_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let memory_id = encode_memoria_memory_id(&memory_id);
     memory_proxy_call(
         &state,
         &headers,
@@ -355,12 +469,29 @@ pub(super) async fn memory_proxy_feedback_handler(
     Path(memory_id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let memory_id = encode_memoria_memory_id(&memory_id);
     memory_proxy_call(
         &state,
         &headers,
         reqwest::Method::POST,
         &format!("/v1/memories/{memory_id}/feedback"),
         body,
+    )
+    .await
+}
+
+pub(super) async fn memory_proxy_delete_by_id_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(memory_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let memory_id = encode_memoria_memory_id(&memory_id);
+    memory_proxy_call(
+        &state,
+        &headers,
+        reqwest::Method::DELETE,
+        &format!("/v1/memories/{memory_id}"),
+        serde_json::json!({}),
     )
     .await
 }
@@ -593,14 +724,15 @@ pub(super) async fn memoria_proxy_consolidate_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_memoria_management_identity, apply_memory_proxy_identity,
+        apply_memoria_management_identity, apply_memory_proxy_identity, encode_memoria_memory_id,
+        exact_memory_ids_for_user_purge, is_strict_session_recall, memory_proxy_scope,
         parse_memoria_forward_status, should_inject_memory_proxy_identity,
     };
     use axum::http::StatusCode;
     use serde_json::json;
 
     #[test]
-    fn apply_memory_proxy_identity_overwrites_spoofed_user_and_session() {
+    fn apply_memory_proxy_identity_overwrites_user_but_preserves_authorized_session() {
         let body = json!({
             "content": "probe",
             "memory_type": "semantic",
@@ -611,7 +743,7 @@ mod tests {
         let out = apply_memory_proxy_identity(body, "real-user", true, "/v1/memories");
 
         assert_eq!(out["user_id"].as_str(), Some("real-user"));
-        assert_eq!(out["session_id"].as_str(), Some("real-user"));
+        assert_eq!(out["session_id"].as_str(), Some("spoofed-session"));
     }
 
     #[test]
@@ -637,6 +769,57 @@ mod tests {
         ));
         assert!(should_inject_memory_proxy_identity("/v1/profiles/me"));
         assert!(!should_inject_memory_proxy_identity("/v1/memories/purge"));
+    }
+
+    #[test]
+    fn memory_proxy_scope_keeps_authenticated_owner_and_durable_session_distinct() {
+        let scope = memory_proxy_scope(
+            &json!({"session_id": "session-7", "user_id": "spoofed"}),
+            "user-3",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(scope.user_id, "user-3");
+        assert_eq!(scope.session_id, "session-7");
+        assert!(memory_proxy_scope(&json!({"session_id": 7}), "user-3").is_err());
+        assert!(memory_proxy_scope(&json!({"session_id": " session-7"}), "user-3").is_err());
+    }
+
+    #[test]
+    fn only_retrieve_is_a_strict_session_response_contract() {
+        assert!(is_strict_session_recall(
+            "/v1/memories/retrieve",
+            &json!({"session_id": "session-7", "session_scope": "only"})
+        ));
+        assert!(!is_strict_session_recall(
+            "/v1/memories/retrieve",
+            &json!({"session_id": "session-7"})
+        ));
+        assert!(!is_strict_session_recall(
+            "/v1/memories",
+            &json!({"session_id": "session-7", "session_scope": "only"})
+        ));
+    }
+
+    #[test]
+    fn memory_id_is_encoded_as_one_upstream_path_segment() {
+        assert_eq!(encode_memoria_memory_id("a/b ?"), "a%2Fb%20%3F");
+    }
+
+    #[test]
+    fn user_purge_accepts_only_bounded_exact_ids() {
+        assert_eq!(
+            exact_memory_ids_for_user_purge(&json!({
+                "memory_ids": ["m1", "m1", "m2"]
+            }))
+            .unwrap(),
+            vec!["m1".to_string(), "m2".to_string()]
+        );
+        assert!(exact_memory_ids_for_user_purge(&json!({"topic": "shared"})).is_err());
+        assert!(exact_memory_ids_for_user_purge(&json!({"memory_ids": []})).is_err());
+        assert!(exact_memory_ids_for_user_purge(&json!({"memory_ids": ["m1", 2]})).is_err());
+        let too_many = (0..65).map(|index| format!("m{index}")).collect::<Vec<_>>();
+        assert!(exact_memory_ids_for_user_purge(&json!({"memory_ids": too_many})).is_err());
     }
 
     #[test]

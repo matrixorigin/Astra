@@ -18,8 +18,8 @@ pub struct ContextFeedback {
 impl ContextFeedback {
     /// Build feedback from raw token usage fields.
     ///
-    /// Cache hit ratio = cache_read / (cache_read + cache_creation).
-    /// Returns 0.0 when both are zero (not NaN).
+    /// Cache read share = cache_read / total input tokens.
+    /// Returns 0.0 when total input is zero (not NaN).
     #[must_use]
     pub fn from_usage(
         prompt: u64,
@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn from_usage_computes_ratio() {
-        let f = ContextFeedback::from_usage(0, 800, 200, 100, false);
+        let f = ContextFeedback::from_usage(100, 800, 100, 100, false);
         assert!((f.cache_hit_ratio - 0.8).abs() < 1e-9);
     }
 

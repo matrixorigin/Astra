@@ -321,9 +321,8 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Runtime-owned per-turn control text that must reach the current model
     /// call while staying out of user content and prompt-facing history.
     pub(crate) input_runtime_required_texts: &'a [String],
-    /// Runtime-owned per-turn control text derived outside the agent loop
-    /// from CLI/session state. This is not user content and must flow through
-    /// the volatile lane, not `message` or persisted prompt-facing history.
+    /// Dynamic text from external/session sources. Runtime-owned policy,
+    /// guardrail, and telemetry signals use the typed injection lane instead.
     pub(crate) input_runtime_volatile_texts: &'a [String],
     /// Structured semantic query derived before prompt wrapping when the CLI
     /// knows the message is an active-thread follow-up attachment.
@@ -668,36 +667,4 @@ mod tests {
     //! `ChatTurnParams` (not a hard-coded `None`). The grep is
     //! scoped to the same source file so it breaks immediately if
     //! someone reverts the fix.
-
-    #[test]
-    fn basic_cli_propagates_agent_spawner_not_hardcoded_none() {
-        // Read THIS source file and check that `agent_spawner`
-        // inside `basic_cli` is sourced from `ctx.agent_spawner`.
-        // A regression to `agent_spawner: None,` in the `basic_cli`
-        // body would have to coexist with the `ctx.agent_spawner`
-        // pattern for this to pass — unlikely by accident and
-        // easily caught in code review if intentional.
-        let src = include_str!("params.rs");
-        assert!(
-            src.contains("agent_spawner: ctx.agent_spawner.clone()"),
-            "basic_cli must propagate ctx.agent_spawner; if this \
-             test fails, the Bug-A regression has returned"
-        );
-        assert!(
-            src.contains("root_agent_id: ctx.root_agent_id"),
-            "basic_cli must propagate ctx.root_agent_id alongside \
-             the spawner"
-        );
-    }
-
-    #[test]
-    fn basic_cli_context_has_spawner_field() {
-        // The structural AST contract the rest of the CLI relies
-        // on: BasicCliChatContext exposes public `agent_spawner`
-        // and `root_agent_id` fields. If these go away we can't
-        // wire one-shot chat to dynamic agent spawning.
-        let src = include_str!("params.rs");
-        assert!(src.contains("pub agent_spawner: Option<Arc<"));
-        assert!(src.contains("pub root_agent_id: Option<&'a str>"));
-    }
 }

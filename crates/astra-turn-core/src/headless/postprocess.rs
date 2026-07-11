@@ -2,7 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use crate::guardrails::error_recovery::{ErrorCategory, build_recovery_message, classify_error};
+use crate::guardrails::error_recovery::{
+    ErrorCategory, build_recovery_message_with_evidence, classify_error,
+};
 use crate::guardrails::turn_guard::TurnGuard;
 use crate::headless_tool_assembly::{HeadlessRoundToolIdx, headless_timeout_aborted_tool_names};
 use crate::result_quality::ResultQuality;
@@ -28,16 +30,30 @@ pub struct HeadlessOutputEnrichCtx<'a> {
     pub turn_guard: &'a mut TurnGuard,
 }
 
+/// Inputs and mutable output for enriching one headless tool result.
+pub struct HeadlessOutputEnrichRequest<'a> {
+    pub name: &'a str,
+    pub result_str: &'a mut String,
+    pub is_err: &'a mut bool,
+    pub source_error_kind: Option<ErrorCategory>,
+    pub source_recovery_evidence: Option<&'a astra_core::ToolFailureEvidence>,
+    pub tool_already_restricted: bool,
+}
+
 /// `true` when resource-limit handling forced error-quality treatment (matches CLI `resource_limit_recorded`).
 pub fn enrich_headless_tool_output_for_errors_and_limits(
-    name: &str,
-    result_str: &mut String,
-    is_err: &mut bool,
-    source_error_kind: Option<ErrorCategory>,
-    tool_already_restricted: bool,
+    request: HeadlessOutputEnrichRequest<'_>,
     ctx: &mut HeadlessOutputEnrichCtx<'_>,
     mut on_signal: impl FnMut(HeadlessOutputEnrichSignal),
 ) -> bool {
+    let HeadlessOutputEnrichRequest {
+        name,
+        result_str,
+        is_err,
+        source_error_kind,
+        source_recovery_evidence,
+        tool_already_restricted,
+    } = request;
     let mut resource_limit_recorded = false;
 
     if *is_err && !tool_already_restricted {
@@ -57,8 +73,13 @@ pub fn enrich_headless_tool_output_for_errors_and_limits(
         }
 
         let avoidance_advised = ctx.turn_guard.health.health_avoidance_tools();
-        let recovery_msg =
-            build_recovery_message(name, result_str.as_str(), category, &avoidance_advised);
+        let recovery_msg = build_recovery_message_with_evidence(
+            name,
+            result_str.as_str(),
+            category,
+            &avoidance_advised,
+            source_recovery_evidence,
+        );
         result_str.push_str(&format!("\n{recovery_msg}"));
     }
 
@@ -256,11 +277,14 @@ mod tests {
             turn_guard: &mut tg,
         };
         let rec = enrich_headless_tool_output_for_errors_and_limits(
-            "bash",
-            &mut out,
-            &mut is_err,
-            None,
-            false,
+            HeadlessOutputEnrichRequest {
+                name: "bash",
+                result_str: &mut out,
+                is_err: &mut is_err,
+                source_error_kind: None,
+                source_recovery_evidence: None,
+                tool_already_restricted: false,
+            },
             &mut ctx,
             |s| signals.push(s),
         );
@@ -285,11 +309,14 @@ mod tests {
         };
 
         let rec = enrich_headless_tool_output_for_errors_and_limits(
-            "read_file",
-            &mut out,
-            &mut is_err,
-            None,
-            false,
+            HeadlessOutputEnrichRequest {
+                name: "read_file",
+                result_str: &mut out,
+                is_err: &mut is_err,
+                source_error_kind: None,
+                source_recovery_evidence: None,
+                tool_already_restricted: false,
+            },
             &mut ctx,
             |s| signals.push(s),
         );
@@ -313,11 +340,14 @@ mod tests {
             turn_guard: &mut tg,
         };
         let rec = enrich_headless_tool_output_for_errors_and_limits(
-            "bash",
-            &mut out,
-            &mut is_err,
-            None,
-            false,
+            HeadlessOutputEnrichRequest {
+                name: "bash",
+                result_str: &mut out,
+                is_err: &mut is_err,
+                source_error_kind: None,
+                source_recovery_evidence: None,
+                tool_already_restricted: false,
+            },
             &mut ctx,
             |s| signals.push(s),
         );
@@ -329,6 +359,38 @@ mod tests {
                 tool: "bash".into()
             }]
         );
+    }
+
+    #[test]
+    fn source_authored_large_input_evidence_drives_targeted_recovery() {
+        let mut turn_guard = TurnGuard::new();
+        let mut output = "opaque external failure".to_string();
+        let mut is_error = true;
+        let mut context = HeadlessOutputEnrichCtx {
+            turn_guard: &mut turn_guard,
+        };
+        let evidence = astra_core::ToolFailureEvidence::new(
+            astra_core::ErrorKind::ToolInvalidArgs,
+            astra_core::ToolFailureCause::InputTooLarge,
+            false,
+            vec![astra_core::ToolRecoveryAction::ReadTargetedRange],
+        );
+
+        enrich_headless_tool_output_for_errors_and_limits(
+            HeadlessOutputEnrichRequest {
+                name: "read_file",
+                result_str: &mut output,
+                is_err: &mut is_error,
+                source_error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+                source_recovery_evidence: Some(&evidence),
+                tool_already_restricted: false,
+            },
+            &mut context,
+            |_| {},
+        );
+
+        assert!(output.contains("targeted line/range read"), "{output}");
+        assert!(!output.contains("retry the same tool"), "{output}");
     }
 
     #[test]

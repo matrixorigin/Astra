@@ -283,10 +283,6 @@ fn build_hook_db_persist_from_payload(
             .unwrap_or("");
         let is_err = astra_turn_core::tool_result_semantics::is_tool_error(result_text)
             || tool_result.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
-        let error_text = tool_result
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
         let duration_ms = tool_result
             .get("duration_ms")
             .and_then(serde_json::Value::as_u64)
@@ -294,15 +290,29 @@ fn build_hook_db_persist_from_payload(
         let was_rejected = tool_result
             .get("status")
             .and_then(serde_json::Value::as_str)
-            == Some("rejected")
-            || error_text.starts_with("blocked_tool:")
-            || result_text.starts_with("blocked_tool:");
-        let classification = astra_turn_core::action_compensation::classify_execution_outcome(
-            result_text,
-            is_err,
-            duration_ms,
-            was_rejected,
-        );
+            == Some("rejected");
+        let error_kind = tool_result
+            .get("error_kind")
+            .and_then(serde_json::Value::as_str)
+            .and_then(astra_core::ErrorKind::parse_tag);
+        let result_class = tool_result
+            .get("result_class")
+            .and_then(serde_json::Value::as_str);
+        let exit_semantics = tool_result
+            .get("exit_semantics")
+            .and_then(serde_json::Value::as_str);
+        let classification =
+            astra_turn_core::action_compensation::classify_execution_outcome_from_input(
+                astra_turn_core::action_compensation::ExecutionOutcomeInput {
+                    result_text,
+                    is_error: is_err,
+                    duration_ms,
+                    was_rejected,
+                    error_kind,
+                    result_class,
+                    exit_semantics,
+                },
+            );
         tool_execution_outcomes.insert(tool_call_id.clone(), classification);
 
         if let Some(snapshot_id) = tool_result
@@ -1051,6 +1061,7 @@ mod inprocess_hook_contract_tests {
             "tool_call_id": "call-1",
             "name": "bash",
             "ok": false,
+            "status": "rejected",
             "error": "blocked_tool: Explicit approval required: action scope is unbounded."
         })];
         let tool_calls = vec![json!({

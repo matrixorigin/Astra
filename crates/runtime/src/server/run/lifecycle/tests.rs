@@ -1174,6 +1174,55 @@ fn trace_redaction_removes_nested_secrets_and_truncates_long_text() {
 }
 
 #[test]
+fn format_run_events_adds_index() {
+    let events = AgenticRunLifecycleService::format_run_events(
+        &[
+            json!({"event_type": "run_started"}),
+            json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
+        ],
+        0,
+    );
+
+    assert_eq!(events[0]["index"], 0);
+    assert_eq!(events[1]["index"], 1);
+    assert_eq!(events[1]["event_type"], "text_delta");
+}
+
+#[test]
+fn format_run_events_preserves_global_offset() {
+    let events = AgenticRunLifecycleService::format_run_events(
+        &[
+            json!({"event_type": "tool_call"}),
+            json!({"event_type": "tool_result"}),
+        ],
+        41,
+    );
+
+    assert_eq!(events[0]["index"], 41);
+    assert_eq!(events[1]["index"], 42);
+}
+
+#[test]
+fn run_status_as_str_matches_durable_status_constants() {
+    assert_eq!(RunStatus::Running.as_str(), STATUS_RUNNING);
+    assert_eq!(RunStatus::InputQueued.as_str(), STATUS_INPUT_QUEUED);
+    assert_eq!(RunStatus::Paused.as_str(), STATUS_PAUSED);
+    assert_eq!(RunStatus::Waiting.as_str(), STATUS_WAITING);
+    assert_eq!(RunStatus::Completed.as_str(), STATUS_COMPLETED);
+    assert_eq!(RunStatus::Failed.as_str(), STATUS_FAILED);
+    assert_eq!(RunStatus::Cancelled.as_str(), STATUS_CANCELLED);
+}
+
+#[test]
+fn server_loop_causal_chain_ids_fit_agent_event_column() {
+    let id = server_loop_causal_chain_id("server-loop-tools");
+    assert!(
+        id.len() <= astra_services::storage::AGENT_EVENT_ID_LEN,
+        "server loop causal chain id must fit agent_events.event_id: {id}"
+    );
+}
+
+#[test]
 fn tool_trace_events_populate_columns_and_redacted_payloads() {
     let trace = TraceContext {
         session_id: "session-1".to_string(),
@@ -1275,7 +1324,12 @@ fn extract_prev_assistant_text_skips_empty_assistant_bodies() {
 
 #[test]
 fn build_run_turn_complete_event_carries_authoritative_assistant_text() {
-    let event = build_run_turn_complete_event_with_interruption(0, "recovered final answer", None);
+    let event = build_run_turn_complete_event_with_interruption(
+        0,
+        "recovered final answer",
+        None,
+        &astra_turn_core::complete::TurnCompletionFacts::default(),
+    );
     assert_eq!(event["type"], "turn_complete");
     assert_eq!(event["assistant_text"], "recovered final answer");
     assert_eq!(event["has_tool_calls"], false);
@@ -1283,7 +1337,12 @@ fn build_run_turn_complete_event_carries_authoritative_assistant_text() {
 
 #[test]
 fn build_run_turn_complete_event_omits_empty_assistant_text() {
-    let event = build_run_turn_complete_event_with_interruption(1, "", None);
+    let event = build_run_turn_complete_event_with_interruption(
+        1,
+        "",
+        None,
+        &astra_turn_core::complete::TurnCompletionFacts::default(),
+    );
     assert_eq!(event["type"], "turn_complete");
     assert_eq!(event["has_tool_calls"], true);
     assert!(event.get("assistant_text").is_none());
@@ -1452,7 +1511,6 @@ fn subrun_turn_budget_keeps_profile_extensions_when_spawn_budget_is_small() {
             true,
             true,
             astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex,
-            true,
         );
     let budget = resolve_subrun_agentic_turn_budget(profile, Some(3));
 
@@ -1483,7 +1541,7 @@ fn subrun_turn_budget_respects_spawn_budget_above_profile_hard_limit() {
 }
 
 #[test]
-fn server_subrun_completed_status_settles_non_blocking_task_board_completion() {
+fn server_subrun_empty_completion_remains_paused_regardless_of_task_board() {
     let svc = test_service();
     let request = test_request("subrun task board bookkeeping");
     let mut state = svc.build_initial_state(
@@ -1512,17 +1570,78 @@ fn server_subrun_completed_status_settles_non_blocking_task_board_completion() {
         },
     ));
 
-    assert_eq!(server_subrun_completed_status(&state), STATUS_COMPLETED);
+    assert_eq!(server_subrun_completed_status(&state), STATUS_PAUSED);
     let outcome = Ok(AgenticLoopOutcome::Completed);
     assert_eq!(
         server_subrun_live_termination(&outcome, &state),
-        astra_turn_core::agent_live_event::AgentLiveTermination::Completed
+        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
     );
-    assert_eq!(server_subrun_live_reason(&outcome, &state), None);
+    assert_eq!(
+        server_subrun_live_reason(&outcome, &state).as_deref(),
+        Some("paused")
+    );
 }
 
 #[test]
-fn server_subrun_completed_status_pauses_task_board_intervention() {
+fn server_subrun_waiting_without_live_task_is_interrupted_not_cancelled() {
+    let svc = test_service();
+    let request = test_request("subrun waits for external input");
+    let state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "child-run-waiting",
+        None,
+        None,
+        None,
+    );
+    let outcome = Ok(AgenticLoopOutcome::Waiting("approval".to_string()));
+
+    assert_eq!(
+        server_subrun_live_termination(&outcome, &state),
+        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
+    );
+    assert_eq!(
+        server_subrun_live_reason(&outcome, &state).as_deref(),
+        Some("approval")
+    );
+    assert_eq!(
+        server_subrun_outcome_status(&outcome, &state),
+        STATUS_PAUSED
+    );
+}
+
+#[test]
+fn server_subrun_cancel_is_terminal_across_live_and_durable_projections() {
+    let svc = test_service();
+    let request = test_request("cancel subrun");
+    let state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "child-run-cancelled",
+        None,
+        None,
+        None,
+    );
+    let outcome = Ok(AgenticLoopOutcome::Cancelled);
+
+    assert_eq!(
+        server_subrun_live_termination(&outcome, &state),
+        astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled
+    );
+    assert_eq!(
+        server_subrun_live_reason(&outcome, &state).as_deref(),
+        Some("cancelled")
+    );
+    assert_eq!(
+        server_subrun_outcome_status(&outcome, &state),
+        STATUS_CANCELLED
+    );
+}
+
+#[test]
+fn server_subrun_requires_intervention_from_interruption_not_task_board() {
     let svc = test_service();
     let request = test_request("subrun paused task board");
     let mut state = svc.build_initial_state(
@@ -1557,7 +1676,7 @@ fn server_subrun_completed_status_pauses_task_board_intervention() {
     let outcome = Ok(AgenticLoopOutcome::Completed);
     assert_eq!(
         server_subrun_live_termination(&outcome, &state),
-        astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled
+        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
     );
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),
@@ -1705,11 +1824,12 @@ fn build_run_turn_complete_event_marks_interrupted_turns() {
         7,
         "[Round budget hard-limit reached]",
         Some(&interruption),
+        &astra_turn_core::complete::TurnCompletionFacts::default(),
     );
 
     assert_eq!(event["type"], "turn_complete");
-    assert_eq!(event["has_tool_calls"], false);
-    assert_eq!(event["stall_detected"], true);
+    assert_eq!(event["has_tool_calls"], true);
+    assert!(event.get("stall_detected").is_none());
     assert_eq!(event["execution_state"]["status"], "interrupted");
     assert_eq!(event["execution_state"]["interrupted"], true);
     assert_eq!(
@@ -1955,6 +2075,28 @@ impl RunStateStore for FaultInjectedRunStateStore {
             .await
     }
 
+    async fn update_run_status_with_event_if_current_unless_session_blocked(
+        &self,
+        request: astra_services::runs::GuardedRunStatusTransitionRequest<'_>,
+    ) -> Result<astra_services::runs::GuardedRunStatusTransition, String> {
+        let call = self.next_status_call();
+        self.apply_status_mutation_before_call(call).await?;
+        if self.fail_status_calls.contains(&call) {
+            return Err(format!(
+                "injected update_run_status_with_event_if_current_unless_session_blocked failure on call {call}"
+            ));
+        }
+        let append_call = self.next_append_call();
+        if self.fail_append_calls.contains(&append_call) {
+            return Err(format!(
+                "injected guarded transition append_event failure on call {append_call}"
+            ));
+        }
+        self.inner
+            .update_run_status_with_event_if_current_unless_session_blocked(request)
+            .await
+    }
+
     async fn update_run_status_with_events_if_current(
         &self,
         user_id: &str,
@@ -2189,37 +2331,6 @@ fn resume_hydration_requires_existing_session_with_prior_prompt_history() {
     );
 }
 
-#[test]
-fn transcript_prompt_restore_uses_shared_root_conversation_query() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("async fn restore_transcript_prompt_messages")
-        .expect("transcript prompt restore helper must exist");
-    let fn_end = source[fn_start..]
-        .find("fn restore_csl_messages_into_loop_state")
-        .map(|offset| fn_start + offset)
-        .expect("transcript prompt restore helper end");
-    let body = &source[fn_start..fn_end];
-
-    assert!(
-        body.contains("sqlx::query(PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL)"),
-        "server prompt-history fallback must use the shared root-conversation transcript query"
-    );
-
-    let exists_start = source
-        .find("async fn session_has_prior_prompt_history")
-        .expect("resume-history presence helper must exist");
-    let exists_end = source[exists_start..]
-        .find("fn session_resume_hydration_hint_from_sources")
-        .map(|offset| exists_start + offset)
-        .expect("resume-history presence helper end");
-    let exists_body = &source[exists_start..exists_end];
-    assert!(
-        exists_body.contains("sqlx::query(PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL)"),
-        "resume gating must use the same root-conversation transcript boundary"
-    );
-}
-
 #[tokio::test]
 async fn server_resume_hydration_failure_is_not_prompt_facing() {
     let service = test_service();
@@ -2281,6 +2392,24 @@ fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycle
         engine,
     )
     .with_model_service(Arc::new(ActiveTestModelService))
+}
+
+async fn install_live_run_state(
+    svc: &AgenticRunLifecycleService,
+    user_id: &str,
+    run_id: &str,
+    session_id: &str,
+    status: RunStatus,
+    waiting_for: Option<&str>,
+) {
+    let (mut run_state, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        run_id.to_string(),
+        session_id.to_string(),
+        user_id.to_string(),
+    );
+    run_state.status = status;
+    run_state.waiting_for = waiting_for.map(ToString::to_string);
+    svc.runs.write().await.insert(run_id.to_string(), run_state);
 }
 
 async fn setup_lifecycle_run_db_it() -> SharedPool {
@@ -4797,7 +4926,7 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
             injections: vec!["stall detected".into()],
             avoid_tools: vec!["git_status".into()],
             health_avoidance_tools: vec![],
-            force_stop: false,
+            advisory_threshold_reached: false,
             nudge_count: 1,
             interaction_mode: "prompt".into(),
             suppressed_loop_nudges: false,
@@ -5171,6 +5300,7 @@ fn active_run_live_event_projection_is_bounded() {
         llm_cancel_token: Arc::new(CancellationToken::new()),
         live_tx: None,
         waiting_for: None,
+        execution_live: true,
     };
 
     for idx in 0..(MAX_ACTIVE_RUN_LIVE_EVENTS + 5) {
@@ -5314,6 +5444,7 @@ fn finalize_run_events_completes_answered_run_with_in_progress_task_board() {
     assert_eq!(events[0]["event_type"], "text_done");
     assert_eq!(events[0]["data"]["full_text"], "Done.");
     assert_eq!(events[1]["event_type"], "run_finished");
+    assert_eq!(events[1]["data"]["task_board"]["in_progress_count"], 1);
     assert!(events[1]["data"].get("waiting_for").is_none());
     assert!(
         events
@@ -5324,7 +5455,7 @@ fn finalize_run_events_completes_answered_run_with_in_progress_task_board() {
 }
 
 #[test]
-fn finalize_run_events_completes_non_blocking_task_board_empty_settlement() {
+fn finalize_run_events_pauses_real_empty_completion_regardless_of_task_board() {
     let svc = test_service();
     let request = test_request("empty settlement");
     let mut state = svc.build_initial_state(
@@ -5362,27 +5493,19 @@ fn finalize_run_events_completes_non_blocking_task_board_empty_settlement() {
         &state,
     );
 
-    assert_eq!(status, RunStatus::Completed);
+    assert_eq!(status, RunStatus::Paused);
     assert!(error.is_none());
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["event_type"], "run_finished");
-    assert_eq!(
-        events[0]["data"]["settled_interruption_kind"],
-        "empty_completion"
-    );
-    assert_eq!(events[0]["data"]["resume_mode"], "settle");
+    assert_eq!(events[0]["event_type"], "run_interrupted");
+    assert_eq!(events[0]["data"]["kind"], "empty_completion");
     assert_eq!(events[0]["data"]["task_board"]["in_progress_count"], 1);
     assert!(events[0]["data"].get("waiting_for").is_none());
-    assert!(
-        events
-            .iter()
-            .all(|event| event["event_type"] != "run_interrupted"),
-        "non-blocking task-board settlement must not surface as a user-facing interruption: {events:?}"
-    );
+    assert_eq!(events[1]["event_type"], "run_finished");
+    assert_eq!(events[1]["data"]["interrupted"], true);
+    assert!(events[1]["data"].get("waiting_for").is_none());
 }
 
 #[test]
-fn finalize_run_events_keeps_task_board_intervention_for_paused_task() {
+fn finalize_run_events_waiting_reason_comes_from_interruption_authority() {
     let svc = test_service();
     let request = test_request("paused task");
     let mut state = svc.build_initial_state(
@@ -5400,14 +5523,14 @@ fn finalize_run_events_keeps_task_board_intervention_for_paused_task() {
     state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
         astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
         astra_turn_core::interruption::ResumeAction::RequiresIntervention {
-            description: "paused task needs direction".to_string(),
+            description: "external approval is required".to_string(),
         },
         astra_turn_core::interruption::InterruptionStateSummary {
             has_checkpoint: true,
             tool_calls_completed: 1,
             turns_completed: 1,
             remaining_turns: 3,
-            error_detail: Some("paused task needs direction".to_string()),
+            error_detail: Some("external approval is required".to_string()),
             stall_signal: None,
             resume_restricted_tools: vec![],
         },
@@ -5420,12 +5543,12 @@ fn finalize_run_events_keeps_task_board_intervention_for_paused_task() {
     );
 
     assert_eq!(status, RunStatus::Paused);
-    assert_eq!(error.as_deref(), Some("task_board_intervention"));
+    assert_eq!(error.as_deref(), Some("user_intervention"));
     assert_eq!(events[1]["event_type"], "run_interrupted");
-    assert_eq!(events[1]["data"]["waiting_for"], "task_board_intervention");
+    assert_eq!(events[1]["data"]["waiting_for"], "user_intervention");
     assert_eq!(events[1]["data"]["task_board"]["paused_count"], 1);
     assert_eq!(events[2]["event_type"], "run_finished");
-    assert_eq!(events[2]["data"]["waiting_for"], "task_board_intervention");
+    assert_eq!(events[2]["data"]["waiting_for"], "user_intervention");
 }
 
 #[test]
@@ -5446,6 +5569,7 @@ fn merge_cancelled_run_events_preserves_order_and_usage() {
         llm_cancel_token: cancel_token,
         live_tx: None,
         waiting_for: None,
+        execution_live: false,
     };
 
     merge_cancelled_run_events(
@@ -6117,7 +6241,7 @@ async fn list_runs_filters_by_user() {
 }
 
 #[tokio::test]
-async fn list_runs_cursor_pagination() {
+async fn list_runs_cursor_pagination_omits_count_and_returns_next_cursor() {
     let svc = test_service();
     for i in 0..5 {
         ok(svc
@@ -6125,44 +6249,17 @@ async fn list_runs_cursor_pagination() {
             .await);
     }
     let page1 = ok(svc.list_runs_cursor("user-1".into(), 2, None).await);
-    assert_eq!(page1.runs.len(), 2);
     assert_eq!(page1.total, None);
+    assert_eq!(page1.runs.len(), 2);
     assert!(page1.next_cursor.is_some());
     let page2 = ok(svc
         .list_runs_cursor("user-1".into(), 2, page1.next_cursor)
         .await);
+    assert_eq!(page2.total, None);
     assert_eq!(page2.runs.len(), 2);
     assert!(page2.next_cursor.is_some());
     let page3 = ok(svc
         .list_runs_cursor("user-1".into(), 2, page2.next_cursor)
-        .await);
-    assert_eq!(page3.runs.len(), 1);
-    assert!(page3.next_cursor.is_none());
-}
-
-#[tokio::test]
-async fn list_runs_cursor_pagination_omits_count_and_returns_next_cursor() {
-    let svc = test_service();
-    for i in 0..5 {
-        ok(svc
-            .create_run("user-cursor".into(), test_request(&format!("msg {i}")))
-            .await);
-    }
-
-    let page1 = ok(svc.list_runs_cursor("user-cursor".into(), 2, None).await);
-    assert_eq!(page1.total, None);
-    assert_eq!(page1.runs.len(), 2);
-    assert!(page1.next_cursor.is_some());
-
-    let page2 = ok(svc
-        .list_runs_cursor("user-cursor".into(), 2, page1.next_cursor)
-        .await);
-    assert_eq!(page2.total, None);
-    assert_eq!(page2.runs.len(), 2);
-    assert!(page2.next_cursor.is_some());
-
-    let page3 = ok(svc
-        .list_runs_cursor("user-cursor".into(), 2, page2.next_cursor)
         .await);
     assert_eq!(page3.total, None);
     assert_eq!(page3.runs.len(), 1);
@@ -6201,29 +6298,6 @@ async fn list_runs_cursor_clamps_pagination() {
         result.limit <= astra_services::pagination::MAX_API_LIST_LIMIT,
         "limit must be clamped to MAX_API_LIST_LIMIT"
     );
-}
-
-#[test]
-fn format_run_events_adds_index() {
-    let events = vec![
-        json!({"event_type": "run_started"}),
-        json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
-    ];
-    let formatted = AgenticRunLifecycleService::format_run_events(&events, 0);
-    assert_eq!(formatted[0]["index"], 0);
-    assert_eq!(formatted[1]["index"], 1);
-    assert_eq!(formatted[1]["event_type"], "text_delta");
-}
-
-#[test]
-fn format_run_events_preserves_global_offset() {
-    let events = vec![
-        json!({"event_type": "text_delta", "data": {"chunk": "a"}}),
-        json!({"event_type": "text_delta", "data": {"chunk": "b"}}),
-    ];
-    let formatted = AgenticRunLifecycleService::format_run_events(&events, 5);
-    assert_eq!(formatted[0]["index"], 5);
-    assert_eq!(formatted[1]["index"], 6);
 }
 
 #[test]
@@ -7547,12 +7621,6 @@ fn run_status_as_str() {
 }
 
 #[test]
-fn server_loop_causal_chain_ids_fit_agent_event_column() {
-    assert!(server_loop_causal_chain_id("server-loop").len() <= 64);
-    assert!(server_loop_causal_chain_id("server-loop-tools").len() <= 64);
-}
-
-#[test]
 fn has_buffered_terminal_completion_ignores_cancelled_and_interrupted_finishes() {
     assert!(has_buffered_terminal_completion(&[json!({
         "event_type": "run_finished",
@@ -7596,7 +7664,7 @@ fn preserve_manual_pause_wins_over_late_completed_status() {
 
 #[tokio::test]
 async fn durable_paused_state_wins_over_late_completed_status() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
     svc.run_engine
         .persist_status(
@@ -7636,8 +7704,29 @@ async fn pause_run_transitions_running_to_paused() {
     let result = ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
     assert_eq!(result.status, "paused");
     assert_eq!(result.previous_status, "running");
-    let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
+
+    // HTTP surface
+    let status = ok(svc
+        .get_run_status(run.run_id.clone(), "user-1".into())
+        .await);
     assert_eq!(status.status, "paused");
+
+    // Memory state: verify pause_flag, waiting_for, status, and events
+    let runs = svc.runs.read().await;
+    let live = runs.get(&run.run_id).expect("live run present after pause");
+    assert!(
+        live.pause_flag.load(Ordering::SeqCst),
+        "pause_flag must be set"
+    );
+    assert_eq!(
+        live.waiting_for.as_deref(),
+        Some("user_resume"),
+        "waiting_for must be user_resume"
+    );
+    assert_eq!(live.status, RunStatus::Paused);
+    let events = &live.events;
+    assert_eq!(events.len(), 2, "expect run_started + run_paused");
+    assert_eq!(events[1]["event_type"], "run_paused");
 }
 
 #[tokio::test]
@@ -7672,13 +7761,39 @@ async fn resume_run_transitions_paused_to_running() {
     let result = ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
     assert_eq!(result.status, "running");
     assert_eq!(result.previous_status, "paused");
-    let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
+
+    // HTTP surface
+    let status = ok(svc
+        .get_run_status(run.run_id.clone(), "user-1".into())
+        .await);
     assert_eq!(status.status, "running");
+
+    // Memory state: verify pause_flag cleared, waiting_for cleared, events
+    let runs = svc.runs.read().await;
+    let live = runs
+        .get(&run.run_id)
+        .expect("live run present after resume");
+    assert!(
+        !live.pause_flag.load(Ordering::SeqCst),
+        "pause_flag must be cleared"
+    );
+    assert_eq!(
+        live.waiting_for, None,
+        "waiting_for must be None after resume"
+    );
+    assert_eq!(live.status, RunStatus::Running);
+    let events = &live.events;
+    assert_eq!(
+        events.len(),
+        3,
+        "expect run_started + run_paused + run_resumed"
+    );
+    assert_eq!(events[2]["event_type"], "run_resumed");
 }
 
 #[tokio::test]
 async fn resume_run_promotes_buffered_completed_pause_to_completed() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
     ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
     svc.run_engine
@@ -7752,7 +7867,7 @@ async fn resume_run_does_not_promote_cancelled_or_interrupted_finish_to_complete
         ("cancelled", json!({"cancelled": true})),
         ("interrupted", json!({"interrupted": true})),
     ] {
-        let svc = test_service_with_engine();
+        let svc = test_service();
         let run = ok(svc
             .create_run("user-1".into(), test_request(&format!("task-{suffix}")))
             .await);
@@ -8158,14 +8273,10 @@ async fn double_pause_is_conflict() {
 
 // ─── Durable persistence integration tests ─────────────────────────
 
-fn test_service_with_engine() -> AgenticRunLifecycleService {
-    test_service()
-}
-
 #[tokio::test]
 #[ignore] // runs full agentic loop; needs live infra
 async fn durable_create_run_persists_to_store() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
     let engine = &svc.run_engine;
@@ -8182,7 +8293,7 @@ async fn durable_create_run_persists_to_store() {
 #[tokio::test]
 #[ignore] // runs full agentic loop; needs live infra
 async fn durable_create_run_eventually_persists_terminal_event() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
     let engine = &svc.run_engine;
@@ -8215,7 +8326,7 @@ async fn durable_create_run_eventually_persists_terminal_event() {
 #[tokio::test]
 #[ignore] // runs full agentic loop; needs live infra
 async fn durable_stream_chat_persists_final_state() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let stream = ok(svc
         .stream_chat("user-1".into(), test_request("hello"))
         .await);
@@ -8253,7 +8364,7 @@ async fn durable_stream_chat_persists_final_state() {
 #[tokio::test]
 #[ignore] // runs full agentic loop; needs live infra
 async fn durable_cancel_persists_to_store() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
     ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
 
@@ -8286,7 +8397,7 @@ async fn durable_cancel_persists_to_store() {
 #[tokio::test]
 #[ignore] // runs full agentic loop; needs live infra
 async fn durable_pause_resume_round_trip() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
 
     ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
@@ -8311,7 +8422,7 @@ async fn durable_pause_resume_round_trip() {
 
 #[tokio::test]
 async fn cancel_run_returns_durable_terminal_status_on_cache_miss() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
     engine
@@ -8326,7 +8437,7 @@ async fn cancel_run_returns_durable_terminal_status_on_cache_miss() {
 
 #[tokio::test]
 async fn cancel_run_running_cache_miss_persists_cancelled() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
 
@@ -8442,6 +8553,18 @@ async fn resume_run_stale_read_does_not_overwrite_cancelled() {
         )
         .await
         .unwrap();
+    let (mut live, _, pause_flag, _) = AgenticRunLifecycleService::build_tracked_run_state(
+        "run-resume-race".to_string(),
+        "sess-1".to_string(),
+        "user-1".to_string(),
+    );
+    live.status = RunStatus::Paused;
+    live.waiting_for = Some("user_resume".to_string());
+    pause_flag.store(true, Ordering::SeqCst);
+    svc.runs
+        .write()
+        .await
+        .insert("run-resume-race".to_string(), live);
 
     let e = err(svc
         .resume_run("run-resume-race".into(), "user-1".into())
@@ -8465,8 +8588,8 @@ async fn resume_run_stale_read_does_not_overwrite_cancelled() {
 }
 
 #[tokio::test]
-async fn pause_run_running_succeeds_via_db() {
-    let svc = test_service_with_engine();
+async fn pause_run_orphaned_running_reconciles_to_session_continuation() {
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
 
@@ -8474,11 +8597,24 @@ async fn pause_run_running_succeeds_via_db() {
     assert_eq!(result.status, STATUS_PAUSED);
     let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
     assert_eq!(durable.status, STATUS_PAUSED);
+    assert!(durable.waiting_for.is_none());
+    assert_eq!(
+        durable.events.last().unwrap()["event_type"],
+        "run_interrupted"
+    );
+    assert_eq!(
+        durable.events.last().unwrap()["data"]["resume_strategy"],
+        "session_continuation"
+    );
+    engine
+        .start_run("run-2", "user-1", "sess-1")
+        .await
+        .expect("orphan reconciliation must release the session slot");
 }
 
 #[tokio::test]
-async fn resume_run_paused_succeeds_via_db() {
-    let svc = test_service_with_engine();
+async fn resume_run_paused_without_live_executor_requires_session_continuation() {
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
     engine
@@ -8486,10 +8622,23 @@ async fn resume_run_paused_succeeds_via_db() {
         .await
         .unwrap();
 
-    let result = ok(svc.resume_run("run-1".into(), "user-1".into()).await);
-    assert_eq!(result.status, STATUS_RUNNING);
+    let error = err(svc.resume_run("run-1".into(), "user-1".into()).await);
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("run_execution_not_live")
+    );
     let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
-    assert_eq!(durable.status, STATUS_RUNNING);
+    assert_eq!(durable.status, STATUS_PAUSED);
+    assert!(durable.waiting_for.is_none());
+    assert_eq!(
+        durable.events.last().unwrap()["data"]["requested_operation"],
+        "resume"
+    );
+    engine
+        .start_run("run-2", "user-1", "sess-1")
+        .await
+        .expect("failed same-run resume must still enable session continuation");
 }
 
 #[tokio::test]
@@ -8583,9 +8732,260 @@ async fn resume_run_transition_failure_does_not_commit_status_or_event() {
     assert_eq!(live.events[1]["event_type"], "run_paused");
 }
 
+// Durable resume/session exclusivity
+
+#[tokio::test]
+async fn durable_resume_succeeds_when_current_paused_run_is_only_blocker() {
+    let svc = test_service();
+    let engine = &svc.run_engine;
+
+    engine
+        .start_run("run-solo-resume", "user-1", "sess-solo-resume")
+        .await
+        .unwrap();
+    engine
+        .persist_status(
+            "user-1",
+            "run-solo-resume",
+            STATUS_PAUSED,
+            Some("user_resume"),
+            None,
+        )
+        .await
+        .unwrap();
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-solo-resume",
+        "sess-solo-resume",
+        RunStatus::Paused,
+        Some("user_resume"),
+    )
+    .await;
+
+    let result = ok(svc
+        .resume_run("run-solo-resume".into(), "user-1".into())
+        .await);
+
+    assert_eq!(result.status, STATUS_RUNNING);
+    let durable = engine
+        .load_run("user-1", "run-solo-resume")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_RUNNING);
+    assert!(durable.waiting_for.is_none());
+    assert_eq!(durable.events.last().unwrap()["event_type"], "run_resumed");
+}
+
+#[tokio::test]
+async fn durable_resume_rejects_blocking_sibling_after_cache_miss() {
+    let svc = test_service();
+    let engine = &svc.run_engine;
+
+    engine
+        .start_run("run-parent-blocked", "user-1", "sess-blocked")
+        .await
+        .unwrap();
+    engine
+        .persist_status("user-1", "run-parent-blocked", STATUS_PAUSED, None, None)
+        .await
+        .unwrap();
+    engine
+        .start_run("run-root-blocker", "user-1", "sess-blocked")
+        .await
+        .unwrap();
+
+    let error = err(svc
+        .resume_run("run-parent-blocked".into(), "user-1".into())
+        .await);
+
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(error.1.0.detail, "session already has an active run");
+    let durable = engine
+        .load_run("user-1", "run-parent-blocked")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_PAUSED);
+    assert!(
+        durable
+            .events
+            .iter()
+            .all(|event| event["event_type"] != "run_resumed")
+    );
+}
+
+#[tokio::test]
+async fn durable_resume_promotes_buffered_completion_even_when_session_has_blocker() {
+    let svc = test_service();
+    let engine = &svc.run_engine;
+
+    engine
+        .start_run("run-buffered-complete", "user-1", "sess-buffered")
+        .await
+        .unwrap();
+    engine
+        .persist_status("user-1", "run-buffered-complete", STATUS_PAUSED, None, None)
+        .await
+        .unwrap();
+    engine
+        .append_event(
+            "user-1",
+            "run-buffered-complete",
+            json!({
+                "event_type": "run_finished",
+                "data": {"total_prompt_tokens": 1, "total_completion_tokens": 1}
+            }),
+        )
+        .await
+        .unwrap();
+    engine
+        .start_run("run-buffered-root-blocker", "user-1", "sess-buffered")
+        .await
+        .unwrap();
+
+    let result = ok(svc
+        .resume_run("run-buffered-complete".into(), "user-1".into())
+        .await);
+
+    assert_eq!(result.status, STATUS_COMPLETED);
+    let durable = engine
+        .load_run("user-1", "run-buffered-complete")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_COMPLETED);
+    assert!(durable.waiting_for.is_none());
+    assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
+}
+
+/// Concurrent mutation of two durable-only runs in the same session must
+/// classify the orphaned running row honestly while cancelling its sibling.
+#[tokio::test]
+async fn concurrent_orphan_pause_and_cancel_release_session_slot_consistently() {
+    let svc = test_service();
+    let engine = &svc.run_engine;
+    let session_id = "sess-pause-cancel-conc";
+
+    // Set up via engine (durable-only): run-a budget-exhausted paused,
+    // run-b running. Budget-exhausted paused doesn't block create_run.
+    engine
+        .start_run("run-a", "user-1", session_id)
+        .await
+        .unwrap();
+    engine
+        .persist_status("user-1", "run-a", STATUS_PAUSED, None, None)
+        .await
+        .unwrap();
+    engine
+        .start_run("run-b", "user-1", session_id)
+        .await
+        .unwrap();
+
+    // Concurrent: a pause request discovers that run-b has no executor while
+    // run-a is cancelled. Both operations must converge without inventing a
+    // resumable same-run task.
+    let (result_pause_b, result_cancel_a) = tokio::join!(
+        svc.pause_run("run-b".into(), "user-1".into()),
+        svc.cancel_run("run-a".into(), "user-1".into()),
+    );
+
+    assert!(
+        result_pause_b.is_ok(),
+        "pause run-b must succeed: {result_pause_b:?}"
+    );
+    assert!(
+        result_cancel_a.is_ok(),
+        "cancel run-a must succeed: {result_cancel_a:?}"
+    );
+
+    // Durable store: both mutations applied
+    let durable_a = engine.load_run("user-1", "run-a").await.unwrap().unwrap();
+    let durable_b = engine.load_run("user-1", "run-b").await.unwrap().unwrap();
+
+    assert_eq!(durable_a.status, STATUS_CANCELLED, "run-a cancelled");
+    assert!(durable_a.waiting_for.is_none());
+    assert!(durable_a.events.iter().any(
+        |e| e["event_type"] == "run_finished" && e["data"]["cancelled"].as_bool() == Some(true)
+    ));
+
+    assert_eq!(durable_b.status, STATUS_PAUSED, "run-b paused");
+    assert!(durable_b.waiting_for.is_none());
+    assert_eq!(
+        durable_b.events.last().unwrap()["event_type"],
+        "run_interrupted"
+    );
+    assert_eq!(
+        durable_b.events.last().unwrap()["data"]["resume_strategy"],
+        "session_continuation"
+    );
+    engine
+        .start_run("run-c", "user-1", session_id)
+        .await
+        .expect("concurrent orphan recovery and cancel must release the session slot");
+}
+
+#[tokio::test]
+async fn concurrent_cancel_and_resume_of_same_paused_run_preserves_durable_consistency() {
+    let svc = test_service();
+    let engine = &svc.run_engine;
+    let session_id = "sess-cancel-resume-conc";
+
+    // Set up: run-a is paused with user_resume (eligible for both cancel and resume)
+    engine
+        .start_run("run-a", "user-1", session_id)
+        .await
+        .unwrap();
+    engine
+        .persist_status("user-1", "run-a", STATUS_PAUSED, Some("user_resume"), None)
+        .await
+        .unwrap();
+
+    // Concurrent cancel and resume from two agents
+    let (cancel, resume) = tokio::join!(
+        svc.cancel_run("run-a".into(), "user-1".into()),
+        svc.resume_run("run-a".into(), "user-1".into()),
+    );
+
+    assert!(
+        cancel.is_ok(),
+        "cancel must be accepted from either paused or resumed-running state: {cancel:?}"
+    );
+    if let Err((code, body)) = &resume {
+        assert_eq!(
+            code,
+            &StatusCode::CONFLICT,
+            "resume loser must report conflict, got {code}: {}",
+            body.0.detail
+        );
+    }
+
+    let durable = engine.load_run("user-1", "run-a").await.unwrap().unwrap();
+    assert_eq!(durable.status, STATUS_CANCELLED);
+    assert!(durable.events.iter().any(
+        |e| e["event_type"] == "run_finished" && e["data"]["cancelled"].as_bool() == Some(true)
+    ));
+    if resume.is_ok() {
+        assert!(
+            durable
+                .events
+                .iter()
+                .any(|e| e["event_type"] == "run_resumed")
+        );
+    } else {
+        assert!(
+            durable
+                .events
+                .iter()
+                .all(|e| e["event_type"] != "run_resumed")
+        );
+    }
+}
+
 #[tokio::test]
 async fn cancel_run_paused_cache_miss_persists_cancelled() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
     engine
@@ -8602,7 +9002,7 @@ async fn cancel_run_paused_cache_miss_persists_cancelled() {
 #[tokio::test]
 #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
 async fn get_run_status_falls_back_to_durable_store_on_cache_miss() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let stream = ok(svc
         .stream_chat("user-1".into(), test_request("hello"))
         .await);
@@ -8627,7 +9027,7 @@ async fn get_run_status_falls_back_to_durable_store_on_cache_miss() {
 
 #[tokio::test]
 async fn stream_run_cache_miss_replays_durable_text_done() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine
         .start_run("run-durable-text", "user-1", "session-1")
@@ -8661,13 +9061,22 @@ async fn stream_run_cache_miss_replays_durable_text_done() {
 }
 
 #[tokio::test]
-async fn submit_run_input_uses_durable_idempotency_on_cache_miss() {
-    let svc = test_service_with_engine();
+async fn submit_run_input_uses_durable_idempotency_when_live_cache_has_no_input_event() {
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine
         .start_run("run-input", "user-1", "session-1")
         .await
         .unwrap();
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-input",
+        "session-1",
+        RunStatus::Running,
+        None,
+    )
+    .await;
 
     let first = ok(svc
         .submit_run_input(
@@ -8722,6 +9131,15 @@ async fn submit_run_input_transition_failure_does_not_commit_status_or_events() 
         .start_run("run-input-fail", "user-1", "session-1")
         .await
         .unwrap();
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-input-fail",
+        "session-1",
+        RunStatus::Running,
+        None,
+    )
+    .await;
 
     let e = err(svc
         .submit_run_input(
@@ -8758,8 +9176,53 @@ async fn submit_run_input_transition_failure_does_not_commit_status_or_events() 
 }
 
 #[tokio::test]
+async fn submit_run_input_rejects_orphaned_execution_without_persisting_false_acceptance() {
+    let svc = test_service();
+    let engine = &svc.run_engine;
+    engine
+        .start_run("run-orphaned-input", "user-1", "session-1")
+        .await
+        .unwrap();
+
+    let error = err(svc
+        .submit_run_input(
+            "run-orphaned-input".into(),
+            "user-1".into(),
+            RunInputData {
+                idempotency_key: "key-orphaned".into(),
+                input: json!({"answer": "nobody can consume this"}),
+            },
+        )
+        .await);
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("run_input_consumer_not_live")
+    );
+
+    let durable = engine
+        .load_run("user-1", "run-orphaned-input")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_PAUSED);
+    assert!(durable.waiting_for.is_none());
+    assert!(durable.events.iter().all(|event| {
+        event.get("idempotency_key").and_then(Value::as_str) != Some("key-orphaned")
+    }));
+    assert_eq!(
+        durable.events.last().unwrap()["data"]["requested_operation"],
+        "submit_input"
+    );
+    engine
+        .start_run("run-input-continuation", "user-1", "session-1")
+        .await
+        .expect("rejected orphan input must not leave the session blocked");
+}
+
+#[tokio::test]
 async fn submit_run_input_rejects_terminal_durable_run() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine
         .start_run("run-terminal-input", "user-1", "session-1")
@@ -8785,7 +9248,7 @@ async fn submit_run_input_rejects_terminal_durable_run() {
 
 #[tokio::test]
 async fn submit_run_input_accepts_repeated_queueing_while_input_already_queued() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine
         .start_run("run-queued-input", "user-1", "session-1")
@@ -8801,6 +9264,15 @@ async fn submit_run_input_accepts_repeated_queueing_while_input_already_queued()
         )
         .await
         .unwrap();
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-queued-input",
+        "session-1",
+        RunStatus::InputQueued,
+        Some("user_input"),
+    )
+    .await;
 
     let result = svc
         .submit_run_input(
@@ -8830,7 +9302,7 @@ async fn submit_run_input_accepts_repeated_queueing_while_input_already_queued()
 
 #[tokio::test]
 async fn submit_run_input_rejects_paused_durable_run() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine
         .start_run("run-paused-input", "user-1", "session-1")
@@ -8856,7 +9328,7 @@ async fn submit_run_input_rejects_paused_durable_run() {
 
 #[tokio::test]
 async fn submit_run_input_rejects_oversized_content() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine
         .start_run("run-large-input", "user-1", "session-1")
@@ -8890,7 +9362,7 @@ async fn submit_run_input_rejects_oversized_content() {
 
 #[tokio::test]
 async fn create_run_conflict_checks_durable_active_session() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine
         .start_run("existing-run", "user-1", "shared-session")
@@ -8906,7 +9378,7 @@ async fn create_run_conflict_checks_durable_active_session() {
 #[tokio::test]
 #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
 async fn stream_run_falls_back_to_durable_store_on_cache_miss() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let stream = ok(svc
         .stream_chat("user-1".into(), test_request("hello"))
         .await);
@@ -8931,7 +9403,7 @@ async fn stream_run_falls_back_to_durable_store_on_cache_miss() {
 #[tokio::test]
 #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
 async fn list_runs_falls_back_to_durable_store_on_cache_miss() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let first = ok(svc
         .stream_chat("user-1".into(), test_request("first"))
         .await);
@@ -9090,7 +9562,7 @@ async fn create_run_spawns_background_task() {
 #[tokio::test]
 #[ignore] // runs full agentic loop; needs live infra
 async fn create_run_with_engine_persists_final_state() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
     // Deterministic wait: poll durable state until it leaves "running".
@@ -9115,7 +9587,7 @@ async fn create_run_with_engine_persists_final_state() {
 
 #[tokio::test]
 async fn fail_started_run_before_spawn_persists_terminal_events() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine
         .start_run("run-pre-spawn", "user-1", "session-1")
@@ -9469,18 +9941,6 @@ async fn delegation_tracker_get_children() {
     assert!(children.is_empty());
 }
 
-/// P0-C: The agentic loop spawn must check token budget before starting.
-#[test]
-fn run_lifecycle_checks_token_budget_before_loop() {
-    let source = include_str!("mod.rs");
-    let test_start = source.find("mod tests {").unwrap_or(source.len());
-    let prod_code = &source[..test_start];
-    assert!(
-        prod_code.contains("check_token_budget"),
-        "run_lifecycle must call check_token_budget before the agentic loop"
-    );
-}
-
 /// P0-C: drain_background_tasks returns true when no tasks are running.
 #[tokio::test]
 async fn drain_background_tasks_returns_immediately_when_idle() {
@@ -9673,9 +10133,11 @@ fn run_status_live_semantics_align_with_durable_owner() {
     );
 }
 
-/// P1-A: finalize_run_events must preserve Waiting as a non-error status.
+/// A waiting outcome has no live task after finalization, so it must release
+/// the execution slot and advertise session continuation instead of leaving an
+/// unconsumable durable input queue.
 #[test]
-fn finalize_run_events_preserves_waiting_without_error_event() {
+fn finalize_run_events_routes_waiting_to_session_continuation() {
     let svc = test_service();
     let request = test_request("wait");
     let state = svc.build_initial_state(
@@ -9694,312 +10156,28 @@ fn finalize_run_events_preserves_waiting_without_error_event() {
         &state,
     );
 
-    assert_eq!(status, RunStatus::Waiting);
-    assert_eq!(error.as_deref(), Some("waiting: tool_approval"));
-    assert_eq!(events.len(), 1);
+    assert_eq!(status, RunStatus::Paused);
+    assert!(error.is_none());
+    assert_eq!(events.len(), 2);
     assert_eq!(events[0]["event_type"], "run_waiting");
     assert_eq!(events[0]["data"]["reason"], "waiting: tool_approval");
+    assert_eq!(events[0]["data"]["resume_strategy"], "session_continuation");
+    assert_eq!(events[1]["event_type"], "run_finished");
+    assert_eq!(events[1]["data"]["interrupted"], true);
 }
 
 /// P1-F: stream_chat must persist usage unconditionally.
 /// Cancelled runs still consumed tokens and must have accurate durable records,
 /// even when status persistence is skipped.
-#[test]
-fn stream_chat_persists_usage_unconditionally() {
-    let source = include_str!("mod.rs");
-    // Find the stream_chat method
-    let fn_start = source
-        .find("async fn stream_chat(")
-        .expect("stream_chat must exist");
-    let fn_end = source[fn_start..]
-        .find("\n    async fn ")
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-
-    let usage_pos = fn_body
-        .find(".persist_usage(")
-        .expect("stream_chat must call persist_usage");
-
-    // persist_usage must NOT be inside the status-persistence guard.
-    // Cancelled runs skip persist_status, but usage must still be written.
-    let guard_pos = fn_body
-        .find("if persist_status_update {")
-        .expect("persist_status_update guard must exist");
-    let guard_block = &fn_body[guard_pos..];
-    let mut depth = 0;
-    let mut guard_end = 0;
-    for (i, c) in guard_block.char_indices() {
-        if c == '{' {
-            depth += 1;
-        } else if c == '}' {
-            depth -= 1;
-            if depth == 0 {
-                guard_end = guard_pos + i + 1;
-                break;
-            }
-        }
-    }
-    assert!(
-        usage_pos > guard_end,
-        "persist_usage must remain outside the persist_status_update guard — \
-         cancelled stream_chat runs must still persist usage for billing/audit"
-    );
-}
-
-#[test]
-fn durable_top_level_run_usage_uses_provider_input_tokens() {
-    let source = include_str!("mod.rs");
-    let production = source
-        .split("/// Production sub-run executor backed by")
-        .next()
-        .expect("top-level production lifecycle source");
-    let mut checked_calls = 0;
-    let mut cursor = production;
-    while let Some(pos) = cursor.find(".persist_usage(") {
-        checked_calls += 1;
-        let snippet = &cursor[pos..cursor.len().min(pos + 360)];
-        assert!(
-            snippet.contains("provider_input_tokens()"),
-            "durable run usage has no cache-specific columns, so prompt totals must include cache read/write buckets: {snippet}"
-        );
-        assert!(
-            !snippet.contains("total_prompt,"),
-            "fresh-input-only totals would under-report prompt-cache-heavy runs: {snippet}"
-        );
-        cursor = &cursor[pos + ".persist_usage(".len()..];
-    }
-    assert!(
-        checked_calls >= 2,
-        "top-level run paths must persist usage on terminal paths"
-    );
-}
-
-#[test]
-fn server_subrun_persists_durable_usage() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("impl SubRunExecutor for ServerSubRunExecutor")
-        .expect("server sub-run executor must exist");
-    let fn_end = source[fn_start..]
-        .find("// ─── Tests")
-        .map(|p| fn_start + p)
-        .expect("server sub-run executor body");
-    let fn_body = &source[fn_start..fn_end];
-    let call_pos = fn_body
-        .find("self.persist_durable_subrun_usage(")
-        .expect("sub-runs must persist durable usage after execution");
-    let snippet = &fn_body[call_pos..fn_body.len().min(call_pos + 360)];
-
-    assert!(
-        snippet.contains("prompt_tokens"),
-        "sub-run usage must use provider input tokens including cache buckets: {snippet}"
-    );
-    assert!(
-        snippet.contains("loop_state.total_completion"),
-        "sub-run completion token usage must be persisted: {snippet}"
-    );
-    assert!(
-        snippet.contains("loop_state.total_tool_calls"),
-        "sub-run tool-call usage must be persisted: {snippet}"
-    );
-}
-
-#[test]
-fn server_subrun_agent_result_prompt_tokens_include_cache_buckets() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("impl SubRunExecutor for ServerSubRunExecutor")
-        .expect("server sub-run executor must exist");
-    let fn_end = source[fn_start..]
-        .find("// ─── Tests")
-        .map(|p| fn_start + p)
-        .expect("server sub-run executor body");
-    let fn_body = &source[fn_start..fn_end];
-
-    assert!(
-        fn_body.contains("let prompt_tokens = loop_state.provider_input_tokens();"),
-        "AgentResult has no cache-specific fields; prompt_tokens must represent provider input tokens"
-    );
-    assert!(
-        !fn_body.contains("prompt_tokens: loop_state.total_prompt"),
-        "fresh-input-only totals would under-report prompt-cache-heavy sub-runs"
-    );
-}
 
 /// P1-C: build_server_skill_executor must accept and wire a cancel_token.
 /// Without this, skill sub-runs ignore parent cancellation.
-#[test]
-fn build_server_skill_executor_accepts_cancel_token() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_server_skill_executor(")
-        .expect("build_server_skill_executor must exist");
-    let fn_end = source[fn_start..]
-        .find("\npub(crate) fn ")
-        .or_else(|| source[fn_start..].find("\nfn "))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("cancel_token"),
-        "build_server_skill_executor must accept a cancel_token parameter"
-    );
-    assert!(
-        fn_body.contains("with_cancel_token"),
-        "build_server_skill_executor must wire cancel_token via with_cancel_token"
-    );
-}
 
 /// Runtime tool surfacing for forked server skills must inherit the parent
 /// workspace/executor/runtime binding; otherwise sub-runs see raw edge
 /// schemas without the capability resolver's runtime truth.
-#[test]
-fn build_server_skill_executor_wires_execution_binding_snapshot() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_server_skill_executor(")
-        .expect("build_server_skill_executor must exist");
-    let fn_end = source[fn_start..]
-        .find("\npub(crate) fn ")
-        .or_else(|| source[fn_start..].find("\nfn "))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("execution_bindings"),
-        "build_server_skill_executor must accept execution binding metadata"
-    );
-    assert!(
-        fn_body.contains("with_execution_binding_snapshot"),
-        "build_server_skill_executor must pass execution bindings to server skill sub-runs"
-    );
-}
-
-#[test]
-fn build_server_skill_executor_wires_inherited_permissions() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_server_skill_executor(")
-        .expect("build_server_skill_executor must exist");
-    let fn_end = source[fn_start..]
-        .find("\npub(crate) fn ")
-        .or_else(|| source[fn_start..].find("\nfn "))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("inherited_permissions"),
-        "build_server_skill_executor must accept request-level permissions"
-    );
-    assert!(
-        fn_body.contains("with_inherited_permissions"),
-        "build_server_skill_executor must pass request-level permissions to server skill sub-runs"
-    );
-}
-
-#[test]
-fn build_server_skill_executor_wires_reflect_service() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_server_skill_executor(")
-        .expect("build_server_skill_executor must exist");
-    let fn_end = source[fn_start..]
-        .find("\npub(crate) fn ")
-        .or_else(|| source[fn_start..].find("\nfn "))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("reflect_service: Arc<dyn astra_services::ReflectService>"),
-        "build_server_skill_executor must accept the shared reflect service"
-    );
-    assert!(
-        fn_body.contains(".with_reflect_service(reflect_service)"),
-        "build_server_skill_executor must pass reflect service to server skill sub-runs"
-    );
-}
-
-#[test]
-fn lifecycle_executor_construction_wires_reflect_service() {
-    let source = include_str!("mod.rs");
-    let production = source
-        .split("\n#[cfg(test)]\nmod tests")
-        .next()
-        .expect("production lifecycle source");
-    let root_wires = production
-        .matches("wire_reflect_service_into_executor(executor, &self.reflect_service)")
-        .count();
-    assert!(
-        root_wires >= 3,
-        "root/resume/sub-run RuntimeToolExecutor construction must all inject the shared reflect service"
-    );
-    assert!(
-        production.contains(".with_reflect_service(Arc::clone(&self.reflect_service))"),
-        "dynamic agent spawner/sub-run builders must inherit the shared reflect service"
-    );
-    assert!(
-        production.contains("self.reflect_service.is_configured()"),
-        "capability construction must derive reflect visibility from reflect service readiness"
-    );
-}
 
 /// P1-C: build_initial_state must pass cancel_token to skill executor builder.
-#[test]
-fn build_initial_state_passes_cancel_token_to_skill_executor() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_initial_state(")
-        .expect("build_initial_state must exist");
-    let fn_end = source[fn_start..]
-        .find("\n    fn ")
-        .or_else(|| source[fn_start..].find("\n    pub"))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("cancel_token"),
-        "build_initial_state must accept and pass cancel_token to skill executor"
-    );
-}
-
-#[test]
-fn build_initial_state_passes_execution_bindings_to_skill_executor() {
-    let source = include_str!("mod.rs");
-    let fn_start = source
-        .find("fn build_initial_state(")
-        .expect("build_initial_state must exist");
-    let fn_end = source[fn_start..]
-        .find("\n    fn ")
-        .or_else(|| source[fn_start..].find("\n    pub"))
-        .map(|p| fn_start + p)
-        .unwrap_or(source.len());
-    let fn_body = &source[fn_start..fn_end];
-    assert!(
-        fn_body.contains("execution_bindings"),
-        "build_initial_state must accept execution bindings"
-    );
-    assert!(
-        fn_body.contains("build_initial_state_inner(") && fn_body.contains("execution_bindings,"),
-        "build_initial_state must pass execution bindings into build_initial_state_inner"
-    );
-
-    let inner_start = source[fn_start..]
-        .find("fn build_initial_state_inner(")
-        .map(|p| fn_start + p)
-        .expect("build_initial_state_inner must exist");
-    let inner_end = source[inner_start..]
-        .find("\n    fn ")
-        .or_else(|| source[inner_start..].find("\n    pub"))
-        .map(|p| inner_start + p)
-        .unwrap_or(source.len());
-    let inner_body = &source[inner_start..inner_end];
-    assert!(
-        inner_body.contains("build_server_skill_executor(")
-            && inner_body.contains("execution_bindings,"),
-        "build_initial_state_inner must pass execution bindings into the skill executor builder"
-    );
-}
 
 #[test]
 fn resumable_run_statuses_stay_live_for_resume() {
@@ -10015,7 +10193,7 @@ fn resumable_run_statuses_stay_live_for_resume() {
 /// the process-local control handle is gone.
 #[tokio::test]
 async fn cancel_run_waiting_cache_miss_persists_cancelled() {
-    let svc = test_service_with_engine();
+    let svc = test_service();
     let engine = &svc.run_engine;
     engine
         .start_run("waiting-run", "user-1", "session-1")

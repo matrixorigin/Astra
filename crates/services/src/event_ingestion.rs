@@ -212,7 +212,8 @@ fn merged_metadata_from_journal_event(
     let has_extra = event.session_lineage.is_some()
         || event.coordination.is_some()
         || event.edge_policy.is_some()
-        || event.context_assembly_trace.is_some();
+        || event.context_assembly_trace.is_some()
+        || event.tool_outcomes.is_some();
     if !has_extra && event.metadata.is_none() {
         return None;
     }
@@ -242,6 +243,11 @@ fn merged_metadata_from_journal_event(
     }
     if let Some(ref trace) = event.context_assembly_trace {
         obj.insert("context_assembly_trace".to_string(), trace.clone());
+    }
+    if let Some(ref outcomes) = event.tool_outcomes
+        && let Ok(value) = serde_json::to_value(outcomes)
+    {
+        obj.insert("tool_outcomes".to_string(), value);
     }
     Some(serde_json::Value::Object(obj))
 }
@@ -422,15 +428,29 @@ impl IngestionEvent {
                 let tc_event_id =
                     stable_event_id(&["tool_call", &main_event_id, &index, &tool_name]);
 
-                let raw_content = if tc.ok {
-                    format!("{} completed in {}ms", tool_name, tc.ms)
-                } else {
-                    format!(
+                let disposition = tc.effective_disposition();
+                let raw_content = match disposition {
+                    crate::session_journal::ToolCallDisposition::Executed if tc.ok => {
+                        format!("{} completed in {}ms", tool_name, tc.ms)
+                    }
+                    crate::session_journal::ToolCallDisposition::Executed => format!(
                         "{} failed in {}ms: {}",
                         tool_name,
                         tc.ms,
                         tc.error.as_deref().unwrap_or("unknown error")
-                    )
+                    ),
+                    crate::session_journal::ToolCallDisposition::Rejected => {
+                        format!("{} was rejected before execution", tool_name)
+                    }
+                    crate::session_journal::ToolCallDisposition::Reused => {
+                        format!("{} reused an existing result", tool_name)
+                    }
+                    crate::session_journal::ToolCallDisposition::Suppressed => {
+                        format!("{} was suppressed before execution", tool_name)
+                    }
+                    crate::session_journal::ToolCallDisposition::Deferred => {
+                        format!("{} was deferred before execution", tool_name)
+                    }
                 };
                 let content = if redact_content {
                     redacted_content_marker(&raw_content)
@@ -442,6 +462,25 @@ impl IngestionEvent {
                 metadata.insert("tool_name".into(), Value::String(tool_name.clone()));
                 metadata.insert("ok".into(), Value::Bool(tc.ok));
                 metadata.insert("duration_ms".into(), Value::from(tc.ms));
+                metadata.insert(
+                    "disposition".into(),
+                    serde_json::to_value(disposition).unwrap_or(Value::Null),
+                );
+                if let Some(error_kind) = tc.error_kind {
+                    metadata.insert(
+                        "error_kind".into(),
+                        serde_json::to_value(error_kind).unwrap_or(Value::Null),
+                    );
+                }
+                if let Some(result_class) = tc.result_class.as_ref() {
+                    metadata.insert("result_class".into(), Value::String(result_class.clone()));
+                }
+                if let Some(exit_semantics) = tc.exit_semantics.as_ref() {
+                    metadata.insert(
+                        "exit_semantics".into(),
+                        Value::String(exit_semantics.clone()),
+                    );
+                }
                 metadata.insert(
                     "error".into(),
                     tc.error
@@ -461,10 +500,13 @@ impl IngestionEvent {
                     event_id: tc_event_id,
                     session_id: session_id.clone(),
                     user_id: uid.clone(),
-                    event_type: if tc.ok {
-                        "tool_call".to_string()
-                    } else {
+                    event_type: if disposition
+                        == crate::session_journal::ToolCallDisposition::Executed
+                        && !tc.ok
+                    {
                         "tool_error".to_string()
+                    } else {
+                        "tool_call".to_string()
                     },
                     content: Some(content),
                     token_usage: None,
@@ -1890,6 +1932,7 @@ mod tests {
             selected_skills: Some(vec!["tune-performance".into()]),
             tools_used: Some(vec!["github".into()]),
             tool_calls: None,
+            tool_outcomes: None,
             budget_used: None,
             budget_pressure: None,
             stall_type: None,
@@ -2366,6 +2409,41 @@ mod tests {
         assert_eq!(meta["ok"], true);
         assert_eq!(meta["duration_ms"], 500);
         assert_eq!(meta["turn"], 3);
+        assert_eq!(meta["disposition"], "executed");
+    }
+
+    #[test]
+    fn rejected_tool_request_is_not_ingested_as_an_execution_failure() {
+        let journal =
+            make_turn_event().with_tool_calls(vec![crate::session_journal::ToolCallRecord {
+                name: "git".into(),
+                ok: false,
+                ms: 0,
+                error: Some("invalid arguments".into()),
+                error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+                disposition: Some(crate::session_journal::ToolCallDisposition::Rejected),
+                ..Default::default()
+            }]);
+
+        let events =
+            IngestionEvent::expand_journal_event(&journal, "u1").expect("valid journal event");
+        let main_metadata = events[0].metadata.as_ref().expect("turn metadata");
+        assert_eq!(main_metadata["tool_outcomes"]["requested"], 1);
+        assert_eq!(main_metadata["tool_outcomes"]["executed"], 0);
+        assert_eq!(main_metadata["tool_outcomes"]["rejected"], 1);
+
+        let request = &events[1];
+        assert_eq!(request.event_type, "tool_call");
+        let metadata = request.metadata.as_ref().expect("tool metadata");
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["error_kind"], "tool_invalid_args");
+        assert!(
+            request
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("before execution")
+        );
     }
 
     #[test]

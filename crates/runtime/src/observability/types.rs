@@ -210,7 +210,6 @@ pub struct QueryBehavior {
 pub struct BridgeInjectionPreviews<'a> {
     pub lessons: &'a str,
     pub volatile: &'a str,
-    pub memoria_insights: &'a str,
     pub memoria_prefetch: &'a str,
     pub self_awareness: &'a str,
     pub feedback_rules: &'a str,
@@ -224,7 +223,6 @@ impl BridgeInjectionPreviews<'_> {
     pub const EMPTY: Self = Self {
         lessons: "",
         volatile: "",
-        memoria_insights: "",
         memoria_prefetch: "",
         self_awareness: "",
         feedback_rules: "",

@@ -64,6 +64,9 @@ fn skipped_tool(name: &str) -> ToolCallRecord {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        result_class: Some(
+            astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string(),
+        ),
         ..Default::default()
     }
 }
@@ -81,6 +84,9 @@ fn deferred_tool(name: &str) -> ToolCallRecord {
         file_path: None,
         surgically_removed: None,
         original_tool_name: None,
+        result_class: Some(
+            astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string(),
+        ),
         ..Default::default()
     }
 }

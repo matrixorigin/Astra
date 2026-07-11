@@ -1446,6 +1446,55 @@ mod tests {
     }
 
     #[test]
+    fn typed_prompt_recall_changes_only_dynamic_anthropic_bytes() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let assemble = |memory_id: &str, content: &str| {
+            let entries = vec![
+                astra_turn_core::context_sources::MemoryEntry::scored(content, 0.9)
+                    .with_memory_identity(memory_id, "semantic")
+                    .with_source("memoria.prefetch"),
+            ];
+            assemble_bridge_pipeline_outcome(
+                &["bash"],
+                &[],
+                &[],
+                &[],
+                &entries,
+                None,
+                None,
+                &cache_cfg,
+                None,
+                "sid-memory-cache",
+                "claude-sonnet-4-6",
+                None,
+                "anthropic",
+                Some("/repo"),
+                Some("main"),
+                None,
+                "",
+                "",
+                "2026-07-10",
+            )
+        };
+
+        let first = assemble("m1", "first typed recall evidence");
+        let second = assemble("m2", "second typed recall evidence");
+        assert_eq!(
+            first.primary_system, second.primary_system,
+            "per-turn recall must not churn the cacheable prefix"
+        );
+        assert_ne!(
+            first.dynamic_system, second.dynamic_system,
+            "changed recall evidence must remain visible in the dynamic lane"
+        );
+    }
+
+    #[test]
     fn bridge_pipeline_outcome_keeps_deferred_tools_block_in_session_prefix() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");

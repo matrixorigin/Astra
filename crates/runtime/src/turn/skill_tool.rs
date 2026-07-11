@@ -788,6 +788,8 @@ pub struct SkillCallResult {
 pub struct InterceptedToolResult {
     pub tool_call_id: String,
     pub tool_name: String,
+    pub ok: bool,
+    pub result_class: Option<String>,
     pub result: String,
 }
 
@@ -840,7 +842,7 @@ pub async fn partition_discover_and_execute_skills(
 
         let args = extract_tool_args(&tc);
 
-        let result = match args {
+        let (result, ok) = match args {
             Some(args) => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                 let (text, discovered) = execute_discover_skills(query, catalog, excluded.clone());
@@ -855,9 +857,12 @@ pub async fn partition_discover_and_execute_skills(
                         }
                     }
                 }
-                text
+                (text, true)
             }
-            None => "Invalid discover_skills arguments: expected object or JSON string".to_string(),
+            None => (
+                "Invalid discover_skills arguments: expected object or JSON string".to_string(),
+                false,
+            ),
         };
 
         combined_results.push(InterceptedToolResult {
@@ -868,6 +873,8 @@ pub async fn partition_discover_and_execute_skills(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            ok,
+            result_class: None,
             result,
         });
     }
@@ -1002,12 +1009,16 @@ pub async fn partition_and_execute_skills(
                 InterceptedToolResult {
                     tool_call_id: call_id,
                     tool_name,
+                    ok: effective_success,
+                    result_class: None,
                     result,
                 }
             }
             None => InterceptedToolResult {
                 tool_call_id: call_id,
                 tool_name,
+                ok: false,
+                result_class: None,
                 result: "Invalid skill arguments: expected object or JSON string".to_string(),
             },
         };
@@ -1857,8 +1868,17 @@ fn execute_skill<'a>(
                             Ok(result) => {
                                 run_hooks(&skill.hooks.post_invoke, is_mcp);
 
+                                // `success` is the typed child-run completion
+                                // contract.  Do not promote partial output from
+                                // an interrupted/cancelled/failed sub-run, and
+                                // do not fall back to inline after the child may
+                                // already have performed side effects.
+                                let execution_succeeded = result.success;
+
                                 // Post-execution verification (fork skills only)
-                                let (output, verification) = if !skill.success_criteria.is_empty() {
+                                let (output, verification) = if execution_succeeded
+                                    && !skill.success_criteria.is_empty()
+                                {
                                     let work_dir = skill
                                         .skill_dir
                                         .as_ref()
@@ -1908,11 +1928,13 @@ fn execute_skill<'a>(
 
                                 return SkillCallResult {
                                     output,
-                                    success: verification
-                                        .as_ref()
-                                        .map(|v| v.all_required_passed)
-                                        .unwrap_or(true),
-                                    activation: Some(build_activation(&skill)),
+                                    success: execution_succeeded
+                                        && verification
+                                            .as_ref()
+                                            .map(|v| v.all_required_passed)
+                                            .unwrap_or(true),
+                                    activation: execution_succeeded
+                                        .then(|| build_activation(&skill)),
                                     verification,
                                 };
                             }
@@ -3622,6 +3644,94 @@ mod tests {
         assert!(r.activation.is_some());
         let verification = r.verification.expect("expected verification outcome");
         assert!(verification.all_required_passed);
+    }
+
+    #[tokio::test]
+    async fn incomplete_fork_result_is_not_activated_or_reexecuted_inline() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ForkResolver;
+        impl SkillResolver for ForkResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "This instruction must not be returned as an inline fallback."
+                        .into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Fork,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Local,
+                    success_criteria: vec![],
+                    composition: None,
+                    input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
+                    forward_headers: vec![],
+                    required_headers: vec![],
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                })
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        struct InterruptedExecutor {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl SkillExecutor for InterruptedExecutor {
+            async fn execute(
+                &self,
+                _skill: &LoadedSkill,
+                _context: &SkillExecutionContext,
+            ) -> Result<
+                crate::skills::traits::SkillExecutionResult,
+                crate::skills::traits::SkillError,
+            > {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::skills::traits::SkillExecutionResult {
+                    output: "partial child evidence".into(),
+                    tokens_used: 10,
+                    turns: 1,
+                    duration_ms: 1,
+                    success: false,
+                    verification_results: Vec::new(),
+                    error_category: Some(crate::skills::manifest::SkillErrorKind::Interrupted),
+                })
+            }
+
+            fn supports(&self, _context: &ExecutionContext) -> bool {
+                true
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor: Arc<dyn SkillExecutor> = Arc::new(InterruptedExecutor {
+            calls: Arc::clone(&calls),
+        });
+        let result = execute_skill(
+            &ForkResolver,
+            Some(&executor),
+            "fork-review",
+            "review task",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!result.success);
+        assert!(result.activation.is_none());
+        assert_eq!(result.output, "partial child evidence");
     }
 
     #[test]

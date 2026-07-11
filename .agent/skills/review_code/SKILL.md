@@ -23,6 +23,14 @@ allowed_tools:
 This is not a general code review. Answer one question: do the tests prove the
 changed behavior, especially when things go wrong?
 
+Hard rule: flag production control flow that depends on natural-language text
+matching. Safety, admission, routing, blocking, retry, recovery, evaluation, and
+state transitions must use typed fields such as enums, `ErrorKind`,
+`result_class`, `exit_semantics`, structured JSON, protocol parsers, AST/token
+parsers, or exact machine-owned sentinel fields. Text matching is acceptable
+only for UI display/search, rendered-text tests, or explicitly named legacy
+`fallback` parsers that are not the primary decision path.
+
 ## Task
 
 $ARGUMENTS

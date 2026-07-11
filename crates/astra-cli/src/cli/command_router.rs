@@ -164,7 +164,7 @@ fn emit_task_event(enabled: bool, value: serde_json::Value) {
 pub(crate) fn exit_code_for_error_kind(error_kind: &str) -> Option<ExitCode> {
     match error_kind {
         "tool_failure" => Some(ExitCode::ToolFailure),
-        "force_stop" => Some(ExitCode::ForceStop),
+        "cancelled" => Some(ExitCode::Cancelled),
         "api_error" => Some(ExitCode::ApiError),
         "persistence_error" => Some(ExitCode::PersistenceError),
         "partial" => Some(ExitCode::Partial),
@@ -177,7 +177,7 @@ pub(crate) fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static s
     match exit_code {
         ExitCode::Success => None,
         ExitCode::ToolFailure => Some("tool_failure"),
-        ExitCode::ForceStop => Some("force_stop"),
+        ExitCode::Cancelled => Some("cancelled"),
         ExitCode::ApiError => Some("api_error"),
         ExitCode::PersistenceError => Some("persistence_error"),
         ExitCode::Partial => Some("partial"),
@@ -191,7 +191,8 @@ fn task_status_for_exit_code(exit_code: ExitCode) -> &'static str {
         ExitCode::Partial => "partial",
         ExitCode::Unfinished => "unfinished",
         ExitCode::PersistenceError => "persistence_error",
-        ExitCode::ToolFailure | ExitCode::ForceStop | ExitCode::ApiError => "failed",
+        ExitCode::Cancelled => "cancelled",
+        ExitCode::ToolFailure | ExitCode::ApiError => "failed",
     }
 }
 
@@ -281,7 +282,7 @@ fn task_terminal_summary_line(
         ExitCode::Partial => (theme::icon_warn(), "finished partially"),
         ExitCode::Unfinished => (theme::icon_warn(), "unfinished"),
         ExitCode::PersistenceError => (theme::icon_warn(), "finished with persistence degradation"),
-        ExitCode::ForceStop => (theme::icon_warn(), "stopped"),
+        ExitCode::Cancelled => (theme::icon_warn(), "cancelled"),
         ExitCode::ToolFailure | ExitCode::ApiError => (theme::icon_err(), "failed"),
     };
     match output_path {
@@ -3164,7 +3165,7 @@ mod exit_code_tests {
     }
 
     #[test]
-    fn exit_code_force_stop_overrides_tool_failure() {
+    fn strong_behavior_advisory_does_not_override_tool_failure() {
         let mut sr = empty_stream_result();
         sr.tool_call_records
             .push(astra_services::session_journal::ToolCallRecord {
@@ -3187,7 +3188,7 @@ mod exit_code_tests {
             injections: vec![],
             avoid_tools: vec![],
             health_avoidance_tools: vec![],
-            force_stop: true,
+            advisory_threshold_reached: true,
             nudge_count: 0,
             interaction_mode: "prompt".to_string(),
             suppressed_loop_nudges: false,
@@ -3200,7 +3201,7 @@ mod exit_code_tests {
             total_cache_hits: 0,
             flaky_count: 0,
         });
-        assert_eq!(compute_exit_code(&sr), ExitCode::ForceStop);
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
     }
 
     #[test]
@@ -3307,7 +3308,7 @@ mod exit_code_tests {
     }
 
     #[test]
-    fn exit_code_success_with_non_force_stop_verdict() {
+    fn exit_code_success_with_behavior_advisory() {
         let mut sr = empty_stream_result();
         sr.verdict_events.push(VerdictEvent {
             turn: 1,
@@ -3315,7 +3316,7 @@ mod exit_code_tests {
             injections: vec![],
             avoid_tools: vec![],
             health_avoidance_tools: vec![],
-            force_stop: false,
+            advisory_threshold_reached: false,
             nudge_count: 1,
             interaction_mode: "prompt".to_string(),
             suppressed_loop_nudges: false,

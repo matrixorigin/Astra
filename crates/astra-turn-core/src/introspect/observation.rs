@@ -547,7 +547,7 @@ fn build_introspect_observations(
 
         ObservationFacet::Stall
             if snapshot.stall_state.nudge_count > 0
-                || !snapshot.stall_state.forced_corrections.is_empty() =>
+                || !snapshot.stall_state.advisory_signals.is_empty() =>
         {
             if snapshot.stall_state.nudge_count > 0 {
                 observations.push(ObservationRecord {
@@ -561,7 +561,7 @@ fn build_introspect_observations(
                     evidence_refs: vec![RUNTIME_SNAPSHOT_REF.to_string()],
                 });
             }
-            for correction in &snapshot.stall_state.forced_corrections {
+            for correction in &snapshot.stall_state.advisory_signals {
                 observations.push(ObservationRecord {
                     ref_id: Urn::new("observation", "local", "introspect")
                         .seg("stall")
@@ -570,7 +570,7 @@ fn build_introspect_observations(
                         .build(),
                     topic: request.topic.as_str().to_string(),
                     facet: request.facet.as_str().to_string(),
-                    kind: "stall_forced_correction".to_string(),
+                    kind: "stall_advisory_signal".to_string(),
                     severity: "warning".to_string(),
                     summary: format!("forced correction fired: {correction}"),
                     confidence: ObservationConfidence::evidence(0.95),
@@ -723,15 +723,15 @@ fn build_introspect_action_hints(
 
     // ── 2. Strategy change hint ──
     let stall = &snapshot.stall_state;
-    let has_active_corrections = !stall.forced_corrections.is_empty();
+    let has_active_corrections = !stall.advisory_signals.is_empty();
     let nudge_pressure = stall.nudge_count >= 2 || stall.drift_nudge_count >= 2;
     if has_active_corrections || nudge_pressure {
         let mut parts: Vec<String> = Vec::new();
         if has_active_corrections {
             parts.push(format!(
                 "{} forced correction(s): {}",
-                stall.forced_corrections.len(),
-                stall.forced_corrections.join(", ")
+                stall.advisory_signals.len(),
+                stall.advisory_signals.join(", ")
             ));
         }
         if nudge_pressure {
@@ -1010,12 +1010,12 @@ fn build_introspect_graph_slice(
                         "nudge_count": snapshot.stall_state.nudge_count,
                         "event_count": snapshot.stall_state.events.len(),
                         "introspection_count": snapshot.stall_state.introspection_count,
-                        "forced_corrections": snapshot.stall_state.forced_corrections,
+                        "advisory_signals": snapshot.stall_state.advisory_signals,
                     })),
                 },
             );
         }
-        for correction in &snapshot.stall_state.forced_corrections {
+        for correction in &snapshot.stall_state.advisory_signals {
             push_graph_node(
                 &mut nodes,
                 &mut node_refs,
@@ -1027,7 +1027,7 @@ fn build_introspect_graph_slice(
                         .build(),
                     layer: ObservationGraphLayer::Runtime,
                     kind: ObservationGraphNodeKind::Outcome,
-                    label: "stall_forced_correction".to_string(),
+                    label: "stall_advisory_signal".to_string(),
                     summary: Some(format!("forced correction fired: {correction}")),
                     metadata: None,
                 },
@@ -1409,7 +1409,7 @@ mod tests {
         let snapshot = IntrospectSnapshot {
             stall_state: StallSnapshotSummary {
                 nudge_count: 3,
-                forced_corrections: vec!["execution_escalation".into()],
+                advisory_signals: vec!["execution_escalation".into()],
                 ..Default::default()
             },
             ..Default::default()
@@ -1441,7 +1441,7 @@ mod tests {
         assert_eq!(slice.nodes.len(), 3);
         let labels: Vec<_> = slice.nodes.iter().map(|n| n.label.as_str()).collect();
         assert!(labels.contains(&"stall_telemetry"));
-        assert!(labels.contains(&"stall_forced_correction"));
+        assert!(labels.contains(&"stall_advisory_signal"));
     }
 
     #[test]

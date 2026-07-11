@@ -18,6 +18,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
                 .get(crate::service_handlers::events::list_events_handler),
         )
         .route(
+            "/sync/outbox/events",
+            post(crate::service_handlers::events::create_sync_outbox_event_handler),
+        )
+        .route(
             "/events/{event_id}",
             get(crate::service_handlers::events::get_event_handler)
                 .delete(crate::service_handlers::events::delete_event_handler),

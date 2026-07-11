@@ -25,7 +25,7 @@ pub(crate) fn report_turn_failure(
         ui.show_error(&format!(
             "  {} {}",
             crate::cli::theme::icon_err(),
-            &failure.error
+            failure.error
         ));
     }
 

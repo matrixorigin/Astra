@@ -4,33 +4,75 @@ use astra_services::session_journal;
 use std::time::Instant;
 
 /// Cloud journal ingestion is server-owned; CLI keeps the local journal path.
-fn enqueue_ingestion(_state: &SessionState, _event: &session_journal::JournalEvent) {}
-
-pub(crate) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
-    enqueue_ingestion(state, event);
+fn enqueue_ingestion(
+    _state: &SessionState,
+    event: &session_journal::JournalEvent,
+    schedule_background_drain: bool,
+) {
+    let store = astra_services::SyncOutboxStore::local();
+    if event
+        .session_id
+        .as_deref()
+        .is_none_or(|session_id| session_id.trim().is_empty())
+    {
+        if let Err(error) = store.record_skipped_journal_event(
+            event,
+            astra_services::SyncOutboxSkipKind::MissingSessionId,
+            "journal event has no session_id and cannot be delivered to /events",
+        ) {
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                event_type = ?event.event_type,
+                "failed to record skipped sync outbox event"
+            );
+        }
+        tracing::warn!(
+            target: "astra_cli::cloud_sync",
+            event_type = ?event.event_type,
+            "skipping sync outbox enqueue for journal event without a session_id"
+        );
+        return;
+    }
+    match store.enqueue_journal_event(event) {
+        Ok(_) if schedule_background_drain => crate::cli::cloud_sync::schedule_sync_outbox_drain(),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                event_type = ?event.event_type,
+                session_id = event.session_id.as_deref().unwrap_or(""),
+                "failed to enqueue journal event into durable sync outbox"
+            );
+        }
+    }
 }
 
-pub(crate) async fn close_pending_memory_feedback_at_turn_end(
-    session_id: Option<&str>,
-    cloud_base: Option<String>,
-    cloud_token: Option<String>,
-    context_prefix: &str,
-) -> astra_tools::memoria::FeedbackDrainReport {
+pub(crate) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
+    enqueue_ingestion(state, event, true);
+}
+
+pub(crate) fn enqueue_ingestion_for_immediate_drain_pub(
+    state: &SessionState,
+    event: &session_journal::JournalEvent,
+) {
+    enqueue_ingestion(state, event, false);
+}
+
+pub(crate) fn drop_unattributed_memory_recalls_at_turn_end(session_id: Option<&str>) -> usize {
     let Some(session_id) = session_id.filter(|sid| !sid.trim().is_empty()) else {
-        return astra_tools::memoria::FeedbackDrainReport::default();
+        return 0;
     };
-    crate::edge_tools::memoria::close_pending_recall_feedback_with_proxy(
-        session_id,
-        "useful",
-        context_prefix,
-        cloud_base,
-        cloud_token,
-    )
-    .await
+    // A completed turn is not proof that a surfaced memory helped. Successful
+    // tool-result hooks already close causally adjacent recalls; anything left
+    // here is unattributed and must be dropped without reinforcing its rank.
+    astra_tools::memoria::MemoriaToolGateway::drain_recalls(session_id, None).len()
 }
 
 #[derive(Clone)]
 struct JournalPromptTurn {
+    model_id: String,
     snapshot: astra_turn_core::cache_diagnostics::PromptStateSnapshot,
     usage: astra_runtime::turn::token_usage::TokenUsage,
 }
@@ -101,17 +143,21 @@ pub(crate) fn build_bridge_pipeline_journal_events(
                 && event.event_type == session_journal::JournalEventType::PipelineFeedback
         })
         .filter_map(|event| {
-            event
-                .metadata
-                .as_ref()
-                .and_then(|meta| meta.get("cache_hit_ratio"))
-                .and_then(serde_json::Value::as_f64)
+            let metadata = event.metadata.as_ref()?;
+            (metadata.get("model_id").and_then(serde_json::Value::as_str) == Some(model_id))
+                .then(|| {
+                    metadata
+                        .get("cache_hit_ratio")
+                        .and_then(serde_json::Value::as_f64)
+                })
+                .flatten()
         })
         .collect();
     let prior_ratios = if prior_feedback_ratios.is_empty() {
         turns
             .iter()
             .take(turns.len().saturating_sub(1))
+            .filter(|turn| turn.model_id == model_id)
             .filter_map(|turn| {
                 let total_input = turn
                     .usage
@@ -130,11 +176,15 @@ pub(crate) fn build_bridge_pipeline_journal_events(
     } else {
         prior_ratios.iter().sum::<f64>() / prior_ratios.len() as f64
     };
-    let stats = astra_turn_core::pipeline_stats::PipelineStats {
+    let mut stats = astra_turn_core::pipeline_stats::PipelineStats {
         turns_executed: prior_ratios.len() as u32,
         avg_cache_hit_ratio,
         ..Default::default()
     };
+    for ratio in &prior_ratios {
+        stats.record_cache_read_share_observation(model_id, *ratio);
+    }
+    stats.record_cache_read_share_observation(model_id, feedback.cache_hit_ratio);
 
     let feedback_evt = astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
         turn, model_id, &feedback,
@@ -150,6 +200,7 @@ pub(crate) fn build_bridge_pipeline_journal_events(
 
     for alert in astra_turn_core::trace_alert::evaluate_alerts(
         turn,
+        model_id,
         &feedback,
         &stats,
         &astra_turn_core::recovery_state::RecoveryState::default(),
@@ -300,7 +351,11 @@ fn journal_prompt_turns(events: &[session_journal::JournalEvent]) -> Vec<Journal
                     continue;
                 };
                 snapshot.provider = provider;
-                turns.push(JournalPromptTurn { snapshot, usage });
+                turns.push(JournalPromptTurn {
+                    model_id: model,
+                    snapshot,
+                    usage,
+                });
             }
             _ => {}
         }
@@ -354,7 +409,7 @@ fn journal_prompt_snapshot_from_messages(
 mod tests {
     use super::{
         append_one_shot_journal_events, build_bridge_pipeline_journal_events,
-        close_pending_memory_feedback_at_turn_end,
+        drop_unattributed_memory_recalls_at_turn_end,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -362,25 +417,17 @@ mod tests {
 
     use astra_services::session_journal;
 
-    #[tokio::test]
-    async fn close_pending_memory_feedback_at_turn_end_drains_recall_queue() {
+    #[test]
+    fn turn_end_drops_unattributed_recalls_without_sending_positive_feedback() {
         let session_id = "chat-turn-close-feedback";
-        astra_tools::memoria::MemoriaClient::reset_recall_ledger(session_id);
-        astra_tools::memoria::MemoriaClient::record_recall(session_id, 4, vec!["m1".into()]);
+        astra_tools::memoria::MemoriaToolGateway::reset_recall_ledger(session_id);
+        astra_tools::memoria::MemoriaToolGateway::record_recall(session_id, 4, vec!["m1".into()]);
 
-        let report = close_pending_memory_feedback_at_turn_end(
-            Some(session_id),
-            Some("http://127.0.0.1:9".to_string()),
-            Some("token".to_string()),
-            "unit-test",
-        )
-        .await;
+        let dropped = drop_unattributed_memory_recalls_at_turn_end(Some(session_id));
 
-        assert_eq!(report.attempted, 1);
-        assert_eq!(report.failed, 1);
-        assert_eq!(report.succeeded, 0);
+        assert_eq!(dropped, 1);
         assert_eq!(
-            astra_tools::memoria::MemoriaClient::pending_recall_count(session_id),
+            astra_tools::memoria::MemoriaToolGateway::pending_recall_count(session_id),
             0
         );
     }

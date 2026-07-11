@@ -31,7 +31,7 @@ use astra_core::observation_journal::{
     JournalFacts, ObservationJournal, ObservationStore, TuningStore,
 };
 
-use super::runtime_policy::FrameworkAction;
+use super::runtime_policy::RuntimePolicyEvidence;
 
 // ── ObservationEvent ────────────────────────────────────────────────────────
 
@@ -49,10 +49,10 @@ pub enum ObservationEvent {
         facts: JournalFacts,
     },
 
-    /// Emitted when the runtime policy produces a framework action.
-    PolicyDecision {
-        /// The action decided by [`RuntimePolicy::decide`].
-        action: FrameworkAction,
+    /// Emitted when the runtime policy produces advisory evidence.
+    PolicyEvidence {
+        /// The evidence derived by [`RuntimePolicy::decide`].
+        evidence: RuntimePolicyEvidence,
     },
 }
 
@@ -315,7 +315,7 @@ mod tests {
                 ObservationEvent::TurnCompleted { .. } => {
                     self.events.push("turn_completed".to_string());
                 }
-                ObservationEvent::PolicyDecision { .. } => {
+                ObservationEvent::PolicyEvidence { .. } => {
                     self.events.push("policy_decision".to_string());
                 }
             }
@@ -401,7 +401,7 @@ mod tests {
             fn consume(&mut self, event: &ObservationEvent) -> Result<(), String> {
                 let label = match event {
                     ObservationEvent::TurnCompleted { .. } => "turn_completed",
-                    ObservationEvent::PolicyDecision { .. } => "policy_decision",
+                    ObservationEvent::PolicyEvidence { .. } => "policy_decision",
                 };
                 self.events.lock().unwrap().push(label.to_string());
                 Ok(())
@@ -417,8 +417,8 @@ mod tests {
             metrics: Box::new(TurnMetrics::default()),
             facts: JournalFacts::default(),
         });
-        dispatcher.dispatch(ObservationEvent::PolicyDecision {
-            action: FrameworkAction::Continue,
+        dispatcher.dispatch(ObservationEvent::PolicyEvidence {
+            evidence: RuntimePolicyEvidence::NoAdvisory,
         });
 
         let captured = events.lock().unwrap();

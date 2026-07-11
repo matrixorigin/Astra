@@ -3,6 +3,9 @@
 use std::pin::Pin;
 use std::time::Duration;
 
+use astra_sync_protocol::{
+    SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, sync_outbox_request_signature,
+};
 use async_stream::stream;
 use futures_util::{Stream, StreamExt};
 use reqwest::{
@@ -146,6 +149,10 @@ impl ThinClient {
             h.insert(header::AUTHORIZATION, v);
         }
         h
+    }
+
+    fn resolved_bearer_token<'a>(&'a self, token_override: Option<&'a str>) -> Option<&'a str> {
+        token_override.or(self.bearer_token.as_deref())
     }
 
     async fn text_or_api(resp: Response) -> Result<String, ThinClientError> {
@@ -1073,6 +1080,7 @@ impl ThinClient {
             .post(url)
             .headers(self.auth_headers_for(bearer_override))
             .json(body)
+            .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1382,6 +1390,69 @@ impl ThinClient {
             .http
             .post(url)
             .headers(self.auth_headers_for(bearer_override))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /events` — create or replay an idempotent automation event.
+    pub async fn post_event_json(
+        &self,
+        bearer_override: Option<&str>,
+        body: &Value,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::EVENTS)?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /sync/outbox/events` — ingest durable edge sync outbox events.
+    pub async fn post_sync_outbox_event_json(
+        &self,
+        bearer_override: Option<&str>,
+        body: &Value,
+    ) -> Result<SyncOutboxAck, ThinClientError> {
+        let url = self.url(paths::SYNC_OUTBOX_EVENTS)?;
+        let mut headers = self.auth_headers_for(bearer_override);
+        if let Some(token) = self.resolved_bearer_token(bearer_override) {
+            let signature = sync_outbox_request_signature(token, body);
+            let header = HeaderValue::from_str(&signature).map_err(|error| {
+                ThinClientError::InvalidInput(format!(
+                    "failed to encode sync-outbox signature header: {error}"
+                ))
+            })?;
+            headers.insert(SYNC_OUTBOX_SIGNATURE_HEADER, header);
+        }
+        let resp = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
+    /// Read back one authoritative event for delivery reconciliation.
+    pub async fn get_event_json(
+        &self,
+        bearer_override: Option<&str>,
+        event_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::event(event_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -2123,6 +2194,79 @@ mod tests {
             .unwrap();
         assert_eq!(v["parent_run_id"], "run-1");
         assert_eq!(v["affected"], 2);
+    }
+
+    #[tokio::test]
+    async fn wiremock_post_event_json() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/events"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "event_id": "event_1",
+                "metadata": {
+                    "source": "ordinary"
+                }
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client
+            .post_event_json(
+                Some("tok"),
+                &serde_json::json!({
+                    "event_id": "event_1",
+                    "session_id": "session-1",
+                    "event_type": "ordinary_marker",
+                    "content": "{}",
+                    "metadata": {
+                        "source": "ordinary"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["event_id"], "event_1");
+        assert_eq!(v["metadata"]["source"], "ordinary");
+    }
+
+    #[tokio::test]
+    async fn wiremock_post_sync_outbox_event_json() {
+        let srv = MockServer::start().await;
+        let body = serde_json::json!({
+            "event_id": "sync_evt_1",
+            "session_id": "session-1",
+            "event_type": "sync_marker",
+            "content": "{}",
+            "metadata": {
+                "sync_outbox": {
+                    "payload_hash": "sha256:abc"
+                }
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/sync/outbox/events"))
+            .and(header("authorization", "Bearer tok"))
+            .and(header(
+                "x-astra-sync-outbox-signature",
+                sync_outbox_request_signature("tok", &body),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "record_id": "sync_evt_1",
+                "payload_hash": "sha256:abc",
+                "ingestion_status": "created"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client
+            .post_sync_outbox_event_json(Some("tok"), &body)
+            .await
+            .unwrap();
+        assert!(v.confirms("sync_evt_1", "sha256:abc"));
     }
 
     #[tokio::test]

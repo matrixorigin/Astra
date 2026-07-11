@@ -146,8 +146,13 @@ pub(crate) fn record_loop_completion_feedback(
                 .with_turn(&turn_id),
             ));
         }
-        Ok(AgenticLoopOutcome::Waiting(_)) => {
-            // No signal for waiting — the loop will resume.
+        Ok(AgenticLoopOutcome::Waiting(reason)) => {
+            hub.record_feedback(enrich_signal(
+                FeedbackSignal::new(SignalType::Interruption)
+                    .with_turn(&turn_id)
+                    .with_context("resume_strategy", serde_json::json!("caller_reinvoke"))
+                    .with_context("waiting_reason", serde_json::json!(reason)),
+            ));
         }
     }
 
@@ -183,7 +188,7 @@ pub(crate) fn record_loop_completion_feedback(
         .stall
         .tool_call_records
         .iter()
-        .filter(|r| !r.ok)
+        .filter(|r| r.was_executed() && !r.ok)
         .count() as u32;
     if failed_tools > 0 && tool_calls > 0 {
         let failure_rate = failed_tools as f64 / tool_calls as f64;
@@ -238,7 +243,9 @@ pub(crate) fn record_loop_completion_feedback(
         if records.len() >= 2 {
             let mut consecutive = 1u32;
             for pair in records.windows(2).rev() {
-                if pair[0].name == pair[1].name
+                if pair[0].was_executed()
+                    && pair[1].was_executed()
+                    && pair[0].name == pair[1].name
                     && pair[0].args_preview == pair[1].args_preview
                     && !pair[1].ok
                 {

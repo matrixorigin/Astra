@@ -140,6 +140,31 @@ pub fn classify_command_result(
     stderr: &str,
     exit_code: Option<i32>,
 ) -> CommandResultClass {
+    // Process status is the authoritative execution result. Command output is
+    // untrusted domain data: a successful `git diff`, source dump, or log read
+    // can legitimately contain phrases such as "command not found" or
+    // "test failed". Treating those phrases as control signals turns inspected
+    // text into a false runtime failure.
+    if let Some(code) = exit_code {
+        match classify_exit(command, code) {
+            ExitSemantics::Success | ExitSemantics::PipelineTruncated => {
+                return CommandResultClass::Success;
+            }
+            ExitSemantics::EmptyResult => return CommandResultClass::EmptyResult,
+            ExitSemantics::DomainNegative => {
+                return if is_build_test_or_lint_command(command) {
+                    CommandResultClass::TestFailure
+                } else {
+                    CommandResultClass::DomainNegative
+                };
+            }
+            ExitSemantics::TimedOut | ExitSemantics::Cancelled | ExitSemantics::Signaled => {
+                return CommandResultClass::ExecutionError;
+            }
+            ExitSemantics::ExecutionError => {}
+        }
+    }
+
     let combined = if stderr.is_empty() {
         stdout.to_string()
     } else if stdout.is_empty() {
@@ -158,31 +183,13 @@ pub fn classify_command_result(
     }
 
     match exit_code {
-        Some(code) => match classify_exit(command, code) {
-            ExitSemantics::Success | ExitSemantics::PipelineTruncated => {
-                CommandResultClass::Success
-            }
-            ExitSemantics::EmptyResult => CommandResultClass::EmptyResult,
-            ExitSemantics::DomainNegative => {
-                if is_build_test_or_lint_command(command) {
-                    CommandResultClass::TestFailure
-                } else {
-                    CommandResultClass::DomainNegative
-                }
-            }
-            ExitSemantics::TimedOut | ExitSemantics::Cancelled | ExitSemantics::Signaled => {
+        Some(_) => {
+            if is_build_test_or_lint_command(command) && looks_like_build_or_test_failure(&lower) {
+                CommandResultClass::TestFailure
+            } else {
                 CommandResultClass::ExecutionError
             }
-            ExitSemantics::ExecutionError => {
-                if is_build_test_or_lint_command(command)
-                    && looks_like_build_or_test_failure(&lower)
-                {
-                    CommandResultClass::TestFailure
-                } else {
-                    CommandResultClass::ExecutionError
-                }
-            }
-        },
+        }
         None => {
             if looks_like_build_or_test_failure(&lower) {
                 CommandResultClass::TestFailure
@@ -708,24 +715,26 @@ mod tests {
 
     #[test]
     fn command_result_classification_cases() {
-        // env failure even when exit zero
+        // Successful execution is authoritative even when the inspected output
+        // contains failure-like text.
         let class = classify_command_result(
             "python -m pytest tests 2>&1 | tail -20",
             "bash: python: command not found\n",
             "",
             Some(0),
         );
-        assert_eq!(class, CommandResultClass::EnvFailure);
-        assert!(class.is_tool_error());
+        assert_eq!(class, CommandResultClass::Success);
+        assert!(!class.is_tool_error());
 
-        // masked test failure in output
+        // The same invariant applies to build/test output. Wrappers that need
+        // failure propagation must preserve a non-zero process status.
         let class = classify_command_result(
             "cargo test --lib",
             "test result: FAILED. 0 passed; 1 failed",
             "",
             Some(0),
         );
-        assert_eq!(class, CommandResultClass::TestFailure);
+        assert_eq!(class, CommandResultClass::Success);
         assert!(!class.is_tool_error());
 
         // grep no-match is a semantic non-error outcome, distinct from
@@ -745,15 +754,39 @@ mod tests {
     }
 
     #[test]
-    fn command_result_detects_masked_test_failure() {
+    fn command_result_does_not_infer_failure_from_successful_output() {
         let class = classify_command_result(
             "cargo test 2>&1 | tail -20",
             "test result: FAILED. 1 passed; 1 failed\n",
             "",
             Some(0),
         );
-        assert_eq!(class, CommandResultClass::TestFailure);
+        assert_eq!(class, CommandResultClass::Success);
         assert!(!class.is_tool_error());
+    }
+
+    #[test]
+    fn successful_diff_with_error_like_source_text_stays_successful() {
+        let output = r#"+ return Err(\"no such file or directory\");
++ eprintln!(\"command not found\");
++ // test result: FAILED"#;
+        assert_eq!(
+            classify_command_result("git diff main", output, "", Some(0)),
+            CommandResultClass::Success
+        );
+    }
+
+    #[test]
+    fn nonzero_execution_error_can_use_typed_text_detail() {
+        assert_eq!(
+            classify_command_result(
+                "python -m pytest tests",
+                "",
+                "python: command not found",
+                Some(127),
+            ),
+            CommandResultClass::EnvFailure
+        );
     }
 
     #[test]

@@ -65,26 +65,35 @@ fn execution_boundary_wait_error_kind(reason: &str) -> Option<&'static str> {
 
 pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
-    let waiting_reason = parsed.as_ref().and_then(|value| {
+    let interrupted_agent = parsed.as_ref().and_then(|value| {
         let status = value.get("status").and_then(Value::as_str)?;
-        if status != "waiting" {
+        if !matches!(status, "waiting" | "interrupted") {
             return None;
         }
-        Some(
-            value
+        let reason = match status {
+            "waiting" => value
                 .get("reason")
                 .and_then(Value::as_str)
                 .unwrap_or("waiting"),
-        )
+            "interrupted" => value
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("interrupted"),
+            _ => unreachable!("status is constrained above"),
+        };
+        Some((status, reason))
     });
 
-    let Some(reason) = waiting_reason else {
+    let Some((agent_status, reason)) = interrupted_agent else {
         return tool_result_from_output(output);
     };
 
     let normalized_reason = normalized_wait_reason(reason);
-    let error_kind =
-        execution_boundary_wait_error_kind(reason).unwrap_or(TOOL_ERROR_KIND_AGENT_WAITING);
+    let boundary_error_kind = execution_boundary_wait_error_kind(reason);
+    if agent_status == "interrupted" && boundary_error_kind.is_none() {
+        return tool_result_from_output(output);
+    }
+    let error_kind = boundary_error_kind.unwrap_or(TOOL_ERROR_KIND_AGENT_WAITING);
     let mut result = astra_tools::ToolResult::error(output);
     let mut metadata = Map::new();
     metadata.insert(
@@ -95,7 +104,7 @@ pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::Tool
     metadata.insert("blocked".to_string(), Value::Bool(true));
     metadata.insert(
         "agent_status".to_string(),
-        Value::String("waiting".to_string()),
+        Value::String(agent_status.to_string()),
     );
     if let Some(agent_id) = parsed
         .as_ref()

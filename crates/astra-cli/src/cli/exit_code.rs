@@ -5,8 +5,8 @@ pub(crate) enum ExitCode {
     Success = 0,
     /// Tool execution failure (1) - at least one tool call failed
     ToolFailure = 1,
-    /// Force stop (2) - agent was force-stopped due to errors/stalls
-    ForceStop = 2,
+    /// Cancellation (2) - the task was explicitly cancelled
+    Cancelled = 2,
     /// API/network error (3) - failed to communicate with server
     ApiError = 3,
     /// Local session durability failure after the turn itself succeeded (4)

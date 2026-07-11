@@ -1579,7 +1579,6 @@ pub fn build_system_prompt_trace(
             section.trace_signals.context_signals.implicit_feedback;
         context_signals.learned_feedback_rules |=
             section.trace_signals.context_signals.learned_feedback_rules;
-        context_signals.memoria_insights |= section.trace_signals.context_signals.memoria_insights;
         guidance_signals.parallel_feedback |=
             section.trace_signals.guidance_signals.parallel_feedback;
         guidance_signals.parallel_batching_nudge |= section

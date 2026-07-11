@@ -15,7 +15,7 @@ use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     prompts,
     tool_registry::{self, ToolRegistry},
-    turn::agentic_loop::host::{TurnInteractionMode, TurnInteractionPolicy},
+    turn::agentic_loop::host::{TurnInteractionMode, TurnInteractionPolicy, VolatileInjection},
     turn::agentic_prepare_payload::attach_filtered_edge_tools_to_payload,
     turn::agentic_turn_telemetry::{
         capture_first_surface_report_if_empty, record_first_latency_ms_since,
@@ -127,19 +127,48 @@ fn message_has_tool_calls(m: &Value) -> bool {
         .is_some_and(|calls| !calls.is_empty())
 }
 
-fn should_skip_memory_boost(
-    has_semantic_query_override: bool,
-    history: &[(String, String)],
-) -> bool {
-    !history.is_empty() && has_semantic_query_override
-}
-
 fn retained_history_messages(messages: &[Value]) -> &[Value] {
     match messages.split_last() {
         Some((last, history)) if last.get("role").and_then(Value::as_str) == Some("user") => {
             history
         }
         _ => messages,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CrossSessionMemoryProjection {
+    contents: Vec<String>,
+    ranked: Vec<(String, f64)>,
+    preferred_repos: Vec<String>,
+    feedback_ids: Vec<String>,
+}
+
+fn project_cross_session_memory_hits(
+    query: &str,
+    memory_hits: &[astra_tools::memoria::BoostSearchHit],
+) -> CrossSessionMemoryProjection {
+    let contents: Vec<String> = memory_hits.iter().map(|hit| hit.content.clone()).collect();
+    let ranked = if contents.is_empty() {
+        Vec::new()
+    } else {
+        astra_turn_core::retrieval::rank_memory_results(query, &contents)
+    };
+    let preferred_repos = contents
+        .iter()
+        .flat_map(|content| extract_repos_from_memory(content))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let feedback_ids = memory_hits
+        .iter()
+        .filter_map(|hit| hit.memory_id.clone())
+        .collect();
+    CrossSessionMemoryProjection {
+        contents,
+        ranked,
+        preferred_repos,
+        feedback_ids,
     }
 }
 
@@ -205,6 +234,7 @@ struct PrepareChatTurnRequest<'a> {
     messages: &'a [Value],
     runtime_required_texts: &'a [String],
     runtime_volatile_texts: &'a [String],
+    runtime_volatile_injections: &'a [VolatileInjection],
     ephemeral_prefix: Option<&'a Value>,
     current_session_id: Option<&'a str>,
     model_id: Option<&'a str>,
@@ -464,6 +494,21 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
     }
 
+    if let Some(value) =
+        astra_runtime::turn::agentic_loop::host::runtime_volatile_injections_edge_profile_value(
+            ctx.runtime_volatile_injections,
+        )
+        && let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        ep_obj.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                .to_string(),
+            value,
+        );
+    }
+
     // Route skill listing through edge_profile → bridge volatile lane, so
     // it lands in RuntimeVolatile (post-cache-marker) rather than becoming a
     // leading role:system message that breaks the prefix cache on
@@ -509,63 +554,54 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         ctx.effective_input_budget_tokens,
     );
 
-    let semantic_query_str = ctx.semantic_query_override.unwrap_or(ctx.message);
+    let memory_retrieval_decision =
+        astra_turn_core::retrieval::decide_cross_session_memory_retrieval(
+            ctx.message,
+            ctx.semantic_query_override,
+            !ctx.history.is_empty(),
+        );
+    let semantic_query_str = memory_retrieval_decision.query();
     let mut boost_terms =
         astra_turn_core::retrieval::extract_boost_terms_from_pairs(ctx.history, semantic_query_str);
-    let mut memoria_insights_text: Option<String> = None;
     {
-        if should_skip_memory_boost(ctx.semantic_query_override.is_some(), ctx.history) {
-            if let Some(collector) = ctx.telem.trace_collector {
-                collector.record_memory_retrieval(semantic_query_str, 0, &[], 0);
-            }
-        } else {
-            let mem_start = Instant::now();
-            let memory_hits = ctx
-                .executor
-                .memory_boost_search(semantic_query_str, 5)
-                .await;
-            let mem_latency_ms = mem_start.elapsed().as_millis() as u64;
-            record_first_latency_ms_since(ctx.telem.first_memoria_ms, mem_start);
-
-            // Always record memory retrieval trace, even when no hits (for observability)
-            let memory_contents: Vec<String> =
-                memory_hits.iter().map(|h| h.content.clone()).collect();
-            let ranked = if memory_contents.is_empty() {
-                Vec::new()
-            } else {
-                astra_turn_core::retrieval::rank_memory_results(
-                    semantic_query_str,
-                    &memory_contents,
-                )
-            };
-            if let Some(collector) = ctx.telem.trace_collector {
-                collector.record_memory_retrieval(
-                    semantic_query_str,
-                    memory_contents.len() as u32,
-                    &ranked,
-                    mem_latency_ms,
+        match memory_retrieval_decision {
+            astra_turn_core::retrieval::CrossSessionMemoryDecision::Skip { query, reason } => {
+                tracing::debug!(
+                    ?reason,
+                    "cross session memory retrieval skipped by structured decision"
                 );
-            }
-
-            if !memory_hits.is_empty() {
-                for content in &memory_contents {
-                    for repo in extract_repos_from_memory(content) {
-                        ctx.executor.add_preferred_repo(&repo);
-                    }
+                if let Some(collector) = ctx.telem.trace_collector {
+                    collector.record_memory_retrieval(query, 0, &[], 0);
                 }
-                astra_turn_core::retrieval::append_boost_terms_from_ranked_memory(
-                    &mut boost_terms,
-                    semantic_query_str,
-                    &ranked,
-                );
-                memoria_insights_text =
-                    astra_runtime::memory_hooks::insights::render_digest(&memory_contents);
-                // Send "useful" feedback for retrieved memories (fire-and-forget)
-                let feedback_ids: Vec<String> = memory_hits
-                    .iter()
-                    .filter_map(|h| h.memory_id.clone())
-                    .collect();
-                ctx.executor.memory_feedback_useful(feedback_ids);
+            }
+            astra_turn_core::retrieval::CrossSessionMemoryDecision::Retrieve { query, top_k } => {
+                let mem_start = Instant::now();
+                let memory_hits = ctx.executor.memory_boost_search(query, top_k).await;
+                let mem_latency_ms = mem_start.elapsed().as_millis() as u64;
+                record_first_latency_ms_since(ctx.telem.first_memoria_ms, mem_start);
+
+                let projection = project_cross_session_memory_hits(query, &memory_hits);
+                if let Some(collector) = ctx.telem.trace_collector {
+                    collector.record_memory_retrieval(
+                        query,
+                        projection.contents.len() as u32,
+                        &projection.ranked,
+                        mem_latency_ms,
+                    );
+                }
+
+                if !projection.contents.is_empty() {
+                    for repo in &projection.preferred_repos {
+                        ctx.executor.add_preferred_repo(repo);
+                    }
+                    astra_turn_core::retrieval::append_boost_terms_from_ranked_memory(
+                        &mut boost_terms,
+                        query,
+                        &projection.ranked,
+                    );
+                    // Send "useful" feedback for retrieved memories (fire-and-forget)
+                    ctx.executor.memory_feedback_useful(projection.feedback_ids);
+                }
             }
         }
     }
@@ -979,14 +1015,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     {
         ep_obj.insert("recent_arg_hints_text".to_string(), json!(hints_text));
     }
-    // ─── Memoria insights: inject recall digest into edge_profile ───
-    if let Some(ref insights) = memoria_insights_text
-        && let Some(root) = payload.as_object_mut()
-        && let Some(ep) = root.get_mut("edge_profile")
-        && let Some(ep_obj) = ep.as_object_mut()
-    {
-        ep_obj.insert("memoria_insights_text".to_string(), json!(insights));
-    }
     // ─── Lessons: inject bootstrapped session lessons into edge_profile ───
     // Fixes the "signal channel blank" bug where lessons were loaded from
     // Memoria by `ensure_bootstrapped_lessons()` but never injected into the
@@ -1180,10 +1208,10 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// call but must stay out of user content and persisted prompt-facing
     /// history.
     pub runtime_required_texts: &'a [String],
-    /// CLI runtime nudges drained from the structured volatile lane. Sent as
-    /// edge metadata so the runtime can apply model-resolved cache capability
-    /// before deciding whether to inject or drop them.
+    /// Dynamic text from external/session sources. This remains distinct from
+    /// runtime-owned typed injections below.
     pub runtime_volatile_texts: &'a [String],
+    pub runtime_volatile_injections: &'a [VolatileInjection],
     /// Ephemeral system message prepended to messages for this turn only
     /// (e.g., skill listing). Not stored in conversation history.
     pub ephemeral_prefix: Option<&'a Value>,
@@ -1350,6 +1378,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         messages,
         runtime_required_texts,
         runtime_volatile_texts,
+        runtime_volatile_injections,
         ephemeral_prefix,
         current_session_id,
         tool_results,
@@ -1422,6 +1451,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             messages,
             runtime_required_texts,
             runtime_volatile_texts,
+            runtime_volatile_injections,
             ephemeral_prefix,
             current_session_id,
             model_id,
@@ -1549,15 +1579,17 @@ mod tests {
     use super::{
         PrepareChatTurnRequest, PrepareTurnTelemetry, build_retained_history_turns,
         chat_turn_budget_pressure, inject_bridge_turn_identity, inject_runtime_turn_overrides,
-        msg_content, prepare_chat_turn_payload, retained_history_messages,
-        should_skip_memory_boost,
+        msg_content, prepare_chat_turn_payload, project_cross_session_memory_hits,
+        retained_history_messages,
     };
-    use astra_runtime::turn::agentic_loop::host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
+    use astra_runtime::turn::agentic_loop::host::{
+        ASK_USER_TOOL_NAME, TurnInteractionMode, VolatileInjection,
+    };
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
     use astra_turn_core::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
         EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
-        EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
+        EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
     };
     use serde_json::{Value, json};
 
@@ -1633,6 +1665,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts,
             runtime_volatile_texts,
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -1710,6 +1743,128 @@ mod tests {
         assert!(!messages.contains("Resume the interrupted turn"));
         assert!(!messages.contains("Background task completed"));
         assert!(!messages.contains("<system-reminder>"));
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_routes_runtime_volatile_injections_as_typed_lane() {
+        let injection = VolatileInjection {
+            kind: astra_runtime::turn::agentic_loop::host::VolatileKind::PolicyAdvisory,
+            payload: json!({
+                "schema": "policy_advisory.v1",
+                "advisories": [{"kind": "test_signal"}]
+            }),
+            round_index: 3,
+        };
+        let required: Vec<String> = Vec::new();
+        let volatile_texts: Vec<String> = Vec::new();
+        let messages = vec![json!({"role": "user", "content": "continue"})];
+
+        let payload = {
+            use crate::edge_tools::ToolExecutor;
+            use astra_pipeline::step_recorder::StepRecorder;
+            use astra_runtime::{
+                tool_registry::ToolRegistry,
+                turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+            };
+            use astra_turn_core::{
+                interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard,
+            };
+            use std::{collections::HashSet, sync::Arc, time::Instant};
+
+            let temp_dir = tempfile::tempdir().unwrap();
+            let all_schemas: Vec<Value> = Vec::new();
+            let registry = ToolRegistry::new(all_schemas.clone()).with_schema_budget(100);
+            let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+            let tool_results = Vec::new();
+            let history: Vec<(String, String)> = Vec::new();
+            let recent_tools: Vec<String> = Vec::new();
+            let file_context: Vec<String> = Vec::new();
+            let mut restricted_tools = HashSet::new();
+            let mut valid_tool_names = HashSet::new();
+            let mut widen_selection_pending = false;
+            let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
+            let turn_guard = TurnGuard::default();
+            let mut turn_policy = TurnInteractionPolicy::default();
+            let mut first_memoria_ms = None;
+            let mut first_selection_report = None;
+            let mut first_budget_pressure = 0.0;
+            let mut first_context_assembly_ms = None;
+            let mut all_selected_skills = Vec::new();
+
+            prepare_chat_turn_payload(PrepareChatTurnRequest {
+                messages: &messages,
+                runtime_required_texts: &required,
+                runtime_volatile_texts: &volatile_texts,
+                runtime_volatile_injections: &[injection],
+                ephemeral_prefix: None,
+                current_session_id: Some("session-1"),
+                model_id: None,
+                model: None,
+                context_window_tokens: 200_000,
+                effective_input_budget_tokens: 200_000,
+                explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+                project_root: temp_dir.path(),
+                message: "continue",
+                user_intent: "continue",
+                semantic_query_override: None,
+                history: &history,
+                recent_tools: &recent_tools,
+                executor,
+                registry: &registry,
+                tool_results: &tool_results,
+                all_schemas: &all_schemas,
+                valid_tool_names: &mut valid_tool_names,
+                turn_guard: &turn_guard,
+                restricted_tools: &mut restricted_tools,
+                widen_selection_pending: &mut widen_selection_pending,
+                step_recorder: &mut step_recorder,
+                file_context: &file_context,
+                assembly_start: Instant::now(),
+                telem: PrepareTurnTelemetry {
+                    first_memoria_ms: &mut first_memoria_ms,
+                    first_selection_report: &mut first_selection_report,
+                    first_budget_pressure: &mut first_budget_pressure,
+                    first_context_assembly_ms: &mut first_context_assembly_ms,
+                    all_selected_skills: &mut all_selected_skills,
+                    trace_collector: None,
+                },
+                is_plan_subtask: false,
+                plan_subtask_id: None,
+                timing_phases: false,
+                prep_ui_phase: None,
+                skill_effort: None,
+                skill_agent_type: None,
+                interaction_mode: TurnInteractionMode::NonInteractive,
+                turn_policy: &mut turn_policy,
+                skill_allowed_tools: None,
+                previous_confidence_fallback: None,
+                round_index: 0,
+                session_turn: 1,
+                turn_chain_id: None,
+                user_query_event_id: None,
+                denial_pressure: (0, 0),
+                recent_rejections: Vec::new(),
+                observability_hub: None,
+                append_system_prompt: None,
+                plan_resume_hint: None,
+                plan_mode_active: false,
+                lessons_text: None,
+            })
+            .await
+        };
+
+        let lane = &payload["edge_profile"][EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS];
+        assert_eq!(lane[0]["kind"], json!("policy_advisory"));
+        assert_eq!(lane[0]["delivery_class"], json!("advisory_evidence"));
+        assert_eq!(lane[0]["round_index"], json!(3));
+        assert_eq!(lane[0]["payload"]["schema"], "policy_advisory.v1");
+        assert_eq!(lane[0]["payload"]["advisories"][0]["kind"], "test_signal");
+        assert!(
+            payload["edge_profile"]
+                .get(EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS)
+                .is_none(),
+            "internal runtime injections must not be flattened into the legacy text lane"
+        );
     }
 
     #[tokio::test]
@@ -1890,14 +2045,41 @@ mod tests {
     }
 
     #[test]
-    fn semantic_query_override_skips_memory_boost_once_history_exists() {
-        let history = vec![(
-            "review 这个: aa1f419b".to_string(),
-            "Need to fix timeout.".to_string(),
-        )];
-        assert!(should_skip_memory_boost(true, &history));
-        assert!(!should_skip_memory_boost(true, &[]));
-        assert!(!should_skip_memory_boost(false, &history));
+    fn cross_session_memory_projection_preserves_hit_metadata_without_side_effects() {
+        let hits = vec![
+            astra_tools::memoria::BoostSearchHit {
+                memory_id: Some("mem-1".to_string()),
+                content: "runtime retrieval should use structured memory decisions".to_string(),
+                score: Some(0.92),
+            },
+            astra_tools::memoria::BoostSearchHit {
+                memory_id: None,
+                content: "other memory content".to_string(),
+                score: Some(0.74),
+            },
+        ];
+
+        let projection = project_cross_session_memory_hits("runtime retrieval", &hits);
+
+        assert_eq!(projection.contents.len(), 2);
+        assert_eq!(projection.feedback_ids, vec!["mem-1"]);
+        assert!(!projection.ranked.is_empty());
+        assert!(
+            projection
+                .ranked
+                .iter()
+                .any(|(content, _)| content.contains("structured memory decisions"))
+        );
+    }
+
+    #[test]
+    fn cross_session_memory_projection_handles_empty_hits() {
+        let projection = project_cross_session_memory_hits("runtime retrieval", &[]);
+
+        assert!(projection.contents.is_empty());
+        assert!(projection.ranked.is_empty());
+        assert!(projection.preferred_repos.is_empty());
+        assert!(projection.feedback_ids.is_empty());
     }
 
     #[test]
@@ -1961,7 +2143,7 @@ mod tests {
             policy.visible_tool_names,
             vec!["mo_query".to_string(), ASK_USER_TOOL_NAME.to_string()]
         );
-        assert_eq!(policy.evidence_tool_names, vec!["mo_query".to_string()]);
+        assert_eq!(policy.observation_tool_names, vec!["mo_query".to_string()]);
         assert!(policy.allow_ask_user);
     }
 
@@ -1971,7 +2153,7 @@ mod tests {
             super::turn_policy_from_payload_edge_tools(&json!({}), TurnInteractionMode::Auto);
 
         assert!(policy.visible_tool_names.is_empty());
-        assert!(policy.evidence_tool_names.is_empty());
+        assert!(policy.observation_tool_names.is_empty());
         assert!(!policy.allow_ask_user);
     }
 
@@ -2293,6 +2475,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: Some("model-qwen"),
@@ -2478,6 +2661,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -2603,6 +2787,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-empty-surface"),
             model_id: None,
@@ -2724,6 +2909,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-pending-activation"),
             model_id: None,
@@ -2824,6 +3010,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-empty"),
             model_id: None,
@@ -2941,6 +3128,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -3060,6 +3248,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -3194,6 +3383,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -3323,6 +3513,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -3438,6 +3629,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -3546,6 +3738,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -3662,6 +3855,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -3774,6 +3968,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -3843,6 +4038,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -3950,6 +4146,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,
@@ -4053,6 +4250,7 @@ mod tests {
             messages: &messages,
             runtime_required_texts: &[],
             runtime_volatile_texts: &[],
+            runtime_volatile_injections: &[],
             ephemeral_prefix: None,
             current_session_id: Some("session-1"),
             model_id: None,

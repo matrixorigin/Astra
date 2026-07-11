@@ -1,77 +1,58 @@
-# astra Documentation
+# Astra documentation
 
-Welcome to astra documentation! This guide will help you find the information you need.
+This directory is the design, operation, and reference documentation for Astra.
 
-## 🚀 Quick Start
+Design docs are normative target contracts. They guide implementation; they are not summaries of whatever the current code happens to do today. Current implementation may satisfy only part of a design in a given branch.
 
-**New to astra?** Start here:
+Docs here should describe durable design, target behavior, public contracts, runbooks, and reference material. They should not be used as implementation diaries, PR status logs, verification transcripts, or historical scratchpads.
 
-- [5-Minute Quick Start](quickstart/README.md) - Get up and running fast
-- [Development Environment](quickstart/development.md) - Set up local development
-- [Docker Deployment](quickstart/docker.md) - Run with Docker
-- [Production Deployment](quickstart/production.md) - Deploy to production
+## Start here
 
-## 📘 Guides
+| Document | Scope |
+| --- | --- |
+| [Architecture](design/ARCHITECTURE.md) | Current system overview and non-negotiable architecture principles. |
+| [Design index](design/README.md) | Canonical design domains and ownership boundaries. |
+| [Documentation architecture](design/documentation-architecture.md) | Rules for design ownership, document classes, and migration from historical docs. |
+| [Agent backbone and capacity providers](design/agent-backbone-capacity-provider.md) | Shared agent semantics across Web, CLI, Edge, Server, MCP, and future providers. |
+| [Runtime lifecycle](design/runtime-lifecycle.md) | Sessions, runs, turns, tasks, plan mode, cancel, resume, and recovery. |
+| [Capability system](design/capability-system.md) | Tools, skills, MCP, provider routing, admission, fallback, and diagnostics. |
+| [Tool result quality firewall](design/tool-result-quality-firewall.md) | Tool output validation and quality annotations before model reuse. |
+| [Context and prompt](design/context-and-prompt.md) | Context assembly, prompt cache, dynamic state, and memory injection boundaries. |
+| [Prompt lifecycle](design/prompt-lifecycle.md) | Prompt assembly, versioning, stable prefix, cache, and evolution boundary. |
+| [Context window management](design/context-window-management.md) | Token budgets, compaction, and context preservation. |
+| [Observation plane](design/observation-plane.md) | Trace, audit, introspect, reflect, status, and user-visible diagnostics. |
+| [Introspect and reflect](design/introspect-and-reflect.md) | Agent self-observation, reflection boundaries, and introspection dimensions. |
+| [Session observability](design/session-observability.md) | User/support visible status, stream projection, stuck diagnosis, reconnect. |
+| [Edge-cloud execution](design/edge-cloud-execution.md) | Edge/CLI local capacity and server-safe cloud fallback. |
+| [Cloud-edge sync](architecture/edge-cloud-sync-architecture.md) | Durable outbox, event facts, retention, repair, and sync status. |
+| [Safety and permissions](design/safety-and-permissions.md) | Permission, sandbox, side-effect, policy, and trust boundaries. |
+| [Permission sync](design/permission-sync.md) | Cross-surface scoped approvals, revocation, expiration, and audit. |
+| [Trust and safety](design/trust-and-safety.md) | Evidence, claim support, trust levels, and audit obligations. |
+| [Tuning jobs](design/tuning-jobs.md) | Controlled prompt/skill/routing/memory/model improvement workflows. |
+| [Evaluation](design/evaluation.md) | Behavioral evaluation, replay modes, and regression gates. |
 
-**Learn how to use astra:**
+## Directory map
 
-- [Development Workflow](guides/development-workflow.md) - Daily development commands and workflows
-- [Testing Guide](guides/testing.md) - Run and write tests
-- [Deployment Guide](guides/deployment.md) - Deploy to various environments
-- [Troubleshooting](guides/troubleshooting.md) - Common issues and solutions
-- [Run Projection Repair](guides/run-projection-repair.md) - Diagnose and rebuild stale run display projections
+| Directory | Purpose |
+| --- | --- |
+| `design/` | Current design contracts and target behavior. |
+| `architecture/` | Cross-domain architecture views. |
+| `guides/` | Operational guides and runbooks. |
+| `quickstart/` | Setup and first-run material. |
+| `reference/` | API, CLI, configuration, command, and dependency reference. |
+| `testing/` | Test strategy and coverage contracts. |
 
-## 📚 Reference
+## Documentation rules
 
-**Detailed reference documentation:**
+- One design domain has one canonical document.
+- Avoid implementation chronology. Describe invariants, responsibilities, and failure semantics.
+- Avoid duplicate source-of-truth documents. Merge or delete older versions.
+- Keep stable contracts in `docs/`; keep transient planning in `plans/` only while actionable.
+- Prefer concise current design over long historical documents.
+- A doc should state goals, non-goals, ownership boundaries, data/state model, failure modes, and test obligations.
 
-- [API Reference](reference/api-reference.md) - Complete API endpoint documentation
-- [Makefile Commands](reference/makefile-commands.md) - All available make commands
-- [CLI Commands](reference/cli-commands.md) - single astra CLI reference
-- [Configuration](reference/configuration.md) - Environment variables and configuration
-- [Dependencies](reference/dependencies.md) - Dependency groups, installation, and optional extras
+## Architecture principle
 
-## 🏗️ Design & Architecture
+Astra has one agent backbone and multiple capacity providers.
 
-**Understand the system design:**
-
-- [Architecture](design/ARCHITECTURE.md) - System overview and data flow
-- [Memory Runtime](design/memory-runtime.md) - End-to-end cross-session memory loop (prewarm, recall, update, governance, forward-feed scenes) on the current Rust runtime
-- [Session Memory Protocol](design/session-memory-protocol.md) - In-session L0/L1/L2 context pyramid (upstream of Memoria)
-- [Memory Architecture (legacy)](design/memory/README.md) - Historical Python-era design, retained for context
-- [Context Window Management](design/context-window-management.md) - Token budgets, history compression, procedural memory injection
-- [Tool Result Quality Firewall](design/tool-result-quality-firewall.md) - Pre-LLM tool result quality assessment and annotation
-- [Trust and Safety](design/trust-and-safety.md) - Audit, guardrails, and robustness
-- [Skills and Tools](design/skills-and-tools.md) - Skill architecture and marketplace
-- [Agents and Orchestration](design/agents-and-orchestration.md) - ChatLoop, planning, and teams
-- [Data Versioning](design/data-versioning.md) - Snapshot, clone, and branch workflows
-- [Evaluation and Evolution](design/evaluation-and-evolution.md) - Quality and CI/CD
-
-## 🔧 Implementation Details
-
-**Deep dive into implementation:**
-
-- [Authentication](implementation/authentication.md) - JWT and authorization
-- [LLM Integration](implementation/llm-integration.md) - Provider routing and cost tracking
-- [GitHub Integration](implementation/github-integration.md) - Repository operations
-- [Deployment Details](implementation/deployment.md) - Project structure and Docker
-- [Scope Configuration](implementation/scope-configuration.md) - Scope-based config resolution
-- [CI/CD](implementation/ci.md) - GitHub Actions workflows
-
-## 🆘 Need Help?
-
-- Check [Troubleshooting Guide](guides/troubleshooting.md)
-- Review [API Documentation](reference/api-reference.md)
-- See [Examples](../examples/)
-
-## 📖 Documentation Structure
-
-```
-docs/
-├── README.md (you are here)
-├── quickstart/          # Get started in minutes
-├── guides/              # How-to guides
-├── reference/           # Detailed reference
-├── design/              # Architecture and design
-└── implementation/      # Implementation details
-```
+Web, CLI, Edge, Server, MCP, and future providers share session/run/turn lifecycle, context assembly, trace, reflection, checkpoint, tool admission, failure semantics, and audit. Capability differences come from providers, not from separate agent implementations.

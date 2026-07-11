@@ -25,6 +25,15 @@ Review like a maintainer. Report only material issues: correctness, security,
 data loss, API/contract breakage, concurrency/resource bugs, and meaningful test gaps.
 Do not comment on style unless it hides a bug.
 
+Hard rule: treat production control flow driven by natural-language text
+matching as a correctness issue. Safety, admission, routing, blocking, retry,
+recovery, evaluation, and state transitions must use typed fields such as enums,
+`ErrorKind`, `result_class`, `exit_semantics`, structured JSON, protocol
+parsers, AST/token parsers, or exact machine-owned sentinel fields. Text
+matching is acceptable only for UI display/search, rendered-text tests, or
+explicitly named legacy `fallback` parsers that are not the primary decision
+path.
+
 ## Task
 
 $ARGUMENTS

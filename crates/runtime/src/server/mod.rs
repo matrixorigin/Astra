@@ -314,7 +314,7 @@ async fn log_memoria_startup_health(state: &AppState) {
         return;
     };
 
-    let client = crate::turn::cloud::memoria_compact::HttpMemoriaClient::new(
+    let client = crate::turn::cloud::memoria_compact::HttpMemoriaPort::new(
         state.memoria_base_url.clone(),
         master_key,
     );

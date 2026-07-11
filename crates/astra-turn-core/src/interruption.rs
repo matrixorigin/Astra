@@ -50,6 +50,9 @@ pub enum InterruptionKind {
     /// the turn so resumption surfaces the reason instead of an opaque final
     /// text string.
     GuardAbort,
+    /// A response guard replaced the model's final text before it became
+    /// user-visible. This is not a successful completion.
+    ResponseGuardBlocked,
     /// Generic legacy interruption marker from pre-structured agent result paths.
     Interrupted,
     /// Executor task/channel disappeared before a terminal result was delivered.
@@ -78,6 +81,7 @@ impl InterruptionKind {
             Self::HarnessBlocked => "harness_blocked",
             Self::HarnessPaused => "harness_paused",
             Self::GuardAbort => "guard_abort",
+            Self::ResponseGuardBlocked => "response_guard_blocked",
             Self::Interrupted => "interrupted",
             Self::ExecutorDropped => "executor_dropped",
         }
@@ -103,6 +107,7 @@ impl InterruptionKind {
             "harness_blocked" => Some(Self::HarnessBlocked),
             "harness_paused" => Some(Self::HarnessPaused),
             "guard_abort" => Some(Self::GuardAbort),
+            "response_guard_blocked" => Some(Self::ResponseGuardBlocked),
             "interrupted" => Some(Self::Interrupted),
             "executor_dropped" => Some(Self::ExecutorDropped),
             _ => None,
@@ -124,6 +129,7 @@ impl InterruptionKind {
             | Self::ServerOverload
             | Self::StreamTransport
             | Self::StreamIdle
+            | Self::ResponseGuardBlocked
             | Self::Interrupted
             | Self::ExecutorDropped => true,
             Self::ContextOverflow => true, // resumable with compaction
@@ -178,7 +184,9 @@ impl ResumeMode {
     #[must_use]
     pub fn default_for_interruption(kind: InterruptionKind) -> Self {
         match kind {
-            InterruptionKind::EmptyCompletion => Self::Settle,
+            InterruptionKind::EmptyCompletion | InterruptionKind::ResponseGuardBlocked => {
+                Self::Settle
+            }
             _ => Self::Continue,
         }
     }
@@ -803,6 +811,7 @@ mod tests {
             InterruptionKind::HarnessBlocked,
             InterruptionKind::HarnessPaused,
             InterruptionKind::GuardAbort,
+            InterruptionKind::ResponseGuardBlocked,
             InterruptionKind::Interrupted,
             InterruptionKind::ExecutorDropped,
         ];
@@ -833,6 +842,7 @@ mod tests {
         assert!(InterruptionKind::CumulativeBudgetExceeded.is_resumable());
         assert!(InterruptionKind::ServerOverload.is_resumable());
         assert!(InterruptionKind::CooldownRejected.is_resumable());
+        assert!(InterruptionKind::ResponseGuardBlocked.is_resumable());
         assert!(InterruptionKind::Interrupted.is_resumable());
         assert!(InterruptionKind::ExecutorDropped.is_resumable());
         // non-resumable

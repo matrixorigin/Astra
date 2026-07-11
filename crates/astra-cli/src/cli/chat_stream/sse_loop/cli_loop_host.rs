@@ -575,19 +575,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 astra_runtime::turn::agentic_loop::host::VolatileKind::PlanModeMarker,
                 "[mode=plan] You are in read-only plan mode. The normal tool surface remains visible for cache stability and exploration, but mutating invocations are blocked until the user approves the plan. Use read-only calls, then call `exit_plan_mode(plan=\"<markdown>\")` when ready.",
             );
-
-            // Plan-mode nudge: if the previous turn produced a
-            // plan-shaped response but the model did not actually
-            // call `exit_plan_mode`, the user never sees an approval
-            // overlay and the agent silently stalls. Inject a
-            // corrective so the next round either tightens the plan
-            // and submits via the tool, or asks the user a question.
-            if let Some(reminder) = plan_mode_missed_exit_reminder(&state.messages) {
-                state.push_volatile(
-                    astra_runtime::turn::agentic_loop::host::VolatileKind::Corrective,
-                    reminder,
-                );
-            }
         }
 
         // Drain the structured volatile lane before immutable state borrows,
@@ -606,20 +593,16 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         } else {
             self.model_id.as_deref()
         };
-        let runtime_volatile_texts = state
-            .take_volatile_pending()
-            .into_iter()
-            .map(|injection| injection.content)
-            .filter(|content| !content.trim().is_empty())
-            .chain(
-                self.input_runtime_volatile_texts
-                    .iter()
-                    .map(|content| content.trim().to_string())
-                    .filter(|content| !content.is_empty()),
-            )
+        let runtime_volatile_injections = state.take_volatile_pending();
+        let runtime_volatile_texts = self
+            .input_runtime_volatile_texts
+            .iter()
+            .map(|content| content.trim().to_string())
+            .filter(|content| !content.is_empty())
             .collect::<Vec<_>>();
 
         let interaction_mode = self.turn_interaction_mode_inherent();
+        let persistent_restricted_tools = state.restricted_tools.clone();
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
         state
@@ -704,6 +687,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                     messages: state.messages.as_slice(),
                     runtime_required_texts: self.input_runtime_required_texts,
                     runtime_volatile_texts: &runtime_volatile_texts,
+                    runtime_volatile_injections: &runtime_volatile_injections,
                     ephemeral_prefix: state.skills.listing_message.as_ref(),
                     current_session_id: state.current_session_id.as_deref(),
                     tool_results: state.tool_results.as_slice(),
@@ -782,15 +766,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             turn_result = fetch_turn_sse!();
         }
 
-        for name in &interaction_scoped_restrictions {
-            state.restricted_tools.remove(name);
-        }
-        for name in &request_scoped_restrictions {
-            state.restricted_tools.remove(name);
-        }
-        for name in &plan_scoped_restrictions {
-            state.restricted_tools.remove(name);
-        }
+        // Request overlays must not erase restrictions that were already
+        // owned by a capability/permission boundary before this LLM call.
+        state.restricted_tools = persistent_restricted_tools;
 
         // The sandbox policy is restored automatically when `_sandbox_guard`
         // drops at the end of this scope — including the `?` early-return on
@@ -826,7 +804,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         //   2. Bridge-supplied opaque fingerprints for the 5 bridge-internal
         //      channels (memoria_prefetch, feedback_rules, implicit_feedback,
         //      tool_round_guidance, volatile_pending) and the 3 CLI-visible
-        //      channels the bridge echoes (memoria_insights, recent_arg_hints,
+        //      channels the bridge echoes (recent_arg_hints,
         //      skill_listing) whose source strings the CLI doesn't have
         //      trivial post-turn access to. Wire carries only
         //      hash+bytes+is_empty — no raw text leaves the bridge.
@@ -1271,74 +1249,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     }
 }
 
-/// Detect the "model wrote a plan but forgot to call `exit_plan_mode`"
-/// failure mode. Returns the reminder text to push as a Corrective
-/// volatile, or `None` when the previous turn either did not look
-/// plan-shaped or already exited the plan via the tool.
-///
-/// Heuristic — intentionally conservative:
-///   * Look at the most recent assistant message in `messages`.
-///   * It must contain an explicit `## Plan` / `### Steps` markdown
-///     header, OR a plan marker plus at least three numbered steps.
-///   * The same assistant message must NOT carry a `tool_calls`
-///     entry whose name is `exit_plan_mode` (already-exited turns
-///     don't need the nudge).
-///
-/// Rationale: if the heuristic is too eager it spams the model on
-/// every analytical answer; if it's too cautious it leaves the user
-/// stuck. We err toward "don't nudge" — the cost of a missed nudge
-/// is one stale turn; the cost of a false nudge is repeated
-/// scolding the model takes literally.
-fn plan_mode_missed_exit_reminder(messages: &[serde_json::Value]) -> Option<String> {
-    let last_assistant = messages
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))?;
-
-    if assistant_called_exit_plan_mode(last_assistant) {
-        return None;
-    }
-
-    let content = assistant_text(last_assistant)?;
-    if !looks_plan_shaped(&content) {
-        return None;
-    }
-
-    Some(
-        "[plan-nudge] Your last response looked like a plan but you did not call `exit_plan_mode`. Surface the plan for user approval by calling `exit_plan_mode(plan=\"<markdown>\")`. Without that call the user has no way to approve and unlock execution.".to_string()
-    )
-}
-
-fn assistant_called_exit_plan_mode(message: &serde_json::Value) -> bool {
-    let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) else {
-        return false;
-    };
-    tool_calls.iter().any(|call| {
-        call.get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|n| n.as_str())
-            == Some("exit_plan_mode")
-    })
-}
-
-fn assistant_text(message: &serde_json::Value) -> Option<String> {
-    if let Some(text) = message.get("content").and_then(|v| v.as_str()) {
-        return Some(text.to_string());
-    }
-    // OpenAI-style content arrays: [{type: "text", text: "…"}, …]
-    if let Some(parts) = message.get("content").and_then(|v| v.as_array()) {
-        let collected: String = parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !collected.is_empty() {
-            return Some(collected);
-        }
-    }
-    None
-}
-
 /// Plan mode is a permission overlay, not a schema-pruning pass.
 ///
 /// Return no `restricted_tools` so the model sees the same capability surface
@@ -1375,47 +1285,13 @@ fn request_allowlist_restriction_names(
         .collect()
 }
 
-fn looks_plan_shaped(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    // Markdown plan headers — strongest signal.
-    let has_markdown_plan_header = lower.contains("## plan")
-        || lower.contains("### plan")
-        || lower.contains("## steps")
-        || lower.contains("### steps");
-    if has_markdown_plan_header {
-        return true;
-    }
-    let has_plan_marker = lower.contains("plan:")
-        || lower.contains("here's the plan")
-        || lower.contains("here is the plan")
-        || lower.contains("proposed plan")
-        || lower.contains("implementation plan");
-    if !has_plan_marker {
-        return false;
-    }
-    // Numbered list with at least three items: 1. … 2. … 3. …
-    let mut numbered_hits = 0;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) {
-            if rest.starts_with('.') || rest.starts_with(')') {
-                numbered_hits += 1;
-                if numbered_hits >= 3 {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         CliSummaryClientSkillAutoRouteJudge, deferred_input_status_line,
         derive_turn_interaction_mode, failed_control_tool_recovery_result,
-        permission_mode_change_audit_event, plan_mode_missed_exit_reminder,
-        plan_mode_restriction_names, request_allowlist_restriction_names,
+        permission_mode_change_audit_event, plan_mode_restriction_names,
+        request_allowlist_restriction_names,
     };
     use crate::cli::permission_manager::PermissionMode;
     use astra_runtime::turn::agentic_loop::host::TurnInteractionMode;
@@ -1660,163 +1536,6 @@ mod tests {
             derive_turn_interaction_mode(PermissionMode::Plan, false, false, false, true, true),
             TurnInteractionMode::NonInteractive
         );
-    }
-
-    // ── Session c47c2dca regression guard ─────────────────────────────
-    //
-    // `CliAgenticLoopHost::execute_turn` MUST drain
-    // `state.volatile_pending` before handing messages to the bridge,
-    // otherwise runtime-injected nudges (stall reflections, circuit-
-    // breaker self-check, Task #42/#43 advisories, budget warnings,
-    // the Corrective family, etc.) never reach the LLM. The
-    // `take_volatile_pending_as_message` method on `AgenticLoopState`
-    // exists specifically for this CLI-side drain — if someone
-    // removes the call, nudges silently disappear again.
-    //
-    // A stronger test would drive the full execute_turn path and
-    // snoop the outgoing HTTP payload. But execute_turn pulls in
-    // enough non-trivial state (HTTP client, executor, perm manager,
-    // memoria hub, …) that the minimal-reproduction cost isn't
-    // justified for a single-line check. A source-level assertion
-    // suffices to guard the invariant and documents WHY the call
-    // is there.
-
-    #[test]
-    fn execute_turn_drains_volatile_lane_into_edge_profile() {
-        // Guard against the session c47c2dca regression. The CLI must
-        // drain the structured volatile lane before building the
-        // outgoing HTTP payload; otherwise stall nudges, circuit-breaker
-        // self-check messages, and Task #42/#43 advisories are silently
-        // dropped.
-        //
-        // We check three independent textual signatures of the fix —
-        // assembled by string concatenation so this test's literals
-        // don't self-match. If any one of these goes missing, the
-        // regression is likely back.
-        let source = include_str!("cli_loop_host.rs");
-
-        // Signature 1: the drain method must be actually INVOKED, not
-        // just mentioned in comments/docstrings. We look for the exact
-        // call syntax (dot prefix + parens suffix) assembled via
-        // concat! so this test's literal cannot self-satisfy.
-        //
-        // The accepted method is the structured drain. The CLI must not inline
-        // the text into messages because only the server has the resolved model
-        // row and prompt-cache capability metadata.
-        //
-        // Do NOT quote the call syntax verbatim anywhere in this
-        // function body or its comments — it would defeat the check.
-        let safe_call = concat!(".take_volatile_pending", "()");
-        assert!(
-            source.contains(safe_call),
-            "execute_turn must invoke the structured volatile drain method \
-             (session c47c2dca regression + cache-capability guard). \
-             The expected call syntax is absent; nudges will be dropped \
-             or model-specific cache policy will be bypassed."
-        );
-
-        // Signature 2: the drained text travels in the dedicated request field,
-        // not as appended user messages.
-        assert!(
-            source.contains("runtime_volatile_texts"),
-            "execute_turn must route the drained volatile lane through \
-             runtime_volatile_texts so the server can apply cache capability"
-        );
-
-        // Signature 3: raw history stays raw; volatile must not mutate
-        // `messages[]` before server-side model resolution.
-        assert!(
-            source.contains("messages: state.messages.as_slice()"),
-            "execute_turn must pass raw state.messages and keep volatile \
-             separate from the conversation history"
-        );
-    }
-
-    #[test]
-    fn plan_nudge_fires_on_numbered_plan_without_exit_call() {
-        let messages = vec![serde_json::json!({
-            "role": "assistant",
-            "content": "Sure. Plan:\n1. Read auth.rs\n2. Add tests\n3. Submit PR",
-        })];
-        let nudge = plan_mode_missed_exit_reminder(&messages)
-            .expect("numbered plan without exit_plan_mode call must trigger nudge");
-        assert!(
-            nudge.contains("exit_plan_mode"),
-            "nudge must point the model at exit_plan_mode. Got: {nudge}"
-        );
-    }
-
-    #[test]
-    fn plan_nudge_fires_on_markdown_plan_header() {
-        let messages = vec![serde_json::json!({
-            "role": "assistant",
-            "content": "## Plan\n\nWe will read the file then add tests.",
-        })];
-        assert!(plan_mode_missed_exit_reminder(&messages).is_some());
-    }
-
-    #[test]
-    fn plan_nudge_skipped_when_assistant_called_exit_plan_mode() {
-        // The model already submitted the plan via the tool — no
-        // need to nag.
-        let messages = vec![serde_json::json!({
-            "role": "assistant",
-            "content": "Submitting the plan for approval.",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "function": {
-                        "name": "exit_plan_mode",
-                        "arguments": "{\"plan\":\"1. step\"}"
-                    }
-                }
-            ]
-        })];
-        assert!(plan_mode_missed_exit_reminder(&messages).is_none());
-    }
-
-    #[test]
-    fn plan_nudge_skipped_for_short_analytical_answer() {
-        // A one-paragraph answer is not plan-shaped and must not
-        // trigger the nudge — false positives spam the model.
-        let messages = vec![serde_json::json!({
-            "role": "assistant",
-            "content": "The auth module lives in `src/auth.rs`; it uses bcrypt.",
-        })];
-        assert!(plan_mode_missed_exit_reminder(&messages).is_none());
-    }
-
-    #[test]
-    fn plan_nudge_skipped_for_analytical_numbered_list_without_plan_marker() {
-        let messages = vec![serde_json::json!({
-            "role": "assistant",
-            "content": "I'll analyze this in three stages:\n1. Read the module\n2. Trace the call graph\n3. Summarize the risk",
-        })];
-        assert!(
-            plan_mode_missed_exit_reminder(&messages).is_none(),
-            "ordinary analytical numbered lists should not force a plan approval nudge"
-        );
-    }
-
-    #[test]
-    fn plan_nudge_handles_openai_content_array_shape() {
-        let messages = vec![serde_json::json!({
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "Plan:"},
-                {"type": "text", "text": "1. read\n2. test\n3. ship"},
-            ]
-        })];
-        assert!(plan_mode_missed_exit_reminder(&messages).is_some());
-    }
-
-    #[test]
-    fn plan_nudge_skipped_when_no_assistant_message_yet() {
-        let messages = vec![serde_json::json!({
-            "role": "user",
-            "content": "Investigate the auth module"
-        })];
-        assert!(plan_mode_missed_exit_reminder(&messages).is_none());
     }
 
     // ── Plan-mode restriction lifecycle ─────────────────────────

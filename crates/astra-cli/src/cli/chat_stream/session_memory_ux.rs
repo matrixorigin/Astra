@@ -218,7 +218,7 @@ mod tests {
         BackgroundActivity, BackgroundActivityBroker, ConstSelectorResolver,
         MemoryExtractionService,
     };
-    use astra_runtime::turn::cloud::memoria_compact::{MemoriaClient, MemoriaMemory};
+    use astra_runtime::turn::cloud::memoria_compact::{MemoriaMemory, MemoriaPort};
     use astra_services::event_ingestion::IngestionSender;
     use astra_services::session_journal::{
         SessionMemoryExtractionErrorReason, SessionMemoryExtractionSource,
@@ -235,7 +235,7 @@ mod tests {
     struct NullMemoria;
 
     #[async_trait::async_trait]
-    impl MemoriaClient for NullMemoria {
+    impl MemoriaPort for NullMemoria {
         async fn retrieve_ext(
             &self,
             _query: &str,
@@ -262,7 +262,7 @@ mod tests {
     fn build_service() -> (Arc<MemoryExtractionService>, Arc<BackgroundActivityBroker>) {
         let (ingestion, _rx) = IngestionSender::for_tests(16);
         let broker = Arc::new(BackgroundActivityBroker::new());
-        let memoria: Arc<dyn MemoriaClient> = Arc::new(NullMemoria);
+        let memoria: Arc<dyn MemoriaPort> = Arc::new(NullMemoria);
         let svc = Arc::new(MemoryExtractionService::new(
             Arc::new(ConstSelectorResolver(None)),
             memoria,
@@ -455,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn lagged_does_not_kill_bridge() {
         // Build a broker with a tiny capacity so we can force a lag.
-        let memoria: Arc<dyn MemoriaClient> = Arc::new(NullMemoria);
+        let memoria: Arc<dyn MemoriaPort> = Arc::new(NullMemoria);
         let broker = Arc::new(BackgroundActivityBroker::with_capacity(2));
         let (ingestion, _ing_rx) = IngestionSender::for_tests(16);
         let svc = Arc::new(MemoryExtractionService::new(

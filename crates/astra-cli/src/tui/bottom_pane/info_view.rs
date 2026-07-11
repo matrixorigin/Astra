@@ -77,7 +77,7 @@ impl BottomPaneView for InfoView {
 
         // Title
         if y < area.bottom() {
-            let line = Line::from(Span::styled(format!("  {}", &self.title), title_style));
+            let line = Line::from(Span::styled(format!("  {}", self.title), title_style));
             Widget::render(line, Rect::new(area.x, y, area.width, 1), buf);
             y += 1;
         }

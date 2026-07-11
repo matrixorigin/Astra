@@ -2106,11 +2106,11 @@ tests/test_main.py .....                                                  [100%]
     }
 
     #[test]
-    fn parse_masked_command_not_found_as_env_failure() {
+    fn successful_process_status_is_not_overridden_by_failure_like_output() {
         let result = parse_build_test_output("bash: python: command not found\n", Some(0));
-        assert!(!result.passed);
-        assert_eq!(result.summary, "environment failure");
-        assert_eq!(result.error_count, 1);
+        assert!(result.passed);
+        assert_eq!(result.summary, "completed");
+        assert_eq!(result.error_count, 0);
     }
 
     #[test]

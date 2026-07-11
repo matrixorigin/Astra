@@ -105,6 +105,22 @@ impl ToolResult {
         }
     }
 
+    /// Attach source-authored structured recovery evidence. Consumers surface
+    /// this to the model as advisory context; it does not authorize retries or
+    /// tool-surface mutation.
+    pub fn with_failure_evidence(mut self, evidence: astra_core::ToolFailureEvidence) -> Self {
+        self.is_error = true;
+        let metadata = self.metadata.get_or_insert_with(serde_json::Map::new);
+        metadata.insert(
+            "error_kind".to_string(),
+            Value::String(evidence.kind.as_str().to_string()),
+        );
+        if let Ok(value) = serde_json::to_value(evidence) {
+            metadata.insert("recovery_evidence".to_string(), value);
+        }
+        self
+    }
+
     /// Attach exit-code semantics while preserving the existing output/error shape.
     pub fn with_exit_semantics(mut self, semantics: exit_semantics::ExitSemantics) -> Self {
         self.exit_semantics = Some(semantics);
@@ -491,9 +507,8 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "rollback_database_snapshots",
 ];
 
-fn git_stash_action_requires_approval(args: &Value) -> bool {
-    args.get("stash_action")
-        .or_else(|| args.get("sub_action"))
+fn git_stash_sub_action_requires_approval(args: &Value) -> bool {
+    args.get("sub_action")
         .and_then(Value::as_str)
         .is_some_and(|action| matches!(action, "push" | "save" | "apply" | "pop" | "drop"))
 }
@@ -508,7 +523,7 @@ pub fn tool_requires_approval(tool_name: &str, args: &Value) -> bool {
                 | crate::git_tool_contract::GitAction::RevertCommit
                 | crate::git_tool_contract::GitAction::Push => true,
                 crate::git_tool_contract::GitAction::Stash => {
-                    git_stash_action_requires_approval(args)
+                    git_stash_sub_action_requires_approval(args)
                 }
                 crate::git_tool_contract::GitAction::Status
                 | crate::git_tool_contract::GitAction::Diff
@@ -1038,7 +1053,7 @@ mod tests {
         ));
         assert!(tool_requires_approval(
             "git",
-            &serde_json::json!({"action": "stash", "stash_action": "drop"})
+            &serde_json::json!({"action": "stash", "sub_action": "drop"})
         ));
     }
 

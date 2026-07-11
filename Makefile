@@ -1106,11 +1106,18 @@ test-online:
 	TEST_DB_BASE=$${ASTRA_TEST_DATABASE:-astra_runtime_test}; \
 	RUNTIME_IGNORED_DB="$${TEST_DB_BASE}_runtime_ignored"; \
 	INTEGRATION_DB="$${TEST_DB_BASE}_integration"; \
+	ONLINE_LANE=$${ASTRA_ONLINE_LANE:-all}; \
+	case "$$ONLINE_LANE" in \
+		all) DB_NAMES="$$RUNTIME_IGNORED_DB $$INTEGRATION_DB" ;; \
+		core) DB_NAMES="$$RUNTIME_IGNORED_DB" ;; \
+		integration) DB_NAMES="$$INTEGRATION_DB" ;; \
+		*) echo "❌ invalid ASTRA_ONLINE_LANE=$$ONLINE_LANE (expected all, core, or integration)"; exit 2 ;; \
+	esac; \
 	DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
 	DB_PORT=$${MATRIXONE_PORT:-6001}; \
 	DB_USER=$${MATRIXONE_USER:-root}; \
 	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
-	echo "Recreating test databases $$RUNTIME_IGNORED_DB and $$INTEGRATION_DB ..."; \
+	echo "Running online lane=$$ONLINE_LANE; recreating test databases: $$DB_NAMES ..."; \
 	run_mysql_ddl() { _sql=$$1; shift; mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$_sql"; }; \
 	mysql_ssl_disable_arg() { \
 		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
@@ -1119,43 +1126,49 @@ test-online:
 		fi; \
 	}; \
 	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
-	for DB_NAME in "$$RUNTIME_IGNORED_DB" "$$INTEGRATION_DB"; do \
+	for DB_NAME in $$DB_NAMES; do \
 		SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
 		run_mysql_ddl "$$SQL" 2>/dev/null || { \
 			if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$SQL" "$$MYSQL_SSL_ARG"; else run_mysql_ddl "$$SQL"; fi; \
 		} 2>/dev/null || true; \
 	done; \
-	echo "Running astra-runtime ignored unit/bin tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
 	FAILED=""; \
-	ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-		ASTRA_TEST_DB_IT=1 \
-		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-			--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
-			-E 'not test(/durable_run_event_pressure_probe/)' \
-			|| FAILED="$$FAILED astra-runtime-ignored"; \
-	echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
-	ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-		ASTRA_TEST_DB_IT=1 \
-		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-turn-core \
-			--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
-			|| FAILED="$$FAILED astra-turn-core-db-store"; \
-	echo "Running astra-services ignored lib tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
-	ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-		ASTRA_TEST_DB_IT=1 \
-		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services \
-			--lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
-			|| FAILED="$$FAILED astra-services-db-store"; \
-	echo "Running ignored integration suites (live DB=$$INTEGRATION_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
-	ASTRA_DATABASE=$$INTEGRATION_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
-		ASTRA_TEST_DATABASE=$$INTEGRATION_DB \
-		ASTRA_TEST_DB_IT=1 \
-		$(MAKE) test-ignored-integration \
-		|| FAILED="$$FAILED test-ignored-integration"; \
+	if [ "$$ONLINE_LANE" != "integration" ]; then \
+		echo "Running astra-runtime ignored unit/bin tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); live-LLM suite gated by ASTRA_LIVE_LLM)..."; \
+		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+			ASTRA_TEST_DB_IT=1 \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+				--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+				-E 'not test(/durable_run_event_pressure_probe/)' \
+				|| FAILED="$$FAILED astra-runtime-ignored"; \
+		echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
+		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+			ASTRA_TEST_DB_IT=1 \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-turn-core \
+				--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+				|| FAILED="$$FAILED astra-turn-core-db-store"; \
+		echo "Running astra-services ignored lib tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
+		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+			ASTRA_TEST_DB_IT=1 \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services \
+				--lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+				|| FAILED="$$FAILED astra-services-db-store"; \
+	fi; \
+	if [ "$$ONLINE_LANE" != "core" ]; then \
+		echo "Running ignored integration suites (live DB=$$INTEGRATION_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
+		ASTRA_DATABASE=$$INTEGRATION_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+			ASTRA_TEST_DATABASE=$$INTEGRATION_DB \
+			ASTRA_TEST_DB_IT=1 \
+			$(MAKE) test-ignored-integration \
+			|| FAILED="$$FAILED test-ignored-integration"; \
+	fi; \
 	if [ -n "$$FAILED" ]; then \
 		echo "❌ test-online: failed suites:$$FAILED"; \
 		exit 1; \
 	fi
-	@if [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
+	@if [ "$${ASTRA_ONLINE_LANE:-all}" = "core" ]; then \
+		echo "Skipping @astra/sdk remote E2E in the core online lane"; \
+	elif [ "$${ASTRA_SDK_ONLINE_E2E:-}" = "1" ]; then \
 		$(MAKE) test-sdk-online; \
 	else \
 		echo "Skipping @astra/sdk remote E2E (set ASTRA_SDK_ONLINE_E2E=1 with API running, or: make test-sdk-online)"; \
@@ -1238,7 +1251,7 @@ test-saas-coverage:
 	@command -v cargo-llvm-cov >/dev/null 2>&1 || { \
 		echo "cargo-llvm-cov not found; install with: cargo install cargo-llvm-cov"; exit 1; \
 	}
-	@rustup component add llvm-tools-preview --toolchain stable >/dev/null 2>&1 || { \
+	@rustup component add llvm-tools-preview >/dev/null 2>&1 || { \
 		echo "llvm-tools-preview required; run: rustup component add llvm-tools-preview"; exit 1; \
 	}
 	@if [ ! -f .env ]; then \
@@ -1400,8 +1413,17 @@ check: lint format-check type-check check-web
 ci: check test
 	@echo "✅ All CI checks passed!"
 
+.PHONY: toolchain-check
+toolchain-check:
+	@toolchain_version=$$(sed -nE 's/^channel = "([^"]+)"/\1/p' rust-toolchain.toml); \
+	docker_version=$$(sed -nE 's/^ARG RUST_VERSION=([0-9.]+)-.*/\1/p' Dockerfile); \
+	if [ -z "$$toolchain_version" ] || [ -z "$$docker_version" ] || [ "$$toolchain_version" != "$$docker_version" ]; then \
+		echo "❌ Rust toolchain mismatch: rust-toolchain.toml=$${toolchain_version:-missing}, Dockerfile=$${docker_version:-missing}"; \
+		exit 1; \
+	fi
+
 .PHONY: lint
-lint: sweep
+lint: toolchain-check sweep
 	@echo "Running clippy..."
 	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
 

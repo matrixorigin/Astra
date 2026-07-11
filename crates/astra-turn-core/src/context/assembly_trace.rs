@@ -16,6 +16,14 @@ use std::time::SystemTime;
 
 use crate::section_types::estimate_text_tokens;
 
+/// Product-level lower bound for memories that may become prompt-visible.
+///
+/// Memory below this score is not neutral: it consumes cacheable prompt budget
+/// and can re-anchor the model to unrelated prior sessions. The trace builder
+/// is the final common path before retrieved memories are selected for context,
+/// so the guard belongs here rather than in session-specific callers.
+pub const MEMORY_TRACE_MIN_RELEVANCE_SCORE: f64 = 0.30;
+
 // ─── Top-Level Trace ─────────────────────────────────────────────────────────
 
 /// Complete trace of context assembly for one turn.
@@ -148,8 +156,6 @@ pub struct PromptContextSignals {
     pub self_awareness: bool,
     pub implicit_feedback: bool,
     pub learned_feedback_rules: bool,
-    #[serde(default)]
-    pub memoria_insights: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -650,6 +656,7 @@ pub fn build_memory_trace_from_retrieval(
     let mut seen = std::collections::HashSet::new();
     let memories_selected: Vec<MemorySelection> = ranked_results
         .iter()
+        .filter(|(_, score)| score.is_finite() && *score >= MEMORY_TRACE_MIN_RELEVANCE_SCORE)
         .filter(|(content, _)| !astra_prompts::memory_proto::is_session_namespace_memory(content))
         .filter(|(content, _)| !content.trim().is_empty())
         .filter(|(content, _)| seen.insert(memory_trace_dedup_key(content)))
@@ -743,6 +750,31 @@ mod tests {
             crate::section_types::estimate_text_tokens(&content)
         );
         assert_eq!(trace.total_tokens, trace.memories_selected[0].tokens);
+    }
+
+    #[test]
+    fn memory_trace_rejects_low_and_non_finite_scores_before_selection() {
+        let ranked = vec![
+            ("low relevance poisoned memory".to_string(), 0.12),
+            ("nan relevance poisoned memory".to_string(), f64::NAN),
+            (
+                "relevant project memory".to_string(),
+                MEMORY_TRACE_MIN_RELEVANCE_SCORE,
+            ),
+        ];
+
+        let trace = build_memory_trace_from_retrieval("memory", ranked.len() as u32, &ranked, 12);
+
+        assert_eq!(trace.memories_selected.len(), 1);
+        assert_eq!(
+            trace.memories_selected[0].content_preview,
+            "relevant project memory"
+        );
+        assert_eq!(
+            trace.memories_selected[0].relevance_score,
+            MEMORY_TRACE_MIN_RELEVANCE_SCORE
+        );
+        assert_eq!(trace.candidates_considered, 3);
     }
 
     #[test]

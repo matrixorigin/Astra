@@ -153,12 +153,24 @@ fn agent_tool_display_name_hint(value: &Value) -> Option<String> {
 }
 
 fn summarize_agent_tool_control_error(error: &str) -> String {
-    if error.contains("duplicate_within_turn") {
-        "same-turn retries hit duplicate_within_turn".to_string()
-    } else if error.contains("blocked_tool") {
-        "later retries were blocked after the tool was restricted".to_string()
-    } else {
-        error.lines().next().unwrap_or(error).trim().to_string()
+    let first_line = error.lines().next().unwrap_or(error).trim();
+    match agent_tool_control_error_tag(first_line) {
+        Some("duplicate_within_turn") => "same-turn retries hit duplicate_within_turn".to_string(),
+        Some("blocked_tool") => {
+            "later retries were blocked after the tool was restricted".to_string()
+        }
+        _ => first_line.to_string(),
+    }
+}
+
+fn agent_tool_control_error_tag(first_line: &str) -> Option<&str> {
+    let tag = first_line
+        .split_once(':')
+        .map(|(tag, _)| tag.trim())
+        .unwrap_or(first_line);
+    match tag {
+        "duplicate_within_turn" | "blocked_tool" => Some(tag),
+        _ => None,
     }
 }
 

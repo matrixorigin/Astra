@@ -11,7 +11,7 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::context_planner::ContextPlan;
-use crate::context_sources::ContextSources;
+use crate::context_sources::{ContextSources, MemoryEntry};
 use crate::section_types::{
     BYTES_PER_TOKEN_ESTIMATE, BoundSection, PlannedSection, SectionArtifact, SectionKind,
     estimate_text_tokens,
@@ -172,9 +172,10 @@ fn bind_memory(planned: &PlannedSection, sources: &ContextSources<'_>) -> String
         if entry.content.trim().is_empty() || !seen.insert(entry.content_hash) {
             continue;
         }
+        let prompt_content = render_prompt_memory_entry(&entry);
         let estimate = entry
             .token_estimate
-            .max(estimate_text_tokens(&entry.content))
+            .max(estimate_text_tokens(&prompt_content))
             .max(1);
         let remaining = budget.saturating_sub(used);
         if remaining == 0 {
@@ -182,9 +183,9 @@ fn bind_memory(planned: &PlannedSection, sources: &ContextSources<'_>) -> String
         }
         if estimate <= remaining {
             used = used.saturating_add(estimate);
-            selected.push(entry.content);
+            selected.push(prompt_content);
         } else if selected.is_empty() {
-            selected.push(truncate_memory_to_budget(&entry.content, remaining));
+            selected.push(truncate_memory_to_budget(&prompt_content, remaining));
             break;
         }
     }
@@ -193,6 +194,25 @@ fn bind_memory(planned: &PlannedSection, sources: &ContextSources<'_>) -> String
         String::new()
     } else {
         format!("{MEMORY_SECTION_HEADER}{}", selected.join("\n\n"))
+    }
+}
+
+fn render_prompt_memory_entry(entry: &MemoryEntry) -> String {
+    match (
+        entry
+            .memory_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty()),
+        entry
+            .memory_type
+            .as_deref()
+            .filter(|kind| !kind.trim().is_empty()),
+    ) {
+        (Some(memory_id), Some(memory_type)) => format!(
+            "[Memory evidence id={memory_id} type={memory_type}]\n{}",
+            entry.content.trim()
+        ),
+        _ => entry.content.trim().to_string(),
     }
 }
 
@@ -794,6 +814,21 @@ mod tests {
         let planned = planned_memory(1024);
         let content = bind_memory(&planned, &sources);
         assert!(content.contains("pipeline-first"));
+    }
+
+    #[test]
+    fn bind_memory_exposes_typed_identity_for_correction_and_feedback() {
+        let mut fixture = test_sources();
+        fixture.external.memory_entries = vec![
+            MemoryEntry::scored("[@pref/active] Prefer the server-side execution path", 0.9)
+                .with_memory_identity("mem-42", "profile"),
+        ];
+        let sources = fixture.context();
+
+        let content = bind_memory(&planned_memory(128), &sources);
+
+        assert!(content.contains("[Memory evidence id=mem-42 type=profile]"));
+        assert!(content.contains("[@pref/active] Prefer the server-side execution path"));
     }
 
     #[test]

@@ -38,6 +38,9 @@ pub(crate) fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord
     let mut files = Vec::new();
     let mut failed = Vec::new();
     for record in records {
+        if !record.was_executed() {
+            continue;
+        }
         if record.ok
             && let Some(file_path) = record.file_path.as_deref()
             && !files.contains(&file_path)
@@ -64,7 +67,13 @@ pub(crate) fn build_turn_tool_summary(records: &[session_journal::ToolCallRecord
     if !failed.is_empty() {
         parts.push(format!("failed: {}", failed.join(", ")));
     }
-    parts.push(format!("tool_calls: {}", records.len()));
+    parts.push(format!(
+        "tool_calls: {}",
+        records
+            .iter()
+            .filter(|record| record.was_executed())
+            .count()
+    ));
 
     format!("\n\n[Turn context: {}]", parts.join(" | "))
 }
@@ -253,8 +262,7 @@ mod tests {
         interruption_status_notice,
     };
     use astra_runtime::pipeline::evaluation::{
-        EvalSignal, EvaluationThresholds, TurnEvaluation, build_turn_evaluation_annotated_text,
-        turn_evaluation_status_notice,
+        EvalSignal, EvaluationThresholds, TurnEvaluation, turn_evaluation_status_notice,
     };
     use astra_services::session_journal;
 
@@ -300,42 +308,6 @@ mod tests {
         };
 
         assert!(turn_evaluation_status_notice(&eval).is_none());
-    }
-
-    #[test]
-    fn turn_evaluation_annotation_marks_incomplete_prompt_history() {
-        let eval = TurnEvaluation {
-            success: false,
-            quality: 0.0,
-            confidence: 0.9,
-            signals: vec![EvalSignal::LlmRoundChurn {
-                rounds: 40,
-                prompt_tokens: 94_900,
-            }],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        let annotated = build_turn_evaluation_annotated_text("完成。", &eval);
-
-        assert!(annotated.starts_with("完成。"));
-        assert!(annotated.contains("[Turn evaluation: incomplete."));
-        assert!(annotated.contains("too many LLM rounds"));
-    }
-
-    #[test]
-    fn turn_evaluation_annotation_leaves_successful_turn_unchanged() {
-        let eval = TurnEvaluation {
-            success: true,
-            quality: 0.8,
-            confidence: 0.7,
-            signals: vec![EvalSignal::AllToolsHealthy],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        assert_eq!(
-            build_turn_evaluation_annotated_text("Done.", &eval),
-            "Done."
-        );
     }
 
     #[test]

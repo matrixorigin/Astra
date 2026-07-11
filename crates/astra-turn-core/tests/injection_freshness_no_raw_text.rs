@@ -3,7 +3,7 @@
 //! Raw channel text never crosses the HTTP boundary.
 //!
 //! Motivation: wip-5's event emitted full text for every channel
-//! (`self_awareness`, `memoria_insights`, `feedback_rules`,
+//! (`self_awareness`, `memoria_prefetch`, `feedback_rules`,
 //! `implicit_feedback`, etc.). Any external client hitting `/chat/turn`
 //! saw that plaintext via the pass-through behaviour of
 //! `services::runs::transform_run_event_for_client`. Learned feedback
@@ -32,7 +32,6 @@ fn injection_freshness_event_carries_no_raw_text_keys() {
     // or similar back into the SSE payload.
     let forbidden_keys = [
         "self_awareness",
-        "memoria_insights",
         "memoria_prefetch",
         "recent_arg_hints",
         "skill_listing",
@@ -51,7 +50,7 @@ fn injection_freshness_event_carries_no_raw_text_keys() {
         "type": "injection_freshness",
         "channels": [
             { "tag": "self_awareness", "hash": 1u64, "bytes": 42u64, "is_empty": false },
-            { "tag": "memoria_insights", "hash": 0u64, "bytes": 0u64, "is_empty": true },
+            { "tag": "memoria_prefetch", "hash": 0u64, "bytes": 0u64, "is_empty": true },
         ]
     });
     let data = serde_json::to_string(&allowed_event).unwrap();
@@ -87,7 +86,7 @@ fn injection_freshness_event_carries_no_raw_text_keys() {
     assert_eq!(first.bytes, 42);
     assert!(!first.is_empty);
     let second = &bundle.channels[1];
-    assert_eq!(second.tag, "memoria_insights");
+    assert_eq!(second.tag, "memoria_prefetch");
     assert!(second.is_empty);
 }
 

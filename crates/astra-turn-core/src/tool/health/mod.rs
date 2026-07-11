@@ -9,7 +9,9 @@
 
 pub mod persistence;
 
-use crate::action_compensation::{FailureCategory, classify_execution_outcome};
+use crate::action_compensation::{
+    ExecutionOutcomeInput, FailureCategory, classify_execution_outcome_from_input,
+};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -88,14 +90,45 @@ impl ToolOutcome {
     /// this already; exposing it explicitly keeps this helper pure.
     ///
     /// When `success == false`, the failure category is derived automatically
-    /// from the result text via [`classify_execution_outcome`]. Callers that
-    /// already have a category handy should prefer [`ToolOutcome::with_category`].
+    /// via [`classify_execution_outcome_from_input`]. Callers that already
+    /// have a category handy should prefer [`ToolOutcome::with_category`], and
+    /// callers with structured `error_kind`/`result_class`/`exit_semantics`
+    /// should prefer [`ToolOutcome::with_classification`].
     #[must_use]
     pub fn new(success: bool, latency_ms: u64, result_str: &str) -> Self {
         let failure_category = if success {
             None
         } else {
-            classify_execution_outcome(result_str, true, latency_ms, false).failure_category
+            classify_execution_outcome_from_input(ExecutionOutcomeInput {
+                result_text: result_str,
+                is_error: true,
+                duration_ms: latency_ms,
+                was_rejected: false,
+                error_kind: None,
+                result_class: None,
+                exit_semantics: None,
+            })
+            .failure_category
+        };
+        Self::with_category(success, latency_ms, result_str, failure_category)
+    }
+
+    /// Build a `ToolOutcome` from structured execution facts.
+    ///
+    /// Prefer this over [`ToolOutcome::new`] when the caller has typed
+    /// `error_kind`, `result_class`, or `exit_semantics`; those produce a
+    /// precise [`FailureCategory`] instead of degrading to `Unknown`.
+    #[must_use]
+    pub fn with_classification(
+        success: bool,
+        latency_ms: u64,
+        result_str: &str,
+        input: ExecutionOutcomeInput<'_>,
+    ) -> Self {
+        let failure_category = if success {
+            None
+        } else {
+            classify_execution_outcome_from_input(input).failure_category
         };
         Self::with_category(success, latency_ms, result_str, failure_category)
     }
@@ -1794,17 +1827,75 @@ mod tests {
 
     #[test]
     fn tool_outcome_new_auto_classifies_failure_category() {
+        // Success never carries a failure category.
         let ok = ToolOutcome::new(true, 5, "whatever");
         assert_eq!(ok.failure_category, None);
 
+        // Timeout is derived from duration_ms (a typed fact), not text.
         let timeout = ToolOutcome::new(false, 130_000, "Error: operation timed out after 120s");
         assert_eq!(timeout.failure_category, Some(FailureCategory::Timeout));
 
+        // Text-only input without typed error_kind/result_class/exit_semantics
+        // legitimately degrades to Unknown. Callers with structured facts
+        // should use ToolOutcome::with_classification (see test below).
         let perm = ToolOutcome::new(false, 4, "Error: Permission denied (EACCES)");
+        assert_eq!(perm.failure_category, Some(FailureCategory::Unknown));
+    }
+
+    #[test]
+    fn tool_outcome_with_classification_uses_typed_error_kind() {
+        use crate::action_compensation::ExecutionOutcomeInput;
+
+        let ok = ToolOutcome::with_classification(
+            true,
+            5,
+            "whatever",
+            ExecutionOutcomeInput {
+                result_text: "whatever",
+                is_error: false,
+                duration_ms: 5,
+                was_rejected: false,
+                error_kind: Some(astra_core::ErrorKind::Auth),
+                result_class: None,
+                exit_semantics: None,
+            },
+        );
+        assert_eq!(ok.failure_category, None);
+
+        let perm = ToolOutcome::with_classification(
+            false,
+            4,
+            "Error: Permission denied (EACCES)",
+            ExecutionOutcomeInput {
+                result_text: "Error: Permission denied (EACCES)",
+                is_error: true,
+                duration_ms: 4,
+                was_rejected: false,
+                error_kind: Some(astra_core::ErrorKind::Auth),
+                result_class: None,
+                exit_semantics: None,
+            },
+        );
         assert_eq!(
             perm.failure_category,
             Some(FailureCategory::PermissionDenied)
         );
+
+        let net = ToolOutcome::with_classification(
+            false,
+            3_000,
+            "Error: connection refused by server",
+            ExecutionOutcomeInput {
+                result_text: "Error: connection refused by server",
+                is_error: true,
+                duration_ms: 3_000,
+                was_rejected: false,
+                error_kind: Some(astra_core::ErrorKind::Network),
+                result_class: None,
+                exit_semantics: None,
+            },
+        );
+        assert_eq!(net.failure_category, Some(FailureCategory::NetworkError));
     }
 
     #[test]
@@ -1831,10 +1922,25 @@ mod tests {
 
     #[test]
     fn latest_outcomes_propagate_failure_category() {
+        use crate::action_compensation::ExecutionOutcomeInput;
+
         let mut tracker = ToolHealthTracker::new();
         tracker.record_outcome(
             r#"bash:{"command":"curl https://x"}"#,
-            ToolOutcome::new(false, 3_000, "Error: connection refused by server"),
+            ToolOutcome::with_classification(
+                false,
+                3_000,
+                "Error: connection refused by server",
+                ExecutionOutcomeInput {
+                    result_text: "Error: connection refused by server",
+                    is_error: true,
+                    duration_ms: 3_000,
+                    was_rejected: false,
+                    error_kind: Some(astra_core::ErrorKind::Network),
+                    result_class: None,
+                    exit_semantics: None,
+                },
+            ),
         );
         let hints = tracker.latest_outcomes(1);
         assert_eq!(hints.len(), 1);

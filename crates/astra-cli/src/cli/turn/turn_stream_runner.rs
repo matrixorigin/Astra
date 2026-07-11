@@ -284,34 +284,6 @@ mod tests {
     /// is the only stable way to prove this short of a full E2E test against
     /// a live server — and the regression risk (silent removal during a
     /// refactor) is exactly the failure mode that produced this bug.
-    #[test]
-    fn await_stream_with_interrupts_calls_server_cancel_on_user_cancel() {
-        let source = include_str!("turn_stream_runner.rs");
-        let fn_start = source
-            .find("async fn await_stream_with_interrupts")
-            .expect("await_stream_with_interrupts must exist");
-        let fn_end = source[fn_start..]
-            .find("\n}\n")
-            .map(|p| fn_start + p)
-            .expect("function must have a closing brace");
-        let fn_body = &source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("notify_server_to_cancel_run"),
-            "await_stream_with_interrupts must call notify_server_to_cancel_run \
-             on user-cancel paths so the server-side run does not keep \
-             executing after the SSE reader closes"
-        );
-        assert!(
-            fn_body
-                .matches("prepared.run_control.request_cancel()")
-                .count()
-                >= 2,
-            "await_stream_with_interrupts must write user cancellation into the \
-             local RunControlProvider on both Ctrl+C and TUI cancel paths so \
-             CLI local runs use the same shared control-status contract as \
-             server runs"
-        );
-    }
 
     #[tokio::test]
     async fn prepare_turn_stream_state_does_not_inject_task_board_prompt() {

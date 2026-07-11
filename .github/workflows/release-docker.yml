@@ -82,12 +82,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.IDC_REGISTRY }}
-          username: ${{ secrets.IDC_REGISTRY_USERNAME }}
-          password: ${{ secrets.IDC_REGISTRY_PASSWORD }}
-
       - uses: docker/metadata-action@v5
         id: meta
         with:
@@ -105,16 +99,16 @@ jobs:
           context: .
           file: Dockerfile
           platforms: ${{ matrix.platform }}
-          tags: |
-            ${{ env.IMAGE_NAME }}
-            ${{ env.IDC_IMAGE_NAME }}
+          tags: ${{ env.IMAGE_NAME }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             IMAGE_VERSION=${{ needs.version.outputs.image_version }}
             IMAGE_REVISION=${{ github.sha }}
             IMAGE_BRANCH=${{ github.ref_name }}
-          cache-from: type=gha,scope=docker-${{ matrix.slug }}
-          cache-to: type=gha,scope=docker-${{ matrix.slug }},mode=max
+          # Registry caches are shared across release tags/branches and do not
+          # compete with Rust/sccache for the repository's Actions cache quota.
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.slug }}
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.slug }},mode=max
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
@@ -135,7 +129,7 @@ jobs:
           retention-days: 1
 
   merge:
-    name: Merge & Push Docker Manifest
+    name: Publish DockerHub Manifest
     needs:
       - version
       - build
@@ -155,12 +149,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.IDC_REGISTRY }}
-          username: ${{ secrets.IDC_REGISTRY_USERNAME }}
-          password: ${{ secrets.IDC_REGISTRY_PASSWORD }}
-
       - uses: docker/metadata-action@v5
         id: meta
         with:
@@ -172,51 +160,80 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.latest == 'true' }}
             type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
 
-      - uses: docker/metadata-action@v5
-        id: idc-meta
-        with:
-          images: ${{ env.IDC_IMAGE_NAME }}
-          flavor: |
-            latest=false
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.latest == 'true' }}
-            type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
-
-      - name: Create Docker manifest lists
+      - name: Create DockerHub manifest list
         shell: bash
         working-directory: /tmp/digests
         env:
           DOCKERHUB_IMAGE_NAME: ${{ env.IMAGE_NAME }}
           DOCKERHUB_METADATA_JSON: ${{ steps.meta.outputs.json }}
-          IDC_IMAGE_NAME: ${{ env.IDC_IMAGE_NAME }}
-          IDC_METADATA_JSON: ${{ steps.idc-meta.outputs.json }}
         run: |
           set -euo pipefail
           shopt -s nullglob
+          mapfile -t tag_args < <(jq -r '.tags[] | "-t", .' <<< "${DOCKERHUB_METADATA_JSON}")
+          if [ "${#tag_args[@]}" -eq 0 ]; then
+            echo "No DockerHub tags were generated" >&2
+            exit 1
+          fi
 
-          create_manifest_list() {
-            local image_name="$1"
-            local metadata_json="$2"
-            local -a tag_args=()
-            local -a sources=()
+          sources=()
+          for digest in *; do
+            sources+=("${DOCKERHUB_IMAGE_NAME}@sha256:${digest}")
+          done
+          if [ "${#sources[@]}" -eq 0 ]; then
+            echo "No platform image digests were downloaded" >&2
+            exit 1
+          fi
 
-            mapfile -t tag_args < <(jq -r '.tags[] | "-t", .' <<< "${metadata_json}")
-            if [ "${#tag_args[@]}" -eq 0 ]; then
-              echo "No Docker tags were generated for ${image_name}" >&2
-              exit 1
-            fi
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
-            for digest in *; do
-              sources+=("${image_name}@sha256:${digest}")
-            done
-            if [ "${#sources[@]}" -eq 0 ]; then
-              echo "No platform image digests were downloaded" >&2
-              exit 1
-            fi
+  idc:
+    name: Publish IDC Manifest
+    needs:
+      - version
+      - merge
+    runs-on: amd64-mo-shanghai-dind
+    timeout-minutes: 45
+    env:
+      http_proxy: http://proxy-service.proxy.svc.cluster.local:8001
+      https_proxy: http://proxy-service.proxy.svc.cluster.local:8001
+      no_proxy: .local,.cn,.gitee.com,.tencent.com,.tencentyun.com,.aliyun.com,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,localhost,127.0.0.0/8,.qq.com,169.254.0.0/16,.myqcloud.com,.matrixone.tech,.aliyuncs.com,.digicert.com,.microsoft.com,.visualstudio.com,.symcb.com,0.0.0.0
 
-            docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
-          }
+    steps:
+      - name: Install crane
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL \
+            -o "${RUNNER_TEMP}/go-containerregistry.tar.gz" \
+            "https://github.com/google/go-containerregistry/releases/download/v0.20.6/go-containerregistry_Linux_x86_64.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/go-containerregistry.tar.gz" -C "${RUNNER_TEMP}/bin" crane
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/bin/crane" version
 
-          create_manifest_list "${DOCKERHUB_IMAGE_NAME}" "${DOCKERHUB_METADATA_JSON}"
-          create_manifest_list "${IDC_IMAGE_NAME}" "${IDC_METADATA_JSON}"
+      - name: Copy DockerHub manifest to IDC
+        shell: bash
+        env:
+          IMAGE_VERSION: ${{ needs.version.outputs.image_version }}
+          PUBLISH_LATEST: ${{ needs.version.outputs.latest }}
+          SOURCE_IMAGE: ${{ env.IMAGE_NAME }}
+          TARGET_IMAGE: ${{ env.IDC_IMAGE_NAME }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IDC_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
+          IDC_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${DOCKERHUB_TOKEN}" | crane auth login index.docker.io -u "${DOCKERHUB_USERNAME}" --password-stdin
+          printf '%s' "${IDC_PASSWORD}" | crane auth login "${IDC_REGISTRY}" -u "${IDC_USERNAME}" --password-stdin
+
+          tags=("${IMAGE_VERSION}")
+          if [ "${PUBLISH_LATEST}" = "true" ]; then
+            tags+=("${IMAGE_VERSION%.*}" "latest")
+          fi
+          for tag in "${tags[@]}"; do
+            crane copy --platform=all --jobs 2 \
+              "docker.io/${SOURCE_IMAGE}:${IMAGE_VERSION}" \
+              "${TARGET_IMAGE}:${tag}"
+          done
+          crane manifest "${TARGET_IMAGE}:${IMAGE_VERSION}" >/dev/null

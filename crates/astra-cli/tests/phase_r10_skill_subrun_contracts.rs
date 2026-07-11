@@ -6,9 +6,8 @@
 //!     vs CLI ceilings, so drift on either side is surfaced.
 //!   * `MAX_AGENT_RECURSION_DEPTH` (3) — capping nested delegations,
 //!     skill forks, and spawned agents.
-//!   * `SubRunResult` carries EXACTLY three fields
-//!     (`output: String`, `tokens_used: u32`, `turns: u32`) — no richer
-//!     channel. Constructing via struct-literal guarantees this.
+//!   * `SubRunResult` carries a typed terminal outcome independently from
+//!     partial text output.
 //!
 //! The CLI-side `SUBRUN_MAX_TURNS` / `SUBRUN_MAX_CUMULATIVE_TOKENS` are
 //! pinned inside `astra_cli::cli::skill_subrun`'s own `#[cfg(test)]` mod
@@ -19,7 +18,7 @@ use astra_runtime::server::server_skill_subrun::{
     SUBRUN_MAX_CUMULATIVE_TOKENS as SERVER_SUBRUN_MAX_TOKENS,
     SUBRUN_MAX_TURNS as SERVER_SUBRUN_MAX_TURNS,
 };
-use astra_runtime::skills::executor::isolated::SubRunResult;
+use astra_runtime::skills::executor::isolated::{SubRunOutcome, SubRunResult};
 use astra_runtime::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH;
 
 #[test]
@@ -46,27 +45,19 @@ fn agent_recursion_depth_cap_is_exactly_3() {
     assert_eq!(MAX_AGENT_RECURSION_DEPTH, 3u8);
 }
 
-/// Pin: `SubRunResult` has EXACTLY three fields. Struct-literal
-/// construction with the exact type-annotated fields — if a field is
-/// added, removed, or retyped, this test stops compiling.
 #[test]
-fn subrun_result_has_exactly_three_typed_fields() {
+fn subrun_result_preserves_typed_terminal_outcome() {
     let r = SubRunResult {
         output: String::from("hello world"),
         tokens_used: 1234u32,
         turns: 7u32,
+        outcome: SubRunOutcome::Interrupted {
+            finish_reason: "budget_exhausted".to_string(),
+        },
     };
-    // Access each field by name to lock the struct surface.
-    let output_ref: &String = &r.output;
-    let tokens_ref: &u32 = &r.tokens_used;
-    let turns_ref: &u32 = &r.turns;
-    assert_eq!(output_ref, "hello world");
-    assert_eq!(*tokens_ref, 1234);
-    assert_eq!(*turns_ref, 7);
 
-    // Field type pins: if these types ever shift (e.g. u32→u64), the
-    // compiler rejects the explicit type annotations above. Runtime
-    // assertion on size is a coarse secondary guard.
-    assert_eq!(std::mem::size_of_val(&r.tokens_used), 4);
-    assert_eq!(std::mem::size_of_val(&r.turns), 4);
+    assert!(!r.outcome.is_completed());
+    assert_eq!(r.outcome.label(), "interrupted");
+    assert_eq!(r.outcome.detail(), Some("budget_exhausted"));
+    assert_eq!(r.output, "hello world", "partial output remains available");
 }

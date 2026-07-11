@@ -23,7 +23,7 @@ use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
-    StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host,
+    StopHookState, TurnInteractionPolicy, project_skill_subrun_outcome, run_agentic_loop_with_host,
 };
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
@@ -410,9 +410,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
-            textless_stop_retries: 0,
             last_finish_reason: None,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
@@ -579,14 +578,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
-        if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {
-            return Err(format!(
-                "Skill sub-run '{}' failed after {} turns: {}",
-                skill_name,
-                SUBRUN_MAX_TURNS.saturating_sub(state.remaining_turns),
-                err
-            ));
-        }
+        let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        let outcome = project_skill_subrun_outcome(&loop_result, &state);
 
         // audit-#8: avoid underflow if remaining_turns somehow exceeds the cap.
         let turns = SUBRUN_MAX_TURNS.saturating_sub(state.remaining_turns) as u32;
@@ -596,6 +589,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             output: state.final_text,
             tokens_used,
             turns,
+            outcome,
         })
     }
 }

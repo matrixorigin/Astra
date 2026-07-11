@@ -35,6 +35,11 @@ use std::time::{Duration, Instant};
 /// the "only poll while incomplete" gate in the reference TUI — if a
 /// board has no in-flight work, ticks skip the fetch entirely.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// A successful terminal/empty board has no active work to monitor. Keep a
+/// low-frequency reconciliation poll for stores without subscriptions, while
+/// avoiding a request every five seconds for the lifetime of an idle session.
+const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
 /// Faster poll right after a broadcast/rebind so the user sees writes
 /// land within UI-perceptible latency. Gated by the `dirty` atomic
 /// so a quiet board never re-reads the store; only fires when there
@@ -147,6 +152,13 @@ struct ObserverState {
     manual_review_visible: bool,
     /// When the last `store.load()` returned. Used to gate polling.
     last_fetch: Instant,
+    /// Whether the current single-session binding has completed at least one
+    /// successful read. This distinguishes an uninitialized empty cache from a
+    /// real empty board.
+    single_session_loaded: bool,
+    /// Consecutive store failures. Used only to bound retry pressure; dirty
+    /// notifications still bypass the backoff.
+    consecutive_failures: u32,
     /// Whether a fetch is currently in flight. Prevents ticks from
     /// firing concurrent spawns.
     fetch_in_flight: bool,
@@ -210,6 +222,8 @@ impl TaskBoardObserver {
                 last_fetch: Instant::now()
                     .checked_sub(POLL_INTERVAL)
                     .unwrap_or_else(Instant::now),
+                single_session_loaded: false,
+                consecutive_failures: 0,
                 fetch_in_flight: false,
                 event_ring: Vec::new(),
                 completed_at: std::collections::HashMap::new(),
@@ -248,6 +262,8 @@ impl TaskBoardObserver {
                                 if st.session_id.is_empty() && !changed_sid.is_empty() {
                                     st.session_id = changed_sid.clone();
                                     st.snapshot = TaskBoardSnapshot::default();
+                                    st.single_session_loaded = false;
+                                    st.consecutive_failures = 0;
                                     st.hide_at = None;
                                     st.manual_review_visible = false;
                                     adopted = true;
@@ -426,6 +442,8 @@ impl TaskBoardObserver {
         st.event_ring.clear();
         st.completed_at.clear();
         st.cancelled_at.clear();
+        st.single_session_loaded = false;
+        st.consecutive_failures = 0;
         self.inner.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -496,7 +514,12 @@ impl TaskBoardObserver {
                 // window survives to the next tick.
                 let dirty = self.inner.dirty.load(Ordering::Relaxed);
                 let elapsed = now.saturating_duration_since(st.last_fetch);
-                let window = if dirty { FAST_POLL } else { POLL_INTERVAL };
+                let failure_backoff = failure_backoff(st.consecutive_failures);
+                let window = if dirty {
+                    FAST_POLL
+                } else {
+                    POLL_INTERVAL.max(failure_backoff)
+                };
                 if elapsed < window {
                     Due::Skip
                 } else {
@@ -507,8 +530,12 @@ impl TaskBoardObserver {
                         ViewMode::AllSessions => true,
                         ViewMode::SingleSession => {
                             let has_incomplete = st.snapshot.has_incomplete();
-                            let never_fetched_or_empty = st.snapshot.tasks.is_empty();
-                            has_incomplete || never_fetched_or_empty || dirty
+                            let needs_reconciliation =
+                                st.single_session_loaded && elapsed >= QUIET_POLL_INTERVAL;
+                            has_incomplete
+                                || !st.single_session_loaded
+                                || needs_reconciliation
+                                || dirty
                         }
                     };
                     if !do_fetch {
@@ -544,12 +571,14 @@ impl TaskBoardObserver {
                             let (mut st, _) = lock_state(&inner, "multi_fetch_failed");
                             st.fetch_in_flight = false;
                             st.last_fetch = Instant::now();
+                            st.consecutive_failures = st.consecutive_failures.saturating_add(1);
                             return;
                         }
                     };
                     let (mut st, _) = lock_state(&inner, "multi_fetch_complete");
                     st.fetch_in_flight = false;
                     st.last_fetch = Instant::now();
+                    st.consecutive_failures = 0;
                     // Bail if the user toggled back to single mode
                     // while our query was in flight.
                     if st.view_mode != ViewMode::AllSessions {
@@ -577,6 +606,7 @@ impl TaskBoardObserver {
                             let (mut st, _) = lock_state(&inner, "fetch_failed");
                             st.fetch_in_flight = false;
                             st.last_fetch = Instant::now();
+                            st.consecutive_failures = st.consecutive_failures.saturating_add(1);
                             return;
                         }
                     };
@@ -588,6 +618,8 @@ impl TaskBoardObserver {
                     if st.session_id != sid {
                         return;
                     }
+                    st.single_session_loaded = true;
+                    st.consecutive_failures = 0;
                     if !same_board(&tasks, &st.snapshot.tasks) {
                         // Diff BEFORE replacing the snapshot — events
                         // carry id+title from the pair (prev, new)
@@ -687,6 +719,14 @@ impl TaskBoardObserver {
             }
         }
     }
+}
+
+fn failure_backoff(consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return Duration::ZERO;
+    }
+    let multiplier = 1_u32 << consecutive_failures.saturating_sub(1).min(4);
+    (POLL_INTERVAL * multiplier).min(MAX_FAILURE_BACKOFF)
 }
 
 /// Cheap equality check for Tier 1 boards (dozens of rows): compare
@@ -908,6 +948,84 @@ mod tests {
             "failed refresh must preserve the last known task board instead of rendering empty"
         );
         assert_eq!(snapshot.tasks[0].title, "visible work");
+    }
+
+    #[tokio::test]
+    async fn successful_empty_board_uses_quiet_reconciliation_cadence() {
+        struct CountingEmptyStore {
+            loads: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl TaskStore for CountingEmptyStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                self.loads.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(Vec::new())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let store = Arc::new(CountingEmptyStore {
+            loads: AtomicUsize::new(0),
+        });
+        let obs = TaskBoardObserver::new(store.clone() as Arc<dyn TaskStore>, "sess-empty");
+        wait_until(
+            || store.loads.load(AtomicOrdering::SeqCst) == 1,
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+
+        {
+            let mut st = obs.inner.state.lock_recover();
+            assert!(st.single_session_loaded);
+            st.last_fetch = Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or_else(Instant::now);
+        }
+        obs.inner.dirty.store(false, Ordering::Relaxed);
+        obs.maybe_refresh();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            store.loads.load(AtomicOrdering::SeqCst),
+            1,
+            "a confirmed empty board must not poll on the active-work cadence"
+        );
+
+        {
+            let mut st = obs.inner.state.lock_recover();
+            st.last_fetch = Instant::now()
+                .checked_sub(QUIET_POLL_INTERVAL + Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+        }
+        obs.maybe_refresh();
+        wait_until(|| store.loads.load(AtomicOrdering::SeqCst) == 2, 200, || {}).await;
+        assert_eq!(store.loads.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[test]
+    fn store_failure_backoff_is_bounded_and_monotonic() {
+        assert_eq!(failure_backoff(0), Duration::ZERO);
+        assert_eq!(failure_backoff(1), Duration::from_secs(5));
+        assert_eq!(failure_backoff(2), Duration::from_secs(10));
+        assert_eq!(failure_backoff(4), Duration::from_secs(40));
+        assert_eq!(failure_backoff(5), MAX_FAILURE_BACKOFF);
+        assert_eq!(failure_backoff(u32::MAX), MAX_FAILURE_BACKOFF);
     }
 
     /// REGRESSION: completed tasks used to linger on the board until

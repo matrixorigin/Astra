@@ -790,7 +790,7 @@ mod tests {
             tx,
             ApprovalMetadata::default().with_mcp_capability(meta.clone()),
         );
-        let entries_dbg = format!("{:?}", &q.entries);
+        let entries_dbg = format!("{:?}", q.entries);
         assert!(entries_dbg.contains("mcp_capability_known: Some(true)"));
     }
 

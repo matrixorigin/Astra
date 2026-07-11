@@ -118,7 +118,7 @@ pub(crate) fn task_record_outcome(task: &TaskRecord) -> Option<TaskOutcome> {
     if let Some(error_kind) = task_record_error_kind(task) {
         return Some(match error_kind {
             "partial" => TaskOutcome::Partial,
-            "force_stop" => TaskOutcome::Cancelled,
+            "cancelled" => TaskOutcome::Cancelled,
             _ => TaskOutcome::Failed,
         });
     }
@@ -178,7 +178,7 @@ pub(crate) fn task_list_item_outcome(task: &TaskListItem) -> Option<TaskOutcome>
     if let Some(error_kind) = task_list_item_error_kind(task) {
         return Some(match error_kind {
             "partial" => TaskOutcome::Partial,
-            "force_stop" => TaskOutcome::Cancelled,
+            "cancelled" => TaskOutcome::Cancelled,
             _ => TaskOutcome::Failed,
         });
     }

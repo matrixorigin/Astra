@@ -1017,8 +1017,8 @@ fn show_correction_timeline(session_id: &str) {
                     .join(", ")
             })
             .unwrap_or_default();
-        let force_stop = meta
-            .and_then(|m| m.get("force_stop"))
+        let advisory_threshold_reached = meta
+            .and_then(|m| m.get("advisory_threshold_reached"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let avoid_reason = meta
@@ -1038,8 +1038,8 @@ fn show_correction_timeline(session_id: &str) {
         } else {
             format!(", avoid: [{}]", avoid_tools)
         };
-        let stop_str = if force_stop {
-            format!(" {}", "⛔ FORCE STOP".red())
+        let stop_str = if advisory_threshold_reached {
+            format!(" {}", "strong advisory".yellow())
         } else {
             String::new()
         };

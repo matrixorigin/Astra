@@ -15,7 +15,7 @@ pub(crate) fn analyze_chat_turn_learning(
     result: &StreamResult,
 ) -> TurnLearningSnapshot {
     use astra_runtime::pipeline::evaluation::{
-        TurnEvaluationTelemetry, apply_final_answer_relevance, current_evaluation_thresholds,
+        TurnEvaluationTelemetry, current_evaluation_thresholds,
         evaluate_tool_call_records_with_thresholds_and_telemetry,
     };
     use astra_turn_core::routing_engine::RoutingEngine;
@@ -53,7 +53,7 @@ pub(crate) fn analyze_chat_turn_learning(
         );
     }
 
-    let mut eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
+    let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
         &latest_user_input,
         recent_tools,
         &result.tool_call_records,
@@ -68,8 +68,6 @@ pub(crate) fn analyze_chat_turn_learning(
             max_round_prompt_tokens,
         },
     );
-    apply_final_answer_relevance(&mut eval, &latest_user_input, &result.full_text);
-
     TurnLearningSnapshot { routing, eval }
 }
 
@@ -225,37 +223,6 @@ mod tests {
                 delta_tokens: 11_553,
             }
         )));
-    }
-
-    #[test]
-    fn analyze_chat_turn_learning_applies_final_answer_relevance() {
-        let mut result =
-            crate::tests::stub_stream_result("148 files changed, +9498 / -2335 lines, 11 commits.");
-        result.tools_used = vec!["git".into()];
-        result.tool_calls_count = 1;
-        result.tool_call_records = vec![session_journal::ToolCallRecord {
-            name: "git".into(),
-            ok: true,
-            ms: 12,
-            output_bytes: Some(240),
-            result_preview: Some("diff".into()),
-            ..Default::default()
-        }];
-
-        let learning = analyze_chat_turn_learning("相关的测试够硬核吗？", 3, &[], &result);
-
-        assert!(!learning.eval.success);
-        assert!(learning.eval.signals.iter().any(|signal| matches!(
-            signal,
-            astra_runtime::pipeline::evaluation::EvalSignal::FinalAnswerOffTarget { .. }
-        )));
-        assert!(
-            !learning.eval.signals.iter().any(|signal| matches!(
-                signal,
-                astra_runtime::pipeline::evaluation::EvalSignal::AllToolsHealthy
-            )),
-            "tool health must not mask an off-target answer"
-        );
     }
 
     #[test]

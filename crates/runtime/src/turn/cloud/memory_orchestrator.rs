@@ -5,15 +5,13 @@
 //! lifecycle (pre-warm context, persist episodes, trigger reflection,
 //! nudge attention on topic shifts).
 //!
-//! Production hot paths still use the lower-level `memory_prefetch` and
-//! `astra_tools::memoria::MemoriaClient` helpers directly where crate
-//! boundaries require it (CLI/tool execution cannot depend on runtime).
-//! Keep this orchestrator as a facade over those canonical helpers, not
-//! as a second source of state or policy.
+//! Production hot paths and the LLM-facing gateway share
+//! [`astra_memoria::memoria_runtime_state`]. Keep this orchestrator as a
+//! facade over that canonical state, not as a second source of state or policy.
 //!
 //! Design:
-//! - **Stateless at construction**; all state is held either on the
-//!   underlying [`MemoriaClient`] (focus store) or passed per-call.
+//! - **Stateless at construction**; all ephemeral state is session-keyed in
+//!   [`astra_memoria::MemoriaRuntimeState`].
 //! - **Best-effort**: every method returns a result but failures at the
 //!   orchestrator level log and degrade, never panic or abort the turn.
 //! - **No LLM calls**: orchestration is deterministic. Summarisation
@@ -40,7 +38,9 @@
 
 use std::sync::Arc;
 
-use super::memoria_compact::{MemoriaClient, MemoriaMemory};
+use super::memoria_compact::{MemoriaMemory, MemoriaPort};
+#[cfg(test)]
+use astra_memoria::MAX_RECALL_LEDGER_PER_SESSION;
 
 /// Bundle returned on session start — memories the orchestrator pulled
 /// to warm up context. Callers decide how to surface them (system
@@ -173,58 +173,23 @@ impl RecallObservedOutcome {
     }
 }
 
-/// One entry in the recall ledger — remembers which memory_ids
-/// were surfaced to the LLM at a given turn so a later tool-outcome
-/// observation can route feedback back to them.
-#[derive(Debug, Clone)]
-struct RecallLedgerEntry {
-    memory_ids: Vec<String>,
-    turn: u32,
-    at: std::time::Instant,
-}
-
-/// Soft cap on recall-ledger depth per session. When an LLM probes
-/// repeatedly without outcomes closing the loop we discard the oldest
-/// entry so the ledger doesn't grow unbounded. Tuned conservatively —
-/// a typical turn produces at most 1–2 recalls, so 16 entries covers
-/// ~10+ turns of accumulation.
-const MAX_RECALL_LEDGER_PER_SESSION: usize = 16;
-
 /// The orchestrator itself. Cheap to construct — just an Arc'd trait
-/// object — so callers instantiate one per session without worrying
-/// about shared state. The recall-ledger is the one piece of interior
-/// state: it remembers which memory_ids the last recall surfaced so
-/// downstream tool outcomes can be routed back as feedback.
+/// object — so callers instantiate one per session without duplicating
+/// attention, surfaced-memory, or recall-attribution state.
 pub struct MemoryOrchestrator {
-    client: Arc<dyn MemoriaClient>,
+    client: Arc<dyn MemoriaPort>,
     /// Top-k used on session-start prefetch queries.
     prefetch_top_k: usize,
     /// Maximum episodes surfaced on session start.
     max_episodes: usize,
-    /// Per-session FIFO queue of recalls awaiting outcome attribution.
-    /// A single turn can legitimately fire multiple recalls (the LLM
-    /// may probe for different topics before acting); each sits in the
-    /// queue until [`observe_recall_outcome`] consumes it. Bounded
-    /// softly by [`MAX_RECALL_LEDGER_PER_SESSION`] — when the cap is
-    /// reached the oldest entry is dropped so we don't leak memory on
-    /// sessions whose LLMs never let us close the loop.
-    recall_ledger: std::sync::RwLock<
-        std::collections::HashMap<String, std::collections::VecDeque<RecallLedgerEntry>>,
-    >,
-    // NOTE: "already surfaced" dedup lives in a single canonical store
-    // in astra-tools (`MemoriaClient::{record_seen, seen_snapshot,
-    // reset_seen}`) because the tool-side `decorate_recall_response`
-    // also needs it. The orchestrator is a thin facade — no parallel
-    // state here.
 }
 
 impl MemoryOrchestrator {
-    pub fn new(client: Arc<dyn MemoriaClient>) -> Self {
+    pub fn new(client: Arc<dyn MemoriaPort>) -> Self {
         Self {
             client,
             prefetch_top_k: 5,
             max_episodes: 3,
-            recall_ledger: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -232,11 +197,11 @@ impl MemoryOrchestrator {
     /// session so future recalls can filter them out. Callers invoke
     /// this after injecting a memory block into the prompt.
     ///
-    /// Delegates to the canonical `astra-tools` store so both the
+    /// Delegates to the canonical Memoria runtime state so both the
     /// bridge's session-start injection and the tool-side
     /// `memory(action=recall)` post-processor see the same dedup set.
     pub fn mark_surfaced(&self, session_id: &str, memory_ids: &[String]) {
-        astra_tools::memoria::MemoriaClient::record_seen(
+        astra_memoria::memoria_runtime_state().record_seen(
             session_id,
             memory_ids.iter().filter(|id| !id.is_empty()).cloned(),
         );
@@ -250,7 +215,7 @@ impl MemoryOrchestrator {
         session_id: &str,
         memories: Vec<MemoriaMemory>,
     ) -> Vec<MemoriaMemory> {
-        let seen = astra_tools::memoria::MemoriaClient::seen_snapshot(session_id);
+        let seen = astra_memoria::memoria_runtime_state().seen_snapshot(session_id);
         if seen.is_empty() {
             return memories;
         }
@@ -264,7 +229,7 @@ impl MemoryOrchestrator {
     /// session-end cleanup so long-lived orchestrator processes don't
     /// keep per-session state indefinitely.
     pub fn reset_session_surface(&self, session_id: &str) {
-        astra_tools::memoria::MemoriaClient::reset_seen(session_id);
+        astra_memoria::memoria_runtime_state().reset_seen(session_id);
     }
 
     pub fn with_prefetch_top_k(mut self, top_k: usize) -> Self {
@@ -471,7 +436,7 @@ impl MemoryOrchestrator {
 
     /// Per-turn recall. Session-scoped if `strict_session=true`, else
     /// unscoped (prefer-mode default). Active focus hints are applied
-    /// at the transport layer (see `HttpMemoriaClient::retrieve_ext`).
+    /// at the transport layer (see `HttpMemoriaPort::retrieve_ext`).
     ///
     /// After fetching, filters the result against the canonical
     /// "already surfaced" store so a memory shown by session-start
@@ -535,26 +500,20 @@ impl MemoryOrchestrator {
     /// [`observe_recall_outcome`] drains the queue oldest-first so the
     /// same memory_id is scored at most once per recall.
     ///
-    /// Multiple recalls in the same turn are each retained — the prior
-    /// "latest only" policy lost attribution when the LLM probed twice
-    /// before acting. When the per-session queue exceeds
-    /// [`MAX_RECALL_LEDGER_PER_SESSION`] the oldest entry is dropped.
+    /// Multiple recalls in the same turn are each retained in the canonical,
+    /// bounded session ledger.
     pub fn record_recall(&self, session_id: &str, turn: u32, memories: &[MemoriaMemory]) {
         if session_id.is_empty() || memories.is_empty() {
             return;
         }
-        let entry = RecallLedgerEntry {
-            memory_ids: memories.iter().map(|m| m.memory_id.clone()).collect(),
+        astra_memoria::memoria_runtime_state().record_recall(
+            session_id,
             turn,
-            at: std::time::Instant::now(),
-        };
-        if let Ok(mut g) = self.recall_ledger.write() {
-            let q = g.entry(session_id.to_string()).or_default();
-            if q.len() >= MAX_RECALL_LEDGER_PER_SESSION {
-                q.pop_front();
-            }
-            q.push_back(entry);
-        }
+            memories
+                .iter()
+                .map(|memory| memory.memory_id.clone())
+                .collect(),
+        );
     }
 
     /// Observe the outcome of a downstream action that followed recalls
@@ -572,20 +531,7 @@ impl MemoryOrchestrator {
         outcome: RecallObservedOutcome,
         max_age: Option<std::time::Duration>,
     ) -> Vec<Result<(), String>> {
-        let entries: Vec<RecallLedgerEntry> = {
-            let Ok(mut g) = self.recall_ledger.write() else {
-                return Vec::new();
-            };
-            let Some(q) = g.remove(session_id) else {
-                return Vec::new();
-            };
-            q.into_iter()
-                .filter(|e| match max_age {
-                    Some(max) => e.at.elapsed() <= max,
-                    None => true,
-                })
-                .collect()
-        };
+        let entries = astra_memoria::memoria_runtime_state().drain_recalls(session_id, max_age);
         let signal = outcome.signal();
         let mut results = Vec::new();
         for entry in entries {
@@ -600,21 +546,14 @@ impl MemoryOrchestrator {
     /// Returns true iff there is an unconsumed recall ledger entry
     /// for this session (for introspection / tests).
     pub fn has_pending_recall(&self, session_id: &str) -> bool {
-        self.recall_ledger
-            .read()
-            .ok()
-            .is_some_and(|g| g.get(session_id).is_some_and(|q| !q.is_empty()))
+        astra_memoria::memoria_runtime_state().pending_recall_count(session_id) > 0
     }
 
     /// Count of unconsumed recall ledger entries for this session.
     /// Exposed so tests can assert FIFO depth without reaching into
     /// private fields.
     pub fn pending_recall_count(&self, session_id: &str) -> usize {
-        self.recall_ledger
-            .read()
-            .ok()
-            .and_then(|g| g.get(session_id).map(|q| q.len()))
-            .unwrap_or(0)
+        astra_memoria::memoria_runtime_state().pending_recall_count(session_id)
     }
 
     /// Given a rolling window of recent user messages (oldest first),
@@ -837,7 +776,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl MemoriaClient for FeedbackCapturingClient {
+    impl MemoriaPort for FeedbackCapturingClient {
         async fn retrieve_ext(
             &self,
             _q: &str,

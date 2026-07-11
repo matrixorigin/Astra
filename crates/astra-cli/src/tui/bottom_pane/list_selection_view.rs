@@ -137,14 +137,14 @@ impl BottomPaneView for ListSelectionView {
                     Span::styled("  ", sel_style),
                     Span::styled(marker, sel_style),
                     Span::styled(num, sel_style),
-                    Span::styled(format!("{}{}", &item.name, current_tag), sel_style),
+                    Span::styled(format!("{}{}", item.name, current_tag), sel_style),
                 ]
             } else {
                 vec![
                     Span::raw("  "),
                     Span::raw(marker),
                     Span::raw(num),
-                    Span::raw(format!("{}{}", &item.name, current_tag)),
+                    Span::raw(format!("{}{}", item.name, current_tag)),
                 ]
             };
 

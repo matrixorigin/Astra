@@ -22,7 +22,8 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-check
-          save-cache: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          save-cache: ${{ github.event_name == 'push' }}
+          install-nextest: false
       - name: Run clippy
         run: make lint
       - name: Check formatting

@@ -448,6 +448,17 @@ impl ToolExecutionService {
                 exit_semantics: None,
             };
         }
+        // A selected offer is the authoritative, precomputed provider binding
+        // from prompt-surface assembly. Dynamic providers such as
+        // request-scoped MCP are not reconstructible from the builtin registry
+        // and an empty schema slice here. Re-check administrator disable and
+        // provider allowlists above, but do not replace the selected offer with
+        // a synthetic NoProvider denial.
+        if transport_request.selected_offer.is_none()
+            && let Some(reason) = admission_denied_unavailable_reason(&admission)
+        {
+            return capability_denied_result(&transport_request, &binding, reason);
+        }
 
         match route {
             ToolExecutionRouteKind::ServerLocal | ToolExecutionRouteKind::ServerControlPlane => {
@@ -657,6 +668,38 @@ fn disallowed_offer_id_for_request(
         .then(|| (offer.offer_id.clone(), offer.provider_id.clone()))
 }
 
+fn admission_denied_unavailable_reason(
+    admission: &super::tool_admission::ToolAdmissionDecision,
+) -> Option<astra_runtime_env::ToolUnavailableReason> {
+    if admission.visible {
+        return None;
+    }
+    let reason = admission.hidden_reason?;
+    Some(match reason {
+        ToolHiddenReason::UnknownTool => astra_runtime_env::ToolUnavailableReason::UnknownTool,
+        ToolHiddenReason::RuntimeSurfaceDenied => {
+            astra_runtime_env::ToolUnavailableReason::RuntimeCapabilityMissing(
+                "runtime_surface_denied".to_string(),
+            )
+        }
+        ToolHiddenReason::SchemaConflict
+        | ToolHiddenReason::DisabledOffer
+        | ToolHiddenReason::ProviderToolNotAllowed => {
+            astra_runtime_env::ToolUnavailableReason::PolicyDenied(format!(
+                "tool admission denied: {reason:?}"
+            ))
+        }
+        ToolHiddenReason::NoProvider
+        | ToolHiddenReason::ProviderUnavailable
+        | ToolHiddenReason::ProviderRouteMismatch
+        | ToolHiddenReason::UnsupportedRoute => {
+            astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(format!(
+                "tool admission denied: {reason:?}"
+            ))
+        }
+    })
+}
+
 fn validate_tool_offer_id(offer_id: &str) -> Result<(), String> {
     if astra_runtime_env::is_valid_tool_offer_id(offer_id) {
         Ok(())
@@ -793,5 +836,53 @@ mod tests {
                 HashSet::from(["web.fetch".to_string()]),
             )]))
             .build();
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct RecordingLocalTransport {
+        called: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ServerLocalToolTransport for RecordingLocalTransport {
+        async fn execute_server_local_tool(
+            &self,
+            _request: &ToolExecutionRequest,
+            _cancel_token: Option<&CancellationToken>,
+        ) -> astra_tools::ToolResult {
+            self.called.store(true, Ordering::Release);
+            astra_tools::ToolResult::text("executed".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_does_not_bypass_admission_when_runtime_provider_is_not_safe() {
+        let service = ToolExecutionService::new_for_test();
+        let transport = RecordingLocalTransport {
+            called: AtomicBool::new(false),
+        };
+        let mut runtime = astra_runtime_env::RuntimeBinding::host_process("runtime-no-isolation");
+        runtime.isolation_backend = astra_runtime_env::RuntimeIsolationBackend::None;
+        let request = ToolExecutionRequest {
+            user_id: "user-1".to_string(),
+            run_id: "run-1".to_string(),
+            turn_chain_id: "run-1".to_string(),
+            session_id: "session-1".to_string(),
+            tool_call_id: "tool-1".to_string(),
+            tool_name: "read_file".to_string(),
+            args: serde_json::json!({"path":"/workspace/file.txt"}),
+            workspace: WorkspaceBinding::server_sandbox("/workspace"),
+            workspace_record: None,
+            executor: ExecutorBinding::server_local(),
+            runtime: Some(runtime),
+            selected_offer: None,
+            policy: Default::default(),
+        };
+
+        let result = service.execute(request, &transport).await;
+
+        assert!(result.is_error);
+        assert!(!transport.called.load(Ordering::Acquire));
     }
 }

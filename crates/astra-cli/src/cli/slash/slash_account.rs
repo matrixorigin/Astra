@@ -7,7 +7,7 @@ use crate::cli::cli_config::cli_utils::{
 use crate::cli::session::session_runtime::{current_access_token, ensure_state_default_model};
 use crate::cli::session::session_state::SessionState;
 use crate::post_auth_cloud_resync;
-use crate::{cli_dim, cli_err, cli_ok, cli_section};
+use crate::{cli_dim, cli_err, cli_ok, cli_section, cli_warn};
 
 async fn refresh_auth_runtime(
     api: &astra_thin_client::ThinClient,
@@ -49,7 +49,10 @@ pub(crate) async fn handle_account_command(
             match do_register(api, profile, &username, &email, &password).await {
                 Ok(token) => {
                     cli_ok!("Registered and logged in");
-                    post_auth_cloud_resync(profile, state).await;
+                    let sync_report = post_auth_cloud_resync(profile, state).await;
+                    if let Some(notice) = sync_report.user_notice() {
+                        cli_warn!("{}", notice);
+                    }
                     if let Some(model) = ensure_state_default_model(api, &token, state).await {
                         crate::cli::slash::slash_config::set_active_model_for_display(Some(
                             model.clone(),
@@ -68,7 +71,10 @@ pub(crate) async fn handle_account_command(
             match do_login(api, profile, &username, &password).await {
                 Ok(token) => {
                     cli_ok!("Logged in");
-                    post_auth_cloud_resync(profile, state).await;
+                    let sync_report = post_auth_cloud_resync(profile, state).await;
+                    if let Some(notice) = sync_report.user_notice() {
+                        cli_warn!("{}", notice);
+                    }
                     if let Some(model) = ensure_state_default_model(api, &token, state).await {
                         crate::cli::slash::slash_config::set_active_model_for_display(Some(
                             model.clone(),

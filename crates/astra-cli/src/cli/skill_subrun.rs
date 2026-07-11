@@ -17,9 +17,10 @@ use astra_runtime::{
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
     turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, CancellationState, HostTurnResult, SkillState,
-        StopHookState, TurnInteractionMode, TurnInteractionPolicy,
-        interaction_scoped_tool_restrictions, runtime_manifest_for_model,
+        AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState, HostTurnResult,
+        SkillState, StopHookState, TurnInteractionMode, TurnInteractionPolicy,
+        interaction_scoped_tool_restrictions, project_skill_subrun_outcome,
+        runtime_manifest_for_model,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
@@ -160,6 +161,31 @@ pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -
     failure_output
 }
 
+fn attach_runtime_volatile_injections(
+    payload: &mut Value,
+    injections: &[astra_runtime::turn::agentic_loop::host::VolatileInjection],
+) {
+    let Some(value) =
+        astra_runtime::turn::agentic_loop::host::runtime_volatile_injections_edge_profile_value(
+            injections,
+        )
+    else {
+        return;
+    };
+    let Some(edge_profile) = payload
+        .as_object_mut()
+        .and_then(|root| root.get_mut("edge_profile"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    edge_profile.insert(
+        astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+            .to_string(),
+        value,
+    );
+}
+
 #[async_trait]
 impl AgenticLoopHost for SubRunHost {
     async fn execute_turn(
@@ -176,17 +202,10 @@ impl AgenticLoopHost for SubRunHost {
                 }
             }));
 
-        // Session c47c2dca regression fix: drain runtime volatile lane so
-        // stall nudges / circuit-breaker / budget advisories reach the
-        // LLM on subrun paths too. Using `_appended_to` keeps the
-        // outgoing payload protocol-valid (no consecutive role=user
-        // pairs → no Bedrock HTTP 400).
-        let augmented_messages: Option<Vec<serde_json::Value>> =
-            state.take_volatile_pending_appended_to(state.messages.clone());
-        let messages_slice: &[serde_json::Value] = match augmented_messages.as_ref() {
-            Some(vec) => vec.as_slice(),
-            None => state.messages.as_slice(),
-        };
+        // Drain runtime volatile as typed edge metadata. Do not splice it into
+        // messages[]: that loses producer kind, pollutes prompt-facing history,
+        // and makes soft runtime evidence look like user content.
+        let runtime_volatile_injections = state.take_volatile_pending();
 
         let effective_model = state
             .skills
@@ -199,13 +218,12 @@ impl AgenticLoopHost for SubRunHost {
         let interaction_mode = TurnInteractionMode::NonInteractive;
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
-        state
-            .restricted_tools
-            .extend(interaction_scoped_restrictions.iter().cloned());
+        let mut effective_restricted_tools = state.restricted_tools.clone();
+        effective_restricted_tools.extend(interaction_scoped_restrictions);
 
         let runtime_decision_user_intent = state.runtime_decision_user_intent();
         let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
-            messages: messages_slice,
+            messages: state.messages.as_slice(),
             user_intent: Some(runtime_decision_user_intent.as_str()),
             session_id: state.current_session_id.as_deref(),
             agent_id: Some(self.agent_id.as_str()),
@@ -220,6 +238,8 @@ impl AgenticLoopHost for SubRunHost {
             git_branch: None,
             thinking: thinking.clone(),
         });
+
+        attach_runtime_volatile_injections(&mut payload, &runtime_volatile_injections);
 
         if let Some(max_tokens) = self.max_completion_tokens {
             payload["max_tokens"] = json!(max_tokens);
@@ -248,7 +268,7 @@ impl AgenticLoopHost for SubRunHost {
             &mut payload,
             schemas_to_use,
             &self.all_schemas,
-            &mut state.restricted_tools,
+            &effective_restricted_tools,
             &self.executor,
             approximate_context_window_from_effective_input_budget(state.max_turn_input_tokens),
             interaction_mode,
@@ -271,9 +291,6 @@ impl AgenticLoopHost for SubRunHost {
             .map_err(|e| e.to_string())?;
 
         if !resp.status().is_success() {
-            for name in &interaction_scoped_restrictions {
-                state.restricted_tools.remove(name);
-            }
             let status = resp.status();
             let body = resp.text().await.map_err(|e| e.to_string())?;
             return Err(astra_core::ClassifiedError::new(
@@ -323,10 +340,6 @@ impl AgenticLoopHost for SubRunHost {
             self.cancel_token.as_ref().map(|t| t.as_ref()), // propagate parent cancel
         )
         .await;
-        for name in &interaction_scoped_restrictions {
-            state.restricted_tools.remove(name);
-        }
-
         Ok(HostTurnResult {
             accum: turn.core,
             ttft_ms: turn.ttft_ms,
@@ -639,9 +652,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            textless_stop_retries: 0,
             last_finish_reason: None,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
@@ -753,10 +765,16 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };
 
-        if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {
-            let err_str = err.to_string();
-            let failure_output = persist_failed_subrun(&mut state, &err_str);
-            return Err(failure_output);
+        let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        let outcome = project_skill_subrun_outcome(&loop_result, &state);
+        match &loop_result {
+            Ok(AgenticLoopOutcome::Error(error)) => {
+                persist_failed_subrun(&mut state, error);
+            }
+            Err(error) => {
+                persist_failed_subrun(&mut state, &error.to_string());
+            }
+            _ => {}
         }
 
         let turns = (SUBRUN_MAX_TURNS - state.remaining_turns) as u32;
@@ -766,6 +784,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             output: state.final_text,
             tokens_used,
             turns,
+            outcome,
         })
     }
 }
@@ -837,7 +856,7 @@ fn attach_subrun_tool_surface(
     payload: &mut Value,
     mut schemas_to_use: Vec<Value>,
     all_schemas: &[Value],
-    restricted_tools: &mut HashSet<String>,
+    restricted_tools: &HashSet<String>,
     executor: &edge_tools::ToolExecutor,
     context_window_tokens: Option<u32>,
     interaction_mode: TurnInteractionMode,
@@ -913,7 +932,7 @@ fn attach_subrun_tool_surface(
 mod tests {
     use super::{
         CliSkillSubRunExecutor, SUBRUN_MAX_CUMULATIVE_TOKENS, SUBRUN_MAX_TURNS, SubRunHost,
-        attach_subrun_tool_surface, resolve_subrun_schemas,
+        attach_runtime_volatile_injections, attach_subrun_tool_surface, resolve_subrun_schemas,
     };
     use astra_runtime::turn::agentic_loop::host::ASK_USER_TOOL_NAME;
     use astra_runtime::turn::agentic_loop::host::{
@@ -938,6 +957,32 @@ mod tests {
                 "parameters": { "type": "object", "properties": {} }
             }
         })
+    }
+
+    #[test]
+    fn subrun_routes_runtime_feedback_as_typed_edge_metadata() {
+        let mut payload = json!({
+            "messages": [{"role": "user", "content": "continue child task"}],
+            "edge_profile": {}
+        });
+        let injections = vec![astra_runtime::turn::agentic_loop::host::VolatileInjection {
+            kind: astra_runtime::turn::agentic_loop::host::VolatileKind::PolicyAdvisory,
+            payload: json!({"signal": "soft subrun evidence"}),
+            round_index: 2,
+        }];
+
+        attach_runtime_volatile_injections(&mut payload, &injections);
+
+        assert_eq!(
+            payload["messages"],
+            json!([{"role": "user", "content": "continue child task"}])
+        );
+        let lane = &payload["edge_profile"]
+            [astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS];
+        assert_eq!(lane[0]["kind"], "policy_advisory");
+        assert_eq!(lane[0]["delivery_class"], "advisory_evidence");
+        assert_eq!(lane[0]["payload"]["signal"], "soft subrun evidence");
+        assert_eq!(lane[0]["round_index"], 2);
     }
 
     #[test]
@@ -1079,7 +1124,7 @@ mod tests {
 
         let policy = turn_policy_from_payload_edge_tools(&payload, interaction_mode);
         assert_eq!(policy.visible_tool_names, vec!["mo_query".to_string()]);
-        assert_eq!(policy.evidence_tool_names, vec!["mo_query".to_string()]);
+        assert_eq!(policy.observation_tool_names, vec!["mo_query".to_string()]);
         assert!(!policy.allow_ask_user);
     }
 
@@ -1388,38 +1433,5 @@ mod tests {
         let resolved = resolve_subrun_schemas(Some(&ip), always_load_fallback.clone());
         // Behaviour: must return fallback (NOT empty, NOT inherited).
         assert_eq!(resolved, always_load_fallback);
-    }
-
-    // Session c47c2dca regression guard. Same invariant as
-    // `cli_loop_host::tests::execute_turn_drains_volatile_lane_into_outgoing_messages`
-    // but for the skill-subrun path (sub-agents also run the stall
-    // detection machinery and their nudges must reach their LLM too).
-    #[test]
-    fn subrun_execute_turn_drains_volatile_lane() {
-        // Session c47c2dca regression guard. Same shape as
-        // `cli_loop_host::tests::execute_turn_drains_volatile_lane_into_outgoing_messages`
-        // but for skill-subrun. Split the expected method name so this
-        // test's literals don't self-match.
-        let source = include_str!("skill_subrun.rs");
-        // Look for the protocol-safe call syntax (`.method(`) assembled
-        // via concat! so this test literal can't self-match. Do not
-        // quote the call form verbatim anywhere in this test body.
-        let safe_call = concat!(".take_volatile_pending", "_appended_to(");
-        assert!(
-            source.contains(safe_call),
-            "skill_subrun::execute_turn must invoke the protocol-safe \
-             drain method so runtime nudges reach the subrun LLM \
-             (session c47c2dca regression + consecutive-user guard)."
-        );
-        assert!(
-            source.contains("augmented.push(msg)"),
-            "skill_subrun::execute_turn must append the drained volatile \
-             msg to a local clone of state.messages"
-        );
-        assert!(
-            source.contains("messages_slice"),
-            "skill_subrun::execute_turn must pass an augmented messages_slice \
-             to chat_turn_base_payload, not raw &state.messages"
-        );
     }
 }

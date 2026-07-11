@@ -146,6 +146,7 @@ dependencies = [
  "astra-sandbox",
  "astra-services",
  "astra-skills",
+ "astra-sync-protocol",
  "astra-text-utils",
  "astra-thin-client",
  "astra-tools",
@@ -330,6 +331,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-memoria"
+version = "0.1.0"
+dependencies = [
+ "astra-turn-types",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "astra-messaging"
 version = "0.1.0"
 dependencies = [
@@ -407,6 +419,7 @@ dependencies = [
  "astra-harness",
  "astra-logging",
  "astra-mcp",
+ "astra-memoria",
  "astra-messaging",
  "astra-pipeline",
  "astra-plan",
@@ -416,6 +429,7 @@ dependencies = [
  "astra-server-types",
  "astra-services",
  "astra-skills",
+ "astra-sync-protocol",
  "astra-text-utils",
  "astra-thin-client",
  "astra-tools",
@@ -580,6 +594,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "astra-sync-protocol"
+version = "0.1.0"
+dependencies = [
+ "astra-core",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "astra-test-harness"
 version = "0.1.0"
 dependencies = [
@@ -616,7 +641,9 @@ dependencies = [
 name = "astra-thin-client"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
  "astra-runtime-env",
+ "astra-sync-protocol",
  "async-stream",
  "futures-util",
  "hex",
@@ -635,6 +662,7 @@ name = "astra-tools"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-memoria",
  "astra-prompts",
  "astra-sandbox",
  "astra-services",

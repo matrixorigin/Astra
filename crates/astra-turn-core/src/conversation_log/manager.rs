@@ -966,6 +966,19 @@ mod tests {
                 .iter()
                 .any(|msg| msg.get("tool_calls").is_some())
         );
+
+        let prompt_messages =
+            crate::prompt_facing::sanitize_prompt_facing_messages(mat.messages.clone());
+        assert_eq!(
+            prompt_messages,
+            vec![
+                user_msg("review changes"),
+                assistant_msg("reviewed"),
+                user_msg("next step"),
+                assistant_msg("next done"),
+            ],
+            "prompt projection must derive clean user/assistant history from canonical CSL"
+        );
     }
 
     #[tokio::test]

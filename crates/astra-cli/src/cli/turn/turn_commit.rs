@@ -203,7 +203,7 @@ fn extend_runtime_sidecar_events(
             &verdict.injections,
             &verdict.avoid_tools,
             &verdict.health_avoidance_tools,
-            verdict.force_stop,
+            verdict.advisory_threshold_reached,
             verdict.nudge_count,
             verdict.total_errors,
             verdict.total_timeouts,
@@ -303,7 +303,7 @@ fn build_primary_turn_event(
     let tool_ms: u64 = result
         .tool_call_records
         .iter()
-        .filter(|record| !record.is_synthetic_placeholder())
+        .filter(|record| record.was_executed())
         .map(|record| record.ms)
         .sum();
     turn_event.total_tool_ms = Some(tool_ms);

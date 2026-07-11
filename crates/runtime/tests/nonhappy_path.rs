@@ -102,21 +102,24 @@ mod turn_guard_integration {
         json!({"function": {"name": name, "arguments": args}})
     }
 
-    /// Proves: drift escalation triggers force-stop when nudge count >= 3
+    /// Proves: repeated drift raises advisory evidence strength.
     #[test]
-    fn drift_escalation_force_stops_after_three_nudges() {
+    fn drift_escalation_reaches_strong_advisory_after_three_observations() {
         let mut guard = TurnGuard::new();
         guard.drift_nudge_count = 3;
 
         let verdict = guard.evaluate();
         assert_eq!(verdict.severity, VerdictSeverity::Critical);
-        assert!(verdict.force_stop, "drift count >= 3 must force-stop");
+        assert!(
+            verdict.advisory_threshold_reached,
+            "drift count >= 3 must reach the strong-advisory threshold"
+        );
         assert!(
             verdict
                 .injections
                 .iter()
-                .any(|m| m.contains("CRITICAL") && m.contains("drift")),
-            "must inject drift critical message"
+                .any(|m| m.contains("intent drift") && m.contains("Recommendation")),
+            "must provide drift evidence and a recommendation"
         );
     }
 
@@ -127,13 +130,16 @@ mod turn_guard_integration {
         guard.drift_nudge_count = 2;
 
         let verdict = guard.evaluate();
-        assert!(!verdict.force_stop, "drift count < 3 must not force-stop");
+        assert!(
+            !verdict.advisory_threshold_reached,
+            "drift count < 3 must stay below the strong-advisory threshold"
+        );
         assert!(
             !verdict
                 .injections
                 .iter()
-                .any(|m| m.contains("CRITICAL") && m.contains("drift")),
-            "must not inject drift critical message"
+                .any(|m| m.contains("intent drift") && m.contains("Recommendation")),
+            "must not inject strong drift evidence below the threshold"
         );
     }
 
@@ -157,7 +163,7 @@ mod turn_guard_integration {
         assert_eq!(verdict.severity, VerdictSeverity::Healthy);
         assert!(verdict.injections.is_empty());
         assert!(verdict.avoid_tools.is_empty());
-        assert!(!verdict.force_stop);
+        assert!(!verdict.advisory_threshold_reached);
     }
 
     /// Proves: stall + tool health compose correctly
@@ -726,10 +732,10 @@ mod error_recovery_integration {
 // validating the contract between the production loop and TurnGuard.
 //
 // Flow per turn: record_tool_calls → record_tool_result (per tool) →
-//   result_feedback (per tool) → evaluate → apply verdict
+//   result_feedback (per tool) → evaluate → observe verdict
 //
 // Each test sets up multi-turn scenarios and asserts not just the verdict,
-// but the SIDE EFFECTS that chat_stream applies (restricted_tools, budget, messages).
+// and confirms behavioral evidence does not mutate hard restrictions or budget.
 
 mod chat_stream_turnguard_e2e {
     use astra_runtime::pipeline::persistence::ToolHealthEntry;
@@ -743,31 +749,27 @@ mod chat_stream_turnguard_e2e {
         json!({"function": {"name": name, "arguments": args}})
     }
 
-    /// Simulates verdict-side budget/event handling from chat_stream.rs.
-    /// Advisory avoid_tools are not hard schema restrictions.
-    fn apply_verdict(
+    /// Observe verdict telemetry while preserving hard runtime state.
+    fn observe_verdict(
         verdict: &TurnVerdict,
         remaining: usize,
         restricted: &mut HashSet<String>,
     ) -> (usize, Vec<(String, u32)>, bool) {
-        let mut remaining_turns = remaining;
         let mut stall_events = Vec::new();
 
         let _ = restricted;
 
         match verdict.severity {
             VerdictSeverity::Critical => {
-                remaining_turns = remaining_turns.saturating_sub(5);
                 stall_events.push(("critical_escalation".to_string(), 0u32));
             }
             VerdictSeverity::Warning => {
-                remaining_turns = remaining_turns.saturating_sub(2);
                 stall_events.push(("warning".to_string(), 0u32));
             }
             _ => {}
         }
 
-        (remaining_turns, stall_events, verdict.force_stop)
+        (remaining, stall_events, verdict.advisory_threshold_reached)
     }
 
     // ── Happy path scenarios ──
@@ -784,7 +786,7 @@ mod chat_stream_turnguard_e2e {
         let q = guard.record_tool_result("git", r#"[{"sha":"abc","msg":"fix"}]"#);
         assert_eq!(q, ResultQuality::Success);
         let v = guard.evaluate();
-        let (remaining, events, stop) = apply_verdict(&v, max_turns, &mut restricted);
+        let (remaining, events, stop) = observe_verdict(&v, max_turns, &mut restricted);
         assert_eq!(remaining, max_turns);
         assert!(events.is_empty());
         assert!(!stop);
@@ -819,8 +821,8 @@ mod chat_stream_turnguard_e2e {
 
     // ── Stall scenarios ──
 
-    /// Exact same tool call 2 turns in a row → stall detected, nudge injected,
-    /// budget penalty applied. Avoid_tools populated only if tool count >= 3.
+    /// Exact same tool call repeatedly → stall evidence emitted without
+    /// consuming the explicit turn budget. AvoidTools remains advisory.
     #[test]
     fn identical_tool_call_stall_full_flow() {
         let mut guard = TurnGuard::new();
@@ -847,9 +849,11 @@ mod chat_stream_turnguard_e2e {
             "should contain structured reflection"
         );
 
-        // Apply verdict like chat_stream does
-        let (remaining, events, _) = apply_verdict(&v2, 25, &mut restricted);
-        assert_eq!(remaining, 23, "Warning costs 2 turns");
+        let (remaining, events, _) = observe_verdict(&v2, 25, &mut restricted);
+        assert_eq!(
+            remaining, 25,
+            "behavior advisories must not consume turn budget"
+        );
         assert!(!events.is_empty());
 
         // Third identical call pushes count to 3 → tool gets added to avoid list
@@ -992,7 +996,7 @@ mod chat_stream_turnguard_e2e {
         );
 
         // Apply verdict
-        apply_verdict(&v, 25, &mut restricted);
+        observe_verdict(&v, 25, &mut restricted);
         assert!(
             !restricted.contains("rollback_database_snapshots"),
             "health avoidance must not become a hard schema restriction"
@@ -1014,7 +1018,7 @@ mod chat_stream_turnguard_e2e {
             "distinct cached signatures should not avoid the whole tool"
         );
 
-        apply_verdict(&v, 25, &mut restricted);
+        observe_verdict(&v, 25, &mut restricted);
         assert!(
             !restricted.contains("read_file"),
             "distinct cached signatures should not land in restricted_tools"
@@ -1041,7 +1045,7 @@ mod chat_stream_turnguard_e2e {
             "cache guidance should not hide read-only observation tools"
         );
 
-        apply_verdict(&v, 25, &mut restricted);
+        observe_verdict(&v, 25, &mut restricted);
         assert!(
             !restricted.contains("read_file"),
             "repeated identical cached signature must not land in restricted_tools"
@@ -1139,12 +1143,12 @@ mod chat_stream_turnguard_e2e {
         assert!(!guard.health.is_avoidance_advised("c")); // empty → no health avoidance
     }
 
-    // ── Escalation + force stop ──
+    // ── Escalation evidence strength ──
 
-    /// Full escalation path: normal → warning → critical → force_stop.
+    /// Full escalation path: normal → warning → critical → advisory_threshold_reached.
     /// Now Critical requires nudges + errors (pure nudges stay at Warning).
     #[test]
-    fn escalation_path_to_force_stop() {
+    fn escalation_path_to_advisory_threshold_reached() {
         let mut guard = TurnGuard::new();
         let mut restricted = HashSet::new();
         let mut budget = 25usize;
@@ -1156,15 +1160,15 @@ mod chat_stream_turnguard_e2e {
         guard.record_tool_calls(std::slice::from_ref(&call));
         let v = guard.evaluate();
         assert_eq!(guard.nudge_count, 1);
-        let (b, _, _) = apply_verdict(&v, budget, &mut restricted);
+        let (b, _, _) = observe_verdict(&v, budget, &mut restricted);
         budget = b;
-        assert!(budget < 25, "warning should reduce budget");
+        assert_eq!(budget, 25, "warning evidence must preserve explicit budget");
 
         // Phase 2: more stalls to accumulate nudges
         for _ in 0..3 {
             guard.record_tool_calls(std::slice::from_ref(&call));
             let v = guard.evaluate();
-            let (b, _, _) = apply_verdict(&v, budget, &mut restricted);
+            let (b, _, _) = observe_verdict(&v, budget, &mut restricted);
             budget = b;
         }
         assert!(guard.nudge_count >= 3);
@@ -1172,29 +1176,32 @@ mod chat_stream_turnguard_e2e {
         // Phase 3: pure nudges → only Warning (not Critical without errors)
         let v = guard.evaluate();
         assert!(
-            !v.force_stop,
-            "pure nudges without errors must NOT force_stop"
+            !v.advisory_threshold_reached,
+            "pure nudges without errors must remain below the strong-advisory threshold"
         );
 
-        // Phase 4: add tool errors to couple with nudges → first Critical → restricted
+        // Phase 4: add tool errors to couple with nudges → first Critical evidence
         guard.record_tool_result("bash", "error: no such file");
         guard.record_tool_result("bash", "error: not found");
         guard.record_tool_result("bash", "Error: unexpected failure");
         let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Critical);
         assert!(
-            !v.force_stop,
-            "first Critical → restricted, not force_stop (progressive degradation)"
+            !v.advisory_threshold_reached,
+            "first Critical remains below the strong-advisory threshold"
         );
 
-        // Phase 5: second consecutive Critical → force_stop
+        // Phase 5: second consecutive Critical → stronger advisory evidence
         let v2 = guard.evaluate();
-        assert!(v2.force_stop, "second consecutive Critical → force_stop");
+        assert!(
+            v2.advisory_threshold_reached,
+            "second consecutive Critical reaches the strong-advisory threshold"
+        );
     }
 
-    /// Critical + 6 nudges → progressive degradation: 1st restricted, 2nd force_stop.
+    /// Critical observations increase evidence strength without restricting tools.
     #[test]
-    fn force_stop_from_errors_and_nudges() {
+    fn advisory_threshold_reached_from_errors_and_nudges() {
         let mut guard = TurnGuard::new();
         guard.nudge_count = 6;
 
@@ -1206,66 +1213,69 @@ mod chat_stream_turnguard_e2e {
             guard.record_tool_result("t2", "Error: fail");
         }
 
-        // First Critical → restricted (progressive degradation)
+        // First Critical remains below the strong threshold.
         let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Critical);
         assert!(
-            !v.force_stop,
-            "first Critical → restricted, not force_stop (progressive degradation)"
+            !v.advisory_threshold_reached,
+            "first Critical remains below the strong-advisory threshold"
         );
 
-        // Next failing round is also Critical → force_stop
+        // Next failing round is also Critical → stronger advisory evidence
         for _ in 0..3 {
             guard.record_tool_result("t1", "Error: fail");
         }
         let v2 = guard.evaluate();
-        assert!(v2.force_stop, "second consecutive Critical → force_stop");
+        assert!(
+            v2.advisory_threshold_reached,
+            "second consecutive Critical reaches the strong-advisory threshold"
+        );
     }
 
-    /// Budget depletion: Warning=-2, Critical=-5.
+    /// Behavioral severity must not consume explicit turn budget.
     #[test]
-    fn budget_penalty_accounting() {
+    fn behavior_verdict_preserves_explicit_turn_budget() {
         let mut restricted = HashSet::new();
 
-        // Warning costs 2
+        // Warning is telemetry/advisory only.
         let warning_verdict = TurnVerdict {
             injections: vec!["warn".into()],
             avoid_tools: vec![],
             severity: VerdictSeverity::Warning,
-            force_stop: false,
+            advisory_threshold_reached: false,
             stall_detected: false,
             is_diverging: false,
         };
-        let (r, _, _) = apply_verdict(&warning_verdict, 25, &mut restricted);
-        assert_eq!(r, 23);
+        let (r, _, _) = observe_verdict(&warning_verdict, 25, &mut restricted);
+        assert_eq!(r, 25);
 
-        // Critical costs 5
+        // Critical still has no budget authority.
         let critical_verdict = TurnVerdict {
             injections: vec!["crit".into()],
             avoid_tools: vec![],
             severity: VerdictSeverity::Critical,
-            force_stop: false,
+            advisory_threshold_reached: false,
             stall_detected: false,
             is_diverging: false,
         };
-        let (r, _, _) = apply_verdict(&critical_verdict, 23, &mut restricted);
-        assert_eq!(r, 18);
+        let (r, _, _) = observe_verdict(&critical_verdict, 23, &mut restricted);
+        assert_eq!(r, 23);
 
         // Healthy costs 0
         let healthy_verdict = TurnVerdict {
             injections: vec![],
             avoid_tools: vec![],
             severity: VerdictSeverity::Healthy,
-            force_stop: false,
+            advisory_threshold_reached: false,
             stall_detected: false,
             is_diverging: false,
         };
-        let (r, _, _) = apply_verdict(&healthy_verdict, 18, &mut restricted);
+        let (r, _, _) = observe_verdict(&healthy_verdict, 18, &mut restricted);
         assert_eq!(r, 18);
 
-        // Budget can't go below 0
-        let (r, _, _) = apply_verdict(&critical_verdict, 3, &mut restricted);
-        assert_eq!(r, 0, "budget floors at 0 via saturating_sub");
+        // A low remaining budget is still owned by the explicit budget layer.
+        let (r, _, _) = observe_verdict(&critical_verdict, 3, &mut restricted);
+        assert_eq!(r, 3);
     }
 
     // ── Nudge-ignore detection ──
@@ -1371,7 +1381,7 @@ mod chat_stream_turnguard_e2e {
             v.severity >= VerdictSeverity::Warning,
             "stall on failing tool after 3 identical calls"
         );
-        let (b, _, _) = apply_verdict(&v, budget, &mut restricted);
+        let (b, _, _) = observe_verdict(&v, budget, &mut restricted);
         budget = b;
 
         // Turn 4: recovery — different tool, success
@@ -1391,9 +1401,11 @@ mod chat_stream_turnguard_e2e {
         guard.record_tool_result("read_file", "fn main() {}");
         let v = guard.evaluate();
 
-        // Session should still be within budget
-        assert!(budget > 0, "budget should survive mixed session");
-        assert!(!v.force_stop, "mixed session should not force stop");
+        assert_eq!(budget, 25, "behavior evidence must not consume budget");
+        assert!(
+            !v.advisory_threshold_reached,
+            "mixed session should remain below the strong-advisory threshold"
+        );
     }
 
     // ── Injection message format contract ──
@@ -1433,7 +1445,7 @@ mod chat_stream_turnguard_e2e {
             v.avoid_tools
                 .contains(&"rollback_database_snapshots".to_string())
         );
-        apply_verdict(&v, 25, &mut restricted);
+        observe_verdict(&v, 25, &mut restricted);
         assert!(!restricted.contains("rollback_database_snapshots"));
 
         // Turn 2: put another tool under health avoidance.
@@ -1442,7 +1454,7 @@ mod chat_stream_turnguard_e2e {
         }
         let v = guard.evaluate();
         assert!(v.avoid_tools.contains(&"write_file".to_string()));
-        apply_verdict(&v, 25, &mut restricted);
+        observe_verdict(&v, 25, &mut restricted);
 
         assert!(
             restricted.is_empty(),
@@ -1458,7 +1470,7 @@ mod chat_stream_turnguard_e2e {
             injections: vec![],
             avoid_tools: vec![],
             severity: VerdictSeverity::Healthy,
-            force_stop: false,
+            advisory_threshold_reached: false,
             stall_detected: false,
             is_diverging: false,
         };
@@ -1477,7 +1489,7 @@ mod chat_stream_turnguard_e2e {
             injections: vec!["info note".into()],
             avoid_tools: vec![],
             severity: VerdictSeverity::Info,
-            force_stop: false,
+            advisory_threshold_reached: false,
             stall_detected: false,
             is_diverging: false,
         };
@@ -1495,7 +1507,7 @@ mod chat_stream_turnguard_e2e {
             injections: vec!["stall detected".into()],
             avoid_tools: vec![],
             severity: VerdictSeverity::Warning,
-            force_stop: false,
+            advisory_threshold_reached: false,
             stall_detected: false,
             is_diverging: false,
         };
@@ -1516,7 +1528,7 @@ mod chat_stream_turnguard_e2e {
         let v = guard.evaluate();
         assert_eq!(v.severity, VerdictSeverity::Healthy);
         assert!(v.injections.is_empty());
-        assert!(!v.force_stop);
+        assert!(!v.advisory_threshold_reached);
     }
 
     /// Many tools in one turn (batch call) → single signature, no stall.
@@ -1727,8 +1739,11 @@ mod chat_stream_turnguard_e2e {
 
         // Apply verdict: health-only avoid guidance must not hide schemas.
         let mut restricted = HashSet::new();
-        let (_, _, force_stop) = apply_verdict(&v, 20, &mut restricted);
-        assert!(!force_stop, "health-only issues should not force stop");
+        let (_, _, advisory_threshold_reached) = observe_verdict(&v, 20, &mut restricted);
+        assert!(
+            !advisory_threshold_reached,
+            "health-only issues should not force stop"
+        );
         assert!(!restricted.contains("mo_query"));
         assert!(!restricted.contains("rollback_database_snapshots"));
     }

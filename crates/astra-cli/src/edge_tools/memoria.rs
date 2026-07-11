@@ -11,6 +11,54 @@ use super::ToolExecutor;
 
 pub use astra_tools::memoria::{BoostSearchHit, parse_memory_search_hits};
 
+pub(crate) const MEMORY_BOOST_MIN_SCORE: f64 = 0.3;
+
+pub(crate) fn filter_memory_boost_hits_for_prompt(
+    hits: Vec<BoostSearchHit>,
+) -> Vec<BoostSearchHit> {
+    hits.into_iter()
+        .filter(|hit| {
+            hit.score
+                .is_some_and(|score| score.is_finite() && score >= MEMORY_BOOST_MIN_SCORE)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod memory_boost_prompt_filter_tests {
+    use super::{BoostSearchHit, filter_memory_boost_hits_for_prompt};
+
+    #[test]
+    fn memory_boost_prompt_filter_rejects_low_missing_and_nan_scores() {
+        let hits = vec![
+            BoostSearchHit {
+                memory_id: Some("low".into()),
+                content: "low relevance".into(),
+                score: Some(0.137),
+            },
+            BoostSearchHit {
+                memory_id: Some("missing".into()),
+                content: "missing score".into(),
+                score: None,
+            },
+            BoostSearchHit {
+                memory_id: Some("nan".into()),
+                content: "nan score".into(),
+                score: Some(f64::NAN),
+            },
+            BoostSearchHit {
+                memory_id: Some("ok".into()),
+                content: "high relevance".into(),
+                score: Some(0.3),
+            },
+        ];
+
+        let filtered = filter_memory_boost_hits_for_prompt(hits);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].memory_id.as_deref(), Some("ok"));
+    }
+}
+
 fn current_memoria_proxy_target() -> Result<(String, String), String> {
     let base = crate::cli::config_manager::resolve_api_url(None)?;
     let token =
@@ -261,26 +309,6 @@ pub async fn memoria_consolidate_fire_and_forget() {
     .await;
 }
 
-pub async fn close_pending_recall_feedback_with_proxy(
-    session_id: &str,
-    signal: &str,
-    context_prefix: &str,
-    cloud_base: Option<String>,
-    cloud_token: Option<String>,
-) -> astra_tools::memoria::FeedbackDrainReport {
-    let session_id = session_id.trim();
-    if session_id.is_empty() || signal.trim().is_empty() {
-        return astra_tools::memoria::FeedbackDrainReport::default();
-    }
-    let (Some(cloud_base), Some(cloud_token)) = (cloud_base, cloud_token) else {
-        return astra_tools::memoria::FeedbackDrainReport::default();
-    };
-    let client = astra_tools::memoria::MemoriaClient::new(Some(cloud_base), Some(cloud_token));
-    client
-        .feedback_pending_recalls(session_id, signal, context_prefix)
-        .await
-}
-
 impl ToolExecutor {
     pub(super) async fn memoria_call(&self, op: &str, args: &Value) -> String {
         self.memoria_call_with_timeout(op, args, Duration::from_secs(10))
@@ -313,7 +341,7 @@ impl ToolExecutor {
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
         }
 
-        // Delegate to the shared MemoriaClient (single source of truth for
+        // Delegate to the shared MemoriaPort (single source of truth for
         // build_direct_request, type normalization, and HTTP method routing).
         let cloud_token = self.cloud_token();
         if cloud_token.is_none() {
@@ -323,7 +351,8 @@ impl ToolExecutor {
             })
             .to_string();
         }
-        let client = astra_tools::memoria::MemoriaClient::new(self.cloud_base.clone(), cloud_token);
+        let client =
+            astra_tools::memoria::MemoriaToolGateway::new(self.cloud_base.clone(), cloud_token);
         let result = client.call_with_timeout(op, args, timeout).await;
 
         // CLI-specific: update circuit breaker + user notification
@@ -388,7 +417,7 @@ impl ToolExecutor {
                 self.memoria_fail_count
                     .store(0, std::sync::atomic::Ordering::Relaxed);
                 let text = resp.text().await.unwrap_or_default();
-                parse_memory_search_hits(&text)
+                filter_memory_boost_hits_for_prompt(parse_memory_search_hits(&text))
             }
             Err(_) => {
                 self.memoria_fail_count
@@ -449,12 +478,12 @@ impl ToolExecutor {
     }
 }
 
-// HttpMethod + build_direct_request moved to astra_tools::memoria::MemoriaClient
+// HttpMethod + build_direct_request moved to astra_tools::memoria::MemoriaToolGateway
 // (single source of truth for CLI and server).
 use astra_tools::memoria::HttpMethod;
 
 fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value, HttpMethod) {
-    astra_tools::memoria::MemoriaClient::build_direct_request(base, op, args)
+    astra_tools::memoria::MemoriaToolGateway::build_direct_request(base, op, args)
 }
 
 // Old build_direct_request body (120 lines) removed.

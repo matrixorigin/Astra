@@ -1,6 +1,6 @@
 //! wip-4 TDD contract: `InjectionChannel` covers every live injection
 //! channel, not just the 4 legacy ones. Motivated by the session
-//! 895536bf diagnostic where Memoria insights, self-awareness, feedback
+//! 895536bf diagnostic where typed Memoria prefetch, self-awareness, feedback
 //! rules, recent-arg hints, skill listing, memoria-prefetch, implicit
 //! feedback, and tool-round guidance all flow into the system prompt
 //! every turn but have no freshness / staleness tracking —
@@ -23,7 +23,6 @@ const EXPECTED_CHANNELS: &[InjectionChannel] = &[
     InjectionChannel::Lessons,
     InjectionChannel::VolatilePending,
     // wip-4 additions — covering all live bridge_inprocess injections:
-    InjectionChannel::MemoriaInsights,
     InjectionChannel::MemoriaPrefetch,
     InjectionChannel::SelfAwareness,
     InjectionChannel::FeedbackRules,
@@ -62,7 +61,6 @@ fn each_channel_has_stable_tag() {
         (InjectionChannel::OutcomeBias, "outcome_bias"),
         (InjectionChannel::Lessons, "lessons"),
         (InjectionChannel::VolatilePending, "volatile_pending"),
-        (InjectionChannel::MemoriaInsights, "memoria_insights"),
         (InjectionChannel::MemoriaPrefetch, "memoria_prefetch"),
         (InjectionChannel::SelfAwareness, "self_awareness"),
         (InjectionChannel::FeedbackRules, "feedback_rules"),

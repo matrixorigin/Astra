@@ -186,15 +186,16 @@ impl MatrixCloudRuntime {
     ///
     /// Also spins up the [`crate::session_memory::MemoryExtractionService`]
     /// here, because it needs all three of: encryptor (for selector
-    /// resolve), ingestion sender (for events), and a [`MemoriaClient`]
+    /// resolve), ingestion sender (for events), and a [`MemoriaPort`]
     /// (the sole persistence target for L1 session memory). If
-    /// [`HttpMemoriaClient::from_env`] returns `None` (no Memoria
+    /// [`HttpMemoriaPort::from_env`] returns `None` (no Memoria
     /// endpoint configured / offline), the service is NOT built —
     /// extraction is opt-in on connectivity, not silent fallback.
     pub fn with_encryptor(mut self, enc: Arc<astra_services::FernetTokenEncryptor>) -> Self {
         self.encryptor = Some(Arc::clone(&enc));
         let ingestion = self.ingestion.lock().ok().and_then(|g| g.as_ref().cloned());
-        let memoria = crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env();
+        let memoria = crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env()
+            .map(|client| client.with_owner_user_id(self.user_id.to_string()));
         if let (Some(ingestion), Some(memoria)) = (ingestion, memoria) {
             let resolver: Arc<dyn crate::session_memory::SelectorParamsResolver> =
                 Arc::new(PoolSelectorResolver {
@@ -202,23 +203,15 @@ impl MatrixCloudRuntime {
                     encryptor: Arc::clone(&enc),
                 });
             let broker = Arc::new(crate::session_memory::BackgroundActivityBroker::new());
-            let memoria_client: Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient> =
+            let memoria_client: Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort> =
                 Arc::new(memoria);
-            // Shared observatory: extraction service writes extraction
-            // records; `compact_with_memoria` (reached via `state.
-            // memory_extraction_service.observatory()`) writes injection
-            // records. `introspect facet=session_memory` reads both.
-            let observatory = Arc::new(crate::session_memory::SessionMemoryObservatory::new());
-            let svc = Arc::new(
-                crate::session_memory::MemoryExtractionService::new(
-                    resolver,
-                    memoria_client,
-                    ingestion,
-                    Arc::clone(&self.user_id),
-                    broker,
-                )
-                .with_observatory(Arc::clone(&observatory)),
-            );
+            let svc = Arc::new(crate::session_memory::MemoryExtractionService::new(
+                resolver,
+                memoria_client,
+                ingestion,
+                Arc::clone(&self.user_id),
+                broker,
+            ));
             self.memory_extraction_service = Some(svc);
         }
         self

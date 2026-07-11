@@ -12,7 +12,7 @@
 //!   [`JournalEntry`] entries, trend computation, strategy verification),
 //!   [`ObservationStore`] (optional persistence trait).
 //! * **Policy layer** (`astra_runtime::turn::runtime_policy`): [`RuntimePolicy`]
-//!   reads [`JournalFacts`] and produces [`FrameworkAction`]s. The core data
+//!   reads [`JournalFacts`] and produces [`RuntimePolicyEvidence`]s. The core data
 //!   layer never decides — it only reports facts.
 //!
 //! # Lifecycle
@@ -68,7 +68,7 @@ pub struct StreakSnapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PerformanceSnapshot {
     /// Total evidence-gathering tool calls across the journal window.
-    pub total_evidence_calls: u32,
+    pub total_observation_calls: u32,
     /// Total errors across the journal window.
     pub total_errors: u32,
     /// Total tool calls in the journal window.
@@ -472,7 +472,7 @@ impl ObservationJournal {
     ///
     /// "Outcome" = at least one of: file mutation, test pass, build success.
     pub fn extract_facts(&self, budget_remaining: u32, budget_max: u32) -> JournalFacts {
-        // total_tool_calls, total_errors, total_evidence_calls are populated
+        // total_tool_calls, total_errors, total_observation_calls are populated
         // by the execution phase from authoritative state, not from the journal
         // (they track entire-session counts, not just the sliding window).
         let mut facts = JournalFacts {
@@ -1080,8 +1080,8 @@ mod tests {
             "extract_facts must not set total_errors"
         );
         assert_eq!(
-            facts.performance.total_evidence_calls, 0,
-            "extract_facts must not set total_evidence_calls"
+            facts.performance.total_observation_calls, 0,
+            "extract_facts must not set total_observation_calls"
         );
         // Streak fields ARE computed correctly.
         assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 2);

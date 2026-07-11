@@ -49,7 +49,7 @@ impl AgentFanoutAction {
 
 pub fn agent_missing_action_message() -> String {
     format!(
-        "missing required parameter `action` for `agent`. Retry the same `agent` tool with action set to one of: {AGENT_ACTIONS_DISPLAY}."
+        "missing required parameter `action` for `agent`. Provide a top-level `action` string: one of {AGENT_ACTIONS_DISPLAY}. For a child agent, call `agent(action='spawn', description='...', prompt='...')`; do not wrap arguments under `spawn` and do not pass `agents:[...]`."
     )
 }
 
@@ -70,6 +70,7 @@ pub fn invalid_agent_agents_payload_message() -> &'static str {
 }
 
 pub fn agent_action_from_args(args: &Value) -> Result<AgentAction, String> {
+    reject_malformed_tool_args("agent", args)?;
     match args.get("action") {
         Some(Value::String(action)) if !action.trim().is_empty() => match action.as_str() {
             "spawn" => Ok(AgentAction::Spawn),
@@ -91,7 +92,7 @@ pub fn agent_action_from_args(args: &Value) -> Result<AgentAction, String> {
 
 pub fn agent_fanout_missing_action_message() -> String {
     format!(
-        "missing required parameter `action` for `agent_fanout`. Retry the same `agent_fanout` tool with action set to one of: {AGENT_FANOUT_ACTIONS_DISPLAY}."
+        "missing required parameter `action` for `agent_fanout`. Provide a top-level `action` string: one of {AGENT_FANOUT_ACTIONS_DISPLAY}. To start parallel agents, call `agent_fanout(action='start', target_count=N, slots=[{{description:'...', prompt:'...'}}])`; to collect an existing group, call `agent_fanout(action='get_results', group_id='...')`."
     )
 }
 
@@ -104,6 +105,7 @@ pub fn agent_fanout_unknown_action_message(action: &str) -> String {
 }
 
 pub fn agent_fanout_action_from_args(args: &Value) -> Result<AgentFanoutAction, String> {
+    reject_malformed_tool_args("agent_fanout", args)?;
     match args.get("action") {
         Some(Value::String(action)) if !action.trim().is_empty() => match action.as_str() {
             "start" => Ok(AgentFanoutAction::Start),
@@ -114,6 +116,15 @@ pub fn agent_fanout_action_from_args(args: &Value) -> Result<AgentFanoutAction, 
         Some(Value::String(_)) | None => Err(agent_fanout_missing_action_message()),
         Some(_) => Err(agent_fanout_action_type_message().to_string()),
     }
+}
+
+fn reject_malformed_tool_args(tool_name: &str, args: &Value) -> Result<(), String> {
+    let Some(parse_error) = args.get("_parse_error").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    Err(format!(
+        "malformed arguments JSON for `{tool_name}`: {parse_error}. Retry with valid JSON and reduce argument size if the previous tool call was truncated."
+    ))
 }
 
 #[cfg(test)]
@@ -133,6 +144,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(parsed_actions, AGENT_ACTIONS);
+    }
+
+    #[test]
+    fn agent_fanout_parse_error_is_not_reported_as_missing_action() {
+        let err = agent_fanout_action_from_args(&json!({
+            "_parse_error": "Malformed arguments JSON: {\"action\":\"start\""
+        }))
+        .unwrap_err();
+        assert!(err.contains("malformed arguments JSON for `agent_fanout`"));
+        assert!(!err.contains("missing required parameter `action`"));
     }
 
     #[test]

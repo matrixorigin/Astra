@@ -41,7 +41,8 @@
 //! - `execute_turn` is called at most `max_turns` times
 //! - Cancel flag is checked cooperatively between turns (not mid-turn)
 //! - Stall detection runs after every turn with tool calls
-//! - Post-tool policy may restrict tools or abort the loop
+//! - Post-tool policy contributes structured advisory evidence to subsequent
+//!   reasoning; hard stops remain reserved for actual runtime boundaries
 //!
 //! # Dispatch
 //!
@@ -66,7 +67,6 @@ use astra_pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_tools::task_mgmt::{SessionTask, TaskManager};
-use astra_turn_core::agentic_turn_ingest::FactualRetryFallbackDecision;
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionTier};
@@ -137,13 +137,6 @@ pub struct HostTurnResult {
     pub error_kind: Option<astra_core::ErrorKind>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct FactualRetryFallbackJudgeContext<'a> {
-    pub original_query: &'a str,
-    pub fallback_text: &'a str,
-    pub retry_text: &'a str,
-}
-
 /// Structured skill pre-route decision supplied by a host-side semantic judge.
 ///
 /// Runtime code must not infer this from natural-language keyword, alias, or
@@ -182,7 +175,7 @@ pub enum ControlToolRecovery {
 
 pub use astra_turn_core::interaction_types::{
     ASK_USER_TOOL_NAME, TurnInteractionMode, TurnInteractionPolicy,
-    interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
+    interaction_scoped_tool_restrictions, tool_counts_as_external_observation,
 };
 
 // ─── Host trait ──────────────────────────────────────────────────────────────
@@ -234,16 +227,6 @@ pub trait AgenticLoopHost: Send {
         _state: &AgenticLoopState,
         _ctx: SkillAutoRouteJudgeContext<'_>,
     ) -> Option<SkillAutoRouteDecision> {
-        None
-    }
-
-    /// Optional LLM response-selection judge for factual retries that gathered
-    /// no real evidence. The runtime must not fall back to lexical similarity
-    /// here; absence or failure means "keep retry".
-    async fn judge_factual_retry_fallback(
-        &mut self,
-        _ctx: FactualRetryFallbackJudgeContext<'_>,
-    ) -> Option<FactualRetryFallbackDecision> {
         None
     }
 
@@ -587,7 +570,10 @@ fn build_introspect_snapshot_with_tool_admission(
         .iter()
         .map(|inj| astra_turn_core::introspect::VolatileSnapshotEntry {
             kind: format!("{:?}", inj.kind),
-            content: inj.content.clone(),
+            content: match &inj.payload {
+                Value::String(text) => text.clone(),
+                payload => serde_json::to_string(payload).unwrap_or_default(),
+            },
             round_index: inj.round_index,
         })
         .collect();
@@ -601,33 +587,33 @@ fn build_introspect_snapshot_with_tool_admission(
         nudge_count: state.stall.nudge_count,
         events,
         introspection_count: state.stall.introspection_count,
-        forced_corrections: {
+        advisory_signals: {
             let mut corrections = Vec::new();
-            if state.stall.forced_execution_escalation {
+            if state.stall.execution_escalation_advisory_emitted {
                 corrections.push("execution_escalation".to_string());
             }
-            if state.stall.forced_parallel_batching {
-                corrections.push("parallel_batching_force".to_string());
+            if state.stall.parallel_batching_advisory_emitted {
+                corrections.push("parallel_batching".to_string());
             }
-            if state.stall.forced_redundant_reads_corrective {
-                corrections.push("redundant_reads_corrective".to_string());
+            if state.stall.repetition_advisory_emitted {
+                corrections.push("identical_signature_repetition".to_string());
             }
-            if state.stall.forced_cache_waste_corrective {
-                corrections.push("cache_waste_corrective".to_string());
+            if state.stall.redundant_reads_advisory_emitted {
+                corrections.push("redundant_reads".to_string());
             }
-            if state.stall.forced_search_fanout_corrective {
-                corrections.push("search_fanout_corrective".to_string());
+            if state.stall.cache_waste_advisory_emitted {
+                corrections.push("cache_waste".to_string());
             }
-            if state.stall.forced_exploration_family_phase2 {
-                corrections.push("exploration_family_lockout".to_string());
+            if state.stall.search_fanout_advisory_emitted {
+                corrections.push("search_fanout".to_string());
             }
-            if state.stall.forced_exploration_family_corrective {
-                corrections.push("exploration_family_corrective".to_string());
+            if state.stall.stronger_exploration_family_advisory_emitted {
+                corrections.push("exploration_family_strong".to_string());
             }
-            if state.stall.forced_completion_soft_stop {
-                corrections.push("completion_soft_stop".to_string());
+            if state.stall.exploration_family_advisory_emitted {
+                corrections.push("exploration_family".to_string());
             }
-            if state.stall.forced_intent_drift {
+            if state.stall.intent_drift_advisory_emitted {
                 corrections.push("intent_drift".to_string());
             }
             corrections
@@ -660,9 +646,9 @@ fn build_introspect_snapshot_with_tool_admission(
 
     // ── Build live alerts from stall / drift / error state ──
     let mut alerts: Vec<String> = Vec::new();
-    let forced = &stall_state.forced_corrections;
+    let forced = &stall_state.advisory_signals;
     if !forced.is_empty() {
-        alerts.push(format!("forced_corrections: {}", forced.join(", ")));
+        alerts.push(format!("advisory_signals: {}", forced.join(", ")));
     }
     if stall_state.drift_nudge_count > 0 {
         alerts.push(format!(
@@ -983,38 +969,17 @@ pub struct StallTrackingState {
     pub last_heavy_checkpoint: Option<StepCheckpoint>,
     /// Tool call records for session journal.
     pub tool_call_records: Vec<ToolCallRecord>,
-    /// Whether a factual-retry was forced this loop.
-    pub forced_factual_retry: bool,
-    /// Original text-only answer saved before a forced factual retry. It is
-    /// restored only when an upstream response-selection judge explicitly
-    /// chooses it after a no-evidence retry.
-    pub factual_retry_fallback_text: Option<String>,
-    /// Whether an execution-retry was forced after a mutating/confirmed task
-    /// attempted to finish without applying any concrete workspace mutation.
-    pub forced_execution_retry: bool,
-    /// Whether a final-answer relevance retry was forced after successful tool
-    /// evidence existed but the text-only synthesis answered stale runtime
-    /// scaffolding or an older question instead of the latest user request.
-    /// One-shot per turn.
-    pub forced_answer_relevance_retry: bool,
     /// Whether a mid-loop execution escalation was injected after a mutating
     /// task accumulated enough read-only tool calls without producing any
     /// workspace mutation. One-shot per turn.
-    pub forced_execution_escalation: bool,
-    /// Whether a parallel-batching force injection has fired this loop. Set
+    pub execution_escalation_advisory_emitted: bool,
+    /// Whether a parallel-batching advisory was emitted this loop. Set
     /// when the model has produced a long streak of consecutive single-tool
     /// rounds despite the soft prompt-layer nudge. One-shot per turn.
-    pub forced_parallel_batching: bool,
-    /// Whether the round-budget convergence guard injected its phase-1
-    /// corrective this loop. Phase-1 fires when `state.llm_rounds_completed`
-    /// crosses the effective round-budget hard limit; it tells the model
-    /// to produce a final answer next round and (in the runtime) restricts
-    /// all tools so the next round must be text-only. One-shot per turn.
-    pub forced_round_budget_phase1: bool,
-    /// Whether the round-budget guard escalated to phase-2 (hard abort).
-    /// Set when phase-1 fired and the model still attempted tool calls on
-    /// the very next round. One-shot per turn.
-    pub forced_round_budget_phase2: bool,
+    pub parallel_batching_advisory_emitted: bool,
+    /// Whether exact-signature repetition was surfaced as advisory evidence
+    /// this turn. One-shot; never stops the loop.
+    pub repetition_advisory_emitted: bool,
     /// Monotonic count of circuit-breaker introspection (self-check) prompts
     /// injected this turn. Used for post-turn telemetry so operators can see
     /// how often the breaker nudged the model on long read-only sessions.
@@ -1024,54 +989,40 @@ pub struct StallTrackingState {
     /// mutation (for cap enforcement), while this counter monotonically
     /// accumulates across the whole turn (for diagnostics).
     pub introspection_count: u32,
-    /// Whether a completion-aware soft-stop prompt was injected after a
-    /// successful task-completion signal (for example a successful git commit).
-    /// One-shot per turn; advisory only, tools remain available.
-    pub forced_completion_soft_stop: bool,
-    /// Whether the unfinished-task-board mid-loop gate already injected its
-    /// corrective this turn. Without this one-shot, a model that responds
-    /// with text-only completions while the task board still has unfinished
-    /// work would keep re-triggering the gate every BreakLoop round —
-    /// burning the global round budget instead of letting the terminal
-    /// guard rewrite the answer with a structured interruption record.
-    /// One-shot per turn; reset in `reset_per_turn_corrective_state`.
-    pub forced_task_board_completion_gate: bool,
-    /// Whether the redundant-reads mid-loop corrective injected a guidance
+    /// Whether the redundant-reads mid-loop advisory emitted guidance
     /// message this loop. Fires when the model has re-read overlapping line
     /// ranges of the same file enough times to cross
     /// `REDUNDANT_READS_MIDLOOP_THRESHOLD` without any intervening
     /// workspace mutation. One-shot per turn — escalation is via the
     /// existing post-mortem `EvalSignal::RedundantOverlappingReads`.
-    pub forced_redundant_reads_corrective: bool,
-    /// Whether the repeated-cache-waste mid-loop corrective injected a
+    pub redundant_reads_advisory_emitted: bool,
+    /// Whether the repeated-cache-waste mid-loop advisory emitted an
     /// guidance message this loop. Fires when the model keeps reissuing
     /// identical tool calls that are served from cache instead of reusing
     /// the earlier result. One-shot per turn.
-    pub forced_cache_waste_corrective: bool,
+    pub cache_waste_advisory_emitted: bool,
     /// Whether broad search fanout has already triggered a convergence
-    /// corrective this turn. This is intentionally advisory and one-shot: it
+    /// advisory this turn. This is intentionally one-shot: it
     /// catches implementation tasks that keep widening search instead of
     /// synthesizing, editing, verifying, or finishing.
-    pub forced_search_fanout_corrective: bool,
-    /// Whether a broad exploration-family corrective injected a guidance
-    /// message and restricted the dominant low-yield family this loop. Fires
+    pub search_fanout_advisory_emitted: bool,
+    /// Whether a broad exploration-family advisory was emitted for the
+    /// dominant low-yield family this loop. Fires
     /// when consecutive multi-call rounds stay inside the same exploratory
     /// family (diff/search/read). One-shot per turn.
-    pub forced_exploration_family_corrective: bool,
-    /// Whether the exploration-family corrective escalated to a stronger
-    /// convergence directive after the model spent a later round attempting
-    /// ONLY tools from the already-restricted family. One-shot per turn.
-    pub forced_exploration_family_phase2: bool,
-    /// Dominant exploratory family currently under runtime correction. Used
-    /// to detect whether later blocked rounds are simply retrying the same
-    /// low-yield path instead of switching families or synthesizing.
-    pub exploration_family_corrective_family: Option<String>,
-    /// Whether the intent-drift mid-loop corrective has fired this turn.
+    pub exploration_family_advisory_emitted: bool,
+    /// Whether a stronger exploration-family advisory was emitted after the
+    /// model spent a later round repeating only that family. One-shot per turn.
+    pub stronger_exploration_family_advisory_emitted: bool,
+    /// Dominant exploratory family named by the latest advisory. Used to
+    /// detect whether later rounds repeat the same low-yield path.
+    pub exploration_family_advisory_family: Option<String>,
+    /// Whether the intent-drift mid-loop advisory has fired this turn.
     /// One-shot per turn — prevents repeated volatile injection that would
     /// break prompt-cache prefix stability on every subsequent round.
-    pub forced_intent_drift: bool,
+    pub intent_drift_advisory_emitted: bool,
     /// How many times intent-drift correction has been injected this session.
-    /// Persists across turns (unlike `forced_intent_drift` which is per-turn).
+    /// Persists across turns (unlike `intent_drift_advisory_emitted` which is per-turn).
     /// Used by TurnGuard escalation: if drift_nudge_count >= threshold,
     /// escalate to force-stop.
     pub drift_nudge_count: usize,
@@ -1097,52 +1048,39 @@ pub struct StallTrackingState {
 }
 
 impl StallTrackingState {
-    /// Whether a *hard* intervention (one that locks out or redirects all
-    /// tools) is currently active for this turn. Correctives that are merely
-    /// advisory defer to these — a phase-1 budget lockout or a completion
-    /// soft-stop supersedes any narrower "use existing context" nudge.
-    ///
-    /// This is the single source of truth for the "defer to hard
-    /// intervention" guard clause that was previously inlined as a 3-flag
-    /// `||` chain in 4+ call sites across `execution_phase.rs` and
-    /// `guards.rs`.
+    /// Whether a stronger advisory was already emitted. Other advisory
+    /// producers defer to it only to avoid stacking redundant evidence in one
+    /// round; it does not lock tools or stop the loop.
     #[inline]
-    pub fn hard_intervention_active(&self) -> bool {
-        self.forced_round_budget_phase1
-            || self.forced_completion_soft_stop
-            || self.forced_exploration_family_phase2
+    pub fn stronger_advisory_emitted(&self) -> bool {
+        self.stronger_exploration_family_advisory_emitted
     }
 
-    /// Whether *any* mid-loop corrective has already fired this turn. Guards
-    /// use this to enforce the "one corrective injection per turn"
+    /// Whether *any* mid-loop advisory has already fired this turn. Guards
+    /// use this to enforce the "one behavioral advisory per turn"
     /// invariant — stacking two guidance messages confuses the model and
     /// burns the round budget faster.
-    ///
-    /// Does NOT include `hard_intervention_active` flags; those are checked
-    /// Whether any mid-loop corrective injection has been fired this turn.
     ///
     /// This tracks quality-related corrections (redundant reads, cache waste,
     /// search fanout, etc.) but intentionally excludes drift correction,
     /// which is semantically orthogonal (intent alignment vs tool quality).
     /// Drift correction can coexist with quality corrections in the same turn.
     #[inline]
-    pub fn any_corrective_fired(&self) -> bool {
-        self.forced_parallel_batching
-            || self.forced_redundant_reads_corrective
-            || self.forced_cache_waste_corrective
-            || self.forced_search_fanout_corrective
-            || self.forced_exploration_family_corrective
-            || self.forced_execution_escalation
-            || self.forced_execution_retry
-            || self.forced_answer_relevance_retry
+    pub fn any_behavior_advisory_emitted(&self) -> bool {
+        self.parallel_batching_advisory_emitted
+            || self.repetition_advisory_emitted
+            || self.redundant_reads_advisory_emitted
+            || self.cache_waste_advisory_emitted
+            || self.search_fanout_advisory_emitted
+            || self.exploration_family_advisory_emitted
+            || self.execution_escalation_advisory_emitted
     }
 
-    /// Whether the loop is already under *any* mid-loop intervention
-    /// (advisory corrective or hard). Guards check this to decide whether a
-    /// new corrective would be redundant.
+    /// Whether any advisory was already emitted. Guards use this only to avoid
+    /// redundant prompt evidence; it has no execution-control semantics.
     #[inline]
-    pub fn any_intervention_active(&self) -> bool {
-        self.hard_intervention_active() || self.any_corrective_fired()
+    pub fn any_advisory_emitted(&self) -> bool {
+        self.stronger_advisory_emitted() || self.any_behavior_advisory_emitted()
     }
 
     /// Purge accumulating state: trim tool_call_records, reset fired flags.
@@ -1367,16 +1305,10 @@ impl TaskBoardSnapshot {
         self.pending_count > 0 || self.in_progress_count > 0 || self.paused_count > 0
     }
 
+    /// Whether the board contains paused work or an unresolved dependency.
+    /// This is evidence for working-memory reconciliation, not run control.
     #[must_use]
-    pub fn has_completion_blocking_tasks(&self) -> bool {
-        self.in_progress_count > 0 || self.paused_count > 0 || self.blocked_count > 0
-    }
-
-    /// Whether the final run settlement must wait for explicit external/user
-    /// intervention. In-progress tasks still deserve one reconciliation round,
-    /// but they are bookkeeping until they become paused or dependency-blocked.
-    #[must_use]
-    pub fn requires_settlement_intervention(&self) -> bool {
+    pub fn has_paused_or_blocked_tasks(&self) -> bool {
         self.paused_count > 0 || self.blocked_count > 0
     }
 
@@ -1488,13 +1420,9 @@ pub struct ErrorRecoveryState {
 
 /// Cross-turn state managed by the runtime loop.
 ///
-/// A structured volatile-injection lane. The runtime produces many
-/// kinds of per-round hints that must be visible to the LLM but must
-/// NOT live in `AgenticLoopState.messages[]` — tool_health warnings,
-/// working-set snapshots, inventory blocks, stall reflections,
-/// execution-escalation / parallel-batching-force nudges, tactical
-/// adaptations, budget-exhaustion alerts, and similar corrective
-/// messages.
+/// A structured volatile-injection lane. The runtime produces per-round
+/// required context, advisory evidence, and telemetry that must not live in
+/// `AgenticLoopState.messages[]`.
 ///
 /// Before this lane existed, every producer called
 /// `state.messages.push(...)` and the wire layer had to scan the full
@@ -1503,20 +1431,21 @@ pub struct ErrorRecoveryState {
 /// history-is-byte-stable invariant lived implicitly across dozens of
 /// call sites.
 ///
-/// Post-fix, every producer calls [`AgenticLoopState::push_volatile`]
-/// instead. `wire_assembly::assemble_llm_messages` drains this lane
-/// into the volatile_preamble on every LLM call, so `messages[]` only
-/// ever carries real user/assistant/tool conversation turns.
+/// Producers call [`AgenticLoopState::push_volatile`] or
+/// [`AgenticLoopState::push_volatile_payload`]. The lane crosses edge
+/// boundaries as typed JSON and is attached at the dynamic wire tail, so
+/// `messages[]` only carries real user/assistant/tool conversation turns.
 #[derive(Debug, Clone)]
 pub struct VolatileInjection {
     /// Classification — used by introspect to enumerate injections by
     /// type, and by downstream dedup/coalescing if needed.
     pub kind: VolatileKind,
-    /// The human-readable injection text the LLM will see. Role is
-    /// implicit in `kind` (coaching / working-set / inventory land as
-    /// system; nudges / corrections land as user). The consumer
-    /// decides the wrapper shape at drain time.
-    pub content: String,
+    /// Signal payload. JSON objects and arrays remain structured across the
+    /// edge boundary; plain-text producers use a JSON string. [`VolatileKind::delivery_class`]
+    /// decides whether the
+    /// payload becomes required context, advisory evidence, or telemetry-only;
+    /// no kind impersonates a user/system history turn.
+    pub payload: Value,
     /// Round index the injection was produced in (for introspect
     /// telemetry; not used by the wire layer).
     pub round_index: u32,
@@ -1552,90 +1481,82 @@ pub const RECENT_ROUNDS_RING_CAPACITY: usize = 32;
 /// Taxonomy of runtime-produced volatile content. Add a new variant
 /// when introducing a new injection kind — both the producer and the
 /// drain path become compile-time-checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VolatileKind {
-    /// TurnGuard "⚠ The following tools have failed…" output.
-    ToolHealthWarning,
-    /// Stall-reflection nudge (`build_stall_reflection`).
+    /// Stall-reflection evidence (`build_stall_reflection`).
     StallNudge,
-    /// Parallel-batching-force corrective ("Detected N consecutive
-    /// single-tool rounds…").
-    ParallelBatchingForce,
-    /// Execution-escalation nudge for mutating-task reads-only-churn.
+    /// Execution-pattern evidence for mutating-task read-only churn.
     ExecutionEscalation,
-    /// `[working-set:v1]` session-facts snapshot.
-    WorkingSet,
     /// `## Already Fetched` inventory block.
     AlreadyFetched,
-    /// "✓ N tools executed in parallel" coaching ping.
+    /// Observation that a tool batch executed in parallel.
     ToolBatchCoaching,
-    /// Budget/turn/round limit advisory ("You have reached the token
-    /// budget…", "Do NOT call any more tools…").
+    /// Authoritative budget/turn/round context. Actual budget enforcement is
+    /// owned by the runtime; this lane tells the model which boundary is active.
     BudgetAdvisory,
     /// Runtime telemetry snapshot. It must never be treated as a user
     /// utterance, because doing so pollutes latest-user-goal extraction.
     SelfStatus,
+    /// Structured soft-policy evidence for the next LLM decision point.
+    /// This is not a user correction or runtime command.
+    PolicyAdvisory,
     /// Per-round anchor for the current user goal. It is rebuilt from
     /// authoritative runtime state immediately before each LLM request.
     ActiveTurnFrame,
-    /// Tactical adaptation hint.
-    TacticalAdaptation,
     /// "Context was just compacted — continue working, do not
     /// summarize." Injected by `handle_token_budget` after a
     /// successful compact+spill pass so the model resumes the task
     /// instead of misreading the smaller context as an interruption
     /// (session 0e37eb46 regression).
     CompactResume,
-    /// Circuit-breaker intermediate / soft-stop messages.
+    /// Circuit-breaker intermediate / completion observation messages.
     CircuitBreaker,
-    /// Error-budget-exhausted / redundant-reads-corrective /
-    /// cache-waste-corrective / exploration-family-corrective — the
-    /// family of "stop and change approach" messages.
-    Corrective,
+    /// Structured evidence from behavioral pattern detectors such as repeated
+    /// errors, redundant reads, cache waste, or exploration-family churn.
+    /// It never carries execution authority.
+    BehaviorAdvisory,
     /// Mailbox / agent-to-agent volatile drop-offs.
     Mailbox,
-    /// User message queued during execution for delivery after the next
-    /// completed tool-call round.
-    DeferredUserInput,
-    /// Budget-review acknowledgment.
+    /// Structured policy evidence suggesting a possible budget review. It does
+    /// not mutate the active runtime budget.
     BudgetReview,
+    /// Authoritative runtime fact that the active turn budget was extended.
+    /// Unlike [`Self::BudgetReview`], this is not a policy suggestion.
+    BudgetUpdate,
     /// Context-pressure guidance from [`RuntimePolicy`]. Singleton so repeated
     /// pressure checks replace the prior guidance instead of stacking prompt
     /// noise inside the same LLM call.
     ContextPressure,
-    /// Open-ended exploration budget reminder.
-    ExplorationBudget,
-    /// Execution retry with corrective reason.
-    ExecutionRetry,
     /// Post-turn hallucination self-check nudge. Fires when the
     /// assistant's prose for the just-finished turn claimed a
     /// phantom tool outcome (e.g. "silently returned {}") that no
     /// tool call actually produced. See
     /// [`astra_turn_core::hallucination_tripwire`] for the detector.
     HallucinationTripwire,
-    /// Task-board completion gate. Singleton and count-only on the wire so
-    /// repeated corrections replace each other instead of accumulating
-    /// dynamic task titles in the volatile prompt suffix.
-    TaskBoardCompletionGate,
-    /// Task-board start gate. Broad multi-step or delegated work should create
-    /// a durable task board before broad exploration/spawn begins.
-    TaskBoardStartGate,
+    /// Advisory evidence about task-board state: either unfinished tracked
+    /// work or broad work that may benefit from a board. It never gates tools,
+    /// delegation, or completion.
+    TaskBoardAdvisory,
+    /// Configured stop-hook expectations surfaced before model decisions.
+    StopHookEvidence,
+    /// Context produced by configured session-start hooks. It is required for
+    /// the current run but is not persisted as synthetic system history.
+    SessionHookContext,
+    /// Harness-imposed capability/checkpoint context. Harness tool restrictions
+    /// are enforced separately; this lane only explains the active boundary.
+    HarnessBoundary,
     /// Plan-mode marker: a single short reminder that the current
     /// turn is read-only investigation and the model must surface
     /// its plan via `exit_plan_mode(plan="…")` for user approval.
     /// Singleton — only the latest one ever rides the wire.
     PlanModeMarker,
-    /// Intent-drift correction: "⚠ INTENT DRIFT DETECTED — you have
+    /// Intent-drift evidence: "⚠ INTENT DRIFT DETECTED — you have
     /// spent N consecutive turns on tools unrelated to the user's
-    /// request…". Singleton so only the latest correction rides the
+    /// request…". Singleton so only the latest observation rides the
     /// wire, avoiding prompt cache bloat from accumulated drift
     /// messages across rounds.
     IntentDrift,
-    /// Behavior monitor nudge: generic rule-based detection of
-    /// Catch-all for producers we haven't categorized yet. Prefer
-    /// adding a new variant over reusing this — introspect reports
-    /// by kind and a generic bucket degrades the signal.
-    Other,
 }
 
 impl VolatileKind {
@@ -1648,85 +1569,114 @@ impl VolatileKind {
     pub fn is_singleton(self) -> bool {
         matches!(
             self,
-            Self::WorkingSet
-                | Self::AlreadyFetched
-                | Self::ExplorationBudget
+            Self::AlreadyFetched
                 | Self::ContextPressure
                 | Self::Mailbox
                 | Self::CompactResume
-                | Self::TaskBoardCompletionGate
-                | Self::TaskBoardStartGate
+                | Self::CircuitBreaker
+                | Self::TaskBoardAdvisory
+                | Self::StopHookEvidence
+                | Self::SessionHookContext
+                | Self::HarnessBoundary
                 | Self::PlanModeMarker
                 | Self::IntentDrift
                 | Self::SelfStatus
+                | Self::PolicyAdvisory
+                | Self::BudgetUpdate
                 | Self::ActiveTurnFrame,
         )
     }
 
-    /// Whether this volatile kind may be rendered into the user-role
-    /// tail reminder used by cache-sensitive providers. Telemetry is
-    /// diagnostic state, not user intent, so it is intentionally excluded.
+    /// Prompt-delivery semantics for this signal. This is deliberately
+    /// independent of chat roles: runtime context is attached at the wire tail
+    /// and never becomes a synthetic prompt-facing history turn.
     #[must_use]
-    pub fn render_in_user_tail(self) -> bool {
-        matches!(
-            self,
-            Self::ToolHealthWarning
-                | Self::StallNudge
-                | Self::ParallelBatchingForce
-                | Self::ExecutionEscalation
-                | Self::Corrective
-                | Self::CircuitBreaker
-                | Self::BudgetAdvisory
-                | Self::CompactResume
-                | Self::TaskBoardCompletionGate
-                | Self::TaskBoardStartGate
-                | Self::ExecutionRetry
-                | Self::ExplorationBudget
-                | Self::ContextPressure
-                | Self::DeferredUserInput
-                | Self::BudgetReview
-                | Self::IntentDrift
-        )
-    }
-
-    /// Default wire role for this kind. System-role for coaching /
-    /// snapshots; user-role for nudges / corrections that deliberately
-    /// mimic the user scolding the LLM.
-    #[must_use]
-    pub fn default_role(self) -> &'static str {
+    pub fn delivery_class(self) -> astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass {
+        use astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass;
         match self {
-            // Operator-persona messages — land in the user slot so the
-            // LLM reads them with "correct my behavior" framing.
-            Self::ToolHealthWarning
-            | Self::StallNudge
-            | Self::ParallelBatchingForce
-            | Self::ExecutionEscalation
-            | Self::Corrective
-            | Self::CircuitBreaker
-            | Self::BudgetAdvisory
-            | Self::CompactResume
-            | Self::TaskBoardCompletionGate
-            | Self::TaskBoardStartGate
-            | Self::ExecutionRetry
-            | Self::ExplorationBudget
-            | Self::ContextPressure
-            | Self::DeferredUserInput
-            | Self::BudgetReview
-            | Self::IntentDrift => "user",
-            // System-role: prevents injection via attacker-crafted file content.
-            Self::HallucinationTripwire => "system",
-            // System-role: in-band runtime snapshots or coaching.
-            Self::SelfStatus
+            Self::BudgetAdvisory
+            | Self::BudgetUpdate
             | Self::ActiveTurnFrame
-            | Self::WorkingSet
+            | Self::CompactResume
+            | Self::Mailbox
+            | Self::SessionHookContext
+            | Self::PlanModeMarker
+            | Self::HarnessBoundary => VolatileDeliveryClass::RequiredContext,
+            Self::SelfStatus => VolatileDeliveryClass::TelemetryOnly,
+            Self::StallNudge
+            | Self::ExecutionEscalation
             | Self::AlreadyFetched
             | Self::ToolBatchCoaching
-            | Self::TacticalAdaptation
-            | Self::Mailbox
-            | Self::PlanModeMarker
-            | Self::Other => "system",
+            | Self::PolicyAdvisory
+            | Self::CircuitBreaker
+            | Self::BehaviorAdvisory
+            | Self::BudgetReview
+            | Self::ContextPressure
+            | Self::HallucinationTripwire
+            | Self::TaskBoardAdvisory
+            | Self::StopHookEvidence
+            | Self::IntentDrift => VolatileDeliveryClass::AdvisoryEvidence,
         }
     }
+
+    /// Stable cross-process kind name derived from the serialized enum.
+    #[must_use]
+    pub(crate) fn wire_kind(self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .expect("unit enum serialization must produce a string")
+    }
+}
+
+fn volatile_payload_is_empty(payload: &Value) -> bool {
+    match payload {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(items) => items.is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+        Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+/// Serialize runtime-owned volatile injections for the CLI/server edge_profile
+/// boundary without flattening away their producer kind.
+#[must_use]
+pub fn runtime_volatile_injections_edge_profile_value(
+    injections: &[VolatileInjection],
+) -> Option<serde_json::Value> {
+    let items = injections
+        .iter()
+        .filter_map(|injection| {
+            if volatile_payload_is_empty(&injection.payload) {
+                return None;
+            }
+            let mut object = serde_json::Map::new();
+            object.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_KIND
+                    .to_string(),
+                serde_json::Value::String(injection.kind.wire_kind()),
+            );
+            object.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_DELIVERY_CLASS
+                    .to_string(),
+                serde_json::to_value(injection.kind.delivery_class())
+                    .expect("volatile delivery class must serialize"),
+            );
+            object.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_PAYLOAD
+                    .to_string(),
+                injection.payload.clone(),
+            );
+            object.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_RUNTIME_VOLATILE_ROUND_INDEX
+                    .to_string(),
+                serde_json::json!(injection.round_index),
+            );
+            Some(serde_json::Value::Object(object))
+        })
+        .collect::<Vec<_>>();
+    (!items.is_empty()).then_some(serde_json::Value::Array(items))
 }
 
 /// Created by the CLI/host from session parameters; mutated by the runtime
@@ -1772,21 +1722,16 @@ pub struct AgenticLoopState {
     pub total_cache_read: u64,
     pub total_cache_creation: u64,
     pub total_tool_calls: u32,
-    pub total_evidence_tool_calls: u32,
+    pub total_observation_tool_calls: u32,
     pub has_any_usage: bool,
 
     // ── Turn management ──
     pub max_turns: usize,
     pub remaining_turns: usize,
-    /// Retry counter: model stopped producing text but had called tools
-    /// in prior rounds. Incremented by `execute_turn_and_ingest_phase`
-    /// when it retries the stop; capped by `RuntimePolicy::textless.max_retries`.
-    pub textless_stop_retries: u32,
     /// The `finish_reason` from the most recent LLM turn. `Some("length")`
     /// when the model hit its output token limit (prose truncated by the API);
     /// `Some("stop")` for natural completion; `None` on the first turn.
-    /// Used by textless-stop retry and terminal-text logic to distinguish
-    /// true silence from forced truncation.
+    /// Used by terminal-text logic to distinguish true silence from forced truncation.
     pub last_finish_reason: Option<String>,
     /// Latches for the per-budget self-pacing hints emitted at
     /// 50 % / 20 % remaining. Reset when a budget extension
@@ -2249,28 +2194,49 @@ impl AgenticLoopState {
     /// (a) isn't a genuine user / assistant / tool conversation turn and
     /// (b) changes across rounds or turns.
     ///
-    /// The injection rides `volatile_preamble` on the next call (see
-    /// `wire_assembly::assemble_llm_messages`) which keeps `messages[]`
-    /// byte-stable across rounds — the property Anthropic / DeepSeek
-    /// prompt caches rely on.
+    /// The injection rides the typed dynamic lane on the next call, which
+    /// keeps `messages[]` and the stable prompt prefix byte-stable across
+    /// rounds.
     ///
-    /// **Singleton kinds auto-dedup**: `WorkingSet`, `AlreadyFetched`,
-    /// and `ExplorationBudget` are snapshot-style — only the most
-    /// recent value matters. If one is already pending when a new one
+    /// **Singleton kinds auto-dedup**: snapshot-style signals such as
+    /// `AlreadyFetched` keep only their most recent value. If one is already pending when a new one
     /// is pushed, the old entry is replaced in place (preserving order
-    /// for other kinds). This mirrors the legacy `state.messages.retain()`
-    /// guard that producers used to write by hand.
+    /// for other kinds).
     ///
     /// Silently trims empty content so call sites can pass formatter
     /// output directly without a guard.
     pub fn push_volatile(&mut self, kind: VolatileKind, content: impl Into<String>) {
-        let content = content.into();
-        if content.trim().is_empty() {
+        let content = content.into().trim().to_string();
+        if content.is_empty() {
+            return;
+        }
+        let payload = if kind.delivery_class()
+            == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence
+        {
+            serde_json::json!({
+                "schema": "runtime_advisory.v1",
+                "signal": kind.wire_kind(),
+                "evidence": content,
+                "authority": "advisory_evidence_only",
+            })
+        } else {
+            Value::String(content)
+        };
+        self.push_volatile_payload(kind, payload);
+    }
+
+    /// Queue a structured runtime payload without flattening it to text at the
+    /// process boundary.
+    pub fn push_volatile_payload(&mut self, kind: VolatileKind, mut payload: Value) {
+        if let Value::String(text) = &mut payload {
+            *text = text.trim().to_string();
+        }
+        if volatile_payload_is_empty(&payload) {
             return;
         }
         let injection = VolatileInjection {
             kind,
-            content,
+            payload,
             round_index: self.current_round_index,
         };
         if kind.is_singleton() {
@@ -2298,121 +2264,6 @@ impl AgenticLoopState {
     #[must_use]
     pub fn take_volatile_pending(&mut self) -> Vec<VolatileInjection> {
         std::mem::take(&mut self.volatile_pending)
-    }
-
-    /// Drain the volatile lane and render it as a single `role=user`
-    /// message (or `None` when the lane is empty / whitespace-only).
-    ///
-    /// The CLI path (`cli_loop_host::execute_turn`) uses this to inject
-    /// runtime nudges into the outgoing HTTP payload right before
-    /// calling the bridge. Without it, 27 `push_volatile` sites —
-    /// including Task #42 force-stop, Task #43 wrap-up advisory,
-    /// circuit-breaker self-check, stall reflections, budget advisories,
-    /// and the corrective family — are silently dropped on `astra chat`
-    /// (session c47c2dca regression: 25-round churn where the model
-    /// never saw the Self-check prompt the stall system thought it
-    /// injected at round 12).
-    ///
-    /// `server_loop_host` has its own drain path via
-    /// `wire_assembly::assemble_llm_messages` and does NOT use this
-    /// method — callers should not double-drain.
-    ///
-    /// ⚠ **Callers that append this directly to an existing messages
-    /// vec** should prefer [`take_volatile_pending_appended_to`] instead,
-    /// which also handles the tail=role=user case (prepends rather
-    /// than appending to avoid consecutive-user protocol violations on
-    /// Bedrock/Anthropic).
-    #[must_use]
-    pub fn take_volatile_pending_as_message(&mut self) -> Option<serde_json::Value> {
-        let drained = self.take_volatile_pending();
-        if drained.is_empty() {
-            return None;
-        }
-        let mut rendered = String::new();
-        for inj in &drained {
-            if !inj.kind.render_in_user_tail() {
-                continue;
-            }
-            let text = inj.content.trim();
-            if text.is_empty() {
-                continue;
-            }
-            if !rendered.is_empty() {
-                rendered.push_str("\n\n");
-            }
-            rendered.push_str(text);
-        }
-        if rendered.is_empty() {
-            return None;
-        }
-        Some(serde_json::json!({
-            "role": "user",
-            "content": rendered,
-        }))
-    }
-
-    /// Drain the volatile lane and splice its rendered text into a
-    /// copy of `base` that's protocol-safe for every provider we
-    /// support. Returns `None` when the lane is empty (caller can use
-    /// `base` as-is).
-    ///
-    /// Shape rule:
-    ///   * If `base` is empty or its tail is NOT `role=user`: append a
-    ///     fresh `role=user` msg carrying the rendered text.
-    ///   * If the tail IS already `role=user`: prepend the rendered
-    ///     text to that message's content (preserving the original
-    ///     query). This avoids creating consecutive-user-role messages,
-    ///     which Bedrock rejects with HTTP 400
-    ///     (`"expected role to alternate …"`).
-    ///
-    /// Prefer this over [`take_volatile_pending_as_message`] +
-    /// `push` in CLI paths — the latter produces invalid payloads for
-    /// any turn where the user has just typed a query (fresh turn
-    /// r0 state).
-    #[must_use]
-    pub fn take_volatile_pending_appended_to(
-        &mut self,
-        base: Vec<serde_json::Value>,
-    ) -> Option<Vec<serde_json::Value>> {
-        let volatile_msg = self.take_volatile_pending_as_message()?;
-        let volatile_text = volatile_msg
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let mut augmented = base;
-        // Single-pass: bind the mutable reference and check the role through
-        // it so we never have to re-`last_mut().expect(...)`. If the borrow
-        // matches and we have non-empty volatile text, prepend in-place;
-        // otherwise the function-level `else` branch appends. This makes
-        // the previous "tail_is_user → non-empty" invariant unrepresentable.
-        let prepended = augmented.last_mut().is_some_and(|last| {
-            if last.get("role").and_then(serde_json::Value::as_str) != Some("user")
-                || volatile_text.is_empty()
-            {
-                return false;
-            }
-            // Prepend into the last user msg so we don't create
-            // `[user, user]` which breaks Bedrock/Anthropic alternation.
-            let existing = last
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let merged = if existing.is_empty() {
-                volatile_text.clone()
-            } else {
-                format!("{volatile_text}\n\n{existing}")
-            };
-            last["content"] = serde_json::Value::String(merged);
-            true
-        });
-        if !prepended {
-            // Safe to append — tail is assistant/tool (tool-loop case),
-            // base was empty, or volatile text was empty.
-            augmented.push(volatile_msg);
-        }
-        Some(augmented)
     }
 
     /// Append an LLM-round summary to the in-memory ring (capped at
@@ -2516,10 +2367,10 @@ fn force_text_only_harness_finalization<H: AgenticLoopHost>(
     for name in host.valid_tool_names() {
         state.restricted_tools.insert(name.clone());
     }
-    state.messages.push(serde_json::json!({
-        "role": "user",
-        "content": harness_pause_finalization_message(reason, &state.message),
-    }));
+    state.push_volatile(
+        VolatileKind::HarnessBoundary,
+        harness_pause_finalization_message(reason, &state.message),
+    );
 }
 
 #[cfg(feature = "harness")]
@@ -2565,6 +2416,45 @@ pub enum AgenticLoopOutcome {
     /// The caller should provide the requested input and re-invoke the loop.
     // Preserved for dispatcher/adapter contract even though the core loop doesn't emit it in non-test builds yet.
     Waiting(String),
+}
+
+/// Project the runtime loop's terminal state into the typed isolated-skill
+/// contract shared by CLI and Server hosts.
+///
+/// Text is intentionally not inspected.  In particular, a non-empty partial
+/// answer does not promote an interrupted child to `Completed`, and an empty
+/// answer does not by itself decide lifecycle state.
+pub fn project_skill_subrun_outcome(
+    outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
+    state: &AgenticLoopState,
+) -> astra_skills::executor::isolated::SubRunOutcome {
+    use astra_skills::executor::isolated::SubRunOutcome;
+
+    let interruption_reason = || {
+        state
+            .interruption
+            .as_ref()
+            .map(|interruption| interruption.kind.label().to_string())
+    };
+
+    match outcome {
+        Ok(AgenticLoopOutcome::Completed) => interruption_reason()
+            .map_or(SubRunOutcome::Completed, |finish_reason| {
+                SubRunOutcome::Interrupted { finish_reason }
+            }),
+        Ok(AgenticLoopOutcome::Waiting(reason)) => SubRunOutcome::Interrupted {
+            finish_reason: interruption_reason().unwrap_or_else(|| reason.clone()),
+        },
+        Ok(AgenticLoopOutcome::Cancelled) => SubRunOutcome::Cancelled {
+            reason: interruption_reason().unwrap_or_else(|| "cancelled".to_string()),
+        },
+        Ok(AgenticLoopOutcome::Error(error)) => SubRunOutcome::Failed {
+            error: error.clone(),
+        },
+        Err(error) => SubRunOutcome::Failed {
+            error: error.to_string(),
+        },
+    }
 }
 
 // ─── Delegation support ──────────────────────────────────────────────────────
@@ -2919,10 +2809,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     reason = %reason,
                     "harness pause recovered at PostTurn — injecting checkpoint guidance"
                 );
-                state.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": reason,
-                }));
+                state.push_volatile(VolatileKind::HarnessBoundary, reason);
                 apply_harness_pause_recovery_threshold(state, recovery_threshold);
                 // Fall through to continue the loop
             }
@@ -3096,9 +2983,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         total_cache_read: 0,
         total_cache_creation: 0,
         total_tool_calls: 0,
-        total_evidence_tool_calls: 0,
+        total_observation_tool_calls: 0,
         has_any_usage: false,
-        textless_stop_retries: 0,
         last_finish_reason: None,
         max_turns: 10,
         remaining_turns: 10,
@@ -3204,7 +3090,7 @@ pub(crate) mod tests {
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
 
-    fn edge_runtime_environment_fields() -> serde_json::Map<String, Value> {
+    pub(crate) fn edge_runtime_environment_fields() -> serde_json::Map<String, Value> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
             astra_runtime_env::RunBinding::edge_developer("/workspace/project", &registry),
@@ -3272,7 +3158,6 @@ pub(crate) mod tests {
             mutates_workspace,
             exploratory_task,
             complexity,
-            true,
         )
     }
 
@@ -3681,7 +3566,7 @@ pub(crate) mod tests {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
@@ -3728,7 +3613,6 @@ pub(crate) mod tests {
             recent_tools: Vec::new(),
             turn_intent: None,
             task_profile: TaskExecutionProfile::default(),
-            textless_stop_retries: 0,
             last_finish_reason: None,
             last_turn_policy: TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
@@ -3881,16 +3765,14 @@ pub(crate) mod tests {
             ]
         );
         assert!(snapshot.has_unfinished_tasks());
-        assert!(snapshot.has_completion_blocking_tasks());
-        assert!(snapshot.requires_settlement_intervention());
+        assert!(snapshot.has_paused_or_blocked_tasks());
         assert!(!snapshot.all_tracked_tasks_completed());
         assert!(snapshot.short_summary().contains("task(s) remain"));
         assert_eq!(
             snapshot.status_count_summary(),
             "1 in_progress, 1 pending task(s) remain"
         );
-        assert!(VolatileKind::TaskBoardCompletionGate.is_singleton());
-        assert!(VolatileKind::TaskBoardStartGate.is_singleton());
+        assert!(VolatileKind::TaskBoardAdvisory.is_singleton());
     }
 
     #[test]
@@ -3970,16 +3852,12 @@ pub(crate) mod tests {
             vec!["task-1 waiting [pending]".to_string()]
         );
         assert!(snapshot.has_unfinished_tasks());
-        assert!(
-            !snapshot.has_completion_blocking_tasks(),
-            "pending-only task board is backlog, not an active completion blocker"
-        );
-        assert!(!snapshot.requires_settlement_intervention());
+        assert!(!snapshot.has_paused_or_blocked_tasks());
         assert!(!snapshot.all_tracked_tasks_completed());
     }
 
     #[test]
-    fn task_board_snapshot_in_progress_reconciles_but_does_not_require_intervention() {
+    fn task_board_snapshot_in_progress_is_unfinished_without_paused_or_blocked_state() {
         let snapshot = TaskBoardSnapshot::from_active_tasks(&[SessionTask {
             archived_at: None,
             id: "task-1".to_string(),
@@ -3997,14 +3875,7 @@ pub(crate) mod tests {
         }]);
 
         assert!(snapshot.has_unfinished_tasks());
-        assert!(
-            snapshot.has_completion_blocking_tasks(),
-            "in-progress work should still trigger one model reconciliation round"
-        );
-        assert!(
-            !snapshot.requires_settlement_intervention(),
-            "in-progress bookkeeping alone must not pause a run after a final answer exists"
-        );
+        assert!(!snapshot.has_paused_or_blocked_tasks());
     }
 
     #[test]
@@ -4028,8 +3899,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.tracked_count, 1);
         assert_eq!(snapshot.completed_count, 1);
         assert!(!snapshot.has_unfinished_tasks());
-        assert!(!snapshot.has_completion_blocking_tasks());
-        assert!(!snapshot.requires_settlement_intervention());
+        assert!(!snapshot.has_paused_or_blocked_tasks());
         assert!(snapshot.all_tracked_tasks_completed());
     }
 
@@ -4054,8 +3924,7 @@ pub(crate) mod tests {
         assert_eq!(snapshot.tracked_count, 1);
         assert_eq!(snapshot.paused_count, 1);
         assert!(snapshot.has_unfinished_tasks());
-        assert!(snapshot.has_completion_blocking_tasks());
-        assert!(snapshot.requires_settlement_intervention());
+        assert!(snapshot.has_paused_or_blocked_tasks());
         assert!(!snapshot.all_tracked_tasks_completed());
         assert_eq!(snapshot.status_count_summary(), "1 paused task(s) remain");
     }
@@ -4119,7 +3988,7 @@ pub(crate) mod tests {
     // ── Original tests ──────────────────────────────────────────────────────
 
     #[test]
-    fn interaction_policy_only_counts_visible_evidence_tools() {
+    fn interaction_policy_only_counts_visible_observation_tools() {
         let policy = TurnInteractionPolicy::from_visible_tool_names(
             TurnInteractionMode::Prompt,
             vec![
@@ -4132,7 +4001,7 @@ pub(crate) mod tests {
         assert!(policy.allow_ask_user);
         assert!(policy.can_pause_for_user);
         assert_eq!(
-            policy.evidence_tool_names,
+            policy.observation_tool_names,
             vec!["mo".to_string(), "read_file".to_string()]
         );
     }
@@ -4361,12 +4230,11 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn off_target_final_after_successful_tool_retries_synthesis() {
+    async fn off_target_final_after_successful_tool_is_preserved_without_guard_retry() {
         let bad_answer = "Session context was unavailable or incomplete in this runtime \
             (degraded resume — no prior prompt-facing history restored). Workspace is bound \
             and ready at /Users/xupeng/github/astra with the executor online.\n\n\
             Awaiting your next instruction.";
-        let good_answer = "当前目录下的子目录包括 rust、web、plans。";
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_edge_tool("list_dir", "rust/\nweb/\nplans/\n")],
@@ -4375,7 +4243,6 @@ pub(crate) mod tests {
                 Some(50),
             ),
             text_result(bad_answer, 15, 5, Some(30)),
-            text_result(good_answer, 15, 5, Some(30)),
         ]);
         let mut state = make_state();
         state.message = "有哪些子目录".to_string();
@@ -4386,16 +4253,17 @@ pub(crate) mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "expected Ok but got: {:?}", outcome);
-        assert_eq!(host.current_turn, 3);
-        assert_eq!(state.final_text, good_answer);
+        assert_eq!(host.current_turn, 2);
         assert!(
-            !state.messages.iter().any(|msg| msg
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| content.contains("Session context was unavailable"))),
-            "{:?}",
-            state.messages
+            state.final_text.starts_with(bad_answer),
+            "model output must be preserved without a guard-driven retry: {}",
+            state.final_text
         );
+        assert!(state.messages.iter().any(|msg| {
+            msg.get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("Session context was unavailable"))
+        }));
     }
 
     #[tokio::test]
@@ -4644,10 +4512,14 @@ pub(crate) mod tests {
         assert_eq!(state.max_turns, 4);
         assert_eq!(state.final_text, "completed after extension");
         assert!(
-            state
-                .volatile_pending
-                .iter()
-                .any(|inj| inj.content.contains("Budget review")),
+            state.volatile_pending.iter().any(|inj| {
+                inj.kind == VolatileKind::BudgetUpdate
+                    && inj.payload["schema"] == "runtime_budget_update.v1"
+                    && inj.payload["event"] == "turn_budget_extended"
+                    && inj.payload["additional_turns"] == 2
+                    && inj.payload["current"]["max_turns"] == 4
+                    && inj.payload["authority"] == "runtime_budget_fact"
+            }),
             "budget-review injection expected in volatile_pending; got {:?}",
             state.volatile_pending,
         );
@@ -4731,7 +4603,7 @@ pub(crate) mod tests {
                 injections: vec!["stall detected".into()],
                 avoid_tools: vec!["write_file".into()],
                 health_avoidance_tools: vec![],
-                force_stop: false,
+                advisory_threshold_reached: false,
                 nudge_count: 1,
                 interaction_mode: "prompt".into(),
                 suppressed_loop_nudges: false,
@@ -4806,10 +4678,14 @@ pub(crate) mod tests {
         assert_eq!(state.max_turns, 4);
         assert_eq!(state.final_text, "completed after exploratory extension");
         assert!(
-            state
-                .volatile_pending
-                .iter()
-                .any(|inj| inj.content.contains("Budget review")),
+            state.volatile_pending.iter().any(|inj| {
+                inj.kind == VolatileKind::BudgetUpdate
+                    && inj.payload["schema"] == "runtime_budget_update.v1"
+                    && inj.payload["event"] == "turn_budget_extended"
+                    && inj.payload["additional_turns"] == 2
+                    && inj.payload["current"]["max_turns"] == 4
+                    && inj.payload["authority"] == "runtime_budget_fact"
+            }),
             "budget-review injection expected in volatile_pending; got {:?}",
             state.volatile_pending,
         );
@@ -5074,7 +4950,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn session_id_captured_from_sse_accum() {
+    async fn first_streamed_session_id_binds_turn_state_and_observability_events() {
         let mut host = MockHost::new(vec![HostTurnResult {
             accum: ChatTurnSseAccum {
                 full_text: "hello".to_string(),
@@ -5094,6 +4970,20 @@ pub(crate) mod tests {
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert_eq!(state.current_session_id, Some("sess-42".to_string()));
         assert_eq!(state.current_run_id, Some("run-7".to_string()));
+        let events = state
+            .turn_event_buffer
+            .as_mut()
+            .expect("turn event buffer")
+            .drain();
+        assert!(
+            !events.is_empty(),
+            "first turn should emit observability events"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| { event.session_id.as_deref() == Some("sess-42") })
+        );
     }
 
     // ── Headless round integration tests ────────────────────────────────────
@@ -5558,6 +5448,66 @@ pub(crate) mod tests {
         assert_eq!(variants.len(), 4);
     }
 
+    #[test]
+    fn skill_subrun_projection_uses_typed_loop_and_interruption_state() {
+        use astra_skills::executor::isolated::SubRunOutcome;
+        use astra_turn_core::interruption::{
+            InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+        };
+
+        let mut state = make_state();
+        let completed = project_skill_subrun_outcome(&Ok(AgenticLoopOutcome::Completed), &state);
+        assert_eq!(completed, SubRunOutcome::Completed);
+
+        state.interruption = Some(InterruptionRecord::new(
+            InterruptionKind::BudgetExhausted,
+            ResumeAction::ContinueImmediately,
+            InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 2,
+                turns_completed: 3,
+                remaining_turns: 0,
+                error_detail: None,
+                stall_signal: None,
+                resume_restricted_tools: vec![],
+            },
+        ));
+        let partial = project_skill_subrun_outcome(&Ok(AgenticLoopOutcome::Completed), &state);
+        assert_eq!(
+            partial,
+            SubRunOutcome::Interrupted {
+                finish_reason: "budget_exhausted".to_string()
+            }
+        );
+
+        state.interruption = None;
+        let waiting = project_skill_subrun_outcome(
+            &Ok(AgenticLoopOutcome::Waiting("approval_required".to_string())),
+            &state,
+        );
+        assert_eq!(
+            waiting,
+            SubRunOutcome::Interrupted {
+                finish_reason: "approval_required".to_string()
+            }
+        );
+        assert_eq!(
+            project_skill_subrun_outcome(&Ok(AgenticLoopOutcome::Cancelled), &state),
+            SubRunOutcome::Cancelled {
+                reason: "cancelled".to_string()
+            }
+        );
+        assert_eq!(
+            project_skill_subrun_outcome(
+                &Ok(AgenticLoopOutcome::Error("provider failed".to_string())),
+                &state,
+            ),
+            SubRunOutcome::Failed {
+                error: "provider failed".to_string()
+            }
+        );
+    }
+
     // ── Delegation passthrough / E2E tests ──────────────────────────────────
 
     #[tokio::test]
@@ -5814,7 +5764,13 @@ pub(crate) mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
-        assert_eq!(state.final_text, "Recovered after bad delegation.");
+        assert!(
+            state
+                .final_text
+                .starts_with("Recovered after bad delegation."),
+            "model output must be preserved even when evaluation adds an incompleteness notice: {}",
+            state.final_text
+        );
 
         // Error message should be injected as tool result
         let error_msg = state
@@ -5899,14 +5855,7 @@ pub(crate) mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
-        assert!(state.final_text.starts_with("Passed through."));
-        assert!(
-            state
-                .final_text
-                .contains("unresolved tool/runtime failure(s): blocked_tool x1"),
-            "{}",
-            state.final_text
-        );
+        assert_eq!(state.final_text, "Passed through.");
     }
 
     #[tokio::test]
@@ -7387,8 +7336,9 @@ pub(crate) mod tests {
         // the lane AFTER the loop; MockHost's execute_turn never
         // drains it, so fires accumulate there for tests to observe.
         let has_resume_directive = state.volatile_pending.iter().any(|inj| {
-            inj.content.contains("Context compacted")
-                && inj.content.to_lowercase().contains("continue")
+            inj.payload.as_str().is_some_and(|text| {
+                text.contains("Context compacted") && text.to_lowercase().contains("continue")
+            })
         });
         assert!(
             has_resume_directive,
@@ -7401,7 +7351,12 @@ pub(crate) mod tests {
                 .iter()
                 .map(|inj| (
                     format!("{:?}", inj.kind),
-                    inj.content.chars().take(80).collect::<String>()
+                    inj.payload
+                        .as_str()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(80)
+                        .collect::<String>()
                 ))
                 .collect::<Vec<_>>()
         );
@@ -7780,25 +7735,23 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
 
-        // Verify: hook context was injected as the first message (before user message)
-        let first_msg = &state.messages[0];
-        let content = first_msg["content"].as_str().unwrap();
-        assert!(
-            content.contains("Branch: main"),
-            "first message should contain hook context, got: {content}"
-        );
-        assert!(
-            content.contains("[Session hooks]"),
-            "should be tagged as session hooks"
-        );
-
-        // Verify: user message follows the hook context
-        let user_msg = state
-            .messages
+        // Hook context uses required runtime context and leaves history clean.
+        assert_eq!(state.messages[0]["role"], "user");
+        assert_eq!(state.messages[0]["content"], "hello");
+        let hook_context = state
+            .volatile_pending
             .iter()
-            .find(|m| m["role"] == "user")
-            .expect("should have user message");
-        assert_eq!(user_msg["content"], "hello");
+            .find(|injection| injection.kind == VolatileKind::SessionHookContext)
+            .expect("session hook context");
+        assert_eq!(
+            hook_context.kind.delivery_class(),
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+        );
+        assert!(
+            hook_context.payload["context"]
+                .as_str()
+                .is_some_and(|content| content.contains("Branch: main"))
+        );
 
         // Verify: final text includes the greeting
         assert!(state.final_text.contains("Hello xupeng"));
@@ -7876,7 +7829,13 @@ pub(crate) mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        let first_content = state.messages[0]["content"].as_str().unwrap();
+        assert_eq!(state.messages[0]["content"], "hi");
+        let first_content = state
+            .volatile_pending
+            .iter()
+            .find(|injection| injection.kind == VolatileKind::SessionHookContext)
+            .and_then(|injection| injection.payload["context"].as_str())
+            .expect("merged session hook context");
         assert!(
             first_content.contains("3 uncommitted"),
             "should contain first hook context"
@@ -7917,12 +7876,12 @@ pub(crate) mod tests {
         );
         assert_eq!(state.final_text, "Hello!");
 
-        // No hook context injected (hook failed)
+        assert_eq!(state.messages[0]["content"], "hello");
         assert!(
-            !state.messages[0]["content"]
-                .as_str()
-                .unwrap_or("")
-                .contains("[Session hooks]"),
+            state
+                .volatile_pending
+                .iter()
+                .all(|injection| injection.kind != VolatileKind::SessionHookContext),
             "failed hook should not inject context"
         );
     }
@@ -7980,7 +7939,13 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        let first_content = state.messages[0]["content"].as_str().unwrap();
+        assert_eq!(state.messages[0]["content"], "analyze my code");
+        let first_content = state
+            .volatile_pending
+            .iter()
+            .find(|injection| injection.kind == VolatileKind::SessionHookContext)
+            .and_then(|injection| injection.payload["context"].as_str())
+            .expect("session hook context");
         assert!(
             first_content.contains("user said: analyze my code"),
             "hook should receive the user message, got: {first_content}"
@@ -8974,6 +8939,21 @@ mod observability_e2e_tests {
     }
 
     fn turn_with_tools(tools: &[&str], text: &str) -> HostTurnResult {
+        let edge_tool_round = tools
+            .iter()
+            .map(|name| {
+                let args = json!({"path": format!("/tmp/{name}.txt")});
+                EdgeToolExecResult {
+                    request_id: format!("call-{name}"),
+                    tool: (*name).to_string(),
+                    args,
+                    output: format!("{name} completed"),
+                    tool_result_fields: Some(edge_runtime_environment_fields()),
+                    status: "completed".to_string(),
+                    duration_ms: 10,
+                }
+            })
+            .collect();
         HostTurnResult {
             accum: ChatTurnSseAccum {
                 full_text: text.to_string(),
@@ -8986,7 +8966,7 @@ mod observability_e2e_tests {
                 ..Default::default()
             },
             ttft_ms: Some(50),
-            edge_tool_round: Vec::new(),
+            edge_tool_round,
             error_kind: None,
         }
     }
@@ -9031,7 +9011,7 @@ mod observability_e2e_tests {
             .stall
             .tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
+            .filter(|r| r.was_executed())
             .collect();
         assert!(
             !records.is_empty(),
@@ -9097,7 +9077,7 @@ mod observability_e2e_tests {
             .stall
             .tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
+            .filter(|r| r.was_executed())
             .collect();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].round, Some(0));
@@ -9198,7 +9178,7 @@ mod parallel_execution_tests {
         } else if name == "git" {
             json!({"action": "diff", "path": format!("/tmp/{id}.txt")})
         } else {
-            json!({"path": format!("/tmp/{name}.txt")})
+            json!({"path": format!("/tmp/{id}.txt")})
         };
         json!({
             "id": id,
@@ -9211,6 +9191,27 @@ mod parallel_execution_tests {
     }
 
     fn turn_with_named_tools(tools: &[(&str, &str)], text: &str) -> HostTurnResult {
+        let edge_tool_round = tools
+            .iter()
+            .map(|(name, id)| {
+                let args = if *name == "bash" {
+                    json!({"command": "true"})
+                } else if *name == "git" {
+                    json!({"action": "diff", "path": format!("/tmp/{id}.txt")})
+                } else {
+                    json!({"path": format!("/tmp/{id}.txt")})
+                };
+                EdgeToolExecResult {
+                    request_id: (*id).to_string(),
+                    tool: (*name).to_string(),
+                    args,
+                    output: format!("{name} completed"),
+                    tool_result_fields: Some(edge_runtime_environment_fields()),
+                    status: "completed".to_string(),
+                    duration_ms: 10,
+                }
+            })
+            .collect();
         HostTurnResult {
             accum: ChatTurnSseAccum {
                 full_text: text.to_string(),
@@ -9226,7 +9227,7 @@ mod parallel_execution_tests {
                 ..Default::default()
             },
             ttft_ms: Some(50),
-            edge_tool_round: Vec::new(),
+            edge_tool_round,
             error_kind: None,
         }
     }
@@ -9245,15 +9246,15 @@ mod parallel_execution_tests {
             ("read_file", "c1"),
             ("grep", "c2"),
             ("glob", "c3"),
-            ("git_status", "c4"),
-            ("git_diff", "c5"),
+            ("git", "c4"),
+            ("git", "c5"),
             ("read_file", "c6"),
         ];
         let mut host = MockHost::new(vec![
             turn_with_named_tools(&tools, ""),
             turn_with_named_tools(&[], "done"),
         ])
-        .with_valid_tools(&["read_file", "grep", "glob", "git_status", "git_diff"]);
+        .with_valid_tools(&["read_file", "grep", "glob", "git"]);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state)
             .await
@@ -9264,9 +9265,14 @@ mod parallel_execution_tests {
             .stall
             .tool_call_records
             .iter()
-            .filter(|r| !r.is_synthetic_placeholder())
+            .filter(|r| r.was_executed())
             .collect();
-        assert_eq!(records.len(), 6, "expected 6 tool call records");
+        assert_eq!(
+            records.len(),
+            6,
+            "expected 6 executed tool call records; all records: {:#?}",
+            state.stall.tool_call_records
+        );
 
         // All should be in round 0, all parallel, all same batch_id.
         for rec in &records {
@@ -9369,258 +9375,30 @@ mod parallel_execution_tests {
         assert!(matches!(&batches[2], ToolBatch::Concurrent(v) if v.len() == 2));
     }
 
-    /// audit-#8: source-level guard against the panicking subtraction.
     #[test]
-    fn turn_count_uses_saturating_sub() {
-        let source = include_str!("host.rs");
-        assert!(
-            source.contains("state.max_turns.saturating_sub(state.remaining_turns)"),
-            "expected saturating_sub in agentic_loop_host"
-        );
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Session c47c2dca REGRESSION: the chat-turn adapter path must drain the
-    // structured volatile lane so runtime nudges reach the LLM.
-    //
-    // 65606b95 migrated 27 runtime injection sites from
-    // `state.messages.push(...)` to `state.push_volatile(Kind, content)`.
-    // `server_loop_host` drains via `wire_assembly::assemble_llm_messages`,
-    // but the CLI `astra chat` path NEVER drained the
-    // lane — every Self-check, force-stop, budget-advisory, corrective,
-    // stall-nudge, working-set snapshot, etc. was silently dropped.
-    //
-    // Fix contract: `AgenticLoopState` must expose a single method the CLI
-    // can call right before it hands messages to the bridge HTTP request,
-    // which:
-    //   1. Drains `volatile_pending` (empty lane afterward).
-    //   2. Renders its contents into a single role=user message.
-    //   3. Returns `None` when the lane is empty (no-op callers).
-    //
-    // Without this test, the regression could silently return any time
-    // someone re-adds a `push_volatile` caller without realizing the CLI
-    // consumer-side plumbing is required.
-    // ═══════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn take_volatile_pending_as_message_returns_none_when_lane_empty() {
+    fn policy_advisory_is_singleton_and_structurally_typed() {
         let mut state = make_state();
-        assert!(state.volatile_pending.is_empty());
-        assert!(
-            state.take_volatile_pending_as_message().is_none(),
-            "empty lane must return None so callers can skip the injection"
-        );
-    }
-
-    #[test]
-    fn take_volatile_pending_as_message_drains_and_wraps_user_role() {
-        let mut state = make_state();
-        state.push_volatile(
-            VolatileKind::CircuitBreaker,
-            "[Self-check — round 12] You have been reading for 12 rounds. Decide and answer.",
-        );
-        state.push_volatile(
-            VolatileKind::ParallelBatchingForce,
-            "## ⚠ Parallel batching force: batch the next 3 independent calls together.",
-        );
-        assert_eq!(state.volatile_pending.len(), 2, "precondition: 2 queued");
-
-        let msg = state
-            .take_volatile_pending_as_message()
-            .expect("lane with content must produce a user message");
-
-        // Lane drained (next LLM call starts clean).
-        assert!(
-            state.volatile_pending.is_empty(),
-            "take_* must empty the lane"
+        assert!(VolatileKind::PolicyAdvisory.is_singleton());
+        assert_eq!(
+            VolatileKind::PolicyAdvisory.delivery_class(),
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence,
         );
 
-        // Wrapped as role=user so the bridge/provider treats it as a user turn.
-        assert_eq!(msg["role"], "user");
-
-        // Content includes BOTH nudges so the model sees every runtime
-        // signal queued this round.
-        let content = msg["content"].as_str().unwrap();
-        assert!(
-            content.contains("Self-check"),
-            "circuit-breaker nudge must appear: {content}"
+        state.push_volatile(VolatileKind::PolicyAdvisory, "first advisory");
+        state.push_volatile(VolatileKind::PolicyAdvisory, "second advisory");
+        assert_eq!(
+            state.volatile_pending.len(),
+            1,
+            "policy advisory must replace within a call instead of accumulating cache noise"
         );
-        assert!(
-            content.contains("Parallel batching force"),
-            "parallel-batching nudge must appear: {content}"
-        );
-    }
-
-    #[test]
-    fn take_volatile_pending_as_message_is_idempotent_second_call_none() {
-        let mut state = make_state();
-        state.push_volatile(VolatileKind::StallNudge, "⚠ REFLECTION");
-        assert!(state.take_volatile_pending_as_message().is_some());
-        assert!(
-            state.take_volatile_pending_as_message().is_none(),
-            "second take must be None — lane was drained"
-        );
-    }
-
-    #[test]
-    fn take_volatile_pending_as_message_excludes_self_status_telemetry() {
-        let mut state = make_state();
-        state.push_volatile(
-            VolatileKind::SelfStatus,
-            "## ⚡ Self-Status\nTurn 9/299 | Cache: 86%",
-        );
-        state.push_volatile(VolatileKind::Corrective, "answer the latest question");
-
-        let msg = state
-            .take_volatile_pending_as_message()
-            .expect("corrective content should still render");
-        let content = msg["content"].as_str().unwrap();
-        assert_eq!(msg["role"], "user");
-        assert!(content.contains("answer the latest question"));
-        assert!(
-            !content.contains("Self-Status"),
-            "runtime telemetry must not be sent as a user message: {content}"
-        );
-    }
-
-    #[test]
-    fn take_volatile_pending_appended_to_merges_into_tail_user() {
-        // Tail is role=user (fresh turn r0 pattern): appending a new
-        // role=user would be consecutive-user → Bedrock HTTP 400. The
-        // method must prepend into the existing user msg instead.
-        let mut state = make_state();
-        state.push_volatile(VolatileKind::StallNudge, "⚠ REFLECTION: stale reads");
-        let base = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "do the task"}),
-        ];
-        let out = state
-            .take_volatile_pending_appended_to(base)
-            .expect("lane non-empty → Some");
-        // Still two msgs — the pivot was merged, not appended.
-        assert_eq!(out.len(), 2, "no new msg appended when tail is user");
-        let last = &out[1];
-        assert_eq!(last["role"], "user");
-        let content = last["content"].as_str().unwrap();
-        assert!(
-            content.contains("⚠ REFLECTION"),
-            "volatile must be prepended to tail user content"
-        );
-        assert!(
-            content.contains("do the task"),
-            "original user content must be preserved"
-        );
-        assert!(
-            content.starts_with("⚠ REFLECTION"),
-            "volatile comes BEFORE existing user content"
-        );
-    }
-
-    #[test]
-    fn take_volatile_pending_appended_to_appends_when_tail_is_tool() {
-        // Tool-loop pattern: tail is role=tool (tool_result). Safe to
-        // append a fresh role=user msg — no alternation conflict.
-        let mut state = make_state();
-        state.push_volatile(VolatileKind::CircuitBreaker, "[Self-check — round 12]");
-        let base = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "original task"}),
-            json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{"id":"c1","function":{"name":"bash","arguments":"{}"}}]
-            }),
-            json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
-        ];
-        let out = state.take_volatile_pending_appended_to(base).unwrap();
-        assert_eq!(out.len(), 5, "fresh msg appended after tool_result");
-        let last = out.last().unwrap();
-        assert_eq!(last["role"], "user");
-        assert!(last["content"].as_str().unwrap().contains("Self-check"));
-        // Historical task msg untouched.
-        assert_eq!(out[1]["content"], "original task");
-    }
-
-    #[test]
-    fn take_volatile_pending_appended_to_returns_none_when_lane_empty() {
-        let mut state = make_state();
-        let base = vec![json!({"role": "user", "content": "hi"})];
-        assert!(
-            state.take_volatile_pending_appended_to(base).is_none(),
-            "empty lane → caller uses its base as-is"
-        );
-    }
-
-    #[test]
-    fn take_volatile_pending_appended_to_appends_when_base_empty() {
-        let mut state = make_state();
-        state.push_volatile(VolatileKind::Corrective, "only nudge");
-        let out = state
-            .take_volatile_pending_appended_to(Vec::new())
-            .expect("lane non-empty");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["role"], "user");
-        assert!(out[0]["content"].as_str().unwrap().contains("only nudge"));
-    }
-
-    #[test]
-    fn take_volatile_pending_appended_to_never_creates_consecutive_user_roles() {
-        // Explicit protocol invariant — the LLM-facing payload must
-        // alternate assistant/user. Violations → Bedrock HTTP 400.
-        // Regression guard: whatever the base shape, the output must
-        // not contain adjacent role=user pairs.
-        for base in [
-            // Fresh-turn (tail=user)
-            vec![
-                json!({"role": "system", "content": "sys"}),
-                json!({"role": "user", "content": "q"}),
-            ],
-            // Tool-loop (tail=tool)
-            vec![
-                json!({"role": "user", "content": "q"}),
-                json!({"role": "assistant", "content": null, "tool_calls": []}),
-                json!({"role": "tool", "tool_call_id": "c1", "content": "out"}),
-            ],
-            // Assistant-tail (rare — between rounds)
-            vec![
-                json!({"role": "user", "content": "q"}),
-                json!({"role": "assistant", "content": "a"}),
-            ],
-        ] {
-            let mut state = make_state();
-            state.push_volatile(VolatileKind::Corrective, "injected");
-            let out = state
-                .take_volatile_pending_appended_to(base.clone())
-                .expect("lane non-empty");
-            // Walk adjacent pairs; neither can be role=user twice.
-            for window in out.windows(2) {
-                let r0 = window[0].get("role").and_then(Value::as_str);
-                let r1 = window[1].get("role").and_then(Value::as_str);
-                assert!(
-                    !(r0 == Some("user") && r1 == Some("user")),
-                    "consecutive user-role messages created for base={base:?} → out={out:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn take_volatile_pending_as_message_skips_empty_entries() {
-        // `push_volatile` already trims empty; simulating the edge where
-        // we end up with whitespace-only content should still not crash.
-        let mut state = make_state();
-        state.push_volatile(VolatileKind::Corrective, "real content");
-        // whitespace-only skipped by push_volatile
-        state.push_volatile(VolatileKind::Other, "   ");
-        let msg = state
-            .take_volatile_pending_as_message()
-            .expect("non-empty content should produce a message");
-        let content = msg["content"].as_str().unwrap();
-        assert!(content.contains("real content"));
-        assert!(
-            !content.trim().is_empty(),
-            "rendered content must not be empty whitespace: {content:?}"
-        );
+        let value = super::runtime_volatile_injections_edge_profile_value(&state.volatile_pending)
+            .expect("policy advisory should serialize to typed edge_profile lane");
+        assert_eq!(value[0]["kind"], "policy_advisory");
+        assert_eq!(value[0]["delivery_class"], "advisory_evidence");
+        assert_eq!(value[0]["payload"]["schema"], "runtime_advisory.v1");
+        assert_eq!(value[0]["payload"]["signal"], "policy_advisory");
+        assert_eq!(value[0]["payload"]["evidence"], "second advisory");
+        assert_eq!(value[0]["payload"]["authority"], "advisory_evidence_only");
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -9629,7 +9407,7 @@ mod parallel_execution_tests {
 
     #[test]
     fn singleton_volatile_replaces_not_appends_on_wire() {
-        // Critical for prompt cache: pushing two IntentDrift corrections
+        // Critical for prompt cache: pushing two IntentDrift advisories
         // in the same round must REPLACE, not APPEND. Otherwise the wire
         // format changes every round drift is detected, breaking the cache
         // prefix stability.
@@ -9648,8 +9426,10 @@ mod parallel_execution_tests {
             .iter()
             .find(|entry| entry.kind == VolatileKind::IntentDrift)
             .expect("intent drift singleton")
-            .content
-            .as_str();
+            .payload
+            .get("evidence")
+            .and_then(Value::as_str)
+            .expect("intent drift payload text");
         assert!(
             content.contains("second"),
             "replacement must keep the LATEST correction, got: {content}"
@@ -9659,8 +9439,10 @@ mod parallel_execution_tests {
             .iter()
             .find(|entry| entry.kind == VolatileKind::ContextPressure)
             .expect("context pressure singleton")
-            .content
-            .as_str();
+            .payload
+            .get("evidence")
+            .and_then(Value::as_str)
+            .expect("context pressure payload text");
         assert!(
             pressure_content.contains("71"),
             "context pressure singleton must keep the latest guidance, got: {pressure_content}"
@@ -9689,19 +9471,19 @@ mod parallel_execution_tests {
     }
 
     #[test]
-    fn forced_intent_drift_flag_is_orthogonal_to_quality_corrections() {
+    fn intent_drift_advisory_emitted_flag_is_orthogonal_to_quality_corrections() {
         // Drift correction (intent alignment) is semantically orthogonal to
         // quality corrections (redundant reads, cache waste, etc.).
         // It should NOT block other correction families in the same turn.
         let mut state = make_state();
         assert!(
-            !state.stall.forced_intent_drift,
+            !state.stall.intent_drift_advisory_emitted,
             "flag must start false each turn"
         );
-        state.stall.forced_intent_drift = true;
+        state.stall.intent_drift_advisory_emitted = true;
         assert!(
-            !state.stall.any_corrective_fired(),
-            "forced_intent_drift must NOT be in any_corrective_fired() — \
+            !state.stall.any_behavior_advisory_emitted(),
+            "intent_drift_advisory_emitted must NOT be in any_behavior_advisory_emitted() — \
              drift is orthogonal to quality corrections"
         );
     }
@@ -9730,7 +9512,8 @@ mod parallel_execution_tests {
             .volatile_pending
             .iter()
             .find(|v| matches!(v.kind, VolatileKind::IntentDrift))
-            .map(|v| v.content.as_str())
+            .and_then(|v| v.payload.get("evidence"))
+            .and_then(Value::as_str)
             .unwrap_or("");
         assert!(
             content.contains("updated drift"),
@@ -10033,15 +9816,12 @@ mod parallel_execution_tests {
                 state.final_text.contains("final checkpoint summary"),
                 "LLM finalization turn should produce the visible answer"
             );
-            let final_request = host
-                .executed_messages
-                .last()
-                .expect("finalization request should be sent");
-            let final_prompt = final_request
-                .last()
-                .and_then(|message| message.get("content"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
+            let final_prompt = state
+                .volatile_pending
+                .iter()
+                .find(|injection| injection.kind == VolatileKind::HarnessBoundary)
+                .and_then(|injection| injection.payload.as_str())
+                .expect("harness boundary should be queued for the final request");
             assert!(
                 final_prompt.contains("produce a concise final response now"),
                 "final request should tell the LLM to summarize before stopping: {final_prompt}"

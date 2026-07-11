@@ -147,7 +147,7 @@ mod tests {
         let evt = PipelineJournalEvent::from_feedback(3, "claude", &fb);
         assert_eq!(evt.kind, PipelineEventKind::Feedback);
         assert_eq!(evt.turn, 3);
-        assert!((evt.cache_hit_ratio.unwrap() - 0.8).abs() < 1e-9);
+        assert!((evt.cache_hit_ratio.unwrap() - 0.4).abs() < 1e-9);
         assert_eq!(evt.cache_read_tokens, Some(800));
         assert_eq!(evt.cache_creation_tokens, Some(200));
         assert_eq!(evt.completion_tokens, Some(500));

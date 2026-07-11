@@ -51,8 +51,6 @@ pub enum InjectionChannel {
     Lessons,
     /// `AgenticLoopState.volatile_pending` content joined into a single fingerprint.
     VolatilePending,
-    /// `edge_profile.memoria_insights_text` — per-turn cross-session recall digest.
-    MemoriaInsights,
     /// `memoria_prefetch_section` — pre-loaded Memoria memories on session start / compaction.
     MemoriaPrefetch,
     /// `edge_profile.self_awareness_text` — rendered `SelfModel::to_system_prompt_section()`.
@@ -83,7 +81,6 @@ impl InjectionChannel {
             Self::OutcomeBias => "outcome_bias",
             Self::Lessons => "lessons",
             Self::VolatilePending => "volatile_pending",
-            Self::MemoriaInsights => "memoria_insights",
             Self::MemoriaPrefetch => "memoria_prefetch",
             Self::SelfAwareness => "self_awareness",
             Self::FeedbackRules => "feedback_rules",
@@ -105,7 +102,6 @@ impl InjectionChannel {
             "outcome_bias" => Some(Self::OutcomeBias),
             "lessons" => Some(Self::Lessons),
             "volatile_pending" => Some(Self::VolatilePending),
-            "memoria_insights" => Some(Self::MemoriaInsights),
             "memoria_prefetch" => Some(Self::MemoriaPrefetch),
             "self_awareness" => Some(Self::SelfAwareness),
             "feedback_rules" => Some(Self::FeedbackRules),
@@ -121,17 +117,16 @@ impl InjectionChannel {
     ///
     /// Ordering policy: self-* signals first (failing tests, bias,
     /// lessons), then volatile/content-derived lanes (volatile pending,
-    /// memoria insights, memoria prefetch), then behavioural/meta-state
+    /// typed memoria prefetch), then behavioural/meta-state
     /// lanes (self-awareness, feedback rules, implicit feedback), then
     /// operational hints (recent-arg, skill listing, tool-round
     /// guidance). Introspect renders in this order for stable output.
-    pub fn all() -> [Self; 12] {
+    pub fn all() -> [Self; 11] {
         [
             Self::RecentFailingTests,
             Self::OutcomeBias,
             Self::Lessons,
             Self::VolatilePending,
-            Self::MemoriaInsights,
             Self::MemoriaPrefetch,
             Self::SelfAwareness,
             Self::FeedbackRules,
@@ -471,23 +466,22 @@ mod tests {
     #[test]
     fn channel_all_returns_stable_ordering_of_every_variant() {
         let all = InjectionChannel::all();
-        assert_eq!(all.len(), 12);
+        assert_eq!(all.len(), 11);
         // Self-* ordering: failing tests → bias → lessons.
         assert_eq!(all[0], InjectionChannel::RecentFailingTests);
         assert_eq!(all[1], InjectionChannel::OutcomeBias);
         assert_eq!(all[2], InjectionChannel::Lessons);
         // Volatile + content-derived block.
         assert_eq!(all[3], InjectionChannel::VolatilePending);
-        assert_eq!(all[4], InjectionChannel::MemoriaInsights);
-        assert_eq!(all[5], InjectionChannel::MemoriaPrefetch);
+        assert_eq!(all[4], InjectionChannel::MemoriaPrefetch);
         // Behavioural / meta-state block.
-        assert_eq!(all[6], InjectionChannel::SelfAwareness);
-        assert_eq!(all[7], InjectionChannel::FeedbackRules);
-        assert_eq!(all[8], InjectionChannel::ImplicitFeedback);
+        assert_eq!(all[5], InjectionChannel::SelfAwareness);
+        assert_eq!(all[6], InjectionChannel::FeedbackRules);
+        assert_eq!(all[7], InjectionChannel::ImplicitFeedback);
         // Operational hints block.
-        assert_eq!(all[9], InjectionChannel::RecentArgHints);
-        assert_eq!(all[10], InjectionChannel::SkillListing);
-        assert_eq!(all[11], InjectionChannel::ToolRoundGuidance);
+        assert_eq!(all[8], InjectionChannel::RecentArgHints);
+        assert_eq!(all[9], InjectionChannel::SkillListing);
+        assert_eq!(all[10], InjectionChannel::ToolRoundGuidance);
     }
 
     #[test]

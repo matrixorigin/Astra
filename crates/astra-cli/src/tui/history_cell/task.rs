@@ -37,6 +37,7 @@ use crate::tui::history_cell::tool::humanize_tool_name;
 pub(crate) enum TaskStatus {
     Running,
     Completed,
+    Interrupted,
     Failed,
 }
 
@@ -143,10 +144,10 @@ impl TaskCell {
         output_summary: Option<String>,
         error: Option<String>,
     ) {
-        self.status = if tool_result_status_is_success(status_str) {
-            TaskStatus::Completed
-        } else {
-            TaskStatus::Failed
+        self.status = match status_str {
+            "interrupted" => TaskStatus::Interrupted,
+            status if tool_result_status_is_success(status) => TaskStatus::Completed,
+            _ => TaskStatus::Failed,
         };
         self.completed_at = Some(Instant::now());
         self.duration_ms = Some(duration_ms);
@@ -159,9 +160,10 @@ impl TaskCell {
     }
 
     pub(crate) fn is_interrupted_wait(&self) -> bool {
-        self.status == TaskStatus::Failed
-            && self.is_agent_result_wait()
-            && self.error.as_deref() == Some(AGENT_RESULT_INTERRUPTED_ERROR)
+        self.status == TaskStatus::Interrupted
+            || (self.status == TaskStatus::Failed
+                && self.is_agent_result_wait()
+                && self.error.as_deref() == Some(AGENT_RESULT_INTERRUPTED_ERROR))
     }
 
     fn arrow(&self) -> Span<'static> {
@@ -171,6 +173,9 @@ impl TaskCell {
                 Span::styled("▶ ", Style::default().fg(theme.accent).bold())
             }
             TaskStatus::Completed => Span::styled("▶ ", Style::default().fg(Color::Green).bold()),
+            TaskStatus::Interrupted => {
+                Span::styled("▶ ", Style::default().fg(Color::Yellow).bold())
+            }
             TaskStatus::Failed if self.is_interrupted_wait() => {
                 Span::styled("▶ ", Style::default().fg(Color::Yellow).bold())
             }
@@ -182,6 +187,7 @@ impl TaskCell {
         match self.status {
             TaskStatus::Running => "running",
             TaskStatus::Completed => "done",
+            TaskStatus::Interrupted => "interrupted",
             TaskStatus::Failed if self.is_interrupted_wait() => "interrupted",
             TaskStatus::Failed => "failed",
         }

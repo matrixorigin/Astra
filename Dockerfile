@@ -1,4 +1,7 @@
-ARG RUST_VERSION=1.94-bookworm
+# Keep this aligned with rust-toolchain.toml. The cargo-chef and final build
+# stages must use the same compiler or the cooked dependency artifacts cannot
+# be reused.
+ARG RUST_VERSION=1.97.0-bookworm
 ARG CARGO_CHEF_VERSION=0.1.77
 ARG CARGO_REGISTRY=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
 ARG DEBIAN_MIRROR=https://mirrors.aliyun.com
@@ -50,7 +53,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM chef AS planner
 
 WORKDIR /app
-COPY . ./
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -59,18 +63,13 @@ WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 # Runtime image intentionally ships the API server plus the single public CLI.
 # Test-only mock_mcp_server and the standalone astra-edge daemon are excluded.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
-    cargo chef cook --release --no-default-features --recipe-path recipe.json \
+RUN cargo chef cook --release --no-default-features --recipe-path recipe.json \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra
 
-COPY . ./
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
-    cargo build --release --no-default-features \
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release --no-default-features \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra && \
     mkdir -p /out && \

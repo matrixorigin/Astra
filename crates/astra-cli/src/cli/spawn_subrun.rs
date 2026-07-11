@@ -10,7 +10,7 @@ use std::sync::Arc;
 use astra_runtime::{
     orchestration::{
         InheritedPermissions, PermissionSummary, SpawnAgentExecutor, SpawnRunConfig,
-        SpawnRunResult, spawn_completion_status_from_finish_reason,
+        SpawnRunResult, project_subrun_status_to_spawn, spawn_completion_status_from_finish_reason,
     },
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
@@ -653,9 +653,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
-            textless_stop_retries: 0,
             last_finish_reason: None,
-            total_evidence_tool_calls: 0,
+            total_observation_tool_calls: 0,
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
@@ -953,12 +952,13 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                             .unwrap_or_else(|| "user cancellation".to_string()),
                     ),
                 );
+                let projection = project_subrun_status_to_spawn(astra_core::STATUS_CANCELLED, None);
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
-                    status: "cancelled".to_string(),
+                    status: projection.status.to_string(),
                     finish_reason: finish_reason_from_state
-                        .unwrap_or_else(|| "cancelled".to_string()),
+                        .unwrap_or_else(|| projection.finish_reason.to_string()),
                     cancelled_by_user: Some(true),
                     output: if state.final_text.is_empty() {
                         None
@@ -1006,16 +1006,23 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 })
             }
             Ok(AgenticLoopOutcome::Waiting(reason)) => {
-                // Emit idle event
+                // The loop has returned, so there is no executor left to
+                // observe a same-run resume. Preserve the reason as evidence
+                // but project lifecycle as an interrupted terminal task.
                 if let Some(ref emitter) = progress_emitter {
                     emitter.idle();
                 }
+                emit_terminated(
+                    astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted,
+                    Some(reason.clone()),
+                );
+                let projection = project_subrun_status_to_spawn(astra_core::STATUS_PAUSED, None);
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,
-                    status: "waiting".to_string(),
+                    status: projection.status.to_string(),
                     finish_reason: finish_reason_from_state
-                        .unwrap_or_else(|| "waiting".to_string()),
+                        .unwrap_or_else(|| projection.finish_reason.to_string()),
                     cancelled_by_user: None,
                     output: Some(reason),
                     error: None,

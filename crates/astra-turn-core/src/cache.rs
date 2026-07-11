@@ -35,9 +35,9 @@ impl SessionCache {
 
     pub fn get(&mut self, key: &str, now: f64) -> Option<Map<String, Value>> {
         let key = key.to_string();
-        let expired = match self.entries.get(&key) {
-            Some(entry) => now - entry.touched_at > self.ttl,
-            None => return None,
+        let expired = {
+            let entry = self.entries.get(&key)?;
+            now - entry.touched_at > self.ttl
         };
 
         if expired {

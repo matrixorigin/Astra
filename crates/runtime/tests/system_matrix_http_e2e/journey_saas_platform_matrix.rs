@@ -751,7 +751,7 @@ pub async fn run_saas_auth_refresh_token_rotation() {
     ctx.pool.close().await;
 }
 
-/// Memory proxy overwrites spoofed user_id in body (§5.4, §5.7).
+/// Memory proxy rejects unowned sessions and overwrites spoofed user identity (§5.4, §5.7).
 pub async fn run_saas_memory_proxy_user_isolation() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -760,7 +760,7 @@ pub async fn run_saas_memory_proxy_user_isolation() {
     let user_id = ctx.user_id.as_str();
 
     let before = ctx.memoria.calls.lock().await.len();
-    let (st, body) = post_json(
+    let (st_spoof, spoof_body) = post_json(
         app,
         "/memory/store",
         Some(auth),
@@ -772,13 +772,35 @@ pub async fn run_saas_memory_proxy_user_isolation() {
         }),
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "memory store: {body}");
+    assert_eq!(
+        st_spoof,
+        StatusCode::NOT_FOUND,
+        "unowned memory session must be rejected: {spoof_body}"
+    );
+    assert_eq!(ctx.memoria.calls.lock().await.len(), before);
+
+    let (st, body) = post_json(
+        app,
+        "/memory/store",
+        Some(auth),
+        json!({
+            "content": "saas owned memory isolation",
+            "memory_type": "semantic",
+            "user_id": "victim-user",
+            "session_id": ctx.session_id
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "owned memory store: {body}");
 
     let calls = ctx.memoria.calls.lock().await;
     assert!(calls.len() > before, "memoria forwarder invoked");
     let (_, forwarded) = calls.last().expect("last call");
     assert_eq!(forwarded["user_id"].as_str(), Some(user_id));
-    assert_eq!(forwarded["session_id"].as_str(), Some(user_id));
+    assert_eq!(
+        forwarded["session_id"].as_str(),
+        Some(ctx.session_id.as_str())
+    );
 
     ctx.pool.close().await;
 }

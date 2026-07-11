@@ -22,7 +22,7 @@
 //! recorder.complete_tool(tool_name, is_error, elapsed_ms);
 //!
 //! // After turn_guard.evaluate():
-//! recorder.record_verdict(severity, injections, force_stop);
+//! recorder.record_verdict(severity, stall, divergence, strong_advisory, injections);
 //!
 //! // After main loop:
 //! let summary = recorder.finalize();
@@ -243,6 +243,9 @@ pub struct StepRecorder {
     checkpoint_count: u32,
     /// Optional file-backed persistence (JSONL) for events
     file_store: Option<FileBackedEventStore>,
+    /// A host explicitly requested persistence once an authoritative session
+    /// id arrives from the first streamed response.
+    attach_persistence_on_session_adoption: bool,
     persistence_required: bool,
     persisted_tail_event_id: Option<String>,
     persistence_error: Option<String>,
@@ -265,6 +268,7 @@ impl StepRecorder {
             phase_log: Vec::new(),
             checkpoint_count: 0,
             file_store: None,
+            attach_persistence_on_session_adoption: false,
             persistence_required: false,
             persisted_tail_event_id: None,
             persistence_error: None,
@@ -286,6 +290,7 @@ impl StepRecorder {
             .unwrap_or(0);
         Self {
             file_store: Some(file_store),
+            attach_persistence_on_session_adoption: false,
             persistence_required: true,
             events: Vec::new(),
             step_sequence: persisted_summary.next_step_sequence,
@@ -295,12 +300,38 @@ impl StepRecorder {
         }
     }
 
+    /// Create an in-memory recorder whose events become durable once the
+    /// authoritative session id is learned from the runtime.
+    ///
+    /// This mode is for a CLI-created first turn: using a fake durable
+    /// `ephemeral` session would leave forensic history under the wrong owner,
+    /// while tying this decision to unrelated context-manifest persistence can
+    /// silently lose the first turn altogether.
+    pub fn with_deferred_persistence(
+        user_id: &str,
+        provisional_session_id: &str,
+        task_id: &str,
+    ) -> Self {
+        let mut recorder = Self::new(user_id, provisional_session_id, task_id);
+        recorder.attach_persistence_on_session_adoption = true;
+        recorder
+    }
+
+    /// Attach persistence only when this recorder was explicitly constructed
+    /// in deferred-persistence mode.
+    pub fn attach_persistence_if_configured(&mut self, session_id: &str) {
+        if self.attach_persistence_on_session_adoption {
+            self.attach_persistence(session_id);
+        }
+    }
+
     /// Attach file-backed persistence after the authoritative session id becomes known.
     ///
     /// Existing in-memory events are rebound to the adopted session id before being
     /// flushed to disk so first-turn forensic artifacts land under the real session.
     pub fn attach_persistence(&mut self, session_id: &str) {
         if self.file_store.is_some() && self.session_id == session_id {
+            self.attach_persistence_on_session_adoption = false;
             return;
         }
 
@@ -322,6 +353,7 @@ impl StepRecorder {
             None
         };
         let mut file_store = FileBackedEventStore::empty(&self.user_id, session_id);
+        self.attach_persistence_on_session_adoption = false;
         self.persistence_required = true;
         for event in &self.events {
             if let Err(error) = file_store.append(event.clone()) {
@@ -1063,14 +1095,12 @@ impl StepRecorder {
         severity: &str,
         is_stall: bool,
         is_diverging: bool,
-        force_stop: bool,
+        advisory_threshold_reached: bool,
         injections_count: usize,
     ) {
         self.transition_phase(StepAction::Evaluate);
 
-        let verdict = if force_stop {
-            StepVerdict::Failed
-        } else if is_stall {
+        let verdict = if is_stall {
             StepVerdict::Stalled
         } else if is_diverging {
             StepVerdict::Diverging
@@ -1091,12 +1121,8 @@ impl StepRecorder {
             step.execution.result = Some(StepResult::Evaluate {
                 verdict,
                 progress,
-                should_continue: !force_stop,
-                next_action: if force_stop {
-                    StepAction::Fail
-                } else {
-                    StepAction::Act
-                },
+                should_continue: true,
+                next_action: StepAction::Act,
             });
         }
 
@@ -1110,7 +1136,7 @@ impl StepRecorder {
             },
             serde_json::json!({
                 "severity": severity,
-                "force_stop": force_stop,
+                "advisory_threshold_reached": advisory_threshold_reached,
                 "injections": injections_count,
             }),
         );
@@ -1764,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn recorder_verdict_force_stop() {
+    fn recorder_verdict_advisory_threshold_reached() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.begin_act(0);
@@ -1777,8 +1803,8 @@ mod tests {
             ..
         }) = &step.execution.result
         {
-            assert!(!should_continue);
-            assert_eq!(*next_action, StepAction::Fail);
+            assert!(*should_continue);
+            assert_eq!(*next_action, StepAction::Act);
         }
     }
 
@@ -2150,6 +2176,43 @@ mod tests {
             !crate::step_checkpoint::owner_session_dir_for(TEST_USER_ID, "ephemeral")
                 .unwrap()
                 .exists()
+        );
+    }
+
+    #[test]
+    fn deferred_persistence_attaches_on_adoption_but_plain_recorder_stays_memory_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+
+        let mut deferred =
+            StepRecorder::with_deferred_persistence(TEST_USER_ID, "ephemeral", "task-deferred");
+        deferred.begin_turn(1);
+        deferred.record_plan(&["read_file".into()], 0.0, 4000);
+        deferred.attach_persistence_if_configured("sess-deferred");
+        deferred.end_turn(true);
+
+        let deferred_events =
+            crate::step_checkpoint::FileBackedEventStore::new(TEST_USER_ID, "sess-deferred")
+                .all_events()
+                .to_vec();
+        assert!(!deferred_events.is_empty());
+        assert!(
+            deferred_events
+                .iter()
+                .all(|event| event.step_id.starts_with("sess-deferred-turn-1-step-"))
+        );
+
+        let mut memory_only = StepRecorder::new(TEST_USER_ID, "ephemeral", "task-memory");
+        memory_only.begin_turn(1);
+        memory_only.record_plan(&["read_file".into()], 0.0, 4000);
+        memory_only.attach_persistence_if_configured("sess-memory-only");
+        memory_only.end_turn(true);
+
+        assert!(
+            crate::step_checkpoint::FileBackedEventStore::new(TEST_USER_ID, "sess-memory-only")
+                .all_events()
+                .is_empty(),
+            "ordinary in-memory recorders must not gain disk side effects merely because a response carries a session id"
         );
     }
 

@@ -51,19 +51,10 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
     "## ⤴",
     "## ⚠",
     "Runtime correction:",
-    "[compact session=",
 ];
 
-/// Prefixes from removed scaffolding formats. These are not supported
-/// interaction surfaces; they are filtered only so persisted runtime garbage
-/// cannot re-enter memory or compaction.
-pub const OBSOLETE_SCAFFOLDING_BODY_PREFIXES: &[&str] = &["[Active task attachment]"];
-
 pub fn scaffolding_body_prefixes_for_filtering() -> impl Iterator<Item = &'static str> {
-    SCAFFOLDING_BODY_PREFIXES
-        .iter()
-        .chain(OBSOLETE_SCAFFOLDING_BODY_PREFIXES.iter())
-        .copied()
+    SCAFFOLDING_BODY_PREFIXES.iter().copied()
 }
 
 /// True when `message` is a runtime-synthesized scaffolding message.
@@ -75,8 +66,6 @@ pub fn scaffolding_body_prefixes_for_filtering() -> impl Iterator<Item = &'stati
 /// 2. Any message whose trimmed `content` starts with one of
 ///    [`SCAFFOLDING_BODY_PREFIXES`] (applies across all roles — assistant
 ///    messages can carry runtime-stamped directives too).
-/// 3. Removed legacy scaffolding prefixes are also filtered to prevent old
-///    stored runtime text from being reintroduced.
 ///
 /// Returns `false` for genuine user/assistant conversational turns.
 ///
@@ -195,14 +184,6 @@ mod tests {
     }
 
     #[test]
-    fn obsolete_active_task_attachment_is_filtered_as_garbage() {
-        assert!(is_runtime_scaffolding_message(&msg(
-            "user",
-            "[Active task attachment] Resume the active task below"
-        )));
-    }
-
-    #[test]
     fn context_manifests_are_scaffolding() {
         assert!(is_runtime_scaffolding_message(&msg(
             "user",
@@ -255,14 +236,6 @@ mod tests {
         assert!(is_runtime_scaffolding_message(&msg(
             "user",
             "Runtime correction: your previous response answered without tools"
-        )));
-    }
-
-    #[test]
-    fn compact_session_marker_is_scaffolding() {
-        assert!(is_runtime_scaffolding_message(&msg(
-            "assistant",
-            "[compact session=sess-123 turn=4 source=auto tier=normal]\nWorking memory summary"
         )));
     }
 

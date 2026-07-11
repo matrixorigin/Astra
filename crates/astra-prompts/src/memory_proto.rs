@@ -183,12 +183,10 @@ pub const NS_SESSION: &str = "session";
 /// filter and the assembly-trace builder use this check so entries don't
 /// leak into the prompt through the wrong channel.
 ///
-/// Uses `MemoryEntry::parse` as the authoritative check (handles leading
-/// whitespace, exact namespace matching), falling back to a fast prefix
-/// scan for entries that don't parse.
+/// Uses `MemoryEntry::parse` as the sole schema boundary. Malformed rows are
+/// not granted namespace semantics by a textual prefix.
 pub fn is_session_namespace_memory(content: &str) -> bool {
     MemoryEntry::parse(content).is_some_and(|entry| entry.ns == NS_SESSION)
-        || content.trim_start().starts_with("[@session/")
 }
 
 // ── Status values ────────────────────────────────────────────────
@@ -198,6 +196,19 @@ pub const ST_DONE: &str = "done";
 pub const ST_ARCHIVED: &str = "archived";
 pub const ST_SUMMARY: &str = "summary";
 pub const ST_AUTO: &str = "auto";
+/// Replaced by a newer version. Kept for provenance, never prompt-recalled.
+pub const ST_SUPERSEDED: &str = "superseded";
+/// Contradicted but not yet resolved. Kept for audit, never prompt-recalled.
+pub const ST_DISPUTED: &str = "disputed";
+/// No longer valid at the current time. Kept for audit, never prompt-recalled.
+pub const ST_EXPIRED: &str = "expired";
+
+/// Whether an entry status represents current evidence that may be surfaced to
+/// the model. Historical and unresolved lifecycle states remain durable for
+/// audit/consolidation but must not silently re-enter prompt context.
+pub fn is_prompt_recallable_status(status: &str) -> bool {
+    matches!(status, ST_PENDING | ST_ACTIVE | ST_SUMMARY | ST_AUTO)
+}
 
 // ── Namespace → Memoria memory_type mapping ──────────────────────
 /// Map a protocol namespace to a Memoria `memory_type`.
@@ -717,6 +728,16 @@ mod tests {
     fn ns_to_memory_type_unknown_fallback() {
         assert_eq!(ns_to_memory_type("bogus"), "semantic");
         assert_eq!(ns_to_memory_type(""), "semantic");
+    }
+
+    #[test]
+    fn prompt_recall_statuses_separate_current_evidence_from_memory_history() {
+        for status in [ST_PENDING, ST_ACTIVE, ST_SUMMARY, ST_AUTO] {
+            assert!(is_prompt_recallable_status(status), "{status}");
+        }
+        for status in [ST_DONE, ST_ARCHIVED, ST_SUPERSEDED, ST_DISPUTED, ST_EXPIRED] {
+            assert!(!is_prompt_recallable_status(status), "{status}");
+        }
     }
 
     // ──────────────────────────────────────────────────────────

@@ -17,6 +17,64 @@ pub mod canonical_names;
 #[cfg(any(test, feature = "dev-defaults"))]
 pub mod test_paths;
 
+pub fn canonical_json_string(value: &serde_json::Value) -> String {
+    fn write(value: &serde_json::Value, out: &mut String) {
+        match value {
+            serde_json::Value::Null => out.push_str("null"),
+            serde_json::Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+            serde_json::Value::Number(value) => out.push_str(&value.to_string()),
+            serde_json::Value::String(value) => {
+                out.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()));
+            }
+            serde_json::Value::Array(values) => {
+                out.push('[');
+                for (index, item) in values.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    write(item, out);
+                }
+                out.push(']');
+            }
+            serde_json::Value::Object(map) => {
+                let mut keys = map.keys().collect::<Vec<_>>();
+                keys.sort();
+                out.push('{');
+                for (index, key) in keys.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(
+                        &serde_json::to_string(key.as_str()).unwrap_or_else(|_| "\"\"".to_string()),
+                    );
+                    out.push(':');
+                    if let Some(item) = map.get(*key) {
+                        write(item, out);
+                    }
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    let mut out = String::new();
+    write(value, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod canonical_json_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_json_sorts_object_keys() {
+        let left = serde_json::json!({"b":2,"a":1});
+        let right = serde_json::json!({"a":1,"b":2});
+
+        assert_eq!(canonical_json_string(&left), canonical_json_string(&right));
+    }
+}
+
 /// Global cap on the sum of `max_connections` across all pools.
 /// Prevents unbounded pool creation from exhausting database connections.
 /// Override with `ASTRA_DB_GLOBAL_MAX_CONNECTIONS` env var.
@@ -403,8 +461,9 @@ pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{
-    ClassifiedError, ErrorKind, classify_llm_error_message,
-    classify_model_resolution_error_message, classify_tool_output, is_llm_context_window_error,
+    ClassifiedError, ErrorKind, ToolFailureCause, ToolFailureEvidence, ToolRecoveryAction,
+    classify_llm_error_message, classify_model_resolution_error_message, classify_tool_output,
+    is_llm_context_window_error,
 };
 pub use observation::{
     ErrorStreak, EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,

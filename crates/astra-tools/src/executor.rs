@@ -645,6 +645,24 @@ impl DefaultToolExecutor {
                     Ok(action) => action,
                     Err(error) => return ToolResult::error(format!("Error: {error}")),
                 };
+                if action == crate::memory_tool_contract::MemoryAction::Inventory {
+                    let inventory = match astra_services::session_memory_inventory::load_local_session_memory_inventory(
+                        &self.ctx.session_id,
+                    ) {
+                        Ok(inventory) => inventory,
+                        Err(error) => {
+                            return ToolResult::error(format!(
+                                "Error: session memory inventory failed: {error}"
+                            ));
+                        }
+                    };
+                    return match serde_json::to_string(&inventory) {
+                        Ok(output) => ToolResult::text(output),
+                        Err(error) => ToolResult::error(format!(
+                            "Error: serialize session memory inventory: {error}"
+                        )),
+                    };
+                }
                 ToolResult::error(format!(
                     "Error: Memory tool (action='{}') is not available — the memoria \
                      service endpoint is not configured in this session.\n\n\
@@ -775,10 +793,9 @@ fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
                 | crate::git_tool_contract::GitAction::RevertCommit
                 | crate::git_tool_contract::GitAction::Push => true,
                 crate::git_tool_contract::GitAction::Stash => args
-                    .get("stash_action")
-                    .or_else(|| args.get("sub_action"))
+                    .get("sub_action")
                     .and_then(Value::as_str)
-                    .is_some_and(git_stash_action_mutates_workspace),
+                    .is_some_and(git_stash_sub_action_mutates_workspace),
                 crate::git_tool_contract::GitAction::CheckoutFile
                 | crate::git_tool_contract::GitAction::Worktree => true,
                 crate::git_tool_contract::GitAction::Status
@@ -794,7 +811,7 @@ fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
     }
 }
 
-fn git_stash_action_mutates_workspace(action: &str) -> bool {
+fn git_stash_sub_action_mutates_workspace(action: &str) -> bool {
     matches!(
         action,
         "push" | "save" | "apply" | "pop" | "drop" | "branch"
@@ -1559,7 +1576,7 @@ mod tests {
         let push = exec
             .execute(
                 "git",
-                &serde_json::json!({"action": "stash", "stash_action": "push", "message": "save tracked"}),
+                &serde_json::json!({"action": "stash", "sub_action": "push", "message": "save tracked"}),
             )
             .await;
         assert!(!push.is_error, "stash push failed: {}", push.output);
@@ -1575,7 +1592,7 @@ mod tests {
         let drop = exec
             .execute(
                 "git",
-                &serde_json::json!({"action": "stash", "stash_action": "drop"}),
+                &serde_json::json!({"action": "stash", "sub_action": "drop"}),
             )
             .await;
         assert!(!drop.is_error, "stash drop failed: {}", drop.output);
@@ -1834,6 +1851,56 @@ mod tests {
             "error must not leak internal type names: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_memory_inventory_uses_journal_even_without_memoria_endpoint() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let (_tmp, exec) = test_executor();
+        let writer = astra_services::session_journal::JournalWriter::new("test-session").unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::session_memory_extraction(
+                    Some("test-session"),
+                    3,
+                    15,
+                    astra_services::session_journal::SessionMemoryExtractionOutcome::Extracted {
+                        source: astra_services::session_journal::SessionMemoryExtractionSource::Llm,
+                        bytes_written: 70,
+                    },
+                    &astra_services::session_journal::SessionMemoryExtractionBreadcrumbs::default(),
+                ),
+            )
+            .unwrap();
+
+        let result = exec
+            .execute("memory", &serde_json::json!({"action": "inventory"}))
+            .await;
+        let inventory: astra_services::session_memory_inventory::SessionMemoryInventory =
+            serde_json::from_str(&result.output).unwrap();
+
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(inventory.successful_extraction_versions, 1);
+        assert_eq!(inventory.llm_versions, 1);
+        assert_eq!(inventory.logical_current_snapshot_count, Some(0));
+    }
+
+    #[tokio::test]
+    async fn dispatch_memory_inventory_fails_when_exactness_cannot_be_proven() {
+        let journal_dir = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let path = astra_services::session_journal::journal_file_path("test-session");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{not-json}\n").unwrap();
+        let (_tmp, exec) = test_executor();
+
+        let result = exec
+            .execute("memory", &serde_json::json!({"action": "inventory"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("cannot be exact"), "{result:?}");
     }
 
     #[tokio::test]

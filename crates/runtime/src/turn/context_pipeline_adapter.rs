@@ -167,6 +167,22 @@ pub(crate) fn build_external_sources(
         }));
     }
 
+    let runtime_advisory_evidence =
+        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+            edge_profile,
+        )
+        .into_iter()
+        .filter(|injection| {
+            injection.delivery_class
+                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence
+        })
+        .collect::<Vec<_>>();
+    if !runtime_advisory_evidence.is_empty() {
+        providers.push(Box::new(RuntimeAdvisoryEvidenceProvider {
+            injections: runtime_advisory_evidence,
+        }));
+    }
+
     // Active skills visibility hint
     if !active_skill_names.is_empty() {
         providers.push(Box::new(ActiveSkillNamesProvider {
@@ -366,6 +382,34 @@ impl astra_turn_core::context_sources::ContextChannelProvider for EnvVolatilePro
 /// None scope by definition: these bytes can change every turn.
 struct RuntimeVolatileTextsProvider {
     texts: Vec<String>,
+}
+
+/// Runtime-owned advisory evidence received through the typed edge lane.
+/// Required context is attached separately by the LLM context assembler so it
+/// survives strict-history volatile suppression; telemetry has no prompt form.
+struct RuntimeAdvisoryEvidenceProvider {
+    injections: Vec<astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection>,
+}
+
+impl astra_turn_core::context_sources::ContextChannelProvider for RuntimeAdvisoryEvidenceProvider {
+    fn channel_id(&self) -> &'static str {
+        "runtime_advisory_evidence"
+    }
+    fn cache_scope(&self) -> CacheScope {
+        CacheScope::None
+    }
+    fn token_bucket(&self) -> PromptTokenBucket {
+        PromptTokenBucket::Environment
+    }
+    fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
+        let text = self
+            .injections
+            .iter()
+            .filter_map(|injection| injection.render_for_prompt())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then(|| PromptSection::dynamic(text, PromptTokenBucket::Environment))
+    }
 }
 
 impl astra_turn_core::context_sources::ContextChannelProvider for RuntimeVolatileTextsProvider {
@@ -583,81 +627,42 @@ impl astra_turn_core::context_sources::ContextChannelProvider for LessonsChannel
 fn build_memory_entries_from_edge_profile(
     edge_profile: &serde_json::Map<String, Value>,
 ) -> Vec<MemoryEntry> {
-    if let Some(entries) = edge_profile.get("memory_entries").and_then(Value::as_array) {
-        let total = entries.len();
-        return entries
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, value)| memory_entry_from_value(value, total, idx))
-            .collect();
-    }
-
     edge_profile
-        .get("memory_section")
-        .and_then(Value::as_str)
-        .map(memory_entries_from_section)
+        .get("memory_entries")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().filter_map(memory_entry_from_value).collect())
         .unwrap_or_default()
 }
 
-fn memory_entry_from_value(value: &Value, total: usize, idx: usize) -> Option<MemoryEntry> {
-    match value {
-        Value::String(content) => {
-            let content = content.trim();
-            if content.is_empty() {
-                return None;
-            }
-            Some(
-                MemoryEntry::scored(content, default_memory_relevance_from_total(total, idx))
-                    .with_source("edge_profile.memory_entries"),
-            )
-        }
-        Value::Object(obj) => {
-            let content = obj.get("content").and_then(Value::as_str)?.trim();
-            if content.is_empty() {
-                return None;
-            }
-            let mut entry = MemoryEntry::scored(
-                content,
-                obj.get("relevance_score")
-                    .and_then(Value::as_f64)
-                    .unwrap_or_else(|| default_memory_relevance_from_total(total, idx)),
-            )
-            .with_source(
-                obj.get("source")
-                    .and_then(Value::as_str)
-                    .unwrap_or("edge_profile.memory_entries"),
-            );
-            if let Some(tokens) = obj.get("token_estimate").and_then(Value::as_u64) {
-                entry = entry.with_token_estimate(tokens.min(u64::from(u32::MAX)) as u32);
-            }
-            if let Some(turn) = obj.get("freshness_turn").and_then(Value::as_u64) {
-                entry = entry.with_freshness_turn(turn.min(u64::from(u32::MAX)) as u32);
-            }
-            Some(entry)
-        }
-        _ => None,
+fn memory_entry_from_value(value: &Value) -> Option<MemoryEntry> {
+    let obj = value.as_object()?;
+    let memory_id = obj.get("memory_id").and_then(Value::as_str)?.trim();
+    let memory_type = obj.get("memory_type").and_then(Value::as_str)?.trim();
+    let content = obj.get("content").and_then(Value::as_str)?.trim();
+    if memory_id.is_empty() || memory_type.is_empty() || content.is_empty() {
+        return None;
     }
-}
-
-fn memory_entries_from_section(section: &str) -> Vec<MemoryEntry> {
-    let lines: Vec<&str> = section
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && *line != "## User Memories")
-        .collect();
-    let total = lines.len();
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(idx, line)| {
-            MemoryEntry::scored(line, default_memory_relevance_from_total(total, idx))
-                .with_source("edge_profile.memory_section")
-        })
-        .collect()
-}
-
-fn default_memory_relevance_from_total(total: usize, idx: usize) -> f64 {
-    total.saturating_sub(idx) as f64
+    let protocol = astra_prompts::memory_proto::MemoryEntry::parse(content)?;
+    if protocol.ns == astra_prompts::memory_proto::NS_SESSION
+        || astra_prompts::memory_proto::ns_to_memory_type(&protocol.ns) != memory_type
+    {
+        return None;
+    }
+    let mut entry = MemoryEntry::scored(
+        content,
+        obj.get("relevance_score")
+            .and_then(Value::as_f64)
+            .unwrap_or_default(),
+    )
+    .with_memory_identity(memory_id, memory_type)
+    .with_source("edge_profile.memory_entries");
+    if let Some(tokens) = obj.get("token_estimate").and_then(Value::as_u64) {
+        entry = entry.with_token_estimate(tokens.min(u64::from(u32::MAX)) as u32);
+    }
+    if let Some(turn) = obj.get("freshness_turn").and_then(Value::as_u64) {
+        entry = entry.with_freshness_turn(turn.min(u64::from(u32::MAX)) as u32);
+    }
+    Some(entry)
 }
 
 /// Build TurnState from AgenticLoopState.
@@ -752,6 +757,26 @@ mod tests {
     use super::*;
     use crate::turn::agentic_loop::host::tests::make_state;
     use astra_turn_core::context_sources::ContextChannelProvider;
+
+    fn typed_edge_memory(
+        memory_id: &str,
+        namespace: &str,
+        memory_type: &str,
+        content: &str,
+    ) -> Value {
+        serde_json::json!({
+            "memory_id": memory_id,
+            "memory_type": memory_type,
+            "content": astra_prompts::memory_proto::MemoryEntry::new(
+                namespace,
+                astra_prompts::memory_proto::ST_ACTIVE,
+                content,
+            ).encode(),
+            "relevance_score": 0.9,
+            "token_estimate": 7,
+            "freshness_turn": 3,
+        })
+    }
 
     #[test]
     fn turn_state_uses_real_remaining_turns_not_hardcoded_20() {
@@ -1017,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn external_sources_carries_prefetched_memory_from_edge_profile() {
+    fn external_sources_rejects_flat_memory_text_lanes() {
         let mut ep = serde_json::Map::new();
         ep.insert(
             "memory_section".into(),
@@ -1025,51 +1050,44 @@ mod tests {
         );
         let state = make_state();
         let sources = build_external_sources(&ep, &state, &["bash"], None, None);
-        assert!(
-            !sources.memory_entries.is_empty(),
-            "edge_profile.memory_section must flow into ExternalSources.memory_entries"
-        );
-        assert_eq!(sources.memory_entries.len(), 2);
-        assert!(sources.memory_entries[0].content.contains("prefers Rust"));
-        assert!(
-            sources.memory_entries[0].relevance_score > sources.memory_entries[1].relevance_score,
-            "memory_section line order should become production relevance"
-        );
+        assert!(sources.memory_entries.is_empty());
     }
 
     #[test]
-    fn external_sources_prefers_structured_memory_entries() {
+    fn external_sources_accepts_only_structured_typed_memory_entries() {
         let mut ep = serde_json::Map::new();
-        ep.insert(
-            "memory_section".into(),
-            Value::String("## User Memories\nfallback should be ignored".into()),
-        );
         ep.insert(
             "memory_entries".into(),
             Value::Array(vec![
-                serde_json::json!({
-                    "content": "fresh structured memory",
-                    "relevance_score": 0.9,
-                    "source": "test",
-                    "token_estimate": 7,
-                    "freshness_turn": 3
-                }),
+                typed_edge_memory(
+                    "m1",
+                    astra_prompts::memory_proto::NS_KNOWLEDGE,
+                    "semantic",
+                    "Fresh structured memory survives the runtime boundary",
+                ),
                 Value::String("ranked fallback string".into()),
+                serde_json::json!({
+                    "memory_id": "m2",
+                    "memory_type": "semantic",
+                    "content": "unstructured content"
+                }),
             ]),
         );
         let state = make_state();
         let sources = build_external_sources(&ep, &state, &["bash"], None, None);
 
-        assert_eq!(sources.memory_entries.len(), 2);
-        assert_eq!(sources.memory_entries[0].content, "fresh structured memory");
-        assert_eq!(sources.memory_entries[0].source.as_deref(), Some("test"));
+        assert_eq!(sources.memory_entries.len(), 1);
+        assert_eq!(sources.memory_entries[0].memory_id.as_deref(), Some("m1"));
+        assert_eq!(
+            sources.memory_entries[0].memory_type.as_deref(),
+            Some("semantic")
+        );
+        assert_eq!(
+            sources.memory_entries[0].source.as_deref(),
+            Some("edge_profile.memory_entries")
+        );
         assert_eq!(sources.memory_entries[0].token_estimate, 7);
         assert_eq!(sources.memory_entries[0].freshness_turn, Some(3));
-        assert!(
-            sources.memory_entries[1]
-                .content
-                .contains("ranked fallback string")
-        );
     }
 
     #[test]
@@ -1225,8 +1243,13 @@ mod tests {
         ep.insert("cwd".into(), Value::String("/tmp/proj".into()));
         ep.insert("git_branch".into(), Value::String("main".into()));
         ep.insert(
-            "memory_section".into(),
-            Value::String("## User Memories\n- prefers terse answers".into()),
+            "memory_entries".into(),
+            Value::Array(vec![typed_edge_memory(
+                "pref-1",
+                astra_prompts::memory_proto::NS_PREF,
+                "profile",
+                "The user prefers terse answers for routine code reviews",
+            )]),
         );
         let state = make_state();
         let ci = build_composite_inputs(&state, &ep, "anthropic", "claude-sonnet-4-6", "hello");
@@ -1427,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_memory_section_appears_iff_edge_profile_has_memory() {
+    fn composite_memory_section_appears_iff_typed_memory_entries_exist() {
         // With memory present → Memory section is planned and bound.
         // Without memory → Memory section is absent (planner skips it so
         // the optimizer doesn't emit an empty block that displaces other
@@ -1436,8 +1459,13 @@ mod tests {
 
         let mut ep_with = serde_json::Map::new();
         ep_with.insert(
-            "memory_section".into(),
-            Value::String("## User Memories\n- uses rustfmt".into()),
+            "memory_entries".into(),
+            Value::Array(vec![typed_edge_memory(
+                "pref-rustfmt",
+                astra_prompts::memory_proto::NS_PREF,
+                "profile",
+                "The user expects rustfmt output for all Rust source changes",
+            )]),
         );
         let ci = build_composite_inputs(&state, &ep_with, "anthropic", "claude-sonnet-4-6", "hi");
         let mut sess = PipelineSession::new(PipelineConfig {
@@ -2189,6 +2217,89 @@ mod tests {
                 .any(|section| section.text.contains("Runtime Turn Context")),
             "turn context must be routed to RuntimeVolatile / CacheScope::None"
         );
+    }
+
+    #[test]
+    fn external_sources_runtime_volatile_injections_use_dynamic_lane() {
+        let mut ep = serde_json::Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                .into(),
+            serde_json::json!([{
+                "kind": "policy_advisory",
+                "delivery_class": "advisory_evidence",
+                "payload": {
+                    "schema": "policy_advisory.v1",
+                    "advisories": [{"kind": "stall"}]
+                },
+                "round_index": 2
+            }]),
+        );
+        let state = make_state();
+        let sources = build_external_sources(&ep, &state, &[], None, None);
+
+        assert!(sources.system_override.is_none());
+        assert!(
+            sources
+                .extra_stable_sections
+                .iter()
+                .all(|section| !section.text.contains("policy_advisory.v1")),
+            "typed runtime volatile must not enter the session-stable prompt prefix"
+        );
+        assert!(
+            sources
+                .extra_dynamic_sections
+                .iter()
+                .any(|section| section.text.contains("policy_advisory.v1")),
+            "typed runtime volatile must be routed to RuntimeVolatile / CacheScope::None"
+        );
+    }
+
+    #[test]
+    fn typed_runtime_advisory_changes_do_not_churn_stable_prompt_sections() {
+        let state = make_state();
+        let build = |content: &str| {
+            let mut ep = serde_json::Map::new();
+            ep.insert(
+                "system_prompt_override".into(),
+                Value::String("stable session contract".to_string()),
+            );
+            ep.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                    .into(),
+                serde_json::json!([{
+                    "kind": "policy_advisory",
+                    "delivery_class": "advisory_evidence",
+                    "payload": content,
+                    "round_index": 3
+                }]),
+            );
+            build_external_sources(&ep, &state, &["bash"], None, None)
+        };
+
+        let first = build("first advisory sample");
+        let second = build("second advisory sample");
+        let stable_bytes = |sources: &ExternalSources| {
+            sources
+                .extra_stable_sections
+                .iter()
+                .map(|section| section.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let dynamic_bytes = |sources: &ExternalSources| {
+            sources
+                .extra_dynamic_sections
+                .iter()
+                .map(|section| section.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        assert_eq!(stable_bytes(&first), stable_bytes(&second));
+        assert_ne!(dynamic_bytes(&first), dynamic_bytes(&second));
+        assert!(dynamic_bytes(&first).contains("first advisory sample"));
+        assert!(dynamic_bytes(&second).contains("second advisory sample"));
     }
 
     #[test]

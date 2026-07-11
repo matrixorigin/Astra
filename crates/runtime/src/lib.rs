@@ -292,10 +292,8 @@ pub use astra_turn_core::{
         CacheBreakCause, CacheBreakDetector, CacheBreakEvent, CacheFingerprint, diff_fingerprints,
     },
     cloud_session_memory_extract::{
-        SESSION_MEMORY_TEMPLATE, SessionMemoryExtractConfig, SessionMemoryState,
-        build_extraction_prompt, build_learnings_extraction_prompt, extract_learnings_for_backflow,
-        extract_section, parse_learnings_response, should_extract as should_extract_session_memory,
-        should_extract_with_error_trigger, truncate_for_prompt,
+        SESSION_MEMORY_TEMPLATE, SessionMemoryState, build_extraction_prompt, extract_section,
+        should_extract as should_extract_session_memory,
     },
     cloud_summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},
     complete::build_turn_complete_event,
@@ -345,8 +343,8 @@ pub use turn::{
         },
         compaction::{CompactBoundary, CompactCircuitBreaker, CompactResult, CompactTrigger},
         memoria_compact::{
-            HttpMemoriaClient, MemoriaClient, MemoriaCompactConfig, MemoriaCompactParams,
-            MemoriaMemory, claude_code_session_memory_path, compact_with_memoria,
+            HttpMemoriaPort, MemoriaCompactConfig, MemoriaCompactParams, MemoriaMemory,
+            MemoriaPort, claude_code_session_memory_path, compact_with_memoria,
             memoria_compact_retrieve_query, sanitize_path_for_claude_projects,
         },
     },

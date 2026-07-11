@@ -51,7 +51,7 @@ pub(super) fn print_verdict_report(verdict_events: &[VerdictEvent], verbose: boo
                 ve.suppressed_loop_nudges,
                 ve.recent_error_pressure,
                 ve.health_avoidance_count,
-                ve.force_stop,
+                ve.advisory_threshold_reached,
             )
             .dim()
         );

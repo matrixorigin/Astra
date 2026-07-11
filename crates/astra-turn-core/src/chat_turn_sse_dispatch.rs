@@ -23,7 +23,7 @@ use super::sse_blocks::{SseBlankLineUtf8Buf, SseUtf8Error};
 /// The fingerprint is enough for `ObservabilitySession` to detect
 /// content change (for the freshness report). The raw preview is
 /// derived CLI-side from channels the CLI already owns
-/// (`lessons`, `self_awareness`, `memoria_insights`,
+/// (`lessons`, `self_awareness`,
 /// `recent_arg_hints`, `skill_listing`). Bridge-internal channels
 /// (`memoria_prefetch`, `feedback_rules`, `implicit_feedback`,
 /// `tool_round_guidance`, `volatile`) carry an empty preview in the

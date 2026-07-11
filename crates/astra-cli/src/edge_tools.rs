@@ -213,20 +213,14 @@ pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
     astra_turn_core::plan_mode_policy::is_plan_mode_blocked_tool(tool, args)
 }
 
-fn git_stash_action_args(args: &Value) -> Value {
-    let stash_action = args
-        .get("sub_action")
-        .or_else(|| args.get("stash_action"))
-        .and_then(Value::as_str);
-    let Some(stash_action) = stash_action else {
+fn git_stash_sub_action_args(args: &Value) -> Value {
+    let sub_action = args.get("sub_action").and_then(Value::as_str);
+    let Some(sub_action) = sub_action else {
         return args.clone();
     };
 
     let mut map = args.as_object().cloned().unwrap_or_default();
-    map.insert(
-        "action".to_string(),
-        Value::String(stash_action.to_string()),
-    );
+    map.insert("action".to_string(), Value::String(sub_action.to_string()));
     Value::Object(map)
 }
 
@@ -426,11 +420,19 @@ fn cli_tool_output_is_error(output: &str) -> bool {
 
 pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;
 
-pub(crate) fn noop_or_cached_tool_result_fields() -> serde_json::Map<String, Value> {
-    serde_json::Map::from_iter([(
-        "result_class".to_string(),
-        Value::String(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string()),
-    )])
+pub(crate) fn nonexecuted_tool_result_fields(
+    disposition: astra_services::session_journal::ToolCallDisposition,
+) -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([
+        (
+            "result_class".to_string(),
+            Value::String(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS.to_string()),
+        ),
+        (
+            "disposition".to_string(),
+            serde_json::to_value(disposition).expect("tool disposition must serialize"),
+        ),
+    ])
 }
 
 fn sandbox_denied_outcome_from_output(output: &str) -> Option<ToolExecutionOutcome> {
@@ -495,6 +497,22 @@ impl EdgeToolRun {
         }
     }
 
+    fn failure_evidence(output: String, evidence: astra_core::ToolFailureEvidence) -> Self {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "disposition".to_string(),
+            serde_json::Value::String("rejected".to_string()),
+        );
+        if let Ok(value) = serde_json::to_value(&evidence) {
+            fields.insert("recovery_evidence".to_string(), value);
+        }
+        Self {
+            output,
+            error_kind: Some(evidence.kind),
+            tool_result_fields: Some(fields),
+        }
+    }
+
     fn with_tool_result_fields(mut self, fields: Option<serde_json::Map<String, Value>>) -> Self {
         self.tool_result_fields = fields;
         self
@@ -551,54 +569,6 @@ fn parse_grep_file_line(line: &str) -> Option<(&str, usize)> {
 ///
 /// Examines the content after the `file:line:` prefix for language-specific
 /// patterns to determine the kind of reference.
-/// One-line label for an extraction outcome. Matches the
-/// [`ExtractionOutcome`] variants but renders terse strings suitable
-/// for a bullet list in the introspect output.
-fn render_extraction_outcome_label(
-    outcome: &astra_runtime::session_memory::observatory::ExtractionOutcome,
-) -> String {
-    use astra_runtime::session_memory::observatory::ExtractionOutcome;
-    match outcome {
-        ExtractionOutcome::Persisted {
-            source,
-            bytes_written,
-            store_attempt,
-        } => format!("persisted({source:?},bytes={bytes_written},attempt={store_attempt})"),
-        ExtractionOutcome::LlmFailedFallbackPersisted {
-            reason,
-            bytes_written,
-            store_attempt,
-        } => {
-            format!("llm_failed_fallback({reason:?},bytes={bytes_written},attempt={store_attempt})")
-        }
-        ExtractionOutcome::PersistFailed { reason, llm_reason } => {
-            if let Some(llm_reason) = llm_reason {
-                format!("persist_failed({reason:?},llm={llm_reason:?})")
-            } else {
-                format!("persist_failed({reason:?})")
-            }
-        }
-        ExtractionOutcome::Skipped { reason } => format!("skipped({reason})"),
-    }
-}
-
-/// Compact staleness display: `-` when clean, else a slash-separated
-/// list of flags that fired. Keeps the injection line short.
-fn render_staleness(s: &astra_runtime::session_memory::observatory::StalenessSignals) -> String {
-    let mut tags = Vec::new();
-    if s.task_contradicted {
-        tags.push("task_contradicted");
-    }
-    if s.missing_corrections {
-        tags.push("missing_corrections");
-    }
-    if tags.is_empty() {
-        "-".to_string()
-    } else {
-        tags.join("/")
-    }
-}
-
 fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
     // Extract content after file:line: prefix
     let content = if let Some(first_colon) = line.find(':') {
@@ -1018,13 +988,6 @@ pub struct ToolExecutor {
     /// state to the model.
     introspect_snapshot:
         std::sync::Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
-    /// Session-memory observatory shared with
-    /// [`MemoryExtractionService`] and the compaction path. `None` in
-    /// tests and offline modes — `introspect facet=session_memory`
-    /// then renders a short placeholder telling the model the
-    /// observatory isn't wired rather than silently returning empty.
-    session_memory_observatory:
-        Option<std::sync::Arc<astra_runtime::session_memory::SessionMemoryObservatory>>,
     /// Session id for persisting self-modification state and serving `astra self`
     /// compatible diagnostics from inside the live agent loop.
     active_session_id: std::sync::Mutex<Option<String>>,
@@ -1178,7 +1141,6 @@ impl ToolExecutor {
             send_message_context: std::sync::Mutex::new(None),
             observability_session: None,
             introspect_snapshot: std::sync::Arc::new(std::sync::RwLock::new(None)),
-            session_memory_observatory: None,
             active_session_id: std::sync::Mutex::new(None),
             current_model: std::sync::RwLock::new(None),
             current_effective_input_budget_tokens: std::sync::RwLock::new(None),
@@ -1908,17 +1870,6 @@ impl ToolExecutor {
         self
     }
 
-    /// Attach the shared session-memory observatory so
-    /// `introspect facet=session_memory` can read the rings. Callers
-    /// supply the same `Arc` they gave to `MemoryExtractionService`.
-    pub fn with_session_memory_observatory(
-        mut self,
-        observatory: std::sync::Arc<astra_runtime::session_memory::SessionMemoryObservatory>,
-    ) -> Self {
-        self.session_memory_observatory = Some(observatory);
-        self
-    }
-
     pub fn with_active_session_id(self, session_id: impl Into<String>) -> Self {
         self.set_active_session_id(session_id);
         self
@@ -2428,9 +2379,9 @@ impl ToolExecutor {
         // the old-format (pure JSON) and new-format (summary + JSON)
         // responses. Pre-prefix responses still work — `find('{')` on
         // a pure-JSON string returns 0 and we parse the whole string.
-        let json_body = match output.find('{') {
-            Some(pos) => &output[pos..],
-            None => return None,
+        let json_body = {
+            let pos = output.find('{')?;
+            &output[pos..]
         };
         serde_json::from_str::<Value>(json_body).ok()
     }
@@ -3259,7 +3210,9 @@ impl ToolExecutor {
         if let Some(ref cache) = self.bg_task_list_cache {
             let cached = cache.read().await;
             if !cached.is_empty() {
-                return cached.clone();
+                return self
+                    .attach_recoverable_fanouts_to_task_list(cached.clone())
+                    .await;
             }
             // Cache not yet populated (first call before the event
             // loop has rendered). Fall through to the queue path so
@@ -3267,6 +3220,9 @@ impl ToolExecutor {
         }
         // Fallback: queue path for when no cache is available
         let Some(ref bg_commands) = self.bg_task_commands else {
+            if let Some(addendum) = self.recoverable_fanout_task_list_addendum().await {
+                return Self::empty_background_task_list_with_fanouts(&addendum);
+            }
             return format_background_task_unavailable(self.cloud_base.is_some());
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3276,7 +3232,7 @@ impl ToolExecutor {
         }
         let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
         match await_bg_task_command_reply(rx, reply_timeout).await {
-            Ok(output) => output,
+            Ok(output) => self.attach_recoverable_fanouts_to_task_list(output).await,
             Err(BgTaskReplyError::Closed) => {
                 "Error: background task registry not available".to_string()
             }
@@ -3284,6 +3240,110 @@ impl ToolExecutor {
                 format_background_task_list_registry_timeout(reply_timeout)
             }
         }
+    }
+
+    async fn attach_recoverable_fanouts_to_task_list(&self, output: String) -> String {
+        let Some(addendum) = self.recoverable_fanout_task_list_addendum().await else {
+            return output;
+        };
+        if output.trim() == "<background_tasks count=\"0\" />" {
+            return Self::empty_background_task_list_with_fanouts(&addendum);
+        }
+        if let Some(close_tag) = output.rfind("</background_tasks>") {
+            let mut merged = String::with_capacity(output.len() + addendum.len() + 2);
+            merged.push_str(&output[..close_tag]);
+            merged.push('\n');
+            merged.push_str(&addendum);
+            merged.push('\n');
+            merged.push_str(&output[close_tag..]);
+            return merged;
+        }
+        format!("{output}\n{addendum}")
+    }
+
+    fn empty_background_task_list_with_fanouts(addendum: &str) -> String {
+        format!(
+            "<background_tasks count=\"0\" active_task_semantics=\"no active shell background tasks; recoverable terminal agent_fanout results may still exist\">\n{addendum}\n</background_tasks>"
+        )
+    }
+
+    async fn recoverable_fanout_task_list_addendum(&self) -> Option<String> {
+        let ctx = self.spawn_context.as_ref()?;
+        let groups: Vec<_> = ctx
+            .spawner
+            .list_fanout_groups()
+            .await
+            .into_iter()
+            .filter(|group| {
+                let summary = group.summary();
+                group.is_terminal() || summary.active > 0
+            })
+            .collect();
+        if groups.is_empty() {
+            return None;
+        }
+
+        const MAX_GROUPS_IN_TASK_LIST: usize = 8;
+        let visible_count = groups.len().min(MAX_GROUPS_IN_TASK_LIST);
+        let mut xml = format!(
+            "<agent_fanouts count=\"{}\" visible=\"{}\" semantics=\"recoverable terminal fanout results are independent from active background shell tasks\">",
+            groups.len(),
+            visible_count,
+        );
+        for group in groups.iter().take(MAX_GROUPS_IN_TASK_LIST) {
+            let summary = group.summary();
+            let status = if group.is_terminal() {
+                if summary.failed > 0 || summary.timed_out > 0 || summary.spawn_rejected > 0 {
+                    "failed"
+                } else {
+                    "completed"
+                }
+            } else if summary.active > 0 {
+                "running"
+            } else {
+                "pending"
+            };
+            let get_results_call = format!(
+                "agent_fanout(action='get_results', group_id='{}')",
+                group.group_id
+            );
+            let task_output_call = format!("task_output(task_id='{}')", group.group_id);
+            let instruction = format!(
+                "Recover existing results with {get_results_call} or {task_output_call}. Do not rerun solely because background_tasks count is zero."
+            );
+            xml.push_str(&format!(
+                "<agent_fanout id=\"{}\" title=\"{}\" status=\"{}\" terminal=\"{}\" active=\"{}\" completed=\"{}\" failed=\"{}\" uncollected=\"{}\" result_ref=\"{}\" get_results_call=\"{}\" task_output_call=\"{}\" instruction=\"{}\" />",
+                Self::xml_attr(&group.group_id),
+                Self::xml_attr(&group.title),
+                status,
+                group.is_terminal(),
+                summary.active,
+                summary.completed,
+                summary.failed,
+                summary.uncollected,
+                Self::xml_attr(&format!("agent_fanout:{}", group.group_id)),
+                Self::xml_attr(&get_results_call),
+                Self::xml_attr(&task_output_call),
+                Self::xml_attr(&instruction),
+            ));
+        }
+        if groups.len() > MAX_GROUPS_IN_TASK_LIST {
+            xml.push_str(&format!(
+                "<truncated hidden=\"{}\" />",
+                groups.len() - MAX_GROUPS_IN_TASK_LIST
+            ));
+        }
+        xml.push_str("</agent_fanouts>");
+        Some(xml)
+    }
+
+    fn xml_attr(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('\'', "&apos;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 
     async fn task_output(&self, args: &Value) -> String {
@@ -3488,7 +3548,15 @@ impl ToolExecutor {
             "uncollected": summary.uncollected,
             "slots": slots_json,
             "slots_truncated": if truncated { Some(total_slots) } else { None },
-            "hint": "This id belongs to an agent_fanout group, not a shell background task. Use agent_fanout(action='get_results', group_id=...) for full slot results.",
+            "recovery": {
+                "result_ref": format!("agent_fanout:{}", group.group_id),
+                "task_output_id": &group.group_id,
+                "get_results_call": format!("agent_fanout(action='get_results', group_id='{}')", group.group_id),
+                "task_output_call": format!("task_output(task_id='{}')", group.group_id),
+                "active_task_list_empty_does_not_mean_results_missing": true,
+                "do_not_rerun_when_user_asks_for_results": true,
+            },
+            "hint": "This id belongs to a recoverable agent_fanout group, not a shell background task. Use agent_fanout(action='get_results', group_id=...) for full slot results.",
         })
         .to_string();
         let start = output.floor_char_boundary((offset as usize).min(output.len()));
@@ -3757,14 +3825,10 @@ impl ToolExecutor {
     /// what did the last compaction inject?" without dumping enough
     /// content to pressure context.
     ///
-    /// Output cap: the last 8 extractions + last 4 injections are
-    /// included verbatim; older rings are summarised as counts. Each
-    /// record renders in one line plus an optional short preview,
-    /// keeping the total under ~400 tokens even when both rings are
-    /// full.
+    /// Extraction events and prompt-placement traces are reconstructed from
+    /// the durable local journal. This keeps introspection aligned with the
+    /// cross-process source of truth instead of a second in-memory event copy.
     fn render_session_memory_introspect(&self) -> String {
-        use std::fmt::Write as _;
-
         let surface_status = self
             .active_session_id()
             .filter(|sid| !sid.is_empty())
@@ -3779,153 +3843,21 @@ impl ToolExecutor {
             .as_ref()
             .map(crate::cli::slash::slash_memory::render_session_memory_surface_status)
             .filter(|block| !block.trim().is_empty());
-        let (journal_fallback, journal_pipeline, journal_notice) =
-            match self.load_active_session_memory_journal() {
-                Ok(Some((session_id, events))) => (
-                    Self::render_session_memory_journal_fallback(&session_id, &events),
-                    Self::render_session_memory_pipeline_traces(&events),
-                    None,
-                ),
-                Ok(None) => (None, None, None),
-                Err(error) => (None, None, Some(format!("journal unavailable: {error}"))),
-            };
-        let Some(obs) = self.session_memory_observatory.as_ref() else {
-            let body = journal_fallback.unwrap_or_else(|| {
-                "# session-memory observatory\n\n\
-                     No observatory attached to this runtime. This is expected \
-                     for offline CLI or legacy test modes; production servers \
-                     attach one so extractions + injections are traceable here."
-                    .to_string()
-            });
-            let body = journal_notice
-                .as_deref()
-                .map(|notice| Self::inject_session_memory_notice(&body, notice))
-                .unwrap_or(body);
-            return Self::prepend_session_memory_surface_status(surface_block.as_deref(), &body);
+        let body = match self.load_active_session_memory_journal() {
+            Ok(Some((session_id, events))) => {
+                Self::render_session_memory_journal_fallback(&session_id, &events).unwrap_or_else(
+                    || {
+                        "# session-memory diagnostics\n\n\
+                         source: local_journal\n\
+                         No session-memory events or context-assembly traces recorded yet."
+                            .to_string()
+                    },
+                )
+            }
+            Ok(None) => "# session-memory diagnostics\n\nNo active session journal.".to_string(),
+            Err(error) => format!("# session-memory diagnostics\n\njournal unavailable: {error}"),
         };
-
-        let ext = obs.extractions_snapshot();
-        let inj = obs.injections_snapshot();
-        if ext.is_empty()
-            && inj.is_empty()
-            && let Some(fallback) = journal_fallback
-        {
-            return Self::prepend_session_memory_surface_status(
-                surface_block.as_deref(),
-                &fallback,
-            );
-        }
-        let mut out = String::from("# session-memory observatory\n\n");
-        if let Some(block) = surface_block.as_deref() {
-            writeln!(out, "{block}\n").ok();
-        }
-        if let Some(notice) = journal_notice.as_deref() {
-            writeln!(out, "{notice}\n").ok();
-        }
-
-        writeln!(
-            out,
-            "extractions_ring: {} / {}    injections_ring: {} / {}\n",
-            ext.len(),
-            astra_runtime::session_memory::observatory::EXTRACTION_RING_CAPACITY,
-            inj.len(),
-            astra_runtime::session_memory::observatory::INJECTION_RING_CAPACITY,
-        )
-        .ok();
-
-        // ── Extractions: last 8, newest-last ────────────────────────
-        out.push_str("## extractions (newest last)\n");
-        if ext.is_empty() {
-            out.push_str("(none recorded this session)\n\n");
-        } else {
-            let tail = ext.iter().rev().take(8).collect::<Vec<_>>();
-            for rec in tail.iter().rev() {
-                writeln!(
-                    out,
-                    "- t{turn} {trigger:?} {outcome} model={model} sections={sections:?}",
-                    turn = rec.turn,
-                    trigger = rec.trigger,
-                    outcome = render_extraction_outcome_label(&rec.outcome),
-                    model = rec.selector_model.as_deref().unwrap_or("-"),
-                    sections = rec.narrative_sections,
-                )
-                .ok();
-                if !rec.content_preview.is_empty() {
-                    // Preview is already capped to PREVIEW_CHAR_CAP by
-                    // the observatory; further truncate for display.
-                    let line = rec.content_preview.replace('\n', " ⏎ ");
-                    let short: String = line.chars().take(120).collect();
-                    writeln!(out, "    preview: {short}").ok();
-                }
-            }
-            if ext.len() > 8 {
-                writeln!(out, "… ({} older records elided)", ext.len() - 8).ok();
-            }
-            out.push('\n');
-        }
-
-        // ── Injections: last 4, newest-last ─────────────────────────
-        out.push_str("## compaction injections (newest last)\n");
-        if inj.is_empty() {
-            out.push_str("(none recorded this session)\n");
-        } else {
-            let tail = inj.iter().rev().take(4).collect::<Vec<_>>();
-            for rec in tail.iter().rev() {
-                writeln!(
-                    out,
-                    "- t{turn} level={level:?} pressure={pressure:.2} chars={chars} plan={cmp}/{tot} files={files} errs={errs} staleness={stale}",
-                    turn = rec.turn,
-                    level = rec.level,
-                    pressure = rec.pressure,
-                    chars = rec.injected_chars,
-                    cmp = rec.facts_summary.plan_completed,
-                    tot = rec.facts_summary.plan_total,
-                    files = rec.facts_summary.active_files_count,
-                    errs = rec.facts_summary.error_count,
-                    stale = render_staleness(&rec.staleness),
-                )
-                .ok();
-                if !rec.narrative_sections_kept.is_empty() {
-                    writeln!(
-                        out,
-                        "    narrative_sections: {:?}",
-                        rec.narrative_sections_kept
-                    )
-                    .ok();
-                }
-                if !rec.retrieved_memories.is_empty() {
-                    let mems = rec
-                        .retrieved_memories
-                        .iter()
-                        .map(|m| {
-                            let id_short: String = m.memory_id.chars().take(8).collect();
-                            let score_s = m.score.map(|s| format!("={s:.2}")).unwrap_or_default();
-                            let content_s = m
-                                .content_preview
-                                .as_deref()
-                                .map(|c| {
-                                    let short: String =
-                                        c.replace('\n', " ").chars().take(60).collect();
-                                    format!(" \"{short}\"")
-                                })
-                                .unwrap_or_default();
-                            format!("{}[{}]{}{}", m.memory_type, id_short, score_s, content_s,)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    writeln!(out, "    retrieved: {mems}").ok();
-                }
-            }
-            if inj.len() > 4 {
-                writeln!(out, "… ({} older records elided)", inj.len() - 4).ok();
-            }
-        }
-
-        if let Some(pipeline) = journal_pipeline {
-            writeln!(out, "\n{pipeline}").ok();
-        }
-
-        out
+        Self::prepend_session_memory_surface_status(surface_block.as_deref(), &body)
     }
 
     fn load_active_session_memory_journal(
@@ -3972,7 +3904,7 @@ impl ToolExecutor {
                     == Some("prompt_cache_break")
         });
 
-        let mut out = String::from("# session-memory observatory\n\n");
+        let mut out = String::from("# session-memory diagnostics\n\n");
         writeln!(out, "source: local_journal").ok();
         writeln!(out, "session_id: {session_id}").ok();
         writeln!(
@@ -4186,15 +4118,6 @@ impl ToolExecutor {
         match surface_block.filter(|block| !block.trim().is_empty()) {
             Some(block) => format!("{block}\n\n{body}"),
             None => body.to_string(),
-        }
-    }
-
-    fn inject_session_memory_notice(body: &str, notice: &str) -> String {
-        const HEADER: &str = "# session-memory observatory\n\n";
-        if let Some(rest) = body.strip_prefix(HEADER) {
-            format!("{HEADER}{notice}\n\n{rest}")
-        } else {
-            format!("{notice}\n\n{body}")
         }
     }
 
@@ -4534,7 +4457,7 @@ impl ToolExecutor {
                     return outcome;
                 }
                 astra_tools::git_tool_contract::GitAction::Stash => {
-                    let stash_args = git_stash_action_args(args);
+                    let stash_args = git_stash_sub_action_args(args);
                     let mut outcome = self.stash_with_metadata(&stash_args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
@@ -4571,6 +4494,11 @@ impl ToolExecutor {
     async fn execute_run(&self, name: &str, args: &Value) -> EdgeToolRun {
         if let Some(error) = self.tool_admission_denial(name, args) {
             return error;
+        }
+        if name == "git"
+            && let Err(error) = astra_tools::git_gix::validate_git_request(&self.project_root, args)
+        {
+            return EdgeToolRun::failure_evidence(error.message, error.evidence);
         }
         let mut tool_result_fields = None;
         let output = self.execute_raw(name, args, &mut tool_result_fields).await;
@@ -4696,7 +4624,7 @@ impl ToolExecutor {
                             self.revert_commit(args)
                         }
                         astra_tools::git_tool_contract::GitAction::Stash => {
-                            let stash_args = git_stash_action_args(args);
+                            let stash_args = git_stash_sub_action_args(args);
                             self.stash(&stash_args)
                         }
                         astra_tools::git_tool_contract::GitAction::CheckoutFile => {
@@ -4784,6 +4712,26 @@ impl ToolExecutor {
                             Ok(action) => action,
                             Err(error) => return format!("Error: {error}"),
                         };
+                    if action == astra_tools::memory_tool_contract::MemoryAction::Inventory {
+                        let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty())
+                        else {
+                            return "Error: memory inventory requires an active session_id"
+                                .to_string();
+                        };
+                        let inventory = match astra_services::session_memory_inventory::load_local_session_memory_inventory(
+                            &session_id,
+                        ) {
+                            Ok(inventory) => inventory,
+                            Err(error) => {
+                                return format!(
+                                    "Error: session memory inventory failed: {error}"
+                                );
+                            }
+                        };
+                        return serde_json::to_string(&inventory).unwrap_or_else(|error| {
+                            format!("Error: serialize session memory inventory: {error}")
+                        });
+                    }
                     let clean_args = self.memory_args_with_context(args);
                     self.memoria_call(action.as_str(), &clean_args).await
                 }
@@ -5034,7 +4982,7 @@ impl ToolExecutor {
             && !cli_tool_output_is_error(&output)
             && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
         {
-            let client = astra_tools::memoria::MemoriaClient::new(
+            let client = astra_tools::memoria::MemoriaToolGateway::new(
                 self.cloud_base.clone(),
                 self.cloud_token(),
             );
@@ -5782,13 +5730,20 @@ mod tests {
         AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputSnapshot, PERSIST_THRESHOLD, ToolExecutor,
         all_tool_schemas, detect_git_remote_repos, extract_github_owner_repo,
         file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
-        format_background_task_output_timeout, format_background_task_stop_error, memoria,
-        parse_memory_search_contents, utf16_col_to_char_idx,
+        format_background_task_output_timeout, format_background_task_stop_error,
+        git_stash_sub_action_args, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
     };
     use crate::lock_recovery::LockRecovery;
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[test]
+    fn git_stash_bridge_remaps_canonical_sub_action() {
+        let canonical =
+            git_stash_sub_action_args(&serde_json::json!({"action":"stash","sub_action":"push"}));
+        assert_eq!(canonical["action"], "push");
+    }
 
     struct ImmediateSpawnExecutor;
 
@@ -5911,6 +5866,24 @@ mod tests {
             "shared trait must return the CLI tool output, got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn cli_git_invalid_path_preserves_typed_source_evidence() {
+        let (_dir, executor) = temp_executor();
+
+        let result = astra_tools::ToolExecutor::execute_with_metadata(
+            &executor,
+            "git",
+            &serde_json::json!({"action": "diff", "path": "missing.rs"}),
+        )
+        .await;
+
+        assert!(result.is_error, "{result:?}");
+        let metadata = result.metadata.expect("typed validation metadata");
+        assert_eq!(metadata["error_kind"], "tool_invalid_args");
+        assert_eq!(metadata["recovery_evidence"]["cause"], "resource_missing");
+        assert_eq!(metadata["recovery_evidence"]["retryable"], false);
     }
 
     #[test]
@@ -6354,6 +6327,55 @@ mod tests {
         assert!(
             !result.contains("Background task registry did not respond"),
             "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_bg_surfaces_recoverable_fanout_results_without_background_runner() {
+        let spawner = test_spawner();
+        let ctx = fanout_test_context(spawner);
+        let executor = test_executor().with_spawn_context(ctx);
+
+        let started = executor
+            .execute(
+                "agent_fanout",
+                &serde_json::json!({
+                    "action": "start",
+                    "group_id": "review-fanout",
+                    "target_count": 1,
+                    "slots": [{
+                        "id": "review",
+                        "description": "Review one area",
+                        "prompt": "Return a short result."
+                    }]
+                }),
+            )
+            .await;
+        let started_value: serde_json::Value = serde_json::from_str(&started).unwrap();
+        assert_eq!(started_value["status"], "completed", "{started}");
+
+        let result = executor.task_list_bg().await;
+
+        assert!(result.contains("<background_tasks count=\"0\""), "{result}");
+        assert!(result.contains("<agent_fanouts count=\"1\""), "{result}");
+        assert!(result.contains("id=\"review-fanout\""), "{result}");
+        assert!(
+            result.contains(
+                "agent_fanout(action=&apos;get_results&apos;, group_id=&apos;review-fanout&apos;)"
+            ),
+            "{result}"
+        );
+        assert!(
+            result.contains("task_output(task_id=&apos;review-fanout&apos;)"),
+            "{result}"
+        );
+        assert!(
+            result.contains("Do not rerun solely because background_tasks count is zero."),
+            "{result}"
+        );
+        assert!(
+            !result.contains("Background task unavailable"),
+            "recoverable fanout results are a valid task_list surface even without a shell background runner: {result}"
         );
     }
 
@@ -7981,6 +8003,58 @@ mod tests {
         assert_eq!(args["turn"].as_u64(), Some(9));
     }
 
+    #[tokio::test]
+    async fn memory_inventory_reads_authoritative_local_journal_without_memoria_recall() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "cli-memory-inventory";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&astra_services::session_journal::JournalEvent::session_memory_extraction(
+                Some(session_id),
+                5,
+                20,
+                astra_services::session_journal::SessionMemoryExtractionOutcome::Extracted {
+                    source:
+                        astra_services::session_journal::SessionMemoryExtractionSource::RuleFallback,
+                    bytes_written: 80,
+                },
+                &astra_services::session_journal::SessionMemoryExtractionBreadcrumbs::default(),
+            ))
+            .unwrap();
+        let executor = test_executor().with_active_session_id(session_id);
+
+        let output = executor
+            .execute("memory", &serde_json::json!({"action": "inventory"}))
+            .await;
+        let inventory: astra_services::session_memory_inventory::SessionMemoryInventory =
+            serde_json::from_str(&output).unwrap();
+
+        assert_eq!(inventory.session_id, session_id);
+        assert_eq!(inventory.successful_extraction_versions, 1);
+        assert_eq!(inventory.rule_fallback_versions, 1);
+        assert_eq!(inventory.logical_current_snapshot_count, Some(0));
+        assert_eq!(inventory.inventory_source, "local_journal");
+    }
+
+    #[tokio::test]
+    async fn memory_inventory_surfaces_corrupt_journal_instead_of_reporting_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "cli-memory-inventory-corrupt";
+        let path = astra_services::session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{not-json}\n").unwrap();
+        let executor = test_executor().with_active_session_id(session_id);
+
+        let output = executor
+            .execute("memory", &serde_json::json!({"action": "inventory"}))
+            .await;
+
+        assert!(output.starts_with("Error: session memory inventory failed:"));
+        assert!(output.contains("cannot be exact"));
+    }
+
     // ── File-journal persistence wiring (regression guard) ──────────────
 
     /// RAII guard that scrubs `_ASTRA_FILE_CHECKPOINT_ROOT` on drop so the
@@ -8532,33 +8606,6 @@ mod tests {
 
     // ── introspect facet=session_memory (unhappy first) ───────────────
 
-    fn attach_empty_observatory(
-        executor: ToolExecutor,
-    ) -> (
-        ToolExecutor,
-        std::sync::Arc<astra_runtime::session_memory::SessionMemoryObservatory>,
-    ) {
-        let obs =
-            std::sync::Arc::new(astra_runtime::session_memory::SessionMemoryObservatory::new());
-        (
-            executor.with_session_memory_observatory(std::sync::Arc::clone(&obs)),
-            obs,
-        )
-    }
-
-    #[test]
-    fn introspect_session_memory_missing_observatory_returns_placeholder() {
-        // Offline executor never wires the observatory — output must be
-        // a short, honest placeholder rather than silently empty so the
-        // model knows the tool works but isn't wired.
-        let executor = test_executor();
-        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
-        assert!(
-            out.contains("No observatory attached"),
-            "expected placeholder, got: {out}"
-        );
-    }
-
     #[test]
     fn introspect_session_memory_missing_observatory_falls_back_to_journal() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8705,158 +8752,6 @@ mod tests {
             out.contains("failed to read session journal for sess-introspect-unreadable"),
             "{out}"
         );
-        assert!(out.contains("No observatory attached"), "{out}");
-    }
-
-    #[test]
-    fn introspect_session_memory_empty_rings_renders_cleanly() {
-        let (executor, _obs) = attach_empty_observatory(test_executor());
-        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
-        assert!(out.contains("extractions_ring: 0"));
-        assert!(out.contains("injections_ring: 0"));
-        assert!(out.contains("(none recorded this session)"));
-    }
-
-    #[test]
-    fn introspect_session_memory_renders_extraction_and_injection() {
-        use astra_runtime::session_memory::observatory::{
-            ExtractionOutcome, ExtractionRecord, ExtractionSource, ExtractionTrigger, FactsSummary,
-            InjectionLevel, InjectionRecord, RetrievedMemoryRef, StalenessSignals,
-        };
-        use std::time::{Duration, SystemTime};
-
-        let (executor, obs) = attach_empty_observatory(test_executor());
-        obs.record_extraction(ExtractionRecord {
-            session_id: "s1".into(),
-            turn: 3,
-            at: SystemTime::UNIX_EPOCH,
-            trigger: ExtractionTrigger::GrowthGate,
-            selector_model: Some("mini-judge".into()),
-            outcome: ExtractionOutcome::Persisted {
-                source: ExtractionSource::Llm,
-                bytes_written: 1234,
-                store_attempt: 2,
-            },
-            narrative_sections: vec!["Task Specification".into(), "Learnings".into()],
-            content_preview: "[session-memory:v1] full\ndetails".into(),
-            latency: Duration::from_millis(120),
-        });
-        obs.record_injection(InjectionRecord {
-            session_id: "s1".into(),
-            turn: 4,
-            at: SystemTime::UNIX_EPOCH,
-            pressure: 0.82,
-            level: InjectionLevel::L1Minimal,
-            injected_chars: 140,
-            facts_summary: FactsSummary {
-                turn: 4,
-                plan_completed: 2,
-                plan_total: 5,
-                active_files_count: 3,
-                error_count: 1,
-                last_error_preview: Some("compile error".into()),
-                ..Default::default()
-            },
-            staleness: StalenessSignals {
-                task_contradicted: false,
-                missing_corrections: true,
-            },
-            retrieved_memories: vec![RetrievedMemoryRef {
-                memory_id: "abcdef12-3456".into(),
-                memory_type: "working".into(),
-                score: Some(0.71),
-                content_preview: Some("Uses PostgreSQL for primary storage".into()),
-            }],
-            narrative_sections_kept: vec!["Task Specification".into()],
-        });
-
-        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
-        // Extraction line
-        assert!(
-            out.contains("t3 GrowthGate persisted(Llm,bytes=1234,attempt=2)"),
-            "extraction line missing; got:\n{out}"
-        );
-        assert!(
-            out.contains("preview:"),
-            "preview line missing; got:\n{out}"
-        );
-        // Newline in preview must be collapsed so one record stays one
-        // visual line (the arrow-return marker keeps it debuggable).
-        assert!(out.contains(" ⏎ "), "expected newline marker; got:\n{out}");
-        // Injection line
-        assert!(
-            out.contains("level=L1Minimal pressure=0.82"),
-            "injection line missing; got:\n{out}"
-        );
-        assert!(
-            out.contains("plan=2/5 files=3 errs=1 staleness=missing_corrections"),
-            "injection summary missing; got:\n{out}"
-        );
-        // Retrieved memories show short id + score
-        assert!(
-            out.contains("retrieved: working[abcdef12]=0.71"),
-            "retrieved line missing; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn introspect_session_memory_output_size_is_bounded_under_full_ring() {
-        // Under capacity, output must stay under 4KB (a comfortable
-        // upper bound well below any reasonable context concern).
-        // Guards against accidental regressions that would dump the
-        // full injection content.
-        use astra_runtime::session_memory::observatory::{
-            ExtractionOutcome, ExtractionRecord, ExtractionSource, ExtractionTrigger, FactsSummary,
-            InjectionLevel, InjectionRecord, StalenessSignals,
-        };
-        use std::time::{Duration, SystemTime};
-
-        let (executor, obs) = attach_empty_observatory(test_executor());
-        let big = "x".repeat(1000); // > PREVIEW_CHAR_CAP on purpose
-        for i in 0..64u32 {
-            obs.record_extraction(ExtractionRecord {
-                session_id: format!("s{i}"),
-                turn: i,
-                at: SystemTime::UNIX_EPOCH,
-                trigger: ExtractionTrigger::GrowthGate,
-                selector_model: Some("m".into()),
-                outcome: ExtractionOutcome::Persisted {
-                    source: ExtractionSource::Llm,
-                    bytes_written: 42,
-                    store_attempt: 1,
-                },
-                narrative_sections: vec!["Task Specification".into()],
-                content_preview: big.clone(), // test overrides; real path clips
-                latency: Duration::from_millis(10),
-            });
-        }
-        for i in 0..32u32 {
-            obs.record_injection(InjectionRecord {
-                session_id: format!("s{i}"),
-                turn: i,
-                at: SystemTime::UNIX_EPOCH,
-                pressure: 0.6,
-                level: InjectionLevel::L1Full,
-                injected_chars: 500,
-                facts_summary: FactsSummary::default(),
-                staleness: StalenessSignals::default(),
-                retrieved_memories: vec![],
-                narrative_sections_kept: vec![],
-            });
-        }
-        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
-        assert!(
-            out.len() < 8_000,
-            "introspect output must stay bounded; got {} bytes",
-            out.len()
-        );
-        // Last 8 extractions visible — the oldest must be hidden.
-        assert!(out.contains("t63"), "newest extraction missing");
-        assert!(!out.contains("t0 GrowthGate"), "oldest must be elided");
-        // Elision breadcrumb present.
-        assert!(
-            out.contains("older records elided"),
-            "must indicate elision; got:\n{out}"
-        );
+        assert!(out.contains("# session-memory diagnostics"), "{out}");
     }
 }

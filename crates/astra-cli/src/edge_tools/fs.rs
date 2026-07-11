@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use super::{
     AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, ReadCoverage, ReadDedupKey,
     SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel, fuzzy_replacer,
-    noop_or_cached_tool_result_fields, tool_output_limit, truncate_output,
+    nonexecuted_tool_result_fields, tool_output_limit, truncate_output,
 };
 use astra_runtime::tool_sandbox::validate_path;
 use astra_sandbox::is_internal_safe_path;
@@ -323,7 +323,9 @@ impl ToolExecutor {
 
         // Consecutive identical outline/range request + unchanged file → stub before I/O.
         if !is_internal_artifact_read && self.can_dedup_identical_partial_read(&path, &dedup_key) {
-            *tool_result_fields = Some(noop_or_cached_tool_result_fields());
+            *tool_result_fields = Some(nonexecuted_tool_result_fields(
+                astra_services::session_journal::ToolCallDisposition::Suppressed,
+            ));
             return format!(
                 "[Same read_file request as immediately before — file unchanged. \
                  Refer to the earlier read_file result for {path_str}.]"
@@ -338,7 +340,9 @@ impl ToolExecutor {
             let s = start_raw.unwrap_or(1);
             let e = end_raw.unwrap_or(u64::MAX);
             if !is_internal_artifact_read && self.is_range_already_read(&path, s, e) {
-                *tool_result_fields = Some(noop_or_cached_tool_result_fields());
+                *tool_result_fields = Some(nonexecuted_tool_result_fields(
+                    astra_services::session_journal::ToolCallDisposition::Suppressed,
+                ));
                 return format!(
                     "[Lines {s}–{e} of {path_str} were already read in earlier requests \
                      and the file is unchanged. Refer to those earlier read_file results \
@@ -584,7 +588,9 @@ impl ToolExecutor {
         // changed, return a stub. Later turns may need the content again after
         // prompt compaction, so cross-turn reads still return the file body.
         if !is_internal_artifact_read && self.can_dedup_read(&path) {
-            *tool_result_fields = Some(noop_or_cached_tool_result_fields());
+            *tool_result_fields = Some(nonexecuted_tool_result_fields(
+                astra_services::session_journal::ToolCallDisposition::Suppressed,
+            ));
             let msg = if is_ranged {
                 format!(
                     "[File already fully read earlier in this turn and unchanged — \
