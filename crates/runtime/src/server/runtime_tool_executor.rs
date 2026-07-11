@@ -1384,19 +1384,6 @@ impl RuntimeToolExecutor {
         Value::Object(self.binding_event_fields())
     }
 
-    /// Whether the current prompt-visible tool surface can mutate the bound
-    /// workspace. Runtime loop guards must not require an edit when this is
-    /// false: a structured user intent describes the requested outcome, not
-    /// necessarily an executable capability in this run.
-    pub(crate) fn has_visible_workspace_mutation_tool(&self) -> bool {
-        let visible_tool_names = self.provider_visible_runtime_tool_names();
-        astra_runtime_env::ToolRegistry::builtins()
-            .iter()
-            .any(|spec| {
-                spec.effect.writes_workspace && visible_tool_names.contains(spec.name.as_str())
-            })
-    }
-
     pub fn capacity_provider_coverage(
         &self,
     ) -> Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry> {
@@ -2250,31 +2237,6 @@ mod tests {
                 "{hidden} must not be advertised without a workspace runtime"
             );
         }
-    }
-
-    #[test]
-    fn workspace_mutation_capability_requires_a_visible_write_tool() {
-        let dir = TempDir::new().unwrap();
-        let mut unbound = RuntimeToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            "test-session".into(),
-            None,
-            None,
-        );
-        assert!(
-            !unbound.has_visible_workspace_mutation_tool(),
-            "an unbound executor must not advertise a mutation capability"
-        );
-
-        unbound.set_execution_bindings(
-            WorkspaceBinding::server_sandbox(dir.path()),
-            ExecutorBinding::server_local(),
-        );
-        assert!(
-            unbound.has_visible_workspace_mutation_tool(),
-            "a writable server workspace must expose at least one mutation tool"
-        );
     }
 
     #[test]

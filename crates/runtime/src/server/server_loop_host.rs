@@ -2473,23 +2473,23 @@ impl ServerAgenticLoopHost {
     ) {
         for update in updates {
             match update {
-                LlmStreamUpdate::TextDelta(content) if !content.is_empty() => {
+                LlmStreamUpdate::Text(content) if !content.is_empty() => {
                     self.emit_event(json!({
                         "type": "text_delta",
                         "content": content,
                     }));
                     streamed_text.push_str(&content);
                 }
-                LlmStreamUpdate::ReasoningDelta(content) if !content.is_empty() => {
+                LlmStreamUpdate::Reasoning(content) if !content.is_empty() => {
                     self.emit_event(json!({
                         "type": "reasoning_delta",
                         "content": content,
                     }));
                     streamed_reasoning.push_str(&content);
                 }
-                LlmStreamUpdate::TextDelta(_)
-                | LlmStreamUpdate::ReasoningDelta(_)
-                | LlmStreamUpdate::ToolCallDelta { .. } => {}
+                LlmStreamUpdate::Text(_)
+                | LlmStreamUpdate::Reasoning(_)
+                | LlmStreamUpdate::ToolCall { .. } => {}
             }
         }
     }
@@ -5072,7 +5072,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 let mut attempt_reasoning = String::new();
                 let mut first_streamed_tool_index = None;
                 let mut on_stream_update = |update: LlmStreamUpdate| match update {
-                    LlmStreamUpdate::TextDelta(content) => {
+                    LlmStreamUpdate::Text(content) => {
                         if !content.is_empty() {
                             attempt_first_stream_update_ms.get_or_insert_with(|| {
                                 llm_round_start.elapsed().as_millis() as u64
@@ -5082,7 +5082,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         }
                         attempt_text.push_str(&content);
                         if self.terminal_handoff_window.is_open() {
-                            action_window_updates.push(LlmStreamUpdate::TextDelta(content.clone()));
+                            action_window_updates.push(LlmStreamUpdate::Text(content.clone()));
                             if !content.is_empty() {
                                 self.terminal_handoff_window.close();
                                 attempt_first_visible_text_ms.get_or_insert_with(|| {
@@ -5125,10 +5125,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             streamed_text.push_str(&content);
                         }
                     }
-                    LlmStreamUpdate::ReasoningDelta(content) => {
+                    LlmStreamUpdate::Reasoning(content) => {
                         attempt_reasoning.push_str(&content);
                         if self.terminal_handoff_window.is_open() {
-                            action_window_updates.push(LlmStreamUpdate::ReasoningDelta(content));
+                            action_window_updates.push(LlmStreamUpdate::Reasoning(content));
                             return;
                         }
                         if streamed_reasoning.starts_with(&attempt_reasoning) {
@@ -5150,7 +5150,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             streamed_reasoning.push_str(&content);
                         }
                     }
-                    LlmStreamUpdate::ToolCallDelta { index, tool_call } => {
+                    LlmStreamUpdate::ToolCall { index, tool_call } => {
                         if !self.terminal_handoff_window.is_open() {
                             return;
                         }

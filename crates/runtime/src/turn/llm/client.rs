@@ -360,9 +360,9 @@ pub(crate) struct LlmCallResult {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LlmStreamUpdate {
-    TextDelta(String),
-    ReasoningDelta(String),
-    ToolCallDelta { index: usize, tool_call: Value },
+    Text(String),
+    Reasoning(String),
+    ToolCall { index: usize, tool_call: Value },
 }
 
 pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
@@ -3313,12 +3313,12 @@ async fn collect_llm_stream(
                 if is_reasoning {
                     reasoning.push_str(&chunk);
                     if let Some(callback) = stream_callback.as_deref_mut() {
-                        callback(LlmStreamUpdate::ReasoningDelta(chunk));
+                        callback(LlmStreamUpdate::Reasoning(chunk));
                     }
                 } else {
                     full_text.push_str(&chunk);
                     if let Some(callback) = stream_callback.as_deref_mut() {
-                        callback(LlmStreamUpdate::TextDelta(chunk));
+                        callback(LlmStreamUpdate::Text(chunk));
                     }
                 }
             }
@@ -3346,7 +3346,7 @@ async fn collect_llm_stream(
             }
             reasoning.push_str(r);
             if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::ReasoningDelta(r.to_string()));
+                callback(LlmStreamUpdate::Reasoning(r.to_string()));
             }
             made_progress = true;
         }
@@ -3423,7 +3423,7 @@ async fn collect_llm_stream(
                     }
                 }
                 if let Some(callback) = stream_callback.as_deref_mut() {
-                    callback(LlmStreamUpdate::ToolCallDelta {
+                    callback(LlmStreamUpdate::ToolCall {
                         index: idx,
                         tool_call: Value::Object(entry.clone()),
                     });
@@ -3629,7 +3629,7 @@ async fn collect_anthropic_llm_stream(
                     if let Some(callback) = stream_callback.as_deref_mut()
                         && let Some(tool_call) = tool_calls_map.get(&index)
                     {
-                        callback(LlmStreamUpdate::ToolCallDelta {
+                        callback(LlmStreamUpdate::ToolCall {
                             index,
                             tool_call: Value::Object(tool_call.clone()),
                         });
@@ -3662,7 +3662,7 @@ async fn collect_anthropic_llm_stream(
                             }
                             full_text.push_str(text);
                             if let Some(callback) = stream_callback.as_deref_mut() {
-                                callback(LlmStreamUpdate::TextDelta(text.to_string()));
+                                callback(LlmStreamUpdate::Text(text.to_string()));
                             }
                             made_progress = true;
                         }
@@ -3687,7 +3687,7 @@ async fn collect_anthropic_llm_stream(
                             }
                             reasoning.push_str(text);
                             if let Some(callback) = stream_callback.as_deref_mut() {
-                                callback(LlmStreamUpdate::ReasoningDelta(text.to_string()));
+                                callback(LlmStreamUpdate::Reasoning(text.to_string()));
                             }
                             made_progress = true;
                         }
@@ -3743,7 +3743,7 @@ async fn collect_anthropic_llm_stream(
                         if let Some(callback) = stream_callback.as_deref_mut()
                             && let Some(tool_call) = tool_calls_map.get(&index)
                         {
-                            callback(LlmStreamUpdate::ToolCallDelta {
+                            callback(LlmStreamUpdate::ToolCall {
                                 index,
                                 tool_call: Value::Object(tool_call.clone()),
                             });
@@ -5128,8 +5128,8 @@ mod tests {
         assert_eq!(
             updates,
             vec![
-                LlmStreamUpdate::ReasoningDelta("hidden reasoning".to_string()),
-                LlmStreamUpdate::TextDelta("visible answer".to_string()),
+                LlmStreamUpdate::Reasoning("hidden reasoning".to_string()),
+                LlmStreamUpdate::Text("visible answer".to_string()),
             ]
         );
     }
@@ -5201,9 +5201,9 @@ mod tests {
         assert_eq!(
             updates,
             vec![
-                LlmStreamUpdate::TextDelta("Hi ".to_string()),
-                LlmStreamUpdate::ReasoningDelta("R".to_string()),
-                LlmStreamUpdate::TextDelta("there".to_string()),
+                LlmStreamUpdate::Text("Hi ".to_string()),
+                LlmStreamUpdate::Reasoning("R".to_string()),
+                LlmStreamUpdate::Text("there".to_string()),
             ],
             "callback should receive deltas before aggregate completion",
         );
@@ -5785,14 +5785,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_llm_stream_decodes_lossy_utf8_inside_json_string() {
+    async fn collect_llm_stream_rejects_invalid_utf8_inside_json_string() {
         let mut v: Vec<u8> = Vec::new();
         v.extend_from_slice(br#"data: {"choices":[{"delta":{"content":"a"#);
         v.push(0xff);
         v.extend_from_slice(br#""}}]}"#);
         v.extend_from_slice(b"\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(v))]);
-        let res = collect_llm_stream(
+        let error = collect_llm_stream(
             stream,
             "m",
             Instant::now(),
@@ -5802,8 +5802,14 @@ mod tests {
             None,
         )
         .await
-        .expect("collect");
-        assert_eq!(res.full_text, "a\u{FFFD}");
+        .expect_err("invalid UTF-8 must fail the stream");
+        match error {
+            StreamCollectError::Transport { error, partial } => {
+                assert!(error.contains("invalid UTF-8"), "{error}");
+                assert!(partial.full_text.is_empty());
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
     }
 
     // ── Anthropic native stream tests ──────────────────────────────────────

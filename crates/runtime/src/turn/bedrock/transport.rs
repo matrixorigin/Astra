@@ -259,12 +259,12 @@ pub(crate) async fn collect_bedrock_stream(
                 match &ev {
                     BedrockStreamEvent::TextDelta(text) => {
                         if let Some(callback) = stream_callback.as_deref_mut() {
-                            callback(LlmStreamUpdate::TextDelta(text.clone()));
+                            callback(LlmStreamUpdate::Text(text.clone()));
                         }
                     }
                     BedrockStreamEvent::ReasoningDelta(text) => {
                         if let Some(callback) = stream_callback.as_deref_mut() {
-                            callback(LlmStreamUpdate::ReasoningDelta(text.clone()));
+                            callback(LlmStreamUpdate::Reasoning(text.clone()));
                         }
                     }
                     BedrockStreamEvent::ToolCallDelta {
@@ -274,7 +274,7 @@ pub(crate) async fn collect_bedrock_stream(
                         arguments,
                     } => {
                         if let Some(callback) = stream_callback.as_deref_mut() {
-                            callback(LlmStreamUpdate::ToolCallDelta {
+                            callback(LlmStreamUpdate::ToolCall {
                                 index: *index as usize,
                                 tool_call: json!({
                                     "id": id,

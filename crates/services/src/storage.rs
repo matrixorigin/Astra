@@ -1619,7 +1619,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_session_execution_slots (
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NOT NULL,
             acquired_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
