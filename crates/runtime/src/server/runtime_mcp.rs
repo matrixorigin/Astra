@@ -30,6 +30,8 @@ static AGENT_BINDING_MCP_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new(
 #[derive(Clone)]
 pub(crate) struct RuntimeMcpBundle {
     pub schemas: Vec<Value>,
+    pub control_tools: crate::turn::terminal_control::RuntimeControlToolSnapshot,
+    pub stop_after_success_tools: crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot,
     pub manager: Option<Arc<RwLock<McpClientManager>>>,
     pub agent_binding_mcp: Option<Arc<AgentBindingMcpRuntime>>,
 }
@@ -47,6 +49,7 @@ struct AgentBindingMcpTool {
     name: String,
     description: Option<String>,
     input_schema: Value,
+    metadata: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -508,6 +511,8 @@ pub(crate) async fn prepare_request_scoped_runtime_bundle(
 
     Ok(Some(RuntimeMcpBundle {
         schemas,
+        control_tools: Default::default(),
+        stop_after_success_tools: Default::default(),
         manager: Some(Arc::new(RwLock::new(manager))),
         agent_binding_mcp: None,
     }))
@@ -645,6 +650,7 @@ fn parse_agent_binding_mcp_tools(
             name: name.to_string(),
             description,
             input_schema,
+            metadata: tool.get("metadata").cloned(),
         });
     }
     Ok(parsed)
@@ -653,9 +659,18 @@ fn parse_agent_binding_mcp_tools(
 fn agent_binding_tools_to_schemas_checked(
     server_name: &str,
     tools: &[AgentBindingMcpTool],
-) -> Result<Vec<Value>, String> {
+) -> Result<
+    (
+        Vec<Value>,
+        crate::turn::terminal_control::RuntimeControlToolSnapshot,
+        crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot,
+    ),
+    (String, &'static str),
+> {
     let mut seen = HashSet::new();
     let mut schemas = Vec::with_capacity(tools.len());
+    let mut control_tools = Vec::new();
+    let mut stop_after_success_tools = Vec::new();
     for tool in tools {
         let schema = mcp_tool_schema_from_parts(
             server_name,
@@ -665,13 +680,37 @@ fn agent_binding_tools_to_schemas_checked(
         );
         let name = schema["function"]["name"].as_str().unwrap_or_default();
         if !seen.insert(name.to_string()) {
-            return Err(format!(
-                "duplicate MCP public tool name after sanitization: {name}"
+            return Err((
+                format!("duplicate MCP public tool name after sanitization: {name}"),
+                "mcp_public_name_conflict",
             ));
+        }
+        if let Some(descriptor) =
+            crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
+                name,
+                tool.metadata.as_ref(),
+            )
+            .map_err(|error| (error.to_string(), error.error_code()))?
+        {
+            control_tools.push(descriptor);
+        }
+        if crate::turn::tool_completion::stop_after_success_from_metadata(
+            name,
+            tool.metadata.as_ref(),
+        )
+        .map_err(|error| (error.to_string(), error.error_code()))?
+        {
+            stop_after_success_tools.push(name.to_string());
         }
         schemas.push(schema);
     }
-    Ok(schemas)
+    Ok((
+        schemas,
+        crate::turn::terminal_control::RuntimeControlToolSnapshot::new(control_tools),
+        crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot::new(
+            stop_after_success_tools,
+        ),
+    ))
 }
 
 fn tool_names_by_public_name(
@@ -866,14 +905,9 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
             "agent_binding_discovery_failed",
         )
     })?;
-    let schemas =
-        agent_binding_tools_to_schemas_checked(&tool_namespace, &tools).map_err(|error| {
-            mcp_error(
-                StatusCode::BAD_GATEWAY,
-                error,
-                "agent_binding_schema_invalid",
-            )
-        })?;
+    let (schemas, control_tools, stop_after_success_tools) =
+        agent_binding_tools_to_schemas_checked(&tool_namespace, &tools)
+            .map_err(|(error, code)| mcp_error(StatusCode::BAD_GATEWAY, error, code))?;
     let tool_names_by_public_name = tool_names_by_public_name(&schemas, &tools);
     let agent_binding_mcp = AgentBindingMcpRuntime {
         server_name: tool_namespace,
@@ -883,6 +917,8 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
     };
     Ok(RuntimeMcpBundle {
         schemas,
+        control_tools,
+        stop_after_success_tools,
         manager: None,
         agent_binding_mcp: Some(Arc::new(agent_binding_mcp)),
     })
@@ -891,6 +927,104 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_binding_discovery_preserves_terminal_control_metadata_by_public_name() {
+        let tools = parse_agent_binding_mcp_tools(json!({
+            "tools": [{
+                "name": "arbitrary-provider-name",
+                "description": "Transfer runtime control",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"action": {"type": "string"}},
+                    "required": ["action"]
+                },
+                "metadata": {
+                    "stop_after_success": true,
+                    "control": {
+                        "kind": "moi.control.handoff.v1",
+                        "terminal": true,
+                        "policy_id": "authoring.handoff.v1",
+                        "ui_visibility": "hidden"
+                    }
+                }
+            }]
+        }))
+        .expect("valid discovery response");
+
+        let (schemas, control_tools, stop_after_success_tools) =
+            agent_binding_tools_to_schemas_checked("provider", &tools).expect("valid schemas");
+        let public_name = schemas[0]["function"]["name"]
+            .as_str()
+            .expect("public tool name");
+        let descriptor = control_tools
+            .descriptor(public_name)
+            .expect("control descriptor must be indexed by public name");
+
+        assert_eq!(public_name, "mcp__provider__arbitrary-provider-name");
+        assert_eq!(descriptor.kind, "moi.control.handoff.v1");
+        assert!(descriptor.terminal);
+        assert_eq!(descriptor.policy_id, "authoring.handoff.v1");
+        assert_eq!(
+            stop_after_success_tools
+                .successful_tool_name(
+                    &[astra_services::session_journal::ToolCallRecord {
+                        name: public_name.to_string(),
+                        ok: true,
+                        tool_call_id: Some("call-1".to_string()),
+                        ..Default::default()
+                    }],
+                    &[json!({
+                        "tool_call_id": "call-1",
+                        "structuredContent": {"output": {"ok": true}}
+                    })],
+                )
+                .as_deref(),
+            Some(public_name)
+        );
+    }
+
+    #[test]
+    fn unsupported_terminal_control_kind_fails_before_entering_tool_surface() {
+        let tools = parse_agent_binding_mcp_tools(json!({
+            "tools": [{
+                "name": "handoff",
+                "inputSchema": {"type": "object"},
+                "metadata": {
+                    "control": {
+                        "kind": "moi.control.handoff.v2",
+                        "terminal": true,
+                        "policy_id": "authoring.handoff.v2"
+                    }
+                }
+            }]
+        }))
+        .expect("discovery parsing should not validate runtime semantics");
+
+        let (message, code) =
+            agent_binding_tools_to_schemas_checked("provider", &tools).unwrap_err();
+
+        assert_eq!(code, "terminal_handoff_unsupported");
+        assert!(message.contains("unsupported kind"));
+    }
+
+    #[test]
+    fn invalid_stop_after_success_metadata_fails_before_entering_tool_surface() {
+        let tools = parse_agent_binding_mcp_tools(json!({
+            "tools": [{
+                "name": "agent_builder",
+                "inputSchema": {"type": "object"},
+                "metadata": {"stop_after_success": "true"}
+            }]
+        }))
+        .expect("discovery parsing should not validate runtime semantics");
+
+        let (message, code) =
+            agent_binding_tools_to_schemas_checked("provider", &tools).unwrap_err();
+
+        assert_eq!(code, "stop_after_success_contract_violation");
+        assert!(message.contains("stop_after_success"));
+    }
 
     #[test]
     fn redacts_bearer_and_token_fragments() {
@@ -1182,6 +1316,7 @@ mod tests {
             .expect("empty Agent Binding MCP discovery should be allowed");
 
         assert!(bundle.schemas.is_empty());
+        assert!(bundle.control_tools.is_empty());
         assert!(bundle.manager.is_none());
         assert!(bundle.agent_binding_mcp.is_some());
         server.abort();

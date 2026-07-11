@@ -4871,6 +4871,89 @@ fn finalize_run_events_appends_run_finished_for_failures() {
 }
 
 #[test]
+fn finalize_run_events_preserves_terminal_handoff_and_marks_source_delegated() {
+    let svc = test_service();
+    let request = test_request("handoff");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.total_prompt = 21;
+    state.total_completion = 4;
+    let handoff_event = json!({
+        "type": "runtime.control.handoff.requested",
+        "handoff_id": "handoff-1",
+        "kind": "moi.control.handoff.v1",
+        "target": "agent_authoring",
+        "action": "revise_current_agent",
+        "terminal": true,
+        "tool_call_id": "call-1"
+    });
+
+    let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+        Ok(AgenticLoopOutcome::Delegated),
+        vec![handoff_event.clone()],
+        &state,
+    );
+
+    assert_eq!(status, RunStatus::Delegated);
+    assert!(error.is_none());
+    assert_eq!(events[0], handoff_event);
+    assert_eq!(events[1]["event_type"], "run_finished");
+    assert_eq!(events[1]["data"]["status"], "delegated");
+    assert_eq!(events[1]["data"]["outcome"], "delegated");
+    assert_eq!(events[1]["data"]["prompt_tokens"], 21);
+    assert_eq!(events[1]["data"]["completion_tokens"], 4);
+}
+
+#[test]
+fn finalize_run_events_preserves_terminal_control_rejection_code() {
+    let svc = test_service();
+    let request = test_request("late handoff");
+    let state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    let rejection = crate::turn::terminal_control::TerminalControlRejection {
+        code: "terminal_handoff_window_closed",
+        message: "terminal handoff must be the source run's first agent action".to_string(),
+        tool_call_id: Some("call-late".to_string()),
+    };
+
+    let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+        Ok(AgenticLoopOutcome::ControlRejected(rejection)),
+        vec![json!({
+            "type": "runtime.control.handoff.rejected",
+            "error_code": "terminal_handoff_window_closed",
+            "tool_call_id": "call-late"
+        })],
+        &state,
+    );
+
+    assert_eq!(status, RunStatus::Failed);
+    assert!(error.is_some());
+    assert_eq!(events[1]["event_type"], "run_error");
+    assert_eq!(
+        events[1]["data"]["error_code"],
+        "terminal_handoff_window_closed"
+    );
+    assert_eq!(
+        events[2]["data"]["error_code"],
+        "terminal_handoff_window_closed"
+    );
+}
+
+#[test]
 fn finalize_run_events_classifies_string_error_outcomes() {
     let svc = test_service();
     let request = test_request("classify");
@@ -5389,18 +5472,33 @@ fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
         json!({"event_type": "reasoning_message_content", "data": {"content": "raw chain of thought"}}),
         json!({"type": "reasoning_done"}),
         json!({"type": "thinking_done"}),
+        json!({"type": "runtime.control.handoff.requested", "handoff_id": "handoff-1"}),
+        json!({"type": "runtime.control.handoff.rejected", "error_code": "terminal_handoff_window_closed"}),
         json!({"event_type": "text_done", "data": {"full_text": "final answer"}}),
         json!({"event_type": "run_error", "data": {"error": "boom"}}),
         json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
     ];
 
     let persisted = terminal_events_for_persistence(&events);
-    assert_eq!(persisted.len(), 5);
+    assert_eq!(persisted.len(), 7);
     assert_eq!(persisted[0]["type"], "reasoning_done");
     assert_eq!(persisted[1]["type"], "thinking_done");
-    assert_eq!(persisted[2]["event_type"], "text_done");
-    assert_eq!(persisted[3]["event_type"], "run_error");
-    assert_eq!(persisted[4]["event_type"], "run_finished");
+    assert_eq!(persisted[2]["type"], "runtime.control.handoff.requested");
+    assert_eq!(persisted[3]["type"], "runtime.control.handoff.rejected");
+    assert_eq!(persisted[4]["event_type"], "text_done");
+    assert_eq!(persisted[5]["event_type"], "run_error");
+    assert_eq!(persisted[6]["event_type"], "run_finished");
+}
+
+#[test]
+fn terminal_handoff_event_uses_live_persistence_without_terminal_replay_duplication() {
+    let event = json!({
+        "type": "runtime.control.handoff.requested",
+        "handoff_id": "handoff-1"
+    });
+
+    assert!(live_delta_event_for_persistence(&event));
+    assert!(!streaming_final_event_for_replay(&event));
 }
 
 #[tokio::test]
@@ -6465,17 +6563,21 @@ fn agent_binding_prompt_override_appends_stable_section() {
 }
 
 #[test]
-fn agent_binding_prompt_override_appends_runtime_system_prompt() {
+fn agent_binding_prompt_context_keeps_runtime_system_prompt_out_of_agent_override() {
     let context = PreparedAgentBindingLoopContext {
         binding: test_agent_binding_record(Some(3)),
         skill_resolver: None,
     };
     let mut edge_profile = serde_json::Map::new();
+    let runtime_control = r#"<runtime_control policy="moi.authoring_handoff.v1">
+- If needed, call the terminal tool as your first action.
+- After calling it, emit no user-facing text and perform no further work.
+</runtime_control>"#;
 
     AgenticRunLifecycleService::apply_agent_binding_prompt_context(
         &mut edge_profile,
         Some(&context),
-        Some("Runtime SQL scope db_name: retail."),
+        Some(runtime_control),
         None,
     );
 
@@ -6483,9 +6585,15 @@ fn agent_binding_prompt_override_appends_runtime_system_prompt() {
         edge_profile
             .get("system_prompt_override")
             .and_then(Value::as_str),
-        Some(
-            "## Agent Binding Instruction\nAlways follow the binding contract.\n\nRuntime SQL scope db_name: retail."
-        )
+        Some("## Agent Binding Instruction\nAlways follow the binding contract.")
+    );
+    let runtime_sections = edge_profile
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS)
+        .and_then(Value::as_array)
+        .expect("runtime-owned prompt section");
+    assert_eq!(
+        runtime_sections,
+        &[Value::String(runtime_control.to_string())]
     );
 }
 
@@ -6590,6 +6698,90 @@ fn agent_binding_prompt_context_routes_turn_context_to_volatile_lane() {
 }
 
 #[test]
+fn agent_binding_prompt_context_preserves_moi_authoring_contract() {
+    let context = PreparedAgentBindingLoopContext {
+        binding: test_agent_binding_record(Some(3)),
+        skill_resolver: None,
+    };
+    let agent_md = format!("# Full agent prompt\n{}", "x".repeat(12_000));
+    let request_context = json!({
+        "mode": "revise",
+        "raw_advice": "Make every response concise.",
+        "source_agent_id": "agent_current",
+        "source_agent_workspace_id": "workspace_current",
+        "source_version": "1.2.3",
+        "advice_user_id": "user_1",
+        "current_agent": {
+            "agent_id": "agent_current",
+            "name": "Current Agent",
+            "description": "Current description",
+            "model_name": "qwen3.7-max",
+            "model_config_ref": "model_ref_1",
+            "tool_names": ["Search"],
+            "skill_names": ["Artifacts"],
+            "knowledge_base_names": ["Handbook"],
+            "agent_md": agent_md,
+            "secret": "must-not-appear"
+        },
+        "authoring_context": {
+            "schema_version": "moi.zero_authoring_context.v1",
+            "recent_chat_context": {
+                "limit_turns": 10,
+                "max_characters": 12000,
+                "truncated": false,
+                "messages": [
+                    {"role": "user", "content": "Older user request", "secret": "must-not-appear"},
+                    {"role": "assistant", "content": "Older assistant answer", "truncated": false}
+                ],
+                "secret": "must-not-appear"
+            },
+            "secret": "must-not-appear"
+        },
+        "secret": "must-not-appear"
+    })
+    .as_object()
+    .expect("context object")
+    .clone();
+    let mut edge_profile = serde_json::Map::new();
+
+    AgenticRunLifecycleService::apply_agent_binding_prompt_context(
+        &mut edge_profile,
+        Some(&context),
+        None,
+        Some(&request_context),
+    );
+
+    let volatile = edge_profile
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS)
+        .and_then(Value::as_array)
+        .expect("runtime volatile texts");
+    let text = volatile
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let payload = text
+        .split("```json\n")
+        .nth(1)
+        .and_then(|value| value.strip_suffix("\n```"))
+        .expect("runtime turn context JSON payload");
+    let visible: Value = serde_json::from_str(payload).expect("decode runtime turn context JSON");
+    assert!(text.contains("\"source_agent_id\":\"agent_current\""));
+    assert!(text.contains("\"source_agent_workspace_id\":\"workspace_current\""));
+    assert!(text.contains("\"source_version\":\"1.2.3\""));
+    assert!(text.contains("\"agent_id\":\"agent_current\""));
+    assert!(text.contains("\"tool_names\":[\"Search\"]"));
+    assert_eq!(
+        visible["current_agent"]["agent_md"].as_str(),
+        Some(agent_md.as_str())
+    );
+    assert!(text.contains("\"schema_version\":\"moi.zero_authoring_context.v1\""));
+    assert!(text.contains("\"content\":\"Older user request\""));
+    assert!(!text.contains("must-not-appear"));
+    assert!(!text.contains("[truncated]"));
+}
+
+#[test]
 fn agent_binding_prompt_context_keeps_stable_prompt_identical_when_turn_context_changes() {
     let context = PreparedAgentBindingLoopContext {
         binding: test_agent_binding_record(Some(3)),
@@ -6643,7 +6835,7 @@ fn agent_binding_prompt_context_keeps_stable_prompt_identical_when_turn_context_
         first_stable, second_stable,
         "per-turn runtime context must not churn the session-stable prompt prefix"
     );
-    assert!(first_stable.contains("Session-level runtime system prompt."));
+    assert!(!first_stable.contains("Session-level runtime system prompt."));
     assert!(!first_stable.contains("first turn advice"));
     assert!(!first_stable.contains("second turn advice"));
 
@@ -6663,6 +6855,21 @@ fn agent_binding_prompt_context_keeps_stable_prompt_identical_when_turn_context_
         .filter_map(Value::as_str)
         .collect::<Vec<_>>()
         .join("\n");
+    let first_required = first_profile
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS)
+        .and_then(Value::as_array)
+        .expect("first required runtime texts");
+    let second_required = second_profile
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS)
+        .and_then(Value::as_array)
+        .expect("second required runtime texts");
+    assert_eq!(first_required, second_required);
+    assert_eq!(
+        first_required,
+        &[Value::String(
+            "Session-level runtime system prompt.".to_string()
+        )]
+    );
     assert_ne!(first_volatile, second_volatile);
     assert!(first_volatile.contains("first turn advice"));
     assert!(second_volatile.contains("second turn advice"));
@@ -7082,6 +7289,8 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
                     "parameters": {"type": "object"}
                 }
             })],
+            control_tools: Default::default(),
+            stop_after_success_tools: Default::default(),
             manager: None,
             agent_binding_mcp: None,
         }),
@@ -7257,6 +7466,7 @@ fn run_status_as_str() {
     assert_eq!(RunStatus::Running.as_str(), "running");
     assert_eq!(RunStatus::InputQueued.as_str(), "input-queued");
     assert_eq!(RunStatus::Completed.as_str(), "completed");
+    assert_eq!(RunStatus::Delegated.as_str(), "delegated");
     assert_eq!(RunStatus::Failed.as_str(), "failed");
     assert_eq!(RunStatus::Cancelled.as_str(), "cancelled");
     assert_eq!(RunStatus::Paused.as_str(), "paused");
@@ -9341,6 +9551,10 @@ fn run_status_live_semantics_align_with_durable_owner() {
         Some(RunStatus::Completed)
     );
     assert_eq!(
+        RunStatus::from_durable_status(STATUS_DELEGATED),
+        Some(RunStatus::Delegated)
+    );
+    assert_eq!(
         RunStatus::from_durable_status(STATUS_FAILED),
         Some(RunStatus::Failed)
     );
@@ -9354,6 +9568,7 @@ fn run_status_live_semantics_align_with_durable_owner() {
     assert!(RunStatus::Paused.is_resumable());
     assert!(!RunStatus::Running.is_resumable());
     assert!(!RunStatus::Completed.is_resumable());
+    assert!(!RunStatus::Delegated.is_resumable());
 
     assert_eq!(
         RunStatus::Running.blocks_session(None),
@@ -9377,6 +9592,10 @@ fn run_status_live_semantics_align_with_durable_owner() {
     assert_eq!(
         RunStatus::Completed.blocks_session(None),
         astra_services::runs::durable_run_status_blocks_session(STATUS_COMPLETED, None)
+    );
+    assert_eq!(
+        RunStatus::Delegated.blocks_session(None),
+        astra_services::runs::durable_run_status_blocks_session(STATUS_DELEGATED, None)
     );
 }
 

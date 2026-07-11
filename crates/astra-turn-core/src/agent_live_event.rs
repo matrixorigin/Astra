@@ -19,6 +19,7 @@ pub struct AgentLiveEvent {
 #[serde(rename_all = "snake_case")]
 pub enum AgentLiveTermination {
     Completed,
+    Delegated,
     Failed,
     Cancelled,
 }

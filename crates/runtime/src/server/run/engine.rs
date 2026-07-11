@@ -1438,6 +1438,7 @@ impl RunInputProvider for RunEngine {
         match durable_run_status_kind(&run.status) {
             DurableRunStatusKind::Cancelled
             | DurableRunStatusKind::Completed
+            | DurableRunStatusKind::Delegated
             | DurableRunStatusKind::Failed => return Ok(()),
             _ => {}
         }
@@ -1466,6 +1467,7 @@ impl RunInputProvider for RunEngine {
             match durable_run_status_kind(&current.status) {
                 DurableRunStatusKind::Cancelled
                 | DurableRunStatusKind::Completed
+                | DurableRunStatusKind::Delegated
                 | DurableRunStatusKind::Failed => return Ok(()),
                 _ => {}
             }

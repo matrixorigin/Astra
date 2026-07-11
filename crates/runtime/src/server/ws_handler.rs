@@ -43,7 +43,7 @@ use super::header_utils::collect_forward_headers;
 use super::provider_runtime_context::inject_effective_runtime_context;
 use super::*;
 use crate::server::run::handlers::transform_stream_run_events_for_client_with_pending;
-use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
+use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED};
 use astra_server_types::merge_plan_subtask_context;
 use astra_services::runs::durable_run_status_is_terminal;
 use astra_tools::{AskUserAnswers, AskUserPrompt};
@@ -3131,6 +3131,7 @@ mod tests {
     #[test]
     fn durable_run_status_is_terminal_detects_expected_statuses() {
         assert!(durable_run_status_is_terminal(STATUS_COMPLETED));
+        assert!(durable_run_status_is_terminal(STATUS_DELEGATED));
         assert!(durable_run_status_is_terminal(STATUS_FAILED));
         assert!(durable_run_status_is_terminal(STATUS_CANCELLED));
         assert!(!durable_run_status_is_terminal("running"));

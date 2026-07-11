@@ -1,7 +1,7 @@
 use astra_core::{
-    ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED,
-    STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
-    error_response_coded,
+    ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
+    STATUS_INPUT_QUEUED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState,
+    error_response, error_response_coded,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -795,6 +795,7 @@ pub enum DurableRunStatusKind {
     Waiting,
     Paused,
     Completed,
+    Delegated,
     Failed,
     Cancelled,
     Other,
@@ -807,6 +808,7 @@ pub fn durable_run_status_kind(status: &str) -> DurableRunStatusKind {
         STATUS_WAITING => DurableRunStatusKind::Waiting,
         STATUS_PAUSED => DurableRunStatusKind::Paused,
         STATUS_COMPLETED => DurableRunStatusKind::Completed,
+        STATUS_DELEGATED => DurableRunStatusKind::Delegated,
         STATUS_FAILED => DurableRunStatusKind::Failed,
         STATUS_CANCELLED => DurableRunStatusKind::Cancelled,
         _ => DurableRunStatusKind::Other,
@@ -817,6 +819,7 @@ pub fn durable_run_status_is_terminal(status: &str) -> bool {
     matches!(
         durable_run_status_kind(status),
         DurableRunStatusKind::Completed
+            | DurableRunStatusKind::Delegated
             | DurableRunStatusKind::Failed
             | DurableRunStatusKind::Cancelled
     )
@@ -835,7 +838,7 @@ pub fn durable_run_status_to_subrun_state(status: &str) -> SubRunState {
     match durable_run_status_kind(status) {
         DurableRunStatusKind::Running | DurableRunStatusKind::InputQueued => SubRunState::Running,
         DurableRunStatusKind::Waiting | DurableRunStatusKind::Paused => SubRunState::Paused,
-        DurableRunStatusKind::Completed => SubRunState::Completed,
+        DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated => SubRunState::Completed,
         DurableRunStatusKind::Failed | DurableRunStatusKind::Other => SubRunState::Failed,
         DurableRunStatusKind::Cancelled => SubRunState::Cancelled,
     }
@@ -4559,6 +4562,8 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "run_paused",
     "run_resumed",
     "run_input_queued",
+    "runtime.control.handoff.requested",
+    "runtime.control.handoff.rejected",
     "context_meta",
     "session_info",
     "turn_complete",
@@ -4842,6 +4847,8 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 for key in [
                     "run_id",
                     "status",
+                    "outcome",
+                    "finish_reason",
                     "error",
                     "error_code",
                     "error_kind",
@@ -5451,6 +5458,10 @@ mod tests {
             DurableRunStatusKind::Completed
         );
         assert_eq!(
+            durable_run_status_kind(STATUS_DELEGATED),
+            DurableRunStatusKind::Delegated
+        );
+        assert_eq!(
             durable_run_status_kind(STATUS_FAILED),
             DurableRunStatusKind::Failed
         );
@@ -5464,6 +5475,7 @@ mod tests {
         );
 
         assert!(durable_run_status_is_terminal(STATUS_COMPLETED));
+        assert!(durable_run_status_is_terminal(STATUS_DELEGATED));
         assert!(durable_run_status_is_terminal(STATUS_FAILED));
         assert!(durable_run_status_is_terminal(STATUS_CANCELLED));
         assert!(!durable_run_status_is_terminal(STATUS_RUNNING));
@@ -5480,6 +5492,7 @@ mod tests {
         ));
         assert!(!durable_run_status_blocks_session(STATUS_PAUSED, None));
         assert!(!durable_run_status_blocks_session(STATUS_COMPLETED, None));
+        assert!(!durable_run_status_blocks_session(STATUS_DELEGATED, None));
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_WAITING),
             SubRunState::Paused
@@ -5491,6 +5504,10 @@ mod tests {
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_INPUT_QUEUED),
             SubRunState::Running
+        );
+        assert_eq!(
+            durable_run_status_to_subrun_state(STATUS_DELEGATED),
+            SubRunState::Completed
         );
         assert_eq!(
             durable_run_status_to_subrun_state("mystery"),

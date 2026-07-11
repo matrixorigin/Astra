@@ -113,6 +113,18 @@ pub(crate) fn record_loop_completion_feedback(
                 FeedbackSignal::new(SignalType::TaskSuccess).with_turn(&turn_id),
             ));
         }
+        Ok(AgenticLoopOutcome::Delegated) => {
+            // Delegation transfers ownership; it is neither task success nor failure
+            // for the source agent's adaptive feedback.
+        }
+        Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
+            hub.record_feedback(enrich_signal(
+                FeedbackSignal::new(SignalType::TaskFailure {
+                    reason: format!("{}: {}", rejection.code, rejection.message),
+                })
+                .with_turn(&turn_id),
+            ));
+        }
         Ok(AgenticLoopOutcome::Cancelled) => {
             hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::Interruption).with_turn(&turn_id),

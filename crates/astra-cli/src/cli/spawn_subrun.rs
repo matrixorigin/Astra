@@ -850,6 +850,54 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         };
 
         match loop_result {
+            Ok(AgenticLoopOutcome::Delegated) => {
+                emit_terminated(
+                    astra_turn_core::agent_live_event::AgentLiveTermination::Delegated,
+                    Some("delegated".to_string()),
+                );
+                Ok(SpawnRunResult {
+                    agent_id,
+                    run_id,
+                    status: "delegated".to_string(),
+                    finish_reason: "delegated".to_string(),
+                    cancelled_by_user: None,
+                    output: None,
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                    permission_summary,
+                    permission_requests,
+                    permission_requests_approved,
+                    tools_blocked,
+                })
+            }
+            Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
+                let error = format!("{}: {}", rejection.code, rejection.message);
+                if let Some(ref emitter) = progress_emitter {
+                    emitter.failed(&error);
+                }
+                emit_terminated(
+                    astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
+                    Some(error.clone()),
+                );
+                Ok(SpawnRunResult {
+                    agent_id,
+                    run_id,
+                    status: "failed".to_string(),
+                    finish_reason: "terminal_control_rejected".to_string(),
+                    cancelled_by_user: None,
+                    output: None,
+                    error: Some(error),
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                    permission_summary,
+                    permission_requests,
+                    permission_requests_approved,
+                    tools_blocked,
+                })
+            }
             Ok(AgenticLoopOutcome::Completed) => {
                 // Emit completed event
                 if let Some(ref emitter) = progress_emitter {

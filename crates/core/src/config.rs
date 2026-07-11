@@ -296,25 +296,6 @@ pub struct ProviderRequestAuthConfig {
     #[serde(rename = "type")]
     pub auth_type: String,
     pub key: String,
-    #[serde(default)]
-    pub allowed_capability_descriptors: Vec<ProviderCapabilityDescriptorConfig>,
-}
-
-/// Exact runtime capability descriptor a provider is allowed to advertise.
-///
-/// Provider request auth proves who is calling; this allowlist defines what
-/// runtime endpoints that caller may bind into Astra. Endpoint strings are
-/// intentionally exact-match rather than host-pattern based so a provider cannot
-/// silently widen authority by changing paths, schemes, ports, or protocols.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(default, deny_unknown_fields)]
-pub struct ProviderCapabilityDescriptorConfig {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub descriptor_type: String,
-    pub transport: String,
-    pub endpoint_url: String,
-    pub protocol: String,
 }
 
 impl fmt::Debug for ProviderRequestAuthConfig {
@@ -323,22 +304,6 @@ impl fmt::Debug for ProviderRequestAuthConfig {
             .field("provider", &self.provider)
             .field("auth_type", &self.auth_type)
             .field("key", &(!self.key.is_empty()).then_some("[REDACTED]"))
-            .field(
-                "allowed_capability_descriptors",
-                &self.allowed_capability_descriptors,
-            )
-            .finish()
-    }
-}
-
-impl fmt::Debug for ProviderCapabilityDescriptorConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProviderCapabilityDescriptorConfig")
-            .field("id", &self.id)
-            .field("descriptor_type", &self.descriptor_type)
-            .field("transport", &self.transport)
-            .field("endpoint_url", &self.endpoint_url)
-            .field("protocol", &self.protocol)
             .finish()
     }
 }
@@ -414,28 +379,6 @@ impl AuthConfig {
                     "auth.provider_request_auth provider '{}'.key references an unset environment variable: {}",
                     request_auth.provider, env_name
                 ));
-            }
-            for descriptor in &request_auth.allowed_capability_descriptors {
-                validate_exact_non_empty(
-                    "auth.provider_request_auth[].allowed_capability_descriptors[].id",
-                    &descriptor.id,
-                )?;
-                validate_exact_non_empty(
-                    "auth.provider_request_auth[].allowed_capability_descriptors[].type",
-                    &descriptor.descriptor_type,
-                )?;
-                validate_exact_non_empty(
-                    "auth.provider_request_auth[].allowed_capability_descriptors[].transport",
-                    &descriptor.transport,
-                )?;
-                validate_exact_non_empty(
-                    "auth.provider_request_auth[].allowed_capability_descriptors[].endpoint_url",
-                    &descriptor.endpoint_url,
-                )?;
-                validate_exact_non_empty(
-                    "auth.provider_request_auth[].allowed_capability_descriptors[].protocol",
-                    &descriptor.protocol,
-                )?;
             }
             if !providers.insert(request_auth.provider.as_str()) {
                 return Err(format!(
@@ -2082,7 +2025,6 @@ auth_mode = "legacy"
                         provider: "moi".to_string(),
                         auth_type: "hmac".to_string(),
                         key: "${ASTRA_PROVIDER_HMAC_KEY}".to_string(),
-                        allowed_capability_descriptors: Vec::new(),
                     });
                 config.apply_env_overrides();
                 assert_eq!(
@@ -2105,7 +2047,6 @@ auth_mode = "legacy"
                     provider: "moi".to_string(),
                     auth_type: "hmac".to_string(),
                     key: "${ASTRA_PROVIDER_HMAC_KEY}".to_string(),
-                    allowed_capability_descriptors: Vec::new(),
                 });
             config.apply_env_overrides();
             let err = config

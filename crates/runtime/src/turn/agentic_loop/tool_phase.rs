@@ -1722,6 +1722,20 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .record_tool_result(&edge_result.tool, &edge_result.output);
     }
 
+    if let Some(tool_name) =
+        host.stop_after_successful_tool_round(&round_tool_calls, &new_tool_results)
+    {
+        tracing::info!(
+            target: "astra_runtime::agentic_loop_tool_phase",
+            tool_name,
+            "terminating turn after provider-declared successful tool result"
+        );
+        state.step_recorder.end_turn(false);
+        finalize_turn_trace(state).await;
+        refresh_runtime_promotion_signals_from_db(state).await;
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
+    }
+
     if let Some(reason) = waiting_reason {
         state.step_recorder.end_turn(false);
         finalize_turn_trace(state).await;

@@ -186,6 +186,7 @@ fn canonical_event_bytes(ev: &BedrockStreamEvent) -> Vec<Bytes> {
                 "call_id": id,
             }))]
         }
+        BedrockStreamEvent::ToolCallDelta { .. } => vec![],
         BedrockStreamEvent::Usage(u) => {
             vec![render_sse(&json!({
                 "type": "usage",
@@ -264,6 +265,26 @@ pub(crate) async fn collect_bedrock_stream(
                     BedrockStreamEvent::ReasoningDelta(text) => {
                         if let Some(callback) = stream_callback.as_deref_mut() {
                             callback(LlmStreamUpdate::ReasoningDelta(text.clone()));
+                        }
+                    }
+                    BedrockStreamEvent::ToolCallDelta {
+                        index,
+                        id,
+                        name,
+                        arguments,
+                    } => {
+                        if let Some(callback) = stream_callback.as_deref_mut() {
+                            callback(LlmStreamUpdate::ToolCallDelta {
+                                index: *index as usize,
+                                tool_call: json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": arguments,
+                                    }
+                                }),
+                            });
                         }
                     }
                     _ => {}

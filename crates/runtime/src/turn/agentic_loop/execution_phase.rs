@@ -1422,6 +1422,43 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     );
     update_turn_trace_collector(state, &turn_result);
 
+    if let Some(control_outcome) = host.take_terminal_control_outcome() {
+        if state.telemetry.first_ttft_ms.is_none() {
+            state.telemetry.first_ttft_ms = snap.ttft_ms;
+        }
+        if let Some(session_id) = snap.session_id.as_ref() {
+            state.current_session_id = Some(session_id.clone());
+            if state.context_manifest_user_id.is_some() {
+                state.step_recorder.attach_persistence(session_id);
+            }
+        }
+        if snap.run_id.is_some() {
+            state.current_run_id = snap.run_id.clone();
+        }
+        state.total_prompt += snap.prompt_tokens;
+        state.total_completion += snap.completion_tokens;
+        state.total_cache_read += snap.cache_read_tokens;
+        state.total_cache_creation += snap.cache_creation_tokens;
+        state
+            .step_recorder
+            .record_tokens(snap.prompt_tokens, snap.completion_tokens);
+        state.has_any_usage |= snap.has_usage;
+        state.last_measured_prompt_tokens = Some(snap.prompt_tokens);
+        state.consecutive_context_window_errors = 0;
+
+        return Ok(TurnExecutionControl::Return(match control_outcome {
+            crate::turn::terminal_control::TerminalControlOutcome::Requested(_) => {
+                AgenticLoopOutcome::Delegated
+            }
+            crate::turn::terminal_control::TerminalControlOutcome::Rejected(rejection) => {
+                AgenticLoopOutcome::ControlRejected(rejection)
+            }
+            crate::turn::terminal_control::TerminalControlOutcome::Passthrough => {
+                unreachable!("host must not surface a passthrough terminal-control outcome")
+            }
+        }));
+    }
+
     let edge_len = turn_result.edge_tool_round.len();
     let round_has_edge_work = edge_len > 0 || !snap.tool_calls.is_empty();
     let factual_retry_fallback_decision =

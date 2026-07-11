@@ -90,10 +90,25 @@ pub(super) async fn get_agent_binding_handler(
 
 pub(super) async fn disable_agent_binding_handler(
     State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     Path(id): Path<String>,
+    body: Bytes,
 ) -> Result<Json<AgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let _principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/agent-bindings/{id}/disable",
+                &body,
+            ),
+        )
+        .await?;
     let record = state.agent_binding_service.disable_binding(id).await?;
     Ok(Json(record.into()))
 }

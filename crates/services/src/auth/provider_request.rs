@@ -1,4 +1,4 @@
-use astra_core::{ErrorResponse, ProviderCapabilityDescriptorConfig, error_response_coded};
+use astra_core::{ErrorResponse, error_response_coded};
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -38,27 +38,6 @@ pub fn validate_runtime_capability_descriptor(
         &descriptor.protocol,
         expected_type,
     )
-}
-
-pub fn validate_runtime_capability_descriptor_allowed(
-    descriptor: &RuntimeCapabilityDescriptorRequest,
-    expected_type: &str,
-    allowed: &[ProviderCapabilityDescriptorConfig],
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    validate_runtime_capability_descriptor(descriptor, expected_type)?;
-    if allowed.iter().any(|candidate| {
-        candidate.id == descriptor.id
-            && candidate.descriptor_type == descriptor.descriptor_type
-            && candidate.transport == descriptor.transport
-            && candidate.endpoint_url == descriptor.endpoint_url
-            && candidate.protocol == descriptor.protocol
-    }) {
-        return Ok(());
-    }
-    Err(provider_context_invalid(format!(
-        "capability descriptor {}:{} is not allowed for this provider",
-        descriptor.descriptor_type, descriptor.id
-    )))
 }
 
 fn validate_descriptor_strings(
@@ -137,16 +116,6 @@ mod tests {
         }
     }
 
-    fn allowance(descriptor_type: &str, endpoint_url: &str) -> ProviderCapabilityDescriptorConfig {
-        ProviderCapabilityDescriptorConfig {
-            id: "moi-model-gateway".to_string(),
-            descriptor_type: descriptor_type.to_string(),
-            transport: "http".to_string(),
-            endpoint_url: endpoint_url.to_string(),
-            protocol: "moi-runtime-model-gateway.v1".to_string(),
-        }
-    }
-
     #[test]
     fn validate_runtime_capability_descriptor_accepts_expected_type() {
         validate_runtime_capability_descriptor(
@@ -169,29 +138,5 @@ mod tests {
             body.0.error_code.as_deref(),
             Some("provider_runtime_context_invalid")
         );
-    }
-
-    #[test]
-    fn validate_runtime_capability_descriptor_allowed_requires_exact_provider_allowlist_match() {
-        validate_runtime_capability_descriptor_allowed(
-            &descriptor("model_gateway", "http://127.0.0.1/model"),
-            "model_gateway",
-            &[allowance("model_gateway", "http://127.0.0.1/model")],
-        )
-        .expect("exactly allowed descriptor should pass");
-
-        let (status, body) = validate_runtime_capability_descriptor_allowed(
-            &descriptor("model_gateway", "http://127.0.0.1/other"),
-            "model_gateway",
-            &[allowance("model_gateway", "http://127.0.0.1/model")],
-        )
-        .expect_err("different endpoint path must not be accepted");
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body.0.error_code.as_deref(),
-            Some("provider_runtime_context_invalid")
-        );
-        assert!(body.0.detail.contains("not allowed"));
     }
 }

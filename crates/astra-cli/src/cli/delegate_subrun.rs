@@ -537,6 +537,34 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         };
 
         match loop_result {
+            Ok(astra_runtime::turn::agentic_loop::host::AgenticLoopOutcome::Delegated) => {
+                Ok(AgentResult {
+                    agent_id,
+                    run_id,
+                    status: "delegated".to_string(),
+                    output: None,
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                })
+            }
+            Ok(astra_runtime::turn::agentic_loop::host::AgenticLoopOutcome::ControlRejected(
+                rejection,
+            )) => {
+                let error = format!("{}: {}", rejection.code, rejection.message);
+                let failure_output = persist_failed_subrun(&mut state, &error);
+                Ok(AgentResult {
+                    agent_id,
+                    run_id,
+                    status: "failed".to_string(),
+                    output: Some(failure_output),
+                    error: Some(error),
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                })
+            }
             Ok(astra_runtime::turn::agentic_loop::host::AgenticLoopOutcome::Completed) => {
                 Ok(AgentResult {
                     agent_id,

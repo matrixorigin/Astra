@@ -367,15 +367,6 @@ impl AuthPrincipal {
             AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
         )
     }
-
-    pub fn provider_authorized_request_context(
-        &self,
-    ) -> Option<&AuthProviderAuthorizedRequestContext> {
-        match &self.origin {
-            AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => Some(context),
-            AuthPrincipalOrigin::Internal => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,7 +381,6 @@ pub struct AuthProviderAuthorizedRequestContext {
     pub external_subject: String,
     pub provider_scope_id: String,
     pub request_authorization_id: String,
-    pub allowed_capability_descriptors: Vec<astra_core::ProviderCapabilityDescriptorConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1308,7 +1298,6 @@ impl AuthService for DatabaseAuthService {
                     external_subject: authorized.external_subject,
                     provider_scope_id: authorized.provider_scope_id,
                     request_authorization_id: authorized.request_authorization_id,
-                    allowed_capability_descriptors: provider.allowed_capability_descriptors.clone(),
                 },
             ),
         })
@@ -1473,7 +1462,6 @@ mod tests {
             provider: "moi".to_string(),
             auth_type: "hmac".to_string(),
             key: TEST_PROVIDER_HMAC_KEY.to_string(),
-            allowed_capability_descriptors: Vec::new(),
         }])
     }
 

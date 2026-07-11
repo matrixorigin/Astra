@@ -585,7 +585,9 @@ pub async fn wait_for_run_status(
                 return status.to_string();
             }
             // If we hit a terminal state that's not our target, bail early
-            if matches!(status, "completed" | "failed" | "cancelled") && status != target_status {
+            if matches!(status, "completed" | "delegated" | "failed" | "cancelled")
+                && status != target_status
+            {
                 return status.to_string();
             }
         }

@@ -1787,7 +1787,15 @@ mod context_cache_contract_tests {
         state
             .messages
             .push(json!({"role": "user", "content": "which model are you?"}));
-        let edge_profile = serde_json::Map::new();
+        let history_before = state.messages.clone();
+        let runtime_policy =
+            "Terminal Control Policy: the delegated action must be first and terminal.";
+        let mut edge_profile = serde_json::Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS
+                .to_string(),
+            json!([runtime_policy]),
+        );
         let visible_tools = vec![tool("bash")];
         let restricted_tools = HashSet::new();
         let volatile = vec![crate::prompts::PromptSection::dynamic(
@@ -1835,12 +1843,61 @@ mod context_cache_contract_tests {
             !primary_text.contains("must be suppressed"),
             "ordinary volatile content must stay out of strict-history stable prompt: {primary_text}"
         );
-        assert!(
-            output.volatile_preamble.is_empty(),
-            "CurrentUserOnly providers must still suppress normal volatile preamble"
+        assert_eq!(output.volatile_preamble.len(), 1);
+        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
+            &output.volatile_preamble[0]
+        ));
+        assert_eq!(
+            output.volatile_preamble[0]["role"].as_str(),
+            Some("system"),
+            "required control policy must remain runtime-owned before provider wire adaptation"
         );
         assert_eq!(
-            output.manifest_trace.to_json()["model_context_window_tokens"],
+            output.volatile_preamble[0]["content"].as_str(),
+            Some(runtime_policy),
+            "required control policy must survive strict-history suppression"
+        );
+        assert_eq!(
+            state.messages, history_before,
+            "required runtime policy must not enter persistent conversation history"
+        );
+        assert!(state.messages.iter().all(|message| {
+            !message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains(runtime_policy))
+        }));
+        let manifest_context_window =
+            output.manifest_trace.to_json()["model_context_window_tokens"].clone();
+
+        let wire = crate::turn::wire_assembly::assemble_llm_messages_with_cache_capability(
+            output.system_messages,
+            output.volatile_preamble,
+            Vec::new(),
+            state.messages.clone(),
+            &crate::turn::wire_assembly::PostCompactAttachments::default(),
+            "sid-deepseek",
+            "openai",
+            "deepseek-v4-pro-official(thinking:high)",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            Some(strict_history),
+            &cache_cfg,
+        );
+        assert!(
+            wire.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains(runtime_policy))
+            }),
+            "required control policy must reach the strict-history provider wire: {wire:#?}"
+        );
+        assert_eq!(
+            state.messages, history_before,
+            "wire assembly must not persist required runtime policy as user history"
+        );
+        assert_eq!(
+            manifest_context_window,
             json!(1_000_000),
             "context assembly must use registry context_window, not model-name heuristics or 200K default"
         );

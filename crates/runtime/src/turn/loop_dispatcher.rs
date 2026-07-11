@@ -102,6 +102,8 @@ impl std::fmt::Display for WaitReason {
 pub enum DispatchOutcome {
     /// Loop ran to completion (final text produced or turn budget exhausted).
     Completed(LoopResult),
+    /// Source control was terminally transferred to another runtime owner.
+    Delegated,
     /// Loop is waiting for external input; can be resumed.
     Waiting(WaitReason),
     /// Loop was cancelled externally via cancel flag.
@@ -163,6 +165,10 @@ impl LoopDispatcher {
         match run_agentic_loop_with_host(host, state).await {
             Ok(AgenticLoopOutcome::Completed) => {
                 DispatchOutcome::Completed(LoopResult::from_state(state))
+            }
+            Ok(AgenticLoopOutcome::Delegated) => DispatchOutcome::Delegated,
+            Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
+                DispatchOutcome::Error(format!("{}: {}", rejection.code, rejection.message))
             }
             Ok(AgenticLoopOutcome::Cancelled) => DispatchOutcome::Cancelled,
             Ok(AgenticLoopOutcome::Waiting(reason)) => {

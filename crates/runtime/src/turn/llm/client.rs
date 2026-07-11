@@ -346,6 +346,7 @@ pub(crate) struct LlmCallResult {
 pub(crate) enum LlmStreamUpdate {
     TextDelta(String),
     ReasoningDelta(String),
+    ToolCallDelta { index: usize, tool_call: Value },
 }
 
 pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
@@ -3405,6 +3406,12 @@ async fn collect_llm_stream(
                         }
                     }
                 }
+                if let Some(callback) = stream_callback.as_deref_mut() {
+                    callback(LlmStreamUpdate::ToolCallDelta {
+                        index: idx,
+                        tool_call: Value::Object(entry.clone()),
+                    });
+                }
             }
         }
     }
@@ -3603,6 +3610,14 @@ async fn collect_anthropic_llm_stream(
                             ),
                         ]),
                     );
+                    if let Some(callback) = stream_callback.as_deref_mut()
+                        && let Some(tool_call) = tool_calls_map.get(&index)
+                    {
+                        callback(LlmStreamUpdate::ToolCallDelta {
+                            index,
+                            tool_call: Value::Object(tool_call.clone()),
+                        });
+                    }
                     made_progress = true;
                 }
             }
@@ -3708,6 +3723,14 @@ async fn collect_anthropic_llm_stream(
                         {
                             existing.push_str(args);
                             made_progress = true;
+                        }
+                        if let Some(callback) = stream_callback.as_deref_mut()
+                            && let Some(tool_call) = tool_calls_map.get(&index)
+                        {
+                            callback(LlmStreamUpdate::ToolCallDelta {
+                                index,
+                                tool_call: Value::Object(tool_call.clone()),
+                            });
                         }
                     }
                     _ => {}

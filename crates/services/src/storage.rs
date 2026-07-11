@@ -20,6 +20,21 @@ const EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS: &[&str] = &[
     "turn_chain_id",
     "request_id",
 ];
+const EDGE_PENDING_DISPATCH_LEGACY_COLUMNS: &[&str] = &[
+    "user_id",
+    "edge_agent_id",
+    "request_id",
+    "payload_json",
+    "result_json",
+    "status",
+    "pod_id",
+    "dispatched_at",
+    "completed_at",
+    "created_at",
+];
+const EDGE_PENDING_DISPATCH_LEGACY_PRIMARY_KEY: &[&str] = &["user_id", "request_id"];
+const EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE: &str =
+    "edge_pending_dispatch_legacy_owner_request_v1";
 
 /// Standard column width for `agent_id` across all tables.
 /// All `agent_id`, `edge_agent_id`, `holder_agent_id`, and `parent_agent_id`
@@ -708,6 +723,44 @@ async fn add_index_if_missing(
     Ok(())
 }
 
+async fn existing_table_columns(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+) -> Result<BTreeSet<String>, sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    validate_schema_identifier(table, "matrixone table")?;
+    query(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| row.try_get::<String, _>("COLUMN_NAME"))
+    .collect::<Result<BTreeSet<_>, _>>()
+}
+
+async fn table_exists(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    validate_schema_identifier(table, "matrixone table")?;
+    query(
+        "SELECT 1 FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? LIMIT 1",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.is_some())
+}
+
 async fn fail_if_obsolete_shape(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -728,21 +781,10 @@ async fn fail_if_obsolete_shape(
         validate_schema_identifier(index, "matrixone index")?;
     }
 
-    let column_rows = query(
-        "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    if column_rows.is_empty() {
+    let columns = existing_table_columns(pool, database, table).await?;
+    if columns.is_empty() {
         return Ok(());
     }
-    let columns = column_rows
-        .into_iter()
-        .map(|row| row.try_get::<String, _>("COLUMN_NAME"))
-        .collect::<Result<BTreeSet<_>, _>>()?;
 
     let index_rows = query(
         "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS \
@@ -781,6 +823,75 @@ async fn fail_if_obsolete_shape(
         "obsolete core schema table {table} requires manual migration before startup: {}",
         reasons.join(", ")
     )))
+}
+
+fn is_legacy_edge_pending_dispatch_shape(
+    columns: &BTreeSet<String>,
+    primary_key: &[String],
+) -> bool {
+    EDGE_PENDING_DISPATCH_LEGACY_COLUMNS
+        .iter()
+        .all(|column| columns.contains(*column))
+        && EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS
+            .iter()
+            .skip(1)
+            .take(3)
+            .all(|column| !columns.contains(*column))
+        && primary_key
+            .iter()
+            .map(String::as_str)
+            .eq(EDGE_PENDING_DISPATCH_LEGACY_PRIMARY_KEY.iter().copied())
+}
+
+async fn migrate_legacy_edge_pending_dispatch_if_needed(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    let columns = existing_table_columns(pool, database, "edge_pending_dispatch").await?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let primary_key =
+        existing_index_columns(pool, database, "edge_pending_dispatch", "PRIMARY").await?;
+    if !is_legacy_edge_pending_dispatch_shape(&columns, &primary_key) {
+        return Ok(());
+    }
+    if table_exists(pool, database, EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE).await? {
+        return Err(sqlx::Error::Protocol(format!(
+            "legacy edge_pending_dispatch migration archive {EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE} already exists; inspect the previous migration before startup"
+        )));
+    }
+
+    let active_row = query(
+        "SELECT COUNT(*) AS active_rows FROM edge_pending_dispatch \
+         WHERE status IN ('pending', 'dispatched')",
+    )
+    .fetch_one(pool)
+    .await?;
+    let active_rows: i64 = active_row.try_get("active_rows")?;
+    if active_rows != 0 {
+        return Err(sqlx::Error::Protocol(format!(
+            "legacy edge_pending_dispatch contains {active_rows} active rows without session/run/turn identity; drain them with the pre-turn-scoped Astra release before upgrade"
+        )));
+    }
+    let row = query("SELECT COUNT(*) AS total_rows FROM edge_pending_dispatch")
+        .fetch_one(pool)
+        .await?;
+    let total_rows: i64 = row.try_get("total_rows")?;
+    query(&format!(
+        "RENAME TABLE {} TO {}",
+        crate::snapshot_sql::quote_mysql_identifier("edge_pending_dispatch"),
+        crate::snapshot_sql::quote_mysql_identifier(EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE),
+    ))
+    .execute(pool)
+    .await?;
+    tracing::info!(
+        legacy_table = "edge_pending_dispatch",
+        archive_table = EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE,
+        total_rows,
+        "archived terminal legacy edge dispatch rows before turn-scoped schema creation"
+    );
+    Ok(())
 }
 
 async fn fail_if_required_columns_missing_or_nullable(
@@ -3582,6 +3693,7 @@ pub async fn ensure_core_schema(
     )
     .await?;
 
+    migrate_legacy_edge_pending_dispatch_if_needed(&pool, &settings.database).await?;
     query(
         "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (
             user_id VARCHAR(128) NOT NULL,
@@ -5325,7 +5437,7 @@ pub async fn cleanup_expired_data(
                ON r.user_id = p.user_id AND r.run_id = p.run_id
              WHERE p.created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL {} DAY)) * 1000
                AND (s.session_id IS NULL OR s.status IN ('ended', 'closed', 'cancelled', 'deleting'))
-               AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
+               AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'delegated', 'failed', 'cancelled'))
              ORDER BY p.created_at_unix_ms ASC, p.user_id ASC, p.request_id ASC
              LIMIT ?",
         policy.prompt_request_days
@@ -6061,6 +6173,46 @@ mod tests {
     }
 
     #[test]
+    fn canonical_owner_request_dispatch_schema_is_migrated_before_turn_scoped_creation() {
+        let columns = EDGE_PENDING_DISPATCH_LEGACY_COLUMNS
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<BTreeSet<_>>();
+        let primary_key = EDGE_PENDING_DISPATCH_LEGACY_PRIMARY_KEY
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            is_legacy_edge_pending_dispatch_shape(&columns, &primary_key),
+            "the known 48f owner/request schema must select the explicit migration"
+        );
+
+        let mut mixed_columns = columns.clone();
+        mixed_columns.insert("session_id".to_string());
+        assert!(
+            !is_legacy_edge_pending_dispatch_shape(&mixed_columns, &primary_key),
+            "a partially migrated table must not be archived as the known legacy shape"
+        );
+
+        let source = include_str!("storage.rs");
+        let migration_pos = source
+            .find("migrate_legacy_edge_pending_dispatch_if_needed(&pool, &settings.database)")
+            .expect("legacy edge dispatch migration invocation");
+        let create_pos = source
+            .find("CREATE TABLE IF NOT EXISTS edge_pending_dispatch")
+            .expect("turn-scoped edge dispatch CREATE TABLE");
+        assert!(
+            migration_pos < create_pos,
+            "legacy table must be archived before current edge dispatch schema creation"
+        );
+        assert!(
+            source.contains("RENAME TABLE")
+                && source.contains("WHERE status IN ('pending', 'dispatched')"),
+            "migration must preserve terminal history and block active rows without inventing turn identity"
+        );
+    }
+
+    #[test]
     fn context_manifest_items_identity_is_manifest_order_bound() {
         let source = include_str!("storage.rs");
         let ddl = source
@@ -6534,7 +6686,7 @@ mod tests {
         );
         assert!(
             body.contains("s.status IN ('ended', 'closed', 'cancelled', 'deleting')")
-                && body.contains("r.status IN ('completed', 'failed', 'cancelled')"),
+                && body.contains("r.status IN ('completed', 'delegated', 'failed', 'cancelled')"),
             "prompt cleanup must avoid active sessions and non-terminal runs"
         );
         let child_delete = body

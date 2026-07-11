@@ -13,8 +13,8 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use astra_core::{
-    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED, STATUS_PAUSED,
-    STATUS_RUNNING, STATUS_WAITING,
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED, STATUS_INPUT_QUEUED,
+    STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING,
 };
 use astra_runtime_env::CleanupReason as RuntimeCleanupReason;
 use astra_services::runs::{DurableRunStatusKind, durable_run_status_kind};
@@ -60,35 +60,43 @@ pub enum RunStatus {
     Paused,
     Waiting,
     Completed,
+    Delegated,
     Failed,
     Cancelled,
 }
 
 impl RunStatus {
     #[cfg(test)]
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Running,
         Self::InputQueued,
         Self::Paused,
         Self::Waiting,
         Self::Completed,
+        Self::Delegated,
         Self::Failed,
         Self::Cancelled,
     ];
 
     #[cfg(test)]
-    pub const TERMINAL: [Self; 3] = [Self::Completed, Self::Failed, Self::Cancelled];
+    pub const TERMINAL: [Self; 4] = [
+        Self::Completed,
+        Self::Delegated,
+        Self::Failed,
+        Self::Cancelled,
+    ];
 
     /// Legal state-machine edges for an agentic run.
     ///
     /// Terminal states intentionally have no outgoing edges. A paused run does
     /// not transition to `Completed` during loop finalization; the terminal
     /// completion is buffered and promoted only by an explicit resume path.
-    pub const TRANSITION_EDGES: [(Self, Self); 21] = [
+    pub const TRANSITION_EDGES: [(Self, Self); 23] = [
         (Self::Running, Self::InputQueued),
         (Self::Running, Self::Paused),
         (Self::Running, Self::Waiting),
         (Self::Running, Self::Completed),
+        (Self::Running, Self::Delegated),
         (Self::Running, Self::Failed),
         (Self::Running, Self::Cancelled),
         (Self::InputQueued, Self::InputQueued),
@@ -96,6 +104,7 @@ impl RunStatus {
         (Self::InputQueued, Self::Paused),
         (Self::InputQueued, Self::Waiting),
         (Self::InputQueued, Self::Completed),
+        (Self::InputQueued, Self::Delegated),
         (Self::InputQueued, Self::Failed),
         (Self::InputQueued, Self::Cancelled),
         (Self::Paused, Self::Running),
@@ -115,6 +124,7 @@ impl RunStatus {
             Self::Paused => STATUS_PAUSED,
             Self::Waiting => STATUS_WAITING,
             Self::Completed => STATUS_COMPLETED,
+            Self::Delegated => STATUS_DELEGATED,
             Self::Failed => STATUS_FAILED,
             Self::Cancelled => STATUS_CANCELLED,
         }
@@ -127,6 +137,7 @@ impl RunStatus {
             DurableRunStatusKind::Paused => Some(Self::Paused),
             DurableRunStatusKind::Waiting => Some(Self::Waiting),
             DurableRunStatusKind::Completed => Some(Self::Completed),
+            DurableRunStatusKind::Delegated => Some(Self::Delegated),
             DurableRunStatusKind::Failed => Some(Self::Failed),
             DurableRunStatusKind::Cancelled => Some(Self::Cancelled),
             DurableRunStatusKind::Other => None,
@@ -146,7 +157,7 @@ impl RunStatus {
         match self {
             Self::Running | Self::InputQueued | Self::Waiting => true,
             Self::Paused => waiting_for.is_some(),
-            Self::Completed | Self::Failed | Self::Cancelled => false,
+            Self::Completed | Self::Delegated | Self::Failed | Self::Cancelled => false,
         }
     }
 
@@ -172,6 +183,7 @@ impl RunStatus {
 pub fn cleanup_reason_for_terminal_run_status(status: &RunStatus) -> Option<RuntimeCleanupReason> {
     match status {
         RunStatus::Completed => Some(RuntimeCleanupReason::Completed),
+        RunStatus::Delegated => Some(RuntimeCleanupReason::Delegated),
         RunStatus::Failed => Some(RuntimeCleanupReason::Failed),
         RunStatus::Cancelled => Some(RuntimeCleanupReason::Cancelled),
         RunStatus::Running | RunStatus::InputQueued | RunStatus::Paused | RunStatus::Waiting => {
@@ -312,6 +324,8 @@ pub fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
                 durable_event_type(event),
                 Some(
                     "text_done"
+                        | "runtime.control.handoff.requested"
+                        | "runtime.control.handoff.rejected"
                         | "run_error"
                         | "run_interrupted"
                         | "run_waiting"
@@ -533,6 +547,8 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
         // live transport only; durable replay keeps completion markers.
         "reasoning_done"
             | "thinking_done"
+            | "runtime.control.handoff.requested"
+            | "runtime.control.handoff.rejected"
             | "workspace_bound"
             | "executor_bound"
             | "executor_status_changed"

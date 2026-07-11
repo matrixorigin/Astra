@@ -244,6 +244,26 @@ pub trait AgenticLoopHost: Send {
         None
     }
 
+    /// Drain a terminal runtime-control decision produced while consuming the
+    /// just-finished LLM response. The loop checks this before normal ingest or
+    /// tool execution so terminal controls cannot become ordinary tool calls.
+    fn take_terminal_control_outcome(
+        &mut self,
+    ) -> Option<crate::turn::terminal_control::TerminalControlOutcome> {
+        None
+    }
+
+    /// Returns the public name of a tool that completed this round with the
+    /// provider-declared terminal-success contract. The default keeps CLI and
+    /// non-provider hosts unchanged.
+    fn stop_after_successful_tool_round(
+        &self,
+        _records: &[ToolCallRecord],
+        _results: &[Value],
+    ) -> Option<String> {
+        None
+    }
+
     /// Whether the host already injects round budget guidance into the system
     /// prompt during `execute_turn`.  When true, the agentic loop skips its
     /// own user-message guidance injection to avoid double injection.
@@ -2528,6 +2548,11 @@ pub(crate) use super::tool_support::{extract_file_path_from_tool, record_edge_to
 pub enum AgenticLoopOutcome {
     /// Loop completed normally (final text produced or budget exhausted gracefully).
     Completed,
+    /// Source control was terminally transferred to another runtime owner.
+    /// No source assistant/tool output may be produced after this outcome.
+    Delegated,
+    /// A terminal-control action violated the acceptance-window contract.
+    ControlRejected(crate::turn::terminal_control::TerminalControlRejection),
     /// Loop aborted due to a fatal error.
     // Preserved for dispatcher/adapter contract even though the core loop doesn't emit it in non-test builds yet.
     Error(String),
@@ -2680,7 +2705,12 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 continue;
             }
             TurnExecutionControl::Return(outcome) => {
-                finalize_and_render(host, state).await;
+                if !matches!(
+                    &outcome,
+                    AgenticLoopOutcome::Delegated | AgenticLoopOutcome::ControlRejected(_)
+                ) {
+                    finalize_and_render(host, state).await;
+                }
                 return Ok(outcome);
             }
         };
@@ -3263,6 +3293,7 @@ pub(crate) mod tests {
         cancel_child_agents_delay: Option<std::time::Duration>,
         recovered_control_tool_results: HashMap<String, ControlToolRecovery>,
         pub(crate) recovered_control_requests: Vec<(String, String, Value, Option<String>)>,
+        terminal_control_outcome: Option<crate::turn::terminal_control::TerminalControlOutcome>,
     }
 
     impl MockHost {
@@ -3285,6 +3316,7 @@ pub(crate) mod tests {
                 cancel_child_agents_delay: None,
                 recovered_control_tool_results: HashMap::new(),
                 recovered_control_requests: Vec::new(),
+                terminal_control_outcome: None,
             }
         }
 
@@ -3323,6 +3355,14 @@ pub(crate) mod tests {
             self
         }
 
+        pub(crate) fn with_terminal_control_outcome(
+            mut self,
+            outcome: crate::turn::terminal_control::TerminalControlOutcome,
+        ) -> Self {
+            self.terminal_control_outcome = Some(outcome);
+            self
+        }
+
         pub(crate) fn turn_count(&self) -> usize {
             self.current_turn
         }
@@ -3347,6 +3387,12 @@ pub(crate) mod tests {
             }
             self.current_turn += 1;
             Ok(result)
+        }
+
+        fn take_terminal_control_outcome(
+            &mut self,
+        ) -> Option<crate::turn::terminal_control::TerminalControlOutcome> {
+            self.terminal_control_outcome.take()
         }
 
         async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> TurnIntentJudgeOutcome {
@@ -4162,6 +4208,128 @@ pub(crate) mod tests {
         let mut state = make_state();
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert_eq!(state.telemetry.first_ttft_ms, Some(42));
+    }
+
+    #[tokio::test]
+    async fn terminal_handoff_stops_source_loop_before_tool_execution_or_second_llm() {
+        let terminal_call = json!({
+            "id": "call-handoff",
+            "type": "function",
+            "function": {
+                "name": "mcp__provider__arbitrary_control_name",
+                "arguments": r#"{"action":"revise_current_agent"}"#,
+            }
+        });
+        let first_turn = HostTurnResult {
+            accum: ChatTurnSseAccum {
+                reasoning_content: "internal reasoning".to_string(),
+                tool_calls: vec![terminal_call],
+                has_tool_calls: true,
+                prompt_tokens: 31,
+                completion_tokens: 7,
+                has_usage: true,
+                ..Default::default()
+            },
+            ttft_ms: Some(17),
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        };
+        let request = crate::turn::terminal_control::TerminalHandoffRequest {
+            handoff_id: "handoff-test".to_string(),
+            kind: crate::turn::terminal_control::TERMINAL_HANDOFF_CONTROL_KIND.to_string(),
+            target: "agent_authoring".to_string(),
+            action: "revise_current_agent".to_string(),
+            terminal: true,
+            tool_call_id: "call-handoff".to_string(),
+        };
+        let mut host = MockHost::new(vec![first_turn, text_result("must not run", 9, 3, Some(4))])
+            .with_terminal_control_outcome(
+                crate::turn::terminal_control::TerminalControlOutcome::Requested(request),
+            );
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .expect("terminal handoff should end the source loop cleanly");
+
+        assert!(matches!(outcome, AgenticLoopOutcome::Delegated));
+        assert_eq!(
+            host.turn_count(),
+            1,
+            "source must not issue a second LLM call"
+        );
+        assert_eq!(state.total_prompt, 31);
+        assert_eq!(state.total_completion, 7);
+        assert_eq!(
+            state.total_tool_calls, 0,
+            "control action is not an executed tool"
+        );
+        assert!(state.final_text.is_empty());
+        assert!(
+            state.messages.iter().all(|message| {
+                message.get("role").and_then(Value::as_str) != Some("assistant")
+                    && message.get("role").and_then(Value::as_str) != Some("tool")
+            }),
+            "terminal reasoning/tool action must not enter source conversation history"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_handoff_contract_rejection_stops_before_tool_execution_or_second_llm() {
+        let invalid_terminal_call = json!({
+            "id": "call-invalid",
+            "type": "function",
+            "function": {
+                "name": "mcp__provider__arbitrary_control_name",
+                "arguments": r#"{"action":"revise_current_agent","extra":true}"#,
+            }
+        });
+        let first_turn = HostTurnResult {
+            accum: ChatTurnSseAccum {
+                reasoning_content: "private invalid handoff reasoning".to_string(),
+                tool_calls: vec![invalid_terminal_call],
+                has_tool_calls: true,
+                prompt_tokens: 19,
+                completion_tokens: 5,
+                has_usage: true,
+                ..Default::default()
+            },
+            ttft_ms: Some(11),
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        };
+        let rejection = crate::turn::terminal_control::TerminalControlRejection {
+            code: "terminal_handoff_contract_violation",
+            message: "terminal handoff arguments must contain only action".to_string(),
+            tool_call_id: Some("call-invalid".to_string()),
+        };
+        let mut host = MockHost::new(vec![first_turn, text_result("must not run", 9, 3, Some(4))])
+            .with_terminal_control_outcome(
+                crate::turn::terminal_control::TerminalControlOutcome::Rejected(rejection),
+            );
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .expect("terminal contract rejection should end the source loop cleanly");
+
+        let AgenticLoopOutcome::ControlRejected(rejection) = outcome else {
+            panic!("expected terminal control rejection");
+        };
+        assert_eq!(rejection.code, "terminal_handoff_contract_violation");
+        assert_eq!(host.turn_count(), 1, "source must not call the LLM again");
+        assert_eq!(
+            state.total_tool_calls, 0,
+            "invalid terminal action must not execute as a tool"
+        );
+        assert!(state.final_text.is_empty());
+        assert!(
+            state.messages.iter().all(|message| {
+                message.get("role").and_then(Value::as_str) != Some("assistant")
+                    && message.get("role").and_then(Value::as_str) != Some("tool")
+            }),
+            "rejected terminal action must not enter source conversation history"
+        );
     }
 
     // ── Multi-turn flow tests ───────────────────────────────────────────────

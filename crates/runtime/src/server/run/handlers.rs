@@ -147,6 +147,8 @@ fn should_inject_run_id(event_type: &str) -> bool {
             | "run_paused"
             | "run_resumed"
             | "run_input_queued"
+            | "runtime.control.handoff.requested"
+            | "runtime.control.handoff.rejected"
             | "run_finished"
     ) || event_type == "run_blocked"
 }
@@ -668,6 +670,55 @@ mod tests {
         assert_eq!(
             transformed[1],
             json!({"type": "run_error", "message": "boom", "error": "boom", "code": "RUN_ERROR", "run_id": "run-123", "index": 8})
+        );
+    }
+
+    #[test]
+    fn transform_stream_run_events_for_client_preserves_terminal_handoff_and_delegated_status() {
+        let transformed = transform_stream_run_events_for_client(
+            "run-source",
+            vec![
+                json!({
+                    "type": "runtime.control.handoff.requested",
+                    "handoff_id": "handoff-1",
+                    "kind": "moi.control.handoff.v1",
+                    "target": "agent_authoring",
+                    "action": "revise_current_agent",
+                    "terminal": true
+                }),
+                json!({
+                    "event_type": "run_finished",
+                    "data": {
+                        "status": "delegated",
+                        "outcome": "delegated",
+                        "prompt_tokens": 9,
+                        "completion_tokens": 2
+                    }
+                }),
+            ],
+        );
+
+        assert_eq!(
+            transformed[0],
+            json!({
+                "type": "runtime.control.handoff.requested",
+                "handoff_id": "handoff-1",
+                "kind": "moi.control.handoff.v1",
+                "target": "agent_authoring",
+                "action": "revise_current_agent",
+                "terminal": true,
+                "run_id": "run-source"
+            })
+        );
+        assert_eq!(transformed[1]["type"], "usage");
+        assert_eq!(
+            transformed[2],
+            json!({
+                "type": "run_finished",
+                "run_id": "run-source",
+                "status": "delegated",
+                "outcome": "delegated"
+            })
         );
     }
 

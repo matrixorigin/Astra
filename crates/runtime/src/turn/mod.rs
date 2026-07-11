@@ -41,7 +41,9 @@ pub mod result_quality {
 }
 pub(crate) mod services;
 pub mod skill_tool;
+pub mod terminal_control;
 pub mod token_usage;
+pub(crate) mod tool_completion;
 pub mod tool_side_effects;
 pub mod tuning_consumer;
 pub mod turn_trace_collector;

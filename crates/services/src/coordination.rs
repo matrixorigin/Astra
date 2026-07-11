@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub const AGENT_RESULT_STATUS_COMPLETED: &str = "completed";
+pub const AGENT_RESULT_STATUS_DELEGATED: &str = "delegated";
 pub const AGENT_RESULT_STATUS_FAILED: &str = "failed";
 pub const AGENT_RESULT_STATUS_TIMEOUT: &str = "timeout";
 pub const AGENT_RESULT_STATUS_WAITING: &str = "waiting";
@@ -51,6 +52,7 @@ pub const DELEGATION_RESULT_STATUS_FAILED: &str = "failed";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentResultStatusKind {
     Completed,
+    Delegated,
     Failed,
     Timeout,
     Waiting,
@@ -65,6 +67,7 @@ pub fn agent_result_status_kind(status: &str) -> AgentResultStatusKind {
     let normalized = status.trim().to_ascii_lowercase();
     match normalized.as_str() {
         AGENT_RESULT_STATUS_COMPLETED => AgentResultStatusKind::Completed,
+        AGENT_RESULT_STATUS_DELEGATED => AgentResultStatusKind::Delegated,
         AGENT_RESULT_STATUS_FAILED => AgentResultStatusKind::Failed,
         AGENT_RESULT_STATUS_TIMEOUT => AgentResultStatusKind::Timeout,
         AGENT_RESULT_STATUS_WAITING => AgentResultStatusKind::Waiting,
@@ -77,7 +80,10 @@ pub fn agent_result_status_kind(status: &str) -> AgentResultStatusKind {
 }
 
 pub fn agent_result_status_is_success(status: &str) -> bool {
-    agent_result_status_kind(status) == AgentResultStatusKind::Completed
+    matches!(
+        agent_result_status_kind(status),
+        AgentResultStatusKind::Completed | AgentResultStatusKind::Delegated
+    )
 }
 
 pub fn agent_result_status_is_unfinished(status: &str) -> bool {
@@ -99,7 +105,9 @@ pub fn agent_result_status_is_failure(status: &str) -> bool {
 
 pub fn agent_result_status_to_subrun_state(status: &str) -> SubRunState {
     match agent_result_status_kind(status) {
-        AgentResultStatusKind::Completed => SubRunState::Completed,
+        AgentResultStatusKind::Completed | AgentResultStatusKind::Delegated => {
+            SubRunState::Completed
+        }
         AgentResultStatusKind::Waiting | AgentResultStatusKind::Paused => SubRunState::Paused,
         AgentResultStatusKind::Cancelled => SubRunState::Cancelled,
         AgentResultStatusKind::VerificationFailed => SubRunState::VerificationFailed,
@@ -1314,6 +1322,10 @@ mod tests {
             AgentResultStatusKind::Completed
         );
         assert_eq!(
+            agent_result_status_kind(AGENT_RESULT_STATUS_DELEGATED),
+            AgentResultStatusKind::Delegated
+        );
+        assert_eq!(
             agent_result_status_kind(AGENT_RESULT_STATUS_VERIFICATION_FAILED),
             AgentResultStatusKind::VerificationFailed
         );
@@ -1324,6 +1336,13 @@ mod tests {
         assert!(agent_result_status_is_success(
             AGENT_RESULT_STATUS_COMPLETED
         ));
+        assert!(agent_result_status_is_success(
+            AGENT_RESULT_STATUS_DELEGATED
+        ));
+        assert_eq!(
+            agent_result_status_to_subrun_state(AGENT_RESULT_STATUS_DELEGATED),
+            SubRunState::Completed
+        );
         assert!(agent_result_status_is_failure(
             AGENT_RESULT_STATUS_VERIFICATION_FAILED
         ));

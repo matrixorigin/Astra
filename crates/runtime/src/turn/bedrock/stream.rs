@@ -31,6 +31,14 @@ pub enum BedrockStreamEvent {
     /// subsequent `contentBlockDelta.toolUse.input` deltas and are parsed
     /// when [`BedrockStreamAccumulator::into_result`] is called.
     ToolCallStart { id: String, name: String },
+    /// Current snapshot of a streamed tool call. `arguments` may be partial
+    /// JSON until the final snapshot emitted at `contentBlockStop`.
+    ToolCallDelta {
+        index: u64,
+        id: String,
+        name: String,
+        arguments: String,
+    },
     /// Final usage metadata (emitted on `metadata` frame).
     Usage(TokenUsage),
     /// Stream terminated with a stopReason.
@@ -270,12 +278,35 @@ impl BedrockStreamAccumulator {
                     // (create a stub) rather than panic.
                     let entry = self.tool_calls.entry(idx).or_default();
                     entry.args_buf.push_str(tool_input);
-                    return Ok(vec![]);
+                    return Ok(vec![BedrockStreamEvent::ToolCallDelta {
+                        index: idx,
+                        id: entry.id.clone(),
+                        name: entry.name.clone(),
+                        arguments: entry.args_buf.clone(),
+                    }]);
                 }
                 Ok(vec![])
             }
 
-            "contentBlockStop" => Ok(vec![]),
+            "contentBlockStop" => {
+                let idx = payload
+                    .get("contentBlockIndex")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let Some(entry) = self.tool_calls.get(&idx) else {
+                    return Ok(vec![]);
+                };
+                Ok(vec![BedrockStreamEvent::ToolCallDelta {
+                    index: idx,
+                    id: entry.id.clone(),
+                    name: entry.name.clone(),
+                    arguments: if entry.args_buf.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        entry.args_buf.clone()
+                    },
+                }])
+            }
 
             "messageStop" => {
                 let stop_reason = payload
@@ -525,20 +556,29 @@ mod tests {
             }]
         );
         // JSON arguments streamed in three pieces.
+        let mut last_delta = Vec::new();
         for chunk in [r#"{"comm"#, r#"and":"#, r#""\"pwd\""}"#] {
             let payload = format!(
                 r#"{{"contentBlockIndex":1,"delta":{{"toolUse":{{"input":{}}}}}}}"#,
                 serde_json::to_string(chunk).unwrap()
             );
-            acc.push_frame(&frame("event", "contentBlockDelta", payload.as_bytes()))
+            last_delta = acc
+                .push_frame(&frame("event", "contentBlockDelta", payload.as_bytes()))
                 .unwrap();
         }
-        acc.push_frame(&frame(
-            "event",
-            "contentBlockStop",
-            br#"{"contentBlockIndex":1}"#,
-        ))
-        .unwrap();
+        assert!(matches!(
+            last_delta.as_slice(),
+            [BedrockStreamEvent::ToolCallDelta { index: 1, id, name, arguments }]
+                if id == "tu-1" && name == "bash" && arguments == r#"{"command":"\"pwd\""}"#
+        ));
+        let stop = acc
+            .push_frame(&frame(
+                "event",
+                "contentBlockStop",
+                br#"{"contentBlockIndex":1}"#,
+            ))
+            .unwrap();
+        assert_eq!(stop, last_delta);
         acc.push_frame(&frame(
             "event",
             "messageStop",
@@ -554,6 +594,35 @@ mod tests {
         let args_str = r.tool_calls[0]["function"]["arguments"].as_str().unwrap();
         let args: Value = serde_json::from_str(args_str).unwrap();
         assert_eq!(args["command"], "\"pwd\"");
+    }
+
+    #[test]
+    fn tool_use_without_argument_deltas_emits_complete_empty_object_at_stop() {
+        let mut acc = BedrockStreamAccumulator::new();
+        acc.push_frame(&frame(
+            "event",
+            "contentBlockStart",
+            br#"{"contentBlockIndex":2,"start":{"toolUse":{"toolUseId":"tu-empty","name":"status"}}}"#,
+        ))
+        .unwrap();
+
+        let stop = acc
+            .push_frame(&frame(
+                "event",
+                "contentBlockStop",
+                br#"{"contentBlockIndex":2}"#,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            stop,
+            vec![BedrockStreamEvent::ToolCallDelta {
+                index: 2,
+                id: "tu-empty".to_string(),
+                name: "status".to_string(),
+                arguments: "{}".to_string(),
+            }]
+        );
     }
 
     #[test]

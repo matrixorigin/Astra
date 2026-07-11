@@ -441,6 +441,7 @@ pub fn worktree_base_path() -> PathBuf {
 
 pub const STATUS_RUNNING: &str = "running";
 pub const STATUS_COMPLETED: &str = "completed";
+pub const STATUS_DELEGATED: &str = "delegated";
 pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_PAUSED: &str = "paused";
 pub const STATUS_CANCELLED: &str = "cancelled";

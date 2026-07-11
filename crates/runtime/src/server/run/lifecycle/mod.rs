@@ -104,8 +104,8 @@ use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
 use astra_core::{
-    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED, STATUS_PAUSED,
-    STATUS_RUNNING, STATUS_WAITING,
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED, STATUS_INPUT_QUEUED,
+    STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING,
 };
 use astra_runtime_env::{
     CleanupReason as RuntimeCleanupReason, PolicyIntent as RuntimePolicyIntent,
@@ -2328,6 +2328,35 @@ impl AgenticRunLifecycleService {
             (RunStatus::Cancelled, None)
         } else {
             match loop_outcome {
+                Ok(AgenticLoopOutcome::Delegated) => {
+                    let mut finished = usage;
+                    finished["status"] = Value::String(STATUS_DELEGATED.to_string());
+                    finished["outcome"] = Value::String(STATUS_DELEGATED.to_string());
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": finished,
+                    }));
+                    (RunStatus::Delegated, None)
+                }
+                Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
+                    events.push(json!({
+                        "event_type": "run_error",
+                        "data": {
+                            "error": rejection.message.clone(),
+                            "error_code": rejection.code,
+                            "error_kind": "contract_violation",
+                        }
+                    }));
+                    let mut finished = usage;
+                    finished["error"] = Value::String(rejection.message.clone());
+                    finished["error_code"] = Value::String(rejection.code.to_string());
+                    finished["error_kind"] = Value::String("contract_violation".to_string());
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": finished,
+                    }));
+                    (RunStatus::Failed, Some(rejection.message))
+                }
                 Ok(AgenticLoopOutcome::Completed) => {
                     if let Some(interruption) = loop_state.interruption.as_ref() {
                         let task_board_snapshot = loop_state.hooks.task_board_snapshot.clone();
@@ -3286,7 +3315,18 @@ impl AgenticRunLifecycleService {
         let allowed = if path.is_empty() {
             matches!(
                 normalized.as_str(),
-                "mode" | "raw_advice" | "model_name" | "author" | "authority" | "resources"
+                "mode"
+                    | "raw_advice"
+                    | "model_name"
+                    | "author"
+                    | "authority"
+                    | "resources"
+                    | "source_agent_id"
+                    | "source_agent_workspace_id"
+                    | "source_version"
+                    | "advice_user_id"
+                    | "current_agent"
+                    | "authoring_context"
             )
         } else {
             match path.last().map(String::as_str) {
@@ -3296,6 +3336,29 @@ impl AgenticRunLifecycleService {
                 ),
                 Some("models") => matches!(normalized.as_str(), "name" | "model_name"),
                 Some("tools" | "skills" | "knowledge_bases") => normalized == "name",
+                Some("current_agent") => matches!(
+                    normalized.as_str(),
+                    "agent_id"
+                        | "name"
+                        | "description"
+                        | "model_name"
+                        | "model_config_ref"
+                        | "tool_names"
+                        | "skill_names"
+                        | "knowledge_base_names"
+                        | "agent_md"
+                ),
+                Some("authoring_context") => {
+                    matches!(
+                        normalized.as_str(),
+                        "schema_version" | "recent_chat_context"
+                    )
+                }
+                Some("recent_chat_context") => matches!(
+                    normalized.as_str(),
+                    "limit_turns" | "max_characters" | "truncated" | "messages"
+                ),
+                Some("messages") => matches!(normalized.as_str(), "role" | "content" | "truncated"),
                 _ => false,
             }
         };
@@ -3307,7 +3370,15 @@ impl AgenticRunLifecycleService {
             [field]
                 if matches!(
                     field.as_str(),
-                    "mode" | "raw_advice" | "model_name" | "author" | "authority"
+                    "mode"
+                        | "raw_advice"
+                        | "model_name"
+                        | "author"
+                        | "authority"
+                        | "source_agent_id"
+                        | "source_agent_workspace_id"
+                        | "source_version"
+                        | "advice_user_id"
                 ) =>
             {
                 matches!(
@@ -3338,7 +3409,114 @@ impl AgenticRunLifecycleService {
                     Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
                 )
             }
+            [field] if matches!(field.as_str(), "current_agent" | "authoring_context") => {
+                value.is_object()
+            }
+            [root, field]
+                if root == "current_agent"
+                    && matches!(
+                        field.as_str(),
+                        "agent_id"
+                            | "name"
+                            | "description"
+                            | "model_name"
+                            | "model_config_ref"
+                            | "agent_md"
+                    ) =>
+            {
+                matches!(
+                    value,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            }
+            [root, field]
+                if root == "current_agent"
+                    && matches!(
+                        field.as_str(),
+                        "tool_names" | "skill_names" | "knowledge_base_names"
+                    ) =>
+            {
+                value.is_array()
+            }
+            [root, field] if root == "authoring_context" && field == "schema_version" => {
+                matches!(
+                    value,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            }
+            [root, field] if root == "authoring_context" && field == "recent_chat_context" => {
+                value.is_object()
+            }
+            [root, context, field]
+                if root == "authoring_context"
+                    && context == "recent_chat_context"
+                    && matches!(
+                        field.as_str(),
+                        "limit_turns" | "max_characters" | "truncated"
+                    ) =>
+            {
+                matches!(
+                    value,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            }
+            [root, context, field]
+                if root == "authoring_context"
+                    && context == "recent_chat_context"
+                    && field == "messages" =>
+            {
+                value.is_array()
+            }
+            [root, context, messages, field]
+                if root == "authoring_context"
+                    && context == "recent_chat_context"
+                    && messages == "messages"
+                    && matches!(field.as_str(), "role" | "content" | "truncated") =>
+            {
+                matches!(
+                    value,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            }
             _ => false,
+        }
+    }
+
+    fn prompt_visible_context_string_limit(path: &[String]) -> Option<usize> {
+        match path {
+            [field] if field == "raw_advice" => None,
+            [root, _] if root == "current_agent" => None,
+            [root, context, messages, field]
+                if root == "authoring_context"
+                    && context == "recent_chat_context"
+                    && messages == "messages"
+                    && field == "content" =>
+            {
+                None
+            }
+            _ => Some(2_000),
+        }
+    }
+
+    fn prompt_visible_context_array_limit(path: &[String]) -> Option<usize> {
+        match path {
+            [root, field]
+                if root == "current_agent"
+                    && matches!(
+                        field.as_str(),
+                        "tool_names" | "skill_names" | "knowledge_base_names"
+                    ) =>
+            {
+                None
+            }
+            [root, context, field]
+                if root == "authoring_context"
+                    && context == "recent_chat_context"
+                    && field == "messages" =>
+            {
+                None
+            }
+            _ => Some(24),
         }
     }
 
@@ -3347,30 +3525,28 @@ impl AgenticRunLifecycleService {
         depth: usize,
         path: &mut Vec<String>,
     ) -> Option<Value> {
-        const MAX_DEPTH: usize = 4;
+        const MAX_DEPTH: usize = 5;
         const MAX_OBJECT_FIELDS: usize = 48;
-        const MAX_ARRAY_ITEMS: usize = 24;
-        const MAX_STRING_CHARS: usize = 2_000;
 
         match value {
             Value::Null | Value::Bool(_) | Value::Number(_) => Some(value.clone()),
-            Value::String(text) => {
-                if text.is_empty() {
-                    Some(Value::String(String::new()))
-                } else if text.chars().count() <= MAX_STRING_CHARS {
-                    Some(Value::String(text.clone()))
-                } else {
-                    let truncated = text.chars().take(MAX_STRING_CHARS).collect::<String>();
+            Value::String(text) => match Self::prompt_visible_context_string_limit(path) {
+                None if !text.is_empty() => Some(Value::String(text.clone())),
+                Some(max_chars) if text.chars().count() > max_chars => {
+                    let truncated = text.chars().take(max_chars).collect::<String>();
                     Some(Value::String(format!("{truncated}...[truncated]")))
                 }
-            }
+                _ => Some(Value::String(text.clone())),
+            },
             Value::Array(items) => {
                 if depth >= MAX_DEPTH {
                     return None;
                 }
+                let max_items =
+                    Self::prompt_visible_context_array_limit(path).unwrap_or(usize::MAX);
                 let values = items
                     .iter()
-                    .take(MAX_ARRAY_ITEMS)
+                    .take(max_items)
                     .filter_map(|item| Self::prompt_visible_context_value(item, depth + 1, path))
                     .collect::<Vec<_>>();
                 Some(Value::Array(values))
@@ -3415,14 +3591,12 @@ impl AgenticRunLifecycleService {
         ))
     }
 
-    fn append_runtime_volatile_prompt_text(edge_profile: &mut Map<String, Value>, text: String) {
-        use astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS;
-
+    fn append_runtime_prompt_text(edge_profile: &mut Map<String, Value>, lane: &str, text: String) {
         if text.trim().is_empty() {
             return;
         }
         let entry = edge_profile
-            .entry(EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS.to_string())
+            .entry(lane.to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
         match entry {
             Value::Array(items) => items.push(Value::String(text)),
@@ -3434,6 +3608,22 @@ impl AgenticRunLifecycleService {
                 *entry = Value::Array(vec![Value::String(text)]);
             }
         }
+    }
+
+    fn append_runtime_required_prompt_text(edge_profile: &mut Map<String, Value>, text: String) {
+        Self::append_runtime_prompt_text(
+            edge_profile,
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+            text,
+        );
+    }
+
+    fn append_runtime_volatile_prompt_text(edge_profile: &mut Map<String, Value>, text: String) {
+        Self::append_runtime_prompt_text(
+            edge_profile,
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
+            text,
+        );
     }
 
     fn apply_agent_binding_prompt_context(
@@ -3449,19 +3639,22 @@ impl AgenticRunLifecycleService {
             .map(str::to_string);
         let binding_section = agent_binding_context
             .map(|context| Self::agent_binding_prompt_section(&context.binding));
-        // `runtime_system_prompt` is a session-stable system override. Per-turn
-        // facts must use `runtime_volatile_texts` so they land in
-        // RuntimeVolatile / CacheScope::None and do not churn the cached prefix.
-        let runtime_section = runtime_system_prompt
-            .filter(|prompt| !prompt.is_empty())
-            .map(str::to_string);
-        let sections = [existing, binding_section, runtime_section]
+        let sections = [existing, binding_section]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
         if !sections.is_empty() {
             let merged = sections.join("\n\n");
             edge_profile.insert("system_prompt_override".to_string(), Value::String(merged));
+        }
+        // Provider-owned runtime policy is not part of the editable agent
+        // prompt. It is required control context: strict-history/cache paths
+        // may reposition it, but must never drop or persist it as user history.
+        if let Some(runtime_system_prompt) = runtime_system_prompt {
+            Self::append_runtime_required_prompt_text(
+                edge_profile,
+                runtime_system_prompt.to_string(),
+            );
         }
         if let Some(turn_context_section) = agent_binding_context
             .and(request_context)
@@ -5421,7 +5614,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )));
         }
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-            host.install_runtime_tool_schemas(bundle.schemas.clone());
+            host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
+            host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
         }
         let mut loop_state = self.build_initial_state_inner(
             &user_id,
@@ -6358,7 +6552,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── MCP: inject request-scoped schemas into host tool surface ─
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-            host.install_runtime_tool_schemas(bundle.schemas.clone());
+            host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
+            host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
         }
         let state_restore_ms = state_restore_started_at.elapsed().as_millis() as u64;
 
@@ -7391,7 +7586,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let durable_status = Self::run_status_from_durable(&durable.status)?;
         if matches!(
             durable_status,
-            RunStatus::Paused | RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            RunStatus::Paused
+                | RunStatus::Completed
+                | RunStatus::Delegated
+                | RunStatus::Failed
+                | RunStatus::Cancelled
         ) {
             return Err(Self::run_state_conflict("submit input to", &durable.status));
         }
@@ -7492,7 +7691,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let durable_status = Self::run_status_from_durable(&durable.status)?;
         if matches!(
             durable_status,
-            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            RunStatus::Completed | RunStatus::Delegated | RunStatus::Failed | RunStatus::Cancelled
         ) {
             return Ok(CancelRunRecord {
                 run_id,
@@ -7524,7 +7723,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let current_status = Self::run_status_from_durable(&current.status)?;
             if matches!(
                 current_status,
-                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+                RunStatus::Completed
+                    | RunStatus::Delegated
+                    | RunStatus::Failed
+                    | RunStatus::Cancelled
             ) {
                 return Ok(CancelRunRecord {
                     run_id,
@@ -7700,7 +7902,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let current_status = Self::run_status_from_durable(&current.status)?;
                 if matches!(
                     current_status,
-                    RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+                    RunStatus::Completed
+                        | RunStatus::Delegated
+                        | RunStatus::Failed
+                        | RunStatus::Cancelled
                 ) {
                     return Ok(RunMutationRecord {
                         run_id,
@@ -8018,10 +8223,13 @@ fn server_subrun_live_termination(
             AgentLiveTermination::Cancelled
         }
         Ok(AgenticLoopOutcome::Completed) => AgentLiveTermination::Completed,
+        Ok(AgenticLoopOutcome::Delegated) => AgentLiveTermination::Delegated,
         Ok(AgenticLoopOutcome::Cancelled | AgenticLoopOutcome::Waiting(_)) => {
             AgentLiveTermination::Cancelled
         }
-        Ok(AgenticLoopOutcome::Error(_)) | Err(_) => AgentLiveTermination::Failed,
+        Ok(AgenticLoopOutcome::Error(_) | AgenticLoopOutcome::ControlRejected(_)) | Err(_) => {
+            AgentLiveTermination::Failed
+        }
     }
 }
 
@@ -8036,9 +8244,13 @@ fn server_subrun_live_reason(
             Some("paused".to_string())
         }
         Ok(AgenticLoopOutcome::Completed) => None,
+        Ok(AgenticLoopOutcome::Delegated) => Some("delegated".to_string()),
         Ok(AgenticLoopOutcome::Cancelled) => Some("cancelled".to_string()),
         Ok(AgenticLoopOutcome::Waiting(reason)) => Some(reason.clone()),
         Ok(AgenticLoopOutcome::Error(error)) => Some(error.clone()),
+        Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
+            Some(format!("{}: {}", rejection.code, rejection.message))
+        }
         Err(error) => Some(error.to_string()),
     }
 }
@@ -8919,6 +9131,28 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         let prompt_tokens = loop_state.provider_input_tokens();
         match &outcome {
+            Ok(AgenticLoopOutcome::Delegated) => {
+                self.persist_durable_subrun_terminal_status(
+                    &durable_user_id,
+                    &durable_session_id,
+                    &durable_run_id,
+                    STATUS_DELEGATED,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
+                self.persist_durable_subrun_terminal_status(
+                    &durable_user_id,
+                    &durable_session_id,
+                    &durable_run_id,
+                    STATUS_FAILED,
+                    None,
+                    Some(rejection.message.as_str()),
+                )
+                .await;
+            }
             Ok(AgenticLoopOutcome::Completed) => {
                 let status = server_subrun_completed_status(&loop_state);
                 self.persist_durable_subrun_terminal_status(
@@ -8987,6 +9221,28 @@ impl SubRunExecutor for ServerSubRunExecutor {
         )
         .await;
         match outcome {
+            Ok(AgenticLoopOutcome::Delegated) => Ok(astra_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: STATUS_DELEGATED.to_string(),
+                output: None,
+                error: None,
+                prompt_tokens,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
+            Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
+                Ok(astra_services::coordination::AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: STATUS_FAILED.to_string(),
+                    output: None,
+                    error: Some(format!("{}: {}", rejection.code, rejection.message)),
+                    prompt_tokens,
+                    completion_tokens: loop_state.total_completion,
+                    tool_calls: loop_state.total_tool_calls,
+                })
+            }
             Ok(AgenticLoopOutcome::Completed) => {
                 let status = server_subrun_completed_status(&loop_state);
                 Ok(astra_services::coordination::AgentResult {
