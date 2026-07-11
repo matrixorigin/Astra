@@ -2442,6 +2442,12 @@ pub fn project_skill_subrun_outcome(
             .map_or(SubRunOutcome::Completed, |finish_reason| {
                 SubRunOutcome::Interrupted { finish_reason }
             }),
+        Ok(AgenticLoopOutcome::Delegated) => SubRunOutcome::Interrupted {
+            finish_reason: "delegated".to_string(),
+        },
+        Ok(AgenticLoopOutcome::ControlRejected(rejection)) => SubRunOutcome::Failed {
+            error: format!("{}: {}", rejection.code, rejection.message),
+        },
         Ok(AgenticLoopOutcome::Waiting(reason)) => SubRunOutcome::Interrupted {
             finish_reason: interruption_reason().unwrap_or_else(|| reason.clone()),
         },
@@ -5438,6 +5444,14 @@ pub(crate) mod tests {
         // Ensure all variants have Debug
         let variants: Vec<AgenticLoopOutcome> = vec![
             AgenticLoopOutcome::Completed,
+            AgenticLoopOutcome::Delegated,
+            AgenticLoopOutcome::ControlRejected(
+                crate::turn::terminal_control::TerminalControlRejection {
+                    code: "terminal_handoff_contract_violation",
+                    message: "invalid terminal handoff".to_string(),
+                    tool_call_id: None,
+                },
+            ),
             AgenticLoopOutcome::Error("fail".into()),
             AgenticLoopOutcome::Cancelled,
             AgenticLoopOutcome::Waiting("resume".into()),
@@ -5445,7 +5459,7 @@ pub(crate) mod tests {
         for v in &variants {
             let _ = format!("{v:?}");
         }
-        assert_eq!(variants.len(), 4);
+        assert_eq!(variants.len(), 6);
     }
 
     #[test]
@@ -5495,6 +5509,27 @@ pub(crate) mod tests {
             project_skill_subrun_outcome(&Ok(AgenticLoopOutcome::Cancelled), &state),
             SubRunOutcome::Cancelled {
                 reason: "cancelled".to_string()
+            }
+        );
+        assert_eq!(
+            project_skill_subrun_outcome(&Ok(AgenticLoopOutcome::Delegated), &state),
+            SubRunOutcome::Interrupted {
+                finish_reason: "delegated".to_string()
+            }
+        );
+        assert_eq!(
+            project_skill_subrun_outcome(
+                &Ok(AgenticLoopOutcome::ControlRejected(
+                    crate::turn::terminal_control::TerminalControlRejection {
+                        code: "terminal_handoff_contract_violation",
+                        message: "invalid terminal handoff".to_string(),
+                        tool_call_id: None,
+                    },
+                )),
+                &state,
+            ),
+            SubRunOutcome::Failed {
+                error: "terminal_handoff_contract_violation: invalid terminal handoff".to_string()
             }
         );
         assert_eq!(

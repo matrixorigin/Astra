@@ -7051,10 +7051,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     bg_cancel_flag.clone(),
                     bg_llm_cancel_token.clone(),
                 );
-                let agentic_loop_started_at = Instant::now();
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
-                let agentic_loop_ms = agentic_loop_started_at.elapsed().as_millis() as u64;
                 let loop_success = loop_result.is_ok();
                 drop(client_disconnect_watcher);
 
