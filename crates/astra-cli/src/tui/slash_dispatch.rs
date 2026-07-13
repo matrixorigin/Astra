@@ -30,6 +30,22 @@ pub(crate) enum SlashResult {
     Exit,
 }
 
+/// Session-lifecycle controls that must be honored before an input can enter
+/// the active-run intent ledger. These controls are phase-independent: a
+/// settling model turn must never reinterpret them as conversational input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImmediateControl {
+    Exit,
+}
+
+pub(crate) fn immediate_control(text: &str) -> Option<ImmediateControl> {
+    let (command, _args) = parse_slash(text);
+    match command_registry::resolve_command(command).ok()? {
+        "/exit" => Some(ImmediateControl::Exit),
+        _ => None,
+    }
+}
+
 impl SlashResult {
     fn background_read(action: SlashBackgroundRead) -> Self {
         Self::BackgroundRead(Box::new(action))
@@ -3913,6 +3929,25 @@ mod split_sub_tests {
             split_sub("analyze deep abc-123"),
             ("analyze", "deep abc-123")
         );
+    }
+}
+
+#[cfg(test)]
+mod immediate_control_tests {
+    use super::{ImmediateControl, immediate_control};
+
+    #[test]
+    fn exit_is_phase_independent_even_with_whitespace_or_arguments() {
+        for input in ["/exit", "  /exit  ", "/exit now"] {
+            assert_eq!(immediate_control(input), Some(ImmediateControl::Exit));
+        }
+    }
+
+    #[test]
+    fn ordinary_slash_and_conversation_inputs_are_not_immediate_controls() {
+        for input in ["/agent", "/help", "please /exit later", ""] {
+            assert_eq!(immediate_control(input), None, "input: {input}");
+        }
     }
 }
 

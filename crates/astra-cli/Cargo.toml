@@ -109,3 +109,4 @@ serial_test = "3"
 temp-env = "0.3"
 wiremock = "0.6"
 insta.workspace = true
+vt100 = "0.16.2"

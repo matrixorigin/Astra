@@ -5750,6 +5750,17 @@ pub(crate) async fn run_tui_session(
                                                             bottom_pane.pre_draw_tick(std::time::Instant::now());
                                                             match bottom_pane.handle_key(k) {
                                                                     BottomPaneAction::SubmitInput(queued_text) => {
+                                                                        if matches!(
+                                                                            slash_dispatch::immediate_control(&queued_text),
+                                                                            Some(slash_dispatch::ImmediateControl::Exit)
+                                                                        ) {
+                                                                            // `/exit` is a workbench lifecycle command in every
+                                                                            // turn phase. Cancel the in-flight local boundary and
+                                                                            // leave through the regular shutdown path; never queue
+                                                                            // it as model guidance or a follow-up user message.
+                                                                            tui_cancel_token.cancel();
+                                                                            break 'main Ok(());
+                                                                        }
                                                                         match classify_local_shell_submission(&queued_text) {
                                                                             LocalShellSubmission::NotShell => {}
                                                                             LocalShellSubmission::Empty => {

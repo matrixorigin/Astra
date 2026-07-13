@@ -36,6 +36,7 @@ struct PtyAstra {
     output_rx: Receiver<Vec<u8>>,
     reader: Option<JoinHandle<()>>,
     output: Vec<u8>,
+    screen: vt100::Parser,
     cpr_replies: usize,
     da1_replies: usize,
 }
@@ -119,6 +120,7 @@ impl PtyAstra {
             output_rx,
             reader: Some(reader),
             output: Vec::new(),
+            screen: vt100::Parser::new(size.ws_row, size.ws_col, 0),
             cpr_replies: 0,
             da1_replies: 0,
         }
@@ -129,35 +131,23 @@ impl PtyAstra {
         self.writer.flush().expect("flush PTY input");
     }
 
-    fn output_len(&self) -> usize {
-        self.output.len()
-    }
-
     fn wait_for(&mut self, needle: &str, timeout: Duration) {
-        self.wait_for_since(0, needle, timeout);
-    }
-
-    fn wait_for_since(&mut self, offset: usize, needle: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
-            if self
-                .output
-                .get(offset..)
-                .is_some_and(|output| String::from_utf8_lossy(output).contains(needle))
-            {
+            if self.current_screen().contains(needle) {
                 return;
             }
             if let Some(status) = self.child.try_wait().expect("poll Astra child") {
                 panic!(
                     "Astra exited before rendering {needle:?} ({status})\n{}",
-                    self.output_tail()
+                    self.screen_diagnostic()
                 );
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
                 "timed out waiting for {needle:?}\n{}",
-                self.output_tail()
+                self.screen_diagnostic()
             );
             self.receive(remaining.min(Duration::from_millis(100)));
         }
@@ -166,6 +156,7 @@ impl PtyAstra {
     fn receive(&mut self, timeout: Duration) {
         match self.output_rx.recv_timeout(timeout) {
             Ok(chunk) => {
+                self.screen.process(&chunk);
                 self.output.extend_from_slice(&chunk);
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -227,6 +218,18 @@ impl PtyAstra {
             .chars()
             .rev()
             .collect()
+    }
+
+    fn current_screen(&self) -> String {
+        self.screen.screen().contents()
+    }
+
+    fn screen_diagnostic(&self) -> String {
+        format!(
+            "current screen:\n{}\n\nraw PTY tail:\n{}",
+            self.current_screen(),
+            self.output_tail()
+        )
     }
 }
 
@@ -332,22 +335,15 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
     // A single token stays contiguous in the terminal byte stream even when
     // ratatui positions separately styled words with cursor movement codes.
     let draft = "draft_survives_transcript_round_trip";
-    let draft_offset = astra.output_len();
     astra.write(draft.as_bytes());
-    astra.wait_for_since(draft_offset, draft, Duration::from_secs(5));
+    astra.wait_for(draft, Duration::from_secs(5));
 
-    let open_offset = astra.output_len();
     astra.write(&[0x0f]); // Ctrl+O
-    astra.wait_for_since(
-        open_offset,
-        "Main conversation · Transcript",
-        Duration::from_secs(5),
-    );
-    astra.wait_for_since(open_offset, "filter:", Duration::from_secs(2));
+    astra.wait_for("Main conversation · Transcript", Duration::from_secs(5));
+    astra.wait_for("filter:", Duration::from_secs(2));
 
-    let close_offset = astra.output_len();
     astra.write(&[0x0f]); // Ctrl+O
-    astra.wait_for_since(close_offset, draft, Duration::from_secs(5));
+    astra.wait_for(draft, Duration::from_secs(5));
 
     astra.write(&[0x15]); // Ctrl+U clears the restored draft.
     astra.write(b"/exit\r");
@@ -371,18 +367,12 @@ async fn ctrl_o_opens_during_an_active_turn_and_receives_live_completion() {
     astra.write(b"complete_this_live_transcript_journey\r");
     astra.wait_for("Sending", Duration::from_secs(5));
 
-    let open_offset = astra.output_len();
     astra.write(&[0x0f]); // Ctrl+O while the HTTP turn is still pending.
-    astra.wait_for_since(
-        open_offset,
-        "Main conversation · Transcript",
-        Duration::from_secs(5),
-    );
-    astra.wait_for_since(open_offset, "successfully.", Duration::from_secs(10));
+    astra.wait_for("Main conversation · Transcript", Duration::from_secs(5));
+    astra.wait_for("successfully.", Duration::from_secs(10));
 
-    let close_offset = astra.output_len();
     astra.write(&[0x0f]);
-    astra.wait_for_since(close_offset, "Enter send", Duration::from_secs(10));
+    astra.wait_for("Enter send", Duration::from_secs(10));
     astra.write(b"/exit\r");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
@@ -410,18 +400,12 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
     astra.write(b"\r");
     astra.wait_for("wrote the requested file", Duration::from_secs(10));
 
-    let open_offset = astra.output_len();
     astra.write(&[0x0f]); // Ctrl+O after the compact view observed the tool.
-    astra.wait_for_since(
-        open_offset,
-        "Main conversation · Transcript",
-        Duration::from_secs(5),
-    );
-    astra.wait_for_since(open_offset, "Ran Write file", Duration::from_secs(5));
+    astra.wait_for("Main conversation · Transcript", Duration::from_secs(5));
+    astra.wait_for("Ran Write file", Duration::from_secs(5));
 
-    let close_offset = astra.output_len();
     astra.write(&[0x0f]);
-    astra.wait_for_since(close_offset, "Enter send", Duration::from_secs(5));
+    astra.wait_for("Enter send", Duration::from_secs(5));
     astra.write(b"/exit\r");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
@@ -445,22 +429,12 @@ async fn ctrl_o_round_trip_preserves_a_live_tool_approval() {
     astra.write(b"request_a_write_and_wait_for_my_approval\r");
     astra.wait_for("Approval · Write File", Duration::from_secs(10));
 
-    let transcript_offset = astra.output_len();
     astra.write(&[0x0f]); // Ctrl+O while approval owns the bottom pane.
-    astra.wait_for_since(
-        transcript_offset,
-        "Main conversation · Transcript",
-        Duration::from_secs(5),
-    );
-    astra.wait_for_since(transcript_offset, "write_file", Duration::from_secs(5));
+    astra.wait_for("Main conversation · Transcript", Duration::from_secs(5));
+    astra.wait_for("write_file", Duration::from_secs(5));
 
-    let approval_offset = astra.output_len();
     astra.write(&[0x0f]);
-    astra.wait_for_since(
-        approval_offset,
-        "Approval · Write File",
-        Duration::from_secs(5),
-    );
+    astra.wait_for("Approval · Write File", Duration::from_secs(5));
     astra.write(b"\r"); // The focused Yes action approves exactly this request.
     astra.wait_for("wrote the requested file", Duration::from_secs(10));
 
@@ -470,7 +444,7 @@ async fn ctrl_o_round_trip_preserves_a_live_tool_approval() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ctrl_g_opens_a_real_live_child_transcript() {
+async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     let _journey = pty_journey_lock().lock().await;
     let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
         astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
@@ -485,21 +459,37 @@ async fn ctrl_g_opens_a_real_live_child_transcript() {
     astra.write(b"delegate_one_child_and_keep_it_observable\r");
     wait_for_agent_journey_child_request(&mock, &mut astra, Duration::from_secs(5)).await;
 
-    let monitor_offset = astra.output_len();
     astra.write(&[0x07]); // Ctrl+G while the child response is still pending.
-    astra.wait_for_since(monitor_offset, "Conversations", Duration::from_secs(5));
-    astra.wait_for_since(monitor_offset, "Mock child review", Duration::from_secs(5));
+    astra.wait_for("Conversations", Duration::from_secs(5));
+    astra.wait_for("Mock child review", Duration::from_secs(5));
 
-    let transcript_offset = astra.output_len();
     astra.write(b"1\r"); // Numeric selection addresses the first child, not the root tab.
-    astra.wait_for_since(transcript_offset, "Transcript", Duration::from_secs(5));
-    astra.wait_for_since(
-        transcript_offset,
-        "child_evidence_visible",
+    astra.wait_for("Transcript", Duration::from_secs(5));
+    astra.wait_for("child_evidence_visible", Duration::from_secs(10));
+
+    // Ctrl+O always focuses the retained root conversation without destroying
+    // the child workspace.
+    astra.write(&[0x0f]);
+    astra.wait_for(
+        "Parent synthesized the child evidence",
         Duration::from_secs(10),
     );
 
-    let return_offset = astra.output_len();
-    astra.write(&[0x07]); // Ctrl+G returns to the run navigator.
-    astra.wait_for_since(return_offset, "Conversations", Duration::from_secs(5));
+    // Completed children remain addressable from the same conversation
+    // navigator. Reopening must hydrate the stored transcript prefix rather
+    // than showing only events emitted after the view was opened.
+    astra.write(&[0x07]);
+    astra.wait_for("Conversations", Duration::from_secs(5));
+    astra.wait_for("Mock child review", Duration::from_secs(5));
+    astra.write(b"1\r");
+    astra.wait_for("Transcript", Duration::from_secs(5));
+    astra.wait_for("child_evidence_visible", Duration::from_secs(5));
+    assert_eq!(
+        mock.received_requests()
+            .iter()
+            .filter(|request| is_agent_journey_child_request(request))
+            .count(),
+        1,
+        "one canonical spawn result must advance the parent instead of repeating delegation"
+    );
 }

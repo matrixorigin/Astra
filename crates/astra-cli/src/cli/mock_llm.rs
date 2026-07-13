@@ -322,6 +322,26 @@ fn is_agent_journey_child_request(body: &Value) -> bool {
 }
 
 fn root_has_tool_result(body: &Value, tool_name: &str) -> bool {
+    // Tool results can be executed by a pre-resolved runtime binding, in
+    // which case their transport-level `name` is `pre_resolved`. The stable
+    // join is the tool_call_id emitted by the preceding assistant message,
+    // not a duplicated display name on the result envelope.
+    let matching_call_ids = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|message| {
+            message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|call| call.pointer("/function/name").and_then(Value::as_str) == Some(tool_name))
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .collect::<std::collections::HashSet<_>>();
+
     let callback_has_result = body
         .get("tool_results")
         .and_then(Value::as_array)
@@ -329,6 +349,10 @@ fn root_has_tool_result(body: &Value, tool_name: &str) -> bool {
             results.iter().any(|result| {
                 result.get("name").and_then(Value::as_str) == Some(tool_name)
                     || result.get("tool").and_then(Value::as_str) == Some(tool_name)
+                    || result
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|call_id| matching_call_ids.contains(call_id))
             })
         });
     if callback_has_result {
@@ -341,7 +365,11 @@ fn root_has_tool_result(body: &Value, tool_name: &str) -> bool {
         .flatten()
         .any(|message| {
             message.get("role").and_then(Value::as_str) == Some("tool")
-                && message.get("_tool_name").and_then(Value::as_str) == Some(tool_name)
+                && (message.get("_tool_name").and_then(Value::as_str) == Some(tool_name)
+                    || message
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|call_id| matching_call_ids.contains(call_id)))
         })
 }
 
@@ -651,6 +679,7 @@ mod tests {
     use super::{
         MockScenario, body_complete, body_fail, body_malformed_json, body_multi_turn,
         body_rate_limited, body_sse_chunk_split, body_text_only, body_tool_then_complete,
+        root_has_tool_result,
     };
     use serde_json::Value;
 
@@ -677,6 +706,36 @@ mod tests {
         assert!(completion.contains("text_done"));
         assert!(!completion.contains("tool_call_start"));
         assert!(completion.contains("\"type\":\"done\""));
+    }
+
+    #[test]
+    fn tool_result_identity_survives_pre_resolved_transport_names() {
+        let request = serde_json::json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-agent-1",
+                        "type": "function",
+                        "function": {"name": "agent", "arguments": "{}"}
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-agent-1",
+                    "_tool_name": "pre_resolved",
+                    "content": "result"
+                }
+            ],
+            "tool_results": [{
+                "tool_call_id": "call-agent-1",
+                "name": "pre_resolved",
+                "result": "result"
+            }]
+        });
+
+        assert!(root_has_tool_result(&request, "agent"));
+        assert!(!root_has_tool_result(&request, "tool_search"));
     }
 
     #[test]
