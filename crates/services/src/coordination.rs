@@ -108,7 +108,8 @@ pub fn agent_result_status_to_subrun_state(status: &str) -> SubRunState {
         AgentResultStatusKind::Completed | AgentResultStatusKind::Delegated => {
             SubRunState::Completed
         }
-        AgentResultStatusKind::Waiting | AgentResultStatusKind::Paused => SubRunState::Paused,
+        AgentResultStatusKind::Waiting => SubRunState::Waiting,
+        AgentResultStatusKind::Paused => SubRunState::Paused,
         AgentResultStatusKind::Cancelled => SubRunState::Cancelled,
         AgentResultStatusKind::VerificationFailed => SubRunState::VerificationFailed,
         AgentResultStatusKind::Failed
@@ -1364,7 +1365,7 @@ mod tests {
         assert!(make_unfinished("a2").is_unfinished());
         assert_eq!(
             agent_result_status_to_subrun_state(AGENT_RESULT_STATUS_WAITING),
-            SubRunState::Paused
+            SubRunState::Waiting
         );
         assert_eq!(
             agent_result_status_to_subrun_state(AGENT_RESULT_STATUS_VERIFICATION_FAILED),

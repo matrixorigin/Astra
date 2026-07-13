@@ -1072,7 +1072,8 @@ pub fn durable_run_status_blocks_session(status: &str, waiting_for: Option<&str>
 pub fn durable_run_status_to_subrun_state(status: &str) -> SubRunState {
     match durable_run_status_kind(status) {
         DurableRunStatusKind::Running => SubRunState::Running,
-        DurableRunStatusKind::Waiting | DurableRunStatusKind::Paused => SubRunState::Paused,
+        DurableRunStatusKind::Waiting => SubRunState::Waiting,
+        DurableRunStatusKind::Paused => SubRunState::Paused,
         DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated => SubRunState::Completed,
         DurableRunStatusKind::Failed | DurableRunStatusKind::Other => SubRunState::Failed,
         DurableRunStatusKind::Cancelled => SubRunState::Cancelled,
@@ -7535,7 +7536,7 @@ mod tests {
         assert!(!durable_run_status_blocks_session(STATUS_DELEGATED, None));
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_WAITING),
-            SubRunState::Paused
+            SubRunState::Waiting
         );
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_RUNNING),

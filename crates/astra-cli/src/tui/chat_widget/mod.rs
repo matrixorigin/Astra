@@ -3067,8 +3067,7 @@ impl ChatWidget {
             // distinct from model/tool activity.
             AgentLiveEventKind::Signal(
                 astra_turn_core::agent_live_event::AgentLiveSignal::AskUserPrompted { .. }
-                | astra_turn_core::agent_live_event::AgentLiveSignal::ApprovalRequired { .. }
-                | astra_turn_core::agent_live_event::AgentLiveSignal::WaitingForModel,
+                | astra_turn_core::agent_live_event::AgentLiveSignal::ApprovalRequired { .. },
             ) => AgentRunStatus::Waiting,
             AgentLiveEventKind::OutputDelta(_)
             | AgentLiveEventKind::ThinkingDelta(_)
@@ -3171,7 +3170,6 @@ impl ChatWidget {
                     signal,
                     astra_turn_core::agent_live_event::AgentLiveSignal::AskUserPrompted { .. }
                         | astra_turn_core::agent_live_event::AgentLiveSignal::ApprovalRequired { .. }
-                        | astra_turn_core::agent_live_event::AgentLiveSignal::WaitingForModel
                 )
             {
                 projection.set_attention_summary(Some(agent_live_signal_summary(signal)));
@@ -6034,6 +6032,31 @@ mod tests {
                 .is_none(),
             "a resumed run must not retain an old attention reason"
         );
+    }
+
+    #[test]
+    fn waiting_for_model_is_activity_without_user_attention() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal,
+        };
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-model".into(),
+            agent_id: "reviewer@model".into(),
+            kind: AgentLiveEventKind::Signal(AgentLiveSignal::WaitingForModel),
+        })));
+
+        let rows = widget.agent_monitor_snapshot(0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Running);
+        assert!(rows[0].attention_summary.is_none());
+        assert!(matches!(
+            widget
+                .agent_run_cell("reviewer@model")
+                .map(|cell| cell.status),
+            Some(crate::tui::history_cell::task::TaskStatus::Running)
+        ));
     }
 
     #[test]

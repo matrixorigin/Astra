@@ -1118,7 +1118,10 @@ impl DelegationTracker {
             return;
         }
 
-        debug_assert_eq!(result_state, SubRunState::Paused);
+        debug_assert!(matches!(
+            result_state,
+            SubRunState::Waiting | SubRunState::Paused
+        ));
         self.set_sub_run_result_state(run_id, result_state, error, output_preview, false)
             .await;
     }
@@ -1208,6 +1211,9 @@ impl DelegationTracker {
                             total_tool_calls: 0,
                             total_tokens: (0, 0),
                             duration_ms: 0,
+                        },
+                        SubRunState::Waiting => ProgressEventType::Waiting {
+                            reason: error.unwrap_or("external_dependency").to_string(),
                         },
                         SubRunState::Cancelled => ProgressEventType::Cancelled {
                             reason: format!("Sub-run {} cancelled", run_id),
@@ -7025,18 +7031,17 @@ mod tests {
             Some("sub-1")
         );
         assert_eq!(tracker.get_depth("sub-2").await, Some(2));
-        assert_eq!(
-            tracker.get_sub_run_state("sub-3").await,
-            Some(SubRunState::Paused)
-        );
-
         // Paused sub-run gets pause flag
         let flag = tracker.get_pause_flag("sub-2").await;
         assert!(flag.is_some());
         assert!(flag.unwrap().load(Ordering::SeqCst)); // paused = true
 
-        // Waiting sub-run maps to paused tracker state but does not recreate
-        // a cooperative pause flag.
+        // Waiting is a distinct recoverable state and does not recreate a
+        // cooperative pause flag.
+        assert_eq!(
+            tracker.get_sub_run_state("sub-3").await,
+            Some(SubRunState::Waiting)
+        );
         assert!(tracker.get_pause_flag("sub-3").await.is_none());
 
         // Completed sub-run has no pause flag

@@ -599,8 +599,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         // a short error that points the user at the two valid forms.
         "/context" => {
             let args_trim = args.trim();
-            if let Some(rest) = args_trim.strip_prefix("dump") {
-                return handle_context_dump(rest.trim(), ctx);
+            if let Some(path) = context_dump_argument(args_trim) {
+                return handle_context_dump(path, ctx);
             }
             if !args_trim.is_empty() {
                 ctx.show_info(CONTEXT_USAGE_MESSAGE.into());
@@ -857,7 +857,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
             let model = ctx.state.model.as_deref().unwrap_or("<unset>");
             let session = ctx.state.session_id.as_deref().unwrap_or("<none>");
-            let perm = format!("{:?}", ctx.state.perm_manager.mode());
+            let perm = ctx.state.perm_manager.mode().chip_text().to_owned();
             let skills = ctx.state.unified_skill_registry.len();
             let version = env!("CARGO_PKG_VERSION");
             let pending = ctx
@@ -2470,6 +2470,13 @@ fn keyboard_shortcut_pairs() -> Vec<(&'static str, String)> {
 
 const CONTEXT_USAGE_MESSAGE: &str = "Usage: /context — open the context panel\n       /context dump [path] — write a JSON snapshot.";
 
+/// Return the optional dump path only when `dump` is the complete first token.
+/// Prefixes such as `dumpster` are ordinary invalid `/context` arguments.
+fn context_dump_argument(args: &str) -> Option<&str> {
+    let mut tokens = args.splitn(2, char::is_whitespace);
+    (tokens.next() == Some("dump")).then(|| tokens.next().unwrap_or_default().trim())
+}
+
 // ── /model subcommand helpers ───────────────────────────────────
 
 pub(crate) const MODEL_PICKER_FOOTER_HINT: &str =
@@ -3283,9 +3290,9 @@ mod routing_tests {
     use super::{
         CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, HelpCommandRoute, HistoryCommandRoute,
         MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute,
-        SkillCommandRoute, config_command_route, context_breakdown_for_panel, help_command_route,
-        history_command_route, is_model_picker_request, keyboard_shortcut_pairs,
-        memory_command_route, skill_command_route,
+        SkillCommandRoute, config_command_route, context_breakdown_for_panel,
+        context_dump_argument, help_command_route, history_command_route, is_model_picker_request,
+        keyboard_shortcut_pairs, memory_command_route, skill_command_route,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::tui::context_panel::{
@@ -3414,6 +3421,18 @@ mod routing_tests {
             CONTEXT_USAGE_MESSAGE,
             "Usage: /context — open the context panel\n       /context dump [path] — write a JSON snapshot."
         );
+    }
+
+    #[test]
+    fn context_dump_requires_an_exact_command_token() {
+        assert_eq!(context_dump_argument("dump"), Some(""));
+        assert_eq!(
+            context_dump_argument("dump   snapshot.json"),
+            Some("snapshot.json")
+        );
+        assert_eq!(context_dump_argument("dumpster"), None);
+        assert_eq!(context_dump_argument("dumpster output.json"), None);
+        assert_eq!(context_dump_argument(""), None);
     }
 
     #[test]
