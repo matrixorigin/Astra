@@ -220,7 +220,9 @@ fn update_index(dir: &Path, checkpoint: &Checkpoint) -> std::io::Result<()> {
         }
         Err(error) => return Err(error),
     };
-    content.push_str(&entry);
+    if !content.lines().any(|line| line == entry.trim_end()) {
+        content.push_str(&entry);
+    }
     // Atomic write: tmp file + rename to prevent corruption on crash.
     let tmp_path = index_path.with_extension("md.tmp");
     std::fs::write(&tmp_path, &content)?;
@@ -433,6 +435,30 @@ mod tests {
             read_checkpoint_index(&session_id).unwrap().is_empty(),
             "checkpoint index must not reference a removed checkpoint"
         );
+    }
+
+    #[test]
+    fn repeated_checkpoint_write_keeps_one_index_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let _guard = crate::session_journal::JournalDirGuard::new(&sessions);
+        let session_id = format!("test-cp-idempotent-{}", uuid::Uuid::new_v4());
+        let cp = Checkpoint {
+            number: 1,
+            turn: 5,
+            title: "First checkpoint".to_string(),
+            summary: "Did some stuff.".to_string(),
+            tools_used: vec!["bash".to_string()],
+            total_tokens: 1000,
+            had_stalls: false,
+            error_count: 0,
+            contract_state_json: None,
+        };
+
+        write_checkpoint(&session_id, &cp).unwrap();
+        write_checkpoint(&session_id, &cp).unwrap();
+
+        assert_eq!(read_checkpoint_index(&session_id).unwrap().len(), 1);
     }
 
     #[test]

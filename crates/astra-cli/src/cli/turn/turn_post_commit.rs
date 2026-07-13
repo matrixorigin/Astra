@@ -17,6 +17,8 @@ use crate::cli::stream::streaming_types::StreamResult;
 /// turn into cancellation: dropping an in-flight projection creates an
 /// avoidable continuation gap on the next resume.
 const PLAN_MIRROR_SYNC_BUDGET: Duration = Duration::from_millis(750);
+const SIDECAR_PROJECTION_MAX_ATTEMPTS: usize = 3;
+const SIDECAR_PROJECTION_RETRY_BASE: Duration = Duration::from_millis(25);
 
 struct PlanMirrorRefresh {
     api: astra_thin_client::ThinClient,
@@ -144,10 +146,26 @@ pub(crate) async fn execute_turn_post_commit_job(
 ) -> TurnPostCommitCompletion {
     let mut errors = Vec::new();
     if let Some(sidecars) = job.deferred_sidecars.take() {
-        match tokio::task::spawn_blocking(move || sidecars.execute()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => errors.push(error),
-            Err(error) => errors.push(format!("post-commit sidecar worker failed: {error}")),
+        let sidecars = std::sync::Arc::new(sidecars);
+        for attempt in 0..SIDECAR_PROJECTION_MAX_ATTEMPTS {
+            let work = std::sync::Arc::clone(&sidecars);
+            match tokio::task::spawn_blocking(move || work.execute(attempt > 0)).await {
+                Ok(Ok(())) => break,
+                Ok(Err(error))
+                    if error.is_retryable() && attempt + 1 < SIDECAR_PROJECTION_MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(SIDECAR_PROJECTION_RETRY_BASE * 2u32.pow(attempt as u32))
+                        .await;
+                }
+                Ok(Err(error)) => {
+                    errors.push(error.to_string());
+                    break;
+                }
+                Err(error) => {
+                    errors.push(format!("post-commit sidecar worker failed: {error}"));
+                    break;
+                }
+            }
         }
     }
 

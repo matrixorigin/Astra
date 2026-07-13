@@ -751,6 +751,9 @@ impl RunMutationRecord {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunUserIntentData {
+    /// Stable idempotency identity supplied by the caller. Delivery and input
+    /// remain separate typed fields; identity must never be reconstructed by
+    /// concatenating display text with a magic separator.
     pub intent_id: String,
     pub delivery: UserIntentDelivery,
     pub input: serde_json::Value,
@@ -1502,8 +1505,12 @@ pub trait RunStateStore: Send + Sync {
 
 /// In-memory run state store for tests and single-process deployments.
 pub struct InMemoryRunStateStore {
-    runs: tokio::sync::RwLock<std::collections::HashMap<String, DurableRunRecord>>,
+    // Lock-order invariant for operations that need both maps:
+    // `execution_slots` must be acquired before `runs`. Single-map operations
+    // must release their guard before acquiring the other map. Keeping the
+    // order adjacent to the fields makes future transitions auditable.
     execution_slots: tokio::sync::RwLock<std::collections::HashMap<(String, String), String>>,
+    runs: tokio::sync::RwLock<std::collections::HashMap<String, DurableRunRecord>>,
     checkpoints:
         tokio::sync::RwLock<std::collections::HashMap<String, Vec<DurableRunCheckpointRecord>>>,
     projections:
@@ -1517,8 +1524,8 @@ impl InMemoryRunStateStore {
 
     pub fn new() -> Self {
         Self {
-            runs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             execution_slots: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            runs: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             checkpoints: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             projections: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }

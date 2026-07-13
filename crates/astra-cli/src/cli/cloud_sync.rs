@@ -20,7 +20,7 @@ use astra_services::{
 };
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -41,6 +41,8 @@ const SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const SYNC_OUTBOX_JOURNAL_INGEST_QUEUE_CAPACITY: usize = 128;
 const SYNC_OUTBOX_JOURNAL_INGEST_BATCH_WINDOW: Duration = Duration::from_millis(25);
 const SYNC_OUTBOX_JOURNAL_INGEST_RETRY_DELAY: Duration = Duration::from_millis(250);
+const SYNC_OUTBOX_JOURNAL_INGEST_MAX_RETRY_DELAY: Duration = Duration::from_secs(4);
+const SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES: u32 = 5;
 static SYNC_OUTBOX_DRAIN_OWNER: AtomicU64 = AtomicU64::new(0);
 static SYNC_OUTBOX_NEXT_DRAIN_OWNER: AtomicU64 = AtomicU64::new(1);
 static SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
@@ -53,6 +55,40 @@ static SYNC_OUTBOX_JOURNAL_INGEST_DISPATCHER: LazyLock<Mutex<Option<mpsc::Sender
     LazyLock::new(|| Mutex::new(None));
 static SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW: LazyLock<Mutex<BTreeSet<String>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalIngestFailureDisposition {
+    RetryAfter(Duration),
+    QuarantineUntilNewHint,
+}
+
+#[derive(Default)]
+struct JournalIngestRetryBudget {
+    consecutive_failures: BTreeMap<String, u32>,
+}
+
+impl JournalIngestRetryBudget {
+    fn observe_success(&mut self, session_id: &str) {
+        self.consecutive_failures.remove(session_id);
+    }
+
+    fn observe_failure(&mut self, session_id: &str) -> JournalIngestFailureDisposition {
+        let failures = self
+            .consecutive_failures
+            .entry(session_id.to_string())
+            .and_modify(|failures| *failures = failures.saturating_add(1))
+            .or_insert(1);
+        if *failures >= SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES {
+            self.consecutive_failures.remove(session_id);
+            return JournalIngestFailureDisposition::QuarantineUntilNewHint;
+        }
+        let multiplier = 2u32.pow(failures.saturating_sub(1));
+        JournalIngestFailureDisposition::RetryAfter(std::cmp::min(
+            SYNC_OUTBOX_JOURNAL_INGEST_RETRY_DELAY * multiplier,
+            SYNC_OUTBOX_JOURNAL_INGEST_MAX_RETRY_DELAY,
+        ))
+    }
+}
 
 struct SyncOutboxDrainScheduleGuard {
     owner: u64,
@@ -208,13 +244,40 @@ fn journal_ingest_sender(handle: &tokio::runtime::Handle) -> mpsc::Sender<String
 
 async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<String>) {
     let mut pending_sessions = BTreeSet::new();
+    let mut delayed_sessions = BTreeMap::<String, tokio::time::Instant>::new();
+    let mut retry_budget = JournalIngestRetryBudget::default();
     loop {
+        let now = tokio::time::Instant::now();
+        let ready_after_backoff = delayed_sessions
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in ready_after_backoff {
+            delayed_sessions.remove(&session_id);
+            pending_sessions.insert(session_id);
+        }
+
         if pending_sessions.is_empty() {
-            match receiver.recv().await {
-                Some(session_id) => {
-                    pending_sessions.insert(session_id);
+            if let Some(next_retry) = delayed_sessions.values().min().copied() {
+                tokio::select! {
+                    session_id = receiver.recv() => match session_id {
+                        Some(session_id) => {
+                            if !delayed_sessions.contains_key(&session_id) {
+                                pending_sessions.insert(session_id);
+                            }
+                        }
+                        None => break,
+                    },
+                    _ = tokio::time::sleep_until(next_retry) => continue,
                 }
-                None => break,
+            } else {
+                match receiver.recv().await {
+                    Some(session_id) => {
+                        pending_sessions.insert(session_id);
+                    }
+                    None => break,
+                }
             }
         }
 
@@ -224,40 +287,53 @@ async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<Stri
             tokio::select! {
                 session_id = receiver.recv() => match session_id {
                     Some(session_id) => {
-                        pending_sessions.insert(session_id);
+                        if !delayed_sessions.contains_key(&session_id) {
+                            pending_sessions.insert(session_id);
+                        }
                     }
                     None => break,
                 },
                 _ = &mut deadline => break,
             }
         }
-        pending_sessions.extend(std::mem::take(&mut *recover_mutex_lock(
+        for session_id in std::mem::take(&mut *recover_mutex_lock(
             &SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW,
-        )));
+        )) {
+            if !delayed_sessions.contains_key(&session_id) {
+                pending_sessions.insert(session_id);
+            }
+        }
 
         let sessions = std::mem::take(&mut pending_sessions);
-        let mut retry_needed = false;
         for session_id in sessions {
             match reconcile_sync_outbox_journal(&session_id).await {
                 Ok(projected) => {
+                    retry_budget.observe_success(&session_id);
                     if projected {
                         schedule_sync_outbox_drain();
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "astra_cli::cloud_sync",
-                        session_id,
-                        ?error,
-                        "journal-to-outbox projection failed; keeping source queued for retry"
-                    );
-                    pending_sessions.insert(session_id);
-                    retry_needed = true;
-                }
+                Err(error) => match retry_budget.observe_failure(&session_id) {
+                    JournalIngestFailureDisposition::RetryAfter(delay) => {
+                        tracing::warn!(
+                            target: "astra_cli::cloud_sync",
+                            session_id,
+                            ?error,
+                            retry_after_ms = delay.as_millis(),
+                            "journal-to-outbox projection failed; retry remains bounded"
+                        );
+                        delayed_sessions.insert(session_id, tokio::time::Instant::now() + delay);
+                    }
+                    JournalIngestFailureDisposition::QuarantineUntilNewHint => {
+                        tracing::error!(
+                            target: "astra_cli::cloud_sync",
+                            session_id,
+                            ?error,
+                            "journal-to-outbox projection exhausted its retry budget; canonical journal remains durable and a new journal hint or process recovery will retry"
+                        );
+                    }
+                },
             }
-        }
-        if retry_needed {
-            tokio::time::sleep(SYNC_OUTBOX_JOURNAL_INGEST_RETRY_DELAY).await;
         }
     }
 }
@@ -1092,9 +1168,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CloudPullResult, SyncOutboxDrainReport, claim_sync_outbox_retry_wake_deadline,
-        cloud_pull_warrants_sync_marker, next_sync_outbox_drain_delay,
-        reconcile_sync_outbox_journal, record_settlement_result,
+        CloudPullResult, JournalIngestFailureDisposition, JournalIngestRetryBudget,
+        SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES, SyncOutboxDrainReport,
+        claim_sync_outbox_retry_wake_deadline, cloud_pull_warrants_sync_marker,
+        next_sync_outbox_drain_delay, reconcile_sync_outbox_journal, record_settlement_result,
         release_sync_outbox_drain_schedule, release_sync_outbox_retry_wake_schedule,
         run_sync_outbox_io, schedule_sync_outbox_journal_ingestion,
         should_append_cloud_pull_journal, try_claim_sync_outbox_drain_schedule,
@@ -1102,6 +1179,30 @@ mod tests {
     use astra_services::session_journal::{JournalEvent, JournalWriter, ProcessJournalDirGuard};
     use astra_services::{SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore};
     use fs2::FileExt;
+
+    #[test]
+    fn journal_ingest_retry_budget_quarantines_and_success_resets() {
+        let mut budget = JournalIngestRetryBudget::default();
+        for _ in 1..SYNC_OUTBOX_JOURNAL_INGEST_MAX_CONSECUTIVE_FAILURES {
+            assert!(matches!(
+                budget.observe_failure("session-a"),
+                JournalIngestFailureDisposition::RetryAfter(_)
+            ));
+        }
+        assert_eq!(
+            budget.observe_failure("session-a"),
+            JournalIngestFailureDisposition::QuarantineUntilNewHint
+        );
+        assert!(matches!(
+            budget.observe_failure("session-a"),
+            JournalIngestFailureDisposition::RetryAfter(_)
+        ));
+        budget.observe_success("session-a");
+        assert!(matches!(
+            budget.observe_failure("session-a"),
+            JournalIngestFailureDisposition::RetryAfter(_)
+        ));
+    }
 
     #[test]
     fn cloud_pull_result_default_not_reachable() {

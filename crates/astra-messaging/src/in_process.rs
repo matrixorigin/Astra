@@ -202,9 +202,8 @@ impl MessageTransport for InProcessTransport {
             .read()
             .await
             .iter()
-            .filter_map(|(address, member_delegation)| {
-                (member_delegation == delegation_id).then(|| address.clone())
-            })
+            .filter(|(_, member_delegation)| *member_delegation == delegation_id)
+            .map(|(address, _)| address.clone())
             .collect::<Vec<_>>();
         agents.sort_by(|left, right| {
             left.agent_id

@@ -34,7 +34,7 @@ pub(crate) fn apply_turn_success(
 ) {
     let primary = apply_turn_success_primary_sync(state, profile, line, result, turn_start);
     if let Some(sidecars) = primary.deferred_sidecars {
-        let _ = sidecars.execute();
+        let _ = sidecars.execute(false);
     }
 }
 
@@ -458,8 +458,8 @@ fn apply_turn_success_sync(
     let primary = apply_turn_success_primary_sync(state, profile, line, result, turn_start);
     let outcome = primary.outcome.clone();
     if let Some(sidecars) = primary.deferred_sidecars {
-        if let Err(error) = sidecars.execute() {
-            state.session_persistence_error = Some(error);
+        if let Err(error) = sidecars.execute(false) {
+            state.session_persistence_error = Some(error.to_string());
         }
     }
     outcome

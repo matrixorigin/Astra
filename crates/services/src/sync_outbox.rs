@@ -643,9 +643,11 @@ impl SyncOutboxStore {
         let result = f(&mut state);
         let unlock_result = lock.unlock();
 
-        // If the operation succeeded, return success even if unlock fails.
-        // The operation already modified in-memory state and attempted disk write.
-        // Unlock failure is a resource leak, not a transaction failure.
+        // An explicit unlock failure is operational evidence, not a reason to
+        // replay an already-committed transaction. The file handle is dropped
+        // before this function returns, which releases the OS lock on every
+        // supported platform (including Windows); surface the anomaly in logs
+        // while preserving the authoritative operation result.
         match result {
             Ok(value) => {
                 if let Err(unlock_err) = unlock_result {

@@ -85,11 +85,40 @@ pub(crate) struct TurnCommitOutcome {
     pub(crate) persistence_error: Option<String>,
 }
 
+#[derive(Debug)]
+pub(crate) enum DeferredTurnSidecarError {
+    Retryable(String),
+    Permanent(String),
+}
+
+impl DeferredTurnSidecarError {
+    fn retryable(message: impl Into<String>) -> Self {
+        Self::Retryable(message.into())
+    }
+
+    fn permanent(message: impl Into<String>) -> Self {
+        Self::Permanent(message.into())
+    }
+
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable(_))
+    }
+}
+
+impl std::fmt::Display for DeferredTurnSidecarError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(message) | Self::Permanent(message) => formatter.write_str(message),
+        }
+    }
+}
+
 /// A sidecar projection is deliberately separate from the journal turn
-/// boundary. It owns only copies of data that are already represented by the
-/// primary event, so it can be serialized by the UI's post-commit queue
-/// without borrowing or delaying the next live turn.
+/// boundary. It owns derived views plus immutable runtime evidence captured at
+/// that boundary, so it can be serialized by the UI's post-commit queue
+/// without borrowing mutable session state or delaying the next live turn.
 pub(crate) struct DeferredTurnSidecarWork {
+    projection_id: String,
     session_id: String,
     model: String,
     turn: u32,
@@ -104,6 +133,71 @@ pub(crate) struct DeferredTurnSidecarWork {
     turn_observability_events: Vec<session_journal::JournalEvent>,
     tools_used: Vec<String>,
     journal_dir_override: Option<std::path::PathBuf>,
+}
+
+const SIDECAR_PROJECTION_ID_KEY: &str = "sidecar_projection_id";
+const SIDECAR_PROJECTION_INDEX_KEY: &str = "sidecar_projection_index";
+
+fn tag_sidecar_projection_events(
+    events: &mut [session_journal::JournalEvent],
+    projection_id: &str,
+) {
+    fn insert_identity(
+        metadata: &mut serde_json::Map<String, serde_json::Value>,
+        projection_id: &str,
+        index: usize,
+    ) {
+        metadata.insert(
+            SIDECAR_PROJECTION_ID_KEY.into(),
+            serde_json::Value::String(projection_id.to_string()),
+        );
+        metadata.insert(
+            SIDECAR_PROJECTION_INDEX_KEY.into(),
+            serde_json::json!(index),
+        );
+    }
+
+    for (index, event) in events.iter_mut().enumerate() {
+        let metadata = event
+            .metadata
+            .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        match metadata {
+            serde_json::Value::Object(metadata) => {
+                insert_identity(metadata, projection_id, index);
+            }
+            metadata => {
+                let previous = std::mem::take(metadata);
+                let mut replacement = serde_json::Map::new();
+                replacement.insert("previous_metadata".into(), previous);
+                insert_identity(&mut replacement, projection_id, index);
+                *metadata = serde_json::Value::Object(replacement);
+            }
+        };
+    }
+}
+
+fn completed_sidecar_projection_indices(
+    session_id: &str,
+    projection_id: &str,
+) -> std::io::Result<std::collections::HashSet<usize>> {
+    Ok(session_journal::read_journal(session_id)?
+        .into_iter()
+        .filter_map(|event| {
+            let metadata = event.metadata?;
+            let metadata = metadata.as_object()?;
+            (metadata
+                .get(SIDECAR_PROJECTION_ID_KEY)
+                .and_then(serde_json::Value::as_str)
+                == Some(projection_id))
+            .then(|| {
+                metadata
+                    .get(SIDECAR_PROJECTION_INDEX_KEY)
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+            })
+            .flatten()
+        })
+        .collect())
 }
 
 impl DeferredTurnSidecarWork {
@@ -129,6 +223,7 @@ impl DeferredTurnSidecarWork {
         extend_runtime_sidecar_events(&mut sidecar_events, state, line, result, learning_snap);
 
         Some(Self {
+            projection_id: format!("turn-sidecar:{session_id}:{}", state.turn),
             session_id,
             model: astra_core::model_override::normalize_model_override(state.model.as_deref())
                 .unwrap_or("unknown")
@@ -154,12 +249,13 @@ impl DeferredTurnSidecarWork {
     /// Executes all derived local persistence after the primary journal event
     /// is durable. Callers must serialize work for a session to preserve the
     /// workspace/checkpoint order.
-    pub(crate) fn execute(mut self) -> Result<(), String> {
+    pub(crate) fn execute(&self, reconcile_existing: bool) -> Result<(), DeferredTurnSidecarError> {
         let _journal_dir_guard = self
             .journal_dir_override
             .as_deref()
             .map(session_journal::JournalDirGuard::new);
         let mut projection_errors = Vec::new();
+        let mut sidecar_events = self.sidecar_events.clone();
         let mut workspace =
             match astra_services::session_workspace::read_workspace_optional(&self.session_id) {
                 Ok(Some(workspace)) => workspace,
@@ -190,19 +286,25 @@ impl DeferredTurnSidecarWork {
             .max(self.total_cache_creation_tokens);
         workspace.status = "active".to_string();
         workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        workspace.permission_mode = Some(self.permission_mode);
-        workspace.discovered_skills = self.discovered_skills;
-        workspace.contract_json = self.contract_state_json;
+        workspace.permission_mode = Some(self.permission_mode.clone());
+        workspace.discovered_skills = self.discovered_skills.clone();
+        workspace.contract_json = self.contract_state_json.clone();
 
         let mut written_checkpoint = None;
         if astra_services::session_checkpoint::should_checkpoint(
-            workspace.turn_count,
+            self.turn,
             astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
         ) {
+            let existing_checkpoint = workspace
+                .checkpoints
+                .iter()
+                .position(|turn| *turn == self.turn);
             let checkpoint = astra_services::session_checkpoint::Checkpoint {
-                number: workspace.checkpoints.len() as u32 + 1,
-                turn: workspace.turn_count,
-                title: format!("Turn {} checkpoint", workspace.turn_count),
+                number: existing_checkpoint
+                    .map(|index| index as u32 + 1)
+                    .unwrap_or(workspace.checkpoints.len() as u32 + 1),
+                turn: self.turn,
+                title: format!("Turn {} checkpoint", self.turn),
                 summary: format!(
                     "Accumulated {} tokens ({} in, {} out). Tools: {}",
                     workspace.total_tokens_in + workspace.total_tokens_out,
@@ -216,24 +318,32 @@ impl DeferredTurnSidecarWork {
                 error_count: 0,
                 contract_state_json: workspace.contract_json.clone(),
             };
-            match astra_services::session_checkpoint::write_checkpoint(
-                &self.session_id,
-                &checkpoint,
-            ) {
-                Ok(_) => {
-                    workspace.record_checkpoint();
-                    self.sidecar_events
-                        .push(session_journal::JournalEvent::checkpoint(
+            if existing_checkpoint.is_some() {
+                sidecar_events.push(session_journal::JournalEvent::checkpoint(
+                    Some(&self.session_id),
+                    self.turn,
+                    &checkpoint.summary,
+                    checkpoint.total_tokens,
+                    checkpoint.tools_used.len(),
+                ));
+            } else {
+                match astra_services::session_checkpoint::write_checkpoint(
+                    &self.session_id,
+                    &checkpoint,
+                ) {
+                    Ok(_) => {
+                        workspace.record_checkpoint();
+                        sidecar_events.push(session_journal::JournalEvent::checkpoint(
                             Some(&self.session_id),
-                            workspace.turn_count,
+                            self.turn,
                             &checkpoint.summary,
                             checkpoint.total_tokens,
                             checkpoint.tools_used.len(),
                         ));
-                    written_checkpoint = Some(checkpoint);
-                }
-                Err(error) => {
-                    projection_errors.push(format!("failed to write session checkpoint: {error}"))
+                        written_checkpoint = Some(checkpoint);
+                    }
+                    Err(error) => projection_errors
+                        .push(format!("failed to write session checkpoint: {error}")),
                 }
             }
         }
@@ -253,7 +363,9 @@ impl DeferredTurnSidecarWork {
                     "failed to remove checkpoint after workspace write failure"
                 );
             }
-            return Err(format!("failed to write workspace metadata: {error}"));
+            return Err(DeferredTurnSidecarError::retryable(format!(
+                "failed to write workspace metadata: {error}"
+            )));
         }
 
         let pipeline_events = match build_bridge_pipeline_journal_events(
@@ -276,18 +388,36 @@ impl DeferredTurnSidecarWork {
                         "failed to persist deferred pipeline projection error in workspace"
                     );
                 }
-                return Err(error);
+                return Err(DeferredTurnSidecarError::permanent(error));
             }
         };
-        self.sidecar_events.extend(self.turn_observability_events);
-        self.sidecar_events.extend(pipeline_events);
-        if self.sidecar_events.is_empty() {
-            return Ok(());
+        sidecar_events.extend(self.turn_observability_events.clone());
+        sidecar_events.extend(pipeline_events);
+        tag_sidecar_projection_events(&mut sidecar_events, &self.projection_id);
+        if reconcile_existing {
+            let completed =
+                completed_sidecar_projection_indices(&self.session_id, &self.projection_id)
+                    .map_err(|error| {
+                        DeferredTurnSidecarError::retryable(format!(
+                            "failed to reconcile turn sidecar projection: {error}"
+                        ))
+                    })?;
+            sidecar_events.retain(|event| {
+                event
+                    .metadata
+                    .as_ref()
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|metadata| metadata.get(SIDECAR_PROJECTION_INDEX_KEY))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .is_none_or(|index| !completed.contains(&index))
+            });
         }
 
-        let journal = session_journal::JournalWriter::new(&self.session_id)
-            .map_err(|error| format!("failed to open sidecar journal: {error}"))?;
-        if let Err(error) = journal.append_bulk(&self.sidecar_events) {
+        let journal = session_journal::JournalWriter::new(&self.session_id).map_err(|error| {
+            DeferredTurnSidecarError::retryable(format!("failed to open sidecar journal: {error}"))
+        })?;
+        if let Err(error) = journal.append_bulk(&sidecar_events) {
             workspace.last_persistence_error =
                 Some(format!("failed to append turn sidecar events: {error}"));
             if let Err(rewrite_error) =
@@ -299,13 +429,17 @@ impl DeferredTurnSidecarWork {
                     "failed to persist deferred sidecar error in workspace"
                 );
             }
-            return Err(format!("failed to append turn sidecar events: {error}"));
+            return Err(DeferredTurnSidecarError::retryable(format!(
+                "failed to append turn sidecar events: {error}"
+            )));
         }
-        enqueue_ingestion_events(&self.sidecar_events);
+        enqueue_ingestion_events(&sidecar_events);
         if projection_errors.is_empty() {
             Ok(())
         } else {
-            Err(projection_errors.join("; "))
+            Err(DeferredTurnSidecarError::retryable(
+                projection_errors.join("; "),
+            ))
         }
     }
 }
@@ -579,9 +713,9 @@ mod tests {
         let primary = commit_primary_turn(state, line, result, learning, turn_start);
         let outcome = primary.outcome.clone();
         if let Some(sidecars) = primary.deferred_sidecars
-            && let Err(error) = sidecars.execute()
+            && let Err(error) = sidecars.execute(false)
         {
-            state.session_persistence_error = Some(error);
+            state.session_persistence_error = Some(error.to_string());
         }
         outcome
     }
@@ -624,13 +758,65 @@ mod tests {
         primary
             .deferred_sidecars
             .expect("durable turn should enqueue derived projections")
-            .execute()
+            .execute(false)
             .unwrap();
         let events = session_journal::read_journal(&sid).unwrap();
         assert!(
             events
                 .iter()
                 .any(|event| event.event_type == session_journal::JournalEventType::TurnEvaluation)
+        );
+    }
+
+    #[test]
+    fn sidecar_reconciliation_is_idempotent_after_ambiguous_success() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("sidecar-reconcile-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            turn: astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("durable answer");
+        let learning = analyze_chat_turn_learning("inspect", state.turn, &[], &result);
+        let primary = commit_primary_turn(
+            &mut state,
+            "inspect",
+            &mut result,
+            &learning,
+            Instant::now(),
+        );
+        let sidecars = primary.deferred_sidecars.expect("sidecar work");
+
+        sidecars.execute(false).unwrap();
+        sidecars.execute(true).unwrap();
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == session_journal::JournalEventType::TurnEvaluation
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == session_journal::JournalEventType::Checkpoint)
+                .count(),
+            1
+        );
+        let workspace = astra_services::session_workspace::read_workspace(&sid).unwrap();
+        assert_eq!(workspace.checkpoints, vec![state.turn]);
+        assert_eq!(
+            astra_services::session_checkpoint::read_checkpoint_index(&sid)
+                .unwrap()
+                .len(),
+            1
         );
     }
 

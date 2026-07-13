@@ -358,7 +358,7 @@ impl AgenticLoopHost for SubRunHost {
                     run_id: run_id.clone(),
                     router: mailbox.router(),
                     metrics: state.messaging.metrics.clone(),
-                    delegation_id: mailbox.delegation_id.clone().or_else(|| Some(run_id)),
+                    delegation_id: mailbox.delegation_id.clone().or(Some(run_id)),
                 }
             }));
 
