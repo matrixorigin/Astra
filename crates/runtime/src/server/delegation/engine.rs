@@ -1291,8 +1291,12 @@ impl DelegationTracker {
     /// progress entries, pause flags, parent mappings, and delegation records.
     /// Call after the delegation lifecycle is fully complete.
     pub async fn cleanup_delegation(&self, delegation_id: &str) -> Result<(), String> {
-        // Gather run_ids before cleanup
-        let records = self.get_sub_runs(delegation_id).await;
+        // Acquire the authoritative delegation map before checking terminality.
+        // `record_sub_run` follows the same delegations → parents order, so a
+        // concurrent child cannot appear between validation and cleanup and
+        // leave an orphan parent/token entry behind.
+        let mut delegations = self.delegations.write().await;
+        let records = delegations.get(delegation_id).cloned().unwrap_or_default();
         let non_terminal: Vec<String> = records
             .iter()
             .filter(|record| !record.state.is_terminal())
@@ -1308,7 +1312,6 @@ impl DelegationTracker {
 
         // Acquire locks in consistent order: delegations → parents → pause_flags → cancel_tokens → progress
         // (same order as load_from_run_records to prevent deadlock)
-        let mut delegations = self.delegations.write().await;
         let mut parents = self.parents.write().await;
         let mut pause_flags = self.pause_flags.write().await;
         let mut cancel_tokens = self.cancel_tokens.write().await;
@@ -1337,15 +1340,12 @@ impl DelegationTracker {
                 if !visited.insert(original_id.clone()) {
                     break; // Cycle detected
                 }
-                let found = records
+                let previous = records
                     .iter()
-                    .find(|r| r.run_id == original_id && r.retry_of.is_some());
-                match found {
-                    Some(r) => {
-                        original_id = r.retry_of.clone().unwrap_or_else(|| {
-                            unreachable!("guarded by retry_of.is_some() check above")
-                        })
-                    }
+                    .find(|record| record.run_id == original_id)
+                    .and_then(|record| record.retry_of.as_ref());
+                match previous {
+                    Some(previous) => original_id = previous.clone(),
                     None => break,
                 }
             }
