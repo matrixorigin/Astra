@@ -6,11 +6,14 @@
 use serde::{Deserialize, Serialize};
 
 use crate::context_feedback::ContextFeedback;
+use crate::context_pipeline::PipelineRunMetrics;
 use crate::trace_alert::TraceAlert;
 
 /// Discriminator for pipeline journal events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PipelineEventKind {
+    /// Plan-phase pressure/tier decision, emitted before the LLM call.
+    Metrics,
     /// Per-turn feedback snapshot (cache ratio, tokens, tier).
     Feedback,
     /// A trace alert fired (cache break, recovery loop, etc.).
@@ -27,6 +30,28 @@ pub enum PipelineEventKind {
 pub struct PipelineJournalEvent {
     pub kind: PipelineEventKind,
     pub turn: u32,
+
+    // Metrics fields (plan-phase, pre-call)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub raw_pressure: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub predictive_pressure: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub spilled: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub output_reserve_tokens: Option<u32>,
+    /// Where the reserve came from this call: `memory`, `journal`, or `cold`
+    /// (see `overlay_session_reserves` in the bridge). Diagnostic only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub reserve_source: Option<String>,
 
     // Feedback fields
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,12 +96,53 @@ pub struct PipelineJournalEvent {
 }
 
 impl PipelineJournalEvent {
+    /// Create a metrics event from a turn's plan-phase pipeline output.
+    ///
+    /// Emitted before the LLM call (unlike feedback/alerts, which follow the
+    /// response), so a session's metrics events — read in journal order —
+    /// give a real call-by-call pressure/tier trajectory even though the
+    /// bridge's own `turn` numbering is coarser than one row per call.
+    #[must_use]
+    pub fn from_metrics(metrics: &PipelineRunMetrics, reserve_source: &str) -> Self {
+        Self {
+            kind: PipelineEventKind::Metrics,
+            turn: metrics.turn_index,
+            raw_pressure: Some(metrics.raw_pressure),
+            predictive_pressure: Some(metrics.predictive_pressure),
+            tier: Some(format!("{:?}", metrics.compact_tier)),
+            spilled: Some(metrics.spilled),
+            output_reserve_tokens: Some(metrics.output_reserve_tokens),
+            reserve_source: Some(reserve_source.to_string()),
+            cache_hit_ratio: None,
+            prompt_tokens: None,
+            fresh_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            completion_tokens: None,
+            model_id: None,
+            cache_break_reason: None,
+            api_calls_total: None,
+            alert_rule: None,
+            alert_severity: None,
+            alert_message: None,
+            compaction_strategy: None,
+            items_affected: None,
+            tokens_freed: None,
+        }
+    }
+
     /// Create a feedback event from API response metrics.
     #[must_use]
     pub fn from_feedback(turn: u32, model_id: &str, feedback: &ContextFeedback) -> Self {
         Self {
             kind: PipelineEventKind::Feedback,
             turn,
+            raw_pressure: None,
+            predictive_pressure: None,
+            tier: None,
+            spilled: None,
+            output_reserve_tokens: None,
+            reserve_source: None,
             cache_hit_ratio: Some(feedback.cache_hit_ratio),
             prompt_tokens: Some(feedback.tokens.prompt),
             fresh_tokens: Some(
@@ -116,6 +182,12 @@ impl PipelineJournalEvent {
         Self {
             kind: PipelineEventKind::Alert,
             turn: alert.turn,
+            raw_pressure: None,
+            predictive_pressure: None,
+            tier: None,
+            spilled: None,
+            output_reserve_tokens: None,
+            reserve_source: None,
             cache_hit_ratio: None,
             prompt_tokens: None,
             fresh_tokens: None,
@@ -145,6 +217,12 @@ impl PipelineJournalEvent {
         Self {
             kind: PipelineEventKind::CompactionAudit,
             turn,
+            raw_pressure: None,
+            predictive_pressure: None,
+            tier: None,
+            spilled: None,
+            output_reserve_tokens: None,
+            reserve_source: None,
             cache_hit_ratio: None,
             prompt_tokens: None,
             fresh_tokens: None,
@@ -167,6 +245,37 @@ impl PipelineJournalEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_event_fields() {
+        use crate::compaction_types::CompactionTier;
+        let metrics = PipelineRunMetrics {
+            turn_index: 12,
+            input_tokens: 34_934,
+            output_reserve_tokens: 4_000,
+            raw_pressure: 0.2665,
+            predictive_pressure: 0.2985,
+            compact_tier: CompactionTier::TrimSchemas,
+            sections: 5,
+            messages: 82,
+            tool_schemas: 12,
+            cache_markers: 2,
+            tokens_cleared: 0,
+            avg_cache_hit_ratio: 0.94,
+            spilled: 1,
+            api_calls_total: 38,
+        };
+        let evt = PipelineJournalEvent::from_metrics(&metrics, "memory");
+        assert_eq!(evt.kind, PipelineEventKind::Metrics);
+        assert_eq!(evt.turn, 12);
+        assert!((evt.raw_pressure.unwrap() - 0.2665).abs() < 1e-9);
+        assert!((evt.predictive_pressure.unwrap() - 0.2985).abs() < 1e-9);
+        assert_eq!(evt.tier.as_deref(), Some("TrimSchemas"));
+        assert_eq!(evt.spilled, Some(1));
+        assert_eq!(evt.output_reserve_tokens, Some(4_000));
+        assert_eq!(evt.reserve_source.as_deref(), Some("memory"));
+        assert_eq!(evt.cache_hit_ratio, None, "metrics precede feedback");
+    }
 
     #[test]
     fn feedback_event_fields() {

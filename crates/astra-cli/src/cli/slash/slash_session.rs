@@ -2330,7 +2330,8 @@ pub(crate) async fn handle_session_command(
                                     detail,
                                 );
                             }
-                            session_journal::JournalEventType::PipelineFeedback
+                            session_journal::JournalEventType::PipelineMetrics
+                            | session_journal::JournalEventType::PipelineFeedback
                             | session_journal::JournalEventType::PipelineAlert
                             | session_journal::JournalEventType::PipelineCompactionAudit
                             | session_journal::JournalEventType::Bootstrap

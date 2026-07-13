@@ -2041,6 +2041,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::LlmRequestFull => "llm_request_full",
         JournalEventType::LlmResponseFull => "llm_response_full",
         JournalEventType::SessionMemoryExtraction => "session_memory_extraction",
+        JournalEventType::PipelineMetrics => "pipeline_metrics",
         JournalEventType::PipelineFeedback => "pipeline_feedback",
         JournalEventType::PipelineAlert => "pipeline_alert",
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",

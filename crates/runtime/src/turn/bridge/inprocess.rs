@@ -2550,6 +2550,23 @@ impl InProcessChatTurnBridge {
                     tier = ?pipeline_outcome.tier,
                     "bridge pipeline pressure"
                 );
+                // Same fields as the log line above, also journaled so
+                // `astra journal trace` can render a real per-call trace
+                // table after a run instead of parsing server.log.
+                if let Some(buf) = turn_event_buffer.as_mut() {
+                    let metrics_evt =
+                        astra_turn_core::pipeline_journal::PipelineJournalEvent::from_metrics(
+                            metrics,
+                            reserve_source,
+                        );
+                    if let Ok(payload) = serde_json::to_value(&metrics_evt) {
+                        buf.record(astra_services::session_journal::JournalEvent::pipeline_metrics(
+                            (!session_id.is_empty()).then_some(session_id.as_str()),
+                            metrics.turn_index,
+                            payload,
+                        ));
+                    }
+                }
             }
             let mut system_msg = pipeline_outcome.primary_system;
             let mut dynamic_msg = pipeline_outcome.dynamic_system;

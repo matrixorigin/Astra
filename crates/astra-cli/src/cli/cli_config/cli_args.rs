@@ -1160,6 +1160,24 @@ pub(crate) enum JournalCmd {
     Tree(JournalTreeArgs),
     /// Compare two session journals on tool sequence, token totals, event counts
     Diff(JournalDiffArgs),
+    /// Export the EXPLAIN ANALYZE pressure/tier trace table (markdown or CSV)
+    Trace(JournalTraceArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct JournalTraceArgs {
+    /// Session id, unique prefix, `last`, or omit for most recent local journal
+    #[arg(value_name = "SESSION")]
+    pub session_id: Option<String>,
+    /// Same meaning as positional SESSION (positional wins if both are set)
+    #[arg(long = "session", value_name = "SESSION")]
+    pub session: Option<String>,
+    /// Output format: markdown (default) or csv
+    #[arg(long, default_value = "markdown")]
+    pub format: String,
+    /// Write the rendered trace to this file instead of stdout
+    #[arg(long, value_name = "FILE")]
+    pub out: Option<String>,
 }
 
 #[derive(Args, Debug)]

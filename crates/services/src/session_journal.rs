@@ -1495,6 +1495,8 @@ pub enum JournalEventType {
     /// Describes a single atomic rewrite of the session-memory L1
     /// artifact.
     SessionMemoryExtraction,
+    /// Context pipeline plan-phase metrics (pressure, tier), pre-call.
+    PipelineMetrics,
     /// Context pipeline per-turn feedback (cache ratio, tokens, tier).
     PipelineFeedback,
     /// Context pipeline trace alert fired (cache break, recovery loop, etc.).
@@ -4786,6 +4788,18 @@ impl JournalEvent {
         evt.turn = Some(turn);
         evt.duration_ms = Some(duration_ms);
         evt.metadata = Some(outcome.to_json(breadcrumbs));
+        evt
+    }
+
+    /// Context pipeline plan-phase metrics event (pressure, tier), pre-call.
+    pub fn pipeline_metrics(
+        session_id: Option<&str>,
+        turn: u32,
+        event_payload: serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::PipelineMetrics, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(event_payload);
         evt
     }
 

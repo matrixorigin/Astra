@@ -34,6 +34,7 @@ pub mod idle_agent_messages;
 pub mod interactive_chat;
 pub mod journal_diff;
 pub mod journal_digest;
+pub mod journal_trace;
 pub mod journal_tree;
 pub mod mcp_config;
 pub mod mock_llm;

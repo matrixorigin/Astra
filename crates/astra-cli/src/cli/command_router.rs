@@ -56,8 +56,8 @@ use crate::cli::task::task_worker_support::{
     get_claimed_task_or_release, revert_interrupted_task_to_pending_if_still_owned,
 };
 use crate::cli::{
-    agent_loader, delegate_subrun, diff_presenter, journal_diff, journal_digest, journal_tree,
-    theme,
+    agent_loader, delegate_subrun, diff_presenter, journal_diff, journal_digest, journal_trace,
+    journal_tree, theme,
 };
 use astra_thin_client::paths;
 use clap::CommandFactory;
@@ -2390,6 +2390,11 @@ async fn execute_cli_command_impl(
 
         Some(Command::Journal(JournalCmd::Diff(args))) => {
             journal_diff::run_diff(&args)?;
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Journal(JournalCmd::Trace(args))) => {
+            journal_trace::run_trace(&args)?;
             Ok(ExitCode::Success)
         }
 
