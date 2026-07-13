@@ -23,13 +23,6 @@ pub(crate) enum AgentControlFailureKind {
     ToolFailed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CancelledStateUpdate {
-    Set,
-    Clear,
-    Preserve,
-}
-
 pub(crate) struct AgentControlSurface<'a> {
     parsed: Option<&'a Value>,
     finish_reason: Option<&'a str>,
@@ -80,27 +73,6 @@ impl<'a> AgentControlSurface<'a> {
         self.outcome
     }
 
-    pub(crate) fn is_terminal(&self) -> bool {
-        matches!(
-            self.outcome,
-            AgentControlOutcome::Completed
-                | AgentControlOutcome::Failed(_)
-                | AgentControlOutcome::Cancelled
-        )
-    }
-
-    pub(crate) fn cancelled_state_update(&self) -> CancelledStateUpdate {
-        match self.outcome {
-            AgentControlOutcome::Cancelled => CancelledStateUpdate::Set,
-            AgentControlOutcome::Completed | AgentControlOutcome::Failed(_) => {
-                CancelledStateUpdate::Clear
-            }
-            AgentControlOutcome::Running | AgentControlOutcome::NoChange => {
-                CancelledStateUpdate::Preserve
-            }
-        }
-    }
-
     pub(crate) fn agent_id(&self) -> Option<&'a str> {
         self.agent_id
     }
@@ -149,11 +121,6 @@ mod tests {
         let parsed = parse(r#"{"agent_id":"reviewer@abc","result":"done"}"#);
         let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
         assert_eq!(surface.outcome(), AgentControlOutcome::Completed);
-        assert!(surface.is_terminal());
-        assert_eq!(
-            surface.cancelled_state_update(),
-            CancelledStateUpdate::Clear
-        );
     }
 
     #[test]
@@ -164,19 +131,14 @@ mod tests {
             surface.outcome(),
             AgentControlOutcome::Failed(AgentControlFailureKind::ToolFailed)
         );
-        assert!(surface.is_terminal());
     }
 
     #[test]
-    fn tool_failure_without_status_is_failed_and_clears_cancelled() {
+    fn tool_failure_without_status_is_control_failure() {
         let surface = AgentControlSurface::from_wire("spawn", "failed", None);
         assert_eq!(
             surface.outcome(),
             AgentControlOutcome::Failed(AgentControlFailureKind::ToolFailed)
-        );
-        assert_eq!(
-            surface.cancelled_state_update(),
-            CancelledStateUpdate::Clear
         );
         assert_eq!(
             surface.failure_message().as_deref(),
@@ -189,11 +151,6 @@ mod tests {
         let parsed = parse(r#"{"agent_id":"reviewer@abc"}"#);
         let surface = AgentControlSurface::from_wire("get_result", "completed", Some(&parsed));
         assert_eq!(surface.outcome(), AgentControlOutcome::NoChange);
-        assert!(!surface.is_terminal());
-        assert_eq!(
-            surface.cancelled_state_update(),
-            CancelledStateUpdate::Preserve
-        );
     }
 
     #[test]
@@ -204,16 +161,13 @@ mod tests {
             surface.outcome(),
             AgentControlOutcome::Failed(AgentControlFailureKind::AgentFailed)
         );
-        assert!(surface.is_terminal());
     }
 
     #[test]
-    fn cancelled_status_sets_cancelled_tracking() {
+    fn cancelled_status_is_typed_cancelled_outcome() {
         let parsed = parse(r#"{"status":"cancelled","agent_id":"reviewer@abc"}"#);
         let surface = AgentControlSurface::from_wire("spawn", "completed", Some(&parsed));
         assert_eq!(surface.outcome(), AgentControlOutcome::Cancelled);
-        assert_eq!(surface.cancelled_state_update(), CancelledStateUpdate::Set);
-        assert!(surface.is_terminal());
     }
 
     #[test]
@@ -227,10 +181,6 @@ mod tests {
             surface.running_preview().as_deref(),
             Some("Agent is running after 120s. call again")
         );
-        assert_eq!(
-            surface.cancelled_state_update(),
-            CancelledStateUpdate::Preserve
-        );
     }
 
     #[test]
@@ -243,14 +193,9 @@ mod tests {
             surface.outcome(),
             AgentControlOutcome::Failed(AgentControlFailureKind::Interrupted)
         );
-        assert!(surface.is_terminal());
-        assert_eq!(
-            surface.cancelled_state_update(),
-            CancelledStateUpdate::Clear
-        );
         assert_eq!(
             surface.failure_message().as_deref(),
-            Some(crate::tui::agent_control_status::AGENT_RESULT_INTERRUPTED_ERROR)
+            Some(astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_INTERRUPTED_ERROR)
         );
     }
 
@@ -263,11 +208,6 @@ mod tests {
         assert_eq!(
             surface.outcome(),
             AgentControlOutcome::Failed(AgentControlFailureKind::Interrupted)
-        );
-        assert!(surface.is_terminal());
-        assert_eq!(
-            surface.cancelled_state_update(),
-            CancelledStateUpdate::Clear
         );
         assert_eq!(
             surface.failure_message().as_deref(),

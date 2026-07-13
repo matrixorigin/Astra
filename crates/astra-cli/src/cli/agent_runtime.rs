@@ -73,7 +73,7 @@ pub(crate) async fn build_one_shot_spawner(
     // re-read from. The token-provider wiring lives on the REPL path
     // (`initialize_multi_agent_runtime`) where token rotation is real.
     if let Some(sid) = session_id.as_deref() {
-        spawn_executor = spawn_executor.with_active_session_id(sid.to_string());
+        spawn_executor = spawn_executor.with_session_transcript(sid.to_string());
     }
 
     let runtime_cfg = astra_config::runtime_config::RuntimeConfig::load();
@@ -233,7 +233,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
         spawn_executor = spawn_executor.with_token_provider(provider);
     }
     if let Some(session_id) = state.session_id.clone() {
-        spawn_executor = spawn_executor.with_active_session_id(session_id);
+        spawn_executor = spawn_executor.with_session_transcript(session_id);
     }
 
     // Fork-prefix pipeline: driven entirely by RuntimeConfig (which

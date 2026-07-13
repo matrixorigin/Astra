@@ -46,7 +46,7 @@ use crate::server::run::handlers::transform_stream_run_events_for_client_with_pe
 use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED};
 use astra_server_types::merge_plan_subtask_context;
 use astra_services::runs::durable_run_status_is_terminal;
-use astra_tools::{AskUserAnswers, AskUserPrompt};
+use astra_tools::{AskUserAnswers, AskUserPrompt, normalize_ask_user_answers};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -635,7 +635,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 approved,
                                 reason,
                             }) => {
-                                handle_tool_approval(
+                                handle_shared_tool_approval(
                                     state, &conn, &request_id, approved, reason,
                                 )
                                 .await;
@@ -645,7 +645,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 answers,
                                 cancelled,
                             }) => {
-                                handle_user_prompt_response(
+                                handle_shared_user_prompt_response(
                                     state,
                                     &conn,
                                     &request_id,
@@ -921,417 +921,239 @@ async fn handle_resume_run(
     }
 }
 
-/// Outcome of a dedup-insert into the edge-callback ledger.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum WsLedgerOutcome {
-    /// Key was absent; value has been inserted.
-    Inserted,
-    /// Key was present with an identical JSON value; no-op idempotent replay.
-    IdempotentReplay,
-    /// Key was present with a DIFFERENT value; the original decision is preserved.
-    ConflictIgnored,
-    /// Key was absent but the shared ledger was already at capacity.
-    CapacityExceeded,
-}
-
-fn ws_ledger_outcome_label(outcome: WsLedgerOutcome) -> &'static str {
-    match outcome {
-        WsLedgerOutcome::Inserted => "inserted",
-        WsLedgerOutcome::IdempotentReplay => "idempotent_replay",
-        WsLedgerOutcome::ConflictIgnored => "conflict_ignored",
-        WsLedgerOutcome::CapacityExceeded => "capacity_exceeded",
-    }
-}
-
-/// Insert `value` under `key` in the ledger with at-most-once idempotency semantics.
-///
-/// - Key absent → insert, return `Inserted`.
-/// - Key present + same JSON value → no-op, return `IdempotentReplay`.
-/// - Key present + different JSON value → do NOT overwrite; emit a warning;
-///   return `ConflictIgnored`.
-/// - Key absent + ledger full → do NOT insert; emit a warning; return
-///   `CapacityExceeded`.
-pub(crate) fn ws_ledger_dedup_insert(
-    ledger: &mut std::collections::HashMap<String, serde_json::Value>,
-    key: String,
-    value: serde_json::Value,
-) -> WsLedgerOutcome {
-    use std::collections::hash_map::Entry;
-    if !ledger.contains_key(&key)
-        && ledger.len() >= astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES
-    {
-        tracing::warn!(
-            target: "astra_runtime::ws_callback",
-            key = %key,
-            entries = ledger.len(),
-            limit = astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES,
-            "WS ledger dedup: refusing new callback because edge callback ledger is full"
-        );
-        return WsLedgerOutcome::CapacityExceeded;
-    }
-
-    match ledger.entry(key.clone()) {
-        Entry::Vacant(e) => {
-            e.insert(value);
-            WsLedgerOutcome::Inserted
-        }
-        Entry::Occupied(e) => {
-            let existing = e.get();
-            if existing == &value {
-                WsLedgerOutcome::IdempotentReplay
-            } else {
-                let existing_repr = existing.to_string().chars().take(80).collect::<String>();
-                let new_repr = value.to_string().chars().take(80).collect::<String>();
-                tracing::warn!(
-                    target: "astra_runtime::ws_callback",
-                    key = %key,
-                    existing = %existing_repr,
-                    incoming = %new_repr,
-                    "WS ledger dedup: incoming value conflicts with stored decision; original preserved"
-                );
-                WsLedgerOutcome::ConflictIgnored
-            }
-        }
-    }
-}
-
-/// Store a tool approval response in the edge callback ledger.
-async fn handle_tool_approval(
+/// Resolve a tool approval against shared durable run state.
+async fn handle_shared_tool_approval(
     state: &AppState,
     conn: &WsConnection,
     request_id: &str,
     approved: bool,
     reason: Option<String>,
 ) {
-    use astra_services::session_journal::{
-        ApprovalDecisionAppendOutcome, ApprovalJournalDecision,
-        append_approval_decision_for_run_if_absent, find_latest_approval_required_for_run,
-        validate_session_id,
-    };
-    use astra_turn_core::edge_ledger::approval_callback_key;
-
-    fn approval_ledger_value(approved: bool, reason: Option<String>) -> serde_json::Value {
-        serde_json::json!({
-            "approved": approved,
-            "reason": reason,
-        })
-    }
-
-    fn approval_ledger_value_from_journal(decision: &ApprovalJournalDecision) -> serde_json::Value {
-        let approved = matches!(decision.decision.as_str(), "allow" | "allow_session");
-        approval_ledger_value(approved, decision.reason.clone())
-    }
-
-    let registry = state.metrics_registry();
-    let Some(session_id) = conn.session_id.as_deref() else {
-        crate::server::interaction_metrics::record_approval_journal_write(
-            registry.as_ref(),
-            "skipped_no_context",
-        );
+    let (Some(session_id), Some(run_id)) = (
+        conn.session_id.as_deref(),
+        conn.active_run_id
+            .as_deref()
+            .filter(|run_id| !run_id.trim().is_empty()),
+    ) else {
         return;
     };
-    let Some(run_id) = conn
-        .active_run_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|run_id| !run_id.is_empty())
-    else {
-        crate::server::interaction_metrics::record_approval_journal_write(
-            registry.as_ref(),
-            "invalid_run",
-        );
-        return;
+    let user_id = &conn.principal.user.user_id;
+    let target = match state
+        .execution
+        .run_lifecycle_service
+        .get_run_status(run_id.to_string(), user_id.clone())
+        .await
+    {
+        Ok(target) if target.session_id == session_id => target,
+        Ok(_) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                "approval response session does not own run"
+            );
+            return;
+        }
+        Err((_, error)) => {
+            tracing::warn!(run_id, request_id, error = %error.0.detail, "approval run lookup failed");
+            return;
+        }
     };
-    if let Err(error) = validate_session_id(session_id) {
+    if target.waiting_for.as_deref() != Some("tool_approval") {
         tracing::warn!(
-            target: "astra_runtime::ws_callback",
-            user_id = %conn.principal.user.user_id,
-            request_id = %request_id,
-            session_id = %session_id,
-            error = %error,
-            "refusing approval response with invalid session_id"
-        );
-        crate::server::interaction_metrics::record_approval_journal_write(
-            registry.as_ref(),
-            "invalid_session",
+            run_id,
+            request_id,
+            "approval response arrived after wait ended"
         );
         return;
     }
-
-    let key = approval_callback_key(&conn.principal.user.user_id, session_id, run_id, request_id);
-    let mut value = approval_ledger_value(approved, reason.clone());
-    let decision = if approved { "allow" } else { "deny" };
-    let required = match find_latest_approval_required_for_run(session_id, request_id, run_id) {
-        Ok(Some(request)) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
-                registry.as_ref(),
-                "required",
-                "hit",
-            );
-            Some(request)
-        }
+    let required = match state
+        .execution
+        .run_lifecycle_service
+        .get_run_interaction_event(
+            run_id.to_string(),
+            user_id.clone(),
+            request_id.to_string(),
+            "approval_required".to_string(),
+        )
+        .await
+    {
+        Ok(Some(required)) => required,
         Ok(None) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
-                registry.as_ref(),
-                "required",
-                "miss",
-            );
-            None
+            tracing::warn!(run_id, request_id, "unknown durable approval response");
+            return;
         }
-        Err(error) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
-                registry.as_ref(),
-                "required",
-                "error",
-            );
-            tracing::warn!(
-                target: "astra_runtime::ws_callback",
-                user_id = %conn.principal.user.user_id,
-                session_id = %session_id,
-                run_id = %run_id,
-                request_id = %request_id,
-                error = %error,
-                "approval journal required lookup failed"
-            );
-            None
+        Err((_, error)) => {
+            tracing::warn!(run_id, request_id, error = %error.0.detail, "approval lookup failed");
+            return;
         }
     };
-    let approval_turn = required.as_ref().and_then(|request| request.turn);
-    let tool_name = required
-        .as_ref()
-        .and_then(|request| request.tool_name.as_deref());
-    let approval_kind = required
-        .as_ref()
-        .and_then(|request| request.approval_kind.as_deref());
-    match append_approval_decision_for_run_if_absent(
-        session_id,
-        approval_turn,
-        request_id,
-        run_id,
-        tool_name,
-        approval_kind,
-        decision,
-        reason.as_deref(),
-    ) {
-        Ok(ApprovalDecisionAppendOutcome::Appended) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
-                registry.as_ref(),
-                "decision",
-                "miss",
-            );
-            crate::server::interaction_metrics::record_approval_journal_write(
-                registry.as_ref(),
-                "ok",
-            );
+    let data = required.get("data").unwrap_or(&required);
+    let Some(tool) = data.get("tool").and_then(Value::as_str) else {
+        tracing::warn!(run_id, request_id, "approval request has no canonical tool");
+        return;
+    };
+    let approval_kind = data
+        .get("approval_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("standard");
+    let decision = if approved { "allow" } else { "deny" };
+    let response = serde_json::json!({
+        "request_id": request_id,
+        "outcome": if approved { "approved" } else { "denied" },
+        "decision": decision,
+        "reason": reason,
+        "tool": tool,
+        "approval_kind": approval_kind,
+    });
+    match state
+        .execution
+        .run_lifecycle_service
+        .resolve_run_interaction(
+            run_id.to_string(),
+            user_id.clone(),
+            request_id.to_string(),
+            astra_services::runs::DurableRunInteractionKind::Approval,
+            response,
+        )
+        .await
+    {
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_))
+        | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => {}
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(_)) => {
+            tracing::warn!(run_id, request_id, "conflicting approval response ignored");
         }
-        Ok(ApprovalDecisionAppendOutcome::Idempotent) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
-                registry.as_ref(),
-                "decision",
-                "hit",
-            );
-            crate::server::interaction_metrics::record_approval_journal_write(
-                registry.as_ref(),
-                "idempotent",
-            );
-        }
-        Ok(ApprovalDecisionAppendOutcome::Conflict(existing)) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
-                registry.as_ref(),
-                "decision",
-                "hit",
-            );
-            crate::server::interaction_metrics::record_approval_journal_write(
-                registry.as_ref(),
-                "conflict",
-            );
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::MissingRequest) => {
             tracing::warn!(
-                target: "astra_runtime::ws_callback",
-                user_id = %conn.principal.user.user_id,
-                session_id = %session_id,
-                run_id = %run_id,
-                request_id = %request_id,
-                existing_decision = %existing.decision,
-                incoming_decision = %decision,
-                "approval decision already durable; preserving existing decision for local ledger"
+                run_id,
+                request_id,
+                "approval request disappeared before resolution"
             );
-            value = approval_ledger_value_from_journal(&existing);
         }
-        Err(error) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
-                registry.as_ref(),
-                "decision",
-                "error",
-            );
-            crate::server::interaction_metrics::record_approval_journal_write(
-                registry.as_ref(),
-                "error",
-            );
-            tracing::warn!(
-                target: "astra_runtime::ws_callback",
-                user_id = %conn.principal.user.user_id,
-                session_id = %session_id,
-                run_id = %run_id,
-                request_id = %request_id,
-                error = %error,
-                "failed to persist approval decision journal event"
-            );
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting) => {
+            tracing::warn!(run_id, request_id, "late approval response ignored");
+        }
+        Err((_, error)) => {
+            tracing::warn!(run_id, request_id, error = %error.0.detail, "approval resolution failed");
         }
     }
-
-    let outcome = {
-        let ledger = state.edge_callback_ledger.clone();
-        let mut guard = ledger.lock().await;
-        ws_ledger_dedup_insert(&mut guard, key, value)
-    };
-    crate::server::interaction_metrics::record_approval_ledger_insert(
-        registry.as_ref(),
-        ws_ledger_outcome_label(outcome),
-    );
 }
 
-/// Store an ask_user response in the edge callback ledger.
-async fn handle_user_prompt_response(
+async fn handle_shared_user_prompt_response(
     state: &AppState,
     conn: &WsConnection,
     request_id: &str,
     answers: Option<AskUserAnswers>,
     cancelled: bool,
 ) {
-    use astra_services::session_journal::{JournalEvent, JournalWriter, validate_session_id};
-    use astra_turn_core::edge_ledger::user_prompt_callback_key;
-
-    let registry = state.metrics_registry();
-    let (session_id, run_id) = match (conn.session_id.as_deref(), conn.active_run_id.as_deref()) {
-        (Some(session_id), Some(run_id)) if !run_id.trim().is_empty() => (session_id, run_id),
-        (Some(_), Some(_)) => {
-            crate::server::interaction_metrics::record_ask_user_journal_write(
-                registry.as_ref(),
-                "response",
-                "invalid_run",
-            );
-            crate::server::interaction_metrics::record_ask_user_ledger_insert(
-                registry.as_ref(),
-                "invalid_context",
+    let (Some(session_id), Some(run_id)) = (
+        conn.session_id.as_deref(),
+        conn.active_run_id
+            .as_deref()
+            .filter(|run_id| !run_id.trim().is_empty()),
+    ) else {
+        return;
+    };
+    if cancelled == answers.is_some() {
+        return;
+    }
+    let user_id = &conn.principal.user.user_id;
+    let target = match state
+        .execution
+        .run_lifecycle_service
+        .get_run_status(run_id.to_string(), user_id.clone())
+        .await
+    {
+        Ok(target) if target.session_id == session_id => target,
+        Ok(_) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                "ask_user response session does not own run"
             );
             return;
         }
-        _ => {
-            crate::server::interaction_metrics::record_ask_user_journal_write(
-                registry.as_ref(),
-                "response",
-                "skipped_no_context",
-            );
-            crate::server::interaction_metrics::record_ask_user_ledger_insert(
-                registry.as_ref(),
-                "skipped_no_context",
-            );
+        Err((_, error)) => {
+            tracing::warn!(run_id, request_id, error = %error.0.detail, "ask_user run lookup failed");
             return;
         }
     };
-    if let Err(error) = validate_session_id(session_id) {
+    if target.waiting_for.as_deref() != Some("user_input") {
         tracing::warn!(
-            target: "astra_runtime::ws_callback",
-            user_id = %conn.principal.user.user_id,
-            request_id = %request_id,
-            session_id = %session_id,
-            error = %error,
-            "refusing durable ask_user response journal write for invalid session_id"
-        );
-        crate::server::interaction_metrics::record_ask_user_journal_write(
-            registry.as_ref(),
-            "response",
-            "invalid_session",
-        );
-        crate::server::interaction_metrics::record_ask_user_ledger_insert(
-            registry.as_ref(),
-            "invalid_session",
+            run_id,
+            request_id,
+            "ask_user response arrived after wait ended"
         );
         return;
-    } else {
-        if !cancelled && answers.is_none() {
-            crate::server::interaction_metrics::record_ask_user_journal_write(
-                registry.as_ref(),
-                "response",
-                "missing_answers",
-            );
-            crate::server::interaction_metrics::record_ask_user_ledger_insert(
-                registry.as_ref(),
-                "invalid_payload",
-            );
+    }
+    let required = match state
+        .execution
+        .run_lifecycle_service
+        .get_run_interaction_event(
+            run_id.to_string(),
+            user_id.clone(),
+            request_id.to_string(),
+            "ask_user_prompted".to_string(),
+        )
+        .await
+    {
+        Ok(Some(required)) => required,
+        Ok(None) => return,
+        Err((_, error)) => {
+            tracing::warn!(run_id, request_id, error = %error.0.detail, "ask_user lookup failed");
             return;
         }
-        let status = if cancelled { "cancelled" } else { "submitted" };
-        let mut write_outcome = "ok";
-        let answers_json = match answers.as_ref() {
-            Some(answers) => match serde_json::to_value(answers) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    tracing::warn!(
-                        target: "astra_runtime::ws_callback",
-                        user_id = %conn.principal.user.user_id,
-                        request_id = %request_id,
-                        session_id = %session_id,
-                        error = %error,
-                        "failed to serialize ask_user answers for journal"
-                    );
-                    write_outcome = "serialize_error";
-                    None
-                }
-            },
-            None => None,
-        };
-        match JournalWriter::new(session_id).and_then(|writer| {
-            writer.append(&JournalEvent::ask_user_response(
-                Some(session_id),
-                None,
-                request_id,
-                Some(run_id),
-                status,
-                answers_json,
-            ))
-        }) {
-            Ok(()) => crate::server::interaction_metrics::record_ask_user_journal_write(
-                registry.as_ref(),
-                "response",
-                write_outcome,
-            ),
+    };
+    let prompt = match required
+        .pointer("/data/prompt")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<AskUserPrompt>(value).ok())
+    {
+        Some(prompt) => prompt,
+        None => return,
+    };
+    let normalized_answers = match answers {
+        Some(answers) => match normalize_ask_user_answers(&prompt, &answers)
+            .and_then(|answers| serde_json::to_value(answers).map_err(|error| error.to_string()))
+        {
+            Ok(answers) => Some(answers),
             Err(error) => {
-                crate::server::interaction_metrics::record_ask_user_journal_write(
-                    registry.as_ref(),
-                    "response",
-                    "error",
-                );
-                tracing::warn!(
-                    target: "astra_runtime::ws_callback",
-                    user_id = %conn.principal.user.user_id,
-                    request_id = %request_id,
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    error = %error,
-                    "failed to persist ask_user response journal event"
-                );
+                tracing::warn!(run_id, request_id, error, "invalid ask_user response");
+                return;
             }
+        },
+        None => None,
+    };
+    let response = serde_json::json!({
+        "request_id": request_id,
+        "outcome": if cancelled { "cancelled" } else { "submitted" },
+        "answers": normalized_answers,
+    });
+    match state
+        .execution
+        .run_lifecycle_service
+        .resolve_run_interaction(
+            run_id.to_string(),
+            user_id.clone(),
+            request_id.to_string(),
+            astra_services::runs::DurableRunInteractionKind::AskUser,
+            response,
+        )
+        .await
+    {
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_))
+        | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => {}
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(_)) => {
+            tracing::warn!(run_id, request_id, "conflicting ask_user response ignored");
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::MissingRequest)
+        | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting) => {
+            tracing::warn!(run_id, request_id, "late ask_user response ignored");
+        }
+        Err((_, error)) => {
+            tracing::warn!(run_id, request_id, error = %error.0.detail, "ask_user resolution failed");
         }
     }
-    let key =
-        user_prompt_callback_key(&conn.principal.user.user_id, session_id, run_id, request_id);
-    let value = if cancelled {
-        serde_json::json!({ "cancelled": true })
-    } else {
-        serde_json::json!({ "answers": answers })
-    };
-    let outcome = {
-        let ledger = state.edge_callback_ledger.clone();
-        let mut guard = ledger.lock().await;
-        ws_ledger_dedup_insert(&mut guard, key, value)
-    };
-    crate::server::interaction_metrics::record_ask_user_ledger_insert(
-        registry.as_ref(),
-        ws_ledger_outcome_label(outcome),
-    );
 }
-
 #[cfg(test)]
 fn build_bridge_chat_payload(
     session_id: Option<String>,
@@ -1776,14 +1598,14 @@ async fn stream_run_over_websocket(
                                 handle_resume_run(socket, state, conn, &run_id, false).await;
                             }
                             Ok(WsClientMessage::ToolApproval { request_id, approved, reason }) => {
-                                handle_tool_approval(state, conn, &request_id, approved, reason).await;
+                                handle_shared_tool_approval(state, conn, &request_id, approved, reason).await;
                             }
                             Ok(WsClientMessage::UserPrompt {
                                 request_id,
                                 answers,
                                 cancelled,
                             }) => {
-                                handle_user_prompt_response(
+                                handle_shared_user_prompt_response(
                                     state,
                                     conn,
                                     &request_id,
@@ -4939,525 +4761,6 @@ mod tests {
     fn user_prompt_rejects_client_supplied_session_and_run_identity() {
         let json = r#"{"type":"user_prompt","request_id":"req-2","session_id":"sess-1","run_id":"run-1","answers":{"answers":[]}}"#;
         assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn tool_approval_response_handler_persists_journal_and_local_ledger() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let writer = astra_services::session_journal::JournalWriter::new("sess-approval-ws")
-            .expect("journal writer");
-        writer
-            .append(
-                &astra_services::session_journal::JournalEvent::approval_required_for_run(
-                    Some("sess-approval-ws"),
-                    Some(11),
-                    "req-approval-ws",
-                    Some("run-approval-ws"),
-                    "write_file",
-                    "standard",
-                    None,
-                ),
-            )
-            .expect("approval required journal event");
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-        let conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-approval-ws".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-approval-ws".into()),
-            bridge_prepared_run_id: None,
-        };
-
-        handle_tool_approval(
-            &state,
-            &conn,
-            "req-approval-ws",
-            true,
-            Some("approved from ws".into()),
-        )
-        .await;
-
-        let decision = astra_services::session_journal::find_latest_approval_decision_for_run(
-            "sess-approval-ws",
-            "req-approval-ws",
-            "run-approval-ws",
-        )
-        .unwrap()
-        .expect("approval decision should be durable for no-sticky replay");
-        assert_eq!(decision.run_id.as_deref(), Some("run-approval-ws"));
-        assert_eq!(decision.decision, "allow");
-        assert_eq!(decision.reason.as_deref(), Some("approved from ws"));
-        assert_eq!(decision.tool_name.as_deref(), Some("write_file"));
-        assert_eq!(decision.approval_kind.as_deref(), Some("standard"));
-
-        let ledger = state.edge_callback_ledger.lock().await;
-        let key = astra_turn_core::edge_ledger::approval_callback_key(
-            "u1",
-            "sess-approval-ws",
-            "run-approval-ws",
-            "req-approval-ws",
-        );
-        assert_eq!(
-            ledger.get(&key),
-            Some(&serde_json::json!({
-                "approved": true,
-                "reason": "approved from ws",
-            }))
-        );
-        drop(ledger);
-
-        let metrics = state.metrics_registry().render_prometheus();
-        assert!(
-            metrics.contains(
-                "astra_interaction_approval_journal_lookup_total{event=\"required\",outcome=\"hit\"} 1"
-            ),
-            "{metrics}"
-        );
-        assert!(
-            metrics.contains("astra_interaction_approval_journal_write_total{outcome=\"ok\"} 1"),
-            "{metrics}"
-        );
-        assert!(
-            metrics
-                .contains("astra_interaction_approval_ledger_insert_total{outcome=\"inserted\"} 1"),
-            "{metrics}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn tool_approval_response_on_other_appstate_replays_from_journal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let callback_state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-        let waiter_state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-        let conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-approval-no-sticky".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-approval-no-sticky".into()),
-            bridge_prepared_run_id: None,
-        };
-
-        handle_tool_approval(
-            &callback_state,
-            &conn,
-            "req-approval-no-sticky",
-            false,
-            Some("not allowed here".into()),
-        )
-        .await;
-
-        let callback_key = astra_turn_core::edge_ledger::approval_callback_key(
-            "u1",
-            "sess-approval-no-sticky",
-            "run-approval-no-sticky",
-            "req-approval-no-sticky",
-        );
-        assert!(
-            callback_state
-                .edge_callback_ledger
-                .lock()
-                .await
-                .contains_key(&callback_key),
-            "callback pod may keep its same-pod wakeup entry"
-        );
-        assert!(
-            waiter_state.edge_callback_ledger.lock().await.is_empty(),
-            "waiter pod intentionally has no same-pod ledger entry"
-        );
-
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let gate =
-            astra_turn_core::ws_approval_gate::WebSocketApprovalGate::new_with_journal_context(
-                "u1".into(),
-                "sess-approval-no-sticky".into(),
-                "run-approval-no-sticky".into(),
-                Some(4),
-                waiter_state.edge_callback_ledger.clone(),
-                tx,
-            );
-        let decision = gate
-            .request_approval(
-                "req-approval-no-sticky",
-                "write_file",
-                &serde_json::json!({"path": "x"}),
-            )
-            .await;
-
-        match decision {
-            astra_tools::ApprovalDecision::Denied { reason } => {
-                assert_eq!(reason.as_deref(), Some("not allowed here"));
-            }
-            other => panic!("expected denied approval from journal, got {other:?}"),
-        }
-        assert!(
-            waiter_state.edge_callback_ledger.lock().await.is_empty(),
-            "journal replay should not require or populate waiter ledger"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn user_prompt_response_handler_persists_journal_and_local_ledger() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-        let conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-ws-journal".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-ws-journal".into()),
-            bridge_prepared_run_id: None,
-        };
-        let answers = AskUserAnswers {
-            answers: vec![astra_tools::AskUserQuestionAnswer {
-                question: "Continue?".into(),
-                answers: vec!["yes".into()],
-                multi_select: false,
-                annotation: None,
-            }],
-        };
-
-        handle_user_prompt_response(
-            &state,
-            &conn,
-            "req-ws-journal",
-            Some(answers.clone()),
-            false,
-        )
-        .await;
-
-        let journal_response =
-            astra_services::session_journal::find_latest_ask_user_response_for_run(
-                "sess-ws-journal",
-                "req-ws-journal",
-                "run-ws-journal",
-            )
-            .unwrap()
-            .expect("ask_user response should be durable for no-sticky replay");
-        assert_eq!(journal_response.status, "submitted");
-        assert_eq!(journal_response.run_id.as_deref(), Some("run-ws-journal"));
-        let durable_answers: AskUserAnswers =
-            serde_json::from_value(journal_response.answers.expect("durable answers")).unwrap();
-        assert_eq!(durable_answers, answers);
-
-        let ledger = state.edge_callback_ledger.lock().await;
-        let key = astra_turn_core::edge_ledger::user_prompt_callback_key(
-            "u1",
-            "sess-ws-journal",
-            "run-ws-journal",
-            "req-ws-journal",
-        );
-        assert_eq!(
-            serde_json::from_value::<AskUserAnswers>(
-                ledger
-                    .get(&key)
-                    .expect("local ledger should still wake same-pod waiters")["answers"]
-                    .clone()
-            )
-            .unwrap(),
-            answers
-        );
-        drop(ledger);
-
-        let metrics = state.metrics_registry().render_prometheus();
-        assert!(
-            metrics.contains(
-                "astra_interaction_ask_user_journal_write_total{event=\"response\",outcome=\"ok\"} 1"
-            ),
-            "{metrics}"
-        );
-        assert!(
-            metrics
-                .contains("astra_interaction_ask_user_ledger_insert_total{outcome=\"inserted\"} 1"),
-            "{metrics}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn user_prompt_response_missing_answers_is_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-        let conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-ws-missing-answers".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-ws-missing-answers".into()),
-            bridge_prepared_run_id: None,
-        };
-
-        handle_user_prompt_response(&state, &conn, "req-ws-missing-answers", None, false).await;
-
-        assert!(
-            state.edge_callback_ledger.lock().await.is_empty(),
-            "invalid ask_user responses must not wake waiters"
-        );
-        assert!(
-            astra_services::session_journal::find_latest_ask_user_response_for_run(
-                "sess-ws-missing-answers",
-                "req-ws-missing-answers",
-                "run-ws-missing-answers",
-            )
-            .unwrap()
-            .is_none(),
-            "invalid ask_user responses must not become durable"
-        );
-        let metrics = state.metrics_registry().render_prometheus();
-        assert!(
-            metrics.contains(
-                "astra_interaction_ask_user_journal_write_total{event=\"response\",outcome=\"missing_answers\"} 1"
-            ),
-            "{metrics}"
-        );
-        assert!(
-            metrics.contains(
-                "astra_interaction_ask_user_ledger_insert_total{outcome=\"invalid_payload\"} 1"
-            ),
-            "{metrics}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn user_prompt_response_without_connection_context_is_rejected() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-        let conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-ws-no-context".into()),
-            pending_session_id: None,
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-
-        handle_user_prompt_response(
-            &state,
-            &conn,
-            "req-ws-no-context",
-            Some(AskUserAnswers { answers: vec![] }),
-            false,
-        )
-        .await;
-
-        assert!(
-            state.edge_callback_ledger.lock().await.is_empty(),
-            "ask_user responses without an active run must not wake any waiter"
-        );
-        assert!(
-            astra_services::session_journal::find_latest_ask_user_response_for_run(
-                "sess-ws-no-context",
-                "req-ws-no-context",
-                "run-ws-no-context",
-            )
-            .unwrap()
-            .is_none(),
-            "ask_user responses without active run context must not become durable"
-        );
-        let metrics = state.metrics_registry().render_prometheus();
-        assert!(
-            metrics.contains(
-                "astra_interaction_ask_user_journal_write_total{event=\"response\",outcome=\"skipped_no_context\"} 1"
-            ),
-            "{metrics}"
-        );
-        assert!(
-            metrics.contains(
-                "astra_interaction_ask_user_ledger_insert_total{outcome=\"skipped_no_context\"} 1"
-            ),
-            "{metrics}"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn user_prompt_response_on_other_appstate_replays_from_journal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let callback_state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-        let waiter_state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-        let conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-ws-no-sticky".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-ws-no-sticky".into()),
-            bridge_prepared_run_id: None,
-        };
-        let answers = AskUserAnswers {
-            answers: vec![astra_tools::AskUserQuestionAnswer {
-                question: "Continue?".into(),
-                answers: vec!["yes".into()],
-                multi_select: false,
-                annotation: None,
-            }],
-        };
-
-        handle_user_prompt_response(
-            &callback_state,
-            &conn,
-            "req-ws-no-sticky",
-            Some(answers.clone()),
-            false,
-        )
-        .await;
-
-        let callback_key = astra_turn_core::edge_ledger::user_prompt_callback_key(
-            "u1",
-            "sess-ws-no-sticky",
-            "run-ws-no-sticky",
-            "req-ws-no-sticky",
-        );
-        assert!(
-            callback_state
-                .edge_callback_ledger
-                .lock()
-                .await
-                .contains_key(&callback_key),
-            "callback pod may keep its same-pod wakeup entry"
-        );
-        assert!(
-            waiter_state.edge_callback_ledger.lock().await.is_empty(),
-            "waiter pod intentionally has no same-pod ledger entry"
-        );
-
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let gate = astra_turn_core::ws_user_prompt_gate::WebSocketUserPromptGate::new(
-            "u1".into(),
-            "sess-ws-no-sticky".into(),
-            "run-ws-no-sticky".into(),
-            Some(4),
-            waiter_state.edge_callback_ledger.clone(),
-            tx,
-        );
-        let prompt = AskUserPrompt {
-            context: Some("Need confirmation".into()),
-            questions: vec![astra_tools::AskUserQuestion {
-                header: "Confirm".into(),
-                question: "Continue?".into(),
-                options: vec![
-                    astra_tools::AskUserChoice {
-                        label: "yes".into(),
-                        description: None,
-                        preview: None,
-                    },
-                    astra_tools::AskUserChoice {
-                        label: "no".into(),
-                        description: None,
-                        preview: None,
-                    },
-                ],
-                multi_select: false,
-                allow_freeform: false,
-            }],
-            timeout_ms: Some(200),
-        };
-
-        let decision = gate
-            .request_questionnaire("req-ws-no-sticky", &prompt)
-            .await;
-        assert_eq!(decision, astra_tools::AskUserDecision::Submitted(answers));
-        assert!(
-            waiter_state.edge_callback_ledger.lock().await.is_empty(),
-            "journal replay should not require or populate waiter ledger"
-        );
-    }
-
-    // ── ws_ledger_dedup_insert unit tests ──────────────────────────────────
-
-    #[test]
-    fn ws_ledger_dedup_insert_absent_key_inserts_and_returns_inserted() {
-        let mut ledger = std::collections::HashMap::new();
-        let outcome = ws_ledger_dedup_insert(
-            &mut ledger,
-            "user:req-1".to_string(),
-            serde_json::json!({"approved": true, "reason": null}),
-        );
-        assert_eq!(outcome, WsLedgerOutcome::Inserted);
-        assert_eq!(
-            ledger["user:req-1"],
-            serde_json::json!({"approved": true, "reason": null})
-        );
-    }
-
-    #[test]
-    fn ws_ledger_dedup_insert_identical_value_is_idempotent_replay() {
-        let mut ledger = std::collections::HashMap::new();
-        let value = serde_json::json!({"approved": true, "reason": null});
-        ledger.insert("user:req-1".to_string(), value.clone());
-
-        let outcome = ws_ledger_dedup_insert(&mut ledger, "user:req-1".to_string(), value.clone());
-        assert_eq!(outcome, WsLedgerOutcome::IdempotentReplay);
-        // original value unchanged
-        assert_eq!(ledger["user:req-1"], value);
-    }
-
-    #[test]
-    fn ws_ledger_dedup_insert_different_value_is_conflict_ignored_and_preserves_original() {
-        let mut ledger = std::collections::HashMap::new();
-        let original = serde_json::json!({"approved": true, "reason": null});
-        let conflicting = serde_json::json!({"approved": false, "reason": "changed mind"});
-        ledger.insert("user:req-1".to_string(), original.clone());
-
-        let outcome = ws_ledger_dedup_insert(&mut ledger, "user:req-1".to_string(), conflicting);
-        assert_eq!(outcome, WsLedgerOutcome::ConflictIgnored);
-        // original MUST NOT be overwritten
-        assert_eq!(
-            ledger["user:req-1"], original,
-            "conflicting update must not overwrite the first decision"
-        );
-    }
-
-    #[test]
-    fn ws_ledger_dedup_insert_rejects_new_key_when_full() {
-        let mut ledger = std::collections::HashMap::new();
-        for i in 0..astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES {
-            ledger.insert(format!("user:req-{i}"), serde_json::json!({"i": i}));
-        }
-
-        let outcome = ws_ledger_dedup_insert(
-            &mut ledger,
-            "user:req-new".to_string(),
-            serde_json::json!({"approved": true}),
-        );
-
-        assert_eq!(outcome, WsLedgerOutcome::CapacityExceeded);
-        assert!(
-            !ledger.contains_key("user:req-new"),
-            "full ledger must not accept new WS callback keys"
-        );
-        assert_eq!(
-            ledger.len(),
-            astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES
-        );
-    }
-
-    #[test]
-    fn ws_ledger_dedup_insert_allows_existing_key_when_full() {
-        let mut ledger = std::collections::HashMap::new();
-        for i in 0..astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES {
-            ledger.insert(format!("user:req-{i}"), serde_json::json!({"i": i}));
-        }
-        let value = serde_json::json!({"i": 0});
-
-        let outcome = ws_ledger_dedup_insert(&mut ledger, "user:req-0".to_string(), value.clone());
-
-        assert_eq!(outcome, WsLedgerOutcome::IdempotentReplay);
-        assert_eq!(ledger["user:req-0"], value);
-        assert_eq!(
-            ledger.len(),
-            astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES
-        );
     }
 
     #[test]

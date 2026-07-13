@@ -1,9 +1,7 @@
 //! TUI rendering for the Tier 1 session task board.
 //!
-//! Port of the reference TUI's `TaskListV2.tsx`. Takes a `&[SessionTask]` and
-//! produces `Vec<Line<'static>>` that callers merge into their own render
-//! region (mounted under chat_widget's standalone area and under the
-//! spinner's footer — see `docs/plans/tui-task-board.md` §3.3).
+//! Renders full current-session tasks and the smaller, truthful
+//! [`OpenTaskSummary`] projection used by cross-session views.
 //!
 //! Rendering rules (matching the reference TUI):
 //!
@@ -20,24 +18,14 @@
 //! - **Truncation** when `tasks.len() > maxDisplay`: prioritize
 //!   in-progress → pending (blocked last within pending) → completed;
 //!   append `· N more: M working, K queued, J done` when any tasks
-//!   are hidden. Recent-completed 30s TTL tracking is Phase 4.2.
+//!   are hidden. Recent-completed TTL state lives in the observer.
 //! - **Responsive subject truncation** gated behind available columns.
-//!
-//! Phase 4.1 explicitly skips:
-//!
-//! - Owner badge (`(@agent)`) — depends on active-teammate tracking in
-//!   TUI state that we don't expose yet.
-//! - Activity line (rolled-up recent tool calls) — depends on the same.
-//! - Recent-completed prioritization with 30s TTL — widget is stateless
-//!   here; the observer tracks completion timestamps in Phase 4.2.
 
-use astra_tools::task_mgmt::SessionTask;
+use astra_tools::task_mgmt::{OpenTaskSummary, SessionTask, SessionTaskStatusKind};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::collections::HashSet;
 use unicode_width::UnicodeWidthStr;
-
-use astra_tools::task_mgmt::SessionTaskStatusKind;
 
 const TASK_BOARD_TOGGLE_HINT: &str = " · Ctrl+T toggle";
 
@@ -53,6 +41,18 @@ pub(crate) struct TaskBoardColors {
     /// Dim foreground used for pending icons, blocked-by badges, and
     /// the hidden-summary line (mirrors `theme.dim`).
     pub dim: Color,
+    /// Paused/cancelled icon foreground (mirrors `theme.warn`).
+    pub warn: Color,
+    /// Failed icon foreground (mirrors `theme.error`).
+    pub error: Color,
+}
+
+/// Full task-list render metadata for canvases that own keyboard focus and
+/// scrolling. The row identity is carried structurally from `SessionTask.id`;
+/// callers never recover it by searching rendered text.
+pub(crate) struct TaskListRender {
+    pub lines: Vec<Line<'static>>,
+    pub selected_line_index: Option<usize>,
 }
 
 impl TaskBoardColors {
@@ -63,6 +63,8 @@ impl TaskBoardColors {
             accent: t.accent,
             success: t.success,
             dim: t.dim,
+            warn: t.warn,
+            error: t.error,
         }
     }
 
@@ -74,6 +76,8 @@ impl TaskBoardColors {
             accent: theme.accent,
             success: theme.success,
             dim: theme.dim,
+            warn: theme.warn,
+            error: theme.error,
         }
     }
 }
@@ -88,14 +92,14 @@ fn status_icon_and_color(
     match status {
         SessionTaskStatusKind::Completed => ("✔", colors.success),
         SessionTaskStatusKind::InProgress => ("•", colors.accent),
-        SessionTaskStatusKind::Paused => ("⏸", Color::Yellow),
+        SessionTaskStatusKind::Paused => ("⏸", colors.warn),
         SessionTaskStatusKind::Pending
         | SessionTaskStatusKind::Archived
         | SessionTaskStatusKind::Deleted
         | SessionTaskStatusKind::Migrated
         | SessionTaskStatusKind::Other => ("◻", colors.dim),
-        SessionTaskStatusKind::Failed => ("✖", Color::Red),
-        SessionTaskStatusKind::Cancelled => ("■", Color::Yellow),
+        SessionTaskStatusKind::Failed => ("✖", colors.error),
+        SessionTaskStatusKind::Cancelled => ("■", colors.warn),
     }
 }
 
@@ -146,6 +150,22 @@ fn owner_badge(task: &SessionTask) -> Option<String> {
     }
     let owner = owner.strip_prefix('@').unwrap_or(owner);
     Some(format!(" (@{})", truncate_to_width(owner, 14)))
+}
+
+/// Display provenance only when both the stable row namespace and typed
+/// metadata agree. Ordinary task metadata is user/model supplied, so metadata
+/// alone must never let a checklist row impersonate a durable plan step.
+fn source_badge(task: &SessionTask) -> Option<&'static str> {
+    let source = task
+        .metadata
+        .as_ref()?
+        .get("source")?
+        .as_str()
+        .map(str::trim)?;
+    match (task.id.starts_with("plan:"), source) {
+        (true, "plan") => Some(" [plan]"),
+        _ => None,
+    }
 }
 
 /// Truncate a string to fit within `max_cols` display columns, adding a
@@ -271,7 +291,7 @@ fn sort_by_id_asc(mut tasks: Vec<&SessionTask>) -> Vec<&SessionTask> {
 
 /// Order `tasks` by the reference TUI's display priority:
 /// in_progress → pending (open blockers last) → paused → completed →
-/// failed/unknown diagnostics. Tombstones (archived/deleted/migrated)
+/// cancelled/failed/unknown diagnostics. Tombstones (archived/deleted/migrated)
 /// are audit rows and never belong on the live task board.
 fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec<&'a SessionTask> {
     let in_progress = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_in_progress()).collect());
@@ -299,12 +319,15 @@ fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec
             .collect(),
     );
     let completed = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_completed()).collect());
-    // Cancelled tasks are intentionally excluded from the task board display:
-    // the user cancelled them, so they shouldn't clutter the view.
     let terminal = sort_by_id_asc(
         tasks
             .iter()
-            .filter(|t| matches!(t.status, SessionTaskStatusKind::Failed))
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    SessionTaskStatusKind::Cancelled | SessionTaskStatusKind::Failed
+                )
+            })
             .collect(),
     );
     let diagnostics = sort_by_id_asc(
@@ -334,14 +357,18 @@ fn render_task_line(
     let is_in_progress = task.status.is_in_progress();
     let is_blocked = !open_blockers.is_empty();
 
+    let source_badge = source_badge(task);
     let owner_badge = owner_badge(task);
     let subject = truncate_to_width(
         &task.title,
         max_subject_width(columns).saturating_sub(
-            owner_badge
-                .as_deref()
+            source_badge
                 .map(unicode_width::UnicodeWidthStr::width)
-                .unwrap_or(0),
+                .unwrap_or(0)
+                + owner_badge
+                    .as_deref()
+                    .map(unicode_width::UnicodeWidthStr::width)
+                    .unwrap_or(0),
         ),
     );
 
@@ -375,6 +402,13 @@ fn render_task_line(
         subject_style = subject_style.add_modifier(Modifier::DIM);
     }
     spans.push(Span::styled(subject, subject_style));
+
+    if let Some(source_badge) = source_badge {
+        spans.push(Span::styled(
+            source_badge,
+            Style::default().fg(colors.dim).add_modifier(Modifier::DIM),
+        ));
+    }
 
     if let Some(owner_badge) = owner_badge {
         spans.push(Span::styled(
@@ -570,77 +604,30 @@ pub(crate) fn render_with_fresh_predicate<F>(
     columns: u16,
     rows: u16,
     standalone: bool,
-    mut is_fresh: F,
+    is_fresh: F,
 ) -> Vec<Line<'static>>
 where
     F: FnMut(&str) -> bool,
 {
-    let mut lines = render_with_colors(
+    render_with_colors_and_fresh_predicate(
         tasks,
         columns,
-        rows,
+        max_display(rows),
         standalone,
         TaskBoardColors::from_theme(),
-    );
-    // Row positions aren't directly keyed by task id, so the
-    // simplest safe approach is to re-scan the same prioritized
-    // order the renderer used and flip ↺ glyph in for any row whose
-    // title matches a fresh id's title. The renderer doesn't expose
-    // the mapping, so we do a lightweight second pass that finds
-    // lines matching fresh task titles and prepends a flash marker.
-    //
-    // This is deliberately conservative: we never reshape an
-    // existing line's layout, just swap the two-space pad before
-    // the bullet for a ↺ glyph tinted accent.
-    let theme = crate::tui::theme::current();
-    let flash_color = theme.accent;
-    for task in tasks.iter().filter(|task| task_is_renderable(task)) {
-        if !is_fresh(&task.id) {
-            continue;
-        }
-        for line in lines.iter_mut() {
-            // A task row starts with the status-icon span — "✔ " /
-            // "◼ " / "◻ " / "· ". Inspect the first span to avoid
-            // accidentally matching the summary header line ("N
-            // tasks (K done, …)") which also contains titles later.
-            let first_text = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
-            let is_task_row = first_text == "✔ "
-                || first_text == "• "
-                || first_text == "◻ "
-                || first_text == "· "
-                || first_text == "⏸ "
-                || first_text == "✖ "
-                || first_text == "■ ";
-            if !is_task_row {
-                continue;
-            }
-            let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            if joined.contains(&task.title) {
-                // Prepend a flash glyph. Keeps existing spans intact
-                // so colours/modifiers on the icon + title don't drift.
-                line.spans.insert(
-                    0,
-                    Span::styled(
-                        "↻ ",
-                        Style::default()
-                            .fg(flash_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                );
-                break;
-            }
-        }
-    }
-    lines
+        is_fresh,
+        None,
+    )
+    .lines
 }
 
-/// Cross-session render. Walks the `per_session` vec (as produced by
-/// [`TaskStore::load_all_sessions`]) and emits a dim header row per
+/// Cross-session render. Walks the `per_session` vec produced by
+/// `TaskStore::load_open_task_summaries` and emits a dim header row per
 /// session followed by that session's active tasks. Returns empty
 /// when every session is empty of active work or when the terminal
 /// is too short to fit any tasks.
 pub fn render_multi(
-    per_session: &[(String, Vec<SessionTask>)],
+    per_session: &[(String, Vec<OpenTaskSummary>)],
     columns: u16,
     rows: u16,
 ) -> Vec<Line<'static>> {
@@ -648,15 +635,38 @@ pub fn render_multi(
 }
 
 pub fn render_multi_with_colors(
-    per_session: &[(String, Vec<SessionTask>)],
+    per_session: &[(String, Vec<OpenTaskSummary>)],
     columns: u16,
     rows: u16,
+    colors: TaskBoardColors,
+) -> Vec<Line<'static>> {
+    render_multi_with_colors_and_cap(per_session, columns, max_display(rows), colors)
+}
+
+/// Render every already-fetched cross-session row. This is for the primary
+/// task-board canvas, which owns scrolling; compact chat deliberately remains
+/// bounded by terminal height through [`render_multi`].
+pub(crate) fn render_multi_full(
+    per_session: &[(String, Vec<OpenTaskSummary>)],
+    columns: u16,
+) -> Vec<Line<'static>> {
+    render_multi_with_colors_and_cap(
+        per_session,
+        columns,
+        usize::MAX,
+        TaskBoardColors::from_theme(),
+    )
+}
+
+fn render_multi_with_colors_and_cap(
+    per_session: &[(String, Vec<OpenTaskSummary>)],
+    columns: u16,
+    total_cap: usize,
     colors: TaskBoardColors,
 ) -> Vec<Line<'static>> {
     // Reuse the single-session capacity formula per session: we
     // render a header line + up to N task lines per group, and cut
     // the list once we've burned our total row budget.
-    let total_cap = max_display(rows);
     if total_cap == 0 {
         return Vec::new();
     }
@@ -674,7 +684,8 @@ pub fn render_multi_with_colors(
         // across sessions are not actionable and would clutter the
         // cross-session overview. The single-session board still
         // shows its own completed history.
-        let active: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_open_work()).collect();
+        let active: Vec<&OpenTaskSummary> =
+            tasks.iter().filter(|t| t.status.is_open_work()).collect();
         if active.is_empty() {
             continue;
         }
@@ -772,6 +783,63 @@ pub fn render_with_colors(
     standalone: bool,
     colors: TaskBoardColors,
 ) -> Vec<Line<'static>> {
+    render_with_colors_and_fresh_predicate(
+        tasks,
+        columns,
+        max_display(rows),
+        standalone,
+        colors,
+        |_| false,
+        None,
+    )
+    .lines
+}
+
+/// Render every already-fetched task row. The primary task board owns the
+/// viewport, so compact-list row caps must not hide work from navigation.
+pub(crate) fn render_full(
+    tasks: &[SessionTask],
+    columns: u16,
+    standalone: bool,
+) -> Vec<Line<'static>> {
+    render_full_focused(tasks, columns, standalone, None).lines
+}
+
+/// Primary-canvas variant that carries the stable focused task identity into
+/// rendering. The task board owns selection; this renderer only paints the
+/// corresponding row and never infers focus from title text.
+pub(crate) fn render_full_focused(
+    tasks: &[SessionTask],
+    columns: u16,
+    standalone: bool,
+    selected_task_id: Option<&str>,
+) -> TaskListRender {
+    render_with_colors_and_fresh_predicate(
+        tasks,
+        columns,
+        tasks.len(),
+        standalone,
+        TaskBoardColors::from_theme(),
+        |_| false,
+        selected_task_id,
+    )
+}
+
+/// Render the board with an identity-based freshness overlay.  The overlay
+/// belongs in this structural rendering pass: matching rendered text would be
+/// ambiguous for tasks with the same title and couples state to presentation.
+fn render_with_colors_and_fresh_predicate<F>(
+    tasks: &[SessionTask],
+    columns: u16,
+    task_cap: usize,
+    standalone: bool,
+    colors: TaskBoardColors,
+    mut is_fresh: F,
+    selected_task_id: Option<&str>,
+) -> TaskListRender
+where
+    F: FnMut(&str) -> bool,
+{
     let filtered_tasks;
     let tasks = if tasks.iter().all(task_is_renderable) {
         tasks
@@ -779,9 +847,12 @@ pub fn render_with_colors(
         filtered_tasks = renderable_tasks(tasks);
         filtered_tasks.as_slice()
     };
-    let cap = max_display(rows);
+    let cap = task_cap;
     if cap == 0 || tasks.is_empty() {
-        return Vec::new();
+        return TaskListRender {
+            lines: Vec::new(),
+            selected_line_index: None,
+        };
     }
     let counts = counts(tasks);
     let unresolved: HashSet<String> = tasks
@@ -800,6 +871,7 @@ pub fn render_with_colors(
     };
 
     let mut out: Vec<Line<'static>> = Vec::with_capacity(visible.len() + 2);
+    let mut selected_line_index = None;
 
     if standalone {
         let mut header_spans: Vec<Span<'static>> = Vec::new();
@@ -929,7 +1001,31 @@ pub fn render_with_colors(
             .filter(|id| unresolved.contains(*id))
             .cloned()
             .collect();
-        out.push(render_task_line(task, &open_blockers, columns, colors));
+        let mut task_line = render_task_line(task, &open_blockers, columns, colors);
+        if is_fresh(&task.id) {
+            task_line.spans.insert(
+                0,
+                Span::styled(
+                    "↻ ",
+                    Style::default()
+                        .fg(colors.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
+        }
+        if selected_task_id == Some(task.id.as_str()) {
+            selected_line_index = Some(out.len());
+            task_line.spans.insert(
+                0,
+                Span::styled(
+                    "› ",
+                    Style::default()
+                        .fg(colors.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
+        }
+        out.push(task_line);
         // Per-parent cap (keeps one runaway parent from monopolising
         // the global budget) plus the global cap above. reference-agent
         // shows every subtask inline; we cap to keep terminal layout
@@ -958,7 +1054,10 @@ pub fn render_with_colors(
     if let Some(summary) = render_hidden_summary(&hidden) {
         out.push(summary);
     }
-    out
+    TaskListRender {
+        lines: out,
+        selected_line_index,
+    }
 }
 
 /// One-line "compact" summary used as the default board view while the
@@ -1009,7 +1108,7 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
     let icon_color = if counts.in_progress > 0 {
         theme.accent
     } else if counts.paused > 0 {
-        Color::Yellow
+        theme.warn
     } else if counts.completed == total {
         theme.success
     } else {
@@ -1093,6 +1192,90 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
     Some(Line::from(spans))
 }
 
+/// One-line summary for the typed cross-session projection. Unlike the
+/// full-task variant, this never implies that omitted history or subtasks were
+/// loaded; it reports only the open rows the server confirmed.
+pub fn render_collapsed_multi_summary(
+    tasks: &[OpenTaskSummary],
+    columns: u16,
+) -> Option<Line<'static>> {
+    let tasks: Vec<&OpenTaskSummary> = tasks
+        .iter()
+        .filter(|task| task.status.is_open_work())
+        .collect();
+    if tasks.is_empty() {
+        return None;
+    }
+    let counts = tasks
+        .iter()
+        .fold(TaskStatusCounts::default(), |mut counts, task| {
+            match task.status {
+                SessionTaskStatusKind::InProgress => counts.in_progress += 1,
+                SessionTaskStatusKind::Pending => counts.pending += 1,
+                SessionTaskStatusKind::Paused => counts.paused += 1,
+                _ => {}
+            }
+            counts
+        });
+    let current_task = tasks
+        .iter()
+        .find(|task| task.status.is_in_progress())
+        .or_else(|| tasks.iter().find(|task| task.status.is_pending()))
+        .or_else(|| tasks.first())
+        .copied();
+    let theme = crate::tui::theme::current();
+    let (icon, icon_color) = if counts.in_progress > 0 {
+        ("•", theme.accent)
+    } else if counts.paused > 0 {
+        ("⏸", theme.warn)
+    } else {
+        ("·", theme.dim)
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!("{icon} "),
+            Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("Tasks", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " · all sessions",
+            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
+        ),
+    ];
+    for (count, label) in [
+        (counts.in_progress, "working"),
+        (counts.pending, "queued"),
+        (counts.paused, "paused"),
+    ] {
+        if count > 0 {
+            spans.push(Span::styled(
+                format!(" · {count} {label}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+    if let Some(task) = current_task {
+        let used: usize = spans.iter().map(|span| span.content.width()).sum();
+        let separator = " · ";
+        let title_budget = (columns as usize).saturating_sub(used + separator.width());
+        if title_budget > 0 {
+            spans.push(Span::styled(
+                separator,
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            spans.push(Span::raw(truncate_to_width(&task.title, title_budget)));
+        }
+    }
+    let used: usize = spans.iter().map(|span| span.content.width()).sum();
+    if used + TASK_BOARD_TOGGLE_HINT.width() <= columns as usize {
+        spans.push(Span::styled(
+            TASK_BOARD_TOGGLE_HINT,
+            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
+        ));
+    }
+    Some(Line::from(spans))
+}
+
 /// One-line "Focus · <subject>" nudge for use when `expanded_view` is not
 /// `Tasks` but a task is in flight. Matches the reference TUI's Spinner
 /// fallback at `components/Spinner.tsx:296`.
@@ -1139,6 +1322,15 @@ mod tests {
             metadata: None,
             blocks: vec![],
             blocked_by: vec![],
+        }
+    }
+
+    fn mk_summary(id: &str, title: &str, status: &str) -> OpenTaskSummary {
+        OpenTaskSummary {
+            id: id.into(),
+            title: title.into(),
+            status: status.into(),
+            updated_at: "now".into(),
         }
     }
 
@@ -1221,6 +1413,30 @@ mod tests {
     }
 
     #[test]
+    fn durable_plan_rows_are_visibly_distinct_from_checklist_rows() {
+        let mut task = mk_task("plan:plan-7:step-1", "migrate state", "in_progress");
+        task.metadata = Some(serde_json::Map::from_iter([(
+            "source".to_string(),
+            serde_json::Value::String("plan".to_string()),
+        )]));
+
+        let line = render_task_line(&task, &[], 80, TaskBoardColors::from_theme());
+        assert!(spans_text(&line).contains("[plan]"));
+    }
+
+    #[test]
+    fn checklist_metadata_cannot_spoof_a_durable_plan_row() {
+        let mut task = mk_task("task-1", "ordinary checklist", "pending");
+        task.metadata = Some(serde_json::Map::from_iter([(
+            "source".to_string(),
+            serde_json::Value::String("plan".to_string()),
+        )]));
+
+        let line = render_task_line(&task, &[], 80, TaskBoardColors::from_theme());
+        assert!(!spans_text(&line).contains("[plan]"));
+    }
+
+    #[test]
     fn priority_order_is_in_progress_then_pending_then_paused_then_completed() {
         let tasks = vec![
             mk_task("task-1", "first-completed", "completed"),
@@ -1265,9 +1481,7 @@ mod tests {
         let summary = spans_text(lines.last().expect("hidden summary"));
         assert!(summary.contains("1 paused"), "summary: {summary}");
         assert!(summary.contains("1 failed"), "summary: {summary}");
-        // Cancelled tasks are intentionally excluded from the board rather than
-        // summarized as hidden work.
-        assert!(!summary.contains("cancelled"), "summary: {summary}");
+        assert!(summary.contains("1 cancelled"), "summary: {summary}");
         assert!(!summary.contains("working"), "summary: {summary}");
     }
 
@@ -1618,7 +1832,7 @@ mod tests {
         // the row budget isn't burned on dim history.
         let input = vec![(
             "sess-done".to_string(),
-            vec![mk_task("task-1", "finished", "completed")],
+            vec![mk_summary("task-1", "finished", "completed")],
         )];
         let out = render_multi_with_colors(&input, 80, 40, fixture_colors());
         assert!(
@@ -1633,10 +1847,10 @@ mod tests {
         let input = vec![(
             "0123456789ab".to_string(),
             vec![
-                mk_task("task-1", "open one", "pending"),
-                mk_task("task-2", "done one", "completed"),
-                mk_task("task-3", "busy one", "in_progress"),
-                mk_task("task-4", "paused one", "paused"),
+                mk_summary("task-1", "open one", "pending"),
+                mk_summary("task-2", "done one", "completed"),
+                mk_summary("task-3", "busy one", "in_progress"),
+                mk_summary("task-4", "paused one", "paused"),
             ],
         )];
         let out = render_multi_with_colors(&input, 80, 40, fixture_colors());
@@ -1669,15 +1883,15 @@ mod tests {
             (
                 "sess-a".to_string(),
                 vec![
-                    mk_task("a1", "a1", "pending"),
-                    mk_task("a2", "a2", "pending"),
+                    mk_summary("a1", "a1", "pending"),
+                    mk_summary("a2", "a2", "pending"),
                 ],
             ),
             (
                 "sess-b".to_string(),
                 vec![
-                    mk_task("b1", "b1", "pending"),
-                    mk_task("b2", "b2", "pending"),
+                    mk_summary("b1", "b1", "pending"),
+                    mk_summary("b2", "b2", "pending"),
                 ],
             ),
         ];
@@ -1695,8 +1909,29 @@ mod tests {
     }
 
     #[test]
+    fn render_multi_full_leaves_viewport_paging_to_the_primary_board() {
+        let input = vec![(
+            "sess-full".to_string(),
+            (1..=12)
+                .map(|id| mk_summary(&format!("task-{id}"), &format!("row-{id:02}"), "pending"))
+                .collect(),
+        )];
+
+        let out = render_multi_full(&input, 80);
+        assert_eq!(
+            out.len(),
+            13,
+            "header plus every open task must be available"
+        );
+        assert!(
+            spans_text(out.last().expect("last task row")).contains("row-12"),
+            "the primary board, not compact chat, owns paging"
+        );
+    }
+
+    #[test]
     fn render_multi_empty_when_terminal_too_short() {
-        let input = vec![("sess".to_string(), vec![mk_task("a1", "a", "pending")])];
+        let input = vec![("sess".to_string(), vec![mk_summary("a1", "a", "pending")])];
         let out = render_multi_with_colors(&input, 80, 8, fixture_colors());
         assert!(
             out.is_empty(),
@@ -1706,6 +1941,29 @@ mod tests {
 
     // ── render_with_fresh: just-changed row flash ────────────────
 
+    // Collapsed cross-session projection.
+    #[test]
+    fn collapsed_multi_summary_reports_only_confirmed_open_projection() {
+        let tasks = vec![
+            mk_summary("task-1", "current remote work", "in_progress"),
+            mk_summary("task-2", "later remote work", "pending"),
+            mk_summary("task-3", "paused remote work", "paused"),
+            mk_summary("task-4", "historical row", "completed"),
+        ];
+        let line = render_collapsed_multi_summary(&tasks, 120).expect("summary");
+        let text = spans_text(&line);
+        assert!(text.contains("all sessions"), "{text}");
+        assert!(text.contains("1 working"), "{text}");
+        assert!(text.contains("1 queued"), "{text}");
+        assert!(text.contains("1 paused"), "{text}");
+        assert!(text.contains("current remote work"), "{text}");
+        assert!(
+            !text.contains("done") && !text.contains("historical row"),
+            "the open summary must not imply unloaded history: {text}"
+        );
+    }
+
+    // Render-with-fresh just-changed row flash.
     #[test]
     fn render_with_fresh_marks_matching_row_with_flash_glyph() {
         let tasks = vec![
@@ -1761,6 +2019,45 @@ mod tests {
                 .iter()
                 .any(|t| t.contains("↻") && t.contains("cool feature")),
             "predicate path must not mark non-matching tasks: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn fresh_marker_uses_task_identity_when_titles_are_duplicated() {
+        let mut first = mk_task("task-1", "review migration", "in_progress");
+        first.owner = Some("alpha".into());
+        let mut second = mk_task("task-2", "review migration", "pending");
+        second.owner = Some("beta".into());
+
+        let lines = render_with_fresh_predicate(&[first, second], 100, 40, true, |task_id| {
+            task_id == "task-2"
+        });
+        let row_for_owner = |owner: &str| {
+            lines
+                .iter()
+                .find(|line| {
+                    line.spans
+                        .iter()
+                        .any(|span| span.content.as_ref() == format!(" (@{owner})"))
+                })
+                .expect("task row for owner")
+        };
+
+        assert_ne!(
+            row_for_owner("alpha")
+                .spans
+                .first()
+                .map(|span| span.content.as_ref()),
+            Some("↻ "),
+            "the non-fresh duplicate-title row must stay unmarked"
+        );
+        assert_eq!(
+            row_for_owner("beta")
+                .spans
+                .first()
+                .map(|span| span.content.as_ref()),
+            Some("↻ "),
+            "the fresh duplicate-title row must be marked by its stable ID"
         );
     }
 }

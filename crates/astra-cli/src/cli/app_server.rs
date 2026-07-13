@@ -337,14 +337,15 @@ async fn run_turn(
         .and_then(Value::as_str)
         .map(str::to_string)
         .or(ctx.default_model.clone());
-    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stream_tx, mut stream_rx) = crate::cli::chat_stream::stream_event_channel();
     let event_writer = writer.clone();
     let event_task = tokio::spawn(async move {
         while let Some(event) = stream_rx.recv().await {
             let _ = write_stream_notification(&event_writer, event).await;
         }
     });
-    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (approval_tx, mut approval_rx) =
+        tokio::sync::mpsc::channel(crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY);
     let approval_writer = writer.clone();
     let approval_state = state.clone();
     let approval_thread_id = thread_id.clone();
@@ -829,6 +830,22 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
             "turn/explain",
             serde_json::json!({"format": "dag", "text": text}),
         )),
+        StreamEvent::UserIntentApplied {
+            intent_id,
+            delivery,
+            status,
+            event_index,
+            content,
+        } => Some((
+            "turn/userIntentApplied",
+            serde_json::json!({
+                "intentId": intent_id,
+                "delivery": delivery,
+                "status": status,
+                "eventIndex": event_index,
+                "content": content,
+            }),
+        )),
         _ => None,
     }
 }
@@ -1071,6 +1088,24 @@ mod tests {
         assert_eq!(method, "turn/explain");
         assert_eq!(params["format"], "dag");
         assert_eq!(params["text"], "Explain Analyze DAG — turn-1");
+    }
+
+    #[test]
+    fn stream_event_notification_maps_run_input_identity() {
+        let (method, params) = stream_event_notification(&StreamEvent::UserIntentApplied {
+            intent_id: "input-3".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::Applied,
+            event_index: 3,
+            content: "use the failing test first".into(),
+        })
+        .expect("notification");
+        assert_eq!(method, "turn/userIntentApplied");
+        assert_eq!(params["intentId"], "input-3");
+        assert_eq!(params["delivery"], "guide_current_run");
+        assert_eq!(params["status"], "applied");
+        assert_eq!(params["eventIndex"], 3);
+        assert_eq!(params["content"], "use the failing test first");
     }
 
     #[tokio::test]

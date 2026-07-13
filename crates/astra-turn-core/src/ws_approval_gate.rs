@@ -16,7 +16,8 @@ use tokio::sync::mpsc;
 
 use astra_services::InteractionStatus;
 use astra_services::session_journal::{
-    ApprovalJournalDecision, JournalEvent, JournalWriter, find_latest_approval_decision_for_run,
+    ApprovalDecisionAppendOutcome, ApprovalJournalDecision, JournalEvent, JournalWriter,
+    append_approval_decision_for_run_if_absent, find_latest_approval_decision_for_run,
 };
 use astra_tools::{APPROVAL_REQUIRED_TOOLS, ApprovalDecision, ToolApprovalGate};
 
@@ -36,11 +37,25 @@ pub struct ApprovalOutboundRequest {
     pub args: Value,
 }
 
+/// Run-scoped durable identity for an approval interaction.
+///
+/// The journal and callback ledger use this exact scope so a response for one
+/// run can never satisfy a similarly named request in another run.
 #[derive(Debug, Clone)]
-struct ApprovalJournalContext {
-    session_id: String,
-    run_id: String,
-    turn: Option<u32>,
+pub struct ApprovalJournalContext {
+    pub session_id: String,
+    pub run_id: String,
+    pub turn: Option<u32>,
+}
+
+impl ApprovalJournalContext {
+    pub fn new(session_id: String, run_id: String, turn: Option<u32>) -> Self {
+        Self {
+            session_id,
+            run_id,
+            turn,
+        }
+    }
 }
 
 /// [`ToolApprovalGate`] implementation backed by WebSocket messaging.
@@ -114,11 +129,10 @@ fn decision_from_journal_approval(
     let contract = decision.interaction_contract(&context.session_id, None)?;
     match contract.status {
         InteractionStatus::Pending => None,
-        InteractionStatus::Expired | InteractionStatus::Cancelled => {
-            Some(ApprovalDecision::Denied {
-                reason: Some(format!("Approval {}", decision.decision)),
-            })
-        }
+        InteractionStatus::Expired => Some(ApprovalDecision::Timeout),
+        InteractionStatus::Cancelled => Some(ApprovalDecision::Denied {
+            reason: Some(format!("Approval {}", decision.decision)),
+        }),
         InteractionStatus::Resolved => Some(decision_from_approval_fields(
             &decision.decision,
             decision.reason,
@@ -149,38 +163,124 @@ fn decision_from_approval_value(value: Value) -> ApprovalDecision {
     }
 }
 
-fn append_approval_required_journal_event(
+/// Persist the fact that a run is waiting for a specific approval.
+///
+/// This must happen before a detached client is allowed to resolve the
+/// request through the durable callback endpoint.  Callers decide how to
+/// project a persistence failure into their own run state; silently waiting
+/// without this fact would make the interaction unrecoverable after restart.
+pub fn persist_approval_required(
     context: &ApprovalJournalContext,
     request_id: &str,
     tool_name: &str,
-) -> bool {
-    match JournalWriter::new(&context.session_id).and_then(|writer| {
-        writer.append(&JournalEvent::approval_required_for_run(
-            Some(&context.session_id),
-            context.turn,
-            request_id,
-            Some(&context.run_id),
-            tool_name,
-            APPROVAL_KIND_STANDARD,
-            None,
-        ))
-    }) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
-                target: "astra_turn_core::ws_approval_gate",
-                session_id = %context.session_id,
-                run_id = %context.run_id,
-                request_id = %request_id,
-                error = %error,
-                "failed to persist approval required journal event"
-            );
-            false
+) -> std::io::Result<()> {
+    JournalWriter::new(&context.session_id)?.append(&JournalEvent::approval_required_for_run(
+        Some(&context.session_id),
+        context.turn,
+        request_id,
+        Some(&context.run_id),
+        tool_name,
+        APPROVAL_KIND_STANDARD,
+        None,
+    ))
+}
+
+/// Result of atomically closing an approval at its deadline.
+#[derive(Debug)]
+pub enum ApprovalDeadlineClose {
+    TimedOut,
+    Resolved(ApprovalDecision),
+}
+
+fn decision_from_terminal_journal_entry(
+    decision: ApprovalJournalDecision,
+    context: &ApprovalJournalContext,
+) -> std::io::Result<ApprovalDecision> {
+    decision_from_journal_approval(decision.clone(), context).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "approval decision {} for request {} is not terminal",
+                decision.decision, decision.request_id
+            ),
+        )
+    })
+}
+
+/// Atomically make an approval deadline terminal.
+///
+/// A timeout is not merely telemetry: after the executor has moved on, a
+/// late `allow` must not become a second terminal fact for the same request.
+/// The decision append owns that idempotency boundary; the separate timeout
+/// event remains an audit record for timeline and diagnostics.
+pub fn close_approval_at_deadline(
+    context: &ApprovalJournalContext,
+    request_id: &str,
+    tool_name: &str,
+) -> std::io::Result<ApprovalDeadlineClose> {
+    let outcome = append_approval_decision_for_run_if_absent(
+        &context.session_id,
+        context.turn,
+        request_id,
+        &context.run_id,
+        Some(tool_name),
+        Some(APPROVAL_KIND_STANDARD),
+        "timeout",
+        Some("approval deadline elapsed"),
+    )?;
+    match outcome {
+        ApprovalDecisionAppendOutcome::Appended => {
+            if let Err(error) = JournalWriter::new(&context.session_id).and_then(|writer| {
+                writer.append(&JournalEvent::approval_timeout_for_run(
+                    Some(&context.session_id),
+                    context.turn,
+                    request_id,
+                    Some(&context.run_id),
+                    tool_name,
+                    APPROVAL_KIND_STANDARD,
+                ))
+            }) {
+                // The durable terminal decision has already committed.  Do
+                // not reopen the interaction because its secondary audit row
+                // could not be appended; make the degraded audit explicit.
+                tracing::warn!(
+                    target: "astra_turn_core::ws_approval_gate",
+                    session_id = %context.session_id,
+                    run_id = %context.run_id,
+                    request_id,
+                    error = %error,
+                    "approval deadline committed but timeout audit append failed"
+                );
+            }
+            Ok(ApprovalDeadlineClose::TimedOut)
         }
+        ApprovalDecisionAppendOutcome::Idempotent => {
+            let decision = find_latest_approval_decision_for_run(
+                &context.session_id,
+                request_id,
+                &context.run_id,
+            )?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "idempotent approval deadline close has no stored decision",
+                )
+            })?;
+            Ok(ApprovalDeadlineClose::Resolved(
+                decision_from_terminal_journal_entry(decision, context)?,
+            ))
+        }
+        ApprovalDecisionAppendOutcome::Conflict(decision) => Ok(ApprovalDeadlineClose::Resolved(
+            decision_from_terminal_journal_entry(decision, context)?,
+        )),
     }
 }
 
-async fn wait_approval_response(
+/// Await an approval from either the local callback ledger or its durable
+/// journal representation.  This is intentionally transport-neutral: a
+/// WebSocket client, an Edge callback, and a reconnecting Server Only client
+/// all resolve the same run-scoped interaction.
+pub async fn wait_for_durable_approval_response(
     ledger: &Arc<TokioMutex<HashMap<String, Value>>>,
     user_id: &str,
     context: &ApprovalJournalContext,
@@ -261,7 +361,16 @@ impl ToolApprovalGate for WebSocketApprovalGate {
                 reason: Some("WebSocket connection closed".into()),
             };
         }
-        let _ = append_approval_required_journal_event(context, request_id, tool_name);
+        if let Err(error) = persist_approval_required(context, request_id, tool_name) {
+            tracing::warn!(
+                target: "astra_turn_core::ws_approval_gate",
+                session_id = %context.session_id,
+                run_id = %context.run_id,
+                request_id = %request_id,
+                error = %error,
+                "failed to persist approval required journal event"
+            );
+        }
 
         // Wait for the client's response via the same-pod ledger or durable journal.
         let key = approval_callback_key(
@@ -270,7 +379,7 @@ impl ToolApprovalGate for WebSocketApprovalGate {
             &context.run_id,
             request_id,
         );
-        let outcome = wait_approval_response(
+        let outcome = wait_for_durable_approval_response(
             &self.edge_callback_ledger,
             &self.user_id,
             context,
@@ -300,7 +409,26 @@ impl ToolApprovalGate for WebSocketApprovalGate {
                         "no approval response observed before timeout; pending key cleared"
                     );
                 }
-                ApprovalDecision::Timeout
+                match close_approval_at_deadline(context, request_id, tool_name) {
+                    Ok(ApprovalDeadlineClose::TimedOut) => ApprovalDecision::Timeout,
+                    Ok(ApprovalDeadlineClose::Resolved(decision)) => decision,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "astra_turn_core::ws_approval_gate",
+                            session_id = %context.session_id,
+                            run_id = %context.run_id,
+                            request_id = %request_id,
+                            error = %error,
+                            "failed to close approval deadline durably"
+                        );
+                        ApprovalDecision::Denied {
+                            reason: Some(
+                                "approval deadline could not be closed durably; tool was not executed"
+                                    .into(),
+                            ),
+                        }
+                    }
+                }
             }
         }
     }
@@ -638,6 +766,41 @@ mod tests {
             .await;
 
         assert!(matches!(decision, ApprovalDecision::Timeout));
+    }
+
+    #[test]
+    fn approval_deadline_becomes_the_only_terminal_decision_for_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let context =
+            ApprovalJournalContext::new("session-timeout".into(), "run-timeout".into(), Some(3));
+        persist_approval_required(&context, "request-timeout", "write_file").unwrap();
+
+        assert!(matches!(
+            close_approval_at_deadline(&context, "request-timeout", "write_file").unwrap(),
+            ApprovalDeadlineClose::TimedOut
+        ));
+        assert!(matches!(
+            close_approval_at_deadline(&context, "request-timeout", "write_file").unwrap(),
+            ApprovalDeadlineClose::Resolved(ApprovalDecision::Timeout)
+        ));
+
+        let late_allow =
+            astra_services::session_journal::append_approval_decision_for_run_if_absent(
+                "session-timeout",
+                Some(3),
+                "request-timeout",
+                "run-timeout",
+                Some("write_file"),
+                Some(APPROVAL_KIND_STANDARD),
+                "allow",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            late_allow,
+            astra_services::session_journal::ApprovalDecisionAppendOutcome::Conflict(_)
+        ));
     }
 
     #[test]

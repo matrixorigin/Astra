@@ -29,9 +29,6 @@ pub(crate) struct ReasoningCell {
     started_at: Option<Instant>,
     duration: Option<Duration>,
     ts: Option<String>,
-    /// Stamped at finalize. Lets the active-slot gradient gutter
-    /// pin its phase at the freeze moment.
-    frozen_at: super::FreezeStamp,
 }
 
 impl ReasoningCell {
@@ -42,7 +39,6 @@ impl ReasoningCell {
             started_at: Some(Instant::now()),
             duration: None,
             ts: None,
-            frozen_at: super::FreezeStamp::default(),
         }
     }
 
@@ -55,7 +51,6 @@ impl ReasoningCell {
             started_at: None,
             duration: duration_ms.map(Duration::from_millis),
             ts: None,
-            frozen_at: super::FreezeStamp::default(),
         }
     }
 
@@ -78,10 +73,6 @@ impl ReasoningCell {
                 started_at: None,
                 duration: duration_ms.map(Duration::from_millis),
                 ts,
-                // Resumed from persistence — already settled. See
-                // `FreezeStamp::revived` for the launch-independent
-                // phase rationale.
-                frozen_at: super::FreezeStamp::revived(),
             }),
             _ => None,
         }
@@ -108,22 +99,36 @@ impl ReasoningCell {
             Some(format!("{secs}s"))
         }
     }
-}
 
-/// Max body rows shown beneath the `💭 Thinking` header while the
-/// cell is still streaming. Once the window fills up, new rows
-/// replace the oldest (fake scrolling) so the viewport stays at a
-/// fixed height — Cursor's reasoning-preview behaviour, rather
-/// than unbounded growth that pushes the composer off-screen on
-/// a 20-second think. On `finalize()` the whole body collapses
-/// away and only the header remains.
-const LIVE_PREVIEW_MAX_ROWS: usize = 4;
+    /// Whether the transcript projection has content hidden behind the
+    /// compact representation at this width. Settled reasoning always hides
+    /// its body; a live cell is expandable only after its bounded preview has
+    /// actually omitted rows.
+    pub(crate) fn has_transcript_details(&self, width: u16) -> bool {
+        if self.text.trim().is_empty() {
+            return false;
+        }
+        if !self.live {
+            return true;
+        }
+        wrapped_body_rows(&self.text, width).len() > LIVE_PREVIEW_MAX_ROWS
+    }
 
-impl HistoryCell for ReasoningCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        // Empty + still live → nothing to show yet. The widget's
-        // StatusIndicator handles the "thinking but no content"
-        // case; we don't invent a placeholder here.
+    /// Render the transcript-specific projection. Expansion is deliberately
+    /// UI-local: it changes neither the canonical event nor the prompt-facing
+    /// conversation.
+    pub(crate) fn transcript_lines(&self, width: u16, expanded: bool) -> Vec<Line<'static>> {
+        self.display_lines_with_mode(width, expanded, true)
+    }
+
+    fn display_lines_with_mode(
+        &self,
+        width: u16,
+        expanded: bool,
+        transcript: bool,
+    ) -> Vec<Line<'static>> {
+        // Empty + still live -> nothing to show yet. The widget's
+        // StatusIndicator handles the "thinking but no content" case.
         if self.text.is_empty() {
             return Vec::new();
         }
@@ -131,17 +136,7 @@ impl HistoryCell for ReasoningCell {
         let theme = crate::tui::theme::current();
         let stat = Style::default().fg(theme.dim);
         let dim = Style::default().fg(theme.dim).add_modifier(Modifier::DIM);
-        // Body preview text: fg dim only — readable but visually subordinate.
         let body = Style::default().fg(theme.dim);
-
-        // Done thinking → collapse to header only (`Thought ·`
-        // 22s · 45 lines · N tokens`). A 20-second reasoning blob is ~40+
-        // wrapped rows of dim prose; scrollback-dumping all of it
-        // crowds out the actual answer below. Collapse to a one-line
-        // header; users who want the detail can inspect the persisted
-        // transcript. Live cells show the most recent few rows (see
-        // `LIVE_PREVIEW_MAX_ROWS`) so progress is visible without the
-        // viewport growing unboundedly.
         let line_count = self.text.lines().count();
         let token_count = approx_tokens(self.text.chars().count() as u64);
         let line_label = if line_count == 1 {
@@ -158,37 +153,26 @@ impl HistoryCell for ReasoningCell {
             .duration_label()
             .map(|d| format!(" · {d} · {line_label} · {tok_label}"))
             .unwrap_or_else(|| format!(" · {line_label} · {tok_label}"));
+        let marker = if transcript && self.has_transcript_details(width) {
+            if expanded { "▼ " } else { "▶ " }
+        } else {
+            "• "
+        };
         let header_line = Line::from(vec![
-            Span::styled("• ", dim),
+            Span::styled(marker, dim),
             super::assistant::thought_gradient("Thought", theme),
             Span::styled(stat_text, stat),
         ]);
-        // Preserve live body preview (below).
+        let mut lines = vec![header_line];
+        let body_rows = wrapped_body_rows(&self.text, width);
 
-        let mut lines: Vec<Line<'static>> = vec![header_line];
-
-        // Live preview: render ONLY the most recent
-        // `LIVE_PREVIEW_MAX_ROWS` wrapped rows. This gives a
-        // fixed-height scrolling window — new rows slide in at the
-        // bottom, older rows fall off the top, the composer stays
-        // anchored. A `… N earlier lines` counter takes the first slot
-        // once overflow starts, so the user sees that there's
-        // thinking content above the window instead of it silently
-        // sliding away. Finalised cells render no body at all.
-        if self.live {
-            let inner_w = (width as usize).saturating_sub(2).max(20);
-            let mut body_rows: Vec<String> = Vec::new();
-            for logical in self.text.lines() {
-                for row in soft_wrap(logical, inner_w) {
-                    body_rows.push(row);
-                }
+        if expanded {
+            for row in body_rows {
+                lines.push(Line::from(vec![Span::raw("    "), Span::styled(row, body)]));
             }
+        } else if self.live {
             let total = body_rows.len();
             let visible = if total > LIVE_PREVIEW_MAX_ROWS {
-                // Reserve row 0 for the overflow counter; show
-                // the last `LIVE_PREVIEW_MAX_ROWS - 1` actual rows
-                // so the window stays exactly at N rows even as
-                // overflow grows.
                 let tail = LIVE_PREVIEW_MAX_ROWS - 1;
                 let hidden = total - tail;
                 lines.push(Line::from(vec![
@@ -205,6 +189,21 @@ impl HistoryCell for ReasoningCell {
         }
 
         lines
+    }
+}
+
+/// Max body rows shown beneath the `💭 Thinking` header while the
+/// cell is still streaming. Once the window fills up, new rows
+/// replace the oldest (fake scrolling) so the viewport stays at a
+/// fixed height — Cursor's reasoning-preview behaviour, rather
+/// than unbounded growth that pushes the composer off-screen on
+/// a 20-second think. On `finalize()` the whole body collapses
+/// away and only the header remains.
+const LIVE_PREVIEW_MAX_ROWS: usize = 4;
+
+impl HistoryCell for ReasoningCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.display_lines_with_mode(width, false, false)
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -227,11 +226,6 @@ impl HistoryCell for ReasoningCell {
                 self.duration = Some(t.elapsed());
             }
         }
-        self.frozen_at.stamp_now();
-    }
-
-    fn frozen_phase(&self) -> Option<f32> {
-        self.frozen_at.phase()
     }
 
     fn to_persist(&self) -> Option<TurnEvent> {
@@ -241,6 +235,13 @@ impl HistoryCell for ReasoningCell {
             duration_ms: self.duration.map(|d| d.as_millis() as u64),
         })
     }
+}
+
+fn wrapped_body_rows(text: &str, width: u16) -> Vec<String> {
+    let inner_w = (width as usize).saturating_sub(2).max(20);
+    text.lines()
+        .flat_map(|logical| soft_wrap(logical, inner_w))
+        .collect()
 }
 
 /// Break a logical line into visual rows at `width` display cells.

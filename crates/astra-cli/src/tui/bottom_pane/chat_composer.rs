@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::textarea::{TextArea, TextAreaAction};
+use crate::tui::file_writer::TuiFileWriter;
 
 /// Cap on the on-disk history so `~/.astra/history` doesn't grow
 /// unbounded. The oldest entries are dropped when the file is
@@ -44,6 +45,7 @@ pub(crate) struct ChatComposer {
     /// On-disk history file. `None` when the home dir is undetermined
     /// (keeps the struct usable in tests without touching the FS).
     history_path: Option<PathBuf>,
+    file_writer: Option<TuiFileWriter>,
 }
 
 /// Multi-line pastes above this threshold are swapped for a placeholder.
@@ -51,9 +53,9 @@ pub(crate) struct ChatComposer {
 /// expect URLs and one-liners to appear verbatim.
 const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
-const COMPOSER_PLACEHOLDER: &str = "Message astra";
-const IDLE_COMPOSER_HELPER: &str = "Ctrl+E editor · Shift+Enter newline";
-const ACTIVE_TURN_HELPER: &str = "Enter queues follow-up · Ctrl+C stops";
+const COMPOSER_PLACEHOLDER: &str = "Message Astra";
+const IDLE_COMPOSER_HELPER: &str = "Enter send · Shift+Enter newline · / commands · Alt+E editor";
+const ACTIVE_TURN_HELPER: &str = "Enter queues follow-up · Ctrl+C stops · / commands";
 
 impl ChatComposer {
     pub fn new() -> Self {
@@ -75,12 +77,17 @@ impl ChatComposer {
             history,
             history_index: None,
             draft: None,
-            prompt_prefix: "· ".to_string(),
+            prompt_prefix: "› ".to_string(),
             pasted_blobs: Vec::new(),
             paste_counter: 0,
             last_submit_at: None,
             history_path,
+            file_writer: None,
         }
+    }
+
+    pub(crate) fn set_file_writer(&mut self, writer: TuiFileWriter) {
+        self.file_writer = Some(writer);
     }
 
     /// True while the submit-flash animation should paint the prefix in
@@ -204,6 +211,19 @@ impl ChatComposer {
             return;
         };
         let encoded = encode_entry(entry);
+        if let Some(writer) = self.file_writer.as_ref() {
+            if self.history.len() <= HISTORY_MAX_ENTRIES {
+                writer.append_line("composer history", path.clone(), encoded);
+            } else {
+                let keep = &self.history[self.history.len() - HISTORY_MAX_ENTRIES..];
+                writer.rewrite_lines(
+                    "composer history",
+                    path.clone(),
+                    keep.iter().map(|line| encode_entry(line)).collect(),
+                );
+            }
+            return;
+        }
         // Append-only for the common case; rotate the whole file only
         // when the in-memory cache grows past the cap, to keep the
         // amortised cost O(1) per submit.
@@ -345,7 +365,8 @@ impl ChatComposer {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
         if key.code == crossterm::event::KeyCode::Char('e')
-            && key
+            && key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+            && !key
                 .modifiers
                 .contains(crossterm::event::KeyModifiers::CONTROL)
         {
@@ -437,7 +458,7 @@ impl ChatComposer {
         // That shift must be visible at a glance — otherwise the user
         // hits Enter expecting a send and the input silently lands in a
         // queue they didn't realize was active. Two signals combine:
-        //   1. the prefix glyph flips `·` → `»` (queue/"waiting" glyph), and
+        //   1. the prefix glyph flips `›` → `↳` (queued follow-up), and
         //   2. the prefix color brightens from accent_dim to accent, so
         //      the chrome reads as "armed" rather than "idle prompt".
         // The submit flash still wins outright when a send lands.
@@ -451,7 +472,11 @@ impl ChatComposer {
         if self.is_flashing() {
             prefix_style = prefix_style.fg(theme.accent);
         }
-        let prefix_str: &str = if queueing { "» " } else { &self.prompt_prefix };
+        let prefix_str: &str = if queueing {
+            "↳ "
+        } else {
+            &self.prompt_prefix
+        };
         let prefix = Span::styled(prefix_str, prefix_style);
         // Measure the *rendered* prefix, not `self.prompt_prefix`: in queueing
         // mode the glyph is `"» "` and the two strings could diverge in display
@@ -484,7 +509,7 @@ impl ChatComposer {
             let placeholder = Span::styled(
                 truncate_end(COMPOSER_PLACEHOLDER, text_area.width as usize),
                 Style::default()
-                    .fg(theme.selected_fg)
+                    .fg(theme.dim)
                     .bg(panel.bg.unwrap_or(Color::Reset)),
             );
             Widget::render(
@@ -662,6 +687,28 @@ mod paste_tests {
         let out = c.clear_and_submit();
         assert!(out.is_empty());
         assert!(!c.is_flashing());
+    }
+
+    #[tokio::test]
+    async fn submitted_history_uses_ordered_writer_and_flushes_exact_entries() {
+        let dir = crate::tests::test_temp_dir();
+        let path = dir.path().join("history");
+        let (writer, runtime, mut errors) = crate::tui::file_writer::spawn();
+        let mut composer = ChatComposer::build(Vec::new(), Some(path.clone()));
+        composer.set_file_writer(writer.clone());
+
+        composer.set_text("first");
+        assert_eq!(composer.clear_and_submit(), "first");
+        composer.set_text("second\nline");
+        assert_eq!(composer.clear_and_submit(), "second\nline");
+        writer.flush().await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(path).await.unwrap(),
+            "first\nsecond\\nline\n"
+        );
+        assert!(errors.try_recv().is_err());
+        runtime.shutdown().await.unwrap();
     }
 
     #[test]

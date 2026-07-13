@@ -146,7 +146,7 @@ By default the stack pulls:
 
 - `matrixorigin/astra:latest`
 - `matrixorigin/memoria:latest`
-- `matrixorigin/matrixone:4.0.0-rc3`
+- `matrixorigin/matrixone:latest`
 
 Override image tags in `.env`, for example:
 

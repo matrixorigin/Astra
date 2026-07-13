@@ -36,7 +36,9 @@ use ratatui::{
 };
 use serde_json::Value;
 
-use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
+use super::view::{
+    BottomPaneView, CancellationEvent, ConfigEditDisposition, ViewCompletion, ViewResult,
+};
 
 // ─── Public API ──────────────────────────────────────────────────────────
 
@@ -410,16 +412,13 @@ impl BottomPaneView for ConfigEditView {
         if !self.completed {
             return None;
         }
-        // The token is `__config_edit__\n<action>\n<toml-body>`.
-        // Callers split on the first two newlines; body is absent for
-        // Cancelled / Discarded (nothing to persist). TOML is inline
-        // because `completion()` is `&self` — we can't move `self.working`
-        // out without a trait-level change, and cloning is cheap (~KBs).
-        let (tag, want_toml) = match self.action {
-            ConfigEditAction::SaveToUser => ("save_user", true),
-            ConfigEditAction::SaveToProject => ("save_project", true),
-            ConfigEditAction::Discarded => ("discard", false),
-            ConfigEditAction::Cancelled => ("cancel", false),
+        // TOML stays inline because `completion()` only has `&self`; cloning
+        // this small snapshot is preferable to inventing a textual protocol.
+        let (disposition, want_toml) = match self.action {
+            ConfigEditAction::SaveToUser => (ConfigEditDisposition::SaveUser, true),
+            ConfigEditAction::SaveToProject => (ConfigEditDisposition::SaveProject, true),
+            ConfigEditAction::Discarded => (ConfigEditDisposition::Discard, false),
+            ConfigEditAction::Cancelled => (ConfigEditDisposition::Cancel, false),
             _ => return None,
         };
         let body = if want_toml {
@@ -428,7 +427,10 @@ impl BottomPaneView for ConfigEditView {
             String::new()
         };
         Some(ViewCompletion {
-            result: Some(format!("__config_edit__\n{tag}\n{body}")),
+            result: Some(ViewResult::ConfigEdit {
+                disposition,
+                toml_body: body,
+            }),
             reopen: None,
         })
     }

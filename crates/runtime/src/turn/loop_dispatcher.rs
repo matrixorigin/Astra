@@ -271,6 +271,7 @@ mod tests {
     fn test_state(message: &str) -> AgenticLoopState {
         AgenticLoopState {
             messages: vec![json!({"role": "user", "content": message})],
+            run_transcript_capture: None,
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
@@ -283,6 +284,7 @@ mod tests {
             recursion_depth: 0,
             final_text: String::new(),
             final_text_streamed: false,
+            final_output_ready_notified: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -320,7 +322,7 @@ mod tests {
             hooks: Default::default(),
             messaging: Default::default(),
             cancellation: Default::default(),
-            deferred_input: Default::default(),
+            user_intents: Default::default(),
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(

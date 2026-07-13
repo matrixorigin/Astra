@@ -1,244 +1,194 @@
-//! Resume path — load a session's JSONL transcript into a
-//! `ChatWidget`. Phase 4 of the refactor.
-//!
-//! The heavy lifting (parsing, decoding each `TurnEvent` into the
-//! right `HistoryCell`) already lives in `transcript_jsonl::load`
-//! and `ChatWidget::replay`. This module is the single-function
-//! glue that wires them together so callers don't need to know
-//! about the JSONL backing store — they pass a session id, they
-//! get a populated widget back.
+//! Canonical journal hydration for a resumed TUI session.
 
-use super::super::transcript_jsonl;
+use std::collections::HashSet;
+
 use super::ChatWidget;
+use crate::tui::turn_event::{ToolStatus, TurnEvent};
 
-/// Load `session_id`'s transcript from disk and replay it into a
-/// fresh widget. Missing file / empty session id / malformed lines
-/// all collapse to "no history restored" — the widget is returned
-/// empty, never an error, because a partial replay is better than
-/// refusing to open the session.
-///
-/// The returned widget already has its `committed_watermark`
-/// advanced past every replayed cell — the caller is expected to
-/// paint those cells into the terminal scrollback exactly once via
-/// its own renderer, then future `drain_new_committed` calls will
-/// only surface new activity.
-pub(crate) fn load(session_id: impl Into<String>) -> ChatWidget {
-    let sid = session_id.into();
-    let events = transcript_jsonl::load(&sid);
-    let mut w = ChatWidget::new(sid);
-    w.replay(events);
-    // Important: anything we just replayed has already been
-    // rendered to the terminal by the caller (or will be in this
-    // same call); advancing the watermark here prevents those
-    // cells from being redrawn when the widget's next tick runs
-    // `drain_new_committed`.
-    //
-    // We deliberately do NOT call `mark_all_flushed` here though —
-    // the caller is in a better position to decide when the paint
-    // is actually complete (it may need to first render a banner,
-    // open the terminal, etc.). `load` just hands back a
-    // replay-populated widget; the flush is the caller's call.
-    w
+/// Read the root's canonical append-only transcript lane away from the UI
+/// worker, then rebuild the compact-chat scrollback. Presentation-only system
+/// rows and old TUI JSONL projections intentionally do not participate: the
+/// durable transcript browser and resumed chat now share one source.
+pub(crate) async fn load(session_id: impl Into<String>) -> ChatWidget {
+    let session_id = session_id.into();
+    let id_for_read = session_id.clone();
+    let journal_dir_override = astra_services::session_journal::current_journal_dir_override();
+    let events = tokio::task::spawn_blocking(move || {
+        let _scope = journal_dir_override
+            .as_deref()
+            .map(astra_services::session_journal::JournalDirGuard::new);
+        astra_services::session_journal::read_journal_append_order(&id_for_read)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    let mut widget = ChatWidget::new(session_id);
+    widget.replay(canonical_root_turn_events(events));
+    widget
+}
+
+/// Convert only typed, root-owned transcript payloads into the compact chat
+/// cells. The full-fidelity browser consumes the same payload directly; this
+/// conversion is intentionally a lossy visual projection, never a second
+/// durable record or a prompt-history reconstruction.
+fn canonical_root_turn_events(
+    events: Vec<astra_services::session_journal::JournalEvent>,
+) -> Vec<TurnEvent> {
+    let mut seen_source_ids = HashSet::new();
+    let mut out = Vec::new();
+    for event in events {
+        let Some(item) = event.transcript_item else {
+            continue;
+        };
+        if item.agent_id != "root" {
+            continue;
+        }
+        let source_id = if item.source_event_id.trim().is_empty() {
+            format!("{}:{}", item.run_id, item.item_seq)
+        } else {
+            item.source_event_id
+        };
+        if !seen_source_ids.insert(source_id) {
+            continue;
+        }
+        let message = item.message;
+        let role = message.get("role").and_then(serde_json::Value::as_str);
+        match role {
+            Some("user") => {
+                if let Some(content) = message.get("content").and_then(serde_json::Value::as_str)
+                    && !content.is_empty()
+                {
+                    out.push(TurnEvent::User {
+                        ts: Some(event.ts),
+                        text: content.to_string(),
+                    });
+                }
+            }
+            Some("assistant") => {
+                if let Some(reasoning) = message
+                    .get("reasoning_content")
+                    .or_else(|| message.get("reasoning"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    out.push(TurnEvent::Thinking {
+                        ts: Some(event.ts.clone()),
+                        text: reasoning.to_string(),
+                        duration_ms: message
+                            .get("reasoning_duration_ms")
+                            .and_then(serde_json::Value::as_u64),
+                    });
+                }
+                if let Some(content) = message
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    out.push(TurnEvent::Assistant {
+                        ts: Some(event.ts),
+                        markdown: content.to_string(),
+                    });
+                }
+            }
+            Some("tool") => {
+                let content = message
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                out.push(TurnEvent::Tool {
+                    ts: Some(event.ts),
+                    name: message
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("tool")
+                        .to_string(),
+                    description: String::new(),
+                    status: match message.get("status").and_then(serde_json::Value::as_str) {
+                        Some("uncertain") => ToolStatus::Uncertain,
+                        Some("failed" | "error") => ToolStatus::Failed,
+                        _ => ToolStatus::Success,
+                    },
+                    duration_ms: message
+                        .get("duration_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default(),
+                    output_summary: (!content.is_empty()).then_some(content.clone()),
+                    output: (!content.is_empty()).then_some(content),
+                });
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app_event::TuiAppEvent;
-    use crate::tui::chat_widget::bridge::{TurnContext, translate};
-    use crate::tui::history_cell::{
-        HistoryCell, assistant::AssistantCell, turn_summary::TurnSummaryCell, user::UserCell,
-    };
-    use crate::tui::render::line_utils::sanitize_lines_for_terminal;
-    use crate::tui::testing::render::{buffer_to_string, draw_widget};
-    use crate::tui::transcript_jsonl;
-    use crate::tui::turn_event::TurnEvent;
-    use ratatui::text::Line;
+    use astra_services::session_journal::{self, JournalDirGuard, JournalEvent};
 
-    /// Run `f` with `$HOME` pointed at a fresh tempdir so the
-    /// append+load test doesn't scribble into the dev's real
-    /// `~/.astra/`. Uses the crate-wide HOME test guard so these
-    /// path-sensitive tests stay isolated under parallel execution.
-    fn with_tmp_home<F: FnOnce()>(f: F) {
-        let _home = crate::tests::HomeGuard::temp();
-        f();
-    }
-
-    fn render_history(w: &ChatWidget, width: u16) -> String {
-        let mut all_lines: Vec<Line<'static>> = Vec::new();
-        let history = w.history();
-        for (idx, cell) in history.iter().enumerate() {
-            all_lines.extend(sanitize_lines_for_terminal(cell.display_lines(width)));
-            let next = history.get(idx + 1).map(|next| next.as_ref());
-            for _ in 0..crate::tui::history_cell::separator_rows_after(cell.as_ref(), next) {
-                all_lines.push(Line::default());
-            }
-        }
-        let height = (all_lines.len() as u16).max(1);
-        let p = ratatui::widgets::Paragraph::new(all_lines)
-            .wrap(ratatui::widgets::Wrap { trim: false });
-        buffer_to_string(&draw_widget(p, width, height))
-    }
-
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn round_trip_restores_cell_types_in_order() {
-        // End-to-end: append a plausible turn's worth of events,
-        // load them through the resume path, check that the widget
-        // has the right cell types in the right order with the
-        // original payloads intact.
-        with_tmp_home(|| {
-            let sid = "sess_resume_e2e";
-            let events = vec![
-                TurnEvent::User {
-                    ts: None,
-                    text: "what's up".into(),
-                },
-                TurnEvent::Assistant {
-                    ts: None,
-                    markdown: "# hi\n\nall good".into(),
-                },
-                TurnEvent::TurnSummary {
-                    ts: None,
-                    elapsed_ms: Some(1_200),
-                    ttft_ms: Some(300),
-                    tokens_in: Some(200),
-                    tokens_out: Some(40),
-                    cache_read_tokens: None,
-                    tools: 0,
-                    cumulative_tokens: Some(240),
-                    cumulative_cost_usd: Some(0.001),
-                },
-            ];
-            for e in &events {
-                transcript_jsonl::append(sid, e);
-            }
+    async fn canonical_root_journal_hydrates_chat_without_child_or_retry_duplicates() {
+        session_journal::set_journal_content_redact_override(Some(false));
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "sess_resume_canonical";
+        let event = |run_id: &str, agent_id: &str, seq, message| {
+            JournalEvent::transcript_item(session_id, run_id, agent_id, seq, &message)
+                .expect("valid transcript message")
+        };
+        let journal = session_journal::JournalWriter::new(session_id).unwrap();
+        journal
+            .append_bulk(&[
+                event(
+                    "root-run",
+                    "root",
+                    1,
+                    serde_json::json!({"role": "user", "content": "what's up"}),
+                ),
+                event(
+                    "root-run",
+                    "root",
+                    2,
+                    serde_json::json!({
+                        "role": "assistant",
+                        "reasoning_content": "inspect the state",
+                        "content": "all good",
+                    }),
+                ),
+                event(
+                    "child-run",
+                    "reviewer",
+                    1,
+                    serde_json::json!({"role": "assistant", "content": "child-only"}),
+                ),
+                event(
+                    "root-run",
+                    "root",
+                    2,
+                    serde_json::json!({"role": "assistant", "content": "retry must not win"}),
+                ),
+            ])
+            .unwrap();
 
-            let w = load(sid);
-            assert_eq!(w.session_id(), sid);
-            assert_eq!(
-                w.history().len(),
-                3,
-                "three events → three cells; nothing dropped"
-            );
-            assert!(
-                w.history()[0].as_any_ref().is::<UserCell>(),
-                "first cell is the user message"
-            );
-            assert!(
-                w.history()[1].as_any_ref().is::<AssistantCell>(),
-                "second cell is the assistant reply"
-            );
-            assert!(
-                w.history()[2].as_any_ref().is::<TurnSummaryCell>(),
-                "third cell is the turn summary"
-            );
-        });
-    }
+        let widget = load(session_id).await;
 
-    #[test]
-    #[serial_test::serial]
-    fn translated_live_turn_survives_jsonl_resume_identically() {
-        with_tmp_home(|| {
-            let sid = "sess_live_resume_e2e";
-            let mut live = ChatWidget::new(sid);
-
-            live.handle_event(super::super::AppEvent::User(
-                super::super::UserEvent::Submit("inspect cache stats".into()),
-            ));
-            for ev in [
-                TuiAppEvent::ThinkingChunk("checking prior context".into()),
-                TuiAppEvent::ThinkingStopped,
-                TuiAppEvent::ToolStarted {
-                    name: "bash".into(),
-                    description: "echo cache".into(),
-                    tool_use_id: "tu_test".into(),
-                    parent_tool_use_id: None,
-                },
-                TuiAppEvent::ToolCompleted {
-                    name: "bash".into(),
-                    description: String::new(),
-                    status: "completed".into(),
-                    duration_ms: 12,
-                    output_summary: Some("cache ok".into()),
-                    output: None,
-                    tool_use_id: "tu_test".into(),
-                    parent_tool_use_id: None,
-                },
-                TuiAppEvent::Token("Cache stats survived.".into()),
-                TuiAppEvent::TurnComplete,
-            ] {
-                let ctx = TurnContext {
-                    elapsed_ms: Some(1_500),
-                    ttft_ms: Some(250),
-                    tokens_in: Some(200),
-                    tokens_out: Some(50),
-                    cache_read_tokens: Some(150),
-                    tools: 1,
-                    cumulative_tokens: Some(250),
-                    cumulative_cost_usd: Some(0.002),
-                };
-                if let Some(app_ev) = translate(ev, ctx) {
-                    live.handle_event(app_ev);
-                }
-            }
-
-            let persisted = transcript_jsonl::load(sid);
-            assert_eq!(
-                persisted.len(),
-                live.history().len(),
-                "every committed live cell should be persisted"
-            );
-
-            let resumed = load(sid);
-            assert_eq!(resumed.history().len(), live.history().len());
-            assert_eq!(render_history(&resumed, 80), render_history(&live, 80));
-
-            let summary = resumed
-                .history()
-                .last()
-                .and_then(|cell| cell.as_any_ref().downcast_ref::<TurnSummaryCell>())
-                .expect("last resumed cell should be turn summary");
-            assert_eq!(summary.cache_read_tokens, Some(150));
-            let summary_text = summary
-                .display_lines(120)
-                .into_iter()
-                .map(|line| {
-                    line.spans
-                        .into_iter()
-                        .map(|span| span.content.into_owned())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                summary_text.contains("75% cache"),
-                "cache-read stats must remain user-visible after resume"
-            );
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn missing_file_yields_empty_widget() {
-        // First-launch / never-seen session id → empty widget, not
-        // a panic. This path is common on startup for brand-new
-        // sessions that haven't recorded anything yet.
-        with_tmp_home(|| {
-            let w = load("does_not_exist_yet");
-            assert!(w.history().is_empty());
-            assert_eq!(w.session_id(), "does_not_exist_yet");
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn empty_session_id_yields_empty_widget() {
-        // Defensive: a blank id shouldn't reach the filesystem
-        // (see `transcript_jsonl::transcript_path`). Verify the
-        // returned widget is usable even though nothing was loaded.
-        let w = load("");
-        assert!(w.history().is_empty());
-        assert_eq!(w.session_id(), "");
+        assert_eq!(widget.session_id(), session_id);
+        assert_eq!(widget.history().len(), 3);
+        let text = widget
+            .history()
+            .iter()
+            .flat_map(|cell| cell.display_lines(100))
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(text.contains("what's up"), "{text}");
+        assert!(text.contains("all good"), "{text}");
+        assert!(!text.contains("child-only"), "{text}");
+        assert!(!text.contains("retry must not win"), "{text}");
+        session_journal::set_journal_content_redact_override(None);
     }
 }

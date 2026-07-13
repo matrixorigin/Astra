@@ -1,16 +1,14 @@
-//! Plan execution wiring: spawns a background executor task, then runs the
-//! in-process plan monitor in the current task until the run pauses, completes, or
-//! the user cancels. Progress is shown live; between-monitor idle time (if the CLI
-//! prompt is reached again) may still use [`crate::cli::plan_monitor::flush_plan_updates_between_prompts`]
-//! when applicable.
+//! Plan execution wiring.
+//!
+//! The executor is always a background task. Interactive surfaces choose their
+//! own projection: line-mode CLI may run the blocking monitor, while the TUI
+//! drains the same typed updates into the workbench without leaving it.
 
 use crate::cli::delegate_subrun;
 use crate::cli::durable_bridge;
-use crate::cli::plan::{plan_executor, plan_monitor};
+use crate::cli::plan::plan_executor;
 
 use crate::cli::session::session_state::SessionState;
-use crate::cli::theme;
-use crossterm::style::Stylize;
 
 fn build_fallback_delegation_engine()
 -> std::sync::Arc<astra_runtime::server::delegation::engine::DelegationEngine> {
@@ -90,43 +88,24 @@ fn take_plan_context(
     })
 }
 
-/// Spawns a background plan executor, then **blocks the caller** in
-/// [`crate::cli::plan_monitor::run_blocking_plan_monitor`] until the run pauses, finishes,
-/// or the user hits Ctrl+C (per monitor behavior).
-///
-/// The heavy work still runs in the executor’s `tokio` task. This function only
-/// returns after the blocking monitor loop exits, so the normal CLI prompt is not
-/// interleaved with that plan run. The in-memory `executing_plan` copy and
-/// `plan_handle` keep [`crate::cli::plan_monitor::flush_plan_updates_between_prompts`] and
-/// related execution state available when the user is at the prompt again.
-pub(crate) async fn start_and_monitor_plan(
+/// Start a plan executor and retain its typed update/control handle on the
+/// session. This does not choose a renderer or block the caller.
+pub(crate) async fn start_plan_executor(
     state: &mut SessionState,
     current_token: Option<&str>,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Result<(), String> {
     if shutdown_plan_executor(state) {
-        eprintln!(
-            "  {}  Previous plan executor cancelled before starting new run.",
-            theme::icon_warn()
-        );
+        tracing::warn!("previous plan executor cancelled before starting new run");
     }
+    state.plan_execution_paused = false;
 
     ensure_durable_task_state(state, Some(api), current_token).await;
 
     let ctx = take_plan_context(state, api, current_token, profile)?;
     let handle = plan_executor::spawn_plan_executor(ctx);
     state.plan_handle = Some(handle);
-
-    eprintln!(
-        "  {} {}",
-        "▸".bold().magenta(),
-        "Plan executing — Ctrl+C to pause.".bold()
-    );
-
-    // Run the blocking monitor so the user sees live progress.
-    // The monitor handles Ctrl+C (pause/cancel) and approval prompts inline.
-    plan_monitor::run_blocking_plan_monitor(state).await;
 
     Ok(())
 }
@@ -140,6 +119,7 @@ pub(crate) fn shutdown_plan_executor(state: &mut SessionState) -> bool {
     if let Some(mut h) = state.plan_handle.take() {
         let _ = h.send_command(crate::cli::plan::plan_executor::PlanCommand::Cancel);
         while h.try_recv().is_some() {}
+        state.plan_execution_paused = false;
         true
     } else {
         false
@@ -305,6 +285,7 @@ mod tests {
     async fn fallback_delegation_engine_registers_default_root_agent() {
         let engine = build_fallback_delegation_engine();
         let request = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-1".to_string(),
             parent_run_id: "run-1".to_string(),
             task: "delegate".to_string(),

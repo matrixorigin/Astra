@@ -2,10 +2,9 @@
 //!
 //! Owns the **raw markdown source** for the whole reply. Growing
 //! the reply during a stream is `push_delta`; finalising freezes
-//! the source. `display_lines` re-renders the source on each draw,
-//! so width changes (terminal resize) and theme changes between
-//! runs both produce correct output without the cell having to
-//! cache pre-wrapped `Line`s.
+//! the source. `display_lines` caches the exact source+width Markdown
+//! layout, invalidating it on mutation. Width changes still re-render
+//! correctly without reparsing an unchanged reply on every frame.
 //!
 //! This supersedes the four-way split that the old TUI used
 //! (`AssistantChatCell` + `StreamController` + `AgentMessageCell` +
@@ -17,14 +16,13 @@
 //! assistant block. Live cells still use the active-slot wrapper for
 //! structure, but committed replies retain the visual anchor the old
 //! TUI had. A
-//! trailing blinking cursor
-//! block (`▎`) is appended to the final rendered line while the
-//! cell is still live, as a "more is coming" cue.
+//! active response is kept visually distinct by the surrounding status line;
+//! its content itself stays free of transient transport counters.
 //!
-//! ## Inline `<think>` handling
+//! ## Inline thinking handling
 //!
 //! Some providers bundle the model's chain-of-thought into the
-//! main token stream as `<think>…</think>` rather than using the
+//! main token stream as `<think>…</think>` or `<thinking>…</thinking>` rather than using the
 //! separate thinking protocol (which would build a `ReasoningCell`
 //! instead). This cell detects a leading `<think>` block in its
 //! source and renders:
@@ -41,15 +39,43 @@
 //! so resume + future `/think toggle` can surface it.
 
 use std::any::Any;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
 use crate::tui::markdown_render::render_markdown_text_with_width;
 use crate::tui::render::line_utils::line_to_static;
 use crate::tui::turn_event::TurnEvent;
+
+/// The expensive, width-sensitive part of an assistant reply. The renderer
+/// receives one final draw at the same inner width used while streaming, so a
+/// completed reply can reuse its last live layout instead of reparsing a long
+/// markdown document on the input/event-loop path.
+#[derive(Debug)]
+struct MarkdownLayoutCache {
+    revision: u64,
+    width: usize,
+    /// `source` is sometimes the reply body after a closed `<think>` block,
+    /// not always `self.source`. A pointer + length distinguishes those views
+    /// without retaining a second full copy merely for cache matching.
+    source_ptr: usize,
+    source_len: usize,
+    lines: Vec<Line<'static>>,
+}
+
+/// Bounded live Markdown projection. It intentionally lags a burst by a
+/// fraction of a second rather than ever falling back to raw Markdown, while
+/// keeping per-frame work bounded for long answers.
+#[derive(Debug)]
+struct LiveMarkdownLayoutCache {
+    revision: u64,
+    width: usize,
+    refreshed_at: Instant,
+    lines: Vec<Line<'static>>,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct AssistantCell {
@@ -59,21 +85,18 @@ pub(crate) struct AssistantCell {
     /// `finalize()`.
     live: bool,
     ts: Option<String>,
-    /// First `push_delta` timestamp. Used with `token_estimate` to
-    /// show tokens/s on a live cell. `None` for non-streaming
-    /// constructors (resume, `from_markdown`) so replayed replies
-    /// don't show a stale rate.
-    started_at: Option<Instant>,
-    /// CJK-aware token estimate accumulated as chars arrive.
-    /// CJK ideographs ≈ 0.5 token each, other chars ≈ 0.25. Not an
-    /// exact count (the real tokenizer lives server-side and the
-    /// number only returns in TurnStats) but close enough that the
-    /// on-screen "42 tok/s · 1.2k" matches reality within ±15%.
-    token_estimate: f64,
-    /// Stamped by `finalize()`. Lets the active-slot gradient gutter
-    /// pin its phase at the freeze moment instead of snapping to
-    /// `t = 0` on the post-freeze frame.
-    frozen_at: super::FreezeStamp,
+    /// Monotonic source revision. Cache matching by revision avoids an
+    /// O(reply-size) string comparison on every redraw of a long reply.
+    render_revision: u64,
+    /// One exact source+width layout is enough for the active reply. Sharing
+    /// it across view snapshots is safe because rendered lines are immutable;
+    /// a source mutation invalidates it before the next draw.
+    render_cache: Arc<Mutex<Option<MarkdownLayoutCache>>>,
+    /// Latest bounded rich projection while a reply is streaming. Unlike the
+    /// final layout cache it is deliberately retained across token deltas for
+    /// a short refresh interval, preventing an O(n²) reparse without showing
+    /// users raw Markdown between formatted frames.
+    live_render_cache: Arc<Mutex<Option<LiveMarkdownLayoutCache>>>,
 }
 
 impl AssistantCell {
@@ -82,9 +105,9 @@ impl AssistantCell {
             source: String::new(),
             live: true,
             ts: None,
-            started_at: None,
-            token_estimate: 0.0,
-            frozen_at: super::FreezeStamp::default(),
+            render_revision: 0,
+            render_cache: Arc::new(Mutex::new(None)),
+            live_render_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -96,9 +119,9 @@ impl AssistantCell {
             source: markdown.into(),
             live: false,
             ts: None,
-            started_at: None,
-            token_estimate: 0.0,
-            frozen_at: super::FreezeStamp::default(),
+            render_revision: 0,
+            render_cache: Arc::new(Mutex::new(None)),
+            live_render_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -116,12 +139,9 @@ impl AssistantCell {
                 source: markdown,
                 live: false,
                 ts,
-                started_at: None,
-                token_estimate: 0.0,
-                // Resumed from persistence — already settled. See
-                // `FreezeStamp::revived` for the launch-independent
-                // phase rationale.
-                frozen_at: super::FreezeStamp::revived(),
+                render_revision: 0,
+                render_cache: Arc::new(Mutex::new(None)),
+                live_render_cache: Arc::new(Mutex::new(None)),
             }),
             _ => None,
         }
@@ -132,11 +152,9 @@ impl AssistantCell {
     /// event; the render pipeline wraps internally.
     pub fn push_delta(&mut self, delta: &str) {
         debug_assert!(self.live, "push_delta on finalised AssistantCell");
-        if self.started_at.is_none() {
-            self.started_at = Some(Instant::now());
-        }
-        self.token_estimate += estimate_tokens(delta);
         self.source.push_str(delta);
+        self.render_revision = self.render_revision.wrapping_add(1);
+        *astra_core::sync_poison::recover_mutex_lock(&self.render_cache) = None;
     }
 
     #[allow(dead_code)]
@@ -161,8 +179,8 @@ impl AssistantCell {
     /// the prose body still carries a bare `</think>` to close the
     /// window. Cases handled:
     ///
-    /// 1. Matched `<think>…</think>`: inner is between the tags.
-    ///    Leading-`<think>` only; a mid-body `<think>` is just a
+    /// 1. Matched `<think>…</think>` or `<thinking>…</thinking>`: inner is
+    ///    between the tags. Leading tags only; a mid-body tag is just a
     ///    prose reference.
     /// 2. Source ENDS with `</think>`: the whole prose is leaked
     ///    thinking (inner = prose before the close, body = empty).
@@ -181,38 +199,20 @@ impl AssistantCell {
     /// always lands in a later cell. So "ends with close" captures
     /// every legitimate leaked-thinking pattern without mangling
     /// prose that mentions the tag.
-    /// Compose the ` · N tok/s · X` status span that trails the
-    /// final rendered line while the cell is live. Returns `None`
-    /// when the cell hasn't received a delta yet (would divide by
-    /// zero) or when the cell is no longer streaming.
-    fn rate_suffix_span(&self) -> Option<String> {
-        if !self.live {
-            return None;
-        }
-        let started = self.started_at?;
-        let elapsed = started.elapsed().as_secs_f64();
-        if elapsed < 0.3 || self.token_estimate <= 0.0 {
-            return Some(format!(" · {}", format_token_estimate(self.token_estimate)));
-        }
-        let tok_per_s = self.token_estimate / elapsed;
-        Some(format!(
-            " · {} tok/s · {}",
-            tok_per_s.round() as u64,
-            format_token_estimate(self.token_estimate),
-        ))
-    }
-
     fn split_think(&self) -> (Option<&str>, bool, &str) {
         let source = self.source.as_str();
         let trimmed = source.trim_start();
         if trimmed.is_empty() {
             return (None, false, source);
         }
-        let close_tag = "</think>";
-        let open_tag = "<think>";
+        const THINK_TAGS: [(&str, &str); 2] =
+            [("<think>", "</think>"), ("<thinking>", "</thinking>")];
 
-        // Case 1 / 3: explicit `<think>` at the very start.
-        if let Some(after_open) = trimmed.strip_prefix(open_tag) {
+        // Case 1 / 3: an explicit thinking envelope at the very start.
+        if let Some((open_tag, close_tag, after_open)) = THINK_TAGS
+            .iter()
+            .find_map(|&(open, close)| trimmed.strip_prefix(open).map(|after| (open, close, after)))
+        {
             if let Some(close_rel) = after_open.find(close_tag) {
                 let think_inner = &after_open[..close_rel];
                 let leading_ws = source.len() - trimmed.len();
@@ -231,7 +231,11 @@ impl AssistantCell {
         //
         // The test has to handle trailing whitespace from the
         // streaming wire (partial chunks often end in `\n`).
-        if source.trim_end().ends_with(close_tag) {
+        if let Some(close_tag) = THINK_TAGS
+            .iter()
+            .map(|(_, close)| *close)
+            .find(|close| source.trim_end().ends_with(close))
+        {
             let trimmed_end = source.trim_end();
             let last_close = trimmed_end.len() - close_tag.len();
             let think_inner = trimmed_end[..last_close].trim();
@@ -243,16 +247,341 @@ impl AssistantCell {
         // the tag (e.g. a code review discussing this function).
         (None, false, source)
     }
+
+    fn layout_matches(
+        cache: &MarkdownLayoutCache,
+        source: &str,
+        width: usize,
+        revision: u64,
+    ) -> bool {
+        cache.width == width
+            && cache.revision == revision
+            && cache.source_ptr == source.as_ptr() as usize
+            && cache.source_len == source.len()
+    }
+
+    /// Prepare the full semantic Markdown layout exactly once. This is called
+    /// by the background scrollback worker for completed replies; live display
+    /// deliberately uses a bounded plain-text tail instead.
+    fn ensure_markdown_layout(&self, source: &str, width: usize) {
+        let mut cache = astra_core::sync_poison::recover_mutex_lock(&self.render_cache);
+        if cache
+            .as_ref()
+            .is_some_and(|cache| Self::layout_matches(cache, source, width, self.render_revision))
+        {
+            return;
+        }
+
+        let lines = render_markdown_text_with_width(source, Some(width))
+            .lines
+            .iter()
+            .map(line_to_static)
+            .collect::<Vec<_>>();
+        *cache = Some(MarkdownLayoutCache {
+            revision: self.render_revision,
+            width,
+            source_ptr: source.as_ptr() as usize,
+            source_len: source.len(),
+            lines,
+        });
+    }
+
+    fn markdown_layout_window(
+        &self,
+        source: &str,
+        width: usize,
+        start: usize,
+        maximum: usize,
+    ) -> (Vec<Line<'static>>, usize) {
+        self.ensure_markdown_layout(source, width);
+        let cache = astra_core::sync_poison::recover_mutex_lock(&self.render_cache);
+        let cache = cache
+            .as_ref()
+            .expect("markdown layout is installed before it is read");
+        debug_assert!(Self::layout_matches(
+            cache,
+            source,
+            width,
+            self.render_revision
+        ));
+        let total = cache.lines.len();
+        let start = start.min(total);
+        let end = start.saturating_add(maximum).min(total);
+        (cache.lines[start..end].to_vec(), total)
+    }
+
+    fn markdown_layout(&self, source: &str, width: usize) -> Vec<Line<'static>> {
+        self.markdown_layout_window(source, width, 0, usize::MAX).0
+    }
+
+    fn scrollback_body_lines(
+        &self,
+        source: &str,
+        width: u16,
+        start: usize,
+        maximum: usize,
+    ) -> (Vec<Line<'static>>, usize) {
+        if source.is_empty() || maximum == 0 {
+            return (Vec::new(), 0);
+        }
+        let inner_width = (width as usize).saturating_sub(2).max(20);
+        let (rendered, total) = self.markdown_layout_window(source, inner_width, start, maximum);
+        let theme = crate::tui::theme::current();
+        let gutter_style = Style::default().fg(theme.gutter_frozen);
+        let lines = rendered
+            .into_iter()
+            .map(|line| {
+                let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                spans.push(Span::styled("█ ", gutter_style));
+                spans.extend(line.spans);
+                Line::from(spans)
+            })
+            .collect();
+        (lines, total)
+    }
+
+    fn scrollback_body_source(&self) -> &str {
+        let (think_inner, think_closed, body) = self.split_think();
+        if think_inner.is_some() && think_closed {
+            body
+        } else {
+            self.source.as_str()
+        }
+    }
+
+    /// Whether final scrollback can read its full Markdown layout without work
+    /// on the caller's thread.
+    pub(crate) fn has_scrollback_layout(&self, width: u16) -> bool {
+        let source = self.scrollback_body_source();
+        if source.is_empty() {
+            return true;
+        }
+        let inner_width = (width as usize).saturating_sub(2).max(20);
+        astra_core::sync_poison::recover_mutex_lock(&self.render_cache)
+            .as_ref()
+            .is_some_and(|cache| {
+                Self::layout_matches(cache, source, inner_width, self.render_revision)
+            })
+    }
+
+    /// Perform the expensive final Markdown layout. `TerminalGuard` invokes
+    /// this from `spawn_blocking` after the cell has finalized, never from the
+    /// keyboard/render event loop.
+    pub(crate) fn prepare_scrollback_layout(&self, width: u16) {
+        let source = self.scrollback_body_source();
+        if source.is_empty() {
+            return;
+        }
+        let inner_width = (width as usize).saturating_sub(2).max(20);
+        self.ensure_markdown_layout(source, inner_width);
+    }
+
+    /// Cheap live projection for the finite terminal viewport. Rendering a
+    /// growing Markdown document from byte zero on every token made long
+    /// replies O(n²) on the UI thread. While a reply is mutable we instead
+    /// show its newest visible text window; the canonical final Markdown is
+    /// prepared asynchronously after `finalize()`.
+    pub(crate) fn live_viewport_lines(&self, width: u16, maximum: usize) -> Vec<Line<'static>> {
+        debug_assert!(self.live, "only mutable replies use the live projection");
+        if maximum == 0 {
+            return Vec::new();
+        }
+
+        let (think_inner, think_closed, body) = self.split_think();
+        if let Some(think) = think_inner
+            && !think_closed
+        {
+            return render_live_thinking(think, width)
+                .into_iter()
+                .rev()
+                .take(maximum)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+        }
+
+        let mut out = if let Some(think) = think_inner {
+            thought_header_lines(
+                think.trim().lines().count().max(1),
+                approx_tokens(think.chars().count() as u64),
+            )
+        } else {
+            Vec::new()
+        };
+        let body_budget = maximum.saturating_sub(out.len()).max(1);
+        let source = if think_inner.is_some() && think_closed {
+            body
+        } else {
+            self.source.as_str()
+        };
+        out.extend(self.live_markdown_tail_lines(source, width as usize, body_budget));
+        if out.len() > maximum {
+            out.drain(..out.len() - maximum);
+        }
+        out
+    }
+
+    /// Render a bounded rich Markdown suffix for a mutable reply. The cache
+    /// refreshes at most once per short interval during token bursts, so the
+    /// live view never exposes raw Markdown and never reparses an unbounded
+    /// growing document on every frame.
+    fn live_markdown_tail_lines(
+        &self,
+        source: &str,
+        width: usize,
+        maximum: usize,
+    ) -> Vec<Line<'static>> {
+        const MAX_LIVE_SOURCE_BYTES: usize = 16 * 1024;
+        const LIVE_MARKDOWN_REFRESH: std::time::Duration = std::time::Duration::from_millis(80);
+
+        if source.is_empty() || maximum == 0 {
+            return Vec::new();
+        }
+        let (tail, truncated) = utf8_tail_window(source, MAX_LIVE_SOURCE_BYTES);
+        // A tail can begin in the middle of a line. Discard that fragment so
+        // partial Markdown syntax at the boundary cannot corrupt the visible
+        // projection; the leading ellipsis remains the honest continuity cue.
+        let markdown_tail = if truncated {
+            tail.split_once('\n').map(|(_, rest)| rest).unwrap_or(tail)
+        } else {
+            tail
+        };
+        let width = width.max(20);
+        let now = Instant::now();
+        let mut cache = astra_core::sync_poison::recover_mutex_lock(&self.live_render_cache);
+        let lines = match cache.as_ref() {
+            Some(cache) if cache.width == width && cache.revision == self.render_revision => {
+                cache.lines.clone()
+            }
+            Some(cache)
+                if cache.width == width
+                    && now.duration_since(cache.refreshed_at) < LIVE_MARKDOWN_REFRESH =>
+            {
+                // A formatted frame that is a few tokens behind is preferable
+                // to a raw Markdown frame or an input-loop reparse storm.
+                cache.lines.clone()
+            }
+            _ => {
+                let lines = render_markdown_text_with_width(markdown_tail, Some(width))
+                    .lines
+                    .iter()
+                    .map(line_to_static)
+                    .collect::<Vec<_>>();
+                *cache = Some(LiveMarkdownLayoutCache {
+                    revision: self.render_revision,
+                    width,
+                    refreshed_at: now,
+                    lines: lines.clone(),
+                });
+                lines
+            }
+        };
+        drop(cache);
+
+        let visible_start = lines.len().saturating_sub(maximum);
+        let mut out = lines.into_iter().skip(visible_start).collect::<Vec<_>>();
+        if out.is_empty() {
+            out.push(Line::default());
+        }
+        if truncated && let Some(first) = out.first_mut() {
+            first.spans.insert(
+                0,
+                Span::styled("… ", Style::default().fg(crate::tui::theme::current().dim)),
+            );
+        }
+        out
+    }
+
+    /// Materialize only a bounded portion of a final reply for native
+    /// scrollback. Long final messages are inserted over several frames so
+    /// the event loop can continue accepting composer input between chunks.
+    pub(crate) fn scrollback_lines_chunk(
+        &self,
+        width: u16,
+        start: usize,
+        maximum: usize,
+    ) -> (Vec<Line<'static>>, usize, bool) {
+        debug_assert!(!self.live, "live assistant cells stay in the viewport");
+        if maximum == 0 {
+            return (Vec::new(), start, false);
+        }
+
+        let (think_inner, think_closed, body) = self.split_think();
+        let headers = match (think_inner, think_closed) {
+            (Some(think), true) => thought_header_lines(
+                think.trim().lines().count().max(1),
+                approx_tokens(think.chars().count() as u64),
+            ),
+            _ => Vec::new(),
+        };
+        let body_source = if think_inner.is_some() && think_closed {
+            body
+        } else {
+            self.source.as_str()
+        };
+
+        let mut lines = headers
+            .iter()
+            .skip(start)
+            .take(maximum)
+            .cloned()
+            .collect::<Vec<_>>();
+        let body_start = start.saturating_sub(headers.len());
+        let remaining = maximum.saturating_sub(lines.len());
+        let (body_lines, body_total) =
+            self.scrollback_body_lines(body_source, width, body_start, remaining);
+        lines.extend(body_lines);
+        let next = start.saturating_add(lines.len());
+        let total = headers.len().saturating_add(body_total);
+        (lines, next, next >= total)
+    }
+
+    fn render_body_with_gutter(&self, source: &str, width: u16, live: bool) -> Vec<Line<'static>> {
+        if source.trim().is_empty() {
+            return Vec::new();
+        }
+        // Settled cells prepend `█ ` (2 cols) to every line, so wrap text
+        // at `width - 2` to avoid terminal hard-wrap overflow. Live cells
+        // already receive `width - 2` from `active_viewport` (the
+        // `LiveFramedCell` wrapper paints its own gutter column). This means
+        // the final scrollback render uses the same markdown width as the
+        // last active draw and can reuse the cached layout.
+        let prepend_gutter = !live;
+        let inner_w = if prepend_gutter {
+            (width as usize).saturating_sub(2).max(20)
+        } else {
+            (width as usize).max(20)
+        };
+        let rendered = self.markdown_layout(source, inner_w);
+
+        if rendered.is_empty() {
+            return Vec::new();
+        }
+
+        let theme = crate::tui::theme::current();
+        let gutter_style = Style::default().fg(theme.gutter_frozen);
+        rendered
+            .into_iter()
+            .map(|line| {
+                let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
+                if prepend_gutter {
+                    spans.push(Span::styled("█ ", gutter_style));
+                }
+                spans.extend(line.spans.iter().cloned());
+                Line::from(spans)
+            })
+            .collect()
+    }
 }
 
 impl HistoryCell for AssistantCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let (think_inner, think_closed, body) = self.split_think();
-        let rate_suffix = self.rate_suffix_span();
 
         // Branch 1: no <think> block. Original render path.
         let Some(think) = think_inner else {
-            return render_body_with_gutter(&self.source, width, self.live, rate_suffix);
+            return self.render_body_with_gutter(&self.source, width, self.live);
         };
 
         // Branch 2: <think> still open (streaming). Show a dim
@@ -267,7 +596,7 @@ impl HistoryCell for AssistantCell {
         let think_lines = think.trim().lines().count().max(1);
         let think_tokens = approx_tokens(think.chars().count() as u64);
         let mut out = thought_header_lines(think_lines, think_tokens);
-        out.extend(render_body_with_gutter(body, width, self.live, rate_suffix));
+        out.extend(self.render_body_with_gutter(body, width, self.live));
         out
     }
 
@@ -284,11 +613,6 @@ impl HistoryCell for AssistantCell {
 
     fn finalize(&mut self) {
         self.live = false;
-        self.frozen_at.stamp_now();
-    }
-
-    fn frozen_phase(&self) -> Option<f32> {
-        self.frozen_at.phase()
     }
 
     fn to_persist(&self) -> Option<TurnEvent> {
@@ -301,132 +625,6 @@ impl HistoryCell for AssistantCell {
             markdown: self.source.clone(),
         })
     }
-}
-
-/// CJK-aware token estimator. Roughly the same heuristic the
-/// `tiktoken` family's BPE produces on mixed-language prose:
-/// Han ideographs + Hiragana/Katakana ≈ 0.5 token/char (one glyph
-/// usually splits into one or two BPE pieces), other scripts ≈
-/// 0.25 token/char (4 chars/token on avg for English). Non-BMP
-/// emoji count as full tokens each. Good to ±15% which is all we
-/// need for "42 tok/s" feedback.
-fn estimate_tokens(s: &str) -> f64 {
-    let mut total = 0.0_f64;
-    for ch in s.chars() {
-        let c = ch as u32;
-        let w = if (0x3040..=0x30FF).contains(&c)
-            || (0x4E00..=0x9FFF).contains(&c)
-            || (0x3400..=0x4DBF).contains(&c)
-            || (0xAC00..=0xD7AF).contains(&c)
-        {
-            0.5
-        } else if c >= 0x10000 {
-            1.0
-        } else {
-            0.25
-        };
-        total += w;
-    }
-    total
-}
-
-/// Human format for a running token estimate: `420`, `5.1k`,
-/// `12.4k`. Stays short so the status span fits on the final
-/// rendered row next to the prose.
-fn format_token_estimate(tokens: f64) -> String {
-    if tokens < 1_000.0 {
-        format!("{:.0}", tokens)
-    } else {
-        format!("{:.1}k", tokens / 1_000.0)
-    }
-}
-
-/// Three-dot rhythm indicator frames. Each dot toggles on/off at
-/// a different phase so the indicator reads as "tokens arriving"
-/// rather than a static spinner. Frame rate is wall-clock based
-/// via the shared shimmer clock.
-fn rhythm_dots_span() -> Span<'static> {
-    let t = crate::tui::shimmer::elapsed_since_start().as_millis() as u64;
-    // 450 ms cycle: each of the three phases gets one-third. Use
-    // '·' (mid-dot) for "on" and ' ' for "off" so the line width
-    // stays constant (4 display cells: " · · ·" collapsed).
-    const FRAMES: [&str; 6] = [
-        "·    ", //
-        "· ·  ", //
-        "· · ·", //
-        " · · ", //
-        "   · ", //
-        "     ", //
-    ];
-    let idx = ((t / 120) % FRAMES.len() as u64) as usize;
-    Span::styled(
-        FRAMES[idx].to_string(),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-/// Render the reply body. Settled (scrollback) cells get a static
-/// `█ ` accent gutter on every line. Live cells drop the gutter —
-/// the active-slot wrapper (`tui::LiveFramedCell`) paints its own
-/// gradient `█` at the same column, and stacking both produces a
-/// visible double bar.
-fn render_body_with_gutter(
-    source: &str,
-    width: u16,
-    live: bool,
-    rate_suffix: Option<String>,
-) -> Vec<Line<'static>> {
-    if source.trim().is_empty() {
-        return Vec::new();
-    }
-    // Settled cells prepend `█ ` (2 cols) to every line, so wrap text
-    // at `width - 2` to avoid terminal hard-wrap overflow. Live cells
-    // already receive `width - 2` from `active_viewport` (the
-    // `LiveFramedCell` wrapper paints its own gutter column) — so the
-    // asymmetry below is intentional.
-    let prepend_gutter = !live;
-    let inner_w = if prepend_gutter {
-        (width as usize).saturating_sub(2).max(20)
-    } else {
-        (width as usize).max(20)
-    };
-    let text = render_markdown_text_with_width(source, Some(inner_w));
-    let rendered: Vec<Line<'static>> = text.lines.iter().map(line_to_static).collect();
-
-    if rendered.is_empty() {
-        return Vec::new();
-    }
-
-    let theme = crate::tui::theme::current();
-    let gutter_style = Style::default().fg(theme.gutter_frozen);
-    let dim = Style::default().fg(Color::DarkGray);
-    let last_idx = rendered.len() - 1;
-
-    rendered
-        .into_iter()
-        .enumerate()
-        .map(|(i, line)| {
-            let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 3);
-            if prepend_gutter {
-                spans.push(Span::styled("█ ", gutter_style));
-            }
-            spans.extend(line.spans.iter().cloned());
-            // Trailing rhythm-dot indicator + tok/s suffix on the
-            // final row while live. Replaces the old `▎` slow-blink
-            // cursor — a three-dot staggered rhythm reads as
-            // "tokens arriving" rather than "generic spinner".
-            if live && i == last_idx {
-                spans.push(Span::raw(" "));
-                spans.push(rhythm_dots_span());
-                if let Some(ref suffix) = rate_suffix {
-                    spans.push(Span::styled(suffix.clone(), dim));
-                }
-            }
-            Line::from(spans)
-        })
-        .collect()
 }
 
 /// Collapsed one-line header shown in place of a `<think>` block
@@ -457,23 +655,17 @@ fn thought_header_lines(line_count: usize, token_count: u64) -> Vec<Line<'static
     ])]
 }
 
-/// Build a gradient-rendered "Thought" span: bold, tinted with a blend
-/// of accent toward foreground so it stands out but stays readable.
-/// The visual gradient across the header line comes from the transition
-/// Thought (bold, accent-blend) → stat labels (dim).
+/// Build the compact Thought heading from the semantic accent.
+///
+/// `theme.fg` is deliberately `Reset` for terminal compatibility, so blending
+/// an accent toward it produced an implementation-dependent gray title on
+/// several terminals. Thinking is secondary information, but it still needs
+/// a reliable visual anchor next to its dim statistics.
 pub(super) fn thought_gradient(word: &str, theme: &crate::tui::theme::Theme) -> Span<'static> {
-    use crate::tui::color::blend;
-    use crate::tui::theme::color_to_rgb;
-
-    let accent = color_to_rgb(theme.accent);
-    let fg_rgb = color_to_rgb(theme.fg);
-    // Blend accent 60% toward fg — keeps the accent character but
-    // prevents it from being too loud on a dark terminal.
-    let (r, g, b) = blend(accent, fg_rgb, 0.6);
     Span::styled(
         word.to_string(),
         Style::default()
-            .fg(Color::Rgb(r, g, b))
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -562,6 +754,17 @@ fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
     out
 }
 
+fn utf8_tail_window(source: &str, maximum_bytes: usize) -> (&str, bool) {
+    if source.len() <= maximum_bytes {
+        return (source, false);
+    }
+    let mut start = source.len().saturating_sub(maximum_bytes);
+    while !source.is_char_boundary(start) {
+        start += 1;
+    }
+    (&source[start..], true)
+}
+
 /// Break a logical line into visual rows at `width` display cells —
 /// same behaviour as `ReasoningCell::soft_wrap`, duplicated here so
 /// the assistant cell can preview leaked-`<think>` content without
@@ -628,12 +831,105 @@ mod tests {
     }
 
     #[test]
+    fn live_viewport_keeps_only_the_bounded_tail_of_a_long_reply() {
+        let mut c = AssistantCell::new_streaming();
+        c.push_delta(
+            &(0..2_000)
+                .map(|index| format!("line-{index}\n"))
+                .collect::<String>(),
+        );
+
+        let lines = c.live_viewport_lines(80, 3);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(lines.len() <= 3, "live frame must stay bounded");
+        assert!(
+            text.contains("line-1999"),
+            "latest text stays visible: {text}"
+        );
+        assert!(
+            !text.contains("line-0\n"),
+            "old text stays out of the live frame"
+        );
+    }
+
+    #[test]
     fn finalize_flips_is_live() {
         let mut c = AssistantCell::new_streaming();
         c.push_delta("done");
         assert!(c.is_live());
         c.finalize();
         assert!(!c.is_live());
+    }
+
+    #[test]
+    fn final_scrollback_reuses_the_last_live_markdown_layout() {
+        let mut c = AssistantCell::new_streaming();
+        c.push_delta("# Result\n\n- one\n- two\n\n`cargo test`");
+
+        // `active_viewport` gives a live assistant the terminal width minus
+        // its frame gutter. The committed cell adds that gutter itself, so
+        // its scrollback width resolves to the same cached markdown layout.
+        let live = c.display_lines(78);
+        assert!(!live.is_empty());
+        {
+            let cache = astra_core::sync_poison::recover_mutex_lock(&c.render_cache);
+            assert!(matches!(
+                cache.as_ref(),
+                Some(MarkdownLayoutCache { width: 78, .. })
+            ));
+        }
+
+        c.finalize();
+        let settled = c.display_lines(80);
+        assert!(settled.iter().all(|line| !line.spans.is_empty()));
+        let cache = astra_core::sync_poison::recover_mutex_lock(&c.render_cache);
+        assert!(matches!(
+            cache.as_ref(),
+            Some(MarkdownLayoutCache { width: 78, .. })
+        ));
+    }
+
+    #[test]
+    fn final_scrollback_materializes_only_the_requested_line_window() {
+        let c = AssistantCell::from_markdown(
+            (0..32)
+                .map(|index| format!("paragraph {index}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        );
+
+        let (first, next, complete) = c.scrollback_lines_chunk(80, 0, 3);
+        assert_eq!(first.len(), 3);
+        assert_eq!(next, 3);
+        assert!(!complete);
+
+        let (second, next, complete) = c.scrollback_lines_chunk(80, next, 3);
+        assert_eq!(second.len(), 3);
+        assert_eq!(next, 6);
+        assert!(!complete);
+        assert!(first[0].spans[0].content.starts_with("█ "));
+        assert!(second[0].spans[0].content.starts_with("█ "));
+    }
+
+    #[test]
+    fn prepared_final_layout_is_reused_by_scrollback_chunks() {
+        let c = AssistantCell::from_markdown("# Result\n\n- first\n- second");
+        assert!(!c.has_scrollback_layout(80));
+
+        c.prepare_scrollback_layout(80);
+
+        assert!(c.has_scrollback_layout(80));
+        let (lines, _, complete) = c.scrollback_lines_chunk(80, 0, 8);
+        assert!(complete);
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("Result"))
+        }));
     }
 
     #[test]
@@ -657,53 +953,13 @@ mod tests {
     }
 
     #[test]
-    fn live_cell_rhythm_indicator_appears_on_last_line_only() {
-        // Use a paragraph break (`\n\n`) so markdown produces two
-        // separate rendered lines. A soft break in markdown is
-        // treated as whitespace, which would yield one rendered
-        // line — correct behaviour, just not what this test needs
-        // to observe.
-        let mut c = AssistantCell::new_streaming();
-        c.push_delta("line one\n\nline two");
-        let out = render(&c, 60, 4);
-        let rows: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
-        assert!(
-            rows.len() >= 2,
-            "expected at least two non-blank rows: {out}"
-        );
-        // The rhythm-dot indicator contains at least one '·'
-        // character. Token counter text (" · N tok/s") also has
-        // them — so we check that the LAST row has both the
-        // prose and a trailing dot sequence, while the first row
-        // ends on prose alone.
-        assert!(
-            !rows[0].trim_end().ends_with('·'),
-            "rhythm indicator leaked on first line: {:?}",
-            rows[0]
-        );
-        assert!(
-            rows.last().unwrap().contains('·'),
-            "rhythm indicator missing on last line: {:?}",
-            rows.last()
-        );
-    }
-
-    #[test]
-    fn finalised_cell_has_no_live_indicator() {
+    fn live_reply_content_has_no_transport_progress_suffix() {
         let mut c = AssistantCell::new_streaming();
         c.push_delta("answer");
-        c.finalize();
-        let out = render(&c, 60, 2);
-        // Old cursor `▎` must be gone and no tok/s suffix should
-        // appear on a finalised cell.
-        assert!(
-            !out.contains('▎'),
-            "old cursor must vanish after finalize: {out}"
-        );
-        assert!(
-            !out.contains("tok/s"),
-            "rate suffix must not render on a finalised cell: {out}"
-        );
+        let lines = c.display_lines(60);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 1);
+        assert_eq!(lines[0].spans[0].content, "answer");
     }
 
     #[test]
@@ -798,6 +1054,41 @@ mod tests {
             out.contains("Thought") && out.contains("1 line") && out.contains("token"),
             "singular form for one-line think: {out}"
         );
+    }
+
+    #[test]
+    fn thinking_envelope_never_leaks_as_assistant_markdown() {
+        let c = AssistantCell::from_markdown(
+            "<thinking>inspect the runtime state first</thinking>\n\n# Result\n\n- Ready",
+        );
+        let out = render(&c, 80, 5);
+        assert!(
+            !out.contains("<thinking>") && !out.contains("</thinking>"),
+            "thinking protocol tags must not reach the transcript: {out}"
+        );
+        assert!(
+            !out.contains("inspect the runtime state first"),
+            "closed thinking content must collapse: {out}"
+        );
+        assert!(out.contains("Thought") && out.contains("Result") && out.contains("Ready"));
+    }
+
+    #[test]
+    fn live_projection_uses_markdown_before_finalization() {
+        let mut c = AssistantCell::new_streaming();
+        c.push_delta("# Result\n\n- ship the patch\n- run the tests");
+        let lines = c.live_viewport_lines(80, 8);
+        let rendered = buffer_to_string(&draw_widget(
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            80,
+            8,
+        ));
+        assert!(rendered.contains("Result"), "{rendered}");
+        assert!(
+            !rendered.contains("# Result"),
+            "live text must not briefly fall back to raw Markdown: {rendered}"
+        );
+        assert!(rendered.contains("ship the patch") && rendered.contains("run the tests"));
     }
 
     #[test]
@@ -995,68 +1286,6 @@ mod tests {
             "<think>\nThe user is asking a question.\nI will answer briefly.\n</think>\n\nHello — happy to help.",
         );
         crate::tui::testing::assert_tui_snapshot!("assistant_think_closed_60", render(&c, 60, 3));
-    }
-
-    // ── Token estimate (CJK-aware) ──────────────────────────────
-
-    #[test]
-    fn token_estimate_ascii_prose_uses_quarter_ratio() {
-        // 12 ASCII chars ≈ 3 tokens at 0.25 each.
-        let t = super::estimate_tokens("hello, world");
-        assert!(
-            (2.5..=3.5).contains(&t),
-            "expected ~3 tokens for 12 ASCII chars, got {t}"
-        );
-    }
-
-    #[test]
-    fn token_estimate_cjk_uses_half_ratio() {
-        // 4 CJK ideographs → ~2 tokens.
-        let t = super::estimate_tokens("你好世界");
-        assert!(
-            (1.8..=2.2).contains(&t),
-            "expected ~2 tokens for 4 CJK chars, got {t}"
-        );
-    }
-
-    #[test]
-    fn token_estimate_mixed_splits_correctly() {
-        // "hello 你好" = 6 ASCII (incl. space) + 2 CJK
-        //             = 6 * 0.25 + 2 * 0.5 = 1.5 + 1.0 = 2.5
-        let t = super::estimate_tokens("hello 你好");
-        assert!(
-            (2.3..=2.7).contains(&t),
-            "expected ~2.5 tokens for mixed, got {t}"
-        );
-    }
-
-    #[test]
-    fn format_token_estimate_compacts_thousands() {
-        assert_eq!(super::format_token_estimate(420.0), "420");
-        assert_eq!(super::format_token_estimate(1_234.0), "1.2k");
-        assert_eq!(super::format_token_estimate(12_345.0), "12.3k");
-    }
-
-    #[test]
-    fn rate_suffix_none_when_finalised() {
-        let mut c = AssistantCell::new_streaming();
-        c.push_delta("some answer text");
-        c.finalize();
-        assert!(
-            c.rate_suffix_span().is_none(),
-            "no rate suffix on finalised cells"
-        );
-    }
-
-    #[test]
-    fn rate_suffix_shows_cumulative_before_300ms() {
-        // Freshly streaming cell: elapsed < 300ms so we only show
-        // the cumulative estimate, not a volatile tok/s figure.
-        let mut c = AssistantCell::new_streaming();
-        c.push_delta("hi");
-        let s = c.rate_suffix_span().expect("live cell with delta");
-        assert!(!s.contains("tok/s"), "tok/s too early: {s}");
-        assert!(s.contains(" · "), "cumulative estimate missing: {s}");
     }
 
     #[test]

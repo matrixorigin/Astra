@@ -12,6 +12,7 @@ use crate::cli::permission_manager::{PermissionMode, PermissionModeMirror};
 use crate::tui::status_line::{
     BackgroundTaskCounts, BackgroundTaskFanoutSummary, StatusContext, StatusLine,
 };
+use astra_turn_types::{ContextWindowUsage, ContextWindowUsageSource};
 
 pub(crate) struct Footer {
     pub model: Option<String>,
@@ -21,7 +22,14 @@ pub(crate) struct Footer {
     pub is_turn_active: bool,
     pub permission_mode: Option<PermissionMode>,
     pub git_branch: Option<String>,
-    pub token_budget: Option<(u64, u64)>,
+    /// Current request's usable context-window occupancy. This deliberately
+    /// does not use cumulative session/billing token totals.
+    pub context_window: Option<ContextWindowUsage>,
+    context_window_is_previous: bool,
+    /// Client-owned portion of the current request. The runtime adds the
+    /// exact system-prompt count through a typed SSE signal.
+    context_window_non_system_tokens: Option<(u64, u64)>,
+    last_system_prompt_tokens: Option<u32>,
     pub current_objective: Option<String>,
     pub turn_elapsed: Option<Duration>,
     pub pending_approvals: usize,
@@ -51,7 +59,10 @@ impl Footer {
             is_turn_active: false,
             permission_mode: None,
             git_branch: detect_git_branch(),
-            token_budget: None,
+            context_window: None,
+            context_window_is_previous: false,
+            context_window_non_system_tokens: None,
+            last_system_prompt_tokens: None,
             current_objective: None,
             turn_elapsed: None,
             pending_approvals: 0,
@@ -92,7 +103,8 @@ impl Footer {
         StatusContext {
             model: self.model.clone(),
             cwd: self.cwd.clone(),
-            token_budget: self.token_budget,
+            context_window: self.context_window,
+            context_window_is_previous: self.context_window_is_previous,
             current_objective: self.current_objective.clone(),
             turn_elapsed: self.turn_elapsed,
             permission_mode: self.live_mode(),
@@ -108,6 +120,73 @@ impl Footer {
             task_board_expanded: self.task_board_expanded,
             bg_task_counts: self.bg_task_counts,
             bg_fanout_summaries: self.bg_fanout_summaries.clone(),
+        }
+    }
+
+    /// Start a new request-level estimate. Preserve the preceding system
+    /// prompt estimate until this request's `context_meta` arrives, avoiding a
+    /// distracting drop between agentic tool rounds.
+    pub fn begin_context_window_estimate(&mut self, usage: ContextWindowUsage) {
+        if usage.limit_tokens == 0 {
+            return;
+        }
+        self.context_window_non_system_tokens = Some((usage.used_tokens, usage.limit_tokens));
+        let system_tokens = u64::from(self.last_system_prompt_tokens.unwrap_or(0));
+        self.context_window = Some(ContextWindowUsage::estimated(
+            usage.used_tokens.saturating_add(system_tokens),
+            usage.limit_tokens,
+        ));
+        self.context_window_is_previous = false;
+    }
+
+    /// A new model request has started. Retain the preceding request as
+    /// explicitly stale evidence until the new assembly estimate arrives;
+    /// replacing it with an empty gap made the footer look unreliable and
+    /// conveyed less truth than the client actually knew.
+    pub fn clear_context_window_for_new_request(&mut self) {
+        self.context_window_is_previous = self.context_window.is_some();
+        self.context_window_non_system_tokens = None;
+    }
+
+    pub fn context_window_is_previous(&self) -> bool {
+        self.context_window_is_previous
+    }
+
+    /// Incorporate the runtime's exact system-prompt assembly measurement.
+    pub fn set_context_system_prompt_tokens(&mut self, system_tokens: u32) {
+        self.last_system_prompt_tokens = Some(system_tokens);
+        let Some((non_system_tokens, limit_tokens)) = self.context_window_non_system_tokens else {
+            return;
+        };
+        self.context_window = Some(ContextWindowUsage::estimated(
+            non_system_tokens.saturating_add(u64::from(system_tokens)),
+            limit_tokens,
+        ));
+    }
+
+    /// Replace an estimate with the provider-confirmed request input count.
+    pub fn set_context_window_measured(&mut self, used_tokens: u64) {
+        let Some(current) = self.context_window else {
+            return;
+        };
+        self.context_window = Some(ContextWindowUsage::provider_reported(
+            used_tokens,
+            current.limit_tokens,
+        ));
+        self.context_window_is_previous = false;
+    }
+
+    /// Restore a completed request's context value without overriding a live
+    /// request currently being assembled in this TUI instance.
+    pub fn restore_context_window(&mut self, usage: ContextWindowUsage) {
+        if (self.context_window.is_none() || self.context_window_is_previous)
+            && usage.limit_tokens > 0
+        {
+            self.context_window = Some(usage);
+            self.context_window_is_previous = false;
+            if usage.source == ContextWindowUsageSource::Estimated {
+                self.context_window_non_system_tokens = None;
+            }
         }
     }
 
@@ -153,6 +232,7 @@ fn detect_git_branch() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::Footer;
+    use astra_turn_types::{ContextWindowUsage, ContextWindowUsageSource};
     use std::time::Duration;
 
     #[test]
@@ -163,5 +243,40 @@ mod tests {
         let ctx = footer.to_context();
         assert_eq!(ctx.current_objective.as_deref(), Some("Running bash"));
         assert_eq!(ctx.turn_elapsed, Some(Duration::from_secs(16)));
+    }
+
+    #[test]
+    fn context_window_replaces_estimate_with_provider_measurement() {
+        let mut footer = Footer::new();
+        footer.begin_context_window_estimate(ContextWindowUsage::estimated(5_000, 160_000));
+        footer.set_context_system_prompt_tokens(9_000);
+        assert_eq!(
+            footer.to_context().context_window,
+            Some(ContextWindowUsage::estimated(14_000, 160_000))
+        );
+
+        footer.set_context_window_measured(17_250);
+        assert_eq!(
+            footer.to_context().context_window,
+            Some(ContextWindowUsage::provider_reported(17_250, 160_000))
+        );
+
+        footer.clear_context_window_for_new_request();
+        let previous = footer.to_context();
+        assert_eq!(
+            previous.context_window,
+            Some(ContextWindowUsage::provider_reported(17_250, 160_000))
+        );
+        assert!(previous.context_window_is_previous);
+
+        footer.begin_context_window_estimate(ContextWindowUsage::estimated(8_000, 160_000));
+        let next_context = footer.to_context();
+        let next = next_context.context_window.expect("new estimate");
+        assert_eq!(
+            next.used_tokens, 17_000,
+            "prior system count is a bridge only"
+        );
+        assert_eq!(next.source, ContextWindowUsageSource::Estimated);
+        assert!(!next_context.context_window_is_previous);
     }
 }

@@ -270,10 +270,10 @@ pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService
 pub use runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
     DurableRunListPage, DurableRunRecord, InMemoryRunStateStore, LlmTokenServiceConfig,
-    LlmTokenServiceRequest, RunLifecycleService, RunListCursor, RunListRecord, RunMutationRecord,
-    RunStateStore, RunStatusRecord, UnconfiguredRunLifecycleService, extract_event_type,
-    run_list_cursor_db_updated_at, run_list_cursor_run_id, transform_run_event_for_client,
-    validate_run_list_limit,
+    LlmTokenServiceRequest, RunContinuationRecord, RunLifecycleService, RunListCursor,
+    RunListRecord, RunMutationDisposition, RunMutationRecord, RunStateStore, RunStatusRecord,
+    UnconfiguredRunLifecycleService, extract_event_type, run_list_cursor_db_updated_at,
+    run_list_cursor_run_id, transform_run_event_for_client, validate_run_list_limit,
 };
 pub use sandbox::{
     DatabaseSandboxService, SandboxCreateRequestData, SandboxRecord, SandboxService,
@@ -310,10 +310,9 @@ pub use skills::{
     UnconfiguredSkillService,
 };
 pub use state_projection::{
-    BubbleUpTarget, COMPACTION_INVARIANT_SQL, CompactionInvariant, DatabasePlanTodoSink,
-    DatabaseStateProjectionStore, DelegationProjectionUpsert, PROTECTED_COMPACTION_CATEGORIES,
-    PlanTodoSeed, PlanTodoSink, SkillActivationLlmProbe, StateItemUpsert, StateProjectionError,
-    UserAnchorMemoryItem, validate_state_mutation,
+    BubbleUpTarget, COMPACTION_INVARIANT_SQL, CompactionInvariant, DatabaseStateProjectionStore,
+    DelegationProjectionUpsert, PROTECTED_COMPACTION_CATEGORIES, SkillActivationLlmProbe,
+    StateItemUpsert, StateProjectionError, UserAnchorMemoryItem, validate_state_mutation,
 };
 pub use state_sync::{
     LocalOnlySyncService, MatrixOneSyncService, PlanTemplateSyncRow, StateSyncService,
@@ -333,10 +332,10 @@ pub use sync_outbox::{
     SYNC_OUTBOX_ACK_TOMBSTONE_RETAINED_RECORDS, SYNC_OUTBOX_ACKED_RETAINED_RECORDS,
     SYNC_OUTBOX_IN_FLIGHT_LEASE_MS, SYNC_OUTBOX_MAX_ATTEMPTS, SYNC_OUTBOX_SCHEMA_VERSION,
     SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS, SyncOutboxAckOutcome, SyncOutboxAckTombstone,
-    SyncOutboxDeliverySettlement, SyncOutboxEnqueueOutcome, SyncOutboxFile, SyncOutboxPoisonKind,
-    SyncOutboxRecord, SyncOutboxRecordState, SyncOutboxSettlementReport, SyncOutboxSkipKind,
-    SyncOutboxSkippedRecord, SyncOutboxStatus, SyncOutboxStore, sync_outbox_canonical_payload_hash,
-    sync_outbox_stable_event_id,
+    SyncOutboxDeliverySettlement, SyncOutboxEnqueueOutcome, SyncOutboxFile,
+    SyncOutboxJournalDeltaOutcome, SyncOutboxPoisonKind, SyncOutboxRecord, SyncOutboxRecordState,
+    SyncOutboxSettlementReport, SyncOutboxSkipKind, SyncOutboxSkippedRecord, SyncOutboxStatus,
+    SyncOutboxStore, sync_outbox_canonical_payload_hash, sync_outbox_stable_event_id,
 };
 pub use task_orchestrator::{
     LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskClaimability,

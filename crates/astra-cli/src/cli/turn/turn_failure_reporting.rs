@@ -87,6 +87,28 @@ pub(crate) fn report_turn_failure(
         );
         enqueue_ingestion_pub(state, &err_event);
         state.last_turn_event = Some(err_event);
+
+        let transcript_events = crate::cli::stream::streaming_types::root_run_transcript_events(
+            state.session_id.as_deref(),
+            failure.partial.run_id.as_deref(),
+            &failure.partial.run_transcript_messages,
+        );
+        if !transcript_events.is_empty() {
+            if let Err(error) = journal.append_bulk(&transcript_events) {
+                let message = format!("failed to persist interrupted run transcript: {error}");
+                tracing::warn!(%error, "{message}");
+                ui.show_error(&format!("  {} {message}", crate::cli::theme::icon_err()));
+                state.session_persistence_error =
+                    Some(match state.session_persistence_error.take() {
+                        Some(existing) => format!("{existing}; {message}"),
+                        None => message,
+                    });
+            } else {
+                for event in &transcript_events {
+                    enqueue_ingestion_pub(state, event);
+                }
+            }
+        }
     }
 
     // A final failed settlement still consumed a user-visible turn. Keep the
@@ -196,6 +218,53 @@ mod tests {
             persisted.metadata.as_ref().unwrap()["run_id"],
             "run-failure-1"
         );
+    }
+
+    #[test]
+    fn report_turn_failure_persists_captured_root_run_items() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("test-turn-failure-transcript-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "provider stream ended".into(),
+            partial: crate::PartialTurnData {
+                run_id: Some("run-root-failure-1".into()),
+                partial_text: "partial answer".into(),
+                run_transcript_messages: vec![
+                    serde_json::json!({"role": "user", "content": "review this change"}),
+                    serde_json::json!({"role": "assistant", "tool_calls": [{"id": "call-1"}]}),
+                    serde_json::json!({"role": "tool", "tool_call_id": "call-1", "content": "partial result"}),
+                ],
+                ..Default::default()
+            },
+        };
+
+        report_turn_failure(
+            &mut state,
+            None,
+            "review this change",
+            &failure,
+            Instant::now(),
+            &mut crate::cli::ui_adapter::LineUiAdapter,
+        );
+
+        let items = session_journal::read_journal(&sid)
+            .expect("journal should be readable")
+            .into_iter()
+            .filter_map(|event| event.transcript_item)
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().all(|item| item.run_id == "run-root-failure-1"));
+        assert_eq!(
+            items.iter().map(|item| item.item_seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(items[2].message["content"], "partial result");
     }
 
     #[test]

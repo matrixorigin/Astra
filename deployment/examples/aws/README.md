@@ -83,7 +83,7 @@ aws ec2 run-instances \
 
 # Install MatrixOne
 ssh ec2-user@<instance-ip>
-docker run -d -p 6001:6001 matrixorigin/matrixone:4.0.0-rc3
+docker run -d -p 6001:6001 matrixorigin/matrixone:latest
 ```
 
 **Option B: RDS MySQL (compatible)**

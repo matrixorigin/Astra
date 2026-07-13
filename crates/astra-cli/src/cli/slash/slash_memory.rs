@@ -1178,10 +1178,26 @@ pub(crate) async fn load_current_session_memory(
     token: &str,
     session_id: &str,
 ) -> Result<Option<SessionMemoryRecord>, String> {
-    const SESSION_MEMORY_TOP_K: usize = 64;
     if let Some(record) = load_local_session_memory(session_id) {
         return Ok(Some(record));
     }
+
+    match load_remote_session_memory(api, token, session_id).await {
+        Ok(record) => Ok(record.or_else(|| load_local_session_memory(session_id))),
+        Err(error) => load_local_session_memory(session_id).map(Some).ok_or(error),
+    }
+}
+
+/// Load only the remote session snapshot. Callers that can use a local
+/// artifact without authentication should check it before entering this
+/// network path; the CLI wrapper above still reconciles a concurrent local
+/// write after a remote attempt.
+pub(crate) async fn load_remote_session_memory(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    session_id: &str,
+) -> Result<Option<SessionMemoryRecord>, String> {
+    const SESSION_MEMORY_TOP_K: usize = 64;
     let typed_payload = serde_json::json!({
         "query": astra_runtime::session_memory::runner::SESSION_MEMORY_PREFIX,
         "top_k": SESSION_MEMORY_TOP_K,
@@ -1212,12 +1228,7 @@ pub(crate) async fn load_current_session_memory(
         .await
     {
         Ok(response) => response,
-        Err(error) => {
-            if let Some(record) = load_local_session_memory(session_id) {
-                return Ok(Some(record));
-            }
-            return Err(format!("memory retrieve failed: {error}"));
-        }
+        Err(error) => return Err(format!("memory retrieve failed: {error}")),
     };
     let status = response.status();
     let payload: serde_json::Value = response
@@ -1225,13 +1236,9 @@ pub(crate) async fn load_current_session_memory(
         .await
         .map_err(|error| format!("memory retrieve parse failed: {error}"))?;
     if !status.is_success() {
-        if let Some(record) = load_local_session_memory(session_id) {
-            return Ok(Some(record));
-        }
         return Err(format!("memory retrieve failed ({status})"));
     }
-    Ok(select_session_memory_record(&payload, session_id)
-        .or_else(|| load_local_session_memory(session_id)))
+    Ok(select_session_memory_record(&payload, session_id))
 }
 
 pub(crate) fn load_local_session_memory(session_id: &str) -> Option<SessionMemoryRecord> {

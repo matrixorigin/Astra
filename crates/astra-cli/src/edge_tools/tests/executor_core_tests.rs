@@ -435,13 +435,14 @@ async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
         Some(astra_core::ErrorKind::ToolInvalidArgs.as_str()),
         "got: {result}"
     );
+    let error = parsed["error"].as_str().expect("structured error text");
     assert!(
-        result.contains("action='spawn'") || result.contains("\"action\":\"spawn\""),
-        "error must show the correct top-level action shape so the model can recover. Got: {result}"
+        error.contains("\"action\":\"spawn\""),
+        "error must show the correct top-level action shape so the model can recover. Got: {error}"
     );
     assert!(
-        result.contains("top-level") || result.contains("wrapper"),
-        "error must explain that `spawn` is not a wrapper key. Got: {result}"
+        error.contains("top-level") || error.contains("wrapper"),
+        "error must explain that `spawn` is not a wrapper key. Got: {error}"
     );
 }
 
@@ -735,9 +736,10 @@ async fn exit_plan_mode_overlay_paths() {
 
         let mut overlay_task = None;
         if let Some(decision) = &case.decision {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
-                crate::cli::chat_stream::PlanReviewRequest,
-            >();
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<crate::cli::chat_stream::PlanReviewRequest>(
+                    crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+                );
             executor.set_plan_review_request_tx(Some(tx));
             let dec = decision.clone();
             overlay_task = Some(tokio::spawn(async move {
@@ -840,16 +842,8 @@ async fn enter_plan_mode_stages_permission_mode_plan() {
 
 #[tokio::test]
 async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
-    // Invariant I1 reinforcement: explicit assertion that the local
-    // path makes ZERO calls to cloud plan endpoints. Today the path
-    // does a probe `GET /plans?phase=planning` which is borderline
-    // acceptable for fall-back detection, but should not hit
-    // `POST /plans/*/exit-plan-mode`. We rely on wiremock's "no
-    // unmounted endpoint matched" semantics: any unexpected request
-    // produces a 404 the test can observe via the result string.
-    //
-    // GREEN once Step 4 finishes (already partially correct via
-    // dual-path Step 3 work).
+    // The local approval path may probe the active plan, but it neither mutates
+    // a cloud plan nor materializes a second session-todo representation.
     use crate::cli::chat_stream::PlanReviewDecision;
     use crate::cli::permission_manager::PermissionMode;
 
@@ -862,15 +856,14 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plans": []})))
         .mount(&server)
         .await;
-    // Intentionally NO mock for `POST /plans/*/exit-plan-mode`.
-
     let temp = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(temp.path().to_path_buf())
         .with_active_session_id("sess-no-cloud")
         .with_cloud(server.uri(), "token");
 
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::cli::chat_stream::PlanReviewRequest>(
+        crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+    );
     executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
@@ -880,20 +873,25 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
         });
     });
 
-    let result = executor
+    let _result = executor
         .execute("exit_plan_mode", &json!({"plan": "1. Investigate"}))
         .await;
     overlay_task.await.unwrap();
 
+    let requests = server.received_requests().await.expect("captured requests");
     assert!(
-        !result.contains("404")
-            && !result.contains("failed to exit plan mode")
-            && !result.contains("Mock"),
-        "local path must not hit any unmounted plan-exit endpoint. Got: {result}"
+        requests
+            .iter()
+            .all(|request| request.method.as_str() == "GET")
     );
     assert!(
-        result.starts_with("Exited plan mode"),
-        "local path should report success without server confirmation. Got: {result}"
+        executor
+            .task_manager
+            .snapshot()
+            .await
+            .expect("task snapshot")
+            .is_empty(),
+        "plan approval must not write a copied session-todo task"
     );
     assert_eq!(
         executor.take_pending_permission_mode_change(),
@@ -914,7 +912,7 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
 
 #[tokio::test]
 async fn enter_plan_mode_then_exit_full_cycle_offline() {
-    // End-to-end Shift+Tab parity: enter → exit cycle works without
+    // End-to-end local enter → exit flow works without
     // any cloud at all. Asserts the slot transitions cleanly:
     //   1. enter_plan_mode → pending = Some(Plan)
     //   2. host applies → perm_manager simulated as Plan
@@ -941,8 +939,9 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
     );
 
     // Step 2-4: exit through overlay, choose Auto
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::cli::chat_stream::PlanReviewRequest>(
+        crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+    );
     executor.set_plan_review_request_tx(Some(tx));
 
     let overlay_task = tokio::spawn(async move {
@@ -1151,8 +1150,9 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
         "precondition: writes must be blocked before exit. Got: {blocked}"
     );
 
-    let (tx, mut rx) =
-        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::cli::chat_stream::PlanReviewRequest>(
+        crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+    );
     executor.set_plan_review_request_tx(Some(tx));
     let overlay_task = tokio::spawn(async move {
         let request = rx.recv().await.expect("overlay request");
@@ -1414,6 +1414,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
             memoria_ms: None,
             session_lineage: None,
             coordination: None,
+            transcript_item: None,
             edge_policy: None,
             context_assembly_trace: None,
             routing_domain_hint: None,

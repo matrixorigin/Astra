@@ -14,6 +14,7 @@ use astra_services::workspace_records::{
     InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtStore, WorkspaceCleanupDebtStoreError,
     WorkspaceRecordStore,
 };
+use astra_turn_core::orchestration::fanout_group::{AgentFanoutSlotStatus, AgentFanoutStatus};
 use serde_json::json;
 use sqlx::Row;
 use std::collections::HashSet;
@@ -101,27 +102,28 @@ impl crate::turn::run_control::RunStatusProvider for StaticRunControlProvider {
 }
 
 #[async_trait::async_trait]
-impl RunInputProvider for StaticRunControlProvider {
-    async fn poll_user_inputs(
+impl UserIntentProvider for StaticRunControlProvider {
+    async fn poll_user_intents(
         &self,
         _user_id: &str,
         _run_id: &str,
         after_event_index: usize,
-    ) -> crate::turn::run_control::RunQueuedInputPoll {
-        crate::turn::run_control::RunQueuedInputPoll {
+    ) -> crate::turn::run_control::UserIntentPoll {
+        crate::turn::run_control::UserIntentPoll {
             next_cursor: after_event_index,
             inputs: Vec::new(),
+            issues: Vec::new(),
             error: None,
         }
     }
 
-    async fn mark_user_inputs_released(
+    async fn mark_user_intents_applied(
         &self,
         _user_id: &str,
         _run_id: &str,
         _event_indices: &[usize],
-    ) -> Result<(), String> {
-        Ok(())
+    ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
+        Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
     }
 }
 
@@ -320,11 +322,15 @@ fn test_session_task(
 
 fn test_agent_progress_event(
     agent_id: &str,
+    run_id: &str,
+    parent_run_id: &str,
     timestamp_epoch_ms: u64,
     event_type: ProgressEventType,
 ) -> AgentProgressEvent {
     AgentProgressEvent {
         agent_id: agent_id.to_string(),
+        run_id: run_id.to_string(),
+        parent_run_id: parent_run_id.to_string(),
         event_type,
         timestamp_epoch_ms,
         metadata: None,
@@ -339,10 +345,10 @@ fn test_agent_spawned(
 ) -> AgentProgressEvent {
     test_agent_progress_event(
         agent_id,
+        run_id,
+        parent_run_id,
         timestamp_epoch_ms,
         ProgressEventType::AgentSpawned {
-            run_id: run_id.to_string(),
-            parent_run_id: parent_run_id.to_string(),
             agent_type: "reviewer".to_string(),
             description: "review code".to_string(),
             fanout_slot: None,
@@ -711,31 +717,31 @@ fn shutdown_extraction_request_detects_correction_from_structured_user_intent() 
 }
 
 #[test]
-fn run_scoped_agent_progress_filter_replays_early_events_after_spawn() {
+fn run_scoped_agent_progress_filter_accepts_scoped_events_before_spawn() {
     let mut filter = server_loop_host::RunScopedAgentProgressFilter::new("root-run".to_string());
 
     let accepted = filter.accept(test_agent_progress_event(
         "agent-a",
+        "child-run",
+        "root-run",
         1,
         ProgressEventType::Started {
             description: "review code".to_string(),
         },
     ));
-    assert!(accepted.is_empty());
+    assert_eq!(accepted.len(), 1);
 
     let accepted = filter.accept(test_agent_spawned("agent-a", "child-run", "root-run", 2));
-    assert_eq!(accepted.len(), 2);
+    assert_eq!(accepted.len(), 1);
     assert!(matches!(
         accepted[0].event_type,
-        ProgressEventType::Started { .. }
-    ));
-    assert!(matches!(
-        accepted[1].event_type,
         ProgressEventType::AgentSpawned { .. }
     ));
 
     let accepted = filter.accept(test_agent_progress_event(
         "agent-a",
+        "child-run",
+        "root-run",
         3,
         ProgressEventType::ToolExecuting {
             tool_name: "rg".to_string(),
@@ -746,33 +752,23 @@ fn run_scoped_agent_progress_filter_replays_early_events_after_spawn() {
 }
 
 #[test]
-fn run_scoped_agent_progress_filter_replays_bounded_latest_early_events_in_order() {
+fn run_scoped_agent_progress_filter_preserves_scoped_arrival_order() {
     let mut filter = server_loop_host::RunScopedAgentProgressFilter::new("root-run".to_string());
 
     for timestamp in 1..=10 {
-        assert!(
-            filter
-                .accept(test_agent_progress_event(
-                    "agent-a",
-                    timestamp,
-                    ProgressEventType::ToolExecuting {
-                        tool_name: format!("tool-{timestamp}"),
-                        turn: timestamp as u32,
-                    },
-                ))
-                .is_empty()
-        );
+        let accepted = filter.accept(test_agent_progress_event(
+            "agent-a",
+            "child-run",
+            "root-run",
+            timestamp,
+            ProgressEventType::ToolExecuting {
+                tool_name: format!("tool-{timestamp}"),
+                turn: timestamp as u32,
+            },
+        ));
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].timestamp_epoch_ms, timestamp);
     }
-
-    let accepted = filter.accept(test_agent_spawned("agent-a", "child-run", "root-run", 11));
-
-    assert_eq!(
-        accepted
-            .iter()
-            .map(|event| event.timestamp_epoch_ms)
-            .collect::<Vec<_>>(),
-        vec![3, 4, 5, 6, 7, 8, 9, 10, 11]
-    );
 }
 
 #[test]
@@ -783,6 +779,8 @@ fn run_scoped_agent_progress_filter_blocks_foreign_root_events() {
         filter
             .accept(test_agent_progress_event(
                 "agent-b",
+                "child-b",
+                "root-b",
                 1,
                 ProgressEventType::Started {
                     description: "other run".to_string(),
@@ -798,10 +796,6 @@ fn run_scoped_agent_progress_filter_blocks_foreign_root_events() {
     assert!(
         !filter.agent_ids.contains("agent-b"),
         "foreign agent must not be admitted"
-    );
-    assert!(
-        !filter.pending_by_agent.contains_key("agent-b"),
-        "foreign spawn should clear cached early events"
     );
 }
 
@@ -833,9 +827,14 @@ async fn agent_progress_stream_bridge_drains_progress_on_stop() {
 
     let emitter = svc
         .server_agent_progress_broadcaster
-        .for_agent("agent-a".to_string());
+        .for_agent_with_run_context(
+            "agent-a".to_string(),
+            "child-run".to_string(),
+            "root-run".to_string(),
+            None,
+        );
     emitter.started("review code");
-    emitter.agent_spawned("child-run", "root-run", "reviewer", "review code");
+    emitter.agent_spawned("reviewer", "review code");
     emitter.completed("done", 0, (0, 0), 7);
 
     bridge.stop_and_drain().await;
@@ -1077,12 +1076,14 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
     });
     let output = super::agent_live_event_to_work_surface_sse(
         &AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "agent-1".to_string(),
             kind: AgentLiveEventKind::OutputDelta("child output".to_string()),
         },
         Some(&metadata),
     );
     assert_eq!(output["type"], "agent_live_event");
+    assert_eq!(output["run_id"], "test-run");
     assert_eq!(output["agent_id"], "agent-1");
     assert_eq!(output["event_kind"], "output_delta");
     assert_eq!(output["content"], "child output");
@@ -1092,6 +1093,7 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
 
     let terminal = super::agent_live_event_to_work_surface_sse(
         &AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "agent-1".to_string(),
             kind: AgentLiveEventKind::AgentTerminated {
                 termination: AgentLiveTermination::Completed,
@@ -1107,6 +1109,24 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
     assert_eq!(terminal["duration_ms"], 12);
     assert_eq!(terminal["workspace"]["kind"], "edge_workspace");
     assert_eq!(terminal["executor"]["executor_id"], "edge-macbook-1");
+
+    let signal = super::agent_live_event_to_work_surface_sse(
+        &AgentLiveEvent {
+            run_id: "test-run".into(),
+            agent_id: "agent-1".to_string(),
+            kind: AgentLiveEventKind::Signal(
+                astra_turn_core::agent_live_event::AgentLiveSignal::PermissionAutoApproved {
+                    tool: "bash".into(),
+                    reason: "session rule".into(),
+                },
+            ),
+        },
+        Some(&metadata),
+    );
+    assert_eq!(signal["event_kind"], "signal");
+    assert_eq!(signal["signal"]["signal"], "permission_auto_approved");
+    assert_eq!(signal["signal"]["tool"], "bash");
+    assert_eq!(signal["executor"]["executor_id"], "edge-macbook-1");
 }
 
 // ── extract_prev_assistant_text + implicit feedback wiring ──
@@ -1205,7 +1225,6 @@ fn format_run_events_preserves_global_offset() {
 #[test]
 fn run_status_as_str_matches_durable_status_constants() {
     assert_eq!(RunStatus::Running.as_str(), STATUS_RUNNING);
-    assert_eq!(RunStatus::InputQueued.as_str(), STATUS_INPUT_QUEUED);
     assert_eq!(RunStatus::Paused.as_str(), STATUS_PAUSED);
     assert_eq!(RunStatus::Waiting.as_str(), STATUS_WAITING);
     assert_eq!(RunStatus::Completed.as_str(), STATUS_COMPLETED);
@@ -1355,7 +1374,6 @@ fn stream_turn_complete_is_only_for_completed_or_paused_turns() {
     assert!(!should_emit_stream_turn_complete(&RunStatus::Failed));
     assert!(!should_emit_stream_turn_complete(&RunStatus::Cancelled));
     assert!(!should_emit_stream_turn_complete(&RunStatus::Waiting));
-    assert!(!should_emit_stream_turn_complete(&RunStatus::InputQueued));
     assert!(!should_emit_stream_turn_complete(&RunStatus::Running));
 }
 
@@ -1415,6 +1433,7 @@ fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunC
     SpawnRunConfig {
         run_id: "child-run".to_string(),
         agent_id: "child@1234".to_string(),
+        spawn_tool_call_id: None,
         recursion_depth: 1,
         agent_type: "test".to_string(),
         task: "do work".to_string(),
@@ -1448,6 +1467,7 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
         llm_token_service: None,
         request_constraints: RequestConstraints::default(),
         execution_metadata: None,
+        spawner: std::sync::Weak::new(),
         pause_flag: None,
         cancel_token: None,
         trace_context: server_trace_context(user_id, "session-1", parent_run_id, 1),
@@ -1456,6 +1476,13 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
         #[cfg(feature = "harness")]
         harness_sink: None,
     }
+}
+
+fn test_dynamic_agent_spawner() -> Arc<DynamicAgentSpawner> {
+    let transport = Arc::new(astra_messaging::InProcessTransport::new());
+    let tracker = Arc::new(crate::server::delegation::engine::DelegationTracker::new());
+    let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+    Arc::new(DynamicAgentSpawner::new(router))
 }
 
 #[tokio::test]
@@ -1482,6 +1509,132 @@ async fn server_spawn_runtime_context_is_keyed_by_parent_run() {
 
     assert_eq!(context.parent_run_id, "parent-run-b");
     assert_eq!(context.user_id, "user-b");
+}
+
+#[tokio::test]
+async fn server_dynamic_child_becomes_a_valid_parent_for_grandchildren() {
+    let executor = ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    );
+    let spawner = test_dynamic_agent_spawner();
+    let mut root_context = test_spawn_runtime_context("root-run", "user-a");
+    root_context.request_constraints = RequestConstraints::new(
+        Some(["read_file".to_string()].into_iter().collect()),
+        None,
+        None,
+    );
+    root_context.spawner = Arc::downgrade(&spawner);
+    executor.set_runtime_context(root_context).await;
+
+    let mut child = test_spawn_run_config(vec!["read_file", "bash"], false);
+    child.run_id = "child-run".to_string();
+    child.parent_address = Some(astra_messaging::types::AgentAddress::new(
+        "root-run",
+        "root-agent",
+    ));
+    let root = executor.runtime_context_for_config(&child).await.unwrap();
+    let child_constraints = spawn_child_request_constraints(&root.request_constraints, &child);
+    executor
+        .register_child_runtime_context(&root, &child, child_constraints)
+        .await;
+
+    let mut grandchild = test_spawn_run_config(vec!["read_file", "bash"], false);
+    grandchild.run_id = "grandchild-run".to_string();
+    grandchild.parent_address = Some(astra_messaging::types::AgentAddress::new(
+        "child-run",
+        "child-agent",
+    ));
+    let context = executor
+        .runtime_context_for_config(&grandchild)
+        .await
+        .unwrap();
+
+    assert_eq!(context.parent_run_id, "child-run");
+    assert_eq!(context.user_id, "user-a");
+    assert_eq!(
+        context.request_constraints.allowed_tools,
+        Some(["read_file".to_string()].into_iter().collect())
+    );
+    assert!(
+        context.spawner.upgrade().is_some(),
+        "the live child must retain the session-owned spawner capability"
+    );
+}
+
+#[tokio::test]
+async fn server_dynamic_child_controls_are_private_but_parent_cancellation_propagates() {
+    let executor = ServerSpawnAgentExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    );
+    let root_pause_flag = Arc::new(AtomicBool::new(false));
+    let root_cancel_token = Arc::new(CancellationToken::new());
+    let mut root_context = test_spawn_runtime_context("root-run", "user-a");
+    root_context.pause_flag = Some(root_pause_flag.clone());
+    root_context.cancel_token = Some(root_cancel_token.clone());
+    executor.set_runtime_context(root_context).await;
+
+    let mut child = test_spawn_run_config(vec!["read_file"], false);
+    child.run_id = "child-run".to_string();
+    child.parent_address = Some(astra_messaging::types::AgentAddress::new(
+        "root-run",
+        "root-agent",
+    ));
+    let parent = executor.runtime_context_for_config(&child).await.unwrap();
+    let child_context = executor
+        .register_child_runtime_context(
+            &parent,
+            &child,
+            spawn_child_request_constraints(&parent.request_constraints, &child),
+        )
+        .await;
+    let child_pause_flag = child_context.pause_flag.expect("child pause flag");
+    let child_cancel_token = child_context
+        .cancel_token
+        .expect("child cancellation token");
+
+    assert!(
+        !Arc::ptr_eq(&root_pause_flag, &child_pause_flag),
+        "a child must not share its parent's pause flag"
+    );
+    assert!(
+        !Arc::ptr_eq(&root_cancel_token, &child_cancel_token),
+        "a child receives a descendant cancellation token, not the parent's token"
+    );
+    let mut sibling = test_spawn_run_config(vec!["read_file"], false);
+    sibling.run_id = "sibling-run".to_string();
+    sibling.parent_address = Some(astra_messaging::types::AgentAddress::new(
+        "root-run",
+        "root-agent",
+    ));
+    let sibling_context = executor
+        .register_child_runtime_context(
+            &parent,
+            &sibling,
+            spawn_child_request_constraints(&parent.request_constraints, &sibling),
+        )
+        .await;
+    sibling_context
+        .cancel_token
+        .expect("sibling cancellation token")
+        .cancel();
+    assert!(
+        !root_cancel_token.is_cancelled(),
+        "direct child cancellation must not cancel the root"
+    );
+    let child_context = executor
+        .runtime_context_for_config(&child)
+        .await
+        .expect("registered child context");
+    let inherited_child_token = child_context.cancel_token.expect("stored child token");
+    root_cancel_token.cancel();
+    assert!(
+        inherited_child_token.is_cancelled(),
+        "root cancellation must still reach child tokens"
+    );
 }
 
 #[tokio::test]
@@ -2450,6 +2603,7 @@ fn db_backed_test_service(
 
 async fn cleanup_lifecycle_run_fixture(pool: &SharedPool, user_id: &str, run_id: &str) {
     for sql in [
+        "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND run_id = ?",
         "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
         "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
         "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
@@ -3129,6 +3283,25 @@ fn server_subrun_executor_keeps_inherited_permissions() {
     .with_inherited_permissions(inherited_permissions);
 
     assert_eq!(executor.inherited_permissions.mode, PermissionMode::Deny);
+}
+
+#[test]
+fn server_subrun_executor_reuses_the_lifecycle_run_engine() {
+    let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    let executor = ServerSubRunExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_run_engine(run_engine.clone());
+
+    let wired = executor
+        .durable_run_engine()
+        .expect("injected lifecycle engine must be retained");
+    assert!(
+        Arc::ptr_eq(run_engine.store(), wired.store()),
+        "subruns must retain the lifecycle store identity rather than reconstructing a new owner"
+    );
 }
 
 #[test]
@@ -5288,6 +5461,27 @@ fn streaming_durable_persistence_keeps_semantic_events_before_terminal() {
 }
 
 #[test]
+fn agent_communication_is_a_durable_replay_boundary() {
+    let event = json!({
+        "type": "agent_communication",
+        "schema_version": "astra.agent_communication.v1",
+        "observed_by": {"run_id": "run-review", "agent_id": "reviewer"},
+        "direction": "received",
+        "message_id": "msg-1",
+        "from": {"run_id": "run-code", "agent_id": "coder"},
+        "to": {"kind": "direct", "address": {"run_id": "run-review", "agent_id": "reviewer"}},
+        "payload_kind": "text",
+        "summary": "review this",
+        "timestamp_ms": 42,
+        "requires_ack": false
+    });
+
+    assert!(live_delta_event_for_persistence(&event));
+    assert!(streaming_event_for_persistence(&event));
+    assert!(durable_replay_boundary_event(&event));
+}
+
+#[test]
 fn active_run_live_event_projection_is_bounded() {
     let mut run = RunState {
         run_id: "run-live-bound".to_string(),
@@ -5795,36 +5989,672 @@ async fn noninteractive_create_run_does_not_wire_ws_only_channels() {
     assert!(!svc.progress_channels.lock().await.contains_key(&run.run_id));
 }
 
-#[tokio::test]
-async fn noninteractive_approval_gate_denies_required_tools_without_waiting_for_ws() {
-    let gate = NonInteractiveApprovalGate;
+async fn wait_for_durable_run_status(
+    engine: &RunEngine,
+    user_id: &str,
+    run_id: &str,
+    expected_status: &str,
+) -> DurableRunRecord {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let run = engine
+                .load_run(user_id, run_id)
+                .await
+                .unwrap()
+                .expect("durable run");
+            if run.status == expected_status {
+                return run;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("run status transition")
+}
 
-    assert!(astra_tools::ToolApprovalGate::requires_approval(
-        &gate, "bash"
+#[tokio::test(flavor = "current_thread")]
+async fn server_only_approval_wait_resumes_from_shared_interaction_state() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("server-only-run", "user-1", "server-only-session")
+        .await
+        .unwrap();
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "server-only-session".into(),
+        "server-only-run".into(),
+        Some(4),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    )
+    .with_timeout(Duration::from_secs(1));
+
+    let approval = tokio::spawn(async move {
+        astra_tools::ToolApprovalGate::request_approval(
+            &gate,
+            "approval-server-only",
+            "bash",
+            &json!({"command": "git status"}),
+        )
+        .await
+    });
+    wait_for_durable_run_status(&svc.run_engine, "user-1", "server-only-run", STATUS_WAITING).await;
+    let resolved = svc
+        .run_engine
+        .resolve_run_interaction(
+            "user-1",
+            "server-only-run",
+            "approval-server-only",
+            astra_services::runs::DurableRunInteractionKind::Approval,
+            json!({
+                "request_id": "approval-server-only",
+                "outcome": "approved",
+                "decision": "allow",
+                "reason": null,
+                "tool": "bash",
+                "approval_kind": "standard",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        resolved,
+        astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_)
     ));
-    assert!(astra_tools::ToolApprovalGate::requires_approval_for(
-        &gate,
-        "git",
-        &serde_json::json!({"action": "commit"})
+    let decision = approval.await.unwrap();
+
+    assert!(matches!(decision, astra_tools::ApprovalDecision::Approved));
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "server-only-run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_RUNNING);
+    assert_eq!(durable.waiting_for, None);
+    assert_eq!(
+        durable.events[1]["event_type"], "approval_required",
+        "request must be part of durable run replay"
+    );
+    assert_eq!(durable.events[1]["data"]["delivery"], "durable");
+    assert_eq!(durable.events[2]["event_type"], "approval_resolved");
+    assert_eq!(durable.events[2]["data"]["outcome"], "approved");
+    assert_eq!(durable.events[3]["event_type"], "run_resumed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_run_unblocks_durable_approval_without_executing_a_late_decision() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("approval-cancelled", "user-1", "server-only-session")
+        .await
+        .unwrap();
+    let cancel_token = Arc::new(CancellationToken::new());
+    let (wait_started_tx, wait_started_rx) = oneshot::channel();
+    let gate = Arc::new(
+        DurableRunApprovalGate::new(
+            "user-1".into(),
+            "server-only-session".into(),
+            "approval-cancelled".into(),
+            Some(4),
+            svc.run_engine.clone(),
+            svc.runs_handle(),
+            None,
+            None,
+        )
+        .with_timeout(Duration::from_secs(30))
+        .with_cancel_token(cancel_token.clone())
+        .with_wait_started_notifier(wait_started_tx),
+    );
+    let waiting_gate = gate.clone();
+    let waiting = tokio::spawn(async move {
+        astra_tools::ToolApprovalGate::request_approval(
+            waiting_gate.as_ref(),
+            "approval-cancelled-request",
+            "bash",
+            &json!({"command": "touch must-not-run"}),
+        )
+        .await
+    });
+    wait_started_rx.await.expect("approval wait started");
+    svc.run_engine
+        .persist_status("user-1", "approval-cancelled", STATUS_CANCELLED, None, None)
+        .await
+        .unwrap();
+    cancel_token.cancel();
+
+    let decision = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("cancelled approval must not wait for its normal timeout")
+        .expect("approval task join");
+    assert!(matches!(
+        decision,
+        astra_tools::ApprovalDecision::Denied { .. }
     ));
-    assert!(!astra_tools::ToolApprovalGate::requires_approval_for(
-        &gate,
-        "git",
-        &serde_json::json!({"action": "diff"})
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "approval-cancelled")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_CANCELLED);
+    assert!(
+        durable.events.iter().all(|event| {
+            event.get("event_type").and_then(Value::as_str) != Some("run_resumed")
+        }),
+        "a cancellation must not turn a late approval wait back into a running run"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_run_unblocks_durable_user_prompt_without_resuming_the_child() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("prompt-cancelled", "user-1", "server-only-session")
+        .await
+        .unwrap();
+    let cancel_token = Arc::new(CancellationToken::new());
+    let gate = Arc::new(
+        DurableRunUserPromptGate::new(
+            "user-1".into(),
+            "server-only-session".into(),
+            "prompt-cancelled".into(),
+            Some(4),
+            svc.run_engine.clone(),
+            svc.runs_handle(),
+            None,
+            None,
+        )
+        .with_timeout(Duration::from_secs(30))
+        .with_cancel_token(cancel_token.clone()),
+    );
+    let prompt = astra_tools::AskUserPrompt {
+        context: Some("Need a choice".into()),
+        questions: vec![astra_tools::AskUserQuestion {
+            header: "Scope".into(),
+            question: "Continue?".into(),
+            options: Vec::new(),
+            multi_select: false,
+            allow_freeform: true,
+        }],
+        timeout_ms: None,
+    };
+    let waiting_gate = gate.clone();
+    let waiting = tokio::spawn(async move {
+        astra_tools::AskUserGate::request_questionnaire(
+            waiting_gate.as_ref(),
+            "prompt-cancelled-request",
+            &prompt,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let status = svc
+                .run_engine
+                .load_run("user-1", "prompt-cancelled")
+                .await
+                .unwrap()
+                .expect("durable run");
+            if status.status == STATUS_WAITING {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("user prompt must enter a durable wait");
+    svc.run_engine
+        .persist_status("user-1", "prompt-cancelled", STATUS_CANCELLED, None, None)
+        .await
+        .unwrap();
+    cancel_token.cancel();
+
+    let decision = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("cancelled prompt must not wait for its normal timeout")
+        .expect("prompt task join");
+    assert!(matches!(decision, astra_tools::AskUserDecision::Cancelled));
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "prompt-cancelled")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_CANCELLED);
+    assert!(
+        durable.events.iter().all(|event| {
+            event.get("event_type").and_then(Value::as_str) != Some("run_resumed")
+        }),
+        "a cancelled prompt must not resume execution when a late answer appears"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn server_only_user_prompt_wait_resumes_from_shared_interaction_state() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("server-only-prompt", "user-1", "server-only-session")
+        .await
+        .unwrap();
+    let gate = DurableRunUserPromptGate::new(
+        "user-1".into(),
+        "server-only-session".into(),
+        "server-only-prompt".into(),
+        Some(4),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    )
+    .with_timeout(Duration::from_secs(1));
+    let prompt = astra_tools::AskUserPrompt {
+        context: None,
+        questions: vec![astra_tools::AskUserQuestion {
+            header: "Scope".into(),
+            question: "Continue?".into(),
+            options: vec![astra_tools::AskUserChoice {
+                label: "yes".into(),
+                description: None,
+                preview: None,
+            }],
+            multi_select: false,
+            allow_freeform: false,
+        }],
+        timeout_ms: None,
+    };
+    let prompt_wait = tokio::spawn(async move {
+        astra_tools::AskUserGate::request_questionnaire(&gate, "prompt-server-only", &prompt).await
+    });
+    wait_for_durable_run_status(
+        &svc.run_engine,
+        "user-1",
+        "server-only-prompt",
+        STATUS_WAITING,
+    )
+    .await;
+    svc.run_engine
+        .resolve_run_interaction(
+            "user-1",
+            "server-only-prompt",
+            "prompt-server-only",
+            astra_services::runs::DurableRunInteractionKind::AskUser,
+            json!({
+                "request_id": "prompt-server-only",
+                "outcome": "submitted",
+                "answers": {
+                    "answers": [{
+                        "question": "Continue?",
+                        "answers": ["yes"],
+                        "multi_select": false,
+                        "annotation": null
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let decision = prompt_wait.await.unwrap();
+    assert!(matches!(
+        decision,
+        astra_tools::AskUserDecision::Submitted(ref answers)
+            if answers.answers[0].answers == vec!["yes".to_string()]
     ));
+
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "server-only-prompt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_RUNNING);
+    assert_eq!(durable.waiting_for, None);
+    assert_eq!(durable.events[1]["event_type"], "ask_user_prompted");
+    assert_eq!(durable.events[1]["data"]["delivery"], "durable");
+    assert_eq!(durable.events[2]["event_type"], "ask_user_resolved");
+    assert_eq!(durable.events[2]["data"]["outcome"], "submitted");
+    assert_eq!(durable.events[3]["event_type"], "run_resumed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn server_only_user_prompt_projects_required_event_to_active_stream() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("server-only-prompt-stream", "user-1", "server-only-session")
+        .await
+        .unwrap();
+    let (stream_tx, mut stream_rx) = mpsc::channel(4);
+    let gate = DurableRunUserPromptGate::new(
+        "user-1".into(),
+        "server-only-session".into(),
+        "server-only-prompt-stream".into(),
+        Some(5),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        Some(stream_tx),
+    )
+    .with_timeout(Duration::from_secs(1));
+    let prompt = astra_tools::AskUserPrompt {
+        context: Some("Need a decision".into()),
+        questions: vec![astra_tools::AskUserQuestion {
+            header: "Scope".into(),
+            question: "Continue?".into(),
+            options: Vec::new(),
+            multi_select: false,
+            allow_freeform: true,
+        }],
+        timeout_ms: None,
+    };
+    let prompt_wait = tokio::spawn(async move {
+        astra_tools::AskUserGate::request_questionnaire(&gate, "prompt-stream", &prompt).await
+    });
+    wait_for_durable_run_status(
+        &svc.run_engine,
+        "user-1",
+        "server-only-prompt-stream",
+        STATUS_WAITING,
+    )
+    .await;
+    svc.run_engine
+        .resolve_run_interaction(
+            "user-1",
+            "server-only-prompt-stream",
+            "prompt-stream",
+            astra_services::runs::DurableRunInteractionKind::AskUser,
+            json!({
+                "request_id": "prompt-stream",
+                "outcome": "cancelled",
+                "answers": null,
+            }),
+        )
+        .await
+        .unwrap();
+    let decision = prompt_wait.await.unwrap();
+    assert!(matches!(decision, astra_tools::AskUserDecision::Cancelled));
+
+    let required = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv())
+        .await
+        .expect("user prompt required must reach active stream")
+        .expect("user prompt required event");
+    let resumed = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv())
+        .await
+        .expect("user prompt resolution must reach active stream")
+        .expect("user prompt resumed event");
+    assert_eq!(required["type"], "user_prompt_required");
+    assert_eq!(required["run_id"], "server-only-prompt-stream");
+    assert_eq!(required["prompt"]["questions"][0]["question"], "Continue?");
+    assert_eq!(resumed["type"], "run_resumed");
+    assert_eq!(resumed["interaction_outcome"], "cancelled");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn server_only_approval_timeout_is_durable_and_releases_waiting_state() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("server-only-timeout", "user-1", "server-only-session")
+        .await
+        .unwrap();
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "server-only-session".into(),
+        "server-only-timeout".into(),
+        Some(5),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    )
+    .with_timeout(Duration::from_millis(20));
+
     let decision = astra_tools::ToolApprovalGate::request_approval(
         &gate,
-        "req-1",
+        "approval-timeout",
         "bash",
-        &serde_json::json!({"command": "rm -rf /tmp/example"}),
+        &json!({"command": "rm -rf tmp"}),
     )
     .await;
 
+    assert!(matches!(decision, astra_tools::ApprovalDecision::Timeout));
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "server-only-timeout")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_RUNNING);
+    assert_eq!(durable.waiting_for, None);
+    assert_eq!(durable.events[1]["event_type"], "approval_required");
+    assert_eq!(durable.events[2]["event_type"], "approval_resolved");
+    assert_eq!(durable.events[2]["data"]["outcome"], "timed_out");
+    assert_eq!(durable.events[3]["event_type"], "run_resumed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn server_only_approval_projects_required_and_resumed_events_to_active_stream() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("server-only-stream", "user-1", "server-only-session")
+        .await
+        .unwrap();
+    let (stream_tx, mut stream_rx) = mpsc::channel(4);
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "server-only-session".into(),
+        "server-only-stream".into(),
+        Some(6),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        Some(stream_tx),
+    )
+    .with_timeout(Duration::from_secs(1));
+
+    let approval = tokio::spawn(async move {
+        astra_tools::ToolApprovalGate::request_approval(
+            &gate,
+            "approval-stream",
+            "bash",
+            &json!({"command": "git status"}),
+        )
+        .await
+    });
+    wait_for_durable_run_status(
+        &svc.run_engine,
+        "user-1",
+        "server-only-stream",
+        STATUS_WAITING,
+    )
+    .await;
+    svc.run_engine
+        .resolve_run_interaction(
+            "user-1",
+            "server-only-stream",
+            "approval-stream",
+            astra_services::runs::DurableRunInteractionKind::Approval,
+            json!({
+                "request_id": "approval-stream",
+                "outcome": "approved",
+                "decision": "allow",
+                "reason": null,
+                "tool": "bash",
+                "approval_kind": "standard",
+            }),
+        )
+        .await
+        .unwrap();
+    let decision = approval.await.unwrap();
+
+    assert!(matches!(decision, astra_tools::ApprovalDecision::Approved));
+    let required = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv())
+        .await
+        .expect("approval required must reach the active stream within one second")
+        .expect("approval required stream event");
+    let resumed = tokio::time::timeout(Duration::from_secs(1), stream_rx.recv())
+        .await
+        .expect("approval resumed must reach the active stream within one second")
+        .expect("approval resumed stream event");
+    assert_eq!(required["type"], "approval_required");
+    assert_eq!(required["delivery"], "durable");
+    assert_eq!(resumed["type"], "run_resumed");
+    assert_eq!(resumed["interaction_outcome"], "approved");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interactive_approval_uses_the_same_durable_gate_and_delivers_the_request() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("interactive-approval", "user-1", "interactive-session")
+        .await
+        .unwrap();
+    let (approval_tx, mut approval_rx) = mpsc::channel(4);
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "interactive-session".into(),
+        "interactive-approval".into(),
+        Some(7),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        Some(approval_tx),
+        None,
+    )
+    .with_timeout(Duration::from_secs(1));
+
+    let approval = tokio::spawn(async move {
+        astra_tools::ToolApprovalGate::request_approval(
+            &gate,
+            "interactive-request",
+            "write_file",
+            &json!({"path": "notes.txt", "content": "draft"}),
+        )
+        .await
+    });
+    let request = tokio::time::timeout(Duration::from_secs(1), approval_rx.recv())
+        .await
+        .expect("interactive approval request must reach the WS delivery queue")
+        .expect("interactive approval request");
+    assert_eq!(request["request_id"], "interactive-request");
+    assert_eq!(request["tool"], "write_file");
+    assert_eq!(request["args"]["path"], "notes.txt");
+    svc.run_engine
+        .resolve_run_interaction(
+            "user-1",
+            "interactive-approval",
+            "interactive-request",
+            astra_services::runs::DurableRunInteractionKind::Approval,
+            json!({
+                "request_id": "interactive-request",
+                "outcome": "approved",
+                "decision": "allow",
+                "reason": null,
+                "tool": "write_file",
+                "approval_kind": "standard",
+            }),
+        )
+        .await
+        .unwrap();
+    let decision = approval.await.unwrap();
+    assert!(matches!(decision, astra_tools::ApprovalDecision::Approved));
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "interactive-approval")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.events[1]["event_type"], "approval_required");
+    assert_eq!(durable.events[2]["event_type"], "approval_resolved");
+    assert_eq!(durable.events[3]["event_type"], "run_resumed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn approval_cannot_execute_after_the_waiting_run_is_cancelled() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("approval-cancelled", "user-1", "approval-session")
+        .await
+        .unwrap();
+    let (wait_started_tx, wait_started_rx) = oneshot::channel();
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "approval-session".into(),
+        "approval-cancelled".into(),
+        Some(8),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    )
+    .with_timeout(Duration::from_secs(1))
+    .with_wait_started_notifier(wait_started_tx);
+    let approval = tokio::spawn(async move {
+        astra_tools::ToolApprovalGate::request_approval(
+            &gate,
+            "approval-cancelled-request",
+            "bash",
+            &json!({"command": "rm -rf tmp"}),
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), wait_started_rx)
+        .await
+        .expect("approval must persist its waiting state before cancellation")
+        .expect("approval task dropped its waiting-state notifier");
+
+    assert!(
+        svc.run_engine
+            .transition_status_with_event_if_current(
+                "user-1",
+                "approval-cancelled",
+                &[STATUS_WAITING],
+                STATUS_CANCELLED,
+                None,
+                None,
+                json!({"event_type": "run_finished", "data": {"cancelled": true}}),
+            )
+            .await
+            .unwrap()
+    );
+    let late = svc
+        .run_engine
+        .resolve_run_interaction(
+            "user-1",
+            "approval-cancelled",
+            "approval-cancelled-request",
+            astra_services::runs::DurableRunInteractionKind::Approval,
+            json!({
+                "request_id": "approval-cancelled-request",
+                "outcome": "approved",
+                "decision": "allow",
+                "reason": null,
+                "tool": "bash",
+                "approval_kind": "standard",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        late,
+        astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting
+    ));
+
+    let decision = tokio::time::timeout(Duration::from_secs(1), approval)
+        .await
+        .expect("approval must observe the terminal run transition")
+        .expect("approval task must not panic");
     assert!(matches!(
         decision,
-        astra_tools::ApprovalDecision::Denied { reason: Some(reason) }
-            if reason.contains("no interactive client")
+        astra_tools::ApprovalDecision::Denied { .. }
     ));
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "approval-cancelled")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_CANCELLED);
 }
 
 #[tokio::test]
@@ -7612,7 +8442,6 @@ fn build_initial_state_edge_cwd_takes_priority_over_workspace_override() {
 #[test]
 fn run_status_as_str() {
     assert_eq!(RunStatus::Running.as_str(), "running");
-    assert_eq!(RunStatus::InputQueued.as_str(), "input-queued");
     assert_eq!(RunStatus::Completed.as_str(), "completed");
     assert_eq!(RunStatus::Delegated.as_str(), "delegated");
     assert_eq!(RunStatus::Failed.as_str(), "failed");
@@ -7859,6 +8688,515 @@ async fn db_pause_resume_promotes_buffered_completed_terminal() {
         assert!(matches!(&live.status, RunStatus::Completed));
     }
     cleanup_lifecycle_run_fixture(&pool, user_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_cross_pod_parent_control_reaches_remote_child() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = db_backed_test_service(&pool, "control-it-owner-pod");
+    let controller = db_backed_test_service(&pool, "control-it-controller-pod");
+    let user_id = format!("control-it-user-{}", Uuid::new_v4());
+    let session_id = format!("control-it-session-{}", Uuid::new_v4());
+    let root_id = format!("control-it-root-{}", Uuid::new_v4());
+    let child_id = format!("control-it-child-{}", Uuid::new_v4());
+    for run_id in [&child_id, &root_id] {
+        cleanup_lifecycle_run_fixture(&pool, &user_id, run_id).await;
+    }
+
+    owner
+        .run_engine
+        .start_run(&root_id, &user_id, &session_id)
+        .await
+        .expect("owner starts root");
+    owner
+        .run_engine
+        .start_run_ext(
+            &child_id,
+            &user_id,
+            &session_id,
+            Some(&root_id),
+            Some("control-it-delegation"),
+            Some("control-it-agent"),
+            None,
+        )
+        .await
+        .expect("owner starts child");
+
+    let paused = ok(controller.pause_run(root_id.clone(), user_id.clone()).await);
+    assert_eq!(paused.status, STATUS_PAUSED);
+    assert_eq!(
+        owner
+            .run_engine
+            .check_control_status(&user_id, &child_id)
+            .await
+            .expect("owner polls remote pause"),
+        Some(RunControlStatus::Paused)
+    );
+
+    let cancelled = ok(controller
+        .cancel_run(root_id.clone(), user_id.clone())
+        .await);
+    assert_eq!(cancelled.status, STATUS_CANCELLED);
+    assert_eq!(
+        owner
+            .run_engine
+            .check_control_status(&user_id, &child_id)
+            .await
+            .expect("owner polls remote cancellation"),
+        Some(RunControlStatus::Cancelled)
+    );
+    let child = owner
+        .run_engine
+        .load_run(&user_id, &child_id)
+        .await
+        .unwrap()
+        .expect("child remains independently durable");
+    assert_eq!(child.status, STATUS_RUNNING);
+
+    for run_id in [&child_id, &root_id] {
+        cleanup_lifecycle_run_fixture(&pool, &user_id, run_id).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_cross_pod_interactions_resume_detached_gates_and_reject_late_conflicts() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = db_backed_test_service(&pool, "interaction-it-owner-pod");
+    let callback = db_backed_test_service(&pool, "interaction-it-callback-pod");
+    let user_id = format!("interaction-it-user-{}", Uuid::new_v4());
+    let approval_session_id = format!("it-approval-s-{}", Uuid::new_v4());
+    let prompt_session_id = format!("it-prompt-s-{}", Uuid::new_v4());
+    let timeout_session_id = format!("it-timeout-s-{}", Uuid::new_v4());
+    let approval_run_id = format!("interaction-it-approval-{}", Uuid::new_v4());
+    let prompt_run_id = format!("interaction-it-prompt-{}", Uuid::new_v4());
+    let timeout_run_id = format!("interaction-it-timeout-{}", Uuid::new_v4());
+    for (run_id, session_id) in [
+        (&approval_run_id, &approval_session_id),
+        (&prompt_run_id, &prompt_session_id),
+        (&timeout_run_id, &timeout_session_id),
+    ] {
+        cleanup_lifecycle_run_fixture(&pool, &user_id, run_id).await;
+        owner
+            .run_engine
+            .start_run(run_id, &user_id, session_id)
+            .await
+            .expect("owner starts interaction run");
+    }
+
+    let approval_gate = DurableRunApprovalGate::new(
+        user_id.clone(),
+        approval_session_id.clone(),
+        approval_run_id.clone(),
+        Some(1),
+        owner.run_engine.clone(),
+        owner.runs_handle(),
+        None,
+        None,
+    )
+    .with_timeout(Duration::from_secs(3));
+    let approval_wait = tokio::spawn(async move {
+        astra_tools::ToolApprovalGate::request_approval(
+            &approval_gate,
+            "approval-cross-pod",
+            "bash",
+            &json!({"command": "git status"}),
+        )
+        .await
+    });
+    wait_for_durable_run_status(
+        &owner.run_engine,
+        &user_id,
+        &approval_run_id,
+        STATUS_WAITING,
+    )
+    .await;
+    let approval_resolution = callback
+        .resolve_run_interaction(
+            approval_run_id.clone(),
+            user_id.clone(),
+            "approval-cross-pod".into(),
+            astra_services::runs::DurableRunInteractionKind::Approval,
+            json!({
+                "request_id": "approval-cross-pod",
+                "outcome": "approved",
+                "decision": "allow",
+                "reason": null,
+                "tool": "bash",
+                "approval_kind": "standard",
+            }),
+        )
+        .await
+        .expect("callback pod resolves approval");
+    assert!(matches!(
+        approval_resolution,
+        astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_)
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), approval_wait)
+            .await
+            .expect("detached approval gate resumes")
+            .expect("approval gate task"),
+        astra_tools::ApprovalDecision::Approved
+    ));
+
+    let prompt = astra_tools::AskUserPrompt {
+        context: Some("Cross-pod question".into()),
+        questions: vec![astra_tools::AskUserQuestion {
+            header: "Scope".into(),
+            question: "Continue?".into(),
+            options: Vec::new(),
+            multi_select: false,
+            allow_freeform: true,
+        }],
+        timeout_ms: None,
+    };
+    let prompt_gate = DurableRunUserPromptGate::new(
+        user_id.clone(),
+        prompt_session_id.clone(),
+        prompt_run_id.clone(),
+        Some(2),
+        owner.run_engine.clone(),
+        owner.runs_handle(),
+        None,
+        None,
+    )
+    .with_timeout(Duration::from_secs(3));
+    let prompt_wait = tokio::spawn(async move {
+        astra_tools::AskUserGate::request_questionnaire(&prompt_gate, "prompt-cross-pod", &prompt)
+            .await
+    });
+    wait_for_durable_run_status(&owner.run_engine, &user_id, &prompt_run_id, STATUS_WAITING).await;
+    callback
+        .resolve_run_interaction(
+            prompt_run_id.clone(),
+            user_id.clone(),
+            "prompt-cross-pod".into(),
+            astra_services::runs::DurableRunInteractionKind::AskUser,
+            json!({
+                "request_id": "prompt-cross-pod",
+                "outcome": "submitted",
+                "answers": {
+                    "answers": [{
+                        "question": "Continue?",
+                        "answers": ["yes"],
+                        "multi_select": false,
+                        "annotation": null,
+                    }]
+                }
+            }),
+        )
+        .await
+        .expect("callback pod resolves ask_user");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), prompt_wait)
+            .await
+            .expect("detached prompt gate resumes")
+            .expect("prompt gate task"),
+        astra_tools::AskUserDecision::Submitted(_)
+    ));
+
+    let timeout_gate = DurableRunApprovalGate::new(
+        user_id.clone(),
+        timeout_session_id.clone(),
+        timeout_run_id.clone(),
+        Some(3),
+        owner.run_engine.clone(),
+        owner.runs_handle(),
+        None,
+        None,
+    )
+    .with_timeout(Duration::from_millis(20));
+    assert!(matches!(
+        astra_tools::ToolApprovalGate::request_approval(
+            &timeout_gate,
+            "approval-timeout-cross-pod",
+            "bash",
+            &json!({"command": "git status"}),
+        )
+        .await,
+        astra_tools::ApprovalDecision::Timeout
+    ));
+    let late = callback
+        .resolve_run_interaction(
+            timeout_run_id.clone(),
+            user_id.clone(),
+            "approval-timeout-cross-pod".into(),
+            astra_services::runs::DurableRunInteractionKind::Approval,
+            json!({
+                "request_id": "approval-timeout-cross-pod",
+                "outcome": "approved",
+                "decision": "allow",
+                "reason": null,
+                "tool": "bash",
+                "approval_kind": "standard",
+            }),
+        )
+        .await
+        .expect("late callback returns durable conflict outcome");
+    assert!(matches!(
+        late,
+        astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(_)
+    ));
+
+    for run_id in [&approval_run_id, &prompt_run_id, &timeout_run_id] {
+        cleanup_lifecycle_run_fixture(&pool, &user_id, run_id).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_long_running_fanout_survives_observer_restart_and_partial_completion() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = db_backed_test_service(&pool, "fanout-it-owner-pod");
+    let observer = db_backed_test_service(&pool, "fanout-it-observer-pod");
+    let user_id = format!("fanout-it-user-{}", Uuid::new_v4());
+    let session_id = format!("fanout-it-session-{}", Uuid::new_v4());
+    let root_id = format!("fanout-it-root-{}", Uuid::new_v4());
+    let children = [
+        (
+            format!("fanout-it-child-a-{}", Uuid::new_v4()),
+            "reviewer-a",
+            "correctness",
+        ),
+        (
+            format!("fanout-it-child-b-{}", Uuid::new_v4()),
+            "reviewer-b",
+            "performance",
+        ),
+        (
+            format!("fanout-it-child-c-{}", Uuid::new_v4()),
+            "reviewer-c",
+            "tests",
+        ),
+    ];
+    for run_id in children
+        .iter()
+        .map(|(run_id, _, _)| run_id)
+        .chain(std::iter::once(&root_id))
+    {
+        cleanup_lifecycle_run_fixture(&pool, &user_id, run_id).await;
+    }
+
+    owner
+        .run_engine
+        .start_run(&root_id, &user_id, &session_id)
+        .await
+        .expect("owner starts fanout root");
+    for (run_id, agent_id, _) in &children {
+        owner
+            .run_engine
+            .start_run_ext(
+                run_id,
+                &user_id,
+                &session_id,
+                Some(&root_id),
+                Some("fanout-it-delegation"),
+                Some(agent_id),
+                None,
+            )
+            .await
+            .expect("owner starts fanout child");
+    }
+    let spawned = children
+        .iter()
+        .enumerate()
+        .map(|(slot_index, (run_id, agent_id, slot_id))| {
+            json!({
+                "type": "agent_spawned",
+                "run_id": run_id,
+                "parent_run_id": root_id,
+                "agent_id": agent_id,
+                "agent_type": "code-review",
+                "description": format!("Review {slot_id}"),
+                "fanout_slot": {
+                    "group_id": "fanout-it-review",
+                    "target_count": children.len(),
+                    "slot_index": slot_index,
+                    "slot_id": slot_id,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    owner
+        .run_engine
+        .append_events_batch(&user_id, &root_id, &spawned)
+        .await
+        .expect("persist typed fanout membership");
+
+    assert!(
+        owner
+            .run_engine
+            .store()
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &children[0].0,
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                &[
+                    json!({"event_type":"text_done","data":{"full_text":"correctness complete"}}),
+                    json!({"event_type":"run_finished","data":{"status":"completed"}}),
+                ],
+            )
+            .await
+            .expect("complete first child")
+    );
+    assert!(
+        owner
+            .run_engine
+            .store()
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &children[1].0,
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some("performance review failed"),
+                &[
+                    json!({"event_type":"run_error","data":{"error":"performance review failed"}}),
+                    json!({"event_type":"run_finished","data":{"status":"failed"}}),
+                ],
+            )
+            .await
+            .expect("fail second child")
+    );
+
+    let spawner = test_dynamic_agent_spawner();
+    let initial_reconciler = Arc::new(ServerDurableAgentReconciler {
+        run_engine: observer.run_engine.clone(),
+        user_id: user_id.clone(),
+        session_id: session_id.clone(),
+        state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
+    });
+    spawner
+        .set_durable_agent_reconciler(initial_reconciler)
+        .await;
+    assert_eq!(
+        spawner.reconcile_durable_agent_runs().await.unwrap(),
+        children.len(),
+        "new pod reconstructs all children without taking their leases"
+    );
+
+    let partial = spawner
+        .fanout_group_for_agent(children[0].1)
+        .await
+        .expect("partial fanout survives observer restart");
+    assert_eq!(partial.status, AgentFanoutStatus::Running);
+    assert_eq!(partial.slots[0].status, AgentFanoutSlotStatus::Completed);
+    assert_eq!(partial.slots[1].status, AgentFanoutSlotStatus::Failed);
+    assert_eq!(partial.slots[2].status, AgentFanoutSlotStatus::Running);
+    let remote_owner =
+        sqlx::query("SELECT owner_pod_id FROM agent_runs WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id)
+            .bind(&children[2].0)
+            .fetch_one(pool.get())
+            .await
+            .expect("read remote child lease owner")
+            .try_get::<Option<String>, _>("owner_pod_id")
+            .expect("decode remote child lease owner");
+    assert_eq!(remote_owner.as_deref(), Some("fanout-it-owner-pod"));
+
+    assert!(
+        owner
+            .run_engine
+            .store()
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &children[2].0,
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                &[
+                    json!({"event_type":"text_done","data":{"full_text":"tests complete"}}),
+                    json!({"event_type":"run_finished","data":{"status":"completed"}}),
+                ],
+            )
+            .await
+            .expect("remote owner completes final child")
+    );
+    spawner
+        .set_durable_agent_reconciler(Arc::new(ServerDurableAgentReconciler {
+            run_engine: observer.run_engine.clone(),
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            state: TokioMutex::new(ServerDurableAgentReconcileState::default()),
+        }))
+        .await;
+    assert_eq!(spawner.reconcile_durable_agent_runs().await.unwrap(), 1);
+    let settled = spawner
+        .fanout_group_for_agent(children[2].1)
+        .await
+        .expect("settled fanout remains inspectable");
+    assert_eq!(settled.status, AgentFanoutStatus::Finished);
+    assert_eq!(settled.slots[0].status, AgentFanoutSlotStatus::Completed);
+    assert_eq!(settled.slots[1].status, AgentFanoutSlotStatus::Failed);
+    assert_eq!(settled.slots[2].status, AgentFanoutSlotStatus::Completed);
+    let summary = settled.summary();
+    assert_eq!(summary.completed, 2);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.active, 0);
+
+    for run_id in children
+        .iter()
+        .map(|(run_id, _, _)| run_id)
+        .chain(std::iter::once(&root_id))
+    {
+        cleanup_lifecycle_run_fixture(&pool, &user_id, run_id).await;
+    }
+    let _ = sqlx::query(
+        "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(pool.get())
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_orphan_resume_returns_typed_session_continuation() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let service = db_backed_test_service(&pool, "continuation-it-pod");
+    let user_id = format!("continuation-it-user-{}", Uuid::new_v4());
+    let session_id = format!("continuation-it-session-{}", Uuid::new_v4());
+    let run_id = format!("continuation-it-run-{}", Uuid::new_v4());
+    cleanup_lifecycle_run_fixture(&pool, &user_id, &run_id).await;
+    service
+        .run_engine
+        .start_run(&run_id, &user_id, &session_id)
+        .await
+        .expect("start durable run");
+    service
+        .run_engine
+        .persist_status(&user_id, &run_id, STATUS_PAUSED, Some("user_resume"), None)
+        .await
+        .expect("pause durable run");
+    sqlx::query(
+        "UPDATE agent_runs SET owner_pod_id = NULL, owner_lease_expires_at = NULL
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&run_id)
+    .execute(pool.get())
+    .await
+    .expect("simulate lost owner pod");
+
+    let result = ok(service.resume_run(run_id.clone(), user_id.clone()).await);
+    assert_eq!(
+        result.disposition,
+        RunMutationDisposition::SessionContinuationRequired
+    );
+    assert_eq!(result.status, STATUS_PAUSED);
+    let continuation = result.continuation.expect("continuation directive");
+    assert_eq!(continuation.strategy, "session_continuation");
+    assert_eq!(continuation.session_id, session_id);
+    assert_eq!(continuation.source_run_id, run_id);
+
+    cleanup_lifecycle_run_fixture(&pool, &user_id, &continuation.source_run_id).await;
 }
 
 #[tokio::test]
@@ -8622,12 +9960,15 @@ async fn resume_run_paused_without_live_executor_requires_session_continuation()
         .await
         .unwrap();
 
-    let error = err(svc.resume_run("run-1".into(), "user-1".into()).await);
-    assert_eq!(error.0, StatusCode::CONFLICT);
+    let result = ok(svc.resume_run("run-1".into(), "user-1".into()).await);
     assert_eq!(
-        error.1.0.error_code.as_deref(),
-        Some("run_execution_not_live")
+        result.disposition,
+        RunMutationDisposition::SessionContinuationRequired
     );
+    let continuation = result.continuation.expect("typed continuation directive");
+    assert_eq!(continuation.strategy, "session_continuation");
+    assert_eq!(continuation.session_id, "sess-1");
+    assert_eq!(continuation.source_run_id, "run-1");
     let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
     assert_eq!(durable.status, STATUS_PAUSED);
     assert!(durable.waiting_for.is_none());
@@ -8638,7 +9979,7 @@ async fn resume_run_paused_without_live_executor_requires_session_continuation()
     engine
         .start_run("run-2", "user-1", "sess-1")
         .await
-        .expect("failed same-run resume must still enable session continuation");
+        .expect("same-run resume directive must enable session continuation");
 }
 
 #[tokio::test]
@@ -9061,7 +10402,7 @@ async fn stream_run_cache_miss_replays_durable_text_done() {
 }
 
 #[tokio::test]
-async fn submit_run_input_uses_durable_idempotency_when_live_cache_has_no_input_event() {
+async fn submit_run_user_intent_is_idempotent_and_does_not_mutate_execution_state() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine
@@ -9079,22 +10420,24 @@ async fn submit_run_input_uses_durable_idempotency_when_live_cache_has_no_input_
     .await;
 
     let first = ok(svc
-        .submit_run_input(
+        .submit_run_user_intent(
             "run-input".into(),
             "user-1".into(),
-            RunInputData {
-                idempotency_key: "key-1".into(),
-                input: json!({"answer": "yes"}),
+            RunUserIntentData {
+                intent_id: "intent-1".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "Use the focused test first."}),
             },
         )
         .await);
     let duplicate = ok(svc
-        .submit_run_input(
+        .submit_run_user_intent(
             "run-input".into(),
             "user-1".into(),
-            RunInputData {
-                idempotency_key: "key-1".into(),
-                input: json!({"answer": "yes"}),
+            RunUserIntentData {
+                intent_id: "intent-1".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "Use the focused test first."}),
             },
         )
         .await);
@@ -9104,26 +10447,90 @@ async fn submit_run_input_uses_durable_idempotency_when_live_cache_has_no_input_
         .await
         .unwrap()
         .unwrap();
-    let matching_inputs = durable
+    let matching_intents = durable
         .events
         .iter()
-        .filter(|event| event.get("idempotency_key").and_then(Value::as_str) == Some("key-1"))
-        .count();
-    let input_queued_events = durable
-        .events
-        .iter()
-        .filter(|event| event.get("event_type").and_then(Value::as_str) == Some("run_input_queued"))
+        .filter(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("user_intent")
+                && event
+                    .get("data")
+                    .and_then(|data| data.get("intent_id"))
+                    .and_then(Value::as_str)
+                    == Some("intent-1")
+        })
         .count();
     assert!(!first.duplicate);
     assert!(duplicate.duplicate);
-    assert_eq!(matching_inputs, 1);
-    assert_eq!(input_queued_events, 1);
-    assert_eq!(durable.status, STATUS_INPUT_QUEUED);
-    assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
+    assert_eq!(first.intent_id, "intent-1");
+    assert_eq!(duplicate.intent_id, first.intent_id);
+    assert_eq!(
+        first.status,
+        astra_turn_types::UserIntentStatus::AcceptedRemote
+    );
+    assert_eq!(matching_intents, 1);
+    assert_eq!(durable.status, STATUS_RUNNING);
+    assert!(durable.waiting_for.is_none());
 }
 
 #[tokio::test]
-async fn submit_run_input_transition_failure_does_not_commit_status_or_events() {
+async fn concurrent_submit_run_user_intent_commits_one_durable_event() {
+    let svc = Arc::new(test_service());
+    svc.run_engine
+        .start_run("run-input-race", "user-1", "session-1")
+        .await
+        .unwrap();
+    install_live_run_state(
+        &svc,
+        "user-1",
+        "run-input-race",
+        "session-1",
+        RunStatus::Running,
+        None,
+    )
+    .await;
+
+    let submit = |svc: Arc<AgenticRunLifecycleService>| async move {
+        svc.submit_run_user_intent(
+            "run-input-race".into(),
+            "user-1".into(),
+            RunUserIntentData {
+                intent_id: "intent-race".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "apply once"}),
+            },
+        )
+        .await
+    };
+    let (first, second) = tokio::join!(submit(svc.clone()), submit(svc.clone()));
+    let mut duplicate_flags = [ok(first).duplicate, ok(second).duplicate];
+    duplicate_flags.sort_unstable();
+    assert_eq!(duplicate_flags, [false, true]);
+
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "run-input-race")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable
+            .events
+            .iter()
+            .filter(|event| {
+                event.get("event_type").and_then(Value::as_str) == Some("user_intent")
+                    && event
+                        .get("data")
+                        .and_then(|data| data.get("intent_id"))
+                        .and_then(Value::as_str)
+                        == Some("intent-race")
+            })
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn submit_run_user_intent_transition_failure_does_not_commit_status_or_events() {
     let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]));
     let svc = test_service_with_store(store);
     let engine = &svc.run_engine;
@@ -9142,17 +10549,17 @@ async fn submit_run_input_transition_failure_does_not_commit_status_or_events() 
     .await;
 
     let e = err(svc
-        .submit_run_input(
+        .submit_run_user_intent(
             "run-input-fail".into(),
             "user-1".into(),
-            RunInputData {
-                idempotency_key: "key-fail".into(),
-                input: json!({"answer": "not committed"}),
+            RunUserIntentData {
+                intent_id: "intent-fail".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "Do not commit this."}),
             },
         )
         .await);
     assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(e.1.0.detail.contains("input transition"));
 
     let durable = engine
         .load_run("user-1", "run-input-fail")
@@ -9163,20 +10570,18 @@ async fn submit_run_input_transition_failure_does_not_commit_status_or_events() 
     assert!(durable.waiting_for.is_none());
     assert!(
         durable.events.iter().all(|event| {
-            event.get("idempotency_key").and_then(Value::as_str) != Some("key-fail")
+            event
+                .get("data")
+                .and_then(|data| data.get("intent_id"))
+                .and_then(Value::as_str)
+                != Some("intent-fail")
         }),
-        "failed input transition must not leave a partial user_input event"
-    );
-    assert!(
-        durable.events.iter().all(
-            |event| event.get("event_type").and_then(Value::as_str) != Some("run_input_queued")
-        ),
-        "failed input transition must not append run_input_queued"
+        "failed intent append must not leave a partial durable event"
     );
 }
 
 #[tokio::test]
-async fn submit_run_input_rejects_orphaned_execution_without_persisting_false_acceptance() {
+async fn submit_run_user_intent_rejects_orphaned_execution_without_persisting_false_acceptance() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine
@@ -9185,19 +10590,20 @@ async fn submit_run_input_rejects_orphaned_execution_without_persisting_false_ac
         .unwrap();
 
     let error = err(svc
-        .submit_run_input(
+        .submit_run_user_intent(
             "run-orphaned-input".into(),
             "user-1".into(),
-            RunInputData {
-                idempotency_key: "key-orphaned".into(),
-                input: json!({"answer": "nobody can consume this"}),
+            RunUserIntentData {
+                intent_id: "intent-orphaned".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "Nobody can consume this."}),
             },
         )
         .await);
     assert_eq!(error.0, StatusCode::CONFLICT);
     assert_eq!(
         error.1.0.error_code.as_deref(),
-        Some("run_input_consumer_not_live")
+        Some("run_intent_consumer_not_live")
     );
 
     let durable = engine
@@ -9208,11 +10614,15 @@ async fn submit_run_input_rejects_orphaned_execution_without_persisting_false_ac
     assert_eq!(durable.status, STATUS_PAUSED);
     assert!(durable.waiting_for.is_none());
     assert!(durable.events.iter().all(|event| {
-        event.get("idempotency_key").and_then(Value::as_str) != Some("key-orphaned")
+        event
+            .get("data")
+            .and_then(|data| data.get("intent_id"))
+            .and_then(Value::as_str)
+            != Some("intent-orphaned")
     }));
     assert_eq!(
         durable.events.last().unwrap()["data"]["requested_operation"],
-        "submit_input"
+        "submit_user_intent"
     );
     engine
         .start_run("run-input-continuation", "user-1", "session-1")
@@ -9221,7 +10631,7 @@ async fn submit_run_input_rejects_orphaned_execution_without_persisting_false_ac
 }
 
 #[tokio::test]
-async fn submit_run_input_rejects_terminal_durable_run() {
+async fn submit_run_user_intent_rejects_terminal_durable_run() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine
@@ -9234,12 +10644,13 @@ async fn submit_run_input_rejects_terminal_durable_run() {
         .unwrap();
 
     let e = err(svc
-        .submit_run_input(
+        .submit_run_user_intent(
             "run-terminal-input".into(),
             "user-1".into(),
-            RunInputData {
-                idempotency_key: "key-1".into(),
-                input: json!({"answer": "late"}),
+            RunUserIntentData {
+                intent_id: "intent-late".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "Too late."}),
             },
         )
         .await);
@@ -9247,7 +10658,7 @@ async fn submit_run_input_rejects_terminal_durable_run() {
 }
 
 #[tokio::test]
-async fn submit_run_input_accepts_repeated_queueing_while_input_already_queued() {
+async fn submit_run_user_intent_preserves_waiting_execution_state() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine
@@ -9258,8 +10669,8 @@ async fn submit_run_input_accepts_repeated_queueing_while_input_already_queued()
         .persist_status(
             "user-1",
             "run-queued-input",
-            STATUS_INPUT_QUEUED,
-            Some("user_input"),
+            STATUS_WAITING,
+            Some("edge_executor"),
             None,
         )
         .await
@@ -9269,39 +10680,47 @@ async fn submit_run_input_accepts_repeated_queueing_while_input_already_queued()
         "user-1",
         "run-queued-input",
         "session-1",
-        RunStatus::InputQueued,
-        Some("user_input"),
+        RunStatus::Waiting,
+        Some("edge_executor"),
     )
     .await;
 
     let result = svc
-        .submit_run_input(
+        .submit_run_user_intent(
             "run-queued-input".into(),
             "user-1".into(),
-            RunInputData {
-                idempotency_key: "key-queued-1".into(),
-                input: json!({"answer": "keep queueing"}),
+            RunUserIntentData {
+                intent_id: "intent-waiting-1".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "Apply when execution resumes."}),
             },
         )
         .await
-        .expect("input-queued runs should accept additional deferred input");
+        .expect("a live waiting run should accept current-run guidance");
 
-    assert!(result.accepted);
+    assert_eq!(
+        result.status,
+        astra_turn_types::UserIntentStatus::AcceptedRemote
+    );
     assert!(!result.duplicate);
     let durable = engine
         .load_run("user-1", "run-queued-input")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(durable.status, STATUS_INPUT_QUEUED);
-    assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
+    assert_eq!(durable.status, STATUS_WAITING);
+    assert_eq!(durable.waiting_for.as_deref(), Some("edge_executor"));
     assert!(durable.events.iter().any(|event| {
-        event.get("idempotency_key").and_then(Value::as_str) == Some("key-queued-1")
+        event
+            .get("data")
+            .and_then(|data| data.get("intent_id"))
+            .and_then(Value::as_str)
+            == Some("intent-waiting-1")
     }));
 }
 
 #[tokio::test]
-async fn submit_run_input_rejects_paused_durable_run() {
+async fn submit_run_user_intent_rejects_paused_durable_run() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine
@@ -9314,12 +10733,13 @@ async fn submit_run_input_rejects_paused_durable_run() {
         .unwrap();
 
     let e = err(svc
-        .submit_run_input(
+        .submit_run_user_intent(
             "run-paused-input".into(),
             "user-1".into(),
-            RunInputData {
-                idempotency_key: "key-1".into(),
-                input: json!({"answer": "late"}),
+            RunUserIntentData {
+                intent_id: "intent-paused".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "Apply later."}),
             },
         )
         .await);
@@ -9327,7 +10747,7 @@ async fn submit_run_input_rejects_paused_durable_run() {
 }
 
 #[tokio::test]
-async fn submit_run_input_rejects_oversized_content() {
+async fn submit_run_user_intent_rejects_oversized_content() {
     let svc = test_service();
     let engine = &svc.run_engine;
     engine
@@ -9336,12 +10756,13 @@ async fn submit_run_input_rejects_oversized_content() {
         .unwrap();
 
     let e = err(svc
-        .submit_run_input(
+        .submit_run_user_intent(
             "run-large-input".into(),
             "user-1".into(),
-            RunInputData {
-                idempotency_key: "key-large".into(),
-                input: json!({"content": "x".repeat(MAX_DEFERRED_INPUT_CHARS + 1)}),
+            RunUserIntentData {
+                intent_id: "intent-large".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                input: json!({"content": "x".repeat(MAX_USER_INTENT_CHARS + 1)}),
             },
         )
         .await);
@@ -9354,7 +10775,11 @@ async fn submit_run_input_rejects_oversized_content() {
         .unwrap();
     assert!(
         durable.events.iter().all(|event| {
-            event.get("idempotency_key").and_then(Value::as_str) != Some("key-large")
+            event
+                .get("data")
+                .and_then(|data| data.get("intent_id"))
+                .and_then(Value::as_str)
+                != Some("intent-large")
         }),
         "oversized input must not be appended before validation"
     );
@@ -10054,12 +11479,6 @@ fn waiting_is_non_terminal_status() {
     );
     // Waiting serializes as "waiting"
     assert_eq!(RunStatus::Waiting.as_str(), "waiting");
-    assert!(
-        RunStatus::Waiting
-            .try_transition(&RunStatus::InputQueued)
-            .is_ok(),
-        "Waiting → InputQueued must be allowed when user input arrives"
-    );
 }
 
 #[test]
@@ -10067,10 +11486,6 @@ fn run_status_live_semantics_align_with_durable_owner() {
     assert_eq!(
         RunStatus::from_durable_status(STATUS_RUNNING),
         Some(RunStatus::Running)
-    );
-    assert_eq!(
-        RunStatus::from_durable_status(STATUS_INPUT_QUEUED),
-        Some(RunStatus::InputQueued)
     );
     assert_eq!(
         RunStatus::from_durable_status(STATUS_WAITING),

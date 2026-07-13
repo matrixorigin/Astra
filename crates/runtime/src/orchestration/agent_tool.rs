@@ -17,6 +17,7 @@ use futures_util::future::join_all;
 
 use astra_tools::agent_tool_contract::{
     AgentAction, AgentFanoutAction, agent_action_from_args, agent_fanout_action_from_args,
+    has_malformed_tool_args,
 };
 use astra_turn_core::orchestration::agent_result_wire::{
     agent_tool_result_needs_recovery, fanout_slot_status_is_recoverable_issue,
@@ -50,14 +51,31 @@ static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// structured `agent_id` JSON field, where serde escapes it safely.
 const UNKNOWN_AGENT_ID_ERROR: &str = "Unknown agent_id. Use the exact runtime-generated agent_id returned by the earlier spawn result. The optional spawn `name` is only for send_message addressing and cannot be used with get_result.";
 
-fn render_spawn_agent_output(output: SpawnAgentOutput) -> String {
+/// Authoritative storage for the child run's canonical transcript.
+///
+/// This is deliberately separate from control ownership: a client may read a
+/// durable transcript before it has received the server's current
+/// pause/resume/cancel capabilities. Conflating the two made a launch receipt
+/// invent a local control target for server-owned fanout children.
+pub use astra_turn_types::AgentTranscriptLocation;
+
+fn render_spawn_agent_output(
+    output: SpawnAgentOutput,
+    transcript_location: AgentTranscriptLocation,
+) -> String {
     let mut value = match serde_json::to_value(&output) {
         Ok(value) => value,
         Err(_) => return render_agent_tool_error(None, "Failed to serialize output"),
     };
-    if value.get("status").and_then(Value::as_str) == Some("failed")
-        && value.get("finish_reason").and_then(Value::as_str) == Some("executor_dropped")
-        && let Some(object) = value.as_object_mut()
+    let Some(object) = value.as_object_mut() else {
+        return render_agent_tool_error(None, "Failed to serialize output");
+    };
+    object.insert(
+        "transcript_location".to_string(),
+        Value::String(transcript_location.wire_value().to_string()),
+    );
+    if object.get("status").and_then(Value::as_str) == Some("failed")
+        && object.get("finish_reason").and_then(Value::as_str) == Some("executor_dropped")
     {
         object.insert(
             "diagnostic".to_string(),
@@ -239,6 +257,10 @@ pub struct AgentToolContext {
     pub trace_context: Option<TraceContext>,
     /// UI/runtime execution binding metadata inherited by child agents.
     pub execution_metadata: Option<Value>,
+    /// Where the canonical transcript for dynamic child runs is persisted.
+    /// This is emitted in every spawn/fanout receipt so the client can open
+    /// the right history without guessing from a control endpoint.
+    pub transcript_location: AgentTranscriptLocation,
 }
 
 /// Handle the consolidated `agent` tool for shared dynamic-agent actions.
@@ -247,6 +269,9 @@ pub struct AgentToolContext {
 /// the caller before/after this function. This shared handler intentionally
 /// owns spawn/get_result validation and rendering.
 pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+    if has_malformed_tool_args(args) {
+        return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_malformed_arguments_error("agent");
+    }
     let action = match agent_action_from_args(args) {
         Ok(action) => action,
         Err(error) => return render_agent_tool_contract_error(&error),
@@ -264,21 +289,12 @@ pub async fn handle_agent_tool(args: &Value, ctx: Option<&AgentToolContext>) -> 
 
 /// Handle the atomic `agent_fanout` tool.
 pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+    if has_malformed_tool_args(args) {
+        return astra_turn_core::orchestration::agent_result_wire::render_agent_tool_malformed_arguments_error("agent_fanout");
+    }
     let action = match agent_fanout_action_from_args(args) {
         Ok(action) => action,
-        Err(error) => {
-            if args.get("action").is_none()
-                || args.get("action").and_then(Value::as_str) == Some("")
-            {
-                return render_agent_tool_contract_error(&format!(
-                    "{error} Do not retry with empty args {{}}. Choose one of three canonical shapes:\n\
-                         {FANOUT_START_SHAPE}\n\
-                         {FANOUT_GET_RESULTS_SHAPE}\n\
-                         {FANOUT_STOP_SLOT_SHAPE}"
-                ));
-            }
-            return render_agent_tool_contract_error(&error);
-        }
+        Err(error) => return render_agent_tool_contract_error(&error),
     };
     match action {
         AgentFanoutAction::Start => handle_agent_fanout_start_action(args, ctx).await,
@@ -537,9 +553,9 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
     "max_bytes",
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
-const FANOUT_START_SHAPE: &str = "Use canonical shape: agent_fanout(action='start', target_count=N, slots=[{id:'api', description:'Short UI label', prompt:'Full child task prompt'}], defaults={agent_type:'...', model:'...'}). Put work instructions in each slots[i].prompt; there is no top-level brief or agents payload. Runtime config (agent_type, model, max_turns, etc.) belongs in `defaults`, not at top level. Backgrounding is user-controlled with Ctrl+B; do not pass run_in_background.";
-const FANOUT_GET_RESULTS_SHAPE: &str = "Use canonical shape: agent_fanout(action='get_results', group_id='<returned group_id>'). For large results, read one slot window with agent_fanout(action='get_results', group_id='<returned group_id>', slot_index=0, offset=0, max_bytes=8192).";
-const FANOUT_STOP_SLOT_SHAPE: &str = "Use canonical shape: agent_fanout(action='stop_slot', group_id='<returned group_id>', slot_index=0).";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Full child task prompt\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Full child task prompt\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put work instructions in each slots[i].prompt; there is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. Backgrounding is user-controlled with Ctrl+B; do not pass run_in_background.";
+const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
+const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 
 fn reject_unknown_fields_for_shape(
     object: &serde_json::Map<String, Value>,
@@ -869,9 +885,11 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
                     "slot_index": slot_index,
                     "id": slot_id,
                     "agent_id": rendered_value.get("agent_id").cloned().unwrap_or(Value::Null),
+                    "run_id": rendered_value.get("run_id").cloned().unwrap_or(Value::Null),
                     "status": rendered_value.get("status").cloned().unwrap_or(Value::Null),
                     "finish_reason": rendered_value.get("finish_reason").cloned().unwrap_or(Value::Null),
                     "error": rendered_value.get("error").cloned().unwrap_or(Value::Null),
+                    "transcript_location": rendered_value.get("transcript_location").cloned().unwrap_or(Value::Null),
                 })
             })
         })
@@ -906,6 +924,7 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             "group_id": group_id,
             "title": title,
             "target_count": input.target_count,
+            "transcript_location": ctx.transcript_location.wire_value(),
             "agents": agents,
             "fanout": group.as_ref().map(fanout_group_to_json).unwrap_or(Value::Null),
         });
@@ -1091,6 +1110,14 @@ async fn render_agent_fanout_results(
     tool_call_id: Option<String>,
     read_options: FanoutResultReadOptions,
 ) -> String {
+    if let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+        tracing::warn!(
+            target: "fanout",
+            %group_id,
+            %error,
+            "durable fanout reconciliation failed; returning the last confirmed observation"
+        );
+    }
     let Some(group) = find_fanout_group(ctx, group_id).await else {
         return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
     };
@@ -1138,7 +1165,7 @@ async fn render_agent_fanout_results(
                 .insert("_tool_call_id".to_string(), Value::String(tool_call_id));
         }
         futs.push(Box::pin(async move {
-            let rendered = handle_agent_get_result_action(&get_args, Some(ctx)).await;
+            let rendered = handle_agent_get_result_action_inner(&get_args, Some(ctx), false).await;
             let mut value = serde_json::from_str::<Value>(&rendered)
                 .unwrap_or_else(|_| json!({ "status": "failed", "error": rendered }));
             let window = window_fanout_agent_result(
@@ -1225,6 +1252,7 @@ async fn render_agent_fanout_results(
         "group_id": group_id,
         "title": updated.title,
         "target_count": updated.target_count,
+        "transcript_location": ctx.transcript_location.wire_value(),
         "delivery_contract": "Results are bounded for prompt safety. Use results[].next_call, or agent_fanout(action='get_results', group_id=..., slot_index=N, offset=BYTE_OFFSET, max_bytes=BYTES), to read additional slot output. Do not search for or copy physical filesystem paths or runtime-owned tool-result artifacts.",
         "recovery": {
             "result_ref": format!("agent_fanout:{group_id}"),
@@ -1623,6 +1651,7 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
     let mut value = json!({
         "group_id": group.group_id,
         "title": group.title,
+        "parent_run_id": group.parent_run_id,
         "target_count": summary.target_count,
         "status": group.status.as_str(),
         "summary": group.summary_sentence(),
@@ -1644,6 +1673,7 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
             "role": slot.role,
             "requested_description": slot.requested_description,
             "agent_id": &slot.agent_id,
+            "run_id": &slot.run_id,
             "status": fanout_slot_status_label(slot.status),
             "result_collected": slot.result_collected,
             "terminal_reason": &slot.terminal_reason,
@@ -1741,7 +1771,7 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
     };
 
     match ctx.spawner.spawn(input, &spawn_ctx).await {
-        Ok(output) => render_spawn_agent_output(output),
+        Ok(output) => render_spawn_agent_output(output, ctx.transcript_location),
         Err(SpawnError::ExecutorUnavailable) => {
             render_agent_runtime_binding_error("agent", "spawn")
         }
@@ -1917,6 +1947,14 @@ pub async fn handle_agent_get_result_action(
     args: &Value,
     ctx: Option<&AgentToolContext>,
 ) -> String {
+    handle_agent_get_result_action_inner(args, ctx, true).await
+}
+
+async fn handle_agent_get_result_action_inner(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+    reconcile_durable: bool,
+) -> String {
     let agent_id = match args.get("agent_id").and_then(Value::as_str).map(str::trim) {
         Some(id) if !id.is_empty() => id,
         None => {
@@ -1938,6 +1976,15 @@ pub async fn handle_agent_get_result_action(
         return render_agent_tool_error(
             None,
             &format!("Invalid agent_id: exceeds {MAX_AGENT_ID_BYTES} bytes"),
+        );
+    }
+
+    if reconcile_durable && let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+        tracing::warn!(
+            target: "fanout",
+            %agent_id,
+            %error,
+            "durable child reconciliation failed; returning the last confirmed observation"
         );
     }
 
@@ -2430,6 +2477,7 @@ mod tests {
             live_event_sink: None,
             trace_context: None,
             execution_metadata: None,
+            transcript_location: AgentTranscriptLocation::LocalJournal,
         }
     }
 
@@ -2451,6 +2499,27 @@ mod tests {
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_receipt_declares_the_context_transcript_location() {
+        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+        let mut ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        ctx.transcript_location = AgentTranscriptLocation::DurableServer;
+
+        let output = handle_agent_spawn_action(
+            &json!({
+                "description": "Review the latest commit",
+                "prompt": "Review the latest commit",
+                "agent_type": "general-purpose"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let receipt: Value = serde_json::from_str(&output).expect("spawn receipt is JSON");
+
+        assert_eq!(receipt["transcript_location"], "durable_server");
+        assert!(receipt["run_id"].as_str().is_some_and(|id| !id.is_empty()));
     }
 
     #[tokio::test]
@@ -3085,6 +3154,13 @@ mod tests {
         assert_eq!(value["results"].as_array().unwrap().len(), 1);
         assert_eq!(value["results"][0]["result"]["status"], "completed");
         assert_eq!(value["completed"], 1);
+        assert_eq!(value["transcript_location"], "local_journal");
+        assert!(
+            value["fanout"]["slots"][0]["run_id"]
+                .as_str()
+                .is_some_and(|run_id| !run_id.is_empty()),
+            "recovered fanout results must retain every child transcript identity: {result}"
+        );
         assert!(
             value["delivery_contract"]
                 .as_str()
@@ -3700,13 +3776,27 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let promoted = spawner
-            .promote_foreground_agent_to_background(Some("run-parent"))
+            .promote_foreground_work_to_background(Some("run-parent"))
             .await
+            .into_iter()
+            .next()
             .expect("Ctrl+B promotion should background the running fanout slot");
         assert!(promoted.run_in_background);
 
         let start = start_task.await.expect("fanout start task should join");
-        assert!(start.contains("\"status\":\"started\""), "{start}");
+        let start_value: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start_value["status"], "started");
+        assert_eq!(start_value["fanout"]["parent_run_id"], "run-parent");
+        assert_eq!(start_value["transcript_location"], "local_journal");
+        assert_eq!(
+            start_value["agents"][0]["transcript_location"],
+            "local_journal"
+        );
+        assert!(
+            start_value["agents"][0]["run_id"]
+                .as_str()
+                .is_some_and(|run_id| !run_id.is_empty())
+        );
 
         let stop = handle_agent_fanout_tool(
             &json!({
@@ -3791,6 +3881,19 @@ mod tests {
         assert_eq!(value["terminal"], 2);
         assert_eq!(value["collected"], 0);
         assert_eq!(value["uncollected"], 2);
+    }
+
+    #[test]
+    fn fanout_group_json_keeps_slot_run_identity_for_recovery() {
+        let mut group = AgentFanoutGroupProjection::new("review-identity", "Review", 1);
+        group
+            .record_spawn_accepted_with_run(0, "reviewer@run-reviewer", Some("run-reviewer".into()))
+            .unwrap();
+
+        let value = fanout_group_to_json(&group);
+
+        assert_eq!(value["slots"][0]["agent_id"], "reviewer@run-reviewer");
+        assert_eq!(value["slots"][0]["run_id"], "run-reviewer");
     }
 
     #[tokio::test]
@@ -3891,28 +3994,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_fanout_empty_args_returns_executable_canonical_shapes() {
-        let result = handle_agent_fanout_tool(&json!({}), None).await;
+    async fn agent_fanout_malformed_args_returns_unexecuted_structured_advisory() {
+        let result = handle_agent_fanout_tool(
+            &json!({"_parse_error": {"kind": "invalid_json", "executed": false}}),
+            None,
+        )
+        .await;
         let value: Value = serde_json::from_str(&result).expect("fanout error must stay JSON");
+        assert_eq!(value["status"], "failed");
         assert_eq!(
-            value["error_kind"].as_str(),
-            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+            value["error_kind"],
+            astra_core::ErrorKind::ToolInvalidArgs.as_str()
         );
-        assert!(
-            result.contains("missing required parameter `action` for `agent_fanout`"),
-            "{result}"
-        );
-        assert!(result.contains("Do not retry with empty args"), "{result}");
-        // Error recovery must surface all three executable shapes, not just
-        // "missing action" — otherwise the model is left to guess the form.
-        assert!(result.contains("action='start'"), "{result}");
-        assert!(result.contains("action='get_results'"), "{result}");
-        assert!(result.contains("action='stop_slot'"), "{result}");
-        assert!(result.contains("target_count=N"), "{result}");
-        assert!(result.contains("slots=["), "{result}");
-        assert!(result.contains("group_id="), "{result}");
-        assert!(result.contains("slot_index="), "{result}");
-        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert_eq!(value["advisory"]["kind"], "malformed_tool_arguments");
+        assert_eq!(value["advisory"]["tool"], "agent_fanout");
+        assert_eq!(value["advisory"]["executed"], false);
     }
 
     #[tokio::test]
@@ -4011,8 +4107,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         spawner
-            .promote_foreground_agent_to_background(Some("run-parent"))
+            .promote_foreground_work_to_background(Some("run-parent"))
             .await
+            .into_iter()
+            .next()
             .expect("Ctrl+B promotion should background the running fanout slot");
 
         let spawn = spawn_task.await.expect("spawn task should join");

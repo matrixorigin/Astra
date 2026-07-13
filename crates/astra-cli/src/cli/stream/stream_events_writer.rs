@@ -4,12 +4,9 @@
 //! JSON object per line to stderr.  Gateway reads these lines to drive
 //! progressive WeChat delivery (text deltas, tool status, thinking state).
 
-use crate::cli::chat_stream::StreamEvent;
-use tokio::sync::mpsc;
+use crate::cli::chat_stream::{StreamEvent, StreamEventRx};
 
-pub(crate) fn spawn_stderr_writer(
-    mut rx: mpsc::UnboundedReceiver<StreamEvent>,
-) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_stderr_writer(mut rx: StreamEventRx) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             let json = event_to_json(&event);
@@ -20,6 +17,20 @@ pub(crate) fn spawn_stderr_writer(
 
 fn event_to_json(event: &StreamEvent) -> String {
     let value = match event {
+        StreamEvent::ContextWindowEstimated(usage) => {
+            serde_json::json!({
+                "type": "context_window_estimated",
+                "used_tokens": usage.used_tokens,
+                "limit_tokens": usage.limit_tokens,
+                "source": usage.source,
+            })
+        }
+        StreamEvent::ContextSystemPromptTokens(tokens) => {
+            serde_json::json!({"type": "context_system_prompt_tokens", "tokens": tokens})
+        }
+        StreamEvent::ContextWindowMeasured(tokens) => {
+            serde_json::json!({"type": "context_window_measured", "used_tokens": tokens})
+        }
         StreamEvent::Token(text) => {
             serde_json::json!({"type": "token", "text": text})
         }
@@ -126,14 +137,49 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::ModelResponding => {
             serde_json::json!({"type": "model_responding"})
         }
+        StreamEvent::AssistantOutputSettled => {
+            serde_json::json!({"type": "assistant_output_settled"})
+        }
         StreamEvent::StatusLine(text) => {
             serde_json::json!({"type": "status", "text": text})
+        }
+        StreamEvent::UserIntentApplied {
+            intent_id,
+            delivery,
+            status,
+            event_index,
+            content,
+        } => {
+            serde_json::json!({
+                "type": "user_intent_applied",
+                "intent_id": intent_id,
+                "delivery": delivery,
+                "status": status,
+                "event_index": event_index,
+                "content": content,
+            })
         }
         StreamEvent::AgentLive(event) => {
             serde_json::json!({
                 "type": "agent_live",
                 "event": event,
             })
+        }
+        StreamEvent::AgentLiveGap(gap) => {
+            serde_json::json!({
+                "type": "agent_live_gap",
+                "gap": gap,
+            })
+        }
+        StreamEvent::AgentCommunication(event) => {
+            let mut value = serde_json::to_value(event).unwrap_or_default();
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("agent_communication".to_string()),
+                );
+            }
+            value
         }
         StreamEvent::ToolOutput { name, lines, bytes } => {
             serde_json::json!({
@@ -173,7 +219,6 @@ mod tests {
     use super::{event_to_json, spawn_stderr_writer};
     use crate::cli::chat_stream::StreamEvent;
     use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind};
-    use tokio::sync::mpsc;
 
     #[test]
     fn token_event_serializes() {
@@ -189,6 +234,22 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "thinking");
         assert_eq!(v["active"], true);
+    }
+
+    #[test]
+    fn context_window_events_preserve_measurement_provenance() {
+        let estimated = event_to_json(&StreamEvent::ContextWindowEstimated(
+            astra_turn_types::ContextWindowUsage::estimated(12_000, 160_000),
+        ));
+        let estimated: serde_json::Value = serde_json::from_str(&estimated).unwrap();
+        assert_eq!(estimated["type"], "context_window_estimated");
+        assert_eq!(estimated["used_tokens"], 12_000);
+        assert_eq!(estimated["source"], "estimated");
+
+        let measured = event_to_json(&StreamEvent::ContextWindowMeasured(18_000));
+        let measured: serde_json::Value = serde_json::from_str(&measured).unwrap();
+        assert_eq!(measured["type"], "context_window_measured");
+        assert_eq!(measured["used_tokens"], 18_000);
     }
 
     #[test]
@@ -344,6 +405,13 @@ mod tests {
             StreamEvent::WaitingForModel,
             StreamEvent::ModelResponding,
             StreamEvent::StatusLine("done".into()),
+            StreamEvent::UserIntentApplied {
+                intent_id: "input-1".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index: 1,
+                content: "guide".into(),
+            },
             StreamEvent::Compaction(CompactionEvent {
                 kind: CompactionKind::Microcompact,
                 pressure: 0.5,
@@ -366,10 +434,10 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_writer_drains_channel() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = crate::cli::chat_stream::stream_event_channel();
         let handle = spawn_stderr_writer(rx);
-        tx.send(StreamEvent::Token("a".into())).unwrap();
-        tx.send(StreamEvent::Token("b".into())).unwrap();
+        tx.send(StreamEvent::Token("a".into())).await.unwrap();
+        tx.send(StreamEvent::Token("b".into())).await.unwrap();
         drop(tx);
         handle.await.unwrap();
     }
@@ -426,6 +494,24 @@ mod tests {
     }
 
     #[test]
+    fn user_intent_applied_serializes_typed_identity() {
+        let json = event_to_json(&StreamEvent::UserIntentApplied {
+            intent_id: "input-7".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::Applied,
+            event_index: 7,
+            content: "change course".into(),
+        });
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "user_intent_applied");
+        assert_eq!(value["intent_id"], "input-7");
+        assert_eq!(value["delivery"], "guide_current_run");
+        assert_eq!(value["status"], "applied");
+        assert_eq!(value["event_index"], 7);
+        assert_eq!(value["content"], "change course");
+    }
+
+    #[test]
     fn compaction_event_serializes() {
         let event = CompactionEvent {
             kind: CompactionKind::Microcompact,
@@ -455,6 +541,7 @@ mod tests {
     fn agent_live_event_uses_stable_structured_json() {
         let json = event_to_json(&StreamEvent::AgentLive(
             astra_turn_core::agent_live_event::AgentLiveEvent {
+                run_id: "test-run".into(),
                 agent_id: "reviewer@abc12345".into(),
                 kind: astra_turn_core::agent_live_event::AgentLiveEventKind::ToolCompleted {
                     name: "bash".into(),

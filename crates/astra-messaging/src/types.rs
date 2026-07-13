@@ -169,6 +169,116 @@ pub struct AgentMessage {
     pub requires_ack: bool,
 }
 
+const AGENT_COMMUNICATION_SUMMARY_CHARS: usize = 1_000;
+
+pub fn agent_communication_event(
+    observed_by: &AgentAddress,
+    direction: astra_turn_types::AgentCommunicationDirection,
+    message: &AgentMessage,
+) -> astra_turn_types::AgentCommunicationEvent {
+    let (payload_kind, summary, response_accepted, related_message_id) =
+        communication_payload_evidence(&message.payload);
+    astra_turn_types::AgentCommunicationEvent {
+        schema_version: astra_turn_types::AGENT_COMMUNICATION_SCHEMA_VERSION.to_string(),
+        observed_by: communication_party(observed_by),
+        direction,
+        message_id: message.id.clone(),
+        from: communication_party(&message.from),
+        to: communication_target(&message.to),
+        payload_kind,
+        summary,
+        response_accepted,
+        related_message_id,
+        timestamp_ms: message.timestamp_ms,
+        correlation_id: message.correlation_id.clone(),
+        requires_ack: message.requires_ack,
+    }
+}
+
+fn communication_party(address: &AgentAddress) -> astra_turn_types::AgentCommunicationParty {
+    astra_turn_types::AgentCommunicationParty {
+        run_id: address.run_id.clone(),
+        agent_id: address.agent_id.clone(),
+    }
+}
+
+fn communication_target(target: &MessageTarget) -> astra_turn_types::AgentCommunicationTarget {
+    match target {
+        MessageTarget::Direct { address } => astra_turn_types::AgentCommunicationTarget::Direct {
+            address: communication_party(address),
+        },
+        MessageTarget::Broadcast { delegation_id } => {
+            astra_turn_types::AgentCommunicationTarget::Broadcast {
+                delegation_id: delegation_id.clone(),
+            }
+        }
+        MessageTarget::Parent => astra_turn_types::AgentCommunicationTarget::Parent,
+    }
+}
+
+fn communication_payload_evidence(
+    payload: &MessagePayload,
+) -> (String, Option<String>, Option<bool>, Option<String>) {
+    match payload {
+        MessagePayload::Text { content, .. } => (
+            "text".into(),
+            Some(bounded_communication_summary(content)),
+            None,
+            None,
+        ),
+        MessagePayload::Progress { status, detail, .. } => (
+            "progress".into(),
+            Some(bounded_communication_summary(
+                &detail
+                    .as_deref()
+                    .map_or_else(|| status.clone(), |detail| format!("{status} · {detail}")),
+            )),
+            None,
+            None,
+        ),
+        MessagePayload::Request { request_type, .. } => (
+            "request".into(),
+            Some(bounded_communication_summary(&format!("{request_type:?}"))),
+            None,
+            None,
+        ),
+        MessagePayload::Response {
+            request_id,
+            accepted,
+            ..
+        } => (
+            "response".into(),
+            None,
+            Some(*accepted),
+            Some(request_id.clone()),
+        ),
+        MessagePayload::Signal(signal) => (
+            "signal".into(),
+            Some(bounded_communication_summary(&format!("{signal:?}"))),
+            None,
+            None,
+        ),
+        MessagePayload::Ack { message_id } => ("ack".into(), None, None, Some(message_id.clone())),
+        MessagePayload::Nack { message_id, reason } => (
+            "nack".into(),
+            reason.as_deref().map(bounded_communication_summary),
+            None,
+            Some(message_id.clone()),
+        ),
+    }
+}
+
+fn bounded_communication_summary(value: &str) -> String {
+    let mut summary: String = value
+        .chars()
+        .take(AGENT_COMMUNICATION_SUMMARY_CHARS)
+        .collect();
+    if value.chars().count() > AGENT_COMMUNICATION_SUMMARY_CHARS {
+        summary.push('…');
+    }
+    summary
+}
+
 impl AgentMessage {
     /// Create a new message with auto-generated ID and current timestamp.
     pub fn new(from: AgentAddress, to: MessageTarget, payload: MessagePayload) -> Self {
@@ -460,5 +570,37 @@ mod tests {
         );
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("requires_ack"));
+    }
+
+    #[test]
+    fn communication_evidence_is_bounded_and_names_the_observer() {
+        let sender = AgentAddress::new("run-coder", "coder");
+        let receiver = AgentAddress::new("run-reviewer", "reviewer");
+        let message = AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "界".repeat(1_500),
+                summary: None,
+            },
+        )
+        .with_ack_required();
+
+        let evidence = agent_communication_event(
+            &receiver,
+            astra_turn_types::AgentCommunicationDirection::Received,
+            &message,
+        );
+
+        assert_eq!(evidence.observed_by.run_id, "run-reviewer");
+        assert_eq!(evidence.observed_by.agent_id, "reviewer");
+        assert_eq!(evidence.from.run_id, "run-coder");
+        assert_eq!(evidence.payload_kind, "text");
+        assert!(evidence.requires_ack);
+        let summary = evidence.summary.expect("text evidence summary");
+        assert_eq!(summary.chars().count(), 1_001);
+        assert!(summary.ends_with('…'));
     }
 }

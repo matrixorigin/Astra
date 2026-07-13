@@ -3,10 +3,10 @@
 //! See `docs/design/tui-refactor.md` for the architectural rationale.
 //! In short: every on-screen cell in the chat view implements
 //! [`HistoryCell`]. A single owning structure (`ChatWidget.history:
-//! Vec<Arc<dyn HistoryCell>>`) is the *one* source of truth — there is
-//! no parallel transcript buffer, no ANSI-blob store. Persistence
-//! (`TurnEvent` → `~/.astra/transcripts/<sid>.jsonl`) is an explicit
-//! per-cell operation, not a side-effect of rendering.
+//! Vec<Arc<dyn HistoryCell>>`) is the source of truth for the live view —
+//! there is no parallel transcript buffer or ANSI-blob store. The durable
+//! transcript is the canonical session journal; compact [`TurnEvent`] values
+//! are an in-memory adapter for rebuilding cells from that journal.
 //!
 //! ## Lifecycle
 //!
@@ -15,10 +15,10 @@
 //! - **Live** — actively receiving input (streaming tokens, thinking
 //!   chunks, tool output). `is_live()` returns `true`. Held as
 //!   `Option<Box<dyn HistoryCell>>` in the widget's `active_cell`
-//!   slot. Never persisted yet.
+//!   slot. Never durably recorded by the view itself.
 //! - **Committed** — `finalize()` has been called. Immutable
-//!   thereafter. Moved into `history: Vec<Arc<dyn HistoryCell>>` and
-//!   appended to the on-disk JSONL via `to_persist()`.
+//!   thereafter. Moved into `history: Vec<Arc<dyn HistoryCell>>`. The turn
+//!   pipeline independently records its canonical transcript event.
 //!
 //! A cell's **view** (`display_lines`) must be pure and cheap: it
 //! runs on every frame the cell is visible. Any expensive rendering
@@ -80,26 +80,10 @@ pub(crate) trait HistoryCell: Debug + Send + Sync + Any {
     /// that have no transient state.
     fn finalize(&mut self) {}
 
-    /// Process-relative seconds (same basis as
-    /// `tui::shimmer::elapsed_since_start`) at the moment
-    /// `finalize()` ran. `None` while live or for cells that were
-    /// never live. Used by the active-slot gradient gutter to lock
-    /// its phase on freeze instead of snapping to `t = 0`.
-    ///
-    /// Only the cell types that can occupy the *active slot* —
-    /// today: `AssistantCell`, `ReasoningCell`, `ToolCell` — need to
-    /// override this. Cells that never live in the active slot
-    /// (system, user, approval, turn_summary) can leave the default
-    /// `None`: they don't render through `LiveFramedCell` and the
-    /// gutter never queries them.
-    fn frozen_phase(&self) -> Option<f32> {
-        None
-    }
-
-    /// Turn this cell into a durable persistence record. Returning
-    /// `None` marks the cell as ephemeral — it renders but is not
-    /// written to the transcript JSONL (e.g. an in-flight status
-    /// line that would be meaningless on resume).
+    /// Convert this cell to the compact restoration form used by the journal
+    /// resume adapter and cell-level tests. Returning `None` marks a purely
+    /// local UI row (for example an in-flight status line) that must never be
+    /// reconstructed as conversation history.
     fn to_persist(&self) -> Option<TurnEvent> {
         None
     }
@@ -160,54 +144,20 @@ pub(crate) fn separator_rows_after(
     cell: &dyn HistoryCell,
     next: Option<&dyn HistoryCell>,
 ) -> usize {
+    if cell
+        .as_any_ref()
+        .downcast_ref::<system::SystemCell>()
+        .is_some_and(|cell| cell.level() == super::turn_event::SystemLevel::Action)
+        && next.is_some_and(|next| next.as_any_ref().is::<system::SystemCell>())
+    {
+        return 0;
+    }
     if cell.as_any_ref().is::<user::UserCell>()
         && next.is_some_and(|next| next.as_any_ref().is::<user::UserCell>())
     {
         return 1;
     }
     trailing_blank_rows(cell)
-}
-
-/// Tracks the moment a live cell freezes so the gradient gutter can
-/// pin its phase. Centralised here so all `HistoryCell` impls share
-/// one stamping discipline:
-///   * `stamp_now()` — first-write-wins stamp at finalize / complete.
-///   * `revived()` — launch-independent sentinel for cells rebuilt
-///     from persistence. Note: revived cells are *settled*, not
-///     active — they render through `display_lines` directly with a
-///     static `█` marker, not the animated gradient. The stamp
-///     exists so that if a revived cell is ever (incorrectly) routed
-///     through the active slot it still produces a deterministic,
-///     non-flickering hue.
-///   * `phase()` — feeds `frozen_phase()` via `shimmer::time_at`.
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct FreezeStamp(Option<std::time::Instant>);
-
-impl FreezeStamp {
-    /// First-write-wins. Subsequent calls are no-ops so re-entrant
-    /// finalize/complete paths don't push the pinned phase forward.
-    pub(crate) fn stamp_now(&mut self) {
-        if self.0.is_none() {
-            self.0 = Some(std::time::Instant::now());
-        }
-    }
-
-    /// Stamp used by `from_persist` constructors. Pins all revived
-    /// cells to the process time origin (= phase 0) so they share
-    /// a deterministic, launch-independent gutter hue.
-    pub(crate) fn revived() -> Self {
-        Self(Some(crate::tui::shimmer::process_start()))
-    }
-
-    /// Process-relative phase in seconds, or `None` while live.
-    pub(crate) fn phase(self) -> Option<f32> {
-        self.0.map(crate::tui::shimmer::time_at)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_set(self) -> bool {
-        self.0.is_some()
-    }
 }
 
 /// Width-aware string truncation with Unicode display-width

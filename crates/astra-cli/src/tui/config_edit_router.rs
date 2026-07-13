@@ -1,17 +1,17 @@
-//! Glue between `ConfigEditView`'s completion token and the runtime.
+//! Glue between `ConfigEditView`'s typed completion and the runtime.
 //!
 //! The TUI view cannot do I/O from its `completion()` callback (it's
 //! `&self`, and we're running inside the render thread). Instead it
-//! packages its final action + config snapshot into a string token,
-//! the outer event loop in `tui/mod.rs` splits the token, and this
+//! packages its final action + config snapshot into a typed result, and this
 //! module does the blocking work: TOML write + in-memory overlay
 //! refresh so subsequent turns see the new values.
 
+use crate::tui::bottom_pane::view::ConfigEditDisposition;
 use astra_config::config_versions::{ConfigVersionStore, LocalFileStore, PutMetadata, VersionId};
 use astra_config::runtime_config::{RuntimeConfig, set_cli_overlay};
 use std::path::PathBuf;
 
-/// Result of resolving the `__config_edit__` completion token.
+/// Result of resolving a config-editor completion.
 ///
 /// `message` goes to the scrollback as-is. `save` is populated only
 /// when the save succeeded; the caller uses it to stamp the SessionState
@@ -34,25 +34,35 @@ pub(crate) struct SaveRecord {
     pub toml_body: String,
 }
 
-/// Resolve a completion token.
-///
-/// `action` is one of: `save_user` | `save_project` | `discard` | `cancel`.
-/// `toml_body` is the serialized `RuntimeConfig` for save_* actions; the
-/// other two ignore it.
-pub(crate) fn finalize(action: &str, toml_body: &str) -> Result<FinalizeOutcome, String> {
-    match action {
-        "save_user" => save_and_report("user", "slash_config_edit", toml_body),
-        "save_project" => save_and_report("project", "slash_config_edit", toml_body),
-        "discard" => Ok(FinalizeOutcome {
+/// Resolve a typed completion. `toml_body` is the serialized `RuntimeConfig`
+/// for save actions; discard and cancel intentionally ignore it.
+pub(crate) fn finalize(
+    disposition: ConfigEditDisposition,
+    toml_body: &str,
+) -> Result<FinalizeOutcome, String> {
+    match disposition {
+        ConfigEditDisposition::SaveUser => save_and_report("user", "slash_config_edit", toml_body),
+        ConfigEditDisposition::SaveProject => {
+            save_and_report("project", "slash_config_edit", toml_body)
+        }
+        ConfigEditDisposition::Discard => Ok(FinalizeOutcome {
             message: "Discarded config edits. Nothing written.".to_string(),
             save: None,
         }),
-        "cancel" => Ok(FinalizeOutcome {
+        ConfigEditDisposition::Cancel => Ok(FinalizeOutcome {
             message: "Config edit cancelled.".to_string(),
             save: None,
         }),
-        other => Err(format!("Unknown config-edit action: {other}")),
     }
+}
+
+pub(crate) async fn finalize_async(
+    disposition: ConfigEditDisposition,
+    toml_body: String,
+) -> Result<FinalizeOutcome, String> {
+    tokio::task::spawn_blocking(move || finalize(disposition, &toml_body))
+        .await
+        .map_err(|error| format!("config save task failed: {error}"))?
 }
 
 fn save_and_report(
@@ -128,25 +138,21 @@ fn scope_path(scope: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::finalize;
+    use crate::tui::bottom_pane::view::ConfigEditDisposition;
 
     #[test]
     fn discard_and_cancel_produce_friendly_messages() {
-        let a = finalize("discard", "").unwrap();
+        let a = finalize(ConfigEditDisposition::Discard, "").unwrap();
         assert!(a.message.to_lowercase().contains("discard"));
         assert!(a.save.is_none());
-        let b = finalize("cancel", "").unwrap();
+        let b = finalize(ConfigEditDisposition::Cancel, "").unwrap();
         assert!(b.message.to_lowercase().contains("cancel"));
         assert!(b.save.is_none());
     }
 
     #[test]
-    fn unknown_action_is_an_error() {
-        assert!(finalize("what", "").is_err());
-    }
-
-    #[test]
     fn save_with_malformed_toml_is_an_error_not_a_panic() {
-        let err = finalize("save_user", "not valid toml =").unwrap_err();
+        let err = finalize(ConfigEditDisposition::SaveUser, "not valid toml =").unwrap_err();
         assert!(
             err.to_lowercase().contains("parse") || err.to_lowercase().contains("expected"),
             "err: {err}"

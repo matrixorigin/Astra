@@ -1,4 +1,9 @@
+use std::collections::VecDeque;
 use std::io::{self, Stdout, stdout};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crossterm::{
     SynchronizedUpdate, cursor,
@@ -11,14 +16,60 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::text::Line;
 
 use super::custom_terminal;
+use super::frame_requester::FrameRequester;
+use super::history_cell::{HistoryCell, assistant::AssistantCell};
 use super::render::line_utils::sanitize_lines_for_terminal;
 
 pub(crate) type CustomTerminal = custom_terminal::Terminal<CrosstermBackend<Stdout>>;
 
 pub(crate) struct TerminalGuard {
     pub terminal: CustomTerminal,
-    pub pending_history: Vec<Line<'static>>,
+    pending_history: VecDeque<PendingHistory>,
     is_zellij: bool,
+    /// Scrollback is deliberately drained over several frames for very long
+    /// replies. This keeps terminal writes from monopolising the same event
+    /// loop that owns keyboard input and the composer.
+    history_drain_requester: Option<FrameRequester>,
+}
+
+// A terminal write can block on a slow terminal emulator or remote PTY. Keep
+// each interactive draw intentionally small; the frame requester drains the
+// rest without requiring a keypress.
+const MAX_HISTORY_LINES_PER_DRAW: usize = 16;
+const MAX_HISTORY_CHARS_PER_DRAW: usize = 4 * 1024;
+const MAX_LAZY_ASSISTANT_LINES_PER_BATCH: usize = 8;
+
+enum PendingHistory {
+    Lines(VecDeque<Line<'static>>),
+    Assistant(QueuedAssistantHistory),
+}
+
+struct QueuedAssistantHistory {
+    cell: Arc<dyn HistoryCell>,
+    width: u16,
+    next_line: usize,
+    /// Final Markdown layout runs on the blocking pool. Until it is ready the
+    /// queue remains ordered but must not make the input/render loop wait.
+    layout_preparing: Arc<AtomicBool>,
+    rendered_complete: bool,
+    pending_separators: usize,
+    ready: VecDeque<Line<'static>>,
+}
+
+/// Guarantees that a completed blocking layout cannot leave the ordered
+/// scrollback queue permanently waiting, including if the renderer panics.
+struct LayoutPreparationWake {
+    preparing: Arc<AtomicBool>,
+    requester: Option<FrameRequester>,
+}
+
+impl Drop for LayoutPreparationWake {
+    fn drop(&mut self) {
+        self.preparing.store(false, Ordering::Release);
+        if let Some(requester) = self.requester.as_ref() {
+            requester.schedule_frame();
+        }
+    }
 }
 
 struct RawModeGuard;
@@ -52,8 +103,9 @@ impl TerminalGuard {
         let is_zellij = std::env::var("ZELLIJ_SESSION_NAME").is_ok();
         let guard = Self {
             terminal,
-            pending_history: Vec::new(),
+            pending_history: VecDeque::new(),
             is_zellij,
+            history_drain_requester: None,
         };
         // Tell display_sixel the TUI owns the terminal, so it queues images for
         // the event loop to blit on a paused screen instead of writing bytes the
@@ -84,8 +136,84 @@ impl TerminalGuard {
     }
 
     pub fn queue_history_lines(&mut self, lines: Vec<Line<'static>>) {
-        self.pending_history
-            .extend(sanitize_lines_for_terminal(lines));
+        let lines = sanitize_lines_for_terminal(lines);
+        if !lines.is_empty() {
+            self.pending_history
+                .push_back(PendingHistory::Lines(lines.into()));
+        }
+    }
+
+    /// Queue committed cells without eagerly expanding a final assistant
+    /// response. The cell remains immutable in `ChatWidget`; this queue only
+    /// owns presentation progress and can yield back to keyboard handling
+    /// between small scrollback batches.
+    pub fn queue_history_cells(&mut self, cells: Vec<Arc<dyn HistoryCell>>, width: u16) {
+        for (index, cell) in cells.iter().enumerate() {
+            let next = cells.get(index + 1).map(|next| next.as_ref());
+            let separators = super::history_cell::separator_rows_after(cell.as_ref(), next);
+            if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>()
+                && !cell.is_live()
+            {
+                let layout_preparing = self.prepare_assistant_history_layout(
+                    Arc::clone(cell),
+                    assistant.has_scrollback_layout(width),
+                    width,
+                );
+                self.pending_history
+                    .push_back(PendingHistory::Assistant(QueuedAssistantHistory {
+                        cell: Arc::clone(cell),
+                        width,
+                        next_line: 0,
+                        layout_preparing,
+                        rendered_complete: false,
+                        pending_separators: separators,
+                        ready: VecDeque::new(),
+                    }));
+                continue;
+            }
+
+            let mut lines = sanitize_lines_for_terminal(cell.display_lines(width));
+            lines.extend(std::iter::repeat_n(Line::default(), separators));
+            if !lines.is_empty() {
+                self.pending_history
+                    .push_back(PendingHistory::Lines(lines.into()));
+            }
+        }
+    }
+
+    pub fn set_history_drain_requester(&mut self, requester: FrameRequester) {
+        self.history_drain_requester = Some(requester);
+    }
+
+    fn prepare_assistant_history_layout(
+        &self,
+        cell: Arc<dyn HistoryCell>,
+        layout_is_ready: bool,
+        width: u16,
+    ) -> Arc<AtomicBool> {
+        let preparing = Arc::new(AtomicBool::new(false));
+        if layout_is_ready {
+            return preparing;
+        }
+        let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+            // Non-interactive callers and narrowly-scoped tests do not always
+            // own a Tokio runtime. They retain the correct synchronous path;
+            // the interactive TUI always has one and never reaches it.
+            return preparing;
+        };
+        let requester = self.history_drain_requester.clone();
+        preparing.store(true, Ordering::Release);
+        let completion = LayoutPreparationWake {
+            preparing: Arc::clone(&preparing),
+            requester,
+        };
+        handle.spawn_blocking(move || {
+            let _completion = completion;
+            if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>() {
+                assistant.prepare_scrollback_layout(width);
+            }
+        });
+        preparing
     }
 
     /// Draw the viewport — matches Codex tui.rs::draw() sequence:
@@ -111,7 +239,18 @@ impl TerminalGuard {
             }
 
             terminal.draw(draw_fn)
-        })?
+        })??;
+
+        // The frame scheduler intentionally coalesces ordinary redraws. A
+        // large final response needs one additional wake for each bounded
+        // scrollback batch, otherwise the tail would wait until an unrelated
+        // keypress or runtime event arrives.
+        if self.pending_history_has_ready_lines()
+            && let Some(requester) = self.history_drain_requester.as_ref()
+        {
+            requester.schedule_frame();
+        }
+        Ok(())
     }
 
     /// Force a clear+redraw of the viewport. Use after operations that
@@ -158,22 +297,35 @@ impl TerminalGuard {
 
     fn flush_pending_history(
         terminal: &mut CustomTerminal,
-        pending: &mut Vec<Line<'static>>,
+        pending: &mut VecDeque<PendingHistory>,
         is_zellij: bool,
     ) -> io::Result<bool> {
         if pending.is_empty() {
             return Ok(false);
         }
 
-        let lines = std::mem::take(pending);
+        let lines = take_pending_history_batch(pending);
         super::insert_history::insert_history_lines_with_terminal(terminal, &lines, is_zellij)?;
 
         Ok(is_zellij)
     }
 
-    /// Temporarily leave TUI mode, run a closure, then restore.
-    /// Matches Codex tui.rs::with_restored() — used for slash commands
-    /// that do interactive I/O (inquire, eprintln, etc.).
+    fn pending_history_has_ready_lines(&self) -> bool {
+        self.pending_history
+            .front()
+            .is_some_and(|pending| match pending {
+                PendingHistory::Lines(lines) => !lines.is_empty(),
+                PendingHistory::Assistant(queued) => {
+                    !queued.layout_preparing.load(Ordering::Acquire)
+                        && (!queued.ready.is_empty()
+                            || !queued.rendered_complete
+                            || queued.pending_separators > 0)
+                }
+            })
+    }
+
+    /// Temporarily leave TUI mode for an external interactive process, then
+    /// restore. Workbench slash actions must not use this transition.
     pub async fn with_restored<F, Fut, T>(&mut self, f: F) -> io::Result<T>
     where
         F: FnOnce() -> Fut,
@@ -231,13 +383,230 @@ impl TerminalGuard {
     }
 }
 
+fn take_history_batch(pending: &mut VecDeque<Line<'static>>) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut chars = 0usize;
+    while lines.len() < MAX_HISTORY_LINES_PER_DRAW {
+        let Some(next) = pending.front() else {
+            break;
+        };
+        let next_chars = next
+            .spans
+            .iter()
+            .map(|span| span.content.len())
+            .sum::<usize>();
+        if !lines.is_empty() && chars.saturating_add(next_chars) > MAX_HISTORY_CHARS_PER_DRAW {
+            break;
+        }
+        chars = chars.saturating_add(next_chars);
+        // Always make progress for one unusually long code/output line. The
+        // markdown and terminal wrappers handle its visual rows; retaining it
+        // indefinitely would be worse than a bounded exceptional write.
+        lines.push(
+            pending
+                .pop_front()
+                .expect("front item exists until this queue is mutated"),
+        );
+    }
+    lines
+}
+
+fn pending_line_chars(line: &Line<'static>) -> usize {
+    line.spans.iter().map(|span| span.content.len()).sum()
+}
+
+enum PendingHistoryLine {
+    Ready(Line<'static>),
+    Waiting,
+    Exhausted,
+}
+
+fn take_next_pending_history_line(pending: &mut VecDeque<PendingHistory>) -> PendingHistoryLine {
+    loop {
+        let Some(front) = pending.front_mut() else {
+            return PendingHistoryLine::Exhausted;
+        };
+        let next = match front {
+            PendingHistory::Lines(lines) => lines.pop_front().map(PendingHistoryLine::Ready),
+            PendingHistory::Assistant(queued) => {
+                if queued.layout_preparing.load(Ordering::Acquire) {
+                    return PendingHistoryLine::Waiting;
+                }
+                if queued.ready.is_empty() && !queued.rendered_complete {
+                    let assistant = queued
+                        .cell
+                        .as_any_ref()
+                        .downcast_ref::<AssistantCell>()
+                        .expect("only final assistant cells enter the lazy history queue");
+                    let (lines, next_line, complete) = assistant.scrollback_lines_chunk(
+                        queued.width,
+                        queued.next_line,
+                        MAX_LAZY_ASSISTANT_LINES_PER_BATCH,
+                    );
+                    queued.ready.extend(sanitize_lines_for_terminal(lines));
+                    queued.next_line = next_line;
+                    queued.rendered_complete = complete;
+                }
+                queued
+                    .ready
+                    .pop_front()
+                    .map(PendingHistoryLine::Ready)
+                    .or_else(|| {
+                        if queued.rendered_complete && queued.pending_separators > 0 {
+                            queued.pending_separators -= 1;
+                            Some(PendingHistoryLine::Ready(Line::default()))
+                        } else {
+                            None
+                        }
+                    })
+            }
+        };
+        if let Some(next) = next {
+            return next;
+        }
+        pending.pop_front();
+    }
+}
+
+fn return_pending_history_line(pending: &mut VecDeque<PendingHistory>, line: Line<'static>) {
+    match pending.front_mut() {
+        Some(PendingHistory::Lines(lines)) => lines.push_front(line),
+        Some(PendingHistory::Assistant(queued)) => queued.ready.push_front(line),
+        None => unreachable!("a consumed pending history line keeps its queue entry"),
+    }
+}
+
+fn take_pending_history_batch(pending: &mut VecDeque<PendingHistory>) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut chars = 0usize;
+    while lines.len() < MAX_HISTORY_LINES_PER_DRAW {
+        let next = match take_next_pending_history_line(pending) {
+            PendingHistoryLine::Ready(line) => line,
+            PendingHistoryLine::Waiting | PendingHistoryLine::Exhausted => break,
+        };
+        let next_chars = pending_line_chars(&next);
+        if !lines.is_empty() && chars.saturating_add(next_chars) > MAX_HISTORY_CHARS_PER_DRAW {
+            return_pending_history_line(pending, next);
+            break;
+        }
+        chars = chars.saturating_add(next_chars);
+        lines.push(next);
+    }
+    lines
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Interactive rendering is deliberately time-sliced, but terminal
+        // shutdown is a terminal boundary: flush the remaining canonical
+        // scrollback rather than silently discarding a reply tail when the
+        // user exits immediately after it starts painting.
+        while !self.pending_history.is_empty() {
+            let lines = take_pending_history_batch(&mut self.pending_history);
+            if super::insert_history::insert_history_lines_with_terminal(
+                &mut self.terminal,
+                &lines,
+                self.is_zellij,
+            )
+            .is_err()
+            {
+                break;
+            }
+        }
         astra_tools::display_sixel::set_tui_active(false);
         let area = self.terminal.viewport_area;
         let _ = execute!(stdout(), cursor::MoveTo(0, area.bottom()), cursor::Show);
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), DisableBracketedPaste);
         let _ = println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, sync::Arc};
+
+    use ratatui::text::Line;
+
+    use super::{
+        MAX_HISTORY_CHARS_PER_DRAW, MAX_HISTORY_LINES_PER_DRAW, PendingHistory,
+        QueuedAssistantHistory, take_history_batch, take_pending_history_batch,
+    };
+    use crate::tui::history_cell::{HistoryCell, assistant::AssistantCell};
+
+    #[test]
+    fn history_batch_is_bounded_and_preserves_fifo_order() {
+        let mut pending = (0..MAX_HISTORY_LINES_PER_DRAW + 2)
+            .map(|index| Line::raw(format!("line-{index}")))
+            .collect::<VecDeque<_>>();
+
+        let first = take_history_batch(&mut pending);
+        assert_eq!(first.len(), MAX_HISTORY_LINES_PER_DRAW);
+        assert_eq!(first[0].spans[0].content, "line-0");
+        assert_eq!(
+            first.last().expect("bounded batch has content").spans[0].content,
+            format!("line-{}", MAX_HISTORY_LINES_PER_DRAW - 1)
+        );
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending.front().expect("tail remains").spans[0].content,
+            format!("line-{MAX_HISTORY_LINES_PER_DRAW}")
+        );
+    }
+
+    #[test]
+    fn history_batch_never_starves_one_oversized_line() {
+        let mut pending = VecDeque::from([Line::raw("x".repeat(32 * 1024)), Line::raw("tail")]);
+
+        let first = take_history_batch(&mut pending);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].spans[0].content.len(), 32 * 1024);
+        assert_eq!(
+            pending.front().expect("tail remains").spans[0].content,
+            "tail"
+        );
+    }
+
+    #[test]
+    fn history_batch_stops_at_the_character_budget_between_lines() {
+        let line_size = MAX_HISTORY_CHARS_PER_DRAW / 2 + 1;
+        let mut pending = VecDeque::from([
+            Line::raw("x".repeat(line_size)),
+            Line::raw("y".repeat(line_size)),
+        ]);
+
+        let first = take_history_batch(&mut pending);
+        assert_eq!(first.len(), 1);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending.front().expect("second line remains").spans[0]
+                .content
+                .len(),
+            line_size
+        );
+    }
+
+    #[test]
+    fn final_assistant_history_is_materialized_lazily_in_bounded_batches() {
+        let cell: Arc<dyn HistoryCell> = Arc::new(AssistantCell::from_markdown(
+            (0..80)
+                .map(|index| format!("paragraph {index}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        ));
+        let mut pending = VecDeque::from([PendingHistory::Assistant(QueuedAssistantHistory {
+            cell,
+            width: 80,
+            next_line: 0,
+            layout_preparing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rendered_complete: false,
+            pending_separators: 0,
+            ready: VecDeque::new(),
+        })]);
+
+        let first = take_pending_history_batch(&mut pending);
+        assert_eq!(first.len(), MAX_HISTORY_LINES_PER_DRAW);
+        assert!(!pending.is_empty(), "long reply tail remains queued");
+        assert!(first.iter().all(|line| line.spans[0].content == "█ "));
     }
 }

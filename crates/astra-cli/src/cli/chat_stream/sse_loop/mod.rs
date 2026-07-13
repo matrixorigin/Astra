@@ -414,6 +414,8 @@ pub(crate) async fn stream_chat_sse(
                 live_event_sink: p.agent_live_event_sink.clone(),
                 trace_context: None,
                 execution_metadata: None,
+                transcript_location:
+                    astra_runtime::orchestration::AgentTranscriptLocation::LocalJournal,
             };
             ex.with_spawn_context(spawn_ctx)
         } else {
@@ -472,6 +474,13 @@ pub(crate) async fn stream_chat_sse(
         }
     }
     let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
+    // Only the fresh user suffix starts this root execution transcript. The
+    // preceding prompt history is inherited context, not a new conversation
+    // item for this run.
+    let root_initial_transcript_item = messages.last().and_then(|message| {
+        (message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+            .then(|| message.clone())
+    });
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
     // Returns (all_schemas, mcp_runtime_schemas) so the edge executor can
@@ -674,6 +683,7 @@ pub(crate) async fn stream_chat_sse(
         plan_subtask_id: p.plan_subtask_id,
         plan_assemble_line_release: p.plan_assemble_line_release.clone(),
         stream_event_tx: p.stream_event_tx.clone(),
+        agent_live_event_sink: p.agent_live_event_sink.clone(),
         approval_request_tx: p.approval_request_tx,
         ask_user_request_tx: p.ask_user_request_tx,
         plan_review_request_tx: p.plan_review_request_tx,
@@ -764,6 +774,7 @@ pub(crate) async fn stream_chat_sse(
         observation_store: None,
         observation_journal: Default::default(),
         messages,
+        run_transcript_capture: None,
         volatile_pending: Vec::new(),
         recent_rounds: Vec::new(),
         tool_results: Vec::new(),
@@ -778,6 +789,7 @@ pub(crate) async fn stream_chat_sse(
         recursion_depth: 0,
         final_text: String::new(),
         final_text_streamed: false,
+        final_output_ready_notified: false,
         total_prompt: 0,
         total_completion: 0,
         total_cache_read: 0,
@@ -888,7 +900,7 @@ pub(crate) async fn stream_chat_sse(
             progress_emitter: None,
             ..Default::default()
         },
-        deferred_input: Default::default(),
+        user_intents: Default::default(),
         cancellation: CancellationState {
             flag: None,
             pause_flag: None,
@@ -1010,6 +1022,13 @@ pub(crate) async fn stream_chat_sse(
         },
     };
 
+    // Root and child runs capture the same append-only transcript lane. This
+    // must happen before the first model boundary; final prompt history can
+    // later be compacted and is not a valid recovery source for this data.
+    if let Some(item) = root_initial_transcript_item {
+        state.begin_run_transcript_capture(std::iter::once(item));
+    }
+
     // ─── Run the runtime loop ────────────────────────────────────────────
     // Stop the early spinner — the per-turn prep spinner inside execute_turn takes over.
     if let Some(s) = early_spinner {
@@ -1022,7 +1041,7 @@ pub(crate) async fn stream_chat_sse(
         );
         finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
         if let Some(shared) = p.discovered_skills {
-            *shared = state.skills.discovered;
+            *shared = state.skills.discovered.clone();
         }
         let (tool_calls_count, tools_used) = resolved_tool_metrics(
             state.total_tool_calls,
@@ -1045,9 +1064,15 @@ pub(crate) async fn stream_chat_sse(
                 run_id: state.current_run_id.clone(),
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
+                run_transcript_messages: state.take_run_transcript_capture(),
             },
         });
     }
+
+    // The runtime publishes `AssistantOutputSettled` at the terminal-output
+    // boundary, before its slow durable settlement. Everything below is
+    // post-loop local projection work.
+    let post_loop_projection_started_at = Instant::now();
 
     // ─── Finalize ────────────────────────────────────────────────────────
     deferred_activation_state::snapshot_from_executor(
@@ -1092,7 +1117,7 @@ pub(crate) async fn stream_chat_sse(
     if let Some(ref tx) = p.stream_event_tx {
         let explain_turns = state.telemetry.explain_turns.clone();
         let verdict_events = state.stall.verdict_events.clone();
-        let _ = tx.send(StreamEvent::ExplainReport(explain_turns));
+        let _ = tx.send(StreamEvent::ExplainReport(explain_turns)).await;
         if p.explain != ExplainMode::Off {
             let tool_count = resolved_tool_metrics(
                 0,
@@ -1137,23 +1162,27 @@ pub(crate) async fn stream_chat_sse(
                     .map(|(_, trace_json)| trace_json),
                 p.explain == ExplainMode::Verbose,
             ) {
-                let _ = tx.send(StreamEvent::ExplainText(text));
+                let _ = tx.send(StreamEvent::ExplainText(text)).await;
             }
         }
-        let _ = tx.send(StreamEvent::VerdictReport(verdict_events));
+        let _ = tx.send(StreamEvent::VerdictReport(verdict_events)).await;
     }
 
-    let deferred_user_inputs = state
-        .deferred_input
-        .delivered_user_inputs()
+    let applied_user_intents = state
+        .user_intents
+        .applied_user_intents()
         .iter()
         .map(
-            |input| crate::cli::stream::streaming_types::DeferredStreamUserInput {
+            |input| crate::cli::stream::streaming_types::AppliedStreamUserIntent {
+                intent_id: input.intent_id.clone(),
+                delivery: input.delivery,
+                status: input.status,
                 event_index: input.event_index,
                 content: input.content.clone(),
             },
         )
         .collect::<Vec<_>>();
+    let run_transcript_messages = state.take_run_transcript_capture();
     let final_messages = std::mem::take(&mut state.messages);
 
     let result = build_stream_result(StreamResultBuild {
@@ -1190,8 +1219,14 @@ pub(crate) async fn stream_chat_sse(
         llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
         interruption: state.interruption.as_ref().map(|i| i.to_json()),
         final_messages,
-        deferred_user_inputs,
+        run_transcript_messages,
+        applied_user_intents,
     });
+    tracing::debug!(
+        target: "astra_cli::turn_settlement",
+        post_loop_projection_ms = post_loop_projection_started_at.elapsed().as_millis() as u64,
+        "completed stream-loop projections after runtime loop settled"
+    );
     Ok(result)
 }
 

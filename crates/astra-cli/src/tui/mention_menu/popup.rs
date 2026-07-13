@@ -35,8 +35,15 @@ pub(crate) fn render(menu: &MentionMenu, area: Rect, buf: &mut Buffer) {
     }
 
     if menu.is_empty() {
+        let text = if menu.is_loading() {
+            "  loading files…".to_string()
+        } else if let Some(error) = menu.load_error() {
+            format!("  files unavailable · {}", truncate_ellipsis(&error, 56))
+        } else {
+            "  no matching files".to_string()
+        };
         let msg = Line::from(Span::styled(
-            "  no matching files",
+            text,
             Style::default().add_modifier(Modifier::DIM),
         ));
         Paragraph::new(msg).render(area, buf);
@@ -139,7 +146,7 @@ pub(crate) fn format_replacement(entry: &FileEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::menu::MentionToken;
-    use super::super::provider::{FileEntry, FileKind, StaticFileProvider};
+    use super::super::provider::{FileEntry, FileKind, FileProvider, StaticFileProvider};
     use super::{desired_height, format_replacement, render};
     use crate::tui::mention_menu::MentionMenu;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
@@ -172,6 +179,33 @@ mod tests {
     fn render_menu(menu: &MentionMenu, w: u16, h: u16) -> String {
         let buf = draw_widget(PopupWidget(menu), w, h);
         buffer_to_string(&buf)
+    }
+
+    #[derive(Debug)]
+    struct LoadingProvider;
+
+    impl FileProvider for LoadingProvider {
+        fn list(&self, _relative_dir: &str) -> Vec<FileEntry> {
+            Vec::new()
+        }
+
+        fn is_loading(&self, _relative_dir: &str) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn empty_async_provider_renders_loading_instead_of_false_no_matches() {
+        let mut menu = MentionMenu::new(LoadingProvider);
+        menu.set_token(&MentionToken {
+            at_byte: 0,
+            end_byte: 1,
+            partial: String::new(),
+        });
+
+        let rendered = render_menu(&menu, 80, 1);
+        assert!(rendered.contains("loading files"), "{rendered:?}");
+        assert!(!rendered.contains("no matching files"), "{rendered:?}");
     }
 
     #[test]

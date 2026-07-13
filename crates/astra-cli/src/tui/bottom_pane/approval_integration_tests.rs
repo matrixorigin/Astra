@@ -4,12 +4,18 @@
 #![cfg(test)]
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::{buffer::Buffer, layout::Rect};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::oneshot;
 
 use super::{ApprovalActivation, BottomPane, BottomPaneAction};
 use crate::cli::chat_stream::ApprovalResponse;
 use crate::cli::permission_manager::PermissionMode;
 use crate::tui::approval::queue::ApprovalMetadata;
+use crate::tui::bottom_pane::view::BottomPaneView;
 use crate::tui::slash_menu::SlashItem;
 
 fn key(c: char) -> KeyEvent {
@@ -76,6 +82,45 @@ fn type_string(bp: &mut BottomPane, s: &str) {
     }
 }
 
+fn render_text(bp: &BottomPane, width: u16, height: u16) -> String {
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+    bp.render(area, &mut buffer);
+    crate::tui::testing::render::buffer_to_string(&buffer)
+}
+
+fn push_empty_transcript(bp: &mut BottomPane) {
+    use super::transcript_view::{TranscriptSnapshot, TranscriptView};
+
+    bp.push_view(Box::new(TranscriptView::from_snapshot(
+        TranscriptSnapshot::new(Vec::new()),
+        24,
+        80,
+    )));
+}
+
+struct CtrlDProbeView {
+    saw_ctrl_d: Arc<AtomicBool>,
+}
+
+impl BottomPaneView for CtrlDProbeView {
+    fn render(&self, _area: Rect, _buf: &mut Buffer) {}
+
+    fn desired_height(&self, _width: u16) -> u16 {
+        1
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.saw_ctrl_d.store(true, Ordering::Release);
+        }
+    }
+
+    fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
+        None
+    }
+}
+
 // ─── Footer counter ────────────────────────────────────────────────
 
 #[test]
@@ -124,12 +169,232 @@ fn left_from_allow_once_wraps_to_reject() {
 }
 
 #[test]
-fn esc_rejects_focused_approval() {
+fn esc_leaves_focused_approval_pending_until_explicit_reject() {
     let mut bp = BottomPane::new();
-    let rx = enqueue(&mut bp, "bash");
+    let mut rx = enqueue(&mut bp, "bash");
     let action = bp.handle_key(special(KeyCode::Esc));
+    assert!(matches!(action, BottomPaneAction::Consumed));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    let action = bp.handle_key(ctrl_special(KeyCode::Char('d')));
     assert!(matches!(action, BottomPaneAction::ApprovalResolved { .. }));
     assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
+}
+
+#[test]
+fn esc_with_draft_clears_composer_without_rejecting_approval() {
+    let mut bp = BottomPane::new();
+    let mut approval_rx = enqueue(&mut bp, "bash");
+    type_string(&mut bp, "keep this draft");
+
+    assert!(matches!(
+        bp.handle_key(special(KeyCode::Esc)),
+        BottomPaneAction::Consumed
+    ));
+    assert!(bp.composer.is_empty());
+    assert!(matches!(
+        approval_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn active_view_receives_ctrl_d_before_hidden_approval() {
+    let mut bp = BottomPane::new();
+    let mut approval_rx = enqueue(&mut bp, "bash");
+    let saw_ctrl_d = Arc::new(AtomicBool::new(false));
+    bp.push_view(Box::new(CtrlDProbeView {
+        saw_ctrl_d: Arc::clone(&saw_ctrl_d),
+    }));
+
+    assert!(matches!(
+        bp.handle_key(ctrl_special(KeyCode::Char('d'))),
+        BottomPaneAction::Consumed
+    ));
+    assert!(saw_ctrl_d.load(Ordering::Acquire));
+    assert!(matches!(
+        approval_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn transcript_owns_focus_while_hidden_approval_stays_pending_and_observable() {
+    let mut base = BottomPane::new();
+    push_empty_transcript(&mut base);
+    let base_height = base.desired_height(80);
+
+    let mut bp = BottomPane::new();
+    let mut approval_rx = enqueue(&mut bp, "bash");
+    push_empty_transcript(&mut bp);
+    assert_eq!(
+        bp.desired_height(80),
+        base_height + 1,
+        "a hidden approval should reserve exactly one attention row"
+    );
+    let rendered = render_text(&bp, 80, bp.desired_height(80));
+    assert!(
+        rendered.contains("1 approval request waiting"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("review after this panel"), "{rendered}");
+
+    // These keys belong to the visible Transcript. If Down leaked to the
+    // hidden approval, the eventual Enter would select Always instead of Yes.
+    assert!(matches!(
+        bp.handle_key(special(KeyCode::Down)),
+        BottomPaneAction::Consumed
+    ));
+    assert!(matches!(
+        bp.handle_key(ctrl_special(KeyCode::Enter)),
+        BottomPaneAction::Consumed
+    ));
+    assert!(matches!(
+        bp.handle_key(ctrl_special(KeyCode::Char('d'))),
+        BottomPaneAction::Consumed
+    ));
+    assert!(matches!(
+        approval_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    assert!(matches!(
+        bp.handle_key(special(KeyCode::Esc)),
+        BottomPaneAction::ViewAction(
+            crate::tui::bottom_pane::BottomPaneViewAction::ReturnToConversationNavigator
+        )
+    ));
+    // The event-loop dispatcher closes a standalone transcript when there is
+    // no run navigator to return to. Simulate that typed navigation effect;
+    // the hidden approval remains pending and becomes the focused surface.
+    bp.close_active_view();
+    assert!(matches!(
+        approval_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        bp.handle_key(special(KeyCode::Enter)),
+        BottomPaneAction::ApprovalResolved { .. }
+    ));
+    assert_eq!(
+        approval_rx.blocking_recv().unwrap(),
+        ApprovalResponse::AllowOnce
+    );
+}
+
+#[test]
+fn ask_user_owns_navigation_and_submit_over_hidden_approval() {
+    use crate::cli::chat_stream::{
+        AskUserAnswers, AskUserChoice, AskUserPrompt, AskUserQuestion, AskUserQuestionAnswer,
+        AskUserResponse,
+    };
+
+    let mut bp = BottomPane::new();
+    let mut approval_rx = enqueue(&mut bp, "bash");
+    let (ask_tx, mut ask_rx) = oneshot::channel();
+    bp.enqueue_ask_user(
+        AskUserPrompt {
+            context: None,
+            questions: vec![AskUserQuestion {
+                header: "Path".into(),
+                question: "Which visible choice?".into(),
+                options: vec![
+                    AskUserChoice {
+                        label: "First".into(),
+                        description: None,
+                        preview: None,
+                    },
+                    AskUserChoice {
+                        label: "Second".into(),
+                        description: None,
+                        preview: None,
+                    },
+                ],
+                multi_select: false,
+                allow_freeform: false,
+            }],
+            timeout_ms: None,
+        },
+        ask_tx,
+    );
+
+    // Ctrl+D is an approval command only while its card is visible.
+    assert!(matches!(
+        bp.handle_key(ctrl_special(KeyCode::Char('d'))),
+        BottomPaneAction::Consumed
+    ));
+    assert!(matches!(
+        approval_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        ask_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    let _ = bp.handle_key(special(KeyCode::Down));
+    assert!(matches!(
+        bp.handle_key(special(KeyCode::Enter)),
+        BottomPaneAction::ViewCompleted { .. }
+    ));
+    assert_eq!(
+        ask_rx.blocking_recv().unwrap(),
+        AskUserResponse::Submitted(AskUserAnswers {
+            answers: vec![AskUserQuestionAnswer {
+                question: "Which visible choice?".into(),
+                answers: vec!["Second".into()],
+                multi_select: false,
+                annotation: None,
+            }],
+        })
+    );
+    assert!(matches!(
+        approval_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    assert!(matches!(
+        bp.handle_key(ctrl_special(KeyCode::Char('d'))),
+        BottomPaneAction::ApprovalResolved { .. }
+    ));
+    assert_eq!(approval_rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
+}
+
+#[test]
+fn plan_review_receives_ctrl_enter_before_hidden_approval() {
+    use crate::cli::chat_stream::PlanReviewDecision;
+
+    let mut bp = BottomPane::new();
+    let mut approval_rx = enqueue(&mut bp, "bash");
+    let (plan_tx, plan_rx) = oneshot::channel();
+    bp.enqueue_plan_review("1. Review visible plan".into(), plan_tx);
+
+    assert!(matches!(
+        bp.handle_key(ctrl_special(KeyCode::Enter)),
+        BottomPaneAction::ViewCompleted { .. }
+    ));
+    assert_eq!(
+        plan_rx.blocking_recv().unwrap(),
+        PlanReviewDecision::Approve {
+            mode: PermissionMode::Auto
+        }
+    );
+    assert!(matches!(
+        approval_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    // The modal is gone; selecting the explicit No button now resolves the
+    // approval normally.
+    let _ = bp.handle_key(special(KeyCode::Left));
+    assert!(matches!(
+        bp.handle_key(special(KeyCode::Enter)),
+        BottomPaneAction::ApprovalResolved { .. }
+    ));
+    assert_eq!(approval_rx.blocking_recv().unwrap(), ApprovalResponse::Deny);
 }
 
 // ─── Issue #326 P3 / R2 Major 6: Ctrl+D rejects, bare 'd' does NOT ──
@@ -214,6 +479,30 @@ fn ctrl_enter_accepts_even_with_nonempty_composer() {
         "hello",
         "quick approval should not destroy the user's draft"
     );
+}
+
+#[test]
+fn draft_cursor_navigation_does_not_move_approval_button_focus() {
+    let mut bp = BottomPane::new();
+    let rx = enqueue(&mut bp, "bash");
+    type_string(&mut bp, "abcd");
+    assert_eq!(bp.composer.cursor_byte(), 4);
+
+    let _ = bp.handle_key(special(KeyCode::Left));
+    assert_eq!(bp.composer.cursor_byte(), 3);
+    let _ = bp.handle_key(special(KeyCode::Left));
+    assert_eq!(bp.composer.cursor_byte(), 2);
+    let _ = bp.handle_key(special(KeyCode::Right));
+    assert_eq!(bp.composer.cursor_byte(), 3);
+
+    // Clear the draft so the card becomes interactive, then use the default
+    // button. Cursor navigation above must not have changed it underneath.
+    let _ = bp.handle_key(special(KeyCode::Esc));
+    assert!(matches!(
+        bp.handle_key(special(KeyCode::Enter)),
+        BottomPaneAction::ApprovalResolved { .. }
+    ));
+    assert_eq!(rx.blocking_recv().unwrap(), ApprovalResponse::AllowOnce);
 }
 
 // ─── Composer stays live ──────────────────────────────────────────
@@ -311,6 +600,37 @@ fn slash_menu_open_with_approval_pending_routes_tab_to_slash_selection() {
     );
 }
 
+#[test]
+fn slash_popup_owns_up_down_and_escape_over_pending_approval() {
+    let mut bp = BottomPane::new();
+    bp.set_slash_items(slash_items());
+    let mut approval_rx = enqueue(&mut bp, "bash");
+
+    bp.replace_composer_text("/");
+    assert!(bp.slash_menu_is_open());
+    let _ = bp.handle_key(special(KeyCode::Down));
+    let _ = bp.handle_key(special(KeyCode::Tab));
+    assert_eq!(bp.composer.text(), "/history ");
+
+    bp.replace_composer_text("/");
+    assert!(bp.slash_menu_is_open());
+    let _ = bp.handle_key(special(KeyCode::Up));
+    let _ = bp.handle_key(special(KeyCode::Tab));
+    assert_eq!(bp.composer.text(), "/history ");
+
+    bp.replace_composer_text("/");
+    assert!(bp.slash_menu_is_open());
+    assert!(matches!(
+        bp.handle_key(special(KeyCode::Esc)),
+        BottomPaneAction::Consumed
+    ));
+    assert!(!bp.slash_menu_is_open());
+    assert!(matches!(
+        approval_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+}
+
 // ─── Multi-entry: Tab cycles, batch buttons work ──────────────────
 
 #[test]
@@ -360,6 +680,21 @@ fn focused_approval_cell_available_for_render() {
         .expect("focused approval should produce a cell");
     assert_eq!(cell.tool, "bash");
     assert!(cell.focused);
+}
+
+#[test]
+fn approval_card_is_unfocused_and_omits_action_hint_while_editing_draft() {
+    let mut bp = BottomPane::new();
+    let _rx = enqueue(&mut bp, "bash");
+    type_string(&mut bp, "draft in progress");
+
+    let cell = bp
+        .focused_approval_cell()
+        .expect("pending approval should remain observable");
+    assert!(!cell.focused);
+    let rendered = render_text(&bp, 80, bp.desired_height(80));
+    assert!(rendered.contains("Approval · Bash"), "{rendered}");
+    assert!(!rendered.contains("Ctrl+D reject"), "{rendered}");
 }
 
 #[test]
@@ -439,25 +774,18 @@ fn primary_always_resolves_without_second_match_target_step() {
 }
 
 #[test]
-fn tab_cycles_pending_approvals_even_with_composer_text() {
-    // The old guard required `composer.is_empty()` so a stray
-    // character in the composer would hand Tab to completion and
-    // the approval queue would never cycle. Users reported "Tab
-    // did nothing" in exactly this scenario.
+fn draft_navigation_does_not_cycle_pending_approvals() {
     let mut bp = BottomPane::new();
     let _rx1 = enqueue(&mut bp, "alpha");
     let _rx2 = enqueue(&mut bp, "beta");
 
-    // Stray whitespace in the composer — user may have typed
-    // ahead, or an accidental paste.
-    type_string(&mut bp, " ");
+    type_string(&mut bp, "draft");
     assert_eq!(bp.focused_approval_index(), Some(0));
     let _ = bp.handle_key(special(KeyCode::Tab));
-    assert_eq!(
-        bp.focused_approval_index(),
-        Some(1),
-        "Tab must cycle to the next approval regardless of composer content"
-    );
+    let _ = bp.handle_key(special(KeyCode::BackTab));
+    let _ = bp.handle_key(special(KeyCode::Up));
+    let _ = bp.handle_key(special(KeyCode::Down));
+    assert_eq!(bp.focused_approval_index(), Some(0));
 }
 
 #[test]

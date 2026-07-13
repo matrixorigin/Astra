@@ -26,7 +26,7 @@
 #![cfg(test)]
 
 use super::config_edit_view::{ConfigEditAction, ConfigEditView};
-use super::view::BottomPaneView;
+use super::view::{BottomPaneView, ConfigEditDisposition, ViewResult};
 use astra_config::runtime_config::RuntimeConfig;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{buffer::Buffer, layout::Rect};
@@ -261,6 +261,21 @@ fn save_prompt_arrow_wraps_and_enter_saves_to_user_by_default() {
     enter_dirty_state(&mut v);
     v.handle_key(key(KeyCode::Enter));
     assert_eq!(v.pending_action(), ConfigEditAction::SaveToUser);
+}
+
+#[test]
+fn completion_carries_a_typed_config_disposition_not_a_display_token() {
+    let mut v = make_view();
+    enter_dirty_state(&mut v);
+    v.handle_key(ch('d'));
+
+    assert_eq!(
+        v.completion().and_then(|completion| completion.result),
+        Some(ViewResult::ConfigEdit {
+            disposition: ConfigEditDisposition::Discard,
+            toml_body: String::new(),
+        })
+    );
 }
 
 #[test]

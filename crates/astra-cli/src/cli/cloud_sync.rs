@@ -11,6 +11,7 @@
 //! - **Preferences**: [`try_cloud_pull_preferences`] / [`try_cloud_push_preferences`].
 //!   Both go through [`crate::preferences_client`] now.
 
+use astra_core::sync_poison::recover_mutex_lock;
 use astra_services::session_journal;
 use astra_services::state_sync::pref_keys;
 use astra_services::{
@@ -19,11 +20,14 @@ use astra_services::{
 };
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use futures_util::FutureExt;
+use tokio::sync::mpsc;
 
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_side_effects::{
@@ -34,9 +38,21 @@ use crate::{ExplainMode, SessionState};
 const SYNC_OUTBOX_DRAIN_LIMIT: usize = 64;
 const SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS: usize = 4;
 const SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const SYNC_OUTBOX_JOURNAL_INGEST_QUEUE_CAPACITY: usize = 128;
+const SYNC_OUTBOX_JOURNAL_INGEST_BATCH_WINDOW: Duration = Duration::from_millis(25);
+const SYNC_OUTBOX_JOURNAL_INGEST_RETRY_DELAY: Duration = Duration::from_millis(250);
 static SYNC_OUTBOX_DRAIN_OWNER: AtomicU64 = AtomicU64::new(0);
 static SYNC_OUTBOX_NEXT_DRAIN_OWNER: AtomicU64 = AtomicU64::new(1);
 static SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-local hint queue for the durable journal→outbox projector. A hint
+/// can be dropped under pressure because the projector also scans canonical
+/// journals on startup and maintains durable source offsets; the fact itself
+/// never lives only in this queue.
+static SYNC_OUTBOX_JOURNAL_INGEST_DISPATCHER: LazyLock<Mutex<Option<mpsc::Sender<String>>>> =
+    LazyLock::new(|| Mutex::new(None));
+static SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW: LazyLock<Mutex<BTreeSet<String>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
 
 struct SyncOutboxDrainScheduleGuard {
     owner: u64,
@@ -109,6 +125,176 @@ where
     tokio::task::spawn_blocking(move || operation(store))
         .await
         .map_err(|error| std::io::Error::other(format!("sync outbox worker failed: {error}")))?
+}
+
+/// Notify the journal→outbox projector that a canonical session journal gained
+/// durable records. This never performs an outbox fsync on the initiating
+/// turn. The notification is merely a latency hint: durable source offsets
+/// plus startup reconciliation make a full process crash recoverable.
+pub(crate) fn schedule_sync_outbox_journal_ingestion(session_id: &str) -> bool {
+    if session_id.trim().is_empty() {
+        return false;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            target: "astra_cli::cloud_sync",
+            session_id,
+            "journal outbox projection was deferred because no Tokio runtime is active"
+        );
+        return false;
+    };
+    let sender = journal_ingest_sender(&handle);
+    match sender.try_send(session_id.to_string()) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(session_id)) => {
+            recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW).insert(session_id);
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(session_id)) => {
+            // Runtime teardown can close a previously global sender. Keep the
+            // source in the overflow set; the next active runtime recreates
+            // the worker and reconciles it from the canonical journal.
+            recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW).insert(session_id);
+            *recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_DISPATCHER) = None;
+            false
+        }
+    }
+}
+
+/// Start a non-blocking recovery scan for every locally owned journal. This is
+/// deliberately separate from live enqueue: it closes the crash window where
+/// a durable journal append happened after the last in-memory hint but before
+/// the projector wrote the derived outbox record.
+pub(crate) fn schedule_sync_outbox_journal_reconcile_all() {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    spawn_detached_tracked(&handle, async move {
+        let sessions = match tokio::task::spawn_blocking(session_journal::list_sessions).await {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    ?error,
+                    "could not list local journals for sync-outbox recovery"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    ?error,
+                    "journal recovery worker did not complete"
+                );
+                return;
+            }
+        };
+        for session_id in sessions {
+            let _ = schedule_sync_outbox_journal_ingestion(&session_id);
+        }
+    });
+}
+
+fn journal_ingest_sender(handle: &tokio::runtime::Handle) -> mpsc::Sender<String> {
+    let mut slot = recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_DISPATCHER);
+    if let Some(sender) = slot.as_ref().filter(|sender| !sender.is_closed()) {
+        return sender.clone();
+    }
+    let (sender, receiver) = mpsc::channel(SYNC_OUTBOX_JOURNAL_INGEST_QUEUE_CAPACITY);
+    handle.spawn(run_sync_outbox_journal_ingest_worker(receiver));
+    *slot = Some(sender.clone());
+    sender
+}
+
+async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<String>) {
+    let mut pending_sessions = BTreeSet::new();
+    loop {
+        if pending_sessions.is_empty() {
+            match receiver.recv().await {
+                Some(session_id) => {
+                    pending_sessions.insert(session_id);
+                }
+                None => break,
+            }
+        }
+
+        let deadline = tokio::time::sleep(SYNC_OUTBOX_JOURNAL_INGEST_BATCH_WINDOW);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                session_id = receiver.recv() => match session_id {
+                    Some(session_id) => {
+                        pending_sessions.insert(session_id);
+                    }
+                    None => break,
+                },
+                _ = &mut deadline => break,
+            }
+        }
+        pending_sessions.extend(std::mem::take(&mut *recover_mutex_lock(
+            &SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW,
+        )));
+
+        let sessions = std::mem::take(&mut pending_sessions);
+        let mut retry_needed = false;
+        for session_id in sessions {
+            match reconcile_sync_outbox_journal(&session_id).await {
+                Ok(projected) => {
+                    if projected {
+                        schedule_sync_outbox_drain();
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_cli::cloud_sync",
+                        session_id,
+                        ?error,
+                        "journal-to-outbox projection failed; keeping source queued for retry"
+                    );
+                    pending_sessions.insert(session_id);
+                    retry_needed = true;
+                }
+            }
+        }
+        if retry_needed {
+            tokio::time::sleep(SYNC_OUTBOX_JOURNAL_INGEST_RETRY_DELAY).await;
+        }
+    }
+}
+
+async fn reconcile_sync_outbox_journal(session_id: &str) -> Result<bool, std::io::Error> {
+    const STALE_OFFSET_RETRIES: usize = 3;
+    let store = SyncOutboxStore::local();
+    for _ in 0..STALE_OFFSET_RETRIES {
+        let source_session_id = session_id.to_string();
+        let offset = run_sync_outbox_io(store.clone(), move |store| {
+            store.journal_source_offset(&source_session_id)
+        })
+        .await?;
+        let read_session_id = session_id.to_string();
+        let delta = tokio::task::spawn_blocking(move || {
+            session_journal::read_journal_append_delta(&read_session_id, offset)
+        })
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("journal delta worker failed: {error}"))
+        })??;
+        if delta.next_offset == offset {
+            return Ok(false);
+        }
+        let source_session_id = session_id.to_string();
+        let outcome = run_sync_outbox_io(store.clone(), move |store| {
+            store.append_journal_delta(&source_session_id, offset, delta.next_offset, &delta.events)
+        })
+        .await?;
+        match outcome {
+            astra_services::SyncOutboxJournalDeltaOutcome::Appended { .. } => return Ok(true),
+            astra_services::SyncOutboxJournalDeltaOutcome::StaleSourceOffset { .. } => continue,
+        }
+    }
+    Err(std::io::Error::other(
+        "sync outbox journal source offset changed repeatedly during projection",
+    ))
 }
 
 pub(crate) async fn read_sync_outbox_status() -> std::io::Result<SyncOutboxStatus> {
@@ -907,10 +1093,13 @@ mod tests {
 
     use super::{
         CloudPullResult, SyncOutboxDrainReport, claim_sync_outbox_retry_wake_deadline,
-        cloud_pull_warrants_sync_marker, next_sync_outbox_drain_delay, record_settlement_result,
+        cloud_pull_warrants_sync_marker, next_sync_outbox_drain_delay,
+        reconcile_sync_outbox_journal, record_settlement_result,
         release_sync_outbox_drain_schedule, release_sync_outbox_retry_wake_schedule,
-        run_sync_outbox_io, should_append_cloud_pull_journal, try_claim_sync_outbox_drain_schedule,
+        run_sync_outbox_io, schedule_sync_outbox_journal_ingestion,
+        should_append_cloud_pull_journal, try_claim_sync_outbox_drain_schedule,
     };
+    use astra_services::session_journal::{JournalEvent, JournalWriter, ProcessJournalDirGuard};
     use astra_services::{SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore};
     use fs2::FileExt;
 
@@ -1007,6 +1196,97 @@ mod tests {
             .await
             .expect("join blocking status task")
             .expect("status after lock release");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn journal_projection_recovers_and_advances_only_its_durable_source_delta() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = ProcessJournalDirGuard::new(temp.path());
+        let session_id = format!("sync-projector-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&session_id).expect("journal writer");
+        writer
+            .append(&JournalEvent::config_change(
+                Some(&session_id),
+                "model",
+                "gpt-5",
+            ))
+            .expect("append canonical journal event");
+
+        assert!(
+            reconcile_sync_outbox_journal(&session_id)
+                .await
+                .expect("project journal")
+        );
+        let store = SyncOutboxStore::local();
+        let first_offset = store
+            .journal_source_offset(&session_id)
+            .expect("source offset after first projection");
+        assert!(first_offset > 0);
+        assert_eq!(store.status().expect("outbox status").pending, 2);
+
+        assert!(
+            !reconcile_sync_outbox_journal(&session_id)
+                .await
+                .expect("empty source delta is a no-op")
+        );
+
+        writer
+            .append(&JournalEvent::config_change(
+                Some(&session_id),
+                "mode",
+                "auto",
+            ))
+            .expect("append second canonical event");
+        assert!(
+            reconcile_sync_outbox_journal(&session_id)
+                .await
+                .expect("project only newly appended journal bytes")
+        );
+        assert!(
+            store
+                .journal_source_offset(&session_id)
+                .expect("source offset after second projection")
+                > first_offset
+        );
+        assert_eq!(store.status().expect("outbox status").pending, 3);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn asynchronous_journal_ingest_hint_projects_without_blocking_the_submitter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = ProcessJournalDirGuard::new(temp.path());
+        let session_id = format!("sync-async-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&session_id).expect("journal writer");
+        writer
+            .append(&JournalEvent::config_change(
+                Some(&session_id),
+                "model",
+                "gpt-5",
+            ))
+            .expect("append canonical event");
+
+        let scheduled_from_blocking_turn_worker = {
+            let session_id = session_id.clone();
+            tokio::task::spawn_blocking(move || schedule_sync_outbox_journal_ingestion(&session_id))
+                .await
+                .expect("blocking turn worker should finish")
+        };
+        assert!(scheduled_from_blocking_turn_worker);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if SyncOutboxStore::local()
+                    .status()
+                    .is_ok_and(|status| status.pending == 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background projector should flush the durable source delta");
     }
 
     #[test]

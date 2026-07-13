@@ -1,27 +1,15 @@
-//! Structured persistence payload for every committed history cell.
+//! Compact chat-restoration payload.
 //!
-//! A `TurnEvent` is what gets written to
-//! `~/.astra/transcripts/<session_id>.jsonl`, one JSON object per
-//! line. Exactly one `TurnEvent` variant per cell kind. The schema
-//! is the *contract* between a cell's in-memory representation and
-//! its on-disk form — if a cell grows a new field, add it here and
-//! the renderer will automatically pick it up on resume.
+//! A `TurnEvent` is the compact representation used to rebuild a history cell
+//! from canonical session-journal transcript items. Exactly one variant maps
+//! to each renderable cell kind. It is deliberately independent of the journal
+//! schema so the TUI can remain a projection, not a second durable store.
 //!
 //! ## Schema stability
 //!
-//! All variants carry an explicit `"kind"` tag (via `serde(tag)`),
-//! not structural discriminants, so adding new variants in the
-//! future doesn't break old sessions. Unknown variants on load are
-//! dropped with a warning rather than panicking — see
-//! [`transcript_jsonl::load`].
-//!
-//! ## Why not reuse the session journal
-//!
-//! `~/.astra/sessions/<id>.jsonl` stores *agent* events
-//! (tool_call_start, reasoning_delta, usage, etc.) — low-level
-//! protocol noise. The transcript file stores *rendered* events —
-//! one row per user-visible cell. Conceptually distinct, so they
-//! get sibling files.
+//! All variants carry an explicit `"kind"` tag (via `serde(tag)`) so the
+//! adapter stays forward-compatible if it is ever transported or snapshotted.
+//! Unknown variants are safely ignored by the restoration path.
 
 use serde::{Deserialize, Serialize};
 
@@ -39,8 +27,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum TurnEvent {
-    /// User-typed message. The text is exactly what the composer
-    /// submitted (pastes already expanded, no placeholders).
+    /// Prompt-facing user message. The text is the semantic conversation
+    /// body supplied to the turn (pastes expanded, no UI commands). Local
+    /// slash/control actions are persisted as `SystemLevel::Action` instead.
     User {
         /// RFC3339 timestamp of when the user hit Enter.
         #[serde(default)]
@@ -98,8 +87,9 @@ pub(crate) enum TurnEvent {
         output: Option<String>,
     },
 
-    /// System info / warning / error. Flags like "session
-    /// resumed", permission changes, or non-fatal errors.
+    /// Durable workbench-only projection: local action, result, info,
+    /// warning, or error. These rows survive resume but never enter prompt
+    /// continuation.
     System {
         #[serde(default)]
         ts: Option<String>,
@@ -141,12 +131,20 @@ pub(crate) enum TurnEvent {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolStatus {
     Success,
+    /// The tool did not return a complete receipt, but independent typed
+    /// evidence proves that relevant work exists. This is intentionally not
+    /// serialized as success or failure.
+    Uncertain,
     Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SystemLevel {
+    /// User-invoked local UI/control action. It belongs in the durable
+    /// work transcript for audit and resume, but never in prompt-facing
+    /// conversation history.
+    Action,
     /// Free-floating TUI notice (session resumed, etc.). Dim.
     Info,
     /// Result of a slash command — `  ⎿  Set model to …` style.
@@ -213,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_event_roundtrip_success_and_failure() {
+    fn tool_event_roundtrip_terminal_outcomes() {
         assert_roundtrip(&TurnEvent::Tool {
             ts: None,
             name: "bash".into(),
@@ -221,6 +219,15 @@ mod tests {
             status: ToolStatus::Success,
             duration_ms: 42,
             output_summary: Some("3 entries".into()),
+            output: None,
+        });
+        assert_roundtrip(&TurnEvent::Tool {
+            ts: None,
+            name: "agent_fanout".into(),
+            description: "review in parallel".into(),
+            status: ToolStatus::Uncertain,
+            duration_ms: 9,
+            output_summary: Some("live runs were observed".into()),
             output: None,
         });
         assert_roundtrip(&TurnEvent::Tool {
@@ -237,6 +244,7 @@ mod tests {
     #[test]
     fn system_event_levels_roundtrip() {
         for lv in [
+            SystemLevel::Action,
             SystemLevel::Info,
             SystemLevel::Response,
             SystemLevel::Warning,

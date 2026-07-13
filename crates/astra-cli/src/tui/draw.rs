@@ -8,17 +8,25 @@
 //!
 //! See `ARCHITECTURE.md` for the visual-hierarchy grammar.
 
+use astra_tools::task_mgmt::TaskStoreHealth;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
-use super::bottom_pane::{BottomPane, footer::Footer};
+use super::agent_run_projection::{AgentProjectionConfidence, AgentRunState, AgentRunStatus};
+use super::bottom_pane::{BottomPane, ConversationTab, footer::Footer};
+use super::history_cell::assistant::AssistantCell;
 use super::render::line_utils::sanitize_lines_for_terminal;
 use super::render::renderable::{FlexRenderable, Renderable, RenderableItem};
-use super::task_board_observer::TaskBoardObserver;
+use super::task_board_observer::{
+    ProjectedTaskTruthState, TaskBoardObserver, TaskBoardProjection, TaskBoardTruthState,
+};
 use super::terminal::TerminalGuard;
 use super::{chat_widget, status_indicator, task_list};
 use crate::cli::effects::truncate_label;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ───────────────────────────────────────────────────────────────────────
 // Active-view grammar
@@ -31,8 +39,8 @@ use crate::cli::effects::truncate_label;
 /// - **Settled** (not represented here) — committed `HistoryCell`s
 ///   already painted to terminal scrollback. Flat, no border.
 /// - **Active** — something's happening right now. Rendered with a
-///   left `█` gutter whose colour gradient flows while live and
-///   freezes in place on completion.
+///   left `█` gutter whose semantic colour distinguishes live and
+///   settled work without treating animation as progress evidence.
 /// - **Status** — a one-line indicator (`✶ Thinking …`) when we
 ///   have a turn in flight but no cell content yet. No border —
 ///   the cue is the spinner, not the frame.
@@ -41,45 +49,26 @@ pub(crate) enum ActiveView {
     Status(Line<'static>),
     Active {
         lines: Vec<Line<'static>>,
-        /// `true` while still streaming — gradient flows. `false`
-        /// once finalized — gradient freezes in place.
+        /// `true` while still streaming. `false` once finalised.
         live: bool,
-        /// Process-relative seconds at which the underlying cell
-        /// finalized. Mirrors `HistoryCell::frozen_phase` so the
-        /// active-slot gutter can lock its phase on freeze.
-        freeze_phase: Option<f32>,
     },
 }
 
 /// Single live agent's render data inside `ViewportFrame.multi_agent`.
 ///
-/// Compact per-agent row (reference-agent/Kiro-style): `{status_icon}
-/// {name}  {child_count} steps · {elapsed}`. The whole strip renders
-/// inside ONE `LiveFramedCell` with a single gradient gutter so the
+/// Compact per-agent row: `{status_icon} {name} · {tools} · {children} ·
+/// {elapsed}`. The whole strip renders
+/// inside ONE `LiveFramedCell` with a single semantic gutter so the
 /// user sees N agents as a tidy panel, not N stacked frames.
 pub(crate) struct MultiAgentEntry {
     pub agent_id: String,
     /// Display label — name from the agent spawn action if set, falling back
-    /// to description. Building it lives in `agents_drilldown_rows`-
+    /// to description. Building it lives in `agent_monitor_snapshot`-
     /// adjacent territory; here we just render the prepared string.
     pub label: String,
-    /// Number of child tool calls observed under this agent. Mirrors
-    /// the count shown by Kiro's monitor.
-    pub child_count: usize,
+    pub activity: crate::tui::agent_run_projection::AgentActivityCounts,
     pub elapsed_ms: u64,
-    pub live: bool,
-    pub failed: bool,
-    /// Resumable pause/interruption. Distinct from failure and cancellation.
-    pub interrupted: bool,
-    /// User-cancelled (via Ctrl+G x or Ctrl+C). Distinct from `failed`
-    /// so the strip can render a different icon/color: a cancelled
-    /// agent is the user's intent, not an error to alarm about.
-    pub cancelled: bool,
-    /// Cancel-in-flight: the user pressed `x`, the spawner has been
-    /// notified, but the terminal status hasn't landed yet. Surfaced
-    /// as a distinct icon (⊘) and "Cancelling…" suffix so the user
-    /// gets immediate feedback instead of staring at a still-Live row.
-    pub cancelling: bool,
+    pub state: AgentRunState,
 }
 
 /// Build the strip header.
@@ -92,22 +81,85 @@ pub(crate) struct MultiAgentEntry {
 ///
 /// `cancelled` / `cancelling` are split out from `failed` because user
 /// cancellation is an intent, not an alarm — surfacing it as a separate
-/// bucket avoids confusing "I just killed one" with "one died on me".
+/// bucket avoids confusing a user-requested stop with an agent failure.
 ///
-/// Hint advertises both `Ctrl+G` (open drill view) and `x` (kill from
-/// inside drill view) so the new affordance is discoverable.
+/// Hint advertises both `Ctrl+G` (open monitor) and `X` (stop from
+/// inside the monitor) so the affordance is discoverable.
 pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
     let total = cells.len();
-    let live = cells.iter().filter(|c| c.live).count();
-    let cancelling = cells.iter().filter(|c| c.cancelling).count();
-    let failed = cells.iter().filter(|c| c.failed).count();
-    let interrupted = cells.iter().filter(|c| c.interrupted).count();
-    let cancelled = cells.iter().filter(|c| c.cancelled).count();
-    let done = total.saturating_sub(live + cancelling + failed + interrupted + cancelled);
+    let uncertain = cells
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.state.confidence,
+                AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+            )
+        })
+        .count();
+    let confident = |entry: &&MultiAgentEntry| {
+        !matches!(
+            entry.state.confidence,
+            AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+        )
+    };
+    let live = cells
+        .iter()
+        .filter(confident)
+        .filter(|c| {
+            matches!(
+                c.state.status,
+                AgentRunStatus::Starting
+                    | AgentRunStatus::Running
+                    | AgentRunStatus::Pausing
+                    | AgentRunStatus::Resuming
+            )
+        })
+        .count();
+    let waiting = cells
+        .iter()
+        .filter(confident)
+        .filter(|c| c.state.status == AgentRunStatus::Waiting)
+        .count();
+    let paused = cells
+        .iter()
+        .filter(confident)
+        .filter(|c| c.state.status == AgentRunStatus::Paused)
+        .count();
+    let cancelling = cells
+        .iter()
+        .filter(confident)
+        .filter(|c| c.state.status == AgentRunStatus::Cancelling)
+        .count();
+    let failed = cells
+        .iter()
+        .filter(confident)
+        .filter(|c| c.state.status == AgentRunStatus::Failed)
+        .count();
+    let interrupted = cells
+        .iter()
+        .filter(confident)
+        .filter(|c| c.state.status == AgentRunStatus::Interrupted)
+        .count();
+    let cancelled = cells
+        .iter()
+        .filter(confident)
+        .filter(|c| c.state.status == AgentRunStatus::Cancelled)
+        .count();
+    let done = cells
+        .iter()
+        .filter(confident)
+        .filter(|c| c.state.status == AgentRunStatus::Completed)
+        .count();
 
     let mut breakdown = Vec::with_capacity(5);
     if live > 0 {
         breakdown.push(format!("{live} live"));
+    }
+    if waiting > 0 {
+        breakdown.push(format!("{waiting} waiting"));
+    }
+    if paused > 0 {
+        breakdown.push(format!("{paused} paused"));
     }
     if cancelling > 0 {
         breakdown.push(format!("{cancelling} cancelling"));
@@ -121,6 +173,9 @@ pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
     if cancelled > 0 {
         breakdown.push(format!("{cancelled} cancelled"));
     }
+    if uncertain > 0 {
+        breakdown.push(format!("{uncertain} unconfirmed"));
+    }
     if done > 0 {
         breakdown.push(format!("{done} done"));
     }
@@ -130,14 +185,135 @@ pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
         format!(" · {}", breakdown.join(" · "))
     };
 
-    format!("▶ {total} parallel agents{breakdown} · Ctrl+G drill · x kill")
+    format!(
+        "{} {total} parallel agents{breakdown} · Ctrl+G manage",
+        crate::tui::glyphs::current().agent_fanout,
+    )
+}
+
+/// The workbench keeps this one-line activity strip visible above a focused
+/// root or agent transcript. It is intentionally a navigation/status cue,
+/// not a second agent list: `Ctrl+G` remains the place to inspect and control
+/// individual runs.
+fn workspace_agent_activity_line(cells: &[MultiAgentEntry], width: u16) -> Line<'static> {
+    let text = truncate_label(&multi_agent_strip_header(cells), width as usize);
+    Line::from(Span::styled(
+        format!("  {text}"),
+        Style::default()
+            .fg(crate::tui::theme::current().accent)
+            .add_modifier(ratatui::style::Modifier::BOLD),
+    ))
+}
+
+/// A compact browser-like tab strip for retained conversations. On narrow
+/// terminals the active label wins over an incomplete list: hiding which
+/// conversation is on screen is worse than omitting distant tabs that remain
+/// reachable through Ctrl+G and Shift+Left/Right.
+fn workspace_conversation_tab_line(tabs: &[ConversationTab], width: u16) -> Option<Line<'static>> {
+    if tabs.len() < 2 || width == 0 {
+        return None;
+    }
+
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let active_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(ratatui::style::Modifier::BOLD);
+    let label_budget = 22;
+    let labels = tabs
+        .iter()
+        .map(|tab| truncate_label(&tab.label, label_budget))
+        .collect::<Vec<_>>();
+    let shortcut = " · Shift+←/→ switch";
+    let full_width = 2
+        + labels
+            .iter()
+            .map(|label| UnicodeWidthStr::width(label.as_str()) + 2)
+            .sum::<usize>()
+        + tabs.len().saturating_sub(1) * 3
+        + UnicodeWidthStr::width(shortcut);
+
+    if full_width <= usize::from(width) {
+        let mut spans = vec![Span::styled("  ", dim)];
+        for (index, (tab, label)) in tabs.iter().zip(labels).enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" · ", dim));
+            }
+            let marker = if tab.active { "● " } else { "○ " };
+            spans.push(Span::styled(
+                format!("{marker}{label}"),
+                if tab.active { active_style } else { dim },
+            ));
+        }
+        spans.push(Span::styled(shortcut, dim));
+        return Some(Line::from(spans));
+    }
+
+    let active_label = tabs
+        .iter()
+        .zip(labels)
+        .find_map(|(tab, label)| tab.active.then_some(label))
+        .unwrap_or_else(|| "conversation".to_string());
+    let summary = format!(
+        "  {} conversations · ● {active_label} · Shift+←/→ switch",
+        tabs.len()
+    );
+    Some(Line::from(Span::styled(
+        truncate_label(&summary, usize::from(width)),
+        active_style,
+    )))
+}
+
+/// Render the primary workbench canvas without a terminal side effect. Keeping
+/// this composition separate makes the transcript + live-agent coexistence
+/// directly testable against a real ratatui frame.
+fn render_primary_workspace(
+    area: Rect,
+    buf: &mut Buffer,
+    bottom_pane: &mut BottomPane,
+    activity: Option<&Line<'static>>,
+) -> Option<(u16, u16)> {
+    Clear.render(area, buf);
+    let mut chrome = Vec::with_capacity(2);
+    if let Some(tab_line) =
+        workspace_conversation_tab_line(&bottom_pane.conversation_tabs(), area.width)
+    {
+        chrome.push(tab_line);
+    }
+    if let Some(activity) = activity {
+        chrome.push(activity.clone());
+    }
+    let workspace_area = if !chrome.is_empty()
+        && area.height
+            > u16::try_from(chrome.len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(3)
+    {
+        let mut constraints = vec![ratatui::layout::Constraint::Length(1); chrome.len()];
+        constraints.push(ratatui::layout::Constraint::Min(0));
+        let areas = ratatui::layout::Layout::vertical(constraints).split(area);
+        for (line, chrome_area) in chrome.into_iter().zip(areas.iter()) {
+            Paragraph::new(line).render(*chrome_area, buf);
+        }
+        *areas.last().expect("content area follows workspace chrome")
+    } else {
+        area
+    };
+    // The transcript owns this exact content rectangle, not the outer
+    // terminal. Workspace tabs and activity chrome consume rows above it;
+    // sizing against the full terminal leaves the last transcript rows
+    // unreachable whenever that chrome is visible.
+    if bottom_pane.conversation_tab_is_open() {
+        bottom_pane.prepare_conversation_workspace(workspace_area.height, workspace_area.width);
+    }
+    bottom_pane.render(workspace_area, buf);
+    bottom_pane.cursor_position(workspace_area)
 }
 
 /// Pair of (ActiveView, TaskBoard lines) produced by
 /// [`active_viewport`]. The task board is its OWN slot — not an
 /// `ActiveView` variant — so a streaming active cell (tool /
-/// assistant) no longer replaces the board mid-frame. Matches
-/// reference-agent's Ink `<Static>` / panel split.
+/// assistant) no longer replaces the board mid-frame.
 ///
 /// `active` priority (inside the single active-cell slot):
 ///   1. `active_cell` present → `Active` with lines + kind so the
@@ -164,6 +340,120 @@ pub(crate) struct ViewportFrame {
     /// `board_expanded` so that in-turn draws self-correct when
     /// tasks appear mid-turn (rather than waiting for the outer tick).
     pub resolved_board_expanded: bool,
+}
+
+fn task_board_truth_line(
+    state: TaskBoardTruthState,
+    store_health: TaskStoreHealth,
+    width: u16,
+) -> Option<Line<'static>> {
+    if width == 0 {
+        return None;
+    }
+    let theme = crate::tui::theme::current();
+    let (text, color) = match state {
+        // An unbound task lane has no task evidence and no action the user can
+        // take from this surface. Rendering it beside an active run falsely
+        // reads as a run lifecycle failure, so keep the optional lane absent.
+        TaskBoardTruthState::Unbound => return None,
+        TaskBoardTruthState::Loading => ("Checklist · syncing", theme.dim),
+        TaskBoardTruthState::Confirmed => return None,
+        TaskBoardTruthState::Refreshing => (
+            "Checklist · syncing · showing last confirmed checklist",
+            theme.accent,
+        ),
+        TaskBoardTruthState::Stale => match store_health {
+            TaskStoreHealth::AuthenticationRequired => (
+                "Checklist sync needs sign-in · showing last confirmed checklist",
+                theme.warn,
+            ),
+            TaskStoreHealth::SessionUnavailable => (
+                "Checklist sync unavailable for this session · showing last confirmed checklist",
+                theme.warn,
+            ),
+            TaskStoreHealth::ServiceUnavailable => (
+                "Checklist storage unavailable · showing confirmed checklist · Ctrl+T → R refresh",
+                theme.warn,
+            ),
+            TaskStoreHealth::TransportUnavailable => (
+                "Checklist server unreachable · showing confirmed checklist · Ctrl+T → R refresh",
+                theme.warn,
+            ),
+            TaskStoreHealth::ProtocolMismatch => (
+                "Checklist sync protocol mismatch · showing last confirmed checklist",
+                theme.warn,
+            ),
+            TaskStoreHealth::Unknown | TaskStoreHealth::Ready => (
+                "Checklist sync delayed · showing last confirmed checklist · Ctrl+T → R refresh",
+                theme.warn,
+            ),
+        },
+        TaskBoardTruthState::Unavailable => match store_health {
+            TaskStoreHealth::AuthenticationRequired => ("Checklist sync needs sign-in", theme.warn),
+            TaskStoreHealth::SessionUnavailable => {
+                ("Checklist sync unavailable for this session", theme.warn)
+            }
+            TaskStoreHealth::ServiceUnavailable => (
+                "Checklist storage unavailable · Ctrl+T → R refresh",
+                theme.warn,
+            ),
+            TaskStoreHealth::TransportUnavailable => (
+                "Checklist server unreachable · Ctrl+T → R refresh",
+                theme.warn,
+            ),
+            TaskStoreHealth::ProtocolMismatch => (
+                "Checklist sync protocol mismatch · check client/server versions",
+                theme.warn,
+            ),
+            TaskStoreHealth::Unknown | TaskStoreHealth::Ready => (
+                "Checklist sync unavailable · Ctrl+T → R refresh",
+                theme.warn,
+            ),
+        },
+    };
+    Some(Line::from(Span::styled(
+        truncate_state_line(text, width as usize),
+        Style::default().fg(color),
+    )))
+}
+
+/// A degraded canonical plan source must be visible when we are still showing
+/// its last confirmed steps. Do not render an initial unavailable/loading
+/// source: a session without a plan should stay quiet instead of suggesting a
+/// work failure that may not exist.
+fn projected_task_truth_line(state: ProjectedTaskTruthState, width: u16) -> Option<Line<'static>> {
+    if width == 0 || state != ProjectedTaskTruthState::Stale {
+        return None;
+    }
+    let theme = crate::tui::theme::current();
+    Some(Line::from(Span::styled(
+        truncate_state_line(
+            "Plan state delayed · showing last confirmed steps",
+            width as usize,
+        ),
+        Style::default().fg(theme.warn),
+    )))
+}
+
+fn truncate_state_line(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let char_width = ch.width().unwrap_or(0);
+        if used + char_width > max_width.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        used += char_width;
+    }
+    out.push('…');
+    out
 }
 
 pub(crate) fn active_viewport(
@@ -196,53 +486,28 @@ pub(crate) fn active_viewport(
         let cells: Vec<MultiAgentEntry> = agent_ids
             .iter()
             .filter_map(|id| {
-                chat_widget.agent_run_cell(id).map(|tc| {
-                    let is_cancelled = chat_widget.agent_is_cancelled(id);
-                    let is_cancelling = chat_widget.agent_is_cancelling(id);
-                    let raw_failed = matches!(
-                        tc.status,
-                        crate::tui::history_cell::task::TaskStatus::Failed
-                    );
-                    let raw_running = matches!(
-                        tc.status,
-                        crate::tui::history_cell::task::TaskStatus::Running
-                    );
-                    let raw_interrupted = matches!(
-                        tc.status,
-                        crate::tui::history_cell::task::TaskStatus::Interrupted
-                    );
-                    // Cancellation is an overlay on the underlying
-                    // status. A user-cancelled agent that came back as
-                    // Failed renders as Cancelled (the underlying
-                    // failure is incidental to the user's intent); a
-                    // still-running agent the user just `x`-killed
-                    // renders as Cancelling until its terminal status
-                    // lands. Without this overlay the strip showed
-                    // `✗ red` indistinguishably from a real failure.
-                    MultiAgentEntry {
-                        agent_id: id.clone(),
-                        label: tc.description.clone(),
-                        child_count: tc.children.len(),
-                        elapsed_ms: tc
-                            .duration_ms
-                            .unwrap_or_else(|| tc.started_at.elapsed().as_millis() as u64),
-                        live: raw_running && !is_cancelling && !is_cancelled,
-                        failed: raw_failed && !is_cancelled,
-                        interrupted: raw_interrupted && !is_cancelled,
-                        cancelled: is_cancelled,
-                        cancelling: is_cancelling && !is_cancelled,
-                    }
+                chat_widget.agent_run_cell(id).map(|tc| MultiAgentEntry {
+                    agent_id: id.clone(),
+                    label: tc.description.clone(),
+                    activity: chat_widget
+                        .agent_run_activity_counts(id)
+                        .expect("agent id and activity are read from one registry"),
+                    elapsed_ms: tc
+                        .duration_ms
+                        .unwrap_or_else(|| tc.started_at.elapsed().as_millis() as u64),
+                    state: chat_widget
+                        .agent_run_state(id)
+                        .expect("agent id and projection are read from one registry"),
                 })
             })
             .collect();
 
-        let any_live = cells.iter().any(|entry| entry.live || entry.cancelling);
+        let any_live = cells.iter().any(|entry| entry.state.is_actionable_active());
         let any_recently_terminal = !any_live
             && agent_ids.iter().any(|id| {
-                chat_widget.agent_run_cell(id).is_some_and(|tc| {
-                    tc.completed_at
-                        .is_some_and(|completed_at| completed_at.elapsed() < STRIP_LINGER)
-                })
+                chat_widget
+                    .agent_run_terminal_at(id)
+                    .is_some_and(|terminal_at| terminal_at.elapsed() < STRIP_LINGER)
             });
         if should_show_multi_agent_strip(&cells, any_recently_terminal) {
             Some(cells)
@@ -253,14 +518,24 @@ pub(crate) fn active_viewport(
         None
     };
 
+    // The active viewport has finite physical space. A mutable assistant reply
+    // must therefore never build/render its whole growing Markdown document on
+    // every token; use the bounded live tail and reserve rich Markdown for the
+    // finalized background layout path.
+    let live_assistant_rows = usize::from(rows.saturating_sub(10).clamp(4, 48));
     let active = chat_widget.active_cell().and_then(|cell| {
-        let lines = sanitize_lines_for_terminal(cell.display_lines(inner_w));
+        let lines = if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>()
+            && cell.is_live()
+        {
+            assistant.live_viewport_lines(inner_w, live_assistant_rows)
+        } else {
+            cell.display_lines(inner_w)
+        };
+        let lines = sanitize_lines_for_terminal(lines);
         if lines.is_empty() {
             None
         } else {
-            let live = cell.is_live();
-            let freeze_phase = cell.frozen_phase();
-            Some((lines, live, freeze_phase))
+            Some((lines, cell.is_live()))
         }
     });
     // Pump the observer before reading its snapshot. Without this,
@@ -273,26 +548,29 @@ pub(crate) fn active_viewport(
     if let Some(b) = board {
         b.maybe_refresh();
     }
-    // `snap_for_render` drops completed tasks older than
-    // `COMPLETED_TASK_TTL` (~30s) so a long agentic run doesn't pile
-    // up dozens of ✔ rows above the spinner. The footer chip /
-    // header counts still pull from `counts()` (full truth) — only
-    // row rendering cares about the TTL filter.
-    let snap = board.map(|b| b.snapshot_for_render()).unwrap_or_default();
-
+    // Rows and confidence are cloned under one observer lock. Reading them
+    // separately could pair a pre-refresh cache with post-refresh confidence.
+    let projection = board.map(TaskBoardObserver::active_projection);
+    let truth_state = projection.as_ref().map(TaskBoardProjection::truth_state);
+    let has_confirmed_truth = truth_state.is_some_and(TaskBoardTruthState::has_confirmed_truth);
+    let has_tasks = projection
+        .as_ref()
+        .is_some_and(TaskBoardProjection::has_tasks);
+    // `hidden` only records an explicit compact-board collapse. It is never
+    // derived from a terminal-task timeout, so completed work remains
+    // reachable through Ctrl+T and the primary Taskboard.
+    let hidden = matches!(
+        projection.as_ref(),
+        Some(TaskBoardProjection::Single { snapshot, .. }) if snapshot.hidden
+    );
     // Resolve board visibility from the FRESH snapshot every frame.
     // This is the critical fix: previously, resolve_board_visibility
     // only ran in the outer-tick, so in-turn draws always saw the
     // stale `board_expanded = false` from turn start. Now every draw
     // self-corrects — if task_board.create lands mid-turn, the board opens
     // on the very next frame (≤50ms).
-    let has_tasks = !snap.tasks.is_empty();
-    let (resolved_expanded, _reset_pin) = super::board_pin::resolve_board_visibility(
-        board_expanded,
-        board_user_pin,
-        has_tasks,
-        snap.hidden,
-    );
+    let (resolved_expanded, _reset_pin) =
+        super::board_pin::resolve_board_visibility(board_expanded, board_user_pin, has_tasks);
 
     // Three-mode board:
     //   - hidden                       → render nothing
@@ -302,53 +580,94 @@ pub(crate) fn active_viewport(
     // Earlier flow tied "no board" to "render Next: hint into the
     // active region". With bottom-anchor + always-on collapsed
     // summary, the hint is now redundant — the summary IS the hint.
-    let task_board = if snap.hidden {
-        None
-    } else if resolved_expanded {
-        let mode = board
-            .map(|b| b.view_mode())
-            .unwrap_or(super::task_board_observer::ViewMode::SingleSession);
-        match mode {
-            super::task_board_observer::ViewMode::AllSessions => {
-                let multi = board.map(|b| b.multi_snapshot()).unwrap_or_default();
-                if multi.per_session.is_empty() {
-                    None
-                } else {
-                    let lines = task_list::render_multi(&multi.per_session, width, rows);
-                    if lines.is_empty() { None } else { Some(lines) }
-                }
-            }
-            super::task_board_observer::ViewMode::SingleSession => {
-                if snap.tasks.is_empty() {
-                    None
-                } else {
-                    let fresh_task_ids = board
-                        .map(|observer| observer.fresh_task_id_set())
-                        .unwrap_or_default();
-                    let lines = task_list::render_with_fresh_predicate(
-                        &snap.tasks,
-                        width,
-                        rows,
-                        true,
-                        |task_id| fresh_task_ids.contains(task_id),
-                    );
-                    if lines.is_empty() { None } else { Some(lines) }
-                }
-            }
+    let store_health = projection
+        .as_ref()
+        .map(TaskBoardProjection::store_health)
+        .unwrap_or_default();
+    let mut state_lines = Vec::with_capacity(2);
+    // Do not surface an automatically-refreshing optional checklist lane during
+    // startup when it contributes no task. Once the user opens the board or
+    // there is any displayable work, show its independently attributable
+    // health without hiding the canonical task projection.
+    let checklist_lane_is_relevant =
+        has_confirmed_truth || has_tasks || board_expanded || board_user_pin.is_some();
+    if checklist_lane_is_relevant
+        && let Some(line) =
+            truth_state.and_then(|state| task_board_truth_line(state, store_health, width))
+    {
+        state_lines.push(line);
+    }
+    if let Some(line) = projection.as_ref().and_then(|projection| match projection {
+        TaskBoardProjection::Single {
+            projected_truth_state,
+            ..
         }
-    } else if !snap.tasks.is_empty() {
-        task_list::render_collapsed_summary(&snap.tasks, width).map(|line| vec![line])
+        | TaskBoardProjection::All {
+            projected_truth_state,
+            ..
+        } => projected_task_truth_line(*projected_truth_state, width),
+    }) {
+        state_lines.push(line);
+    }
+    let row_budget = rows.saturating_sub(state_lines.len() as u16);
+    let mut cached_lines = if has_tasks && !hidden {
+        match projection.as_ref() {
+            Some(TaskBoardProjection::Single { snapshot, .. }) if resolved_expanded => {
+                let fresh_task_ids = board
+                    .map(TaskBoardObserver::fresh_task_id_set)
+                    .unwrap_or_default();
+                task_list::render_with_fresh_predicate(
+                    &snapshot.tasks,
+                    width,
+                    row_budget,
+                    true,
+                    |task_id| fresh_task_ids.contains(task_id),
+                )
+            }
+            Some(TaskBoardProjection::All { snapshot, .. }) if resolved_expanded => {
+                task_list::render_multi(&snapshot.per_session, width, row_budget)
+            }
+            Some(TaskBoardProjection::Single { snapshot, .. }) => {
+                task_list::render_collapsed_summary(&snapshot.tasks, width)
+                    .into_iter()
+                    .collect()
+            }
+            Some(TaskBoardProjection::All { snapshot, .. }) => {
+                let tasks = snapshot
+                    .per_session
+                    .iter()
+                    .flat_map(|(_, tasks)| tasks.iter().cloned())
+                    .collect::<Vec<_>>();
+                task_list::render_collapsed_multi_summary(&tasks, width)
+                    .into_iter()
+                    .collect()
+            }
+            None => Vec::new(),
+        }
     } else {
+        Vec::new()
+    };
+    let task_board = if state_lines.is_empty() && cached_lines.is_empty() {
         None
+    } else {
+        let mut lines = Vec::with_capacity(cached_lines.len() + state_lines.len());
+        lines.append(&mut state_lines);
+        lines.append(&mut cached_lines);
+        Some(lines)
     };
     let status_line = status.render();
     // Hint suppressed once the collapsed summary covers the same
     // ground (current/next + status icon). Only fall back to the
     // hint when we genuinely have no board slot to fill.
-    let next_hint = if task_board.is_none() && !snap.hidden {
-        task_list::render_next_hint(&snap.tasks, width)
-    } else {
-        None
+    let next_hint = match projection.as_ref() {
+        Some(TaskBoardProjection::Single {
+            truth_state: TaskBoardTruthState::Confirmed,
+            snapshot,
+            ..
+        }) if task_board.is_none() && !hidden => {
+            task_list::render_next_hint(&snapshot.tasks, width)
+        }
+        _ => None,
     };
     let active = pick_active_view(active, status_line, next_hint);
     ViewportFrame {
@@ -360,10 +679,16 @@ pub(crate) fn active_viewport(
 }
 
 fn should_show_multi_agent_strip(cells: &[MultiAgentEntry], any_recently_terminal: bool) -> bool {
-    let any_live = cells.iter().any(|entry| entry.live || entry.cancelling);
-    let any_failed = cells.iter().any(|entry| entry.failed);
-    let any_interrupted = cells.iter().any(|entry| entry.interrupted);
-    any_live || any_failed || any_interrupted || any_recently_terminal
+    let any_live = cells.iter().any(|entry| entry.state.is_actionable_active());
+    let any_attention = cells.iter().any(|entry| {
+        entry.state.status.is_failure()
+            || entry.state.status == AgentRunStatus::Interrupted
+            || matches!(
+                entry.state.confidence,
+                AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+            )
+    });
+    any_live || any_attention || any_recently_terminal
 }
 
 /// Pure priority resolver. Priority: **Active > Status > NextHint >
@@ -371,7 +696,7 @@ fn should_show_multi_agent_strip(cells: &[MultiAgentEntry], any_recently_termina
 /// own sibling slot in the frame so a streaming active cell cannot
 /// flicker-replace it. See [`ViewportFrame`].
 pub(crate) fn pick_active_view(
-    active: Option<(Vec<Line<'static>>, bool, Option<f32>)>,
+    active: Option<(Vec<Line<'static>>, bool)>,
     status_line: Option<Line<'static>>,
     next_hint: Option<Line<'static>>,
 ) -> ActiveView {
@@ -379,12 +704,8 @@ pub(crate) fn pick_active_view(
     // strip is now a SIBLING field on ViewportFrame (rendered
     // above the active slot) so this resolver no longer needs to
     // arbitrate between them — both can co-exist.
-    if let Some((lines, live, freeze_phase)) = active {
-        return ActiveView::Active {
-            lines,
-            live,
-            freeze_phase,
-        };
+    if let Some((lines, live)) = active {
+        return ActiveView::Active { lines, live };
     }
     if let Some(line) = status_line {
         return ActiveView::Status(line);
@@ -443,10 +764,39 @@ pub(crate) fn do_draw(
         .map_err(|e| format!("failed to restore terminal input mode: {e}"))?;
     if let Some((board, expanded)) = task_board {
         sync_task_footer(&mut bottom_pane.footer, board, expanded);
+        bottom_pane.refresh_task_board(&board.active_projection());
     }
     bottom_pane.pre_draw_tick(std::time::Instant::now());
 
-    let width = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+    let terminal_size = guard.terminal.size().unwrap_or(ratatui::layout::Size {
+        width: 80,
+        height: 24,
+    });
+    let width = terminal_size.width;
+    let workspace_agent_activity = multi_agent
+        .as_deref()
+        .map(|cells| workspace_agent_activity_line(cells, width));
+
+    // Root and delegated conversations are peers. Once one is focused, it
+    // replaces the root chat canvas rather than rendering as another pane
+    // below it. The run navigator remains reachable through Ctrl+G and
+    // Left/Esc returns to it, giving this surface browser-tab semantics.
+    if bottom_pane.primary_workspace_is_open() {
+        let height = terminal_size.height.max(1);
+        return guard
+            .draw(height, |frame| {
+                let area = frame.area();
+                if let Some((x, y)) = render_primary_workspace(
+                    area,
+                    frame.buffer_mut(),
+                    bottom_pane,
+                    workspace_agent_activity.as_ref(),
+                ) {
+                    frame.set_cursor_position((x, y));
+                }
+            })
+            .map_err(|error| format!("draw conversation workspace: {error}"));
+    }
 
     let ac_renderable: RenderableItem<'_> = match active {
         ActiveView::Empty => RenderableItem::Owned(Box::new(())),
@@ -457,32 +807,21 @@ pub(crate) fn do_draw(
             let para = Paragraph::new(ratatui::text::Text::from(vec![line]));
             RenderableItem::Owned(Box::new(para))
         }
-        // Active cell renders with a single-column gradient gutter
-        // on the left. While live the gradient flows over time; once
-        // finalized it freezes at the phase captured by the cell so
-        // there's no visual jump on completion. (PR #335.)
-        ActiveView::Active {
-            lines,
-            live,
-            freeze_phase,
-        } => {
-            let framed = LiveFramedCell {
-                lines,
-                live,
-                freeze_phase,
-            };
+        // Active work has a stable semantic gutter rather than a color
+        // animation. New stream events still schedule draws immediately.
+        ActiveView::Active { lines, live } => {
+            let framed = LiveFramedCell { lines, live };
             RenderableItem::Owned(Box::new(framed))
         }
     };
 
-    // Multi-agent strip: reference-agent/Kiro-style compact panel. ONE
-    // gradient-gutter frame containing a header and one short row
+    // Multi-agent strip: one compact gradient-gutter frame containing a header and one short row
     // per live agent. Renders as e.g.:
     //
-    //   █ ▶ 3 parallel agents · 1 live · 1 failed · 1 done · Ctrl+G drill · x kill
-    //   █ ◦ review_tui      · 2 steps · 12s
-    //   █ ✗ review_fixes    · 0 steps · 8s
-    //   █ ✓ review_refactor · 4 steps · 18s
+    //   █ ▶ 3 parallel agents · 1 live · 1 failed · 1 done · Ctrl+G manage
+    //   █ ◦ review_tui      · 2 tools · 1 child · 12s
+    //   █ ✗ review_fixes    · 8s
+    //   █ ✓ review_refactor · 4 tools · 18s
     //
     // (status: ◦ live / ✓ completed / ✗ failed)
     let multi_agent_renderable: Option<RenderableItem<'_>> = multi_agent.map(|cells| {
@@ -490,9 +829,9 @@ pub(crate) fn do_draw(
         // Split live / failed / done so a 3-agent strip with one
         // failure is visible at a glance — without this the user only
         // sees "▶ 3 parallel agents" while one is silently dead.
-        // Hint mentions both drill (Ctrl+G to open the panel) and the
-        // kill key inside it (`x`) so the new affordance is
-        // discoverable from the strip itself.
+        // The strip advertises the key that actually works from the chat
+        // surface. Stop controls are shown after Ctrl+G opens Workbench;
+        // claiming `X stop` here would conflict with ordinary text input.
         let header_line = Line::from(ratatui::text::Span::styled(
             multi_agent_strip_header(&cells),
             ratatui::style::Style::default()
@@ -501,49 +840,69 @@ pub(crate) fn do_draw(
         ));
 
         // Width budget for the label — leave room for status icon (2),
-        // " · " separator (3), "N steps" (~10), " · " (3), "elapsed"
+        // Leave room for activity counts and elapsed time.
         // (~6) ≈ 24 chars of overhead.
         let total_overhead = 24;
         let label_budget = (width as usize).saturating_sub(2 + total_overhead).max(10);
 
-        let dim = ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray);
+        let dim = ratatui::style::Style::default().fg(theme.dim);
+        let glyphs = crate::tui::glyphs::current();
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(cells.len() + 1);
         lines.push(header_line);
         for entry in cells {
-            // Order matters: cancelled overlays everything (the user's
-            // intent), then in-flight cancel, then real failure, then
-            // live, then completed. Without this, a user-cancelled
-            // agent that came back as Failed would render with the red
-            // ✗ "alarm" icon — same as a genuine error.
-            let (icon, icon_color) = if entry.cancelled {
-                ("■", ratatui::style::Color::DarkGray)
-            } else if entry.cancelling {
-                ("⊘", ratatui::style::Color::Yellow)
-            } else if entry.failed {
-                ("✗", ratatui::style::Color::Red)
-            } else if entry.interrupted {
-                ("Ⅱ", ratatui::style::Color::Yellow)
-            } else if entry.live {
-                ("◦", ratatui::style::Color::Yellow)
-            } else {
-                ("✓", ratatui::style::Color::Green)
+            let (icon, icon_color) = match entry.state.confidence {
+                AgentProjectionConfidence::Unconfirmed => (glyphs.agent_unconfirmed, theme.dim),
+                AgentProjectionConfidence::Stale => (glyphs.agent_stale, theme.warn),
+                AgentProjectionConfidence::Observed | AgentProjectionConfidence::Confirmed => {
+                    match entry.state.status {
+                        AgentRunStatus::Starting
+                        | AgentRunStatus::Running
+                        | AgentRunStatus::Pausing
+                        | AgentRunStatus::Resuming => (glyphs.agent_running, theme.warn),
+                        AgentRunStatus::Waiting | AgentRunStatus::Paused => {
+                            (glyphs.agent_waiting, theme.warn)
+                        }
+                        AgentRunStatus::Cancelling => (glyphs.agent_cancelling, theme.warn),
+                        AgentRunStatus::Completed | AgentRunStatus::Delegated => {
+                            (glyphs.agent_completed, theme.success)
+                        }
+                        AgentRunStatus::Interrupted => (glyphs.agent_interrupted, theme.warn),
+                        AgentRunStatus::Failed => (glyphs.agent_failed, theme.error),
+                        AgentRunStatus::Cancelled => (glyphs.agent_cancelled, theme.dim),
+                    }
+                }
             };
             let label = truncate_label(&entry.label, label_budget);
-            let trailing = if entry.cancelling {
-                " · Cancelling…"
-            } else if entry.cancelled {
-                " · Cancelled"
-            } else if entry.interrupted {
-                " · Interrupted"
-            } else {
-                ""
+            let trailing = match entry.state.confidence {
+                AgentProjectionConfidence::Unconfirmed => " · Status unconfirmed",
+                AgentProjectionConfidence::Stale => " · Stale",
+                AgentProjectionConfidence::Observed | AgentProjectionConfidence::Confirmed => {
+                    match entry.state.status {
+                        AgentRunStatus::Starting => " · Starting…",
+                        AgentRunStatus::Waiting => " · Waiting",
+                        AgentRunStatus::Paused => " · Paused",
+                        AgentRunStatus::Pausing => " · Pausing…",
+                        AgentRunStatus::Resuming => " · Resuming…",
+                        AgentRunStatus::Cancelling => " · Cancelling…",
+                        AgentRunStatus::Interrupted => " · Interrupted",
+                        AgentRunStatus::Cancelled => " · Cancelled",
+                        AgentRunStatus::Delegated => " · Delegated",
+                        AgentRunStatus::Running
+                        | AgentRunStatus::Completed
+                        | AgentRunStatus::Failed => "",
+                    }
+                }
             };
-            let suffix = format!(
-                " · {} steps · {}{}",
-                entry.child_count,
-                format_short_elapsed(entry.elapsed_ms),
-                trailing,
-            );
+            let activity = compact_agent_activity(entry.activity);
+            let suffix = if activity.is_empty() {
+                format!(" · {}{}", format_short_elapsed(entry.elapsed_ms), trailing)
+            } else {
+                format!(
+                    " · {activity} · {}{}",
+                    format_short_elapsed(entry.elapsed_ms),
+                    trailing,
+                )
+            };
             let row = Line::from(vec![
                 ratatui::text::Span::styled(
                     icon.to_string(),
@@ -556,11 +915,7 @@ pub(crate) fn do_draw(
             lines.push(row);
         }
 
-        let framed = LiveFramedCell {
-            lines,
-            live: true,
-            freeze_phase: None,
-        };
+        let framed = LiveFramedCell { lines, live: true };
         RenderableItem::Owned(Box::new(framed) as Box<dyn Renderable>)
     });
 
@@ -583,8 +938,7 @@ pub(crate) fn do_draw(
     //   blank spacer               (weight=0)  ← only when board renders
     //   bottom pane / composer     (weight=0)
     //
-    // Earlier iterations stacked the board ABOVE the active cell to
-    // mirror reference-agent's "static panels on top". That broke down for
+    // Earlier iterations stacked the board ABOVE the active cell. That broke down for
     // long agentic turns: streaming text kept pushing the board further
     // from the composer until it was off-screen entirely. Bottom-anchor
     // keeps the board adjacent to the composer — the user's eye only
@@ -656,21 +1010,12 @@ impl<'a> Renderable for BottomPaneRenderable<'a> {
 // LiveFramedCell — gradient gutter renderer for the active cell
 // ───────────────────────────────────────────────────────────────────────
 
-/// Left-gutter renderable: a solid `█` bar on the left edge with a
-/// top-to-bottom colour gradient. While the cell is still streaming
-/// (`live == true`) the gradient flows downward over time; once
-/// finalized (`live == false`) the gradient freezes in place so there
-/// is no visual jump or flash when output completes. PR #335.
+/// Left-gutter renderable: a solid `█` bar on the left edge. Its semantic
+/// color communicates whether the cell is live or settled; motion is not
+/// treated as evidence that useful work is happening.
 struct LiveFramedCell {
     lines: Vec<Line<'static>>,
-    #[allow(dead_code)]
     live: bool,
-    /// Process-relative seconds at which the underlying cell finalized.
-    /// `Some` once frozen — fed into `gradient_color_at_t` so the bar
-    /// stops at the exact phase it had on the final live frame.
-    /// `None` while live, in which case the renderer reads `now` so
-    /// the gradient flows.
-    freeze_phase: Option<f32>,
 }
 
 impl super::render::renderable::Renderable for LiveFramedCell {
@@ -693,19 +1038,13 @@ impl super::render::renderable::Renderable for LiveFramedCell {
         let para = Paragraph::new(ratatui::text::Text::from(self.lines.clone()));
         Widget::render(para, inner, buf);
 
-        // Single formula for live and frozen — only the time component
-        // differs. Live reads `now`; frozen pins the captured value so
-        // colors don't snap on transition.
-        let height = area.height as usize;
-        let period = super::shimmer::LIVE_GUTTER_PERIOD_SECS;
-        let t = match self.freeze_phase {
-            Some(t) => t,
-            None => super::shimmer::elapsed_since_start().as_secs_f32(),
+        let theme = crate::tui::theme::current();
+        let color = if self.live {
+            theme.gutter
+        } else {
+            theme.gutter_frozen
         };
-
-        for row in 0..height {
-            let (r, g, b) = super::shimmer::gradient_color_at_t(row, height.max(1), period, t);
-            let color = ratatui::style::Color::Rgb(r, g, b);
+        for row in 0..area.height as usize {
             set_char(buf, area.x, area.y + row as u16, '█', color);
         }
     }
@@ -747,6 +1086,42 @@ pub(crate) fn format_short_elapsed(ms: u64) -> String {
             format!("{mins}m{secs}s")
         }
     }
+}
+
+fn compact_agent_activity(
+    activity: crate::tui::agent_run_projection::AgentActivityCounts,
+) -> String {
+    let mut parts = Vec::new();
+    if activity.tool_calls > 0 {
+        parts.push(format!(
+            "{} tool{}",
+            activity.tool_calls,
+            if activity.tool_calls == 1 { "" } else { "s" }
+        ));
+    }
+    if activity.child_agents > 0 {
+        let qualifier = if activity.child_agents_partial {
+            "≥"
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "{qualifier}{} child{}",
+            activity.child_agents,
+            if activity.child_agents == 1 {
+                ""
+            } else {
+                "ren"
+            }
+        ));
+    }
+    if activity.messages_sent > 0 || activity.messages_received > 0 {
+        parts.push(format!(
+            "↑{} ↓{}",
+            activity.messages_sent, activity.messages_received
+        ));
+    }
+    parts.join(" · ")
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -796,7 +1171,7 @@ mod active_view_priority_tests {
     #[test]
     fn active_beats_status_and_hint() {
         let v = pick_active_view(
-            Some((lines("active-tool"), true, None)),
+            Some((lines("active-tool"), true)),
             Some(line("status")),
             Some(line("next-hint")),
         );
@@ -838,11 +1213,7 @@ mod active_view_priority_tests {
         ];
         for &(a, s, h, expected) in cases {
             let v = pick_active_view(
-                if a {
-                    Some((lines("a"), true, None))
-                } else {
-                    None
-                },
+                if a { Some((lines("a"), true)) } else { None },
                 if s { Some(line("s")) } else { None },
                 if h { Some(line("h")) } else { None },
             );
@@ -857,11 +1228,27 @@ mod active_view_priority_tests {
 
 #[cfg(test)]
 mod task_board_draw_tests {
-    use super::{ActiveView, active_viewport, sync_task_footer};
-    use crate::tui::{bottom_pane::footer::Footer, chat_widget, status_indicator};
-    use astra_tools::task_mgmt::{InMemoryTaskStore, TaskManager, TaskStore};
-    use std::sync::Arc;
+    use super::{
+        ActiveView, active_viewport, projected_task_truth_line, sync_task_footer,
+        task_board_truth_line,
+    };
+    use crate::tui::{
+        bottom_pane::footer::Footer,
+        chat_widget, status_indicator,
+        task_board_observer::{ProjectedTaskTruthState, TaskBoardTruthState},
+    };
+    use astra_tools::task_mgmt::{
+        InMemoryTaskStore, SessionTask, SessionTaskStatusKind, TaskManager, TaskStore,
+        TaskStoreHealth,
+    };
+    use async_trait::async_trait;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+    use unicode_width::UnicodeWidthStr;
+
+    type SingleLoadResult = Result<Vec<SessionTask>, String>;
+    type MultiLoadResult = Result<Vec<(String, Vec<SessionTask>)>, String>;
 
     async fn wait_until<F: Fn() -> bool>(cond: F, timeout_ms: u64, pump: impl Fn()) {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -869,6 +1256,351 @@ mod task_board_draw_tests {
             pump();
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    struct DrawScriptStore {
+        single: Mutex<VecDeque<SingleLoadResult>>,
+        all: Mutex<VecDeque<MultiLoadResult>>,
+        notify: tokio::sync::broadcast::Sender<String>,
+    }
+
+    impl DrawScriptStore {
+        fn new(single: Vec<SingleLoadResult>, all: Vec<MultiLoadResult>) -> Arc<Self> {
+            let (notify, _) = tokio::sync::broadcast::channel(8);
+            Arc::new(Self {
+                single: Mutex::new(single.into()),
+                all: Mutex::new(all.into()),
+                notify,
+            })
+        }
+
+        fn mark_changed(&self, session_id: &str) {
+            let _ = self.notify.send(session_id.to_string());
+        }
+    }
+
+    #[async_trait]
+    impl TaskStore for DrawScriptStore {
+        async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+            self.single
+                .lock()
+                .expect("single draw script lock")
+                .pop_front()
+                .unwrap_or_else(|| Err("single draw script exhausted".to_string()))
+        }
+
+        async fn load_open_sessions(
+            &self,
+            _limit: usize,
+        ) -> Result<Vec<(String, Vec<SessionTask>)>, String> {
+            self.all
+                .lock()
+                .expect("all-session draw script lock")
+                .pop_front()
+                .unwrap_or_else(|| Err("all-session draw script exhausted".to_string()))
+        }
+
+        async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+            Ok(1)
+        }
+
+        async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+            Ok(1)
+        }
+
+        fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
+            Some(self.notify.subscribe())
+        }
+    }
+
+    fn draw_task(id: &str, title: &str) -> SessionTask {
+        SessionTask {
+            archived_at: None,
+            id: id.to_string(),
+            title: title.to_string(),
+            description: None,
+            status: SessionTaskStatusKind::Pending,
+            subtasks: Vec::new(),
+            created_at: "2026-07-11T00:00:00Z".to_string(),
+            updated_at: "2026-07-11T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        }
+    }
+
+    fn board_text(frame: &super::ViewportFrame) -> String {
+        frame
+            .task_board
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn wait_for_truth(
+        observer: &crate::tui::task_board_observer::TaskBoardObserver,
+        expected: crate::tui::task_board_observer::TaskBoardTruthState,
+    ) {
+        wait_until(
+            || observer.truth_state() == expected,
+            500,
+            || observer.maybe_refresh(),
+        )
+        .await;
+        assert_eq!(observer.truth_state(), expected);
+    }
+
+    #[test]
+    fn task_truth_notices_are_single_line_and_terminal_width_bounded() {
+        use crate::tui::task_board_observer::TaskBoardTruthState;
+
+        for state in [
+            TaskBoardTruthState::Loading,
+            TaskBoardTruthState::Refreshing,
+            TaskBoardTruthState::Stale,
+            TaskBoardTruthState::Unavailable,
+        ] {
+            let line = task_board_truth_line(state, TaskStoreHealth::Unknown, 12)
+                .expect("non-confirmed state notice");
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(text.width() <= 12, "state={state:?} text={text:?}");
+            assert!(!text.contains('\n'));
+        }
+        assert!(
+            task_board_truth_line(TaskBoardTruthState::Unbound, TaskStoreHealth::Unknown, 12)
+                .is_none()
+        );
+        assert!(
+            task_board_truth_line(TaskBoardTruthState::Confirmed, TaskStoreHealth::Ready, 12)
+                .is_none()
+        );
+        assert!(
+            task_board_truth_line(
+                TaskBoardTruthState::Unavailable,
+                TaskStoreHealth::Unknown,
+                0
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_plan_projection_is_visible_but_absent_plan_is_quiet() {
+        let stale = projected_task_truth_line(ProjectedTaskTruthState::Stale, 80)
+            .expect("stale plan rows need an attribution notice");
+        let text = stale
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("last confirmed steps"));
+        assert!(projected_task_truth_line(ProjectedTaskTruthState::Loading, 80).is_none());
+        assert!(projected_task_truth_line(ProjectedTaskTruthState::Unavailable, 80).is_none());
+    }
+
+    #[test]
+    fn task_truth_notice_uses_structured_store_health() {
+        let text = |health| {
+            task_board_truth_line(TaskBoardTruthState::Unavailable, health, 100)
+                .expect("notice")
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+
+        let service = text(TaskStoreHealth::ServiceUnavailable);
+        assert!(
+            service.contains("Checklist storage unavailable"),
+            "{service}"
+        );
+        assert!(service.contains("Ctrl+T → R refresh"), "{service}");
+
+        let transport = text(TaskStoreHealth::TransportUnavailable);
+        assert!(
+            transport.contains("Checklist server unreachable"),
+            "{transport}"
+        );
+
+        let auth = text(TaskStoreHealth::AuthenticationRequired);
+        assert!(auth.contains("needs sign-in"), "{auth}");
+        assert!(!auth.contains("R refresh"), "{auth}");
+
+        let session = text(TaskStoreHealth::SessionUnavailable);
+        assert!(session.contains("this session"), "{session}");
+        assert!(!session.contains("R refresh"), "{session}");
+
+        let protocol = text(TaskStoreHealth::ProtocolMismatch);
+        assert!(protocol.contains("protocol mismatch"), "{protocol}");
+        assert!(!protocol.contains("R refresh"), "{protocol}");
+    }
+
+    #[tokio::test]
+    async fn first_read_failure_renders_unavailable_without_leaking_diagnostics() {
+        use crate::tui::task_board_observer::{TaskBoardObserver, TaskBoardTruthState};
+
+        let store = DrawScriptStore::new(
+            vec![Err("SECRET database topology and credentials".to_string())],
+            Vec::new(),
+        );
+        let observer = TaskBoardObserver::new(store as Arc<dyn TaskStore>, "draw-failed");
+        observer.maybe_refresh();
+        wait_for_truth(&observer, TaskBoardTruthState::Unavailable).await;
+
+        let frame = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&observer),
+            false,
+            None,
+            80,
+            24,
+        );
+        let text = board_text(&frame);
+        assert!(text.is_empty(), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn unavailable_empty_checklist_is_explained_after_the_user_opens_the_board() {
+        use crate::tui::task_board_observer::{TaskBoardObserver, TaskBoardTruthState};
+
+        let store = DrawScriptStore::new(
+            vec![Err("SECRET database topology and credentials".to_string())],
+            Vec::new(),
+        );
+        let observer = TaskBoardObserver::new(store as Arc<dyn TaskStore>, "draw-failed");
+        observer.maybe_refresh();
+        wait_for_truth(&observer, TaskBoardTruthState::Unavailable).await;
+
+        let frame = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&observer),
+            true,
+            Some(true),
+            80,
+            24,
+        );
+        let text = board_text(&frame);
+        assert!(text.contains("Checklist sync unavailable"), "{text}");
+        assert!(text.contains("Ctrl+T → R refresh"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn confirmed_plan_work_remains_visible_when_checklist_sync_fails() {
+        use crate::tui::task_board_observer::{TaskBoardObserver, TaskBoardTruthState};
+
+        let store = DrawScriptStore::new(
+            vec![Err("SECRET checklist endpoint failure".to_string())],
+            Vec::new(),
+        );
+        let observer = TaskBoardObserver::new(store as Arc<dyn TaskStore>, "draw-plan");
+        observer.set_projected_task_projection(
+            vec![draw_task("plan:plan-9:step-1", "verify durable plan work")],
+            ProjectedTaskTruthState::Confirmed,
+        );
+        observer.maybe_refresh();
+        wait_for_truth(&observer, TaskBoardTruthState::Unavailable).await;
+
+        let frame = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&observer),
+            false,
+            None,
+            80,
+            24,
+        );
+        let text = board_text(&frame);
+        assert!(text.contains("verify durable plan work"), "{text}");
+        assert!(text.contains("Checklist sync unavailable"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn stale_notice_keeps_last_confirmed_task_visible() {
+        use crate::tui::task_board_observer::{TaskBoardObserver, TaskBoardTruthState};
+
+        let store = DrawScriptStore::new(
+            vec![
+                Ok(vec![draw_task("task-1", "keep confirmed work visible")]),
+                Err("SECRET refresh failure".to_string()),
+            ],
+            Vec::new(),
+        );
+        let observer = TaskBoardObserver::new(store.clone() as Arc<dyn TaskStore>, "draw-stale");
+        observer.maybe_refresh();
+        wait_for_truth(&observer, TaskBoardTruthState::Confirmed).await;
+
+        store.mark_changed("draw-stale");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        observer.maybe_refresh();
+        wait_for_truth(&observer, TaskBoardTruthState::Stale).await;
+
+        let frame = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&observer),
+            false,
+            None,
+            80,
+            24,
+        );
+        let text = board_text(&frame);
+        assert!(text.contains("Checklist sync delayed"), "{text}");
+        assert!(text.contains("keep confirmed work visible"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn all_sessions_visibility_does_not_inherit_single_session_empty_hidden_state() {
+        use crate::tui::task_board_observer::{TaskBoardObserver, TaskBoardTruthState};
+
+        let store = DrawScriptStore::new(
+            vec![Ok(Vec::new())],
+            vec![Ok(vec![(
+                "cloud-session".to_string(),
+                vec![draw_task("task-cloud", "visible cross-session work")],
+            )])],
+        );
+        let observer = TaskBoardObserver::new(store as Arc<dyn TaskStore>, "draw-single-empty");
+        observer.maybe_refresh();
+        wait_for_truth(&observer, TaskBoardTruthState::Confirmed).await;
+        assert!(
+            observer.snapshot().hidden,
+            "confirmed empty single lane hides itself"
+        );
+
+        observer.toggle_view_mode();
+        observer.maybe_refresh();
+        wait_for_truth(&observer, TaskBoardTruthState::Confirmed).await;
+        let frame = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&observer),
+            false,
+            None,
+            80,
+            24,
+        );
+        let text = board_text(&frame);
+        assert!(text.contains("visible cross-session work"), "{text}");
     }
 
     #[tokio::test]
@@ -915,6 +1647,16 @@ mod task_board_draw_tests {
             || obs.snapshot().tasks.len() == 1,
             500,
             || obs.maybe_refresh(),
+        )
+        .await;
+        // Let the create notification settle, then reconcile once so this
+        // test measures the confirmed short-terminal layout rather than the
+        // intentionally visible Refreshing state.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        obs.maybe_refresh();
+        wait_for_truth(
+            &obs,
+            crate::tui::task_board_observer::TaskBoardTruthState::Confirmed,
         )
         .await;
 
@@ -976,7 +1718,7 @@ mod task_board_draw_tests {
 
         // Parent-level streaming tool cell (what used to steal the slot).
         let mut widget = chat_widget::ChatWidget::new(String::new());
-        widget.handle_event(chat_widget::AppEvent::Wire(WireEvent::ToolStarted {
+        widget.handle_event(chat_widget::AppEvent::wire(WireEvent::ToolStarted {
             name: "bash".into(),
             description: "ls /tmp".into(),
             tool_use_id: "tu_coexist".into(),
@@ -1008,23 +1750,24 @@ mod task_board_draw_tests {
         use crate::tui::chat_widget::WireEvent;
 
         let mut widget = chat_widget::ChatWidget::new(String::new());
-        widget.handle_event(chat_widget::AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "Get agent result: reviewer@abc".into(),
-            status: "completed".into(),
-            duration_ms: 50,
-            output_summary: None,
-            output: Some(
-                serde_json::json!({
-                    "agent_id": "reviewer@abc",
-                    "status": "completed",
-                    "result": "done"
-                })
-                .to_string(),
-            ),
-            tool_use_id: "tu_get_result".into(),
-            parent_tool_use_id: None,
-        }));
+        widget.handle_event(chat_widget::AppEvent::wire(
+            WireEvent::AgentControlCompleted {
+                action: "get_result".into(),
+                label: "reviewer".into(),
+                status: "completed".into(),
+                duration_ms: 50,
+                output: Some(
+                    serde_json::json!({
+                        "agent_id": "reviewer@abc",
+                        "status": "completed",
+                        "result": "done"
+                    })
+                    .to_string(),
+                ),
+                tool_use_id: "tu_get_result".into(),
+                agent_id: Some("reviewer@abc".into()),
+            },
+        ));
 
         let frame = active_viewport(
             &widget,
@@ -1044,15 +1787,16 @@ mod task_board_draw_tests {
 
     #[test]
     fn cancelled_only_agent_strip_dismisses_after_linger_but_drilldown_remains() {
-        use crate::tui::bottom_pane::in_flight_agents_view::AgentRowStatus;
+        use crate::tui::agent_run_projection::AgentRunStatus;
         use crate::tui::chat_widget::WireEvent;
         use astra_turn_core::agent_live_event::{
             AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
         };
 
         let mut widget = chat_widget::ChatWidget::new(String::new());
-        widget.handle_event(chat_widget::AppEvent::Wire(WireEvent::AgentLive(
+        widget.handle_event(chat_widget::AppEvent::wire(WireEvent::AgentLive(
             AgentLiveEvent {
+                run_id: "test-run".into(),
                 agent_id: "reviewer@cancelled".into(),
                 kind: AgentLiveEventKind::AgentTerminated {
                     termination: AgentLiveTermination::Cancelled,
@@ -1080,47 +1824,62 @@ mod task_board_draw_tests {
             frame.multi_agent.is_none(),
             "cancelled-only agent strip must dismiss after the same short linger as completed-only"
         );
-        let rows = widget.agents_drilldown_rows(5);
+        let rows = widget.agent_monitor_snapshot(5);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, AgentRowStatus::Cancelled);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Cancelled);
     }
 }
 
 #[cfg(test)]
 mod multi_agent_strip_tests {
-    //! Pin the compact per-agent row format (reference-agent/Kiro-style).
-    //!
-    //! Each row fits in one line and surfaces label, step count, and
+    //! Each row fits in one line and surfaces label, typed activity, and
     //! elapsed time, plus a status icon that distinguishes live
     //! agents from completed ones.
     use super::{
-        MultiAgentEntry, format_short_elapsed, multi_agent_strip_header,
-        should_show_multi_agent_strip, truncate_label,
+        LiveFramedCell, MultiAgentEntry, compact_agent_activity, format_short_elapsed,
+        multi_agent_strip_header, render_primary_workspace, should_show_multi_agent_strip,
+        truncate_label, workspace_agent_activity_line,
     };
+    use crate::tui::agent_run_projection::{AgentRunState, AgentRunStatus};
 
     fn entry(live: bool, failed: bool) -> MultiAgentEntry {
+        let status = if live {
+            AgentRunStatus::Running
+        } else if failed {
+            AgentRunStatus::Failed
+        } else {
+            AgentRunStatus::Completed
+        };
         MultiAgentEntry {
             agent_id: "a".into(),
             label: "agent".into(),
-            child_count: 0,
+            activity: crate::tui::agent_run_projection::AgentActivityCounts::default(),
             elapsed_ms: 0,
-            live,
-            failed,
-            interrupted: false,
-            cancelled: false,
-            cancelling: false,
+            state: AgentRunState::observed(status),
         }
     }
 
     fn cancelling_entry() -> MultiAgentEntry {
         let mut e = entry(false, false);
-        e.cancelling = true;
+        e.state = AgentRunState::local_intent(AgentRunStatus::Cancelling);
         e
     }
 
     fn cancelled_entry() -> MultiAgentEntry {
         let mut e = entry(false, false);
-        e.cancelled = true;
+        e.state = AgentRunState::observed(AgentRunStatus::Cancelled);
+        e
+    }
+
+    fn paused_entry() -> MultiAgentEntry {
+        let mut e = entry(true, false);
+        e.state = AgentRunState::confirmed_server(AgentRunStatus::Paused);
+        e
+    }
+
+    fn unconfirmed_entry() -> MultiAgentEntry {
+        let mut e = entry(true, false);
+        e.state = AgentRunState::unconfirmed(AgentRunStatus::Running);
         e
     }
 
@@ -1132,8 +1891,8 @@ mod multi_agent_strip_tests {
         assert!(header.contains("2 live"));
         assert!(!header.contains("failed"));
         assert!(!header.contains("done"));
-        assert!(header.contains("Ctrl+G drill"));
-        assert!(header.contains("x kill"));
+        assert!(header.contains("Ctrl+G manage"));
+        assert!(!header.contains("X stop"));
     }
 
     #[test]
@@ -1190,6 +1949,16 @@ mod multi_agent_strip_tests {
     }
 
     #[test]
+    fn header_distinguishes_paused_from_waiting() {
+        let mut waiting = entry(true, false);
+        waiting.state = AgentRunState::confirmed_server(AgentRunStatus::Waiting);
+        let header = multi_agent_strip_header(&[waiting, paused_entry()]);
+
+        assert!(header.contains("1 waiting"), "{header}");
+        assert!(header.contains("1 paused"), "{header}");
+    }
+
+    #[test]
     fn cancelled_only_strip_lingers_then_dismisses() {
         let cells = vec![cancelled_entry(), cancelled_entry()];
         assert!(
@@ -1209,16 +1978,210 @@ mod multi_agent_strip_tests {
     }
 
     #[test]
-    fn header_advertises_kill_affordance() {
-        // The new `x` shortcut on the drill view is hidden inside a
-        // sub-panel; the header is the only place the user sees the
-        // outer flow, so the hint MUST mention it.
+    fn unconfirmed_rows_are_explicit_and_keep_strip_visible() {
+        let cells = vec![unconfirmed_entry()];
+        let header = multi_agent_strip_header(&cells);
+        assert!(header.contains("1 unconfirmed"), "{header}");
+        assert!(!header.contains("1 live"), "{header}");
+        assert!(should_show_multi_agent_strip(&cells, false));
+    }
+
+    #[test]
+    fn header_routes_management_through_the_workbench() {
         let cells = vec![entry(true, false)];
         let header = multi_agent_strip_header(&cells);
-        assert!(
-            header.contains("x kill"),
-            "header must advertise the kill key: {header}"
+        assert!(header.contains("Ctrl+G manage"), "{header}");
+        assert!(!header.contains("X stop"), "{header}");
+    }
+
+    #[test]
+    fn workspace_activity_retains_live_agent_status_and_management_route() {
+        let line = workspace_agent_activity_line(&[entry(true, false)], 100);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(text.contains("1 parallel agent"), "{text}");
+        assert!(text.contains("1 live"), "{text}");
+        assert!(text.contains("Ctrl+G manage"), "{text}");
+    }
+
+    #[test]
+    fn primary_transcript_workspace_renders_live_agent_activity_above_the_conversation() {
+        use crate::tui::bottom_pane::BottomPane;
+        use crate::tui::bottom_pane::transcript_view::{TranscriptSnapshot, TranscriptView};
+        use crate::tui::testing::render::buffer_to_string;
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut pane = BottomPane::new();
+        pane.push_view(Box::new(
+            TranscriptView::from_snapshot(TranscriptSnapshot::default(), 20, 80)
+                .with_title("Main conversation · Transcript"),
+        ));
+        let activity = workspace_agent_activity_line(&[entry(true, false)], 80);
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buffer = Buffer::empty(area);
+
+        render_primary_workspace(area, &mut buffer, &mut pane, Some(&activity));
+        let text = buffer_to_string(&buffer);
+
+        assert!(text.contains("1 parallel agent"), "{text}");
+        assert!(text.contains("Ctrl+G manage"), "{text}");
+        assert!(text.contains("Main conversation · Transcript"), "{text}");
+    }
+
+    #[test]
+    fn primary_workspace_makes_retained_agent_transcripts_visible_as_tabs() {
+        use crate::tui::agent_run_projection::AgentTranscriptTarget;
+        use crate::tui::bottom_pane::BottomPane;
+        use crate::tui::bottom_pane::agent_transcript_view::AgentTranscriptView;
+        use crate::tui::bottom_pane::transcript_view::{TranscriptSnapshot, TranscriptView};
+        use crate::tui::testing::render::buffer_to_string;
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut pane = BottomPane::new();
+        pane.push_view(Box::new(TranscriptView::from_snapshot(
+            TranscriptSnapshot::default(),
+            20,
+            100,
+        )));
+        pane.push_view(Box::new(AgentTranscriptView::live_unbound(
+            "agent-reviewer".into(),
+            "Reviewer".into(),
+            "run-reviewer".into(),
+            Some(AgentTranscriptTarget::LocalJournal),
+            "agents",
+            100,
+            20,
+        )));
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buffer = Buffer::empty(area);
+
+        render_primary_workspace(area, &mut buffer, &mut pane, None);
+        let text = buffer_to_string(&buffer);
+
+        assert!(text.contains("Main conversation"), "{text}");
+        assert!(text.contains("Reviewer"), "{text}");
+        assert!(text.contains("Shift+←/→ switch"), "{text}");
+    }
+
+    #[test]
+    fn context_inspector_uses_the_full_primary_workspace() {
+        use crate::tui::bottom_pane::BottomPane;
+        use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
+        use crate::tui::context_panel::ContextBreakdown;
+        use crate::tui::testing::render::buffer_to_string;
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut pane = BottomPane::new();
+        pane.push_view(Box::new(ContextPanelView::new(ContextBreakdown::empty())));
+        assert!(pane.primary_workspace_is_open());
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buffer = Buffer::empty(area);
+        render_primary_workspace(area, &mut buffer, &mut pane, None);
+        let text = buffer_to_string(&buffer);
+
+        assert!(text.contains("Context"), "{text}");
+        assert!(text.contains("Tab focus"), "{text}");
+    }
+
+    #[test]
+    fn evidence_report_uses_the_full_primary_workspace_only_when_requested() {
+        use crate::tui::bottom_pane::BottomPane;
+        use crate::tui::bottom_pane::info_view::InfoView;
+        use crate::tui::testing::render::buffer_to_string;
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let mut pane = BottomPane::new();
+        let evidence = (0..20)
+            .map(|index| format!("State evidence {index}"))
+            .collect();
+        pane.push_view(Box::new(
+            InfoView::from_plain("Runtime Inspector", evidence).with_primary_workspace(),
+        ));
+        assert!(pane.primary_workspace_is_open());
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buffer = Buffer::empty(area);
+        render_primary_workspace(area, &mut buffer, &mut pane, None);
+        let text = buffer_to_string(&buffer);
+
+        assert!(text.contains("Runtime Inspector"), "{text}");
+        assert!(text.contains("State evidence 19"), "{text}");
+    }
+
+    #[test]
+    fn activity_gutter_uses_semantic_live_and_settled_colors() {
+        use crate::tui::render::renderable::Renderable;
+        use ratatui::{buffer::Buffer, layout::Rect, text::Line};
+
+        let area = Rect::new(0, 0, 20, 2);
+        let mut live_buffer = Buffer::empty(area);
+        LiveFramedCell {
+            lines: vec![Line::from("working")],
+            live: true,
+        }
+        .render(area, &mut live_buffer);
+        assert_eq!(live_buffer[(0, 0)].fg, crate::tui::theme::current().gutter);
+
+        let mut settled_buffer = Buffer::empty(area);
+        LiveFramedCell {
+            lines: vec![Line::from("done")],
+            live: false,
+        }
+        .render(area, &mut settled_buffer);
+        assert_eq!(
+            settled_buffer[(0, 0)].fg,
+            crate::tui::theme::current().gutter_frozen
         );
+    }
+
+    #[test]
+    fn active_edit_diff_paints_the_entire_available_row_surface() {
+        use crate::tui::history_cell::{
+            HistoryCell,
+            tool::{ToolCell, ToolStatus},
+        };
+        use crate::tui::render::renderable::Renderable;
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let area = Rect::new(0, 0, 82, 8);
+        let mut edit = ToolCell::new_running("str_replace", "src/main.rs");
+        edit.status = ToolStatus::Success;
+        edit.duration_ms = Some(12);
+        edit.output_summary = Some("@@ -1 +1 @@\n-fn old_name() {}\n+fn new_name() {}".to_string());
+
+        let lines = edit.display_lines(area.width.saturating_sub(2));
+        let mut buffer = Buffer::empty(area);
+        LiveFramedCell { lines, live: false }.render(area, &mut buffer);
+
+        let find_row = |needle: &str| {
+            (0..area.height)
+                .find(|&y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .expect("diff row must be rendered")
+        };
+        let theme = crate::tui::theme::current();
+        for (needle, expected_background) in [
+            ("old_name", theme.diff_del_bg),
+            ("new_name", theme.diff_add_bg),
+        ] {
+            let row = find_row(needle);
+            for x in area.x + 2..area.right() {
+                assert_eq!(
+                    buffer[(x, row)].bg,
+                    expected_background,
+                    "{needle} must retain its diff surface through the right edge at x={x}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1230,8 +2193,7 @@ mod multi_agent_strip_tests {
 
     #[test]
     fn elapsed_seconds_render_compact_no_decimals() {
-        // Matches Kiro's "0m 10s" inspiration but compacts to "10s"
-        // for sub-minute durations — the strip row has limited width.
+        // Sub-minute durations stay compact because the strip row has limited width.
         assert_eq!(format_short_elapsed(1_000), "1s");
         assert_eq!(format_short_elapsed(12_500), "12s");
         assert_eq!(format_short_elapsed(59_999), "59s");
@@ -1243,6 +2205,30 @@ mod multi_agent_strip_tests {
         assert_eq!(format_short_elapsed(90_000), "1m30s");
         assert_eq!(format_short_elapsed(120_000), "2m");
         assert_eq!(format_short_elapsed(125_000), "2m5s");
+    }
+
+    #[test]
+    fn activity_copy_distinguishes_tools_children_and_partial_counts() {
+        assert_eq!(
+            compact_agent_activity(crate::tui::agent_run_projection::AgentActivityCounts {
+                tool_calls: 3,
+                child_agents: 1,
+                messages_sent: 2,
+                messages_received: 1,
+                child_agents_partial: false,
+            }),
+            "3 tools · 1 child · ↑2 ↓1"
+        );
+        assert_eq!(
+            compact_agent_activity(crate::tui::agent_run_projection::AgentActivityCounts {
+                tool_calls: 0,
+                child_agents: 4,
+                messages_sent: 0,
+                messages_received: 0,
+                child_agents_partial: true,
+            }),
+            "≥4 children"
+        );
     }
 
     /// Labels MUST be char-aware so a CJK label survives truncation
@@ -1274,38 +2260,5 @@ mod multi_agent_strip_tests {
     #[test]
     fn truncate_label_zero_budget_returns_empty() {
         assert_eq!(truncate_label("anything", 0), "");
-    }
-
-    /// REGRESSION (session 8ca96f0f): when N parallel agents share
-    /// the strip, the panel had ONE header + N stacked frames each
-    /// holding the full TaskCell display_lines. With description-only
-    /// rendering, all rows looked alike. The new shape is a single
-    /// frame containing the header + one short row per agent. Pin the
-    /// per-row data shape — the renderer assembles those rows into
-    /// `█ ◦ name · 2 steps · 12s` lines.
-    #[test]
-    fn multi_agent_entry_shape_carries_the_compact_row_data() {
-        // This test pins the public field set on `MultiAgentEntry`
-        // — if anyone resurrects the old `lines: Vec<Line>` shape
-        // (which embedded each agent's full TaskCell) this build
-        // breaks at the constructor below.
-        let entry = super::MultiAgentEntry {
-            agent_id: "agent-A".into(),
-            label: "review_tui".into(),
-            child_count: 4,
-            elapsed_ms: 12_000,
-            live: true,
-            failed: false,
-            interrupted: false,
-            cancelled: false,
-            cancelling: false,
-        };
-        assert_eq!(entry.label, "review_tui");
-        assert_eq!(entry.child_count, 4);
-        assert_eq!(format_short_elapsed(entry.elapsed_ms), "12s");
-        assert!(entry.live);
-        assert!(!entry.failed);
-        assert!(!entry.cancelled);
-        assert!(!entry.cancelling);
     }
 }

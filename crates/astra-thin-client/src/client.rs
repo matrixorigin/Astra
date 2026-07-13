@@ -20,8 +20,9 @@ use crate::error::ThinClientError;
 use crate::paths;
 use crate::protocol::{
     ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest, EdgeRegisterRequest,
-    RunInputRequest, RunInputResponse, SessionCreateRequest, SessionUpdateRequest, StreamEvent,
-    TaskLeaseMutationRequest, ToolResultRequest,
+    RunUserIntentRequest, RunUserIntentResponse, SessionCreateRequest, SessionTranscriptPage,
+    SessionTranscriptReadScope, SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest,
+    ToolResultRequest, UserPromptRespondRequest,
 };
 use crate::sse::SseParser;
 
@@ -1101,6 +1102,57 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
+    /// `GET /sessions/{session_id}/runs` — bounded durable run-tree snapshot.
+    pub async fn get_session_run_tree(
+        &self,
+        bearer_override: Option<&str>,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<astra_server_types::SessionRunTreeSnapshot, ThinClientError> {
+        let url = self.url(&paths::session_runs(session_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .query(&[("limit", limit)])
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
+    /// Durable transcript projection with an explicit server-owned scope.
+    pub async fn get_session_transcript(
+        &self,
+        bearer_override: Option<&str>,
+        session_id: &str,
+        scope: SessionTranscriptReadScope<'_>,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<SessionTranscriptPage, ThinClientError> {
+        let url = self.url(&paths::session_transcript(session_id))?;
+        let mut query = vec![("limit", limit.to_string())];
+        match scope {
+            SessionTranscriptReadScope::Session => {}
+            SessionTranscriptReadScope::RootConversation => {
+                query.push(("scope", "root_conversation".to_string()));
+            }
+            SessionTranscriptReadScope::Run(run_id) => {
+                query.push(("run_id", run_id.to_string()));
+            }
+        }
+        if let Some(before_seq) = before_seq {
+            query.push(("before_seq", before_seq.to_string()));
+        }
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .query(&query)
+            .send()
+            .await?;
+        Self::typed_json_or_error(resp).await
+    }
+
     pub async fn update_session(
         &self,
         bearer_override: Option<&str>,
@@ -1149,14 +1201,14 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
-    /// `POST /chat/runs/{run_id}/input` — queue deferred user input for the active durable run.
-    pub async fn submit_run_input(
+    /// `POST /chat/runs/{run_id}/intents` — guide the active durable run.
+    pub async fn submit_run_user_intent(
         &self,
         bearer_override: Option<&str>,
         run_id: &str,
-        body: &RunInputRequest,
-    ) -> Result<RunInputResponse, ThinClientError> {
-        let url = self.url(&paths::chat_run_input(run_id))?;
+        body: &RunUserIntentRequest,
+    ) -> Result<RunUserIntentResponse, ThinClientError> {
+        let url = self.url(&paths::chat_run_user_intents(run_id))?;
         let resp = self
             .http
             .post(url)
@@ -1485,6 +1537,23 @@ impl ThinClient {
         body: &ApprovalRespondRequest,
     ) -> Result<Value, ThinClientError> {
         let url = self.url(paths::APPROVAL_RESPOND)?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// Submit a response to a durable `ask_user` interaction.
+    pub async fn post_user_prompt_response(
+        &self,
+        bearer_override: Option<&str>,
+        body: &UserPromptRespondRequest,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::USER_PROMPT_RESPOND)?;
         let resp = self
             .http
             .post(url)
@@ -1964,20 +2033,195 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wiremock_submit_run_input() {
+    async fn wiremock_get_session_run_tree_decodes_typed_snapshot() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/s-1/runs"))
+            .and(query_param("limit", "50"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 2,
+                "session_id": "s-1",
+                "snapshot_revision": "sha256:abc",
+                "observed_at": "2026-07-11T00:00:00Z",
+                "node_limit": 50,
+                "truncated": false,
+                "runs": [{
+                    "run_id": "child-1",
+                    "parent_run_id": "root-1",
+                    "root_run_id": "root-1",
+                    "depth": 1,
+                    "agent_id": "reviewer",
+                    "agent_name": "Reviewer",
+                    "status": "waiting",
+                    "waiting_for": "tool_result",
+                    "run_event_high_watermark": 3,
+                    "total_tool_calls": 1,
+                    "runtime": {
+                        "runtime_profile": "edge",
+                        "model_name": "gpt-5",
+                        "model_gateway": "primary",
+                        "agent_binding_id": "reviewer-v2",
+                        "capability_server_refs": {
+                            "mcp": "mcp-edge",
+                            "skills": "skills-edge"
+                        }
+                    },
+                    "available_actions": ["cancel"],
+                    "created_at": "2026-07-11T00:00:00Z",
+                    "updated_at": "2026-07-11T00:00:01Z"
+                }]
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let snapshot = client
+            .get_session_run_tree(Some("tok"), "s-1", 50)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.session_id, "s-1");
+        assert_eq!(
+            snapshot.runs[0].status,
+            astra_server_types::SessionRunLifecycleStatus::Waiting
+        );
+        assert_eq!(
+            snapshot.runs[0].available_actions,
+            vec![astra_server_types::SessionRunAction::Cancel]
+        );
+        let runtime = &snapshot.runs[0].runtime;
+        assert_eq!(runtime.runtime_profile.as_deref(), Some("edge"));
+        assert_eq!(runtime.model_name.as_deref(), Some("gpt-5"));
+        assert_eq!(runtime.agent_binding_id.as_deref(), Some("reviewer-v2"));
+        assert_eq!(
+            runtime.capability_server_refs.as_ref().unwrap().mcp,
+            "mcp-edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn wiremock_session_transcript_preserves_run_filter_and_identity() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/s-1/transcript"))
+            .and(header("authorization", "Bearer tok"))
+            .and(query_param("run_id", "child-run-1"))
+            .and(query_param("before_seq", "42"))
+            .and(query_param("limit", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "s-1",
+                "items": [{
+                    "session_id": "s-1",
+                    "item_seq": 41,
+                    "run_id": "child-run-1",
+                    "role": "assistant",
+                    "content": "Found the race.",
+                    "reasoning": "Inspecting the state transition",
+                    "reasoning_status": "done",
+                    "created_at": "2026-07-11T00:00:00"
+                }],
+                "page_refs": [],
+                "next_before_seq": 41,
+                "has_more": false
+            })))
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let page = client
+            .get_session_transcript(
+                Some("tok"),
+                "s-1",
+                SessionTranscriptReadScope::Run("child-run-1"),
+                Some(42),
+                200,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].run_id.as_deref(), Some("child-run-1"));
+        assert_eq!(page.items[0].reasoning_status.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn wiremock_root_transcript_uses_typed_root_scope_without_run_filter() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/s-1/transcript"))
+            .and(header("authorization", "Bearer tok"))
+            .and(query_param("scope", "root_conversation"))
+            .and(query_param("before_seq", "42"))
+            .and(query_param("limit", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "s-1",
+                "items": [{
+                    "session_id": "s-1",
+                    "item_seq": 41,
+                    "run_id": "root-run-1",
+                    "role": "assistant",
+                    "content": "Root answer only.",
+                    "created_at": "2026-07-11T00:00:00"
+                }],
+                "page_refs": [],
+                "next_before_seq": 41,
+                "has_more": false
+            })))
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let page = client
+            .get_session_transcript(
+                Some("tok"),
+                "s-1",
+                SessionTranscriptReadScope::RootConversation,
+                Some(42),
+                200,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].run_id.as_deref(), Some("root-run-1"));
+    }
+
+    #[tokio::test]
+    async fn wiremock_cancel_run_uses_durable_run_endpoint() {
+        let srv = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/chat/runs/run-1"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id": "run-1",
+                "status": "cancelled"
+            })))
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let response = client.cancel_run(Some("tok"), "run-1").await.unwrap();
+        assert_eq!(response["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn wiremock_submit_run_user_intent() {
         let srv = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/runs/run-1/input"))
+            .and(path("/chat/runs/run-1/intents"))
             .and(header("authorization", "Bearer tok"))
             .and(body_json(serde_json::json!({
-                "idempotency_key": "ik-1",
+                "intent_id": "intent-1",
+                "delivery": "guide_current_run",
                 "input": {
                     "content": "stop after next tool call"
                 }
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "run_id": "run-1",
-                "accepted": true,
+                "intent_id": "intent-1",
+                "status": "accepted_remote",
                 "duplicate": false
             })))
             .mount(&srv)
@@ -1985,11 +2229,12 @@ mod tests {
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let response = client
-            .submit_run_input(
+            .submit_run_user_intent(
                 Some("tok"),
                 "run-1",
-                &RunInputRequest {
-                    idempotency_key: "ik-1".into(),
+                &RunUserIntentRequest {
+                    intent_id: "intent-1".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
                     input: serde_json::json!({
                         "content": "stop after next tool call"
                     }),
@@ -1998,7 +2243,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.run_id, "run-1");
-        assert!(response.accepted);
+        assert_eq!(response.intent_id, "intent-1");
+        assert_eq!(
+            response.status,
+            astra_turn_types::UserIntentStatus::AcceptedRemote
+        );
         assert!(!response.duplicate);
     }
 
@@ -2011,7 +2260,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "run_id": "run-1",
                 "status": "paused",
-                "previous_status": "running"
+                "previous_status": "running",
+                "disposition": "applied"
             })))
             .mount(&srv)
             .await;
@@ -2020,6 +2270,27 @@ mod tests {
         let v = client.pause_run(Some("tok"), "run-1").await.unwrap();
         assert_eq!(v["status"], "paused");
         assert_eq!(v["previous_status"], "running");
+    }
+
+    #[tokio::test]
+    async fn wiremock_resume_run() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/run-1/resume"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id": "run-1",
+                "status": "running",
+                "previous_status": "paused",
+                "disposition": "applied"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let value = client.resume_run(Some("tok"), "run-1").await.unwrap();
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["previous_status"], "paused");
     }
 
     #[tokio::test]

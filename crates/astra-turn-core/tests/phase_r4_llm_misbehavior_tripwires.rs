@@ -82,12 +82,11 @@ fn hallucinated_xml_artifact_tool_name_no_panic() {
 
 // ─── Malformed tool arguments ────────────────────────────────────────────
 
-/// Contract: a `tool_call_start` with a syntactically invalid JSON
-/// string in `arguments` is still accepted (the repair path in
-/// `tool_args_repair` runs later). Assert no panic and the tool_call
-/// is captured for the repair stage.
+/// Contract: a `tool_call_start` with syntactically invalid arguments remains
+/// observable. It must never make the stream accumulator panic or silently
+/// manufacture executable arguments.
 #[test]
-fn tool_call_with_malformed_args_json_is_captured_for_repair() {
+fn tool_call_with_malformed_args_json_remains_observable() {
     let ev = json!({
         "type": "tool_call_start",
         "call_id": "call-repair",

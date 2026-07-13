@@ -16,6 +16,11 @@ pub mod paths;
 pub mod protocol;
 pub mod sse;
 
+pub use astra_server_types::{
+    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunCapabilityServerRefs,
+    SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
+    SessionRunTreeSnapshot,
+};
 pub use client::ThinClient;
 pub use edge::{
     ASTRA_EDGE_ID_HEADER, advertise_executor, builtin_capability_preset,
@@ -24,9 +29,11 @@ pub use edge::{
 pub use error::ThinClientError;
 pub use protocol::{
     ApprovalDecision, ApprovalKind, ApprovalRespondRequest, ChatStreamRequest,
-    EdgeHeartbeatRequest, EdgeRegisterRequest, RunInputRequest, RunInputResponse,
-    SessionCreateRequest, SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest,
-    ToolResultRequest, ToolResultRequestParts, classify_stream_event,
+    EdgeHeartbeatRequest, EdgeRegisterRequest, RunUserIntentRequest, RunUserIntentResponse,
+    SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage, SessionTranscriptPageRef,
+    SessionTranscriptReadScope, SessionTranscriptToolCall, SessionTranscriptToolResult,
+    SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest, ToolResultRequest,
+    ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,
 };
 /// SSE / buffered HTTP response from [`ThinClient::post_chat_turn`] (transport type for consumers like CLI stream rendering).
 pub use reqwest::Response as HttpResponse;

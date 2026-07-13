@@ -39,6 +39,7 @@ fn sample_trace(turn: &str, total_used: u32, history: u32, pressure: f64) -> Con
                 role: "user".to_string(),
                 tokens: history / 2,
                 has_tool_calls: false,
+                content_preview: String::new(),
             }],
             turns_compressed: vec![TurnCompression {
                 turn_index: 0,
@@ -49,6 +50,7 @@ fn sample_trace(turn: &str, total_used: u32, history: u32, pressure: f64) -> Con
                 information_lost: vec!["verbose output".to_string()],
             }],
             turns_dropped: vec![],
+            compression_stages: vec![],
             compression_ratio: 0.6,
             tokens_before: 800,
             tokens_after: history,
@@ -92,6 +94,7 @@ fn sample_trace(turn: &str, total_used: u32, history: u32, pressure: f64) -> Con
             tool_schema_tokens: 100,
             user_message_tokens: 200,
             total_used,
+            usage_source: Default::default(),
             budget_pressure: pressure,
             compression_triggered: pressure > 0.8,
         },

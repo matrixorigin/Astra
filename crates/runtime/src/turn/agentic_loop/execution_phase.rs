@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, DeferredInputState, HostTurnResult,
-    TaskBoardSnapshot, finalize_and_render, finalize_turn_trace, try_write_heavy_checkpoint,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, HostTurnResult, TaskBoardSnapshot,
+    UserIntentState, finalize_and_render, finalize_turn_trace, try_write_heavy_checkpoint,
 };
 use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
@@ -20,7 +20,6 @@ use astra_turn_core::agentic_turn_ingest::{
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interaction_types::TurnInteractionMode;
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
-use astra_turn_core::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON;
 use astra_turn_core::stall::IntentDrift;
 use uuid::Uuid;
 
@@ -28,7 +27,7 @@ use crate::turn::observation_dispatcher::{
     FileSink, MemorySink, ObservationDispatcher, ObservationEvent,
 };
 
-const DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const USER_INTENT_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Lazily-initialized process-wide alert dispatcher.
 ///
@@ -119,50 +118,12 @@ fn record_direct_llm_error_state(
     }
 }
 
-pub(crate) fn deferred_user_input_text(input: &serde_json::Value) -> Option<String> {
-    fn trimmed_text(value: Option<&serde_json::Value>) -> Option<String> {
-        value
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(ToString::to_string)
-    }
-
-    fn active_skills_text(input: &serde_json::Value) -> Option<String> {
-        let skills = input
-            .get("active_skills")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|skill| !skill.is_empty())
-            .collect::<Vec<_>>();
-        (!skills.is_empty()).then(|| format!("Requested active skills: {}.", skills.join(", ")))
-    }
-
-    if let Some(text) = trimmed_text(Some(input)) {
-        return Some(text);
-    }
-
-    let content = trimmed_text(input.get("content"));
-    let text = trimmed_text(input.get("text"));
-    let active_skills = active_skills_text(input);
-
-    match (content.or(text), active_skills) {
-        (Some(content), Some(active_skills)) => Some(format!("{active_skills}\n{content}")),
-        (Some(content), None) => Some(content),
-        (None, Some(active_skills)) => Some(active_skills),
-        (None, None) => None,
-    }
-}
-
-pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
+pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<(), astra_core::ClassifiedError> {
     let poll_started = tokio::time::Instant::now();
-    if !state.deferred_input.should_poll_user_inputs(poll_started) {
+    if !state.user_intents.should_poll_user_intents(poll_started) {
         return Ok(());
     }
 
@@ -177,81 +138,113 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
         _ => return Ok(()),
     };
     let poll = run_control
-        .poll_user_inputs(
-            &user_id,
-            &run_id,
-            state.deferred_input.deferred_user_input_cursor(),
-        )
+        .poll_user_intents(&user_id, &run_id, state.user_intents.user_intent_cursor())
         .await;
     if let Some(error) = &poll.error {
         state
-            .deferred_input
-            .note_user_input_poll_finished(poll_started, DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL);
-        tracing::warn!(run_id, error = %error, "deferred user input poll failed");
+            .user_intents
+            .note_user_intent_poll_finished(poll_started, USER_INTENT_EMPTY_POLL_INTERVAL);
+        state.user_intents.defer_pending_apply_ack(poll_started);
+        tracing::warn!(run_id, error = %error, "user intent poll failed");
         return Ok(());
     }
     let observed = state
-        .deferred_input
-        .observe_polled_user_inputs(poll, deferred_user_input_text);
-    let release_event_indices = state
-        .deferred_input
-        .release_event_indices_to_ack(&observed.released_event_indices);
+        .user_intents
+        .observe_polled_user_intents(poll, crate::turn::run_control::user_intent_content);
+    for issue in &observed.issues {
+        tracing::error!(
+            run_id,
+            event_index = issue.event_index,
+            intent_id = issue.intent_id.as_deref().unwrap_or(""),
+            kind = ?issue.kind,
+            "invalid durable user intent was isolated"
+        );
+    }
+    let has_new_apply_events = !observed.accepted.is_empty();
+    for event in &observed.accepted {
+        host.apply_user_intent_context(event);
+    }
     state
-        .deferred_input
-        .note_user_input_poll_finished(poll_started, DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL);
-    if observed.raw_inputs.is_empty() && release_event_indices.is_empty() {
+        .user_intents
+        .stage_pending_apply_events(&observed.accepted);
+    let release_event_indices = state.user_intents.pending_apply_event_indices();
+    state
+        .user_intents
+        .note_user_intent_poll_finished(poll_started, USER_INTENT_EMPTY_POLL_INTERVAL);
+    // The cursor covers every inspected durable event, including isolated
+    // malformed records. Advancing it before the empty fast-path prevents a
+    // poison event from blocking all later intents forever.
+    state
+        .user_intents
+        .commit_observed_cursor(observed.next_cursor);
+    if observed.accepted.is_empty() && release_event_indices.is_empty() {
         return Ok(());
     }
 
-    for input in &observed.raw_inputs {
-        host.on_deferred_user_input(input);
-    }
-
-    if !observed.contents.is_empty() {
+    if !observed.applied.is_empty() {
         let combined = observed
-            .contents
+            .applied
             .iter()
             .map(|input| input.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
         if !combined.is_empty() {
-            state.messages.push(serde_json::json!({
+            state.push_prompt_history_message(serde_json::json!({
                 "role": "user",
                 "content": combined.clone(),
             }));
             state.message = observed
-                .contents
+                .applied
                 .last()
                 .map(|input| input.content.clone())
                 .unwrap_or_default();
             state
-                .deferred_input
-                .record_delivered_user_inputs(&observed.contents);
+                .user_intents
+                .record_applied_user_intents(&observed.applied);
         }
     }
 
-    state
-        .deferred_input
-        .commit_observed_cursor(observed.next_cursor);
     if release_event_indices.is_empty() {
         return Ok(());
     }
+    if !has_new_apply_events
+        && !state
+            .user_intents
+            .should_retry_apply_ack(tokio::time::Instant::now())
+    {
+        return Ok(());
+    }
     match run_control
-        .mark_user_inputs_released(&user_id, &run_id, &release_event_indices)
+        .mark_user_intents_applied(&user_id, &run_id, &release_event_indices)
         .await
     {
-        Ok(()) => state
-            .deferred_input
-            .note_release_ack_result(&release_event_indices, true),
+        Ok(crate::turn::run_control::UserIntentApplyAck::Applied) => {
+            let acknowledged = state
+                .user_intents
+                .acknowledge_apply_events(&release_event_indices);
+            for event in &acknowledged {
+                host.on_user_intent_applied(event);
+            }
+        }
+        Ok(crate::turn::run_control::UserIntentApplyAck::RunTerminal) => {
+            state
+                .user_intents
+                .discard_pending_apply_events(&release_event_indices);
+            tracing::debug!(
+                run_id = %run_id,
+                ?release_event_indices,
+                "terminal run won user intent application race"
+            );
+        }
         Err(error) => {
             state
-                .deferred_input
-                .note_release_ack_result(&release_event_indices, false);
+                .user_intents
+                .note_apply_ack_failure(tokio::time::Instant::now());
             tracing::warn!(
                 run_id = %run_id,
                 ?release_event_indices,
                 error = %error,
-                "failed to durably acknowledge deferred user input release"
+                "failed to durably acknowledge user intent application"
             );
         }
     }
@@ -593,7 +586,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         emitter.llm_call_started(turn_index as u32);
     }
 
-    inject_polled_deferred_user_inputs(host, state).await?;
+    inject_polled_user_intents(host, state).await?;
 
     // ── Nudge suppression gate ──────────────────────────────────────────
     // In PermissionMode::Auto the user has explicitly asked to let the
@@ -1238,6 +1231,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     let edge_len = turn_result.edge_tool_round.len();
+    let transcript_append_start = state.messages.len();
     let ingest_outcome = ingest_agentic_turn_stream(
         &snap,
         edge_len,
@@ -1265,6 +1259,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
         },
     );
+    let transcript_appended = state.messages[transcript_append_start..].to_vec();
+    state.record_prompt_history_messages(transcript_appended);
     if let Some(session_id) = state.current_session_id.as_deref()
         && let Some(buffer) = state.turn_event_buffer.as_mut()
         && let Err(error) = buffer.bind_session_id(session_id)
@@ -1275,8 +1271,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             "could not bind streamed session identity to first-round observability events"
         );
     }
-
-    let response_guard_blocked = record_response_guard_blocked_interruption_if_needed(state);
 
     // PR 5a: post-sampling hook. Fires exactly once after a
     // successful turn has been received AND cleanly ingested
@@ -1290,7 +1284,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // at the variant via `matches!` so the original `ingest_outcome`
     // can still move by-value into the control-flow mapper below.
     let ingest_is_fatal = matches!(ingest_outcome, AgenticTurnIngestOutcome::Fatal(_));
-    if !ingest_is_fatal && !response_guard_blocked {
+    if !ingest_is_fatal {
         let turn = session_turn_number(state);
         let session_id = state.current_session_id.clone();
         let model_id = state.current_model_identity().map(str::to_string);
@@ -1677,23 +1671,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             turn_result,
         },
     )))
-}
-
-fn record_response_guard_blocked_interruption_if_needed(state: &mut AgenticLoopState) -> bool {
-    let response_guard_blocked =
-        state.last_finish_reason.as_deref() == Some(RESPONSE_GUARD_BLOCKED_FINISH_REASON);
-    if response_guard_blocked && state.interruption.is_none() {
-        let summary = interruption_state_summary(
-            state,
-            Some("response guard blocked the model's final output".to_string()),
-        );
-        state.interruption = Some(InterruptionRecord::new(
-            InterruptionKind::ResponseGuardBlocked,
-            ResumeAction::ContinueImmediately,
-            summary,
-        ));
-    }
-    response_guard_blocked
 }
 
 /// Mid-loop escalation: kicks in while the model is still calling tools but
@@ -2528,10 +2505,10 @@ mod tests {
     use crate::observability::ObservabilityHub;
     use crate::turn::agentic_loop::host::tests::{MockHost, make_state, text_result};
     use crate::turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, DeferredUserInputRecord, VolatileKind,
+        AgenticLoopHost, AgenticLoopState, AppliedUserIntent, VolatileKind,
         run_agentic_loop_with_host,
     };
-    use crate::turn::run_control::{RunInputProvider, RunQueuedInputPoll, RunStatusProvider};
+    use crate::turn::run_control::{RunStatusProvider, UserIntentPoll, UserIntentProvider};
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 
     fn structured_mutating_profile() -> astra_turn_core::chat_turn_heuristics::TaskExecutionProfile
@@ -2708,28 +2685,41 @@ mod tests {
     }
 
     struct StubRunControlProvider {
-        polls: Mutex<VecDeque<RunQueuedInputPoll>>,
+        polls: Mutex<VecDeque<UserIntentPoll>>,
         poll_calls: Mutex<Vec<usize>>,
         released: Mutex<Vec<usize>>,
         release_failures: Mutex<usize>,
+        terminal_on_release: bool,
     }
 
     impl StubRunControlProvider {
-        fn new(polls: Vec<RunQueuedInputPoll>) -> Self {
+        fn new(polls: Vec<UserIntentPoll>) -> Self {
             Self {
                 polls: Mutex::new(VecDeque::from(polls)),
                 poll_calls: Mutex::new(Vec::new()),
                 released: Mutex::new(Vec::new()),
                 release_failures: Mutex::new(0),
+                terminal_on_release: false,
             }
         }
 
-        fn with_release_failures(polls: Vec<RunQueuedInputPoll>, release_failures: usize) -> Self {
+        fn with_release_failures(polls: Vec<UserIntentPoll>, release_failures: usize) -> Self {
             Self {
                 polls: Mutex::new(VecDeque::from(polls)),
                 poll_calls: Mutex::new(Vec::new()),
                 released: Mutex::new(Vec::new()),
                 release_failures: Mutex::new(release_failures),
+                terminal_on_release: false,
+            }
+        }
+
+        fn with_terminal_release(polls: Vec<UserIntentPoll>) -> Self {
+            Self {
+                polls: Mutex::new(VecDeque::from(polls)),
+                poll_calls: Mutex::new(Vec::new()),
+                released: Mutex::new(Vec::new()),
+                release_failures: Mutex::new(0),
+                terminal_on_release: true,
             }
         }
 
@@ -2784,31 +2774,35 @@ mod tests {
     }
 
     #[async_trait]
-    impl RunInputProvider for StubRunControlProvider {
-        async fn poll_user_inputs(
+    impl UserIntentProvider for StubRunControlProvider {
+        async fn poll_user_intents(
             &self,
             _user_id: &str,
             _run_id: &str,
             after_event_index: usize,
-        ) -> RunQueuedInputPoll {
+        ) -> UserIntentPoll {
             self.poll_calls.lock().await.push(after_event_index);
             self.polls
                 .lock()
                 .await
                 .pop_front()
-                .unwrap_or(RunQueuedInputPoll {
+                .unwrap_or(UserIntentPoll {
                     next_cursor: after_event_index,
                     inputs: Vec::new(),
+                    issues: Vec::new(),
                     error: None,
                 })
         }
 
-        async fn mark_user_inputs_released(
+        async fn mark_user_intents_applied(
             &self,
             _user_id: &str,
             _run_id: &str,
             event_indices: &[usize],
-        ) -> Result<(), String> {
+        ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
+            if self.terminal_on_release {
+                return Ok(crate::turn::run_control::UserIntentApplyAck::RunTerminal);
+            }
             let mut release_failures = self.release_failures.lock().await;
             if *release_failures > 0 {
                 *release_failures -= 1;
@@ -2816,7 +2810,7 @@ mod tests {
             }
             drop(release_failures);
             self.released.lock().await.extend_from_slice(event_indices);
-            Ok(())
+            Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
         }
     }
 
@@ -3922,31 +3916,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_user_input_injects_immediately_at_loop_top() {
+    async fn user_intent_injects_immediately_at_loop_top() {
         let mut state = make_state();
         state.current_run_id = Some("run-queued".into());
         state.context_manifest_user_id = Some("user-deferred".into());
-        let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
+        let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
             next_cursor: 2,
-            inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+            inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                intent_id: "input-1".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::AcceptedRemote,
                 event_index: 1,
                 input: serde_json::json!({"content": "Switch to writing tests first."}),
             }],
+            issues: Vec::new(),
             error: None,
         }]));
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
 
-        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
+        assert_eq!(state.user_intents.user_intent_cursor(), 2);
         assert_eq!(*provider.released.lock().await, vec![1]);
+        assert_eq!(host.user_intent_context_indices, vec![1]);
+        assert_eq!(host.user_intent_applied_indices, vec![1]);
         assert_eq!(state.message, "Switch to writing tests first.");
         assert_eq!(
-            state.deferred_input.delivered_user_inputs(),
-            &[DeferredUserInputRecord {
+            state.user_intents.applied_user_intents(),
+            &[AppliedUserIntent {
+                intent_id: "input-1".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
                 event_index: 1,
                 content: "Switch to writing tests first.".to_string(),
             }]
@@ -3966,42 +3969,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_user_input_records_multiple_inputs_without_consecutive_user_messages() {
+    async fn user_intent_records_multiple_inputs_without_consecutive_user_messages() {
         let mut state = make_state();
         state.current_run_id = Some("run-queued-many".into());
         state.context_manifest_user_id = Some("user-deferred".into());
-        let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
+        let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
             next_cursor: 3,
             inputs: vec![
-                crate::turn::run_control::QueuedRunInputEvent {
+                crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "input-1".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
                     event_index: 1,
                     input: serde_json::json!({"content": "first queued input"}),
                 },
-                crate::turn::run_control::QueuedRunInputEvent {
+                crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "input-2".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
                     event_index: 2,
                     input: serde_json::json!({"content": "second queued input"}),
                 },
             ],
+            issues: Vec::new(),
             error: None,
         }]));
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
 
-        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 3);
+        assert_eq!(state.user_intents.user_intent_cursor(), 3);
         assert_eq!(*provider.released.lock().await, vec![1, 2]);
         assert_eq!(state.message, "second queued input");
         assert_eq!(
-            state.deferred_input.delivered_user_inputs(),
+            state.user_intents.applied_user_intents(),
             &[
-                DeferredUserInputRecord {
+                AppliedUserIntent {
+                    intent_id: "input-1".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::Applied,
                     event_index: 1,
                     content: "first queued input".to_string(),
                 },
-                DeferredUserInputRecord {
+                AppliedUserIntent {
+                    intent_id: "input-2".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::Applied,
                     event_index: 2,
                     content: "second queued input".to_string(),
                 },
@@ -4021,42 +4037,49 @@ mod tests {
                     message.get("role").and_then(|role| role.as_str()) == Some("user")
                 })
             }),
-            "deferred input injection must keep prompt history provider-safe"
+            "user intent injection must keep prompt history provider-safe"
         );
     }
 
     #[tokio::test]
-    async fn deferred_user_input_does_not_reinject_after_cursor_advance() {
+    async fn user_intent_does_not_reinject_after_cursor_advance() {
         let mut state = make_state();
         state.current_run_id = Some("run-repoll".into());
         state.context_manifest_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![
-            RunQueuedInputPoll {
+            UserIntentPoll {
                 next_cursor: 2,
-                inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "input-1".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
                     event_index: 1,
                     input: serde_json::json!({"content": "only once"}),
                 }],
+                issues: Vec::new(),
                 error: None,
             },
-            RunQueuedInputPoll {
+            UserIntentPoll {
                 next_cursor: 2,
                 inputs: Vec::new(),
+                issues: Vec::new(),
                 error: None,
             },
         ]));
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
 
-        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
+        assert_eq!(host.user_intent_context_indices, vec![1]);
+        assert_eq!(state.user_intents.user_intent_cursor(), 2);
         assert_eq!(*provider.released.lock().await, vec![1]);
+        assert_eq!(host.user_intent_applied_indices, vec![1]);
         assert_eq!(
             state
                 .messages
@@ -4068,34 +4091,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn deferred_user_input_empty_poll_is_throttled() {
+    async fn user_intent_empty_poll_is_throttled() {
         let mut state = make_state();
         state.current_run_id = Some("run-empty-throttle".into());
         state.context_manifest_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::new(vec![
-            RunQueuedInputPoll {
+            UserIntentPoll {
                 next_cursor: 0,
                 inputs: Vec::new(),
+                issues: Vec::new(),
                 error: None,
             },
-            RunQueuedInputPoll {
+            UserIntentPoll {
                 next_cursor: 2,
-                inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "input-1".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
                     event_index: 1,
                     input: serde_json::json!({"content": "arrived after quiet poll"}),
                 }],
+                issues: Vec::new(),
                 error: None,
             },
         ]));
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
         assert_eq!(provider.poll_call_count().await, 1);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
         assert_eq!(
@@ -4105,9 +4133,8 @@ mod tests {
         );
         assert!(state.messages.is_empty());
 
-        tokio::time::advance(DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL - Duration::from_millis(1))
-            .await;
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        tokio::time::advance(USER_INTENT_EMPTY_POLL_INTERVAL - Duration::from_millis(1)).await;
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
         assert_eq!(
@@ -4117,7 +4144,7 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
         assert_eq!(provider.poll_call_count().await, 2);
@@ -4125,46 +4152,96 @@ mod tests {
         assert_eq!(*provider.released.lock().await, vec![1]);
     }
 
-    #[tokio::test]
-    async fn deferred_user_input_retries_release_without_reinjecting_after_ack_failure() {
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn user_intent_retries_release_without_reinjecting_after_ack_failure() {
         let mut state = make_state();
         state.current_run_id = Some("run-release-retry".into());
         state.context_manifest_user_id = Some("user-deferred".into());
         let provider = Arc::new(StubRunControlProvider::with_release_failures(
             vec![
-                RunQueuedInputPoll {
+                UserIntentPoll {
                     next_cursor: 2,
-                    inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                    inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                        intent_id: "input-1".into(),
+                        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        status: astra_turn_types::UserIntentStatus::AcceptedRemote,
                         event_index: 1,
                         input: serde_json::json!({"content": "inject once"}),
                     }],
+                    issues: Vec::new(),
                     error: None,
                 },
-                RunQueuedInputPoll {
+                UserIntentPoll {
                     next_cursor: 2,
                     inputs: Vec::new(),
+                    issues: Vec::new(),
+                    error: None,
+                },
+                UserIntentPoll {
+                    next_cursor: 2,
+                    inputs: Vec::new(),
+                    issues: Vec::new(),
                     error: None,
                 },
             ],
-            1,
+            2,
         ));
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
 
-        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
+        assert_eq!(host.user_intent_context_indices, vec![1]);
+        assert!(
+            host.user_intent_applied_indices.is_empty(),
+            "live applied evidence must wait for durable acknowledgement"
+        );
+        assert_eq!(
+            provider.poll_call_count().await,
+            1,
+            "failed durable acknowledgement must not create a tight retry loop"
+        );
+        tokio::time::advance(USER_INTENT_EMPTY_POLL_INTERVAL).await;
+        inject_polled_user_intents(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(provider.poll_call_count().await, 2);
+        inject_polled_user_intents(&mut host, &mut state)
+            .await
+            .unwrap();
         assert_eq!(
             provider.poll_call_count().await,
             2,
-            "pending release acknowledgement must bypass empty-poll throttling"
+            "second acknowledgement failure must increase the retry delay"
+        );
+        tokio::time::advance(Duration::from_millis(999)).await;
+        inject_polled_user_intents(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.poll_call_count().await,
+            3,
+            "regular polling continues"
+        );
+        assert!(provider.released.lock().await.is_empty());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        inject_polled_user_intents(&mut host, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(state.user_intents.user_intent_cursor(), 2);
+        assert_eq!(
+            provider.poll_call_count().await,
+            4,
+            "pending release acknowledgement retries after its backoff"
         );
         assert_eq!(*provider.released.lock().await, vec![1]);
+        assert_eq!(host.user_intent_applied_indices, vec![1]);
         assert_eq!(
             state
                 .messages
@@ -4176,61 +4253,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_user_input_advances_cursor_even_when_content_is_unusable() {
+    async fn terminal_run_does_not_publish_user_intent_applied() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-terminal-race".into());
+        state.context_manifest_user_id = Some("user-deferred".into());
+        let provider = Arc::new(StubRunControlProvider::with_terminal_release(vec![
+            UserIntentPoll {
+                next_cursor: 2,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "input-terminal".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 1,
+                    input: serde_json::json!({"content": "too late"}),
+                }],
+                issues: Vec::new(),
+                error: None,
+            },
+        ]));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        inject_polled_user_intents(&mut host, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(host.user_intent_context_indices, vec![1]);
+        assert!(host.user_intent_applied_indices.is_empty());
+        assert!(provider.released.lock().await.is_empty());
+        assert!(
+            !state
+                .user_intents
+                .should_retry_apply_ack(tokio::time::Instant::now())
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_user_intent_isolated_without_blocking_later_valid_input() {
         let mut state = make_state();
         state.current_run_id = Some("run-invalid".into());
         state.context_manifest_user_id = Some("user-deferred".into());
-        let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
+        let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
             next_cursor: 7,
-            inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
-                event_index: 6,
-                input: serde_json::json!({"unexpected": true}),
-            }],
+            inputs: vec![
+                crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "input-6".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 6,
+                    input: serde_json::json!({"unexpected": true}),
+                },
+                crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "input-7".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 7,
+                    input: serde_json::json!({"content": "continue with the valid guidance"}),
+                },
+            ],
+            issues: Vec::new(),
             error: None,
         }]));
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .unwrap();
 
-        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 7);
-        assert_eq!(*provider.released.lock().await, vec![6]);
-        assert!(state.messages.is_empty());
+        assert_eq!(state.user_intents.user_intent_cursor(), 7);
+        assert_eq!(*provider.released.lock().await, vec![7]);
+        assert_eq!(state.message, "continue with the valid guidance");
+        assert_eq!(state.user_intents.applied_user_intents().len(), 1);
+        assert_eq!(
+            state.user_intents.applied_user_intents()[0].intent_id,
+            "input-7"
+        );
         assert!(state.volatile_pending.is_empty());
     }
 
     #[tokio::test]
-    async fn deferred_user_input_poll_error_degrades_without_advancing_cursor() {
+    async fn user_intent_poll_error_degrades_without_advancing_cursor() {
         let mut state = make_state();
         state.current_run_id = Some("run-missing".into());
         state.context_manifest_user_id = Some("user-deferred".into());
-        let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
+        let provider = Arc::new(StubRunControlProvider::new(vec![UserIntentPoll {
             next_cursor: 4,
             inputs: Vec::new(),
-            error: Some("run not found while polling deferred input: run-missing".into()),
+            issues: Vec::new(),
+            error: Some("run not found while polling user intent: run-missing".into()),
         }]));
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_user_intents(&mut host, &mut state)
             .await
             .expect("poll errors are control-plane misses and should not fail the main turn");
 
-        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 0);
+        assert_eq!(state.user_intents.user_intent_cursor(), 0);
         assert!(state.messages.is_empty());
         assert!(state.volatile_pending.is_empty());
         assert!(provider.released.lock().await.is_empty());
     }
 
     #[test]
-    fn deferred_user_input_text_preserves_active_skills_hint() {
-        let rendered = deferred_user_input_text(&serde_json::json!({
+    fn user_intent_content_preserves_active_skills_hint() {
+        let rendered = crate::turn::run_control::user_intent_content(&serde_json::json!({
             "content": "Use the release checklist.",
             "active_skills": ["release-manager", "deploy-auditor"],
         }))
-        .expect("deferred input should render");
+        .expect("user intent should render");
 
         assert!(rendered.contains("Requested active skills: release-manager, deploy-auditor."));
         assert!(rendered.contains("Use the release checklist."));
@@ -5254,45 +5386,4 @@ fn build_spill_summary(messages: &[serde_json::Value]) -> String {
     }
 
     summary
-}
-
-#[cfg(test)]
-mod response_guard_blocked_interruption_tests {
-    use super::*;
-
-    #[test]
-    fn response_guard_blocked_finish_reason_records_structured_interruption() {
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.last_finish_reason = Some(RESPONSE_GUARD_BLOCKED_FINISH_REASON.to_string());
-        state.remaining_turns = 7;
-
-        assert!(record_response_guard_blocked_interruption_if_needed(
-            &mut state
-        ));
-        let interruption = state
-            .interruption
-            .as_ref()
-            .expect("response guard finish reason must create interruption");
-        assert_eq!(interruption.kind, InterruptionKind::ResponseGuardBlocked);
-        assert_eq!(
-            interruption.resume_action,
-            ResumeAction::ContinueImmediately
-        );
-        assert_eq!(interruption.remaining_turns, 7);
-        assert_eq!(
-            interruption.error_detail.as_deref(),
-            Some("response guard blocked the model's final output")
-        );
-    }
-
-    #[test]
-    fn normal_finish_reason_does_not_record_response_guard_interruption() {
-        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.last_finish_reason = Some("normal".to_string());
-
-        assert!(!record_response_guard_blocked_interruption_if_needed(
-            &mut state
-        ));
-        assert!(state.interruption.is_none());
-    }
 }

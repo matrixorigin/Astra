@@ -1,18 +1,19 @@
 //! Successful turn state application and persistence preparation.
 
-use std::sync::Arc;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use astra_turn_core::conversation_log::manager::CslManager;
 
-use super::turn_commit::TurnCommitOutcome;
-use super::turn_commit::commit_turn_journal_workspace_and_sidecars;
+use super::turn_commit::{PrimaryTurnCommit, TurnCommitOutcome, commit_primary_turn};
 use super::turn_learning::{analyze_chat_turn_learning, turn_quality_feedback_from_eval};
-use super::turn_post_commit::{extract_csl_fields_from_result, run_turn_post_commit_tasks};
+use super::turn_post_commit::{
+    TurnPostCommitJob, apply_turn_post_commit_completion, attach_deferred_sidecars,
+    execute_turn_post_commit_job, extract_csl_fields_from_result, prepare_turn_post_commit_job,
+};
 use super::turn_reporting::{build_history_text, print_turn_status_line};
 use crate::cli::cli_config::cli_utils::persist_profile_last_session_or_warn;
-#[cfg(test)]
-use crate::cli::session::session_improvement;
 use crate::cli::session::session_projection::build_continuation_anchor;
 use crate::cli::session::session_startup;
 use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
@@ -20,10 +21,9 @@ use crate::cli::stream::streaming_types::StreamResult;
 use astra_services::session_journal;
 use crossterm::style::Stylize;
 
-/// Test-only sync variant of `apply_turn_success`. Production code paths must
-/// use [`apply_turn_success_async`] so the LLM-driven skill-improvement path
-/// can await its network call. This wrapper keeps the existing synchronous
-/// test fixtures working without pulling a tokio runtime into every assertion.
+/// Test-only synchronous settlement executes the derived projection explicitly
+/// after the primary event. Production TUI paths hand this work to their
+/// managed post-commit queue instead.
 #[cfg(test)]
 pub(crate) fn apply_turn_success(
     state: &mut SessionState,
@@ -32,8 +32,10 @@ pub(crate) fn apply_turn_success(
     result: StreamResult,
     turn_start: Instant,
 ) {
-    let _ = apply_turn_success_sync(state, profile, line, result, turn_start);
-    session_improvement::check_skill_improvement_sync(state);
+    let primary = apply_turn_success_primary_sync(state, profile, line, result, turn_start);
+    if let Some(sidecars) = primary.deferred_sidecars {
+        let _ = sidecars.execute();
+    }
 }
 
 pub(crate) async fn apply_turn_success_async(
@@ -44,21 +46,132 @@ pub(crate) async fn apply_turn_success_async(
     mut result: StreamResult,
     turn_start: Instant,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
+    post_commit_tx: Option<&tokio::sync::mpsc::Sender<TurnPostCommitJob>>,
 ) {
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
-    let commit_outcome = apply_turn_success_sync(state, profile, line, result, turn_start);
+    let primary_commit_started = Instant::now();
+    let primary_commit =
+        apply_turn_success_on_blocking_worker(state, profile, line, result, turn_start).await;
+    let commit_outcome = &primary_commit.outcome;
+    tracing::debug!(
+        target: "astra_cli::turn_settlement",
+        primary_commit_ms = primary_commit_started.elapsed().as_millis() as u64,
+        turn_persisted = commit_outcome.turn_persisted,
+        "completed durable primary turn commit"
+    );
     if commit_outcome.turn_persisted {
-        run_turn_post_commit_tasks(
+        let post_commit_started = Instant::now();
+        let mut post_commit = prepare_turn_post_commit_job(
             state,
             api,
             profile,
             final_messages,
             csl_checkpoint_fields,
             turn_start,
-            ui,
-        )
-        .await;
+        );
+        attach_deferred_sidecars(&mut post_commit, primary_commit.deferred_sidecars);
+        if let Some(tx) = post_commit_tx {
+            match tx.try_send(post_commit) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(post_commit)) => {
+                    // Bounded queue pressure is observable but never a drop:
+                    // preserving sidecar order is more important than shaving
+                    // the rare saturated-turn delay.
+                    if tx.send(post_commit).await.is_err() {
+                        ui.show_warning(
+                            "Turn is durable, but deferred local projections could not be queued.",
+                        );
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(post_commit)) => {
+                    let completion = execute_turn_post_commit_job(post_commit).await;
+                    for error in apply_turn_post_commit_completion(completion, state) {
+                        ui.show_warning(&format!("Deferred turn projection failed: {error}"));
+                    }
+                }
+            }
+        } else {
+            let completion = execute_turn_post_commit_job(post_commit).await;
+            for error in apply_turn_post_commit_completion(completion, state) {
+                ui.show_warning(&format!("Deferred turn projection failed: {error}"));
+            }
+        }
+        tracing::debug!(
+            target: "astra_cli::turn_settlement",
+            post_commit_ms = post_commit_started.elapsed().as_millis() as u64,
+            "completed non-primary turn post-commit tasks"
+        );
+    }
+}
+
+/// The durable primary-turn commit performs just the canonical journal fsync.
+/// Workspace/checkpoint/transcript projections are fully owned post-commit
+/// jobs, so they cannot extend the active turn's lifetime.
+///
+/// Move the whole mutable session through one blocking worker rather than
+/// splitting a transaction across competing owners. The slot restores the
+/// state even if the worker panics, so a worker failure surfaces as degraded
+/// persistence instead of silently discarding the in-memory session.
+async fn apply_turn_success_on_blocking_worker(
+    state: &mut SessionState,
+    profile: Option<&str>,
+    line: &str,
+    result: StreamResult,
+    turn_start: Instant,
+) -> PrimaryTurnCommit {
+    let state_slot = Arc::new(Mutex::new(Some(std::mem::take(state))));
+    let worker_slot = Arc::clone(&state_slot);
+    let profile = profile.map(str::to_owned);
+    let line = line.to_owned();
+    let journal_dir_override = astra_services::session_journal::current_journal_dir_override();
+
+    let worker = tokio::task::spawn_blocking(move || {
+        let _journal_dir_guard = journal_dir_override
+            .as_deref()
+            .map(astra_services::session_journal::JournalDirGuard::new);
+        let mut worker_state = worker_slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("turn state is installed before durable commit starts");
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            apply_turn_success_primary_sync(
+                &mut worker_state,
+                profile.as_deref(),
+                &line,
+                result,
+                turn_start,
+            )
+        }));
+        *worker_slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(worker_state);
+        outcome
+    })
+    .await;
+
+    let restored = state_slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+        .expect("durable commit worker restores the session state");
+    *state = restored;
+
+    match worker {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => failed_primary_turn_commit("turn commit worker panicked".to_string()),
+        Err(error) => failed_primary_turn_commit(format!("turn commit worker failed: {error}")),
+    }
+}
+
+fn failed_primary_turn_commit(persistence_error: String) -> PrimaryTurnCommit {
+    PrimaryTurnCommit {
+        outcome: TurnCommitOutcome {
+            turn_persisted: false,
+            persistence_error: Some(persistence_error),
+        },
+        deferred_sidecars: None,
     }
 }
 
@@ -226,13 +339,13 @@ fn clear_rebound_observability_session(state: &mut SessionState) {
     state.observability_session = None;
 }
 
-fn apply_turn_success_sync(
+fn apply_turn_success_primary_sync(
     state: &mut SessionState,
     profile: Option<&str>,
     line: &str,
     mut result: StreamResult,
     turn_start: Instant,
-) -> TurnCommitOutcome {
+) -> PrimaryTurnCommit {
     // Capture before session/turn mutation. If the primary turn event cannot
     // be persisted, this snapshot restores the live user-visible turn state.
     let live_snapshot = TurnSuccessLiveSnapshot::capture(state);
@@ -297,18 +410,12 @@ fn apply_turn_success_sync(
         && learning_snap.routing.domain_hint.is_none();
     result.set_repl_learning_journal_fields(routing_domain, entity_skipped);
 
-    let commit_outcome = commit_turn_journal_workspace_and_sidecars(
-        state,
-        line,
-        &mut result,
-        &learning_snap,
-        turn_start,
-    );
-    if !commit_outcome.turn_persisted {
-        let persistence_error = commit_outcome.persistence_error.clone();
+    let primary_commit = commit_primary_turn(state, line, &mut result, &learning_snap, turn_start);
+    if !primary_commit.outcome.turn_persisted {
+        let persistence_error = primary_commit.outcome.persistence_error.clone();
         live_snapshot.restore(state);
         state.session_persistence_error = persistence_error;
-        return commit_outcome;
+        return primary_commit;
     }
 
     if let Some(session_id) = result_session_id.as_deref() {
@@ -337,7 +444,25 @@ fn apply_turn_success_sync(
         }
     }
 
-    commit_outcome
+    primary_commit
+}
+
+#[cfg(test)]
+fn apply_turn_success_sync(
+    state: &mut SessionState,
+    profile: Option<&str>,
+    line: &str,
+    result: StreamResult,
+    turn_start: Instant,
+) -> TurnCommitOutcome {
+    let primary = apply_turn_success_primary_sync(state, profile, line, result, turn_start);
+    let outcome = primary.outcome.clone();
+    if let Some(sidecars) = primary.deferred_sidecars {
+        if let Err(error) = sidecars.execute() {
+            state.session_persistence_error = Some(error);
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -345,6 +470,9 @@ mod tests {
     use super::{apply_turn_success, apply_turn_success_async, apply_turn_success_sync};
     use crate::cli::session::session_state::PersistedAdaptiveState;
     use crate::cli::session::session_state::SessionState;
+    use crate::cli::turn::turn_post_commit::{
+        apply_turn_post_commit_completion, execute_turn_post_commit_job,
+    };
     use crate::tests::heavy_checkpoint_with_runtime_state;
     use astra_runtime::tool_registry::ToolRegistry;
     use astra_services::session_journal;
@@ -691,6 +819,7 @@ mod tests {
             result,
             Instant::now(),
             &mut ui,
+            None,
         )
         .await;
 
@@ -713,6 +842,57 @@ mod tests {
                 .unwrap_or_default()
                 .contains("append turn event")
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tui_post_commit_queue_releases_turn_after_primary_journal_event() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("queued-turn-post-commit-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState {
+            session_id: Some(sid.clone()),
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut ui = crate::tests::TestUi::default();
+
+        apply_turn_success_async(
+            &mut state,
+            &api,
+            None,
+            "inspect persistence",
+            crate::tests::stub_stream_result("The canonical event is durable."),
+            Instant::now(),
+            &mut ui,
+            Some(&tx),
+        )
+        .await;
+
+        let primary_events = session_journal::read_journal(&sid).unwrap();
+        assert!(
+            primary_events
+                .iter()
+                .any(|event| { event.event_type == session_journal::JournalEventType::Turn })
+        );
+        assert!(
+            !primary_events.iter().any(|event| {
+                event.event_type == session_journal::JournalEventType::TurnEvaluation
+            }),
+            "derived sidecars must not extend the foreground turn"
+        );
+
+        let job = rx.recv().await.expect("post-commit job should be queued");
+        let completion = execute_turn_post_commit_job(job).await;
+        assert!(completion.errors.is_empty(), "{:?}", completion.errors);
+        let errors = apply_turn_post_commit_completion(completion, &mut state);
+        assert!(errors.is_empty(), "{errors:?}");
+        let projected_events = session_journal::read_journal(&sid).unwrap();
+        assert!(projected_events.iter().any(|event| {
+            event.event_type == session_journal::JournalEventType::TurnEvaluation
+        }));
     }
 
     #[test]

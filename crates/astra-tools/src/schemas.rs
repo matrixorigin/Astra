@@ -287,14 +287,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents. Use exact fields only: path, offset, limit, outline. `offset` is the 1-based starting line number. `limit` is the number of lines to read (default: read to end). For the first 50 lines: offset=1, limit=50. For line 130 with 30 lines around it: offset=100, limit=60. Set outline=true for function/class signatures only.",
+                "description": "Read file contents. Use exact fields only: path, start_line, end_line, outline. Line ranges are inclusive and 1-based. Omit end_line to read from start_line through the end of the file. For the first 50 lines: start_line=1, end_line=50. Set outline=true for function/class signatures only.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "offset": {"type": "integer", "minimum": 1, "description": "1-based line number to start reading."},
-                        "limit": {"type": "integer", "minimum": 1, "description": "Number of lines to read."},
+                        "start_line": {"type": "integer", "minimum": 1, "description": "1-based first line of an inclusive range."},
+                        "end_line": {"type": "integer", "minimum": 1, "description": "1-based final line of an inclusive range. Omit to read to end."},
                         "outline": {"type": "boolean", "description": "Return only function/class/struct signatures with line numbers"}
                     },
                     "required": ["path"]
@@ -862,12 +862,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `send_message`: REQUIRES `action`, `to`, `message`.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is ONLY for `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Later `get_result` calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `get_result`.\n\n\
          ## Spawn example\n\
-         `agent(action='spawn', description='Audit auth flow', prompt='Read src/auth/* and report any token-handling bugs. Focus on session expiry and refresh logic. Return findings as a numbered list.', agent_type='general-purpose')`\n\n\
+         `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\",\"agent_type\":\"general-purpose\"}`\n\n\
          ## Execution mode\n\
          `spawn` is foreground by contract: it blocks until the sub-agent's final result is ready, and the sub-agent's tool calls stream back inline. Backgrounding is user-controlled from the UI with Ctrl+B while the live agent is running; do not pass a background flag in tool arguments.\n\n\
          ## Parallel sub-agent fan-out\n\
-         Use `agent_fanout(action='start', target_count=N, slots=[...])` to run a fixed-size parallel group atomically. It waits for slot results and returns them in the same tool call unless the user backgrounds the live run with Ctrl+B. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result. Do not simulate fan-out with an `agents:[...]` payload on `agent`.\n\
-         For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly. Do NOT wrap them inside `agent(action='run_chain', ...)`.\n\
+         For a fixed-size parallel group, call `agent_fanout` with its JSON object schema; do not simulate it with an `agents:[...]` payload on `agent`. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result.\n\
+         For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly; never wrap them in the `agent` `run_chain` action.\n\
          Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. `agent` launches one child; `agent_fanout` launches a fixed parallel group.
 
          ## agent vs shell work vs task
@@ -910,14 +910,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent_fanout",
-                "description": "Atomic parallel sub-agent fan-out: start needs target_count and exactly target_count slots; each slot needs description+prompt; optional id; no brief/agents/background.\n\n\
-         Actions: start, get_results, stop_slot.\n\n\
-         - `start`: REQUIRES `action`, `target_count`, `slots`. `slots` length must equal `target_count`; every slot requires `description` and `prompt`. Optional per-slot `id` is a stable caller label returned in start/results/fanout projections. Foreground mode waits for all accepted slots and returns `results`; backgrounding is user-controlled with Ctrl+B, not a tool argument.\n\
-         - `get_results`: REQUIRES `action`, `group_id`. Blocks until accepted slots finish, then returns bounded slot result windows and the fanout summary. For large output, pass `slot_index`, `offset`, and `max_bytes` to read one slot in chunks; do not inspect runtime artifact files with shell tools.\n\
-         - `stop_slot`: REQUIRES `action`, `group_id`, `slot_index`. Cancels one running slot in the group.\n\n\
-         Canonical start shape for two children: `agent_fanout(action='start', target_count=2, slots=[{id:'api', description:'Review API', prompt:'Full child task prompt for API'}, {id:'ui', description:'Review UI', prompt:'Full child task prompt for UI'}], defaults={agent_type:'code-review'})`.\n\
-         Canonical large-result read shape: `agent_fanout(action='get_results', group_id='<returned group_id>', slot_index=0, offset=0, max_bytes=8192)`; use `results[].next_call` for the next chunk.\n\
-         Use this instead of `agent` when the user asks for multiple reviewers, parallel exploration, or N independent sub-agents. Do not pass an `agents:[...]` payload to `agent`. Do not put top-level `brief`, `agents`, or `run_in_background` on `agent_fanout`; put full work instructions in each `slots[i].prompt`. Do not put `agent_id` inside slots; use `id` for the caller-facing slot label.",
+                "description": "Launch one atomic parallel agent group. Submit one complete JSON object; do not emit a DSL or a partial object.\n\n\
+         Actions:\n\
+         - `start`: requires `action`, `target_count`, and exactly that many `slots`. Every slot has `description` and `prompt`; optional `id` is only a caller-facing label. Minimal valid start: `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Review API\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"Review UI\",\"prompt\":\"Review the UI and report findings.\"}]}`. Shared optional configuration belongs in `defaults`; omit it unless needed.\n\
+         - `get_results`: requires `action` and returned `group_id`. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
+         - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
+         Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Foreground results wait for accepted children; Ctrl+B is the user-controlled background action.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1274,13 +1272,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
         // ── exit_plan_mode ──────────────────────────────────────────
         // Companion to enter_plan_mode. Surfaces the proposed plan to
         // the user for approval, lifts the write-tool guard on
-        // success, and mirrors the approved plan into the session task
-        // board so the next turn can execute step-by-step.
+        // success. The durable plan remains its own record; the task board
+        // is an explicit execution checklist, never a copied plan tree.
         json!({
             "type": "function",
             "function": {
                 "name": "exit_plan_mode",
-                "description": "Submit the plan for user approval. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects in the trusted UI. The model cannot approve its own plan; approval unlocks writes only after the UI/control plane returns the user's decision. After trusted approval, the approved work appears in the session task board.\n\
+                "description": "Submit the plan for user approval. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects in the trusted UI. The model cannot approve its own plan; approval unlocks writes only after the UI/control plane returns the user's decision. The approved plan remains a durable plan record; use the task board only when an execution checklist materially helps.\n\
         \n\
         ## Plan structure (what makes a good plan)\n\
         - Numbered list of concrete, executable leaf steps — each step maps to ONE artifact, API surface, or validation target.\n\
@@ -1436,13 +1434,17 @@ mod tests {
             .unwrap_or_default();
         let params = &fanout["function"]["parameters"];
 
-        assert!(desc.contains("Atomic parallel sub-agent fan-out"));
+        assert!(desc.contains("one complete JSON object"));
         assert!(desc.contains("`id`"));
         assert!(desc.contains("Ctrl+B"));
-        assert!(desc.contains("Foreground mode") || desc.contains("returns `results`"));
-        assert!(desc.contains("bounded slot result windows"));
+        assert!(desc.contains("Foreground results"));
+        assert!(desc.contains("bounded result window"));
         assert!(desc.contains("results[].next_call"));
         assert!(desc.contains("top-level `brief`"));
+        assert!(
+            !desc.contains("\"defaults\":{\"agent_type\""),
+            "the canonical start example must stay minimal; optional nested defaults are schema fields, not a first-call requirement"
+        );
         assert_eq!(params["additionalProperties"], false);
         assert_eq!(
             params["properties"]["action"]["enum"]
@@ -1824,34 +1826,6 @@ mod tests {
     }
 
     #[test]
-    fn exit_plan_mode_schema_points_to_task_board() {
-        let schemas = all_tool_schemas();
-        let exit =
-            find_schema(&schemas, "exit_plan_mode").expect("exit_plan_mode schema must exist");
-        let desc = exit["function"]["description"].as_str().unwrap();
-        let properties = exit["function"]["parameters"]["properties"]
-            .as_object()
-            .expect("exit_plan_mode properties must be an object");
-
-        assert!(
-            desc.contains("session task board"),
-            "approved plans should surface through the user-visible task board: {desc}"
-        );
-        assert!(
-            desc.contains("model cannot approve its own plan"),
-            "schema must make user approval ownership explicit: {desc}"
-        );
-        assert!(
-            !properties.contains_key("approved"),
-            "model-facing exit_plan_mode schema must not expose an approval parameter"
-        );
-        assert!(
-            !desc.contains("session_plan_todos"),
-            "schema must not expose the old internal plan todo queue: {desc}"
-        );
-    }
-
-    #[test]
     fn introspect_schema_describes_live_observation_surface() {
         let schemas = all_tool_schemas();
         let introspect = find_schema(&schemas, "introspect").expect("introspect schema must exist");
@@ -2229,8 +2203,8 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            desc.contains("offset") && desc.contains("limit"),
-            "read_file description must advertise offset+limit contract: {desc}"
+            desc.contains("start_line") && desc.contains("end_line"),
+            "read_file description must advertise inclusive line-range contract: {desc}"
         );
 
         let params = func
@@ -2246,13 +2220,13 @@ mod tests {
             .get("properties")
             .and_then(Value::as_object)
             .expect("read_file schema properties must be an object");
-        for name in ["path", "offset", "limit", "outline"] {
+        for name in ["path", "start_line", "end_line", "outline"] {
             assert!(
                 properties.contains_key(name),
                 "read_file schema should expose `{name}`"
             );
         }
-        for removed_arg in ["start_line", "end_line", "length", "count"] {
+        for removed_arg in ["offset", "limit", "length", "count"] {
             assert!(
                 !properties.contains_key(removed_arg),
                 "read_file schema must not expose old/removed field `{removed_arg}`"

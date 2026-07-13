@@ -50,8 +50,8 @@
 //! which wraps this loop with consistent outcome mapping.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::turn::runtime_policy::RuntimePolicy;
@@ -257,18 +257,20 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
-    /// Observe a deferred `user_input` event that was appended to the active
-    /// run while execution was already in progress.
-    ///
-    /// Hosts that carry mutable request context, such as the server host's
-    /// `edge_profile`, can use this hook to keep the next LLM round aligned
-    /// with any per-input runtime hints before the deferred user message is
-    /// surfaced to the model.
-    ///
-    /// Contract: the loop calls this at most once per durable input event.
-    /// `DeferredInputState` advances its append-only cursor when staging a
-    /// poll result, so hosts do not need to deduplicate repeated hook calls.
-    fn on_deferred_user_input(&mut self, _input: &Value) {}
+    /// Apply typed intent context needed by the next local model boundary.
+    /// This hook must not publish externally observable "applied" events;
+    /// durable acknowledgement has not committed yet.
+    fn apply_user_intent_context(&mut self, _event: &crate::turn::run_control::QueuedUserIntent) {}
+
+    /// Publish a typed user intent after its durable `user_intent_applied`
+    /// acknowledgement commits. The loop deduplicates this hook across ack
+    /// retries, including commit-then-timeout reconciliation.
+    fn on_user_intent_applied(&mut self, _event: &crate::turn::run_control::QueuedUserIntent) {}
+
+    /// Publish transport-independent agent communication evidence. Hosts may
+    /// stream and persist it, but must not inject it into conversational
+    /// messages or infer control state from its display text.
+    fn on_agent_communication(&mut self, _event: astra_messaging::AgentCommunicationEvent) {}
 
     /// Headless round terminal output.
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String);
@@ -445,6 +447,15 @@ pub trait AgenticLoopHost: Send {
     /// Default: no-op (used by MockHost and hosts that don't support injection).
     fn inject_tool_schema(&mut self, _schema: Value) {}
 
+    /// Optional request-scoped live lane for child-agent activity. The
+    /// default keeps non-interactive hosts independent of presentation while
+    /// allowing TUI-capable hosts to observe delegated children directly.
+    fn agent_live_event_sink(
+        &self,
+    ) -> Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink> {
+        None
+    }
+
     /// Render the final answer text to the user.
     ///
     /// Called only when the agentic loop is certain the text is the final
@@ -454,6 +465,18 @@ pub trait AgenticLoopHost: Send {
     ///
     /// Default: no-op (tests, headless, sub-run hosts).
     fn render_final_text(&mut self, _text: &str) {}
+
+    /// The final user-visible output is now immutable and available to the
+    /// host. This is intentionally a separate lifecycle boundary from full
+    /// turn settlement: checkpointing, telemetry, memory extraction, and
+    /// remote projections may continue afterwards, but they must not make an
+    /// already-visible answer look as though the model is still generating.
+    ///
+    /// Implementations may publish a typed output-settled event here. The
+    /// callback fires at most once for a terminal loop outcome and only after
+    /// the final text (including a truncation marker when applicable) has
+    /// been rendered or confirmed as already streamed.
+    async fn on_final_output_ready(&mut self, _state: &AgenticLoopState) {}
 
     /// Best-effort cancellation hook for child agents that should no longer
     /// continue running after the parent has decided to stop waiting.
@@ -1091,126 +1114,196 @@ impl StallTrackingState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeferredUserInputRecord {
+pub struct AppliedUserIntent {
+    pub intent_id: String,
+    pub delivery: astra_turn_types::UserIntentDelivery,
+    pub status: astra_turn_types::UserIntentStatus,
     pub event_index: usize,
     pub content: String,
 }
 
 #[derive(Default)]
-pub struct DeferredInputState {
-    /// Durable event cursor for deferred user-input polling.
-    deferred_user_input_cursor: usize,
-    /// Next time a best-effort empty/error deferred-input poll is allowed.
-    /// Pending release acknowledgements bypass this throttle.
-    next_deferred_user_input_poll_at: Option<tokio::time::Instant>,
-    /// Event indices already delivered to the model but not yet durably marked
-    /// as released. Retried on later poll points without re-injecting content.
-    pending_release_event_indices: Vec<usize>,
+pub struct UserIntentState {
+    /// Durable event cursor for user-intent polling.
+    user_intent_cursor: usize,
+    /// Next time a best-effort empty/error intent poll is allowed.
+    /// Due release acknowledgements may wake the poll independently.
+    next_user_intent_poll_at: Option<tokio::time::Instant>,
+    /// Retry deadline for durable apply acknowledgements. This is separate
+    /// from polling so new input remains observable while a store write backs
+    /// off.
+    next_apply_ack_at: Option<tokio::time::Instant>,
+    consecutive_apply_ack_failures: u32,
+    /// Typed events already staged for the model but not yet durably marked as
+    /// applied. Retaining the payload lets the loop publish the corresponding
+    /// live event only after a later retry commits.
+    pending_apply_events: Vec<crate::turn::run_control::QueuedUserIntent>,
     /// User messages that were appended to the prompt while this run was
     /// already active. These must be persisted as transcript items after the
     /// loop finishes, otherwise session history diverges from prompt history.
-    delivered_user_inputs: Vec<DeferredUserInputRecord>,
+    applied_user_intents: Vec<AppliedUserIntent>,
 }
 
-pub(crate) struct ObservedDeferredUserInputs {
-    pub(crate) raw_inputs: Vec<Value>,
-    pub(crate) contents: Vec<DeferredUserInputRecord>,
-    pub(crate) released_event_indices: Vec<usize>,
+pub(crate) struct ObservedUserIntents {
+    pub(crate) accepted: Vec<crate::turn::run_control::QueuedUserIntent>,
+    pub(crate) applied: Vec<AppliedUserIntent>,
+    pub(crate) issues: Vec<crate::turn::run_control::UserIntentPollIssue>,
     pub(crate) next_cursor: usize,
 }
 
-impl DeferredInputState {
-    pub fn deferred_user_input_cursor(&self) -> usize {
-        self.deferred_user_input_cursor
+impl UserIntentState {
+    pub fn user_intent_cursor(&self) -> usize {
+        self.user_intent_cursor
     }
 
-    pub(crate) fn should_poll_user_inputs(&self, now: tokio::time::Instant) -> bool {
-        if !self.pending_release_event_indices.is_empty() {
-            return true;
-        }
-        self.next_deferred_user_input_poll_at
+    pub(crate) fn should_poll_user_intents(&self, now: tokio::time::Instant) -> bool {
+        let regular_poll_due = self
+            .next_user_intent_poll_at
             .map(|next| now >= next)
-            .unwrap_or(true)
+            .unwrap_or(true);
+        regular_poll_due || self.should_retry_apply_ack(now)
     }
 
-    pub(crate) fn note_user_input_poll_finished(
+    pub(crate) fn note_user_intent_poll_finished(
         &mut self,
         now: tokio::time::Instant,
         interval: std::time::Duration,
     ) {
-        self.next_deferred_user_input_poll_at = Some(now + interval);
+        self.next_user_intent_poll_at = Some(now + interval);
     }
 
-    pub fn delivered_user_inputs(&self) -> &[DeferredUserInputRecord] {
-        &self.delivered_user_inputs
+    pub fn applied_user_intents(&self) -> &[AppliedUserIntent] {
+        &self.applied_user_intents
     }
 
-    pub(crate) fn record_delivered_user_inputs(&mut self, inputs: &[DeferredUserInputRecord]) {
-        self.delivered_user_inputs.extend_from_slice(inputs);
+    pub(crate) fn record_applied_user_intents(&mut self, intents: &[AppliedUserIntent]) {
+        self.applied_user_intents.extend_from_slice(intents);
     }
 
-    pub(crate) fn release_event_indices_to_ack(&self, observed: &[usize]) -> Vec<usize> {
-        let mut indices = self.pending_release_event_indices.clone();
-        indices.extend(observed.iter().copied());
-        indices.sort_unstable();
-        indices.dedup();
-        indices
-    }
-
-    pub(crate) fn note_release_ack_result(&mut self, event_indices: &[usize], released: bool) {
-        if released {
-            let released = event_indices
-                .iter()
-                .copied()
-                .collect::<std::collections::HashSet<_>>();
-            self.pending_release_event_indices
-                .retain(|event_index| !released.contains(event_index));
-            return;
-        }
-        self.pending_release_event_indices
-            .extend(event_indices.iter().copied());
-        self.pending_release_event_indices.sort_unstable();
-        self.pending_release_event_indices.dedup();
-    }
-
-    pub(crate) fn observe_polled_user_inputs<F>(
+    pub(crate) fn stage_pending_apply_events(
         &mut self,
-        poll: crate::turn::run_control::RunQueuedInputPoll,
+        events: &[crate::turn::run_control::QueuedUserIntent],
+    ) {
+        for event in events {
+            if !self
+                .pending_apply_events
+                .iter()
+                .any(|pending| pending.event_index == event.event_index)
+            {
+                self.pending_apply_events.push(event.clone());
+            }
+        }
+        self.pending_apply_events
+            .sort_by_key(|event| event.event_index);
+    }
+
+    pub(crate) fn pending_apply_event_indices(&self) -> Vec<usize> {
+        self.pending_apply_events
+            .iter()
+            .map(|event| event.event_index)
+            .collect()
+    }
+
+    pub(crate) fn should_retry_apply_ack(&self, now: tokio::time::Instant) -> bool {
+        !self.pending_apply_events.is_empty()
+            && self
+                .next_apply_ack_at
+                .is_none_or(|deadline| now >= deadline)
+    }
+
+    pub(crate) fn acknowledge_apply_events(
+        &mut self,
+        event_indices: &[usize],
+    ) -> Vec<crate::turn::run_control::QueuedUserIntent> {
+        let applied = event_indices
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut acknowledged = Vec::new();
+        self.pending_apply_events.retain(|event| {
+            if applied.contains(&event.event_index) {
+                acknowledged.push(event.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.consecutive_apply_ack_failures = 0;
+        self.next_apply_ack_at = None;
+        acknowledged
+    }
+
+    pub(crate) fn discard_pending_apply_events(&mut self, event_indices: &[usize]) {
+        let discarded = event_indices
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        self.pending_apply_events
+            .retain(|event| !discarded.contains(&event.event_index));
+        self.consecutive_apply_ack_failures = 0;
+        self.next_apply_ack_at = None;
+    }
+
+    pub(crate) fn note_apply_ack_failure(&mut self, now: tokio::time::Instant) {
+        self.consecutive_apply_ack_failures = self.consecutive_apply_ack_failures.saturating_add(1);
+        let exponent = self.consecutive_apply_ack_failures.saturating_sub(1).min(5);
+        let delay = std::time::Duration::from_millis(500)
+            .saturating_mul(1_u32 << exponent)
+            .min(std::time::Duration::from_secs(10));
+        self.next_apply_ack_at = Some(now + delay);
+    }
+
+    pub(crate) fn defer_pending_apply_ack(&mut self, now: tokio::time::Instant) {
+        if !self.pending_apply_events.is_empty() {
+            self.note_apply_ack_failure(now);
+        }
+    }
+
+    pub(crate) fn observe_polled_user_intents<F>(
+        &mut self,
+        poll: crate::turn::run_control::UserIntentPoll,
         mut content_from_input: F,
-    ) -> ObservedDeferredUserInputs
+    ) -> ObservedUserIntents
     where
         F: FnMut(&Value) -> Option<String>,
     {
-        let mut raw_inputs = Vec::new();
-        let mut contents = Vec::new();
-        let mut released_event_indices = Vec::new();
+        let mut accepted = Vec::new();
+        let mut applied = Vec::new();
+        let mut issues = poll.issues;
         for event in poll.inputs {
-            released_event_indices.push(event.event_index);
-            raw_inputs.push(event.input.clone());
             let Some(content) = content_from_input(&event.input) else {
+                issues.push(crate::turn::run_control::UserIntentPollIssue {
+                    event_index: event.event_index,
+                    intent_id: Some(event.intent_id),
+                    kind: crate::turn::run_control::UserIntentPollIssueKind::NoActionableContent,
+                });
                 continue;
             };
-            contents.push(DeferredUserInputRecord {
+            applied.push(AppliedUserIntent {
+                intent_id: event.intent_id.clone(),
+                delivery: event.delivery,
+                status: astra_turn_types::UserIntentStatus::Applied,
                 event_index: event.event_index,
                 content,
             });
+            accepted.push(event);
         }
 
-        ObservedDeferredUserInputs {
-            raw_inputs,
-            contents,
-            released_event_indices,
+        ObservedUserIntents {
+            accepted,
+            applied,
+            issues,
             next_cursor: poll.next_cursor,
         }
     }
 
     #[cfg(test)]
-    pub fn set_deferred_user_input_cursor_for_test(&mut self, cursor: usize) {
-        self.deferred_user_input_cursor = cursor;
+    pub fn set_user_intent_cursor_for_test(&mut self, cursor: usize) {
+        self.user_intent_cursor = cursor;
     }
 
     pub fn commit_observed_cursor(&mut self, next_cursor: usize) {
-        self.deferred_user_input_cursor = self.deferred_user_input_cursor.max(next_cursor);
+        self.user_intent_cursor = self.user_intent_cursor.max(next_cursor);
     }
 }
 
@@ -1684,6 +1777,13 @@ pub fn runtime_volatile_injections_edge_profile_value(
 pub struct AgenticLoopState {
     // ── Message context ──
     pub messages: Vec<Value>,
+    /// Optional append-only capture for a child run's durable transcript.
+    ///
+    /// The prompt history may be compacted or rewritten after an item has
+    /// already been sent to the model. A transcript writer therefore consumes
+    /// this explicit append lane rather than inferring new history by comparing
+    /// serialized message text. Root/server loops leave it disabled.
+    pub run_transcript_capture: Option<Arc<Mutex<Vec<Value>>>>,
     /// Runtime-produced volatile content scheduled to ride the next
     /// LLM call's volatile_preamble. See [`VolatileInjection`]. The
     /// wire layer (`wire_assembly::assemble_llm_messages`) drains this
@@ -1709,6 +1809,11 @@ pub struct AgenticLoopState {
     /// True once the current `final_text` has already been sent to the user.
     /// Deferred completion paths leave this false so finalization emits exactly once.
     pub final_text_streamed: bool,
+    /// True once the host has been told that the terminal user-visible output
+    /// is immutable. This is separate from `final_text_streamed`: streamed
+    /// text can be visible before the runtime has decided no more model
+    /// iteration is possible.
+    pub final_output_ready_notified: bool,
     // Run-level token aggregators. See `turn::token_usage::TokenUsage` for
     // the per-call invariant: these four fields are DISJOINT buckets whose
     // sum equals the billable total across the whole run.
@@ -1796,7 +1901,7 @@ pub struct AgenticLoopState {
     pub messaging: MessagingState,
     /// Durable user input queued while a run is active. Kept separate from
     /// `messaging`, which is reserved for agent-to-agent routing state.
-    pub deferred_input: DeferredInputState,
+    pub user_intents: UserIntentState,
     pub hooks: StopHookState,
     pub cancellation: CancellationState,
     pub error_recovery: ErrorRecoveryState,
@@ -2111,6 +2216,73 @@ pub fn runtime_manifest_for_model(
 }
 
 impl AgenticLoopState {
+    /// Begin recording selected prompt-history items for a child run's
+    /// canonical transcript. The caller chooses the initial visible child
+    /// items, excluding inherited/system context that is not part of the
+    /// child's own conversation.
+    pub fn begin_run_transcript_capture<I>(&mut self, initial_items: I)
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        self.run_transcript_capture =
+            Some(Arc::new(Mutex::new(initial_items.into_iter().collect())));
+    }
+
+    /// Append a genuine conversational item to prompt history and, when this
+    /// is a locally durable child run, to its ordered transcript capture.
+    /// Runtime context must use the typed volatile lanes instead.
+    pub fn push_prompt_history_message(&mut self, message: Value) {
+        self.messages.push(message.clone());
+        self.record_prompt_history_messages(std::iter::once(message));
+    }
+
+    /// Record items appended by a lower-level routine that receives a mutable
+    /// message vector. The caller takes the exact appended slice immediately
+    /// after that routine returns, before any compaction can rewrite history.
+    pub fn record_prompt_history_messages<I>(&self, messages: I)
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        let Some(capture) = self.run_transcript_capture.as_ref() else {
+            return;
+        };
+        let mut pending = capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.extend(messages);
+    }
+
+    /// Drain only items that were appended through
+    /// [`Self::push_prompt_history_message`]. This is independent of later
+    /// compaction, so equal text and duplicate tool results remain distinct.
+    pub fn take_run_transcript_capture(&self) -> Vec<Value> {
+        let Some(capture) = self.run_transcript_capture.as_ref() else {
+            return Vec::new();
+        };
+        let mut pending = capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *pending)
+    }
+
+    /// Restore a failed transcript append ahead of newer captured items.
+    /// Persistence retries must preserve the original run-local order; losing
+    /// the drained batch or appending it after later messages would make the
+    /// canonical transcript diverge from the prompt history.
+    pub fn restore_run_transcript_capture_front(&self, mut messages: Vec<Value>) {
+        if messages.is_empty() {
+            return;
+        }
+        let Some(capture) = self.run_transcript_capture.as_ref() else {
+            return;
+        };
+        let mut pending = capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        messages.append(&mut *pending);
+        *pending = messages;
+    }
+
     /// Only the root access-surface loop owns the session-level composite
     /// snapshot pointer. Delegated/sub-agent loops may share the same
     /// `session_id` for evidence and replay, but their internal checkpoints are
@@ -2973,6 +3145,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         .resolve_for_model(model);
     AgenticLoopState {
         messages: Vec::new(),
+        run_transcript_capture: None,
         volatile_pending: Vec::new(),
         recent_rounds: Vec::new(),
         tool_results: Vec::new(),
@@ -2984,6 +3157,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         recursion_depth: 0,
         final_text: String::new(),
         final_text_streamed: false,
+        final_output_ready_notified: false,
         total_prompt: 0,
         total_completion: 0,
         total_cache_read: 0,
@@ -3024,7 +3198,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         hooks: Default::default(),
         messaging: Default::default(),
         cancellation: Default::default(),
-        deferred_input: Default::default(),
+        user_intents: Default::default(),
         error_recovery: Default::default(),
         pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -3131,6 +3305,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn run_transcript_capture_preserves_duplicate_appends_across_compaction() {
+        let mut state = make_test_loop_state();
+        let task = json!({"role": "user", "content": "inspect the change"});
+        let repeated = json!({"role": "assistant", "content": "same finding"});
+        state.messages = vec![
+            json!({"role": "system", "content": "child identity"}),
+            task.clone(),
+        ];
+        state.begin_run_transcript_capture(std::iter::once(task.clone()));
+        state.push_prompt_history_message(repeated.clone());
+
+        // A compacted prompt can discard or replace visible history. The
+        // append-only capture must retain both real occurrences without
+        // comparing their text to reconstruct a suffix.
+        state.messages = vec![json!({"role": "system", "content": "compacted context"})];
+        state.push_prompt_history_message(repeated.clone());
+
+        assert_eq!(
+            state.take_run_transcript_capture(),
+            vec![task, repeated.clone(), repeated]
+        );
+        assert!(state.take_run_transcript_capture().is_empty());
+    }
+
+    #[test]
+    fn failed_transcript_batch_is_restored_before_newer_items() {
+        let mut state = make_test_loop_state();
+        let first = json!({"role": "assistant", "content": "first"});
+        let second = json!({"role": "tool", "content": "second"});
+        let newer = json!({"role": "assistant", "content": "newer"});
+        state.begin_run_transcript_capture([first.clone(), second.clone()]);
+
+        let failed = state.take_run_transcript_capture();
+        state.push_prompt_history_message(newer.clone());
+        state.restore_run_transcript_capture_front(failed);
+
+        assert_eq!(
+            state.take_run_transcript_capture(),
+            vec![first, second, newer]
+        );
+    }
+
+    #[test]
     fn only_root_loop_owns_session_composite_snapshot() {
         let mut state = make_state();
         assert!(state.owns_session_composite_snapshot());
@@ -3178,11 +3395,14 @@ pub(crate) mod tests {
         interaction_mode: TurnInteractionMode,
         pub(crate) injected_schemas: Vec<Value>,
         pub(crate) rendered_final_text: Vec<String>,
+        pub(crate) final_output_ready: Vec<String>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
         pub(crate) turn_intent: Option<TurnIntent>,
         pub(crate) skill_auto_route_decision: Option<String>,
         pub(crate) skill_auto_route_queries: Vec<String>,
         pub(crate) turn_completed_run_ids: Vec<Option<String>>,
+        pub(crate) user_intent_context_indices: Vec<usize>,
+        pub(crate) user_intent_applied_indices: Vec<usize>,
         pub(crate) cancelled_agent_ids: Vec<String>,
         cancel_child_agents_delay: Option<std::time::Duration>,
         recovered_control_tool_results: HashMap<String, ControlToolRecovery>,
@@ -3201,11 +3421,14 @@ pub(crate) mod tests {
                 interaction_mode: TurnInteractionMode::NonInteractive,
                 injected_schemas: Vec::new(),
                 rendered_final_text: Vec::new(),
+                final_output_ready: Vec::new(),
                 executed_messages: Vec::new(),
                 turn_intent: None,
                 skill_auto_route_decision: None,
                 skill_auto_route_queries: Vec::new(),
                 turn_completed_run_ids: Vec::new(),
+                user_intent_context_indices: Vec::new(),
+                user_intent_applied_indices: Vec::new(),
                 cancelled_agent_ids: Vec::new(),
                 cancel_child_agents_delay: None,
                 recovered_control_tool_results: HashMap::new(),
@@ -3322,6 +3545,17 @@ pub(crate) mod tests {
             &self.valid_tools
         }
 
+        fn apply_user_intent_context(
+            &mut self,
+            event: &crate::turn::run_control::QueuedUserIntent,
+        ) {
+            self.user_intent_context_indices.push(event.event_index);
+        }
+
+        fn on_user_intent_applied(&mut self, event: &crate::turn::run_control::QueuedUserIntent) {
+            self.user_intent_applied_indices.push(event.event_index);
+        }
+
         fn inject_tool_schema(&mut self, schema: Value) {
             if let Some(name) = schema
                 .get("function")
@@ -3335,6 +3569,10 @@ pub(crate) mod tests {
 
         fn render_final_text(&mut self, text: &str) {
             self.rendered_final_text.push(text.to_string());
+        }
+
+        async fn on_final_output_ready(&mut self, state: &AgenticLoopState) {
+            self.final_output_ready.push(state.final_text.clone());
         }
 
         async fn recover_missing_control_tool_result(
@@ -3556,6 +3794,7 @@ pub(crate) mod tests {
     pub(crate) fn make_state() -> AgenticLoopState {
         AgenticLoopState {
             messages: Vec::new(),
+            run_transcript_capture: None,
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
@@ -3567,6 +3806,7 @@ pub(crate) mod tests {
             recursion_depth: 0,
             final_text: String::new(),
             final_text_streamed: false,
+            final_output_ready_notified: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -3610,7 +3850,7 @@ pub(crate) mod tests {
             hooks: Default::default(),
             messaging: Default::default(),
             cancellation: Default::default(),
-            deferred_input: Default::default(),
+            user_intents: Default::default(),
             error_recovery: Default::default(),
             pipeline_session: None,
             message: "test query".to_string(),

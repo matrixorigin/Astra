@@ -15,6 +15,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use axum::Router;
@@ -40,6 +41,9 @@ pub enum MockScenario {
     Fail,
     /// Agent delays 3s before responding (tests timeout/progress display).
     Slow,
+    /// Root activates and calls one foreground child agent, then synthesizes
+    /// the child's completion.
+    AgentThenComplete,
     /// Adversarial: a single tool_call_start event's JSON is split across
     /// multiple SSE `data:` chunks (with blank lines in between) so a naive
     /// per-chunk JSON decoder will fail on each half. A correct client must
@@ -67,6 +71,7 @@ impl MockScenario {
             "multi_turn" | "multi" => Some(Self::MultiTurn),
             "fail" | "error" => Some(Self::Fail),
             "slow" => Some(Self::Slow),
+            "agent_then_complete" | "agent" => Some(Self::AgentThenComplete),
             "sse_chunk_split" | "sse_split" | "chunk_split" => Some(Self::SseChunkSplit),
             "malformed_json" | "malformed" | "bad_json" => Some(Self::MalformedJson),
             "rate_limited" | "rate_limit" | "429" => Some(Self::RateLimited),
@@ -82,6 +87,7 @@ impl MockScenario {
             Self::MultiTurn => "two LLM turns: think then complete",
             Self::Fail => "agent returns error",
             Self::Slow => "3s delay before response (tests progress display)",
+            Self::AgentThenComplete => "one foreground child agent, then parent synthesis",
             Self::SseChunkSplit => "tool_call JSON split across SSE frames (adversarial)",
             Self::MalformedJson => "one SSE event carries malformed JSON (adversarial)",
             Self::RateLimited => "HTTP 429 with Retry-After (adversarial)",
@@ -99,6 +105,10 @@ impl MockScenario {
             ("multi_turn", "two LLM turns: think then complete"),
             ("fail", "agent returns error"),
             ("slow", "3s delay before response (tests progress display)"),
+            (
+                "agent_then_complete",
+                "one foreground child agent, then parent synthesis",
+            ),
             (
                 "sse_chunk_split",
                 "tool_call JSON split across SSE frames (adversarial)",
@@ -154,6 +164,18 @@ fn tool_call_start(call_id: &str, tool: &str, args: Value) -> String {
         "call_id": call_id,
         "tool": tool,
         "arguments": args.to_string(),
+    }))
+}
+
+fn tool_request(call_id: &str, tool: &str, args: Value) -> String {
+    sse_line(&serde_json::json!({
+        "type": "tool_request",
+        "session_id": "mock-session",
+        "run_id": "mock-run-agent-root",
+        "turn_chain_id": "mock-turn-chain-agent-root",
+        "request_id": call_id,
+        "tool": tool,
+        "args": args,
     }))
 }
 
@@ -221,22 +243,26 @@ fn body_complete(agent_id: &str, turn: u32) -> String {
 }
 
 fn body_tool_then_complete(agent_id: &str, turn: u32) -> String {
-    let path = format!("/tmp/mock-output-{agent_id}-{turn}.txt");
-    let content = format!("Output from {agent_id} turn {turn}");
-    let mut s = String::new();
-    s.push_str(&session_info(&format!("mock-run-{turn}")));
-    // First: tool call
-    s.push_str(&tool_call_start(
-        "call-1",
-        "write_file",
-        serde_json::json!({ "path": path, "content": content }),
-    ));
-    s.push_str(&tool_result("call-1", &format!("Written {}", path)));
-    // Then: completion text
-    let msg = format!("{agent_id}: wrote {path} and completed task.");
+    // A client-side tool is a two-turn protocol: the first model response
+    // asks the host to execute it; the next response sees that result and
+    // completes. Returning a synthetic tool result alongside the request (or
+    // issuing the same request on every round) makes a real host loop forever.
+    if turn == 1 {
+        let path = format!("mock-output-{agent_id}.txt");
+        let content = format!("Output from {agent_id}");
+        let args = serde_json::json!({ "path": path, "content": content });
+        let mut s = session_info("mock-run-tool");
+        s.push_str(&tool_call_start("call-1", "write_file", args.clone()));
+        s.push_str(&tool_request("call-1", "write_file", args));
+        s.push_str(&done_event(150));
+        return s;
+    }
+
+    let msg = format!("{agent_id}: wrote the requested file and completed task.");
+    let mut s = session_info("mock-run-tool");
     s.push_str(&text_delta(&msg));
     s.push_str(&text_done(&msg));
-    s.push_str(&done_event(350));
+    s.push_str(&done_event(200));
     s
 }
 
@@ -273,6 +299,100 @@ fn body_fail(_agent_id: &str, turn: u32) -> String {
 async fn body_slow(agent_id: &str, turn: u32) -> String {
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     body_complete(agent_id, turn)
+}
+
+pub const AGENT_JOURNEY_CHILD_TASK: &str =
+    "Inspect the assigned work and return one evidence-backed finding.";
+
+fn is_agent_journey_child_request(body: &Value) -> bool {
+    if body.get("agent_type").and_then(Value::as_str) != Some("general-purpose") {
+        return false;
+    }
+    body.get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        })
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        == Some(AGENT_JOURNEY_CHILD_TASK)
+}
+
+fn root_has_tool_result(body: &Value, tool_name: &str) -> bool {
+    let callback_has_result = body
+        .get("tool_results")
+        .and_then(Value::as_array)
+        .is_some_and(|results| {
+            results.iter().any(|result| {
+                result.get("name").and_then(Value::as_str) == Some(tool_name)
+                    || result.get("tool").and_then(Value::as_str) == Some(tool_name)
+            })
+        });
+    if callback_has_result {
+        return true;
+    }
+
+    body.get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("_tool_name").and_then(Value::as_str) == Some(tool_name)
+        })
+}
+
+async fn body_agent_then_complete(body: &Value) -> String {
+    if is_agent_journey_child_request(body) {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let message = "child_evidence_visible: delegated review completed successfully.";
+        let mut stream = session_info("mock-run-agent-child");
+        stream.push_str(&text_delta(message));
+        stream.push_str(&text_done(message));
+        stream.push_str(&done_event(100));
+        return stream;
+    }
+
+    match (
+        root_has_tool_result(body, "tool_search"),
+        root_has_tool_result(body, "agent"),
+    ) {
+        (false, false) => {
+            let mut stream = session_info("mock-run-agent-root");
+            let args = serde_json::json!({"query": "select:agent"});
+            stream.push_str(&tool_call_start(
+                "call-activate-agent",
+                "tool_search",
+                args.clone(),
+            ));
+            stream.push_str(&tool_request("call-activate-agent", "tool_search", args));
+            stream.push_str(&done_event(40));
+            stream
+        }
+        (true, false) => {
+            let mut stream = session_info("mock-run-agent-root");
+            let args = serde_json::json!({
+                "action": "spawn",
+                "description": "Mock child review",
+                "prompt": AGENT_JOURNEY_CHILD_TASK,
+                "agent_type": "general-purpose"
+            });
+            stream.push_str(&tool_call_start("call-spawn-child", "agent", args));
+            stream.push_str(&done_event(80));
+            stream
+        }
+        (_, true) => {
+            let message = "Parent synthesized the child evidence and completed the task.";
+            let mut stream = session_info("mock-run-agent-root");
+            stream.push_str(&text_delta(message));
+            stream.push_str(&text_done(message));
+            stream.push_str(&done_event(140));
+            stream
+        }
+    }
 }
 
 // ─── Adversarial bodies (P1 hardening) ──────────────────────────────────────
@@ -379,6 +499,7 @@ fn body_text_only(agent_id: &str, turn: u32) -> String {
 struct ServerState {
     scenario: MockScenario,
     call_count: Arc<AtomicU32>,
+    received_requests: Arc<Mutex<Vec<Value>>>,
 }
 
 async fn handle_chat_turn(
@@ -386,15 +507,20 @@ async fn handle_chat_turn(
     body: axum::body::Bytes,
 ) -> Response<axum::body::Body> {
     let turn = state.call_count.fetch_add(1, Ordering::Relaxed) + 1;
+    let request_body = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    if let Ok(mut requests) = state.received_requests.lock() {
+        const MAX_RECORDED_REQUESTS: usize = 32;
+        if requests.len() == MAX_RECORDED_REQUESTS {
+            requests.remove(0);
+        }
+        requests.push(request_body.clone());
+    }
 
     // Extract agent_id from top-level payload field (set by chat_turn_base_payload)
-    let agent_id = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.get("agent_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+    let agent_id = request_body
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
         .unwrap_or_else(|| format!("agent-{turn}"));
 
     let sse_body = match state.scenario {
@@ -403,6 +529,7 @@ async fn handle_chat_turn(
         MockScenario::MultiTurn => body_multi_turn(&agent_id, turn),
         MockScenario::Fail => body_fail(&agent_id, turn),
         MockScenario::Slow => body_slow(&agent_id, turn).await,
+        MockScenario::AgentThenComplete => body_agent_then_complete(&request_body).await,
         MockScenario::SseChunkSplit => body_sse_chunk_split(&agent_id, turn),
         MockScenario::MalformedJson => body_malformed_json(&agent_id, turn),
         MockScenario::TextOnly => body_text_only(&agent_id, turn),
@@ -446,11 +573,16 @@ async fn handle_models() -> axum::Json<Value> {
     }))
 }
 
+async fn handle_tool_result() -> axum::Json<Value> {
+    axum::Json(serde_json::json!({"accepted": true}))
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /// A running mock LLM server. Drop to shut down.
 pub struct MockLlmServer {
     pub base_url: String,
+    received_requests: Arc<Mutex<Vec<Value>>>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -463,13 +595,16 @@ impl MockLlmServer {
         let addr: SocketAddr = listener.local_addr().expect("listener has local_addr");
         let base_url = format!("http://127.0.0.1:{}", addr.port());
 
+        let received_requests = Arc::new(Mutex::new(Vec::new()));
         let state = ServerState {
             scenario,
             call_count: Arc::new(AtomicU32::new(0)),
+            received_requests: received_requests.clone(),
         };
 
         let app = Router::new()
             .route("/chat/turn", post(handle_chat_turn))
+            .route("/tools/result", post(handle_tool_result))
             .route("/models", get(handle_models))
             .with_state(state);
 
@@ -495,8 +630,17 @@ impl MockLlmServer {
 
         Ok(Self {
             base_url,
+            received_requests,
             _shutdown: tx,
         })
+    }
+
+    /// Return the bounded request history observed by this mock server.
+    pub fn received_requests(&self) -> Vec<Value> {
+        self.received_requests
+            .lock()
+            .map(|requests| requests.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -523,13 +667,16 @@ mod tests {
     }
 
     #[test]
-    fn tool_body_contains_tool_call_and_result() {
-        let body = body_tool_then_complete("coder", 2);
-        assert!(body.contains("tool_call_start"));
-        assert!(body.contains("write_file"));
-        assert!(body.contains("tool_result"));
-        assert!(body.contains("text_done"));
-        assert!(body.contains("\"type\":\"done\""));
+    fn tool_body_models_a_real_two_turn_client_side_tool_protocol() {
+        let request = body_tool_then_complete("coder", 1);
+        let completion = body_tool_then_complete("coder", 2);
+        assert!(request.contains("tool_call_start"));
+        assert!(request.contains("write_file"));
+        assert!(!request.contains("tool_result"));
+        assert!(!request.contains("text_done"));
+        assert!(completion.contains("text_done"));
+        assert!(!completion.contains("tool_call_start"));
+        assert!(completion.contains("\"type\":\"done\""));
     }
 
     #[test]
@@ -740,15 +887,14 @@ mod tests {
         );
         // Yet must still have a complete turn shape.
         let events = parse_sse_events(&body);
-        let kinds: Vec<&str> = events
+        let kinds: Vec<String> = events
             .iter()
             .filter_map(|e| serde_json::from_str::<Value>(e).ok())
             .filter_map(|v| v["type"].as_str().map(str::to_string))
-            .map(|s| Box::leak(s.into_boxed_str()) as &str)
             .collect();
-        assert!(kinds.contains(&"session_info"));
-        assert!(kinds.contains(&"text_done"));
-        assert!(kinds.contains(&"done"));
+        assert!(kinds.iter().any(|kind| kind == "session_info"));
+        assert!(kinds.iter().any(|kind| kind == "text_done"));
+        assert!(kinds.iter().any(|kind| kind == "done"));
     }
 
     #[test]

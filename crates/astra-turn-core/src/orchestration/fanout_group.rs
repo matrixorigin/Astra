@@ -5,11 +5,11 @@
 //! module keeps that invariant explicit so retries, failed spawns, user
 //! cancellations, and budget cancellations do not inflate or blur the group.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentFanoutSlotIdentity {
     pub group_id: String,
     pub target_count: usize,
@@ -82,6 +82,10 @@ pub struct AgentFanoutSlot {
     pub role: String,
     pub requested_description: String,
     pub agent_id: Option<String>,
+    /// Immutable execution identity assigned when the child spawn is accepted.
+    /// This keeps a recovered fanout receipt able to reopen the exact child
+    /// conversation when the original tool-result delivery was lost.
+    pub run_id: Option<String>,
     pub status: AgentFanoutSlotStatus,
     pub result_collected: bool,
     pub terminal_reason: Option<String>,
@@ -167,6 +171,7 @@ impl AgentFanoutGroupProjection {
                 role: String::new(),
                 requested_description: String::new(),
                 agent_id: None,
+                run_id: None,
                 status: AgentFanoutSlotStatus::Planned,
                 result_collected: false,
                 terminal_reason: None,
@@ -255,6 +260,18 @@ impl AgentFanoutGroupProjection {
         slot_index: usize,
         agent_id: impl Into<String>,
     ) -> Result<(), String> {
+        self.record_spawn_accepted_with_run(slot_index, agent_id, None)
+    }
+
+    /// Record an accepted child with its immutable execution identity.
+    /// Runtime callers use this form because an accepted fanout slot is a
+    /// durable conversation address, not merely a display label.
+    pub fn record_spawn_accepted_with_run(
+        &mut self,
+        slot_index: usize,
+        agent_id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> Result<(), String> {
         let agent_id = agent_id.into();
         let old_status = {
             let slot = self.slot_mut(slot_index)?;
@@ -265,6 +282,7 @@ impl AgentFanoutGroupProjection {
             }
             let old_status = slot.status;
             slot.agent_id = Some(agent_id.clone());
+            slot.run_id = run_id;
             slot.status = AgentFanoutSlotStatus::Running;
             slot.terminal_reason = None;
             old_status
@@ -576,6 +594,21 @@ mod tests {
         assert!(err.contains("explicit replacement"), "{err}");
         assert_eq!(group.summary().accepted, 1);
         assert_eq!(group.target_count, 3);
+    }
+
+    #[test]
+    fn accepted_slot_retains_its_canonical_run_identity() {
+        let mut group = AgentFanoutGroupProjection::new("review-1", "Review fanout", 1);
+
+        group
+            .record_spawn_accepted_with_run(0, "storage@agent-run-1", Some("agent-run-1".into()))
+            .unwrap();
+
+        assert_eq!(
+            group.slots[0].agent_id.as_deref(),
+            Some("storage@agent-run-1")
+        );
+        assert_eq!(group.slots[0].run_id.as_deref(), Some("agent-run-1"));
     }
 
     #[test]

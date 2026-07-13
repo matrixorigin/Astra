@@ -232,7 +232,7 @@ mod arg_render_tests {
     };
 
     #[test]
-    fn bare_permissions_command_renders_empty_arg_for_mode_cycle() {
+    fn bare_permissions_command_renders_empty_arg_for_explicit_selection() {
         let args = PermissionsArgs { command: None };
         assert_eq!(render_permissions_args(&args), "");
     }

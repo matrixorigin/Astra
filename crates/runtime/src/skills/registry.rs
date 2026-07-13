@@ -23,6 +23,24 @@ struct CachedSkill {
     loaded: Option<LoadedSkill>,
 }
 
+/// One provider that could not participate in a discovery pass.
+///
+/// Discovery is intentionally partial: a remote catalog outage must not erase
+/// working local skills or prevent the CLI from becoming interactive.  The
+/// caller decides how to surface these typed failures for its product surface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillDiscoveryFailure {
+    pub source: SkillSourceKind,
+    pub message: String,
+}
+
+/// Stable result of a discovery pass, including partial provider failures.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillDiscoveryReport {
+    pub registered: Vec<String>,
+    pub failures: Vec<SkillDiscoveryFailure>,
+}
+
 // ── UnifiedSkillRegistry ─────────────────────────────────────────────────────
 
 /// Default metadata-token budget for skill registration.
@@ -131,31 +149,66 @@ impl UnifiedSkillRegistry {
         }
     }
 
-    /// Discover and cache skills from all providers (including MCP).
+    /// Discover only sources guaranteed to be process-local.
     ///
-    /// Clears existing cache and conditional state before re-populating so that
-    /// deleted/renamed skills don't linger across refreshes.
+    /// This is the startup baseline for interactive clients. Database, MCP and
+    /// plugin providers are deliberately deferred so network or subprocess
+    /// latency can never delay the first usable frame.
+    pub async fn discover_local_bootstrap(&self) -> Result<SkillDiscoveryReport, SkillError> {
+        self.discover_report(false).await
+    }
+
+    /// Discover every provider and preserve partial failures as typed data.
+    pub async fn discover_all_report(&self) -> Result<SkillDiscoveryReport, SkillError> {
+        self.discover_report(true).await
+    }
+
+    /// Compatibility-free convenience for runtime callers that only consume
+    /// the registered names. Provider failures are logged structurally instead
+    /// of writing directly into an application's terminal surface.
     pub async fn discover_all(&self) -> Result<Vec<String>, SkillError> {
+        let report = self.discover_all_report().await?;
+        for failure in &report.failures {
+            tracing::warn!(
+                source = failure.source.as_str(),
+                error = %failure.message,
+                "skill provider discovery unavailable"
+            );
+        }
+        Ok(report.registered)
+    }
+
+    async fn discover_report(
+        &self,
+        include_external: bool,
+    ) -> Result<SkillDiscoveryReport, SkillError> {
         let mut all_manifests: Vec<SkillManifest> = Vec::new();
+        let mut failures = Vec::new();
 
         for provider in &self.providers {
+            let source = provider.source_kind();
+            if !include_external
+                && !matches!(source, SkillSourceKind::Local | SkillSourceKind::Bundled)
+            {
+                continue;
+            }
             match provider.discover().await {
                 Ok(manifests) => all_manifests.extend(manifests),
-                Err(e) => {
-                    eprintln!(
-                        "  ⚠ Failed to discover skills from {:?}: {}",
-                        provider.source_kind(),
-                        e
-                    );
-                }
+                Err(error) => failures.push(SkillDiscoveryFailure {
+                    source,
+                    message: error.to_string(),
+                }),
             }
         }
 
         // Include MCP skills from the shared provider.
-        match self.mcp_provider.discover().await {
-            Ok(manifests) => all_manifests.extend(manifests),
-            Err(e) => {
-                eprintln!("  ⚠ Failed to discover MCP skills: {e}");
+        if include_external {
+            match self.mcp_provider.discover().await {
+                Ok(manifests) => all_manifests.extend(manifests),
+                Err(error) => failures.push(SkillDiscoveryFailure {
+                    source: SkillSourceKind::Mcp,
+                    message: error.to_string(),
+                }),
             }
         }
 
@@ -268,7 +321,10 @@ impl UnifiedSkillRegistry {
             );
         }
 
-        Ok(registered)
+        Ok(SkillDiscoveryReport {
+            registered,
+            failures,
+        })
     }
 
     /// Load a skill's full content by name.
@@ -1021,6 +1077,34 @@ mod tests {
 
         let registered = registry.discover_all().await.unwrap();
         assert_eq!(registered, vec!["from-good-provider"]);
+    }
+
+    #[tokio::test]
+    async fn local_bootstrap_is_usable_before_external_discovery_converges() {
+        let mut registry = UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(FailingProvider));
+        registry.add_provider(Box::new(StubProvider {
+            skills: vec![(
+                SkillManifest {
+                    name: "local-baseline".into(),
+                    description: "Ready without external I/O".into(),
+                    source: SkillSourceKind::Bundled,
+                    ..Default::default()
+                },
+                "inst".into(),
+            )],
+        }));
+
+        let bootstrap = registry.discover_local_bootstrap().await.unwrap();
+        assert_eq!(bootstrap.registered, vec!["local-baseline"]);
+        assert!(bootstrap.failures.is_empty());
+        assert!(registry.get_manifest("local-baseline").is_some());
+
+        let converged = registry.discover_all_report().await.unwrap();
+        assert_eq!(converged.registered, vec!["local-baseline"]);
+        assert_eq!(converged.failures.len(), 1);
+        assert_eq!(converged.failures[0].source, SkillSourceKind::Plugin);
+        assert!(registry.get_manifest("local-baseline").is_some());
     }
 
     #[tokio::test]

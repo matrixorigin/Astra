@@ -13,8 +13,11 @@
 //! ```
 //!
 //! Key features:
-//! * **Group headers**: items are grouped by category (Core, Session & Plan, Observability, …)
-//!   with dim `── Group Name ──` dividers when the filtered set spans multiple groups.
+//! * **Group headers**: detailed renderers can group items by category (Core,
+//!   Session & Plan, Observability, …) with dim `── Group Name ──` dividers.
+//! * **Composer compact mode**: the live `/` picker omits those headers and
+//!   inline subcommand previews so every selectable action fits in the input
+//!   area. `/help` remains the place for taxonomy and long-form discovery.
 //! * **Matched characters** (from the filter token) render in the
 //!   accent colour with UNDERLINE so the user can see why the row ranked.
 //! * **Scroll hints**: `↑ N more` / `↓ N more` above/below the window
@@ -64,9 +67,49 @@ pub(crate) fn desired_height(menu: &SlashMenu) -> u16 {
     }
 }
 
+/// Height for the inline composer picker. It uses the compact presentation
+/// below, so one selectable command always consumes one visual row.
+pub(crate) fn desired_composer_height(menu: &SlashMenu) -> u16 {
+    desired_height(menu)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PopupPresentation {
+    show_group_headers: bool,
+    show_selected_subcommands: bool,
+}
+
+const DETAILED_PRESENTATION: PopupPresentation = PopupPresentation {
+    show_group_headers: true,
+    show_selected_subcommands: true,
+};
+
+const COMPOSER_PRESENTATION: PopupPresentation = PopupPresentation {
+    show_group_headers: false,
+    show_selected_subcommands: false,
+};
+
 /// Render `menu` into `area` of `buf`. Safe to call with any area size;
 /// rows beyond `area.height` are clipped.
 pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
+    render_with_presentation(menu, area, buf, DETAILED_PRESENTATION);
+}
+
+/// Render the compact slash picker embedded below the composer.
+///
+/// Typing a trailing space still opens the real subcommand completion mode;
+/// repeating those options beneath a selected command wastes the limited
+/// vertical space and can hide other selectable actions.
+pub(crate) fn render_composer(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
+    render_with_presentation(menu, area, buf, COMPOSER_PRESENTATION);
+}
+
+fn render_with_presentation(
+    menu: &SlashMenu,
+    area: Rect,
+    buf: &mut Buffer,
+    presentation: PopupPresentation,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -108,28 +151,16 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
         .max()
         .unwrap_or(0);
 
-    // Layout columns: gutter (2) + name_col + 2 + alias_col + 2 + desc.
-    let alias_col_width = matches[window_start..window_end]
-        .iter()
-        .map(|i| alias_label(i).map(|s| s.chars().count()).unwrap_or(0))
-        .max()
-        .unwrap_or(0);
-
+    // Layout columns: gutter (2) + name_col + 2 + description.
     let content_width = area.width as usize;
     let show_desc = area.width >= MIN_DESC_WIDTH;
     let gutter_w = 2;
     let sep_w = 2;
-    let alias_budget = if alias_col_width > 0 {
-        alias_col_width + sep_w
-    } else {
-        0
-    };
     let desc_budget = if show_desc {
         content_width
             .saturating_sub(gutter_w)
             .saturating_sub(name_col_width)
             .saturating_sub(sep_w)
-            .saturating_sub(alias_budget)
     } else {
         0
     };
@@ -143,9 +174,13 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
 
     // ── Visible data rows (with group headers) ─────────────────
     let highlights = menu.match_indices();
-    let prev_group_idx = matches
-        .get(window_start.saturating_sub(1))
-        .and_then(|it| it.group);
+    let prev_group_idx = if presentation.show_group_headers {
+        matches
+            .get(window_start.saturating_sub(1))
+            .and_then(|it| it.group)
+    } else {
+        None
+    };
     let mut cur_group: Option<CommandGroup> = prev_group_idx;
 
     for (idx, item) in matches[window_start..window_end].iter().enumerate() {
@@ -155,7 +190,7 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
 
         // Insert group header when group changes.
         let item_group = item.group;
-        if item_group != cur_group {
+        if presentation.show_group_headers && item_group != cur_group {
             cur_group = item_group;
             if let Some(g) = item_group {
                 let label = group_display_name(g);
@@ -193,29 +228,17 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
 
         // Name — with per-char highlights.
         spans.extend(render_name_spans(
-            item.name,
+            item.name.as_ref(),
             &hi,
             name_col_width,
             is_selected,
             theme,
         ));
 
-        // Alias column.
-        if alias_col_width > 0 {
-            spans.push(Span::raw("  "));
-            let alias = alias_label(item).unwrap_or_default();
-            spans.push(Span::styled(
-                pad_right_chars(&alias, alias_col_width),
-                Style::default()
-                    .fg(theme.dim)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-        }
-
         // Description column.
         if show_desc && desc_budget > 0 {
             spans.push(Span::raw("  "));
-            let desc = truncate_ellipsis(item.description, desc_budget);
+            let desc = truncate_ellipsis(item.description.as_ref(), desc_budget);
             let desc_style = if is_selected {
                 Style::default().fg(theme.selected_fg)
             } else {
@@ -230,7 +253,7 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
         }
         lines.push(line);
         // Show subcommands below the selected item (single-line, compact).
-        if is_selected && !item.subcommands.is_empty() {
+        if presentation.show_selected_subcommands && is_selected && !item.subcommands.is_empty() {
             let max_subs = 3.min(item.subcommands.len());
             for (name, desc) in item.subcommands.iter().take(max_subs) {
                 let sub_spans: Vec<Span<'static>> = vec![
@@ -343,14 +366,6 @@ fn render_name_spans(
     spans
 }
 
-fn alias_label(item: &super::SlashItem) -> Option<String> {
-    if item.aliases.is_empty() {
-        None
-    } else {
-        Some(format!("({})", item.aliases.join(", ")))
-    }
-}
-
 /// Compute the half-open range `[start, end)` so the selected row stays
 /// visible with at most `max_rows` slots. Centres the selection when
 /// possible so the user sees context above AND below.
@@ -419,6 +434,13 @@ mod tests {
         }
     }
 
+    struct ComposerPopupWidget<'a>(&'a SlashMenu);
+    impl Widget for ComposerPopupWidget<'_> {
+        fn render(self, area: Rect, buf: &mut Buffer) {
+            render_composer(self.0, area, buf);
+        }
+    }
+
     fn render_menu(menu: &SlashMenu, w: u16, h: u16) -> String {
         let buf = draw_widget(PopupWidget(menu), w, h);
         buffer_to_string(&buf)
@@ -477,10 +499,10 @@ mod tests {
         // 12 items, body fits 10 — selecting #11 must scroll AND show
         // the "↑ N more" hint at the top.
         let items: Vec<SlashItem> = (0..12)
-            .map(|i| {
-                let name: &'static str = Box::leak(format!("/cmd{i:02}").into_boxed_str());
-                let desc: &'static str = Box::leak(format!("description {i}").into_boxed_str());
-                SlashItem::simple(name, desc)
+            .map(|i| SlashItem {
+                name: format!("/cmd{i:02}").into(),
+                description: format!("description {i}").into(),
+                ..Default::default()
             })
             .collect();
         let mut menu = SlashMenu::new(items);
@@ -499,38 +521,38 @@ mod tests {
         use crate::cli::command_registry::CommandGroup;
         let items: Vec<SlashItem> = vec![
             SlashItem {
-                name: "/help",
-                description: "show help",
+                name: "/help".into(),
+                description: "show help".into(),
                 group: Some(CommandGroup::Core),
                 ..Default::default()
             },
             SlashItem {
-                name: "/clear",
-                description: "clear screen",
+                name: "/clear".into(),
+                description: "clear screen".into(),
                 group: Some(CommandGroup::Core),
                 ..Default::default()
             },
             SlashItem {
-                name: "/resume",
-                description: "resume a session",
+                name: "/resume".into(),
+                description: "resume a session".into(),
                 group: Some(CommandGroup::SessionPlan),
                 ..Default::default()
             },
             SlashItem {
-                name: "/plan",
-                description: "manage plan",
+                name: "/plan".into(),
+                description: "manage plan".into(),
                 group: Some(CommandGroup::SessionPlan),
                 ..Default::default()
             },
             SlashItem {
-                name: "/model",
-                description: "pick a model",
+                name: "/model".into(),
+                description: "pick a model".into(),
                 group: Some(CommandGroup::Core),
                 ..Default::default()
             },
             SlashItem {
-                name: "/config",
-                description: "runtime config",
+                name: "/config".into(),
+                description: "runtime config".into(),
                 group: Some(CommandGroup::Observability),
                 ..Default::default()
             },
@@ -543,11 +565,53 @@ mod tests {
     }
 
     #[test]
+    fn composer_picker_prioritizes_selectable_actions_over_group_chrome() {
+        use crate::cli::command_registry::CommandGroup;
+        let menu = SlashMenu::new(vec![
+            SlashItem {
+                name: "/help".into(),
+                description: "show help".into(),
+                group: Some(CommandGroup::Core),
+                ..Default::default()
+            },
+            SlashItem {
+                name: "/plan".into(),
+                description: "plan work".into(),
+                group: Some(CommandGroup::SessionPlan),
+                ..Default::default()
+            },
+            SlashItem {
+                name: "/context".into(),
+                description: "inspect context".into(),
+                group: Some(CommandGroup::Observability),
+                ..Default::default()
+            },
+        ]);
+
+        let output = buffer_to_string(&draw_widget(
+            ComposerPopupWidget(&menu),
+            80,
+            desired_composer_height(&menu),
+        ));
+
+        for command in ["/help", "/plan", "/context"] {
+            assert!(
+                output.contains(command),
+                "composer picker dropped {command}: {output}"
+            );
+        }
+        assert!(
+            !output.contains("── Core ──"),
+            "group chrome belongs in help, not the constrained composer picker: {output}"
+        );
+    }
+
+    #[test]
     fn desired_height_clamps_at_max_plus_chrome() {
         let items: Vec<SlashItem> = (0..20)
-            .map(|i| {
-                let name: &'static str = Box::leak(format!("/x{i}").into_boxed_str());
-                SlashItem::simple(name, "")
+            .map(|i| SlashItem {
+                name: format!("/x{i}").into(),
+                ..Default::default()
             })
             .collect();
         let menu = SlashMenu::new(items);
@@ -601,22 +665,19 @@ mod tests {
 
     #[test]
     fn selected_item_shows_subcommands() {
-        use crate::cli::command_registry::TuiHandler;
-
         const SUBS: &[(&str, &str)] = &[
             ("list", "List all memories"),
             ("search", "Search memories by query"),
             ("inspect", "Inspect a single memory by ID"),
         ];
         let item = SlashItem {
-            name: "/memory",
-            description: "Memory operations",
+            name: "/memory".into(),
+            description: "Memory operations".into(),
             subcommands: SUBS,
             extra_subcommands: Vec::new(),
-            aliases: &[],
             usage_boost: 0,
+            primary: true,
             group: Some(CommandGroup::MemoryTasks),
-            tui_handler: TuiHandler::Panel,
             usage_examples: &[],
         };
         let menu = SlashMenu::new(vec![item]);

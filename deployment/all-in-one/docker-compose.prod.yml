@@ -11,13 +11,11 @@
 #   docker-compose -f docker-compose.prod.yml up -d
 #   docker-compose -f docker-compose.prod.yml up -d --scale api=3
 
-version: "3.8"
-
 services:
   # ─── Database ─────────────────────────────────────────────
 
   matrixone:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:4.0.0-rc3}
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
     hostname: matrixone
     command: ["/mo-service", "-launch", "/etc/quickstart/launch.toml"]
     ports:

@@ -2,7 +2,7 @@
 
 #![cfg(test)]
 
-use super::model::{CategoryKind, ContextBreakdown, PressureBand};
+use super::model::{CategoryKind, ContextBreakdown, PressureBand, summarize_session_read_activity};
 use astra_turn_core::context_assembly_trace::{
     Alternative, CompressionMethod, ContextAssemblyTrace, DecisionExplanation, DecisionType,
     HistorySelectionTrace, MemoryInjection, MemoryRejection, MemorySelection, MemorySource,
@@ -26,6 +26,7 @@ fn trace(max: u32, sys: u32, hist: u32, mem: u32, tools: u32, user: u32) -> Cont
         tool_schema_tokens: tools,
         user_message_tokens: user,
         total_used: total,
+        usage_source: Default::default(),
         budget_pressure: pressure,
         compression_triggered: false,
     };
@@ -46,6 +47,49 @@ fn empty_has_no_categories() {
 fn empty_band_is_low() {
     let b = ContextBreakdown::empty();
     assert_eq!(b.band(), PressureBand::Low);
+}
+
+#[test]
+fn session_read_activity_counts_execution_and_repeat_evidence_without_parsing_output() {
+    use astra_services::session_journal::{JournalEvent, ToolCallDisposition, ToolCallRecord};
+
+    let read = |disposition, args_full: Option<&str>| ToolCallRecord {
+        name: "read_file".into(),
+        ok: true,
+        file_path: Some("src/lib.rs".into()),
+        args_full: args_full.map(str::to_owned),
+        disposition: Some(disposition),
+        ..Default::default()
+    };
+    let exact = r#"{"path":"src/lib.rs","start_line":10,"end_line":20}"#;
+    let different_range = r#"{"path":"src/lib.rs","start_line":21,"end_line":40}"#;
+
+    let first = JournalEvent::turn(Some("session"), 1, None, "read", "done", 1, 0, 0, 0)
+        .with_tool_calls(vec![read(ToolCallDisposition::Executed, Some(exact))]);
+    let mut compacted = ContextAssemblyTrace::default();
+    compacted.token_budget.compression_triggered = true;
+    let compaction =
+        JournalEvent::context_assembly_recorded(Some("session"), 1, compacted.to_json_value());
+    let repeated = JournalEvent::turn(Some("session"), 2, None, "again", "done", 1, 0, 0, 0)
+        .with_tool_calls(vec![read(ToolCallDisposition::Reused, Some(exact))]);
+    let different =
+        JournalEvent::turn(Some("session"), 3, None, "more", "done", 1, 0, 0, 0).with_tool_calls(
+            vec![read(ToolCallDisposition::Suppressed, Some(different_range))],
+        );
+    let unknown = JournalEvent::turn(Some("session"), 4, None, "bad", "done", 1, 0, 0, 0)
+        .with_tool_calls(vec![read(ToolCallDisposition::Rejected, None)]);
+
+    let summary =
+        summarize_session_read_activity(&[first, compaction, repeated, different, unknown]);
+
+    assert_eq!(summary.requested, 4);
+    assert_eq!(summary.executed, 1);
+    assert_eq!(summary.reused_or_suppressed, 2);
+    assert_eq!(summary.other_not_executed, 1);
+    assert_eq!(summary.distinct_files, 1);
+    assert_eq!(summary.requests_with_exact_identity, 3);
+    assert_eq!(summary.exact_repeat_requests, 1);
+    assert_eq!(summary.repeats_after_recorded_compaction, 1);
 }
 
 // ─── from_trace ───────────────────────────────────────────────────
@@ -271,6 +315,7 @@ fn history_summary_counts_retained_compressed_dropped() {
             role: "user".into(),
             tokens: 200,
             has_tool_calls: false,
+            content_preview: String::new(),
         }],
         turns_compressed: vec![
             TurnCompression {
@@ -291,6 +336,7 @@ fn history_summary_counts_retained_compressed_dropped() {
             },
         ],
         turns_dropped: vec![3, 4, 5],
+        compression_stages: vec![],
         compression_ratio: 0.2,
         tokens_before: 10_000,
         tokens_after: 2_000,
@@ -582,9 +628,11 @@ fn session_summary_flows_through_snapshot() {
         completion_tokens: 3_000,
         cache_read_tokens: 8_000,
         cache_creation_tokens: 500,
+        request_context: None,
         continuation_anchor: Some("refactoring auth".into()),
         queued_message: None,
         diagnostics_context: None,
+        read_activity: Default::default(),
     });
     let b = ContextBreakdown::from_trace_with(&t, &snap);
     let s = b.session_summary.expect("session populated");

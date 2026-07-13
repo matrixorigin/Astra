@@ -18,6 +18,8 @@ use astra_runtime::tool_sandbox::{
 use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
 use astra_turn_core::tool::deferred_activation::ToolSurfaceNames;
 
+use crate::background_task_error::BackgroundTaskError;
+
 /// Prefix returned by tool execution when the sandbox blocks a path.
 /// The agentic loop / permission manager can detect this to prompt the user
 /// for authorization instead of letting the model silently fall back to bash.
@@ -645,16 +647,16 @@ pub struct BgTaskOutputSnapshot {
     pub output_ref: String,
 }
 
-pub enum BgTaskCommand {
+pub(crate) enum BgTaskCommand {
     Kill {
         task_id: String,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), BackgroundTaskError>>,
     },
     GetOutputSince {
         task_id: String,
         offset: u64,
         max_bytes: usize,
-        reply: tokio::sync::oneshot::Sender<Result<BgTaskOutputSnapshot, String>>,
+        reply: tokio::sync::oneshot::Sender<Result<BgTaskOutputSnapshot, BackgroundTaskError>>,
     },
     List {
         reply: tokio::sync::oneshot::Sender<String>,
@@ -691,32 +693,44 @@ fn duration_ms_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn format_background_task_error(task_id: &str, error: &str) -> String {
-    if error.contains("no background shell with id") || error.contains("no background task with id")
-    {
-        format!("Background task not found: {task_id}")
-    } else if let Some(detail) = error.strip_prefix("output artifact missing:") {
-        format!(
-            "Read shell output {task_id}\nOutput artifact missing ·{}",
-            detail
-        )
-    } else {
-        format!("Background task output unavailable: {error}")
+fn format_background_task_error(error: &BackgroundTaskError) -> String {
+    match error {
+        BackgroundTaskError::NotFound { task_id } => {
+            format!("Background task not found: {task_id}")
+        }
+        BackgroundTaskError::OutputArtifactMissing { task_id, path } => format!(
+            "Read shell output {task_id}\nOutput artifact missing · {}",
+            path.display()
+        ),
+        BackgroundTaskError::OutputUnavailable { detail, .. } => {
+            format!("Background task output unavailable: {detail}")
+        }
+        BackgroundTaskError::AlreadyTerminated { .. }
+        | BackgroundTaskError::StaleHandle { .. }
+        | BackgroundTaskError::CannotStop { .. } => {
+            format!("Background task output unavailable: {error}")
+        }
     }
 }
 
-fn format_background_task_stop_error(task_id: &str, error: &str) -> String {
-    if error.contains("no background shell with id") || error.contains("no background task with id")
-    {
-        format!("Background task not found: {task_id}")
-    } else if error.contains("already terminated") || error.contains("already finished") {
-        format!("Background task {task_id} already finished.")
-    } else if error.contains("stale handle") {
-        format!(
+fn format_background_task_stop_error(error: &BackgroundTaskError) -> String {
+    match error {
+        BackgroundTaskError::NotFound { task_id } => {
+            format!("Background task not found: {task_id}")
+        }
+        BackgroundTaskError::AlreadyTerminated { task_id } => {
+            format!("Background task {task_id} already finished.")
+        }
+        BackgroundTaskError::StaleHandle { task_id } => format!(
             "Background task {task_id} cannot be stopped because it was restored from a previous session and no live process handle is available."
-        )
-    } else {
-        format!("Background task stop failed: {error}")
+        ),
+        BackgroundTaskError::CannotStop { task_id } => {
+            format!("Background task {task_id} cannot be stopped in its current state.")
+        }
+        BackgroundTaskError::OutputArtifactMissing { .. }
+        | BackgroundTaskError::OutputUnavailable { .. } => {
+            format!("Background task stop failed: {error}")
+        }
     }
 }
 
@@ -2554,7 +2568,7 @@ impl ToolExecutor {
         //    purely local plan-mode pivot. Stages
         //    `PermissionMode::Plan` on the pending slot so the host
         //    flips `perm_manager` at the next turn boundary, exactly
-        //    like Shift+Tab. No cloud row is created and no error
+        //    like an explicit local permission choice. No cloud row is created and no error
         //    bubbles up: a detached / unauthenticated CLI run still
         //    gets plan mode.
         //
@@ -2673,13 +2687,13 @@ impl ToolExecutor {
         //    server-side write guard depends on it; approving the
         //    plan must POST `/plans/{id}/exit-plan-mode` so the row
         //    flips to `refining` and the guard releases.
-        // 2. Shift+Tab / `/allow plan`: only flips the local
+        // 2. `/allow plan`: only flips the local
         //    `perm_manager` to `Plan`. There is no cloud row, no
         //    server-side guard, and the user expects exiting to be
         //    purely local — zero network calls.
         //
         // Conflating both broke session d9b5119f: the user pressed
-        // Shift+Tab, the model produced a plan, called exit_plan_mode,
+        // `/allow plan`, the model produced a plan, called exit_plan_mode,
         // and the cloud lookup returned "no active planning plan
         // found" because none was ever created.
         //
@@ -2716,7 +2730,7 @@ impl ToolExecutor {
     /// prerequisites for the cloud workflow are absent (no session,
     /// no token, no client, no row, network failure). The caller
     /// uses `None` as the signal to fall back to the purely local
-    /// Shift+Tab plan-mode flow.
+    /// `/allow plan` flow.
     async fn lookup_active_authoring_cloud_plan_id(&self) -> Option<String> {
         let session_id = self.active_session_id().filter(|sid| !sid.is_empty())?;
         let plan = self
@@ -2801,42 +2815,6 @@ impl ToolExecutor {
         }
     }
 
-    /// Mirror an approved plan into the session task board so the user
-    /// sees actionable step-by-step work items in the dashboard.
-    ///
-    /// Parses the plan markdown into a [`TaskPlan`], then calls the shared
-    /// [`astra_tools::plan_task_mirror::mirror_approved_plan_to_task_board`].
-    /// Failures are logged but do not block exiting plan mode — the plan
-    /// text is always available in the model's result message.
-    async fn mirror_approved_plan_to_task_board(&self, plan_markdown: &str) {
-        let Some(plan) =
-            astra_tools::plan_task_mirror::parse_plan_markdown_to_task_plan(plan_markdown)
-        else {
-            tracing::debug!("plan markdown had no numbered steps — skipping task board mirror");
-            return;
-        };
-        let Some(session_id) = self.active_session_id() else {
-            tracing::debug!("no active session — skipping plan task board mirror");
-            return;
-        };
-        if let Err(error) = astra_tools::plan_task_mirror::mirror_approved_plan_to_task_board(
-            &self.task_manager,
-            "cli",
-            &session_id,
-            &session_id,     // plan_id == session_id in CLI context
-            "approved plan", // goal
-            &plan,
-        )
-        .await
-        {
-            tracing::warn!(
-                error = %error,
-                step_count = plan.subtasks.len(),
-                "failed to mirror approved plan into task board"
-            );
-        }
-    }
-
     /// `exit_plan_mode` here is a permission-state pivot driven by
     /// the plan-review overlay. When the user approves, writes unlock
     /// and the host advances to the chosen execution mode.
@@ -2864,15 +2842,10 @@ impl ToolExecutor {
                 "write_file",
                 "str_replace",
             ]);
-            let plan_suffix = match plan_markdown {
-                Some(plan) if !plan.is_empty() => {
-                    // Mirror approved plan steps into the task board so the user
-                    // sees actionable step-by-step work items in the dashboard.
-                    self.mirror_approved_plan_to_task_board(plan).await;
-                    format!(" Plan recorded:\n{plan}")
-                }
-                _ => String::new(),
-            };
+            let plan_suffix = plan_markdown
+                .filter(|plan| !plan.is_empty())
+                .map(|plan| format!(" Plan recorded:\n{plan}"))
+                .unwrap_or_default();
             let mode_suffix = format!(" Next turn will run in {next_mode} mode.");
             format!("Exited plan mode; user approved.{mode_suffix}{plan_suffix}")
         } else {
@@ -2914,14 +2887,16 @@ impl ToolExecutor {
             .to_string();
 
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        if tx
-            .send(PlanReviewRequest {
+        if let Err(error) = crate::cli::chat_stream::enqueue_interactive_request(
+            &tx,
+            PlanReviewRequest {
                 plan_markdown: plan_body,
                 response_tx,
-            })
-            .is_err()
-        {
-            return Err("Error: exit_plan_mode overlay sink is closed.".to_string());
+            },
+        ) {
+            return Err(format!(
+                "Error: exit_plan_mode cannot open its review because {error}."
+            ));
         }
 
         match response_rx.await.unwrap_or(PlanReviewDecision::Cancelled) {
@@ -3404,7 +3379,7 @@ impl ToolExecutor {
                             return format_background_task_output(&task_id, offset, &snapshot);
                         }
                     }
-                    Ok(Err(e)) => return format_background_task_error(&task_id, &e),
+                    Ok(Err(e)) => return format_background_task_error(&e),
                     Err(BgTaskReplyError::Closed) => {
                         return "Error: background task registry not available".to_string();
                     }
@@ -3439,7 +3414,7 @@ impl ToolExecutor {
             }
             match await_bg_task_command_reply(rx, reply_timeout).await {
                 Ok(Ok(snapshot)) => format_background_task_output(&task_id, offset, &snapshot),
-                Ok(Err(e)) => format_background_task_error(&task_id, &e),
+                Ok(Err(e)) => format_background_task_error(&e),
                 Err(BgTaskReplyError::Closed) => {
                     "Error: background task registry not available".to_string()
                 }
@@ -3595,7 +3570,7 @@ impl ToolExecutor {
         let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
         match await_bg_task_command_reply(rx, reply_timeout).await {
             Ok(Ok(())) => format!("Background task {task_id} stopped."),
-            Ok(Err(e)) => format_background_task_stop_error(&task_id, &e),
+            Ok(Err(e)) => format_background_task_stop_error(&e),
             Err(BgTaskReplyError::Closed) => {
                 "Error: background task registry not available".to_string()
             }
@@ -5733,6 +5708,7 @@ mod tests {
         format_background_task_output_timeout, format_background_task_stop_error,
         git_stash_sub_action_args, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
     };
+    use crate::background_task_error::BackgroundTaskError;
     use crate::lock_recovery::LockRecovery;
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -5809,6 +5785,8 @@ mod tests {
             live_event_sink: None,
             trace_context: None,
             execution_metadata: None,
+            transcript_location:
+                astra_runtime::orchestration::AgentTranscriptLocation::LocalJournal,
         }
     }
 
@@ -6441,6 +6419,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_output_maps_typed_not_found_reply_without_text_classification() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands.clone());
+        let args = serde_json::json!({"task_id": "bg-shell-missing"});
+
+        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let output_fut = executor.task_output(&args);
+            tokio::pin!(output_fut);
+            loop {
+                tokio::select! {
+                    output = &mut output_fut => break output,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                        if let Some(BgTaskCommand::GetOutputSince { reply, .. }) =
+                            commands.lock_recover().pop()
+                        {
+                            let _ = reply.send(Err(BackgroundTaskError::NotFound {
+                                task_id: "bg-shell-missing".into(),
+                            }));
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("typed registry error should return promptly");
+
+        assert_eq!(output, "Background task not found: bg-shell-missing");
+    }
+
+    #[tokio::test]
     async fn task_stop_cloud_without_edge_runner_names_missing_runner() {
         let executor = test_executor().with_cloud("https://cloud.example", "token");
         let result = tokio::time::timeout(
@@ -6474,6 +6482,36 @@ mod tests {
             result.contains("Background task registry did not respond within"),
             "{result}"
         );
+    }
+
+    #[tokio::test]
+    async fn task_stop_maps_typed_terminal_reply_without_text_classification() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands.clone());
+        let args = serde_json::json!({"task_id": "bg-shell-1"});
+
+        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let stop_fut = executor.task_kill_bg(&args);
+            tokio::pin!(stop_fut);
+            loop {
+                tokio::select! {
+                    output = &mut stop_fut => break output,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                        if let Some(BgTaskCommand::Kill { reply, .. }) =
+                            commands.lock_recover().pop()
+                        {
+                            let _ = reply.send(Err(BackgroundTaskError::AlreadyTerminated {
+                                task_id: "bg-shell-1".into(),
+                            }));
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("typed registry error should return promptly");
+
+        assert_eq!(output, "Background task bg-shell-1 already finished.");
     }
 
     #[tokio::test]
@@ -6745,70 +6783,64 @@ mod tests {
 
     #[test]
     fn background_task_error_projection_names_unknown_id() {
-        let output = format_background_task_error(
-            "bg-shell-missing",
-            "no background shell with id 'bg-shell-missing'",
-        );
+        let output = format_background_task_error(&BackgroundTaskError::NotFound {
+            task_id: "bg-shell-missing".into(),
+        });
         assert_eq!(output, "Background task not found: bg-shell-missing");
     }
 
     #[test]
     fn background_task_error_projection_names_missing_output_artifact() {
-        let output = format_background_task_error(
-            "bg-shell-1",
-            "output artifact missing: /tmp/astra/bg-shell-1.stdout",
-        );
+        let output = format_background_task_error(&BackgroundTaskError::OutputArtifactMissing {
+            task_id: "bg-shell-1".into(),
+            path: PathBuf::from("/tmp/astra/bg-shell-1.stdout"),
+        });
 
-        assert!(output.contains("Read shell output bg-shell-1"), "{output}");
-        assert!(output.contains("Output artifact missing"), "{output}");
-        assert!(output.contains("/tmp/astra/bg-shell-1.stdout"), "{output}");
-        assert!(!output.contains("Background shell error"), "{output}");
-        assert!(!output.contains("No details returned"), "{output}");
+        assert_eq!(
+            output,
+            "Read shell output bg-shell-1\nOutput artifact missing · /tmp/astra/bg-shell-1.stdout"
+        );
     }
 
     #[test]
     fn background_task_error_projection_uses_task_vocabulary_for_generic_errors() {
-        let output = format_background_task_error("bg-shell-1", "permission denied");
+        let output = format_background_task_error(&BackgroundTaskError::OutputUnavailable {
+            task_id: "bg-shell-1".into(),
+            detail: "permission denied".into(),
+        });
 
         assert_eq!(
             output,
             "Background task output unavailable: permission denied"
         );
-        assert!(!output.contains("Background shell error"), "{output}");
-        assert!(!output.contains("No details returned"), "{output}");
     }
 
     #[test]
     fn background_task_stop_error_projection_names_unknown_id() {
-        let output = format_background_task_stop_error(
-            "bg-shell-missing",
-            "no background shell with id 'bg-shell-missing'",
-        );
+        let output = format_background_task_stop_error(&BackgroundTaskError::NotFound {
+            task_id: "bg-shell-missing".into(),
+        });
         assert_eq!(output, "Background task not found: bg-shell-missing");
     }
 
     #[test]
     fn background_task_stop_error_projection_names_terminal_race() {
-        let output = format_background_task_stop_error(
-            "bg-shell-1",
-            "background shell 'bg-shell-1' already terminated",
-        );
+        let output = format_background_task_stop_error(&BackgroundTaskError::AlreadyTerminated {
+            task_id: "bg-shell-1".into(),
+        });
         assert_eq!(output, "Background task bg-shell-1 already finished.");
     }
 
     #[test]
     fn background_task_stop_error_projection_names_stale_handle() {
-        let output = format_background_task_stop_error(
-            "bg-shell-1",
-            "background shell 'bg-shell-1' has a stale handle",
-        );
+        let output = format_background_task_stop_error(&BackgroundTaskError::StaleHandle {
+            task_id: "bg-shell-1".into(),
+        });
 
-        assert!(
-            output.contains("Background task bg-shell-1 cannot be stopped"),
-            "{output}"
+        assert_eq!(
+            output,
+            "Background task bg-shell-1 cannot be stopped because it was restored from a previous session and no live process handle is available."
         );
-        assert!(output.contains("no live process handle"), "{output}");
-        assert!(!output.contains("Background task stop failed"), "{output}");
     }
 
     #[tokio::test]

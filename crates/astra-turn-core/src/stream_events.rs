@@ -3,8 +3,6 @@ use serde_json::{Map, Value};
 use astra_services::multi_agent::EdgeDispatchIdentity;
 use astra_thin_client::ApprovalKind;
 
-use crate::tool::args::repair::try_repair_tool_args;
-
 pub fn build_stream_error_event(message: &str, code: &str, retryable: bool) -> Map<String, Value> {
     let mut event = Map::from_iter([
         ("type".to_string(), Value::String("error".to_string())),
@@ -195,12 +193,7 @@ pub fn build_edge_tool_call_event(tool_call: &Map<String, Value>) -> Map<String,
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        Value::Object(Map::from_iter([(
-            "_parse_error".to_string(),
-            Value::String(
-                "Your output was truncated by max_tokens before the tool_call arguments were complete. The JSON is cut off and cannot be parsed. Please retry with a shorter approach — for example, write smaller sections of code at a time instead of the entire file at once.".to_string(),
-            ),
-        )]))
+        invalid_tool_arguments("truncated")
     } else {
         let raw_arguments = tool_call
             .get("function")
@@ -209,20 +202,8 @@ pub fn build_edge_tool_call_event(tool_call: &Map<String, Value>) -> Map<String,
             .cloned()
             .unwrap_or_else(|| Value::String("{}".to_string()));
         match raw_arguments {
-            Value::String(text) => match serde_json::from_str::<Value>(&text) {
-                Ok(value) => value,
-                Err(_) => try_repair_tool_args(tool_name, &text)
-                    .map(Value::Object)
-                    .unwrap_or_else(|| {
-                        Value::Object(Map::from_iter([(
-                            "_parse_error".to_string(),
-                            Value::String(format!(
-                                "Malformed arguments JSON: {}",
-                                text.chars().take(200).collect::<String>()
-                            )),
-                        )]))
-                    }),
-            },
+            Value::String(text) => serde_json::from_str::<Value>(&text)
+                .unwrap_or_else(|_| invalid_tool_arguments("invalid_json")),
             other => other,
         }
     };
@@ -239,6 +220,20 @@ pub fn build_edge_tool_call_event(tool_call: &Map<String, Value>) -> Map<String,
         ("name".to_string(), Value::String(tool_name.to_string())),
         ("arguments".to_string(), arguments),
     ])
+}
+
+/// A malformed tool call is data about a failed model-to-runtime boundary,
+/// never a best-effort request to execute. Keep the evidence structured and
+/// omit the raw arguments: they can be large, secret-bearing, or themselves
+/// confusing prompt material on the next model turn.
+fn invalid_tool_arguments(kind: &str) -> Value {
+    Value::Object(Map::from_iter([(
+        "_parse_error".to_string(),
+        serde_json::json!({
+            "kind": kind,
+            "executed": false,
+        }),
+    )]))
 }
 
 /// §5.5 `approval_required` — `request_id` matches `POST /approval/respond` ledger keys.
@@ -828,7 +823,26 @@ mod tests {
         ]);
         let ev = build_edge_tool_call_event(&tc);
         let args = ev.get("arguments").and_then(Value::as_object).unwrap();
-        assert!(args.contains_key("_parse_error"));
+        assert_eq!(args["_parse_error"]["kind"], "truncated");
+        assert_eq!(args["_parse_error"]["executed"], false);
+    }
+
+    #[test]
+    fn edge_tool_call_invalid_json_is_unexecuted_structured_evidence() {
+        let raw = r#"{/"action/": /"start/", /"target_count/": 3}"#;
+        let tc = Map::from_iter([
+            ("id".to_string(), Value::String("c1".into())),
+            (
+                "function".to_string(),
+                json!({"name": "agent_fanout", "arguments": raw}),
+            ),
+        ]);
+
+        let ev = build_edge_tool_call_event(&tc);
+        let parse_error = &ev["arguments"]["_parse_error"];
+        assert_eq!(parse_error["kind"], "invalid_json");
+        assert_eq!(parse_error["executed"], false);
+        assert_ne!(ev["arguments"], Value::String(raw.to_string()));
     }
 
     #[test]

@@ -2,12 +2,12 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Widget,
 };
 
-use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
+use super::view::{BottomPaneView, CancellationEvent, ViewCompletion, ViewResult};
 
 pub(crate) struct SelectionItem {
     pub name: String,
@@ -22,13 +22,11 @@ pub(crate) struct ListSelectionView {
     selected: usize,
     filter: String,
     completed: bool,
-    accepted_name: Option<String>,
-    /// Optional prefix prepended to the emitted result string so
-    /// the outer loop can tell two instances of this picker apart
-    /// (e.g. model selection vs thinking-mode selection) without
-    /// a custom view subclass per use case. Consumers strip the
-    /// prefix with `strip_prefix` to dispatch.
-    result_prefix: String,
+    /// Semantic outcomes indexed by the immutable source order. Filtering and
+    /// rendering can change positions, but acceptance always resolves through
+    /// the original row index rather than its display text.
+    results: Vec<ViewResult>,
+    accepted_result: Option<ViewResult>,
 }
 
 impl ListSelectionView {
@@ -43,27 +41,27 @@ impl ListSelectionView {
             selected: initial_sel,
             filter: String::new(),
             completed: false,
-            accepted_name: None,
-            result_prefix: String::new(),
+            results: Vec::new(),
+            accepted_result: None,
         }
     }
 
-    /// Stamp a sentinel prefix on the emitted result.  The sentinel
-    /// lets the outer loop route a generic picker to a specific
-    /// handler (model selection, thinking-mode selection, …)
-    /// without per-use subclasses.
-    pub fn with_result_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.result_prefix = prefix.into();
+    /// Attach one semantic outcome to every immutable source row. A picker
+    /// without a complete mapping would close without a meaningful action, so
+    /// reject that programmer error at construction time.
+    pub fn with_results(mut self, results: Vec<ViewResult>) -> Self {
+        assert_eq!(
+            results.len(),
+            self.items.len(),
+            "each selectable row must carry a typed outcome"
+        );
+        self.results = results;
         self
     }
 
     pub fn with_footer_hint(mut self, hint: impl Into<String>) -> Self {
         self.footer_hint = Some(hint.into());
         self
-    }
-
-    pub fn accepted_name(&self) -> Option<&str> {
-        self.accepted_name.as_deref()
     }
 
     fn filtered_items(&self) -> Vec<(usize, &SelectionItem)> {
@@ -81,9 +79,14 @@ impl ListSelectionView {
 
     fn accept(&mut self) {
         let filtered = self.filtered_items();
-        if let Some((_, item)) = filtered.get(self.selected) {
-            self.accepted_name = Some(item.name.clone());
-            self.completed = true;
+        let accepted = filtered
+            .get(self.selected)
+            .map(|(source_index, _)| *source_index);
+        if let Some(source_index) = accepted {
+            if let Some(result) = self.results.get(source_index).cloned() {
+                self.accepted_result = Some(result);
+                self.completed = true;
+            }
         }
     }
 }
@@ -96,7 +99,8 @@ impl BottomPaneView for ListSelectionView {
             return;
         }
 
-        let dim = Style::default().fg(Color::DarkGray);
+        let theme = crate::tui::theme::current();
+        let dim = Style::default().fg(theme.dim);
         let mut y = area.y;
 
         // Header
@@ -129,7 +133,8 @@ impl BottomPaneView for ListSelectionView {
             let current_tag = if item.is_current { " (current)" } else { "" };
 
             let sel_style = Style::default()
-                .fg(Color::Green)
+                .fg(theme.selected_fg)
+                .bg(theme.selected_bg)
                 .add_modifier(Modifier::BOLD);
 
             let mut spans = if is_sel {
@@ -236,15 +241,8 @@ impl BottomPaneView for ListSelectionView {
 
     fn completion(&self) -> Option<ViewCompletion> {
         if self.completed {
-            let result = self.accepted_name.clone().map(|name| {
-                if self.result_prefix.is_empty() {
-                    name
-                } else {
-                    format!("{}{}", self.result_prefix, name)
-                }
-            });
             Some(ViewCompletion {
-                result,
+                result: self.accepted_result.clone(),
                 reopen: None,
             })
         } else {
@@ -256,7 +254,7 @@ impl BottomPaneView for ListSelectionView {
 #[cfg(test)]
 mod tests {
     use super::{ListSelectionView, SelectionItem};
-    use crate::tui::bottom_pane::view::BottomPaneView;
+    use crate::tui::bottom_pane::view::{BottomPaneView, ViewResult};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -277,27 +275,37 @@ mod tests {
         let mut view = ListSelectionView::new(
             vec![
                 SelectionItem {
-                    name: "deepseek-v4-flash".into(),
+                    name: "Fast general work".into(),
                     description: None,
                     is_current: false,
                 },
                 SelectionItem {
-                    name: "deepseek-v4-flash-anthropic".into(),
+                    name: "Research (Anthropic)".into(),
                     description: None,
                     is_current: false,
                 },
             ],
             Some("Select model".into()),
-        );
+        )
+        .with_results(vec![
+            ViewResult::Model {
+                name: "deepseek-v4-flash".into(),
+            },
+            ViewResult::Model {
+                name: "deepseek-v4-flash-anthropic".into(),
+            },
+        ]);
 
-        for ch in "-anthropic".chars() {
+        for ch in "research".chars() {
             view.handle_key(key(KeyCode::Char(ch)));
         }
         view.handle_key(key(KeyCode::Enter));
 
         assert_eq!(
-            view.accepted_name.as_deref(),
-            Some("deepseek-v4-flash-anthropic")
+            view.completion().and_then(|completion| completion.result),
+            Some(ViewResult::Model {
+                name: "deepseek-v4-flash-anthropic".into(),
+            })
         );
     }
 }

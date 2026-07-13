@@ -26,6 +26,13 @@ use super::Timeline;
 const MIN_SPLIT_WIDTH: u16 = 80;
 pub(crate) const MAX_VISIBLE_ROWS: u16 = 18;
 
+/// Tool success and failure are the only semantic states that own a colored
+/// timeline bar. Keeping the mapping here makes the summary and trace views
+/// agree across truecolor and ANSI terminals.
+fn tool_status_color(ok: bool, theme: &crate::tui::theme::Theme) -> Color {
+    if ok { theme.success } else { theme.error }
+}
+
 pub(crate) fn desired_height(tl: &Timeline) -> u16 {
     if tl.is_empty() {
         return 3;
@@ -45,9 +52,10 @@ pub(crate) fn render(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         return;
     }
 
+    let theme = crate::tui::theme::current();
     let outer = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(theme.gutter_frozen))
         .title(title_line(tl));
     let inner = outer.inner(area);
     outer.render(area, buf);
@@ -90,7 +98,8 @@ fn title_line(tl: &Timeline) -> Line<'static> {
 }
 
 fn render_list(tl: &Timeline, area: Rect, buf: &mut Buffer) {
-    let dim = Style::default().fg(Color::DarkGray);
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
     let rows = area.height.min(MAX_VISIBLE_ROWS) as usize;
     let selected = tl.selected().unwrap_or(0);
     let turns = tl.turns();
@@ -101,7 +110,6 @@ fn render_list(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         let absolute = start + idx;
         let is_sel = absolute == selected;
 
-        let theme = crate::tui::theme::current();
         let gutter = if is_sel {
             Span::styled("▌ ", Style::default().fg(theme.gutter))
         } else {
@@ -168,8 +176,9 @@ fn render_detail(tl: &Timeline, area: Rect, buf: &mut Buffer) {
     let Some(t) = tl.selected_turn() else {
         return;
     };
-    let dim = Style::default().fg(Color::DarkGray);
-    let label = Style::default().fg(crate::tui::theme::current().accent);
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let label = Style::default().fg(theme.accent);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -210,11 +219,11 @@ fn render_detail(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             "error",
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         )));
         lines.push(Line::from(Span::styled(
             err.clone(),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         )));
     }
     if let Some(ref p) = t.user_preview {
@@ -272,18 +281,19 @@ fn fmt_tokens_u64(n: u64) -> String {
 
 fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
     let Some(t) = tl.selected_turn() else { return };
-    let dim = Style::default().fg(Color::DarkGray);
-    let label = Style::default().fg(crate::tui::theme::current().accent);
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let label = Style::default().fg(theme.accent);
     let bold = Style::default().add_modifier(Modifier::BOLD);
 
     let title = format!(" Turn {} · trace ", t.turn);
     let outer = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(theme.gutter_frozen))
         .title(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(crate::tui::theme::current().accent)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = outer.inner(area);
@@ -370,13 +380,13 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         lines.push(Line::from(vec![
             Span::styled("    LLM      ", label),
             Span::styled(format!("{:>5}ms {:>3}% ", llm_time_ms, llm_pct), dim),
-            Span::styled("█".repeat(llm_bar_len), Style::default().fg(Color::Blue)),
+            Span::styled("█".repeat(llm_bar_len), Style::default().fg(theme.accent)),
         ]));
 
         for tc in &t.tool_calls {
             let pct = (tc.ms as f64 / total_ms * 100.0).min(100.0) as usize;
             let bar_len = (pct * bar_width / 100).max(1);
-            let bar_color = if tc.ok { Color::Green } else { Color::Red };
+            let bar_color = tool_status_color(tc.ok, &theme);
             let name: String = tc.name.chars().take(10).collect();
             lines.push(Line::from(vec![
                 Span::styled(format!("    {:<10} ", name), label),
@@ -410,7 +420,7 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
             lines.push(Line::from(vec![
                 Span::styled(format!("    [{:>5}ms] ", offset + ttft), dim),
                 Span::styled("│  ", dim),
-                Span::styled("first token", Style::default().fg(Color::Yellow)),
+                Span::styled("first token", Style::default().fg(theme.warn)),
             ]));
         }
         offset += llm_time_ms;
@@ -425,7 +435,7 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
             let is_last = i == t.tool_calls.len() - 1;
             let branch = if is_last { "└─ " } else { "├─ " };
             let status = if tc.ok { "✓" } else { "✗" };
-            let status_color = if tc.ok { Color::Green } else { Color::Red };
+            let status_color = tool_status_color(tc.ok, &theme);
 
             let tool_offset = if has_real_offsets {
                 tc.start_offset_ms.unwrap_or(offset)
@@ -450,10 +460,7 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
                 Span::styled(format!("    [{:>5}ms] ", tool_offset), dim),
                 Span::styled(branch, dim),
                 Span::styled(format!("{status} "), Style::default().fg(status_color)),
-                Span::styled(
-                    display,
-                    Style::default().fg(crate::tui::theme::current().accent),
-                ),
+                Span::styled(display, Style::default().fg(theme.accent)),
                 Span::styled(format!(" {}ms{round_tag}{par_tag}", tc.ms), dim),
             ]));
 
@@ -463,7 +470,7 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
                 lines.push(Line::from(vec![
                     Span::styled("             ", dim),
                     Span::styled(sub, dim),
-                    Span::styled(preview, Style::default().fg(Color::Red)),
+                    Span::styled(preview, Style::default().fg(theme.error)),
                 ]));
             }
 
@@ -504,7 +511,7 @@ fn render_drill(tl: &Timeline, area: Rect, buf: &mut Buffer) {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             format!("  Error: {err}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         )));
     }
 
@@ -660,5 +667,18 @@ mod tests {
     #[test]
     fn short_time_extracts_hhmmss() {
         assert_eq!(short_time("2024-01-15T10:23:45Z"), "10:23:45");
+    }
+
+    #[test]
+    fn tool_bars_keep_success_and_failure_in_their_semantic_theme_slots() {
+        for theme in [
+            crate::tui::theme::Theme::dark(),
+            crate::tui::theme::Theme::dark_ansi(),
+            crate::tui::theme::Theme::light_ansi(),
+        ] {
+            assert_eq!(tool_status_color(true, &theme), theme.success);
+            assert_eq!(tool_status_color(false, &theme), theme.error);
+            assert_ne!(theme.success, theme.error);
+        }
     }
 }

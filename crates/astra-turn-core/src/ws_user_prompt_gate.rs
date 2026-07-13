@@ -12,7 +12,8 @@ use std::time::Duration;
 use crate::pipeline_metrics::MetricsRegistry;
 use astra_services::InteractionStatus;
 use astra_services::session_journal::{
-    AskUserJournalResponse, JournalEvent, JournalWriter, find_latest_ask_user_response_for_run,
+    AskUserJournalResponse, AskUserResponseAppendOutcome, JournalEvent, JournalWriter,
+    append_ask_user_response_for_run_if_absent, find_latest_ask_user_response_for_run,
 };
 use astra_tools::{AskUserAnswers, AskUserDecision, AskUserGate, AskUserPrompt};
 use async_trait::async_trait;
@@ -40,6 +41,33 @@ pub struct UserPromptOutboundRequest {
     pub session_id: String,
     pub run_id: String,
     pub prompt: AskUserPrompt,
+}
+
+/// Durable identity for one ask-user interaction.  Delivery transports are
+/// optional projections; this journal identity remains authoritative across
+/// reconnects and Server Only execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPromptJournalContext {
+    pub session_id: String,
+    pub run_id: String,
+    pub turn: Option<u32>,
+}
+
+impl UserPromptJournalContext {
+    pub fn new(session_id: String, run_id: String, turn: Option<u32>) -> Self {
+        Self {
+            session_id,
+            run_id,
+            turn,
+        }
+    }
+}
+
+/// The durable outcome observed when an ask-user deadline closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserPromptDeadlineClose {
+    TimedOut,
+    Resolved(AskUserDecision),
 }
 
 /// [`AskUserGate`] implementation backed by WebSocket messaging.
@@ -217,36 +245,67 @@ fn decision_from_journal_response(
     }
 }
 
-fn append_ask_user_prompted_journal_event(
-    session_id: &str,
-    run_id: &str,
-    turn: Option<u32>,
+/// A same-pod ledger value is only a delivery acceleration.  Turn it into the
+/// same immutable journal fact before returning it to the tool loop so a
+/// process crash after the wake-up cannot erase the user's answer.
+fn persist_ledger_user_prompt_decision(
+    context: &UserPromptJournalContext,
+    request_id: &str,
+    user_id: &str,
+    decision: AskUserDecision,
+) -> AskUserDecision {
+    let (status, answers) = match &decision {
+        AskUserDecision::Submitted(answers) => match serde_json::to_value(answers) {
+            Ok(value) => ("submitted", Some(value)),
+            Err(error) => {
+                return AskUserDecision::Error(format!(
+                    "failed to serialize user prompt answers: {error}"
+                ));
+            }
+        },
+        AskUserDecision::Cancelled => ("cancelled", None),
+        AskUserDecision::Timeout => ("timeout", None),
+        AskUserDecision::Error(_) => return decision,
+    };
+    match append_ask_user_response_for_run_if_absent(
+        &context.session_id,
+        context.turn,
+        request_id,
+        &context.run_id,
+        status,
+        answers,
+    ) {
+        Ok(AskUserResponseAppendOutcome::Appended | AskUserResponseAppendOutcome::Idempotent) => {
+            decision
+        }
+        Ok(AskUserResponseAppendOutcome::Conflict(existing)) => {
+            decision_from_journal_response(existing, &context.session_id, user_id).unwrap_or(
+                AskUserDecision::Error(
+                    "conflicting user prompt response is not terminal".to_string(),
+                ),
+            )
+        }
+        Err(error) => AskUserDecision::Error(format!(
+            "failed to record user prompt response durably: {error}"
+        )),
+    }
+}
+
+pub fn persist_user_prompt_required(
+    context: &UserPromptJournalContext,
     request_id: &str,
     prompt: &AskUserPrompt,
-) -> bool {
+) -> std::io::Result<()> {
     let prompt_json = serde_json::to_value(prompt).unwrap_or(Value::Null);
-    match JournalWriter::new(session_id).and_then(|writer| {
+    JournalWriter::new(&context.session_id).and_then(|writer| {
         writer.append(&JournalEvent::ask_user_prompted(
-            Some(session_id),
-            turn,
+            Some(&context.session_id),
+            context.turn,
             request_id,
-            Some(run_id),
+            Some(&context.run_id),
             prompt_json,
         ))
-    }) {
-        Ok(()) => true,
-        Err(error) => {
-            tracing::warn!(
-                target: "astra_turn_core::ws_user_prompt_gate",
-                session_id = %session_id,
-                run_id = %run_id,
-                request_id = %request_id,
-                error = %error,
-                "failed to persist ask_user prompted journal event"
-            );
-            false
-        }
-    }
+    })
 }
 
 async fn evict_late_user_prompt_response(
@@ -274,15 +333,14 @@ async fn evict_late_user_prompt_response(
     }
 }
 
-async fn wait_user_prompt_response(
+pub async fn wait_for_durable_user_prompt_response(
     ledger: &Arc<TokioMutex<HashMap<String, Value>>>,
     user_id: &str,
-    session_id: &str,
-    run_id: &str,
+    context: &UserPromptJournalContext,
     request_id: &str,
     timeout: Duration,
 ) -> Option<AskUserDecision> {
-    let key = user_prompt_callback_key(user_id, session_id, run_id, request_id);
+    let key = user_prompt_callback_key(user_id, &context.session_id, &context.run_id, request_id);
     let started = std::time::Instant::now();
     let mut last_journal_lookup: Option<std::time::Instant> = None;
     loop {
@@ -291,6 +349,8 @@ async fn wait_user_prompt_response(
             guard.remove(&key)
         } {
             let decision = decision_from_user_prompt_value(value);
+            let decision =
+                persist_ledger_user_prompt_decision(context, request_id, user_id, decision);
             record_wait_metric("ledger", decision_outcome_label(&decision));
             return Some(decision);
         }
@@ -300,9 +360,13 @@ async fn wait_user_prompt_response(
             .unwrap_or(true)
         {
             last_journal_lookup = Some(std::time::Instant::now());
-            match find_latest_ask_user_response_for_run(session_id, request_id, run_id) {
+            match find_latest_ask_user_response_for_run(
+                &context.session_id,
+                request_id,
+                &context.run_id,
+            ) {
                 Ok(Some(response)) => {
-                    match decision_from_journal_response(response, session_id, user_id) {
+                    match decision_from_journal_response(response, &context.session_id, user_id) {
                         Some(decision) => {
                             record_journal_lookup_metric("hit");
                             record_wait_metric("journal", decision_outcome_label(&decision));
@@ -320,7 +384,7 @@ async fn wait_user_prompt_response(
                     record_journal_lookup_metric("error");
                     tracing::warn!(
                         target: "astra_turn_core::ws_user_prompt_gate",
-                        session_id = %session_id,
+                        session_id = %context.session_id,
                         request_id = %request_id,
                         error = %error,
                         "ask_user journal replay lookup failed"
@@ -338,6 +402,43 @@ async fn wait_user_prompt_response(
     }
 }
 
+/// Atomically make an unanswered prompt terminal at its deadline.  A late
+/// callback cannot overwrite the timeout; if a callback won the race, return
+/// its existing durable outcome instead.
+pub fn close_user_prompt_at_deadline(
+    context: &UserPromptJournalContext,
+    request_id: &str,
+    user_id: &str,
+) -> std::io::Result<UserPromptDeadlineClose> {
+    if let Some(response) =
+        find_latest_ask_user_response_for_run(&context.session_id, request_id, &context.run_id)?
+    {
+        return Ok(UserPromptDeadlineClose::Resolved(
+            decision_from_journal_response(response, &context.session_id, user_id).unwrap_or(
+                AskUserDecision::Error("ask_user response is still pending at deadline".into()),
+            ),
+        ));
+    }
+
+    match append_ask_user_response_for_run_if_absent(
+        &context.session_id,
+        context.turn,
+        request_id,
+        &context.run_id,
+        "timeout",
+        None,
+    )? {
+        AskUserResponseAppendOutcome::Appended | AskUserResponseAppendOutcome::Idempotent => {
+            Ok(UserPromptDeadlineClose::TimedOut)
+        }
+        AskUserResponseAppendOutcome::Conflict(response) => Ok(UserPromptDeadlineClose::Resolved(
+            decision_from_journal_response(response, &context.session_id, user_id).unwrap_or(
+                AskUserDecision::Error("invalid ask_user response at deadline".into()),
+            ),
+        )),
+    }
+}
+
 #[async_trait]
 impl AskUserGate for WebSocketUserPromptGate {
     async fn request_questionnaire(
@@ -352,18 +453,29 @@ impl AskUserGate for WebSocketUserPromptGate {
             "prompt": prompt,
         });
 
+        let context =
+            UserPromptJournalContext::new(self.session_id.clone(), self.run_id.clone(), self.turn);
+        match persist_user_prompt_required(&context, request_id, prompt) {
+            Ok(()) => record_journal_write_metric("prompted", "ok"),
+            Err(error) => {
+                record_journal_write_metric("prompted", "error");
+                tracing::warn!(
+                    target: "astra_turn_core::ws_user_prompt_gate",
+                    session_id = %self.session_id,
+                    run_id = %self.run_id,
+                    request_id = %request_id,
+                    error = %error,
+                    "failed to persist ask_user prompted journal event"
+                );
+                return AskUserDecision::Error(
+                    "ask_user prompt could not be recorded durably".into(),
+                );
+            }
+        }
         if self.request_tx.send(request).await.is_err() {
             record_wait_metric("channel", "send_error");
             return AskUserDecision::Error("WebSocket connection closed".into());
         }
-        let prompt_write_ok = append_ask_user_prompted_journal_event(
-            &self.session_id,
-            &self.run_id,
-            self.turn,
-            request_id,
-            prompt,
-        );
-        record_journal_write_metric("prompted", if prompt_write_ok { "ok" } else { "error" });
 
         let key =
             user_prompt_callback_key(&self.user_id, &self.session_id, &self.run_id, request_id);
@@ -371,11 +483,10 @@ impl AskUserGate for WebSocketUserPromptGate {
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(self.timeout);
-        match wait_user_prompt_response(
+        match wait_for_durable_user_prompt_response(
             &self.edge_callback_ledger,
             &self.user_id,
-            &self.session_id,
-            &self.run_id,
+            &context,
             request_id,
             timeout,
         )
@@ -384,7 +495,13 @@ impl AskUserGate for WebSocketUserPromptGate {
             Some(decision) => decision,
             None => {
                 evict_late_user_prompt_response(&self.edge_callback_ledger, &key, request_id).await;
-                AskUserDecision::Timeout
+                match close_user_prompt_at_deadline(&context, request_id, &self.user_id) {
+                    Ok(UserPromptDeadlineClose::TimedOut) => AskUserDecision::Timeout,
+                    Ok(UserPromptDeadlineClose::Resolved(decision)) => decision,
+                    Err(error) => AskUserDecision::Error(format!(
+                        "ask_user deadline could not be closed durably: {error}"
+                    )),
+                }
             }
         }
     }
@@ -518,6 +635,25 @@ mod tests {
             )
             .await;
         assert_eq!(decision, AskUserDecision::Timeout);
+        let timeout =
+            find_latest_ask_user_response_for_run("sess-user-prompt", "req-2", "run-user-prompt")
+                .unwrap()
+                .expect("timeout must be an immutable durable interaction outcome");
+        assert_eq!(timeout.status, "timeout");
+        let late = append_ask_user_response_for_run_if_absent(
+            "sess-user-prompt",
+            Some(3),
+            "req-2",
+            "run-user-prompt",
+            "submitted",
+            Some(json!({"answers": []})),
+        )
+        .unwrap();
+        assert!(matches!(
+            late,
+            AskUserResponseAppendOutcome::Conflict(AskUserJournalResponse { status, .. })
+                if status == "timeout"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

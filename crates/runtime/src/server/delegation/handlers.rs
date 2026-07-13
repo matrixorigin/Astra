@@ -378,6 +378,7 @@ mod tests {
 
     fn fan_out_request(run_id: &str) -> DelegationRequest {
         DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "delegation-1".into(),
             parent_run_id: run_id.into(),
             task: "delegate this run".into(),

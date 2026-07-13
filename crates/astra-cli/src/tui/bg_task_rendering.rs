@@ -2,19 +2,17 @@
 //!
 //! TUI rendering layer: row constructors, XML output, and view orchestration.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use super::bg_task_proxy::{
-    BackgroundTaskOutputSystemMessage, background_task_output_snapshot,
-    background_task_output_snapshot_for_local_agent,
+    background_task_output_snapshot, background_task_output_snapshot_for_local_agent,
     background_task_output_snapshot_for_local_agent_projection,
     background_task_rejected_fanout_slot_id, background_task_rejected_fanout_slot_label,
-    format_background_task_output_read_error, format_background_task_output_system_message,
-    format_background_task_output_system_message_for_kind,
-    format_background_task_stop_error_system_message, is_background_task_terminal_race_error,
+    format_background_task_output_read_error, format_background_task_stop_error_system_message,
 };
 use super::bottom_pane::BottomPane;
 use super::frame_requester::FrameRequester;
+use crate::background_task_error::BackgroundTaskError;
 
 pub(crate) fn background_task_rows(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
@@ -28,11 +26,15 @@ pub(crate) fn background_task_rows(
                 handle.projected_status().to_string(),
                 handle.live_control,
                 handle.elapsed_ms(),
+                handle.no_recent_output_ms(),
                 handle.started_at_ms,
                 handle.ended_at_ms,
                 handle.description.clone(),
                 handle.exit_code,
                 handle.terminal_reason.clone(),
+                handle.output_tail().map(str::to_string),
+                handle.output_error().cloned(),
+                handle.observed_output_bytes(),
                 format!(
                     "stdout: {} · stderr: {}",
                     handle.stdout_path.display(),
@@ -50,35 +52,23 @@ pub(crate) fn background_task_rows(
                 status,
                 live_control,
                 elapsed_ms,
+                no_recent_output_ms,
                 started_at_ms,
                 ended_at_ms,
                 description,
                 exit_code,
                 terminal_reason,
+                output_tail,
+                output_error,
+                total_bytes,
                 output_ref,
             )| {
-                let (output_tail, total_bytes, total_lines, output_offset) = background_registry
-                    .get_combined_output_stats(&id, 8192)
-                    .map_or_else(
-                        |error| {
-                            (
-                                Some(format_background_task_output_read_error(&id, &error)),
-                                None,
-                                None,
-                                None,
-                            )
-                        },
-                        |(output, total, lines)| {
-                            let offset = total.saturating_sub(output.len() as u64);
-                            let tail = output.trim_end().to_string();
-                            (
-                                Some(tail).filter(|tail| !tail.is_empty()),
-                                Some(total),
-                                Some(lines),
-                                Some(offset),
-                            )
-                        },
-                    );
+                let output_error = output_error
+                    .as_ref()
+                    .map(format_background_task_output_read_error);
+                let total_bytes = output_error.is_none().then_some(total_bytes);
+                let output_tail =
+                    output_error.or_else(|| output_tail.filter(|tail| !tail.is_empty()));
                 super::bottom_pane::background_task_view::BackgroundTaskRow::shell(
                     id,
                     status,
@@ -89,7 +79,8 @@ pub(crate) fn background_task_rows(
                     total_bytes,
                 )
                 .with_live_control(background_task_live_control_state(live_control))
-                .with_output_stats(output_offset, total_lines)
+                .with_no_recent_output(no_recent_output_ms)
+                .with_output_stats(None, None)
                 .with_terminal(exit_code, terminal_reason)
                 .with_timing(Some(started_at_ms), ended_at_ms)
             },
@@ -288,14 +279,19 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
     };
 
     let elapsed_ms = agent
-        .started_at
-        .elapsed()
+        .ended_at
+        .unwrap_or_else(std::time::SystemTime::now)
+        .duration_since(agent.started_at)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
     let started_at_ms = agent
         .started_at
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
+        .map(|duration| duration.as_millis() as u64);
+    let ended_at_ms = agent
+        .ended_at
+        .and_then(|ended_at| ended_at.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis() as u64);
     let total_bytes = tail.as_ref().map(|tail| tail.len() as u64);
     let total_lines = tail.as_ref().map(|tail| tail.lines().count() as u64);
@@ -312,7 +308,7 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
     )
     .with_output_stats(None, total_lines)
     .with_terminal(None, terminal_reason)
-    .with_timing(started_at_ms, None);
+    .with_timing(started_at_ms, ended_at_ms);
 
     Some(if let Some(slot) = agent.fanout_slot.as_ref() {
         row.with_fanout(background_task_fanout_membership(
@@ -387,27 +383,32 @@ pub(crate) async fn background_task_rows_with_agents(
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
 ) -> Vec<super::bottom_pane::background_task_view::BackgroundTaskRow> {
+    let snapshot = super::local_agent_snapshot::LocalAgentSnapshot::capture(agent_spawner).await;
+    background_task_rows_with_agent_snapshot(background_registry, &snapshot, restored_local_agents)
+}
+
+pub(crate) fn background_task_rows_with_agent_snapshot(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    snapshot: &super::local_agent_snapshot::LocalAgentSnapshot,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+) -> Vec<super::bottom_pane::background_task_view::BackgroundTaskRow> {
     let mut rows = background_task_rows(background_registry);
     let mut live_agent_ids = std::collections::HashSet::new();
-    if let Some(spawner) = agent_spawner {
-        let fanout_groups = spawner.list_fanout_groups().await;
-        let fanout_titles = fanout_groups
-            .iter()
-            .map(|group| (group.group_id.clone(), group.title.clone()))
-            .collect::<BTreeMap<_, _>>();
-        for agent in spawner.get_agent_history(None).await {
+    if snapshot.available {
+        let fanout_titles = snapshot.fanout_titles();
+        for agent in &snapshot.agents {
             let fanout_title = agent
                 .fanout_slot
                 .as_ref()
                 .and_then(|slot| fanout_titles.get(&slot.group_id).map(String::as_str));
             if let Some(row) =
-                background_task_row_for_local_agent_with_fanout_title(&agent, fanout_title)
+                background_task_row_for_local_agent_with_fanout_title(agent, fanout_title)
             {
                 live_agent_ids.insert(row.id.clone());
                 rows.push(row);
             }
         }
-        for group in &fanout_groups {
+        for group in &snapshot.fanout_groups {
             rows.extend(
                 group
                     .slots
@@ -612,56 +613,40 @@ async fn reveal_background_task_view_rows_inner(
     true
 }
 
-pub(crate) async fn try_dispatch_background_task_stop_sentinel(
-    sentinel: &str,
+pub(crate) async fn dispatch_background_task_stop(
+    task_id: &str,
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     chat_widget: &mut super::chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
-) -> bool {
-    let Some(task_id) = super::bottom_pane::background_task_view::parse_stop_sentinel(sentinel)
-    else {
-        return false;
-    };
+) {
     let task_id = task_id.to_string();
-    match background_registry.kill(&task_id) {
-        Ok(()) => {
+    match stop_background_task_with_agents(
+        background_registry,
+        agent_spawner.as_ref(),
+        restored_local_agents,
+        &task_id,
+    )
+    .await
+    {
+        Ok(BackgroundTaskStopTarget::Shell) => {
             chat_widget.commit_system(super::history_cell::system::SystemCell::info(format!(
                 "Stopping background task {task_id}."
             )));
         }
+        Ok(BackgroundTaskStopTarget::LocalAgent) => {
+            chat_widget.commit_system(super::history_cell::system::SystemCell::info(format!(
+                "Stopping local agent {task_id}."
+            )));
+        }
         Err(error) => {
-            if error.contains("no background shell with id")
-                && let Some(spawner) = agent_spawner.as_ref()
-            {
-                if spawner
-                    .cancel_agent(&task_id, "user-requested via background task switcher")
-                    .await
-                {
-                    chat_widget.commit_system(super::history_cell::system::SystemCell::info(
-                        format!("Stopping local agent {task_id}."),
-                    ));
-                } else if spawner.get_agent_state_any(&task_id).await.is_some() {
-                    chat_widget.commit_system(super::history_cell::system::SystemCell::info(
-                        format!("Background task {task_id} already finished or cannot be stopped."),
-                    ));
-                } else {
-                    let message =
-                        format_background_task_stop_error_system_message(&task_id, &error);
-                    chat_widget
-                        .commit_system(super::history_cell::system::SystemCell::error(message));
-                }
+            let message = format_background_task_stop_error_system_message(&error);
+            if matches!(error, BackgroundTaskError::AlreadyTerminated { .. }) {
+                chat_widget.commit_system(super::history_cell::system::SystemCell::info(message));
             } else {
-                let message = format_background_task_stop_error_system_message(&task_id, &error);
-                if is_background_task_terminal_race_error(&error) {
-                    chat_widget
-                        .commit_system(super::history_cell::system::SystemCell::info(message));
-                } else {
-                    chat_widget
-                        .commit_system(super::history_cell::system::SystemCell::error(message));
-                }
+                chat_widget.commit_system(super::history_cell::system::SystemCell::error(message));
             }
         }
     }
@@ -675,7 +660,12 @@ pub(crate) async fn try_dispatch_background_task_stop_sentinel(
     bottom_pane.refresh_background_task_rows(rows);
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();
-    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundTaskStopTarget {
+    Shell,
+    LocalAgent,
 }
 
 pub(crate) async fn stop_background_task_with_agents(
@@ -683,26 +673,30 @@ pub(crate) async fn stop_background_task_with_agents(
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     task_id: &str,
-) -> Result<(), String> {
+) -> Result<BackgroundTaskStopTarget, BackgroundTaskError> {
     match background_registry.kill(task_id) {
-        Ok(()) => Ok(()),
-        Err(error) if error.contains("no background shell with id") => {
+        Ok(()) => Ok(BackgroundTaskStopTarget::Shell),
+        Err(BackgroundTaskError::NotFound { .. }) => {
             if let Some(spawner) = agent_spawner {
                 if spawner
-                    .cancel_agent(task_id, "user-requested via task_stop")
+                    .cancel_agent(task_id, "user-requested via background task control")
                     .await
                 {
-                    return Ok(());
+                    return Ok(BackgroundTaskStopTarget::LocalAgent);
                 }
                 match spawner.get_agent_state_any(task_id).await {
                     Some(state) if !state.run_in_background => {
-                        return Err(format!("no background task with id '{task_id}'"));
+                        return Err(BackgroundTaskError::not_found(task_id));
                     }
                     Some(state) if state.status.is_terminal() => {
-                        return Err(format!("background task '{task_id}' already terminated"));
+                        return Err(BackgroundTaskError::AlreadyTerminated {
+                            task_id: task_id.to_string(),
+                        });
                     }
                     Some(_) => {
-                        return Err(format!("background task '{task_id}' cannot be stopped"));
+                        return Err(BackgroundTaskError::CannotStop {
+                            task_id: task_id.to_string(),
+                        });
                     }
                     None => {}
                 }
@@ -711,97 +705,14 @@ pub(crate) async fn stop_background_task_with_agents(
                 .iter()
                 .any(|projection| projection.id == task_id)
             {
-                return Err(format!("background task '{task_id}' has a stale handle"));
+                return Err(BackgroundTaskError::StaleHandle {
+                    task_id: task_id.to_string(),
+                });
             }
-            Err(format!("no background task with id '{task_id}'"))
+            Err(BackgroundTaskError::not_found(task_id))
         }
         Err(error) => Err(error),
     }
-}
-
-pub(crate) async fn try_dispatch_background_task_output_sentinel(
-    sentinel: &str,
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
-    agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
-    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
-    chat_widget: &mut super::chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-    frame_requester: &FrameRequester,
-) -> bool {
-    let Some(task_id) = super::bottom_pane::background_task_view::parse_output_sentinel(sentinel)
-    else {
-        return false;
-    };
-    let task_id = task_id.to_string();
-
-    if let Some(handle) = background_registry.get(&task_id) {
-        let title = handle.description.clone();
-        let status = handle.projected_status();
-        match background_registry.get_combined_output_stats(&task_id, 8192) {
-            Ok((output, total_bytes, total_lines)) => {
-                let offset = total_bytes.saturating_sub(output.len() as u64);
-                chat_widget.commit_system(super::history_cell::system::SystemCell::info(
-                    format_background_task_output_system_message(
-                        &task_id,
-                        &title,
-                        status,
-                        offset,
-                        total_bytes,
-                        total_lines,
-                        &output,
-                    ),
-                ));
-            }
-            Err(error) => {
-                chat_widget.commit_system(super::history_cell::system::SystemCell::error(
-                    format_background_task_output_read_error(&task_id, &error),
-                ));
-            }
-        }
-    } else {
-        match background_task_output_snapshot_with_agents(
-            background_registry,
-            agent_spawner.as_ref(),
-            restored_local_agents,
-            &task_id,
-            0,
-            8192,
-        )
-        .await
-        {
-            Ok(snapshot) => {
-                chat_widget.commit_system(super::history_cell::system::SystemCell::info(
-                    format_background_task_output_system_message_for_kind(
-                        &snapshot.kind,
-                        BackgroundTaskOutputSystemMessage {
-                            task_id: &task_id,
-                            title: snapshot.title.as_deref().unwrap_or(&task_id),
-                            status: &snapshot.status,
-                            offset: 0,
-                            total_bytes: snapshot.total_bytes,
-                            total_lines: snapshot.total_lines,
-                            output: &snapshot.output,
-                        },
-                    ),
-                ));
-            }
-            Err(error) => {
-                chat_widget.commit_system(super::history_cell::system::SystemCell::error(
-                    format_background_task_output_read_error(&task_id, &error),
-                ));
-            }
-        }
-    }
-    let rows = background_task_rows_with_agents(
-        background_registry,
-        agent_spawner.as_ref(),
-        restored_local_agents,
-    )
-    .await;
-    bottom_pane.refresh_background_task_rows(rows);
-    bottom_pane.sync_popups();
-    frame_requester.schedule_frame();
-    true
 }
 
 pub(crate) async fn background_task_output_snapshot_with_agents(
@@ -811,14 +722,14 @@ pub(crate) async fn background_task_output_snapshot_with_agents(
     task_id: &str,
     offset: u64,
     max_bytes: usize,
-) -> Result<crate::edge_tools::BgTaskOutputSnapshot, String> {
-    match background_task_output_snapshot(background_registry, task_id, offset, max_bytes) {
+) -> Result<crate::edge_tools::BgTaskOutputSnapshot, BackgroundTaskError> {
+    match background_task_output_snapshot(background_registry, task_id, offset, max_bytes).await {
         Ok(snapshot) => Ok(snapshot),
-        Err(error) if error.contains("no background shell with id") => {
+        Err(BackgroundTaskError::NotFound { .. }) => {
             if let Some(spawner) = agent_spawner {
                 if let Some(state) = spawner.get_agent_state_any(task_id).await {
                     if !state.run_in_background {
-                        return Err(format!("no background task with id '{task_id}'"));
+                        return Err(BackgroundTaskError::not_found(task_id));
                     }
                     let info = astra_turn_core::orchestration_types::SpawnedAgentInfo::from(&state);
                     return Ok(background_task_output_snapshot_for_local_agent(
@@ -847,7 +758,7 @@ pub(crate) async fn background_task_output_snapshot_with_agents(
                     projection, offset, max_bytes,
                 ));
             }
-            Err(format!("no background task with id '{task_id}'"))
+            Err(BackgroundTaskError::not_found(task_id))
         }
         Err(error) => Err(error),
     }
@@ -900,7 +811,8 @@ pub(crate) fn render_background_task_rows_xml(
             | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Failed => 0,
             crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Running
             | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Pending => 1,
-            crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Killed => 2,
+            crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Stopping
+            | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Killed => 2,
             crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Completed => 3,
             crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Unavailable => 4,
         };
@@ -933,6 +845,9 @@ pub(crate) fn render_background_task_rows_xml(
         }
         if let Some(ended_at_ms) = row.ended_at_ms {
             attrs.push(("ended_at_ms", ended_at_ms.to_string()));
+        }
+        if let Some(inactive_ms) = row.no_recent_output_ms {
+            attrs.push(("no_recent_output_ms", inactive_ms.to_string()));
         }
         if let Some(output_ref) = row.output_ref.as_deref() {
             attrs.push(("output_ref", xml_escape_attr(output_ref)));

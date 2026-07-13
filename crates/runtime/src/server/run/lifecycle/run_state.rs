@@ -13,8 +13,8 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use astra_core::{
-    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED, STATUS_INPUT_QUEUED,
-    STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING,
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED, STATUS_PAUSED,
+    STATUS_RUNNING, STATUS_WAITING,
 };
 use astra_runtime_env::CleanupReason as RuntimeCleanupReason;
 use astra_services::runs::{
@@ -59,7 +59,6 @@ impl DurableRunEventBatchBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
     Running,
-    InputQueued,
     Paused,
     Waiting,
     Completed,
@@ -68,11 +67,23 @@ pub enum RunStatus {
     Cancelled,
 }
 
+/// Explicit controls a client may request for a durable run.
+///
+/// This intentionally distinguishes user controls from every legal state
+/// transition: for example, a waiting run can return to `Running` when its
+/// required input arrives, but that is not a generic user-facing Resume
+/// control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunControlAction {
+    Pause,
+    Resume,
+    Cancel,
+}
+
 impl RunStatus {
     #[cfg(test)]
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::Running,
-        Self::InputQueued,
         Self::Paused,
         Self::Waiting,
         Self::Completed,
@@ -94,36 +105,36 @@ impl RunStatus {
     /// Terminal states intentionally have no outgoing edges. A paused run does
     /// not transition to `Completed` during loop finalization; the terminal
     /// completion is buffered and promoted only by an explicit resume path.
-    pub const TRANSITION_EDGES: [(Self, Self); 23] = [
-        (Self::Running, Self::InputQueued),
+    pub const TRANSITION_EDGES: [(Self, Self); 13] = [
         (Self::Running, Self::Paused),
         (Self::Running, Self::Waiting),
         (Self::Running, Self::Completed),
         (Self::Running, Self::Delegated),
         (Self::Running, Self::Failed),
         (Self::Running, Self::Cancelled),
-        (Self::InputQueued, Self::InputQueued),
-        (Self::InputQueued, Self::Running),
-        (Self::InputQueued, Self::Paused),
-        (Self::InputQueued, Self::Waiting),
-        (Self::InputQueued, Self::Completed),
-        (Self::InputQueued, Self::Delegated),
-        (Self::InputQueued, Self::Failed),
-        (Self::InputQueued, Self::Cancelled),
         (Self::Paused, Self::Running),
         (Self::Paused, Self::Waiting),
         (Self::Paused, Self::Failed),
         (Self::Paused, Self::Cancelled),
-        (Self::Waiting, Self::InputQueued),
         (Self::Waiting, Self::Running),
         (Self::Waiting, Self::Failed),
         (Self::Waiting, Self::Cancelled),
     ];
 
+    /// User-requestable transitions. This is the single source of truth for
+    /// both server control admission and the controls published in a run-tree
+    /// snapshot.
+    const CONTROL_TRANSITIONS: [(RunControlAction, Self, Self); 5] = [
+        (RunControlAction::Pause, Self::Running, Self::Paused),
+        (RunControlAction::Resume, Self::Paused, Self::Running),
+        (RunControlAction::Cancel, Self::Running, Self::Cancelled),
+        (RunControlAction::Cancel, Self::Paused, Self::Cancelled),
+        (RunControlAction::Cancel, Self::Waiting, Self::Cancelled),
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Running => STATUS_RUNNING,
-            Self::InputQueued => STATUS_INPUT_QUEUED,
             Self::Paused => STATUS_PAUSED,
             Self::Waiting => STATUS_WAITING,
             Self::Completed => STATUS_COMPLETED,
@@ -136,7 +147,6 @@ impl RunStatus {
     pub fn from_durable_status(status: &str) -> Option<Self> {
         match durable_run_status_kind(status) {
             DurableRunStatusKind::Running => Some(Self::Running),
-            DurableRunStatusKind::InputQueued => Some(Self::InputQueued),
             DurableRunStatusKind::Paused => Some(Self::Paused),
             DurableRunStatusKind::Waiting => Some(Self::Waiting),
             DurableRunStatusKind::Completed => Some(Self::Completed),
@@ -158,7 +168,7 @@ impl RunStatus {
 
     pub fn blocks_session(&self, waiting_for: Option<&str>) -> bool {
         match self {
-            Self::Running | Self::InputQueued | Self::Waiting => true,
+            Self::Running | Self::Waiting => true,
             Self::Paused => waiting_for.is_some(),
             Self::Completed | Self::Delegated | Self::Failed | Self::Cancelled => false,
         }
@@ -168,6 +178,34 @@ impl RunStatus {
         Self::TRANSITION_EDGES
             .iter()
             .any(|(from, to)| from == self && to == next)
+    }
+
+    /// Whether this durable state admits a user-requested control.
+    pub fn can_apply_control_action(&self, action: RunControlAction) -> bool {
+        Self::CONTROL_TRANSITIONS
+            .iter()
+            .any(|(candidate, from, _)| *candidate == action && from == self)
+    }
+
+    /// Nominal target state for a valid control. `resume` may still promote a
+    /// buffered completion instead of restarting execution; the lifecycle
+    /// handler owns that exceptional finalization path.
+    pub fn control_action_target(&self, action: RunControlAction) -> Option<Self> {
+        Self::CONTROL_TRANSITIONS
+            .iter()
+            .find_map(|(candidate, from, target)| {
+                (*candidate == action && from == self).then_some(*target)
+            })
+    }
+
+    pub fn available_control_actions(&self) -> impl Iterator<Item = RunControlAction> + '_ {
+        [
+            RunControlAction::Pause,
+            RunControlAction::Resume,
+            RunControlAction::Cancel,
+        ]
+        .into_iter()
+        .filter(|action| self.can_apply_control_action(*action))
     }
 
     /// Validate a status transition. Returns `Err` if the transition is illegal.
@@ -189,9 +227,7 @@ pub fn cleanup_reason_for_terminal_run_status(status: &RunStatus) -> Option<Runt
         RunStatus::Delegated => Some(RuntimeCleanupReason::Delegated),
         RunStatus::Failed => Some(RuntimeCleanupReason::Failed),
         RunStatus::Cancelled => Some(RuntimeCleanupReason::Cancelled),
-        RunStatus::Running | RunStatus::InputQueued | RunStatus::Paused | RunStatus::Waiting => {
-            None
-        }
+        RunStatus::Running | RunStatus::Paused | RunStatus::Waiting => None,
     }
 }
 
@@ -199,7 +235,7 @@ pub fn is_run_finished_event(event: &Value) -> bool {
     event.get("event_type").and_then(Value::as_str) == Some("run_finished")
 }
 
-pub fn deferred_input_text_len(input: &Value) -> usize {
+pub fn user_intent_text_len(input: &Value) -> usize {
     input
         .get("content")
         .or_else(|| input.get("text"))
@@ -395,7 +431,7 @@ pub fn streaming_event_for_persistence(event: &Value) -> bool {
     streaming_final_event_for_replay(event) || live_delta_event_for_persistence(event)
 }
 
-fn durable_replay_boundary_event(event: &Value) -> bool {
+pub(super) fn durable_replay_boundary_event(event: &Value) -> bool {
     matches!(
         durable_event_type(event),
         Some(
@@ -414,7 +450,11 @@ fn durable_replay_boundary_event(event: &Value) -> bool {
                 | "approval_request"
                 | "approval_required"
                 | "approval_batch_required"
+                | "ask_user_prompted"
+                | "user_prompt_required"
                 | "user_input"
+                | "user_intent"
+                | "agent_communication"
                 | "agent_delegated"
                 | "agent_spawned"
                 | "agent_completed"
@@ -595,6 +635,7 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
             | "workspace_bound"
             | "executor_bound"
             | "executor_status_changed"
+            | "agent_communication"
             | "agent_delegated"
             | "agent_spawned"
             | "agent_progress"
@@ -715,6 +756,38 @@ mod tests {
                     from.try_transition(&to).is_ok(),
                     expected,
                     "try_transition mismatch for {from:?} -> {to:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn user_controls_are_derived_from_their_legal_transitions() {
+        let cases = [
+            (
+                RunStatus::Running,
+                vec![RunControlAction::Pause, RunControlAction::Cancel],
+            ),
+            (RunStatus::Waiting, vec![RunControlAction::Cancel]),
+            (
+                RunStatus::Paused,
+                vec![RunControlAction::Resume, RunControlAction::Cancel],
+            ),
+            (RunStatus::Completed, vec![]),
+            (RunStatus::Failed, vec![]),
+            (RunStatus::Cancelled, vec![]),
+        ];
+
+        for (status, expected_actions) in cases {
+            let actual_actions = status.available_control_actions().collect::<Vec<_>>();
+            assert_eq!(actual_actions, expected_actions, "controls for {status:?}");
+            for action in actual_actions {
+                let target = status
+                    .control_action_target(action)
+                    .expect("published control has a target state");
+                assert!(
+                    status.can_transition_to(&target),
+                    "control {action:?} must follow a legal transition: {status:?} -> {target:?}"
                 );
             }
         }

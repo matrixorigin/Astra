@@ -346,6 +346,7 @@ name = "astra-messaging"
 version = "0.1.0"
 dependencies = [
  "astra-text-utils",
+ "astra-turn-types",
  "async-trait",
  "chrono",
  "dotenvy",
@@ -643,7 +644,9 @@ version = "0.1.0"
 dependencies = [
  "astra-core",
  "astra-runtime-env",
+ "astra-server-types",
  "astra-sync-protocol",
+ "astra-turn-types",
  "async-stream",
  "futures-util",
  "hex",

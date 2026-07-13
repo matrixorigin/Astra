@@ -142,6 +142,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/approval/respond",
             post(edge::edge_callback_handlers::post_approval_respond_handler),
         )
+        .route(
+            "/user-prompts/respond",
+            post(edge::edge_callback_handlers::post_user_prompt_respond_handler),
+        )
         .route("/chat/ws", get(ws_handler::ws_chat_handler))
         .route("/edge/ws", get(edge::edge_ws_handler::edge_ws_handler))
         .route(
@@ -178,8 +182,8 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(crate::server::run::handlers::cancel_run_handler),
         )
         .route(
-            "/chat/runs/{run_id}/input",
-            post(crate::server::run::handlers::submit_run_input_handler),
+            "/chat/runs/{run_id}/intents",
+            post(crate::server::run::handlers::submit_run_user_intent_handler),
         )
         .route(
             "/chat/runs/{run_id}/delegate",

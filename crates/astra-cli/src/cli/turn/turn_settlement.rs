@@ -36,6 +36,7 @@ pub(crate) async fn settle_interrupted_turn(
         result,
         dispatch.turn_start,
         dispatch.ui,
+        dispatch.ctx.post_commit_tx.as_ref(),
     )
     .await;
     clear_recovery_scoped_turn_restrictions(state);
@@ -54,6 +55,7 @@ pub(crate) async fn settle_successful_turn(
         result,
         dispatch.turn_start,
         dispatch.ui,
+        dispatch.ctx.post_commit_tx.as_ref(),
     )
     .await;
     clear_recovery_scoped_turn_restrictions(state);
@@ -92,6 +94,7 @@ mod tests {
         let ctx = TurnContext {
             api: &api,
             profile: None,
+            post_commit_tx: None,
         };
         let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {
@@ -131,6 +134,7 @@ mod tests {
         let ctx = TurnContext {
             api: &api,
             profile: None,
+            post_commit_tx: None,
         };
         let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {

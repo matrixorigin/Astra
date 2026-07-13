@@ -11,7 +11,6 @@
 //!
 //! ```text
 //! AppEvent ──▶ ChatWidget::handle_event ──▶ mutate history/active_cell
-//!                                         ──▶ append TurnEvent to disk
 //!                                         ──▶ (outer draws on next frame)
 //! ```
 //!
@@ -31,17 +30,19 @@ mod resume;
 #[cfg(test)]
 mod turn_driver;
 
-use self::agent_control_surface::{AgentControlOutcome, AgentControlSurface, CancelledStateUpdate};
+use self::agent_control_surface::{AgentControlOutcome, AgentControlSurface};
 pub(crate) use bridge::{TurnContext, translate};
 pub(crate) use resume::load as load_resume;
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
+use super::agent_run_projection::{
+    AgentProjectionConfidence, AgentProjectionSource, AgentRunState, AgentRunStatus,
+};
 use super::history_cell::{
     HistoryCell, assistant::AssistantCell, reasoning::ReasoningCell, system::SystemCell,
     task::TaskCell, tool::ToolCell, turn_summary::TurnSummaryCell, user::UserCell,
 };
-use super::transcript_jsonl;
 use super::turn_event::TurnEvent;
 use crate::VerdictEvent;
 use astra_turn_core::compaction_types::CompactionEvent;
@@ -57,7 +58,13 @@ pub(crate) enum AppEvent {
     /// User-originated events (composer submit, future edits, …).
     User(UserEvent),
     /// Wire-originated events from the SSE host / model stream.
-    Wire(WireEvent),
+    Wire(Box<WireEvent>),
+}
+
+impl AppEvent {
+    pub(crate) fn wire(event: WireEvent) -> Self {
+        Self::Wire(Box::new(event))
+    }
 }
 
 /// User-side sources. Today just composer submit; future candidates:
@@ -134,6 +141,8 @@ pub(crate) enum WireEvent {
     },
     AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),
     AgentLiveBatch(Vec<astra_turn_core::agent_live_event::AgentLiveEvent>),
+    AgentLiveGap(astra_turn_core::agent_live_event::AgentLiveGap),
+    AgentCommunication(astra_turn_types::AgentCommunicationEvent),
 
     /// Turn ended cleanly; ChatWidget should emit a summary cell.
     TurnComplete(Box<TurnStats>),
@@ -179,20 +188,425 @@ pub(crate) struct TurnStats {
 /// (assistant streaming, reasoning, single-tool execution) — these
 /// are mutually exclusive within a turn so one slot suffices.
 ///
+struct AgentRunProjection {
+    detail: Box<TaskCell>,
+    state: AgentRunState,
+    state_observed_at: std::time::Instant,
+    terminal_at: Option<std::time::Instant>,
+    reported_tool_calls: usize,
+    reported_child_agents: usize,
+    messages_sent: usize,
+    messages_received: usize,
+    run_id: Option<String>,
+    parent_run_id: Option<String>,
+    depth: u32,
+    metadata_source: Option<AgentProjectionSource>,
+    runtime_facts: astra_thin_client::SessionRunRuntimeFacts,
+    runtime_source: Option<AgentProjectionSource>,
+    control_target: Option<crate::tui::agent_run_projection::AgentControlTarget>,
+    available_actions: Vec<astra_thin_client::SessionRunAction>,
+    control_source: Option<AgentProjectionSource>,
+    transcript_target: Option<crate::tui::agent_run_projection::AgentTranscriptTarget>,
+    transcript_source: Option<AgentProjectionSource>,
+    durable_event_high_watermark: Option<i64>,
+    control_requested_from: Option<AgentRunState>,
+    /// Latest structured reason why this run needs attention. This is a
+    /// projection field, never a prompt-facing transcript substitute: the
+    /// full event remains in the run transcript with its stable identity.
+    attention_summary: Option<String>,
+    live_transcript_events:
+        std::collections::VecDeque<astra_turn_core::agent_live_event::AgentLiveEvent>,
+    live_transcript_bytes: usize,
+    live_transcript_dropped: u64,
+}
+
+impl AgentRunProjection {
+    fn new(id: String, label: String, state: AgentRunState) -> Self {
+        let mut projection = Self {
+            detail: Box::new(TaskCell::new_running(id, label)),
+            state,
+            state_observed_at: std::time::Instant::now(),
+            terminal_at: None,
+            reported_tool_calls: 0,
+            reported_child_agents: 0,
+            messages_sent: 0,
+            messages_received: 0,
+            run_id: None,
+            parent_run_id: None,
+            depth: 1,
+            metadata_source: None,
+            runtime_facts: Default::default(),
+            runtime_source: None,
+            control_target: None,
+            available_actions: Vec::new(),
+            control_source: None,
+            transcript_target: None,
+            transcript_source: None,
+            durable_event_high_watermark: None,
+            control_requested_from: None,
+            attention_summary: None,
+            live_transcript_events: std::collections::VecDeque::new(),
+            live_transcript_bytes: 0,
+            live_transcript_dropped: 0,
+        };
+        projection.sync_detail_status();
+        projection
+    }
+
+    fn set_state(&mut self, state: AgentRunState) -> bool {
+        if !should_accept_agent_state(self.state, state) {
+            return false;
+        }
+        self.state = state;
+        if !matches!(
+            state.status,
+            AgentRunStatus::Waiting | AgentRunStatus::Paused
+        ) {
+            self.attention_summary = None;
+        }
+        if state.source != AgentProjectionSource::LocalIntent {
+            self.control_requested_from = None;
+        }
+        self.state_observed_at = std::time::Instant::now();
+        if state.status.is_terminal() {
+            self.terminal_at.get_or_insert(self.state_observed_at);
+        } else {
+            self.terminal_at = None;
+        }
+        self.sync_detail_status();
+        true
+    }
+
+    fn set_attention_summary(&mut self, summary: Option<String>) {
+        self.attention_summary = summary.filter(|summary| !summary.trim().is_empty());
+    }
+
+    fn record_live_transcript_event(
+        &mut self,
+        event: &astra_turn_core::agent_live_event::AgentLiveEvent,
+    ) {
+        const MAX_LIVE_TRANSCRIPT_BYTES: usize = 512 * 1024;
+        use astra_turn_core::agent_live_event::AgentLiveEventKind;
+
+        let appended = match (
+            self.live_transcript_events
+                .back_mut()
+                .map(|event| &mut event.kind),
+            &event.kind,
+        ) {
+            (
+                Some(AgentLiveEventKind::OutputDelta(previous)),
+                AgentLiveEventKind::OutputDelta(next),
+            )
+            | (
+                Some(AgentLiveEventKind::ThinkingDelta(previous)),
+                AgentLiveEventKind::ThinkingDelta(next),
+            ) => {
+                previous.push_str(next);
+                self.live_transcript_bytes = self.live_transcript_bytes.saturating_add(next.len());
+                true
+            }
+            _ => false,
+        };
+        if !appended {
+            let bytes = agent_live_event_payload_bytes(event);
+            self.live_transcript_events.push_back(event.clone());
+            self.live_transcript_bytes = self.live_transcript_bytes.saturating_add(bytes);
+        }
+        while self.live_transcript_bytes > MAX_LIVE_TRANSCRIPT_BYTES {
+            let Some(evicted) = self.live_transcript_events.pop_front() else {
+                break;
+            };
+            self.live_transcript_bytes = self
+                .live_transcript_bytes
+                .saturating_sub(agent_live_event_payload_bytes(&evicted));
+            self.live_transcript_dropped = self.live_transcript_dropped.saturating_add(1);
+        }
+    }
+
+    fn set_controls(
+        &mut self,
+        source: AgentProjectionSource,
+        target: crate::tui::agent_run_projection::AgentControlTarget,
+        available_actions: Vec<astra_thin_client::SessionRunAction>,
+    ) {
+        if self.control_source.is_some_and(|current| {
+            agent_projection_source_rank(current) > agent_projection_source_rank(source)
+        }) {
+            return;
+        }
+        self.control_source = Some(source);
+        self.control_target = Some(target);
+        self.available_actions = available_actions;
+    }
+
+    fn set_transcript_target(
+        &mut self,
+        source: AgentProjectionSource,
+        target: crate::tui::agent_run_projection::AgentTranscriptTarget,
+    ) {
+        if self.transcript_source.is_some_and(|current| {
+            agent_projection_source_rank(current) > agent_projection_source_rank(source)
+        }) {
+            return;
+        }
+        self.transcript_source = Some(source);
+        self.transcript_target = Some(target);
+    }
+
+    fn set_runtime_metadata(
+        &mut self,
+        source: AgentProjectionSource,
+        run_id: String,
+        parent_run_id: Option<String>,
+        depth: u32,
+        child_agents: usize,
+    ) {
+        if self.metadata_source.is_some_and(|current| {
+            agent_projection_source_rank(current) > agent_projection_source_rank(source)
+        }) {
+            // A lower-confidence source must not replace durable/local
+            // metadata, but a typed live event still carries the immutable
+            // execution identity. Preserve that identity if the earlier
+            // snapshot omitted it; otherwise the transcript cannot be opened.
+            if self.run_id.is_none() {
+                self.run_id = Some(run_id);
+            }
+            return;
+        }
+        self.metadata_source = Some(source);
+        self.run_id = Some(run_id);
+        self.parent_run_id = parent_run_id;
+        self.depth = depth.max(1);
+        self.reported_child_agents = child_agents;
+    }
+
+    fn set_runtime_facts(
+        &mut self,
+        source: AgentProjectionSource,
+        facts: astra_thin_client::SessionRunRuntimeFacts,
+    ) {
+        if self.runtime_source.is_some_and(|current| {
+            agent_projection_source_rank(current) > agent_projection_source_rank(source)
+        }) {
+            return;
+        }
+        self.runtime_source = Some(source);
+        self.runtime_facts = facts;
+    }
+
+    fn activity_counts(
+        &self,
+        durable_snapshot_truncated: bool,
+    ) -> crate::tui::agent_run_projection::AgentActivityCounts {
+        crate::tui::agent_run_projection::AgentActivityCounts {
+            tool_calls: self.detail.children.len().max(self.reported_tool_calls),
+            child_agents: self.reported_child_agents,
+            messages_sent: self.messages_sent,
+            messages_received: self.messages_received,
+            child_agents_partial: durable_snapshot_truncated
+                && self.metadata_source == Some(AgentProjectionSource::DurableServer),
+        }
+    }
+
+    fn begin_control(&mut self, action: astra_thin_client::SessionRunAction) -> bool {
+        if !self.available_actions.contains(&action) {
+            return false;
+        }
+        if self.control_requested_from.is_none() {
+            self.control_requested_from = Some(self.state);
+        }
+        let status = match action {
+            astra_thin_client::SessionRunAction::Pause => AgentRunStatus::Pausing,
+            astra_thin_client::SessionRunAction::Resume
+            | astra_thin_client::SessionRunAction::ContinueSession => AgentRunStatus::Resuming,
+            astra_thin_client::SessionRunAction::Cancel => AgentRunStatus::Cancelling,
+        };
+        self.set_state(AgentRunState::local_intent(status))
+    }
+
+    fn reject_control(&mut self) -> bool {
+        let Some(mut previous) = self.control_requested_from.take() else {
+            return false;
+        };
+        if previous.status.is_active() {
+            previous.confidence = AgentProjectionConfidence::Stale;
+        }
+        self.state = previous;
+        self.state_observed_at = std::time::Instant::now();
+        self.sync_detail_status();
+        true
+    }
+
+    fn mark_unconfirmed_if_active(&mut self) {
+        if matches!(
+            self.state.source,
+            AgentProjectionSource::LiveStream | AgentProjectionSource::LocalIntent
+        ) && self.state.mark_unconfirmed_if_active()
+        {
+            self.state_observed_at = std::time::Instant::now();
+            self.sync_detail_status();
+        }
+    }
+
+    fn mark_stale_if_active(&mut self) {
+        if self.state.mark_stale_if_active() {
+            self.state_observed_at = std::time::Instant::now();
+            self.sync_detail_status();
+        }
+    }
+
+    fn sync_detail_status(&mut self) {
+        use crate::tui::history_cell::task::TaskStatus;
+
+        self.detail.status = if self.state.status.is_active()
+            && matches!(
+                self.state.confidence,
+                AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+            ) {
+            if self.detail.duration_ms.is_none() {
+                self.detail.duration_ms = Some(self.detail.started_at.elapsed().as_millis() as u64);
+            }
+            TaskStatus::Unconfirmed
+        } else {
+            match self.state.status {
+                AgentRunStatus::Starting
+                | AgentRunStatus::Running
+                | AgentRunStatus::Pausing
+                | AgentRunStatus::Resuming
+                | AgentRunStatus::Cancelling => {
+                    self.detail.completed_at = None;
+                    self.detail.duration_ms = None;
+                    TaskStatus::Running
+                }
+                AgentRunStatus::Waiting | AgentRunStatus::Paused => {
+                    self.detail.completed_at = None;
+                    self.detail.duration_ms = None;
+                    TaskStatus::Waiting
+                }
+                AgentRunStatus::Completed | AgentRunStatus::Delegated => TaskStatus::Completed,
+                AgentRunStatus::Interrupted => TaskStatus::Interrupted,
+                AgentRunStatus::Failed => TaskStatus::Failed,
+                AgentRunStatus::Cancelled => TaskStatus::Cancelled,
+            }
+        };
+    }
+}
+
+fn should_accept_agent_state(current: AgentRunState, incoming: AgentRunState) -> bool {
+    let current_rank = current.source_rank();
+    let incoming_rank = incoming.source_rank();
+
+    // A fresh owning source can temporarily take over a stale projection even
+    // when the durable server normally has the higher authority rank.
+    if current.confidence == AgentProjectionConfidence::Stale
+        && incoming.confidence == AgentProjectionConfidence::Confirmed
+        && current.status == incoming.status
+    {
+        return true;
+    }
+
+    // Repeated lower-authority observations must not erase a confirmation.
+    if current.status == incoming.status && incoming_rank < current_rank {
+        return false;
+    }
+    if current.status.is_terminal() {
+        // A terminal result can only be corrected by an equally or more
+        // authoritative terminal observation, or reopened by a stronger
+        // owning source (for example a durable-server repair).
+        return if incoming.status.is_terminal() {
+            incoming_rank >= current_rank
+        } else {
+            incoming_rank > current_rank
+        };
+    }
+
+    // A newer terminal stream event is useful immediately even before the
+    // next runtime snapshot confirms it. Active-to-active observations are
+    // also allowed to reflect newer work/wait/cancel activity.
+    true
+}
+
+fn agent_projection_source_rank(source: AgentProjectionSource) -> u8 {
+    AgentRunState {
+        status: AgentRunStatus::Running,
+        confidence: AgentProjectionConfidence::Observed,
+        source,
+    }
+    .source_rank()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentControlAction {
+    Spawn,
+    GetResult,
+}
+
+impl AgentControlAction {
+    fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "spawn" => Some(Self::Spawn),
+            "get_result" => Some(Self::GetResult),
+            _ => None,
+        }
+    }
+}
+
+struct AgentControlBinding {
+    run_key: String,
+    action: AgentControlAction,
+}
+
+#[derive(PartialEq, Eq)]
+struct AgentRunSignature {
+    id: String,
+    state: AgentRunState,
+    description: String,
+    reported_tool_calls: usize,
+    reported_child_agents: usize,
+    messages_sent: usize,
+    messages_received: usize,
+    run_id: Option<String>,
+    parent_run_id: Option<String>,
+    depth: u32,
+    metadata_source: Option<AgentProjectionSource>,
+    runtime_facts: astra_thin_client::SessionRunRuntimeFacts,
+    runtime_source: Option<AgentProjectionSource>,
+    output: Option<(usize, u64)>,
+    error: Option<(usize, u64)>,
+    fanout: Option<crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership>,
+    control_target: Option<crate::tui::agent_run_projection::AgentControlTarget>,
+    transcript_target: Option<crate::tui::agent_run_projection::AgentTranscriptTarget>,
+    available_actions: Vec<astra_thin_client::SessionRunAction>,
+    durable_event_high_watermark: Option<i64>,
+    attention: Option<(usize, u64)>,
+}
+
+fn agent_text_fingerprint(value: Option<&str>) -> Option<(usize, u64)> {
+    use std::hash::{Hash, Hasher};
+
+    value.map(|value| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hasher);
+        (value.len(), hasher.finish())
+    })
+}
+
 #[derive(Default)]
 struct AgentRunRegistry {
-    runs: std::collections::HashMap<String, Box<TaskCell>>,
+    runs: std::collections::HashMap<String, AgentRunProjection>,
     order: Vec<String>,
     fanout_membership: std::collections::HashMap<
         String,
         crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership,
     >,
-    /// Map of `tool_use_id → registry key` so a follow-up event for
-    /// the same tool call (e.g. a generic `ToolStarted` after a
-    /// structured `AgentControlStarted` already established the
-    /// row) can reuse the existing entry instead of creating a
-    /// duplicate row keyed by the provisional fallback.
-    tool_use_to_key: std::collections::HashMap<String, String>,
+    /// Structured control-call identity. Generic tool descriptions are never
+    /// parsed to recover either the action or run identity.
+    control_bindings: std::collections::HashMap<String, AgentControlBinding>,
+    /// A bounded durable snapshot proves the included rows, but it cannot
+    /// prove that absent runs or child counts are complete.
+    durable_snapshot_truncated: bool,
+    server_truth_state: crate::tui::server_agent_observer::ServerAgentTruthState,
 }
 
 impl AgentRunRegistry {
@@ -200,12 +614,41 @@ impl AgentRunRegistry {
         self.order.clone()
     }
 
-    fn get(&self, id: &str) -> Option<&TaskCell> {
-        self.runs.get(id).map(Box::as_ref)
+    fn get(&self, id: &str) -> Option<&AgentRunProjection> {
+        self.runs.get(id)
     }
 
-    fn get_mut(&mut self, id: &str) -> Option<&mut TaskCell> {
-        self.runs.get_mut(id).map(Box::as_mut)
+    fn get_mut(&mut self, id: &str) -> Option<&mut AgentRunProjection> {
+        self.runs.get_mut(id)
+    }
+
+    fn record_communication(&mut self, event: &astra_turn_types::AgentCommunicationEvent) -> bool {
+        let key = self
+            .order
+            .iter()
+            .find(|key| {
+                self.runs.get(*key).is_some_and(|projection| {
+                    projection.run_id.as_deref() == Some(event.observed_by.run_id.as_str())
+                })
+            })
+            .cloned()
+            .or_else(|| {
+                self.runs
+                    .contains_key(&event.observed_by.agent_id)
+                    .then(|| event.observed_by.agent_id.clone())
+            });
+        let Some(projection) = key.and_then(|key| self.runs.get_mut(&key)) else {
+            return false;
+        };
+        match event.direction {
+            astra_turn_types::AgentCommunicationDirection::Sent => {
+                projection.messages_sent = projection.messages_sent.saturating_add(1);
+            }
+            astra_turn_types::AgentCommunicationDirection::Received => {
+                projection.messages_received = projection.messages_received.saturating_add(1);
+            }
+        }
+        true
     }
 
     fn fanout_membership(
@@ -225,63 +668,123 @@ impl AgentRunRegistry {
         }
     }
 
+    fn reconcile_fanout_membership(
+        &mut self,
+        id: &str,
+        fanout: Option<crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership>,
+    ) {
+        match fanout {
+            Some(fanout) => {
+                self.fanout_membership.insert(id.to_string(), fanout);
+            }
+            None => {
+                self.fanout_membership.remove(id);
+            }
+        }
+    }
+
     fn contains_key(&self, id: &str) -> bool {
         self.runs.contains_key(id)
     }
 
     /// Fetch the registry key bound to `tool_use_id`, if any.
     fn key_for_tool_use(&self, tool_use_id: &str) -> Option<&str> {
-        self.tool_use_to_key.get(tool_use_id).map(String::as_str)
+        self.control_bindings
+            .get(tool_use_id)
+            .map(|binding| binding.run_key.as_str())
+    }
+
+    /// A profile can own several concurrent or retried executions. Live
+    /// streams therefore resolve by their immutable execution id, never by
+    /// their display/profile id.
+    fn key_for_run_id(&self, run_id: &str) -> Option<&str> {
+        self.order.iter().find_map(|key| {
+            self.runs
+                .get(key)
+                .is_some_and(|projection| projection.run_id.as_deref() == Some(run_id))
+                .then_some(key.as_str())
+        })
+    }
+
+    fn key_for_live_event(&self, agent_id: &str, run_id: &str) -> String {
+        if let Some(key) = self.key_for_run_id(run_id) {
+            return key.to_owned();
+        }
+
+        // Preserve an established local key when it is already bound to this
+        // run. A second execution of the same profile gets its own run key,
+        // rather than overwriting the first projection.
+        match self.runs.get(agent_id) {
+            None => agent_id.to_owned(),
+            Some(projection)
+                if projection.run_id.is_none() || projection.run_id.as_deref() == Some(run_id) =>
+            {
+                agent_id.to_owned()
+            }
+            Some(_) => run_id.to_owned(),
+        }
+    }
+
+    fn action_for_tool_use(&self, tool_use_id: &str) -> Option<AgentControlAction> {
+        self.control_bindings
+            .get(tool_use_id)
+            .map(|binding| binding.action)
     }
 
     fn tool_uses_for_key(&self, key: &str) -> Vec<String> {
-        self.tool_use_to_key
+        self.control_bindings
             .iter()
-            .filter(|(_, value)| value.as_str() == key)
+            .filter(|(_, binding)| binding.run_key == key)
             .map(|(tool_use_id, _)| tool_use_id.clone())
             .collect()
     }
 
-    fn bound_tool_use_ids(&self) -> Vec<String> {
-        self.tool_use_to_key.keys().cloned().collect()
-    }
-
-    /// Ensure a row exists for `id` and bind `tool_use_id` to it so
-    /// follow-up events can find the same row.
-    fn ensure_running_for_tool_use(
+    fn ensure_for_tool_use(
         &mut self,
         id: String,
         label: String,
-        tool_use_id: Option<&str>,
+        state: AgentRunState,
+        tool_use_id: &str,
+        action: AgentControlAction,
     ) {
-        self.ensure_running(id.clone(), label);
-        if let Some(tu) = tool_use_id {
-            self.tool_use_to_key.entry(tu.to_string()).or_insert(id);
-        }
+        self.ensure(id.clone(), label, state);
+        self.bind_tool_use(tool_use_id, id, action);
     }
 
-    fn ensure_running(&mut self, id: String, label: String) {
-        if let Some(cell) = self.runs.get_mut(&id) {
-            cell.description = label;
-            cell.status = crate::tui::history_cell::task::TaskStatus::Running;
-            cell.duration_ms = None;
-            return;
+    fn bind_tool_use(&mut self, tool_use_id: &str, id: String, action: AgentControlAction) {
+        self.control_bindings
+            .entry(tool_use_id.to_string())
+            .or_insert(AgentControlBinding {
+                run_key: id,
+                action,
+            });
+    }
+
+    fn ensure(&mut self, id: String, label: String, state: AgentRunState) -> bool {
+        if let Some(projection) = self.runs.get_mut(&id) {
+            if state.source_rank() >= projection.state.source_rank()
+                || projection.detail.description == projection.detail.tool_use_id
+            {
+                projection.detail.description = label;
+            }
+            return projection.set_state(state);
         }
 
         self.order.push(id.clone());
         self.runs
-            .insert(id.clone(), Box::new(TaskCell::new_running(id, label)));
+            .insert(id.clone(), AgentRunProjection::new(id, label, state));
+        true
     }
 
     fn rename(&mut self, old: &str, new: String) {
         if old == new || !self.runs.contains_key(old) {
             return;
         }
-        if let Some(cell) = self.runs.remove(old) {
+        if let Some(projection) = self.runs.remove(old) {
             if let Some(existing) = self.runs.get_mut(&new) {
-                merge_agent_task_cells(existing.as_mut(), *cell);
+                merge_agent_projections(existing, projection);
             } else {
-                self.runs.insert(new.clone(), cell);
+                self.runs.insert(new.clone(), projection);
             }
         }
         if let Some(fanout) = self.fanout_membership.remove(old) {
@@ -296,16 +799,157 @@ impl AgentRunRegistry {
         self.order.retain(|id| seen.insert(id.clone()));
         // Re-point any tool_use_id bindings from `old` to `new` so
         // follow-up events still resolve.
-        for value in self.tool_use_to_key.values_mut() {
-            if value == old {
-                *value = new.clone();
+        for binding in self.control_bindings.values_mut() {
+            if binding.run_key == old {
+                binding.run_key = new.clone();
             }
         }
     }
+
+    fn remove(&mut self, id: &str) {
+        self.runs.remove(id);
+        self.order.retain(|candidate| candidate != id);
+        self.fanout_membership.remove(id);
+        self.control_bindings
+            .retain(|_, binding| binding.run_key != id);
+    }
+
+    fn mark_active_unconfirmed(&mut self) {
+        for projection in self.runs.values_mut() {
+            projection.mark_unconfirmed_if_active();
+        }
+    }
+
+    fn signature(
+        &self,
+    ) -> (
+        Vec<AgentRunSignature>,
+        bool,
+        crate::tui::server_agent_observer::ServerAgentTruthState,
+    ) {
+        (
+            self.order
+                .iter()
+                .filter_map(|id| {
+                    self.runs.get(id).map(|projection| AgentRunSignature {
+                        id: id.clone(),
+                        state: projection.state,
+                        description: projection.detail.description.clone(),
+                        reported_tool_calls: projection.reported_tool_calls,
+                        reported_child_agents: projection.reported_child_agents,
+                        messages_sent: projection.messages_sent,
+                        messages_received: projection.messages_received,
+                        run_id: projection.run_id.clone(),
+                        parent_run_id: projection.parent_run_id.clone(),
+                        depth: projection.depth,
+                        metadata_source: projection.metadata_source,
+                        runtime_facts: projection.runtime_facts.clone(),
+                        runtime_source: projection.runtime_source,
+                        output: agent_text_fingerprint(projection.detail.output_summary.as_deref()),
+                        error: agent_text_fingerprint(projection.detail.error.as_deref()),
+                        fanout: self.fanout_membership.get(id).cloned(),
+                        control_target: projection.control_target.clone(),
+                        transcript_target: projection.transcript_target,
+                        available_actions: projection.available_actions.clone(),
+                        durable_event_high_watermark: projection.durable_event_high_watermark,
+                        attention: agent_text_fingerprint(projection.attention_summary.as_deref()),
+                    })
+                })
+                .collect(),
+            self.durable_snapshot_truncated,
+            self.server_truth_state,
+        )
+    }
 }
 
-fn merge_agent_task_cells(target: &mut TaskCell, source: crate::tui::history_cell::task::TaskCell) {
-    use crate::tui::history_cell::task::{ChildStatus, TaskStatus};
+fn merge_agent_projections(target: &mut AgentRunProjection, source: AgentRunProjection) {
+    let source_state = source.state;
+    let source_state_observed_at = source.state_observed_at;
+    let source_terminal_at = source.terminal_at;
+    let source_reported_tool_calls = source.reported_tool_calls;
+    let source_reported_child_agents = source.reported_child_agents;
+    let source_messages_sent = source.messages_sent;
+    let source_messages_received = source.messages_received;
+    let source_run_id = source.run_id.clone();
+    let source_parent_run_id = source.parent_run_id.clone();
+    let source_depth = source.depth;
+    let source_metadata_source = source.metadata_source;
+    let source_runtime_facts = source.runtime_facts;
+    let source_runtime_source = source.runtime_source;
+    let source_control_target = source.control_target;
+    let source_available_actions = source.available_actions;
+    let source_control_source = source.control_source;
+    let source_transcript_target = source.transcript_target;
+    let source_transcript_source = source.transcript_source;
+    let source_durable_event_high_watermark = source.durable_event_high_watermark;
+    let source_attention_summary = source.attention_summary;
+    let source_is_stronger = source_state.source_rank() > target.state.source_rank()
+        || (!target.state.status.is_terminal() && source_state.status.is_terminal())
+        || (matches!(
+            target.state.confidence,
+            AgentProjectionConfidence::Unconfirmed
+        ) && !matches!(
+            source_state.confidence,
+            AgentProjectionConfidence::Unconfirmed
+        ));
+    let accept_lifecycle = should_accept_agent_state(target.state, source_state)
+        && (source_is_stronger || source_state_observed_at > target.state_observed_at);
+    let accept_content = accept_lifecycle || target.state.status == source_state.status;
+    merge_agent_task_cells(
+        target.detail.as_mut(),
+        *source.detail,
+        accept_lifecycle,
+        accept_content,
+    );
+    target.reported_tool_calls = target.reported_tool_calls.max(source_reported_tool_calls);
+    target.messages_sent = target.messages_sent.max(source_messages_sent);
+    target.messages_received = target.messages_received.max(source_messages_received);
+
+    if let (Some(metadata_source), Some(run_id)) = (source_metadata_source, source_run_id) {
+        target.set_runtime_metadata(
+            metadata_source,
+            run_id,
+            source_parent_run_id,
+            source_depth,
+            source_reported_child_agents,
+        );
+    }
+    if let Some(runtime_source) = source_runtime_source {
+        target.set_runtime_facts(runtime_source, source_runtime_facts);
+    }
+
+    if let (Some(control_source), Some(control_target)) =
+        (source_control_source, source_control_target)
+    {
+        target.set_controls(control_source, control_target, source_available_actions);
+    }
+    if let (Some(transcript_source), Some(transcript_target)) =
+        (source_transcript_source, source_transcript_target)
+    {
+        target.set_transcript_target(transcript_source, transcript_target);
+    }
+    target.durable_event_high_watermark = target
+        .durable_event_high_watermark
+        .max(source_durable_event_high_watermark);
+
+    if accept_lifecycle {
+        target.state = source_state;
+        target.state_observed_at = source_state_observed_at;
+        target.terminal_at = source_terminal_at;
+    }
+    if accept_content {
+        target.attention_summary = source_attention_summary;
+    }
+    target.sync_detail_status();
+}
+
+fn merge_agent_task_cells(
+    target: &mut TaskCell,
+    source: crate::tui::history_cell::task::TaskCell,
+    accept_lifecycle: bool,
+    accept_content: bool,
+) {
+    use crate::tui::history_cell::task::ChildStatus;
 
     let crate::tui::history_cell::task::TaskCell {
         tool_use_id,
@@ -326,15 +970,16 @@ fn merge_agent_task_cells(target: &mut TaskCell, source: crate::tui::history_cel
     if target.description == target.tool_use_id && description != tool_use_id {
         target.description = description;
     }
-    if target.error.is_none() {
+    if accept_content && target.error.is_none() {
         target.error = error;
     }
     target.ctrl_b_background_hint |= ctrl_b_background_hint;
-    if target
-        .output_summary
-        .as_ref()
-        .map(|summary| summary.trim().is_empty())
-        .unwrap_or(true)
+    if accept_content
+        && target
+            .output_summary
+            .as_ref()
+            .map(|summary| summary.trim().is_empty())
+            .unwrap_or(true)
     {
         if let Some(summary) = output_summary.filter(|summary| !summary.trim().is_empty()) {
             target.output_summary = Some(summary);
@@ -358,11 +1003,11 @@ fn merge_agent_task_cells(target: &mut TaskCell, source: crate::tui::history_cel
             target.children.push(child);
         }
     }
-    if matches!(target.status, TaskStatus::Running) && !matches!(status, TaskStatus::Running) {
+    if accept_lifecycle && !target.status.is_terminal() && status.is_terminal() {
         target.status = status;
         target.completed_at = completed_at;
         target.duration_ms = duration_ms;
-    } else if target.completed_at.is_none() {
+    } else if accept_lifecycle && target.completed_at.is_none() {
         target.completed_at = completed_at;
         if target.duration_ms.is_none() {
             target.duration_ms = duration_ms;
@@ -387,6 +1032,421 @@ fn agent_fanout_membership(
         target_count: slot.target_count,
         slot_index: slot.slot_index,
         slot_label: slot_label.to_string(),
+    }
+}
+
+fn agent_run_state_from_fanout_receipt(status: &str) -> Option<AgentRunStatus> {
+    match status {
+        "launched" | "running" => Some(AgentRunStatus::Running),
+        "waiting" => Some(AgentRunStatus::Waiting),
+        "completed" => Some(AgentRunStatus::Completed),
+        "interrupted" => Some(AgentRunStatus::Interrupted),
+        "cancelled" => Some(AgentRunStatus::Cancelled),
+        "failed" => Some(AgentRunStatus::Failed),
+        _ => None,
+    }
+}
+
+fn transcript_target_from_wire(
+    value: Option<&str>,
+) -> Option<crate::tui::agent_run_projection::AgentTranscriptTarget> {
+    match value {
+        Some("local_journal") => {
+            Some(crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal)
+        }
+        Some("durable_server") => {
+            Some(crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer)
+        }
+        _ => None,
+    }
+}
+
+/// UI-side evidence check for a completed fanout control action. A transport
+/// error may have non-empty display text, but only a typed receipt identifies
+/// the group that the user can inspect or control.
+fn fanout_completion_has_receipt(output_summary: Option<&str>, output: Option<&str>) -> bool {
+    [output, output_summary].into_iter().flatten().any(|text| {
+        serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .is_some_and(|receipt| {
+                receipt
+                    .get("group_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|group_id| !group_id.trim().is_empty())
+                    && receipt
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|status| !status.trim().is_empty())
+            })
+    })
+}
+
+/// Project a typed fanout admission failure into an actionable user-facing
+/// summary. The raw tool payload remains protocol evidence upstream; dumping
+/// it into the transcript makes a simple rejected launch look like a broken
+/// JSON document and obscures the only user-relevant fact: no child ran.
+fn fanout_rejection_summary(output_summary: Option<&str>, output: Option<&str>) -> Option<String> {
+    [output, output_summary].into_iter().flatten().find_map(|text| {
+        let payload = serde_json::from_str::<serde_json::Value>(text).ok()?;
+        (payload.get("status").and_then(serde_json::Value::as_str) == Some("failed"))
+            .then_some(())?;
+        (payload.get("error_kind").and_then(serde_json::Value::as_str)
+            == Some("tool_invalid_args"))
+            .then_some(())?;
+        let next_step = payload
+            .get("advisory")
+            .and_then(|advisory| advisory.get("next_step"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|step| !step.trim().is_empty())
+            .unwrap_or("Submit one complete request matching the advertised agent_fanout schema.");
+        Some(format!(
+            "Fanout did not start · its arguments were invalid, so no agents were launched. {next_step}"
+        ))
+    })
+}
+
+fn local_agent_run_status(
+    status: &astra_turn_core::orchestration_types::AgentStatus,
+) -> AgentRunStatus {
+    use astra_turn_core::orchestration_types::AgentStatus;
+    match status {
+        AgentStatus::Initializing => AgentRunStatus::Starting,
+        AgentStatus::Running { .. } => AgentRunStatus::Running,
+        AgentStatus::Idle | AgentStatus::Waiting { .. } => AgentRunStatus::Waiting,
+        AgentStatus::Completed { .. } => AgentRunStatus::Completed,
+        AgentStatus::Interrupted { .. } => AgentRunStatus::Interrupted,
+        AgentStatus::Failed { .. } => AgentRunStatus::Failed,
+        AgentStatus::Cancelled { .. } => AgentRunStatus::Cancelled,
+    }
+}
+
+fn local_agent_runtime_metadata(
+    agents: &[astra_turn_core::orchestration_types::SpawnedAgentInfo],
+) -> std::collections::HashMap<String, (u32, usize)> {
+    let by_run_id = agents
+        .iter()
+        .map(|agent| (agent.run_id.as_str(), agent))
+        .collect::<std::collections::HashMap<_, _>>();
+    let child_counts = agents.iter().fold(
+        std::collections::HashMap::<&str, usize>::new(),
+        |mut counts, agent| {
+            *counts.entry(agent.parent_run_id.as_str()).or_default() += 1;
+            counts
+        },
+    );
+
+    agents
+        .iter()
+        .map(|agent| {
+            let mut depth = 1_u32;
+            let mut parent_run_id = agent.parent_run_id.as_str();
+            let mut seen = std::collections::HashSet::from([agent.run_id.as_str()]);
+            while depth < 64 {
+                let Some(parent) = by_run_id.get(parent_run_id) else {
+                    break;
+                };
+                if !seen.insert(parent.run_id.as_str()) {
+                    break;
+                }
+                depth += 1;
+                parent_run_id = parent.parent_run_id.as_str();
+            }
+            (
+                agent.agent_id.clone(),
+                (
+                    depth,
+                    child_counts
+                        .get(agent.run_id.as_str())
+                        .copied()
+                        .unwrap_or(0),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn append_agent_lineage_subtree(
+    index: usize,
+    depth: u32,
+    rows: &[crate::tui::bottom_pane::in_flight_agents_view::AgentRow],
+    children: &std::collections::HashMap<usize, Vec<usize>>,
+    visited: &mut std::collections::HashSet<usize>,
+    ordered: &mut Vec<crate::tui::bottom_pane::in_flight_agents_view::AgentRow>,
+) {
+    let mut pending = vec![(index, depth)];
+    while let Some((index, depth)) = pending.pop() {
+        if !visited.insert(index) {
+            continue;
+        }
+        let mut row = rows[index].clone();
+        row.depth = depth.max(1);
+        ordered.push(row);
+        if let Some(child_indices) = children.get(&index) {
+            for child_index in child_indices.iter().rev() {
+                pending.push((*child_index, depth.saturating_add(1)));
+            }
+        }
+    }
+}
+
+/// Converts canonical run lineage into a visible forest. A child whose parent
+/// was omitted by terminal filtering or a bounded server snapshot becomes a
+/// visible root instead of being rendered with a misleading orphan indent.
+fn order_agent_monitor_rows_by_lineage(
+    rows: Vec<crate::tui::bottom_pane::in_flight_agents_view::AgentRow>,
+) -> Vec<crate::tui::bottom_pane::in_flight_agents_view::AgentRow> {
+    let run_indices = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| row.run_id.as_deref().map(|run_id| (run_id, index)))
+        .fold(
+            std::collections::HashMap::<&str, usize>::new(),
+            |mut indices, (run_id, index)| {
+                indices.entry(run_id).or_insert(index);
+                indices
+            },
+        );
+    let mut children = std::collections::HashMap::<usize, Vec<usize>>::new();
+    let mut roots = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let parent_index = row
+            .parent_run_id
+            .as_deref()
+            .and_then(|parent_run_id| run_indices.get(parent_run_id).copied())
+            .filter(|parent_index| *parent_index != index);
+        if let Some(parent_index) = parent_index {
+            children.entry(parent_index).or_default().push(index);
+        } else {
+            roots.push(index);
+        }
+    }
+
+    let mut visited = std::collections::HashSet::with_capacity(rows.len());
+    let mut ordered = Vec::with_capacity(rows.len());
+    for root in roots {
+        append_agent_lineage_subtree(root, 1, &rows, &children, &mut visited, &mut ordered);
+    }
+    // Malformed cycles have no root. Preserve every row as a visible root and
+    // let the visited set break the cycle rather than dropping monitor data.
+    for index in 0..rows.len() {
+        append_agent_lineage_subtree(index, 1, &rows, &children, &mut visited, &mut ordered);
+    }
+    ordered
+}
+
+fn local_agent_available_actions(
+    status: AgentRunStatus,
+) -> Vec<astra_thin_client::SessionRunAction> {
+    if status.is_active() && status != AgentRunStatus::Cancelling {
+        vec![astra_thin_client::SessionRunAction::Cancel]
+    } else {
+        Vec::new()
+    }
+}
+
+fn server_agent_run_status(status: astra_thin_client::SessionRunLifecycleStatus) -> AgentRunStatus {
+    use astra_thin_client::SessionRunLifecycleStatus;
+    match status {
+        SessionRunLifecycleStatus::Running => AgentRunStatus::Running,
+        SessionRunLifecycleStatus::Waiting => AgentRunStatus::Waiting,
+        SessionRunLifecycleStatus::Paused => AgentRunStatus::Paused,
+        SessionRunLifecycleStatus::Completed => AgentRunStatus::Completed,
+        SessionRunLifecycleStatus::Delegated => AgentRunStatus::Delegated,
+        SessionRunLifecycleStatus::Failed => AgentRunStatus::Failed,
+        SessionRunLifecycleStatus::Cancelled => AgentRunStatus::Cancelled,
+    }
+}
+
+fn parse_run_timestamp(value: &str) -> Option<std::time::SystemTime> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&chrono::Utc).into())
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|value| value.and_utc().into())
+        })
+        .ok()
+}
+
+fn apply_server_agent_detail(
+    projection: &mut AgentRunProjection,
+    node: &astra_thin_client::SessionRunNode,
+    status: AgentRunStatus,
+) {
+    projection.detail.error = if status == AgentRunStatus::Failed {
+        node.error_message
+            .clone()
+            .or_else(|| node.error_code.clone())
+    } else {
+        None
+    };
+    if matches!(status, AgentRunStatus::Waiting | AgentRunStatus::Paused) {
+        let attention = node.waiting_for.as_deref().map(|reason| {
+            let reason = reason.replace('_', " ");
+            match status {
+                AgentRunStatus::Waiting => format!("Waiting for {reason}"),
+                AgentRunStatus::Paused => format!("Paused · {reason}"),
+                _ => unreachable!(),
+            }
+        });
+        projection.detail.output_summary = attention.clone();
+        projection.set_attention_summary(attention);
+    }
+}
+
+fn restored_agent_run_status(status: &str) -> Option<AgentRunStatus> {
+    match status {
+        "pending" => Some(AgentRunStatus::Starting),
+        "running" => Some(AgentRunStatus::Running),
+        "waiting_for_input" => Some(AgentRunStatus::Waiting),
+        "completed" => Some(AgentRunStatus::Completed),
+        "interrupted" => Some(AgentRunStatus::Interrupted),
+        "failed" => Some(AgentRunStatus::Failed),
+        "cancelled" => Some(AgentRunStatus::Cancelled),
+        "killed" => Some(AgentRunStatus::Cancelled),
+        _ => None,
+    }
+}
+
+fn restored_agent_depth(
+    agent: &astra_services::session_workspace::BackgroundLocalAgentTaskProjection,
+    restored: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+) -> u32 {
+    let parents = restored
+        .iter()
+        .map(|candidate| (candidate.run_id.as_str(), candidate.parent_run_id.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut depth = 1_u32;
+    let mut parent = agent.parent_run_id.as_str();
+    let mut visited = std::collections::HashSet::new();
+    while !parent.is_empty() && parent != astra_runtime::orchestration::ROOT_RUN_ID {
+        if !visited.insert(parent) {
+            break;
+        }
+        let Some(next) = parents.get(parent).copied() else {
+            break;
+        };
+        depth = depth.saturating_add(1);
+        parent = next;
+    }
+    depth
+}
+
+fn align_projection_start_time(
+    projection: &mut AgentRunProjection,
+    started_at: std::time::SystemTime,
+) {
+    let Ok(elapsed) = started_at.elapsed() else {
+        return;
+    };
+    if let Some(inferred) = std::time::Instant::now().checked_sub(elapsed)
+        && inferred < projection.detail.started_at
+    {
+        projection.detail.started_at = inferred;
+    }
+}
+
+fn align_projection_start_epoch_ms(projection: &mut AgentRunProjection, started_at_ms: u64) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(started_at_ms);
+    let elapsed = std::time::Duration::from_millis(now_ms.saturating_sub(started_at_ms));
+    if let Some(inferred) = std::time::Instant::now().checked_sub(elapsed)
+        && inferred < projection.detail.started_at
+    {
+        projection.detail.started_at = inferred;
+    }
+}
+
+fn align_projection_end_time(
+    projection: &mut AgentRunProjection,
+    started_at: std::time::SystemTime,
+    ended_at: Option<std::time::SystemTime>,
+) {
+    let Some(ended_at) = ended_at else {
+        return;
+    };
+    if let Ok(duration) = ended_at.duration_since(started_at) {
+        projection.detail.duration_ms = Some(duration.as_millis() as u64);
+    }
+    let elapsed_since_end = ended_at.elapsed().unwrap_or_default();
+    let completed_at = std::time::Instant::now()
+        .checked_sub(elapsed_since_end)
+        .unwrap_or_else(std::time::Instant::now);
+    projection.detail.completed_at = Some(completed_at);
+    projection.terminal_at = Some(completed_at);
+}
+
+fn apply_local_agent_status(
+    projection: &mut AgentRunProjection,
+    status: &astra_turn_core::orchestration_types::AgentStatus,
+) {
+    use astra_turn_core::orchestration_types::AgentStatus;
+
+    let elapsed_ms = projection.detail.started_at.elapsed().as_millis() as u64;
+    match status {
+        AgentStatus::Initializing => {}
+        AgentStatus::Running { activity } => {
+            if projection.detail.output_summary.is_none() && !activity.trim().is_empty() {
+                projection.detail.output_summary = Some(activity.clone());
+            }
+        }
+        AgentStatus::Idle => {
+            if projection.detail.output_summary.is_none() {
+                projection.detail.output_summary = Some("Agent is waiting for input.".into());
+            }
+            projection.set_attention_summary(Some("Waiting for input".into()));
+        }
+        AgentStatus::Waiting { reason } => {
+            if projection.detail.output_summary.is_none() && !reason.trim().is_empty() {
+                projection.detail.output_summary = Some(reason.clone());
+            }
+            projection.set_attention_summary((!reason.trim().is_empty()).then(|| reason.clone()));
+        }
+        AgentStatus::Completed { result, .. } => {
+            projection
+                .detail
+                .completed_at
+                .get_or_insert_with(std::time::Instant::now);
+            projection.detail.duration_ms = Some(elapsed_ms);
+            if !result.trim().is_empty() {
+                projection.detail.output_summary = Some(result.clone());
+            }
+            projection.detail.error = None;
+        }
+        AgentStatus::Interrupted {
+            partial_result,
+            finish_reason,
+        } => {
+            projection
+                .detail
+                .completed_at
+                .get_or_insert_with(std::time::Instant::now);
+            projection.detail.duration_ms = Some(elapsed_ms);
+            if !partial_result.trim().is_empty() {
+                projection.detail.output_summary = Some(partial_result.clone());
+            }
+            projection.detail.error = Some(finish_reason.clone());
+        }
+        AgentStatus::Failed { error, .. } => {
+            projection
+                .detail
+                .completed_at
+                .get_or_insert_with(std::time::Instant::now);
+            projection.detail.duration_ms = Some(elapsed_ms);
+            projection.detail.error = Some(error.clone());
+        }
+        AgentStatus::Cancelled { reason, .. } => {
+            projection
+                .detail
+                .completed_at
+                .get_or_insert_with(std::time::Instant::now);
+            projection.detail.duration_ms = Some(elapsed_ms);
+            if !reason.trim().is_empty() {
+                projection.detail.output_summary = Some(reason.clone());
+            }
+            projection.detail.error = None;
+        }
     }
 }
 
@@ -419,7 +1479,13 @@ enum AgentLiveMirror {
 pub(crate) struct ChatWidget {
     session_id: String,
     history: Vec<Arc<dyn HistoryCell>>,
+    /// UI projection identities parallel to `history`. IDs are allocated when
+    /// a cell is created, not when it is committed, so a live cell keeps the
+    /// same identity across mid-turn user insertions and live -> settled.
+    history_cell_ids: Vec<u64>,
     active_cell: Option<Box<dyn HistoryCell>>,
+    active_cell_id: Option<u64>,
+    next_cell_id: u64,
     /// Live parallel TaskCells, keyed by their `tool_use_id`.
     /// Mutating directly (no `Arc`) so child events can attach.
     live_tasks: std::collections::HashMap<String, Box<TaskCell>>,
@@ -433,38 +1499,26 @@ pub(crate) struct ChatWidget {
     /// child agent. This registry is populated from those tool outputs and is
     /// the canonical source for the multi-agent strip/drilldown.
     agent_runs: AgentRunRegistry,
+    /// Immutable run identities already known when an `agent_fanout` starts.
+    /// A missing receipt can later be annotated only from newly observed
+    /// canonical run identities, never from display text or a mutable active
+    /// count. The evidence does not prove the tool receipt succeeded, so it
+    /// produces an explicit uncertain outcome rather than a false success.
+    fanout_launch_baselines: std::collections::HashMap<String, HashSet<String>>,
     /// Index into `history` marking cells that have already been
     /// flushed to the terminal scrollback. `drain_new_committed`
     /// returns everything past this index and advances it.
     committed_watermark: usize,
-    /// Index into `history` marking cells that have already been
-    /// persisted to the JSONL transcript. Starts at 0; advanced by
-    /// `persist_from_watermark`. Kept separate from the display
-    /// watermark because their lifecycles diverge — a cell is
-    /// committed to scrollback as soon as it finalises, but may be
-    /// held back from disk if the server hasn't yet assigned a
-    /// session id (turn 1 edge case). When `set_session_id` is
-    /// eventually called, we drain this watermark to persist every
-    /// cell accumulated in the meantime.
-    persist_watermark: usize,
     /// `tool_use_id`s of TaskCells spawned in the current turn that
     /// have not yet reached a terminal state. Ctrl+C on the parent
     /// turn cascades cancel to every id in this set; an individual
     /// TaskCell's Esc handler removes just its own id. Cleared at
     /// turn boundaries.
     in_flight_task_ids: Vec<String>,
-    /// Agent/control ids that have received a local cancel request but
-    /// have not yet delivered their terminal event.
+    /// Control tool ids that have received a local cancel request but have
+    /// not yet delivered their terminal event. Logical Agent cancellation is
+    /// tracked in `AgentRunProjection::state`.
     cancelling_task_ids: std::collections::HashSet<String>,
-    /// Logical agent ids that ended via cancellation. TaskCell has only
-    /// Completed/Failed, so keep this alongside the cell for row status.
-    cancelled_task_ids: std::collections::HashSet<String>,
-    /// Agent ids cleared at a turn boundary. Late terminal events for
-    /// these prior-turn agents must not resurrect rows in the next turn.
-    cleared_agent_run_ids: std::collections::HashSet<String>,
-    /// Control tool ids cleared at a turn boundary. Used to detect
-    /// late `AgentControlCompleted` arrivals after the row was dropped.
-    cleared_agent_tool_use_ids: std::collections::HashSet<String>,
     /// Current-turn UI capability for foreground bash promotion.
     /// Enabled by the interactive event loop only after it installs a
     /// detach handle that Ctrl+B can signal.
@@ -476,17 +1530,17 @@ impl ChatWidget {
         Self {
             session_id: session_id.into(),
             history: Vec::new(),
+            history_cell_ids: Vec::new(),
             active_cell: None,
+            active_cell_id: None,
+            next_cell_id: 1,
             live_tasks: std::collections::HashMap::new(),
             live_task_order: Vec::new(),
             agent_runs: AgentRunRegistry::default(),
+            fanout_launch_baselines: std::collections::HashMap::new(),
             committed_watermark: 0,
-            persist_watermark: 0,
             in_flight_task_ids: Vec::new(),
             cancelling_task_ids: std::collections::HashSet::new(),
-            cancelled_task_ids: std::collections::HashSet::new(),
-            cleared_agent_run_ids: std::collections::HashSet::new(),
-            cleared_agent_tool_use_ids: std::collections::HashSet::new(),
             bash_background_hint_enabled: false,
         }
     }
@@ -521,7 +1575,350 @@ impl ChatWidget {
     }
 
     pub fn agent_run_cell(&self, id: &str) -> Option<&TaskCell> {
-        self.agent_runs.get(id)
+        self.agent_runs
+            .get(id)
+            .map(|projection| projection.detail.as_ref())
+    }
+
+    pub(crate) fn agent_run_state(&self, id: &str) -> Option<AgentRunState> {
+        self.agent_runs.get(id).map(|projection| projection.state)
+    }
+
+    pub(crate) fn agent_run_activity_counts(
+        &self,
+        id: &str,
+    ) -> Option<crate::tui::agent_run_projection::AgentActivityCounts> {
+        self.agent_runs.get(id).map(|projection| {
+            projection.activity_counts(self.agent_runs.durable_snapshot_truncated)
+        })
+    }
+
+    pub(crate) fn agent_run_terminal_at(&self, id: &str) -> Option<std::time::Instant> {
+        self.agent_runs
+            .get(id)
+            .and_then(|projection| projection.terminal_at)
+    }
+
+    pub(crate) fn reconcile_local_agent_snapshot(
+        &mut self,
+        snapshot: &crate::tui::local_agent_snapshot::LocalAgentSnapshot,
+        restored: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    ) -> bool {
+        let before = self.agent_runs.signature();
+        let fanout_titles = snapshot.fanout_titles();
+        let local_runtime_metadata = local_agent_runtime_metadata(&snapshot.agents);
+        let mut present = std::collections::HashSet::new();
+
+        if snapshot.available {
+            for agent in &snapshot.agents {
+                if let Some(tool_use_id) = agent.spawn_tool_call_id.as_deref()
+                    && let Some(provisional_key) = self
+                        .agent_runs
+                        .key_for_tool_use(tool_use_id)
+                        .map(str::to_string)
+                    && provisional_key != agent.agent_id
+                {
+                    self.agent_runs
+                        .rename(&provisional_key, agent.agent_id.clone());
+                }
+                present.insert(agent.agent_id.clone());
+                let status = local_agent_run_status(&agent.status);
+                let state = AgentRunState::confirmed_local(status);
+                let label = if agent.description.trim().is_empty() {
+                    agent_display_name(&agent.agent_id, Some(&agent.agent_type))
+                } else {
+                    agent.description.clone()
+                };
+                let accepted = self.agent_runs.ensure(agent.agent_id.clone(), label, state);
+                if let Some(projection) = self.agent_runs.get_mut(&agent.agent_id) {
+                    let (depth, child_agents) = local_runtime_metadata
+                        .get(agent.agent_id.as_str())
+                        .copied()
+                        .unwrap_or((1, 0));
+                    projection.set_runtime_metadata(
+                        AgentProjectionSource::LocalRuntime,
+                        agent.run_id.clone(),
+                        (!agent.parent_run_id.trim().is_empty())
+                            .then(|| agent.parent_run_id.clone()),
+                        depth,
+                        child_agents,
+                    );
+                    projection.set_runtime_facts(
+                        AgentProjectionSource::LocalRuntime,
+                        astra_thin_client::SessionRunRuntimeFacts {
+                            runtime_profile: Some("cli_local".into()),
+                            agent_binding_name: Some(agent.agent_type.clone()),
+                            background: Some(agent.run_in_background),
+                            permission: Some(astra_thin_client::SessionRunPermissionFacts {
+                                has_issues: agent.has_permission_issues,
+                                requests: agent.metrics.permission_requests,
+                                approved: agent.metrics.permission_requests_approved,
+                                tools_blocked: agent.metrics.tools_blocked,
+                            }),
+                            ..Default::default()
+                        },
+                    );
+                    projection.set_controls(
+                        AgentProjectionSource::LocalRuntime,
+                        crate::tui::agent_run_projection::AgentControlTarget::LocalAgent {
+                            agent_id: agent.agent_id.clone(),
+                        },
+                        local_agent_available_actions(status),
+                    );
+                    projection.set_transcript_target(
+                        AgentProjectionSource::LocalRuntime,
+                        crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal,
+                    );
+                    if accepted {
+                        projection.reported_tool_calls = agent.metrics.tool_calls as usize;
+                        align_projection_start_time(projection, agent.started_at);
+                        apply_local_agent_status(projection, &agent.status);
+                        align_projection_end_time(projection, agent.started_at, agent.ended_at);
+                    }
+                }
+                if accepted {
+                    let fanout = agent.fanout_slot.clone().map(|slot| {
+                        let title = fanout_titles.get(&slot.group_id).map(String::as_str);
+                        agent_fanout_membership(slot, title, &agent.description)
+                    });
+                    self.agent_runs
+                        .reconcile_fanout_membership(&agent.agent_id, fanout);
+                }
+            }
+
+            for (id, projection) in &mut self.agent_runs.runs {
+                if projection.state.source == AgentProjectionSource::LocalRuntime
+                    && !present.contains(id)
+                {
+                    projection.mark_stale_if_active();
+                }
+            }
+        }
+
+        for restored_agent in restored {
+            if self.agent_runs.contains_key(&restored_agent.id) {
+                continue;
+            }
+            let Some(status) = restored_agent_run_status(&restored_agent.status) else {
+                continue;
+            };
+            self.agent_runs.ensure(
+                restored_agent.id.clone(),
+                restored_agent.title.clone(),
+                AgentRunState::stale_workspace(status),
+            );
+            if let Some(projection) = self.agent_runs.get_mut(&restored_agent.id) {
+                projection.set_runtime_metadata(
+                    AgentProjectionSource::WorkspaceSnapshot,
+                    restored_agent.run_id.clone(),
+                    Some(restored_agent.parent_run_id.clone()),
+                    restored_agent_depth(restored_agent, restored),
+                    0,
+                );
+                projection.set_transcript_target(
+                    AgentProjectionSource::WorkspaceSnapshot,
+                    crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal,
+                );
+                align_projection_start_epoch_ms(projection, restored_agent.started_at_ms);
+                projection.detail.output_summary = restored_agent.output_tail.clone();
+                if matches!(status, AgentRunStatus::Failed | AgentRunStatus::Interrupted) {
+                    projection.detail.error = restored_agent.terminal_reason.clone();
+                }
+            }
+            self.agent_runs.set_fanout_membership(
+                &restored_agent.id,
+                restored_agent.fanout.as_ref().map(|fanout| {
+                    crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership {
+                        group_id: fanout.group_id.clone(),
+                        group_title: fanout.group_title.clone(),
+                        target_count: fanout.target_count,
+                        slot_index: fanout.slot_index,
+                        slot_label: fanout.slot_label.clone(),
+                    }
+                }),
+            );
+        }
+
+        before != self.agent_runs.signature()
+    }
+
+    /// Recover terminal local-agent rows from the canonical session journal.
+    ///
+    /// The dynamic spawner is an execution cache, not the ownership boundary
+    /// for a completed conversation. Once a CLI restarts (or an old agent
+    /// leaves the bounded in-memory archive), this path keeps `/agent` able to
+    /// open the exact local transcript by its immutable run id.
+    pub(crate) fn reconcile_local_agent_journal_runs(
+        &mut self,
+        runs: &[crate::tui::local_agent_journal::LocalJournalAgentRun],
+    ) -> bool {
+        let before = self.agent_runs.signature();
+        for run in runs {
+            let Some(status) = restored_agent_run_status(&run.status) else {
+                continue;
+            };
+            let run_key = self
+                .agent_runs
+                .key_for_run_id(&run.run_id)
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    self.agent_runs
+                        .key_for_live_event(&run.agent_id, &run.run_id)
+                });
+            let label = if run.description.trim().is_empty() {
+                agent_display_name(&run.agent_id, None)
+            } else {
+                run.description.clone()
+            };
+            let accepted = self.agent_runs.ensure(
+                run_key.clone(),
+                label,
+                AgentRunState::confirmed_local_journal(status),
+            );
+            let Some(projection) = self.agent_runs.get_mut(&run_key) else {
+                continue;
+            };
+            projection.set_runtime_metadata(
+                AgentProjectionSource::LocalJournal,
+                run.run_id.clone(),
+                run.parent_run_id.clone(),
+                1,
+                0,
+            );
+            projection.set_transcript_target(
+                AgentProjectionSource::LocalJournal,
+                crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal,
+            );
+            if accepted {
+                projection.reported_tool_calls = run.tool_calls;
+                projection.detail.duration_ms = Some(run.duration_ms);
+                projection.detail.completed_at = Some(std::time::Instant::now());
+            }
+        }
+        before != self.agent_runs.signature()
+    }
+
+    pub(crate) fn reconcile_server_agent_projection(
+        &mut self,
+        server: &crate::tui::server_agent_observer::ServerAgentProjection,
+    ) -> bool {
+        use crate::tui::server_agent_observer::ServerAgentTruthState;
+
+        let before = self.agent_runs.signature();
+        self.agent_runs.server_truth_state = server.truth_state;
+        match server.truth_state {
+            ServerAgentTruthState::Stale => {
+                for projection in self.agent_runs.runs.values_mut() {
+                    if projection.state.source == AgentProjectionSource::DurableServer {
+                        projection.mark_stale_if_active();
+                    }
+                }
+            }
+            ServerAgentTruthState::Confirmed => {
+                if let Some(snapshot) = server.snapshot.as_ref() {
+                    self.agent_runs.durable_snapshot_truncated = snapshot.truncated;
+                    let child_counts = snapshot.runs.iter().fold(
+                        std::collections::HashMap::<&str, usize>::new(),
+                        |mut counts, node| {
+                            if node.is_agent_run()
+                                && let Some(parent_run_id) = node.parent_run_id.as_deref()
+                            {
+                                *counts.entry(parent_run_id).or_default() += 1;
+                            }
+                            counts
+                        },
+                    );
+                    let mut present = std::collections::HashSet::new();
+                    for node in snapshot.runs.iter().filter(|node| node.is_agent_run()) {
+                        present.insert(node.run_id.as_str());
+                        if self
+                            .agent_runs
+                            .get(&node.run_id)
+                            .and_then(|projection| projection.durable_event_high_watermark)
+                            .is_some_and(|watermark| watermark > node.run_event_high_watermark)
+                        {
+                            continue;
+                        }
+
+                        let status = server_agent_run_status(node.status);
+                        let state = AgentRunState::confirmed_server(status);
+                        let label = node
+                            .agent_name
+                            .as_deref()
+                            .or(node.agent_id.as_deref())
+                            .filter(|label| !label.trim().is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| agent_display_name(&node.run_id, None));
+                        let accepted = self.agent_runs.ensure(node.run_id.clone(), label, state);
+                        let Some(projection) = self.agent_runs.get_mut(&node.run_id) else {
+                            continue;
+                        };
+                        projection.set_controls(
+                            AgentProjectionSource::DurableServer,
+                            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                                run_id: node.run_id.clone(),
+                            },
+                            node.available_actions.clone(),
+                        );
+                        projection.set_transcript_target(
+                            AgentProjectionSource::DurableServer,
+                            crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer,
+                        );
+                        projection.set_runtime_facts(
+                            AgentProjectionSource::DurableServer,
+                            node.runtime.clone(),
+                        );
+                        if !accepted
+                            && projection.durable_event_high_watermark
+                                == Some(node.run_event_high_watermark)
+                        {
+                            continue;
+                        }
+                        projection.durable_event_high_watermark =
+                            Some(node.run_event_high_watermark);
+                        projection.set_runtime_metadata(
+                            AgentProjectionSource::DurableServer,
+                            node.run_id.clone(),
+                            node.parent_run_id.clone(),
+                            node.depth,
+                            child_counts.get(node.run_id.as_str()).copied().unwrap_or(0),
+                        );
+                        projection.reported_tool_calls = node.total_tool_calls as usize;
+                        if let Some(started_at) = parse_run_timestamp(&node.created_at) {
+                            align_projection_start_time(projection, started_at);
+                            if status.is_terminal() {
+                                align_projection_end_time(
+                                    projection,
+                                    started_at,
+                                    parse_run_timestamp(&node.updated_at),
+                                );
+                            }
+                        }
+                        apply_server_agent_detail(projection, node, status);
+                    }
+
+                    if !snapshot.truncated {
+                        for (run_id, projection) in &mut self.agent_runs.runs {
+                            if projection.state.source == AgentProjectionSource::DurableServer
+                                && !present.contains(run_id.as_str())
+                            {
+                                projection.mark_stale_if_active();
+                            }
+                        }
+                    }
+                }
+            }
+            ServerAgentTruthState::Unbound
+            | ServerAgentTruthState::Loading
+            | ServerAgentTruthState::Unavailable => {}
+        }
+
+        before != self.agent_runs.signature()
+    }
+
+    pub(crate) fn reset_agent_scope(&mut self) {
+        self.agent_runs = AgentRunRegistry::default();
+        self.fanout_launch_baselines.clear();
     }
 
     #[cfg(test)]
@@ -530,65 +1927,21 @@ impl ChatWidget {
         id: &str,
         completed_at: std::time::Instant,
     ) {
-        if let Some(tc) = self.agent_runs.get_mut(id) {
-            tc.completed_at = Some(completed_at);
-        }
-    }
-
-    /// Whether the user has issued a cancel for this agent that has
-    /// already terminated. Distinct from Failed so the strip / drill
-    /// view can render a different icon (■, dim) — a cancelled run is
-    /// the user's intent, not an alarm.
-    pub fn agent_is_cancelled(&self, id: &str) -> bool {
-        self.cancelled_task_ids.contains(id)
-    }
-
-    /// Whether the user has issued a cancel for this agent that has
-    /// NOT yet terminated. Distinct from `agent_is_cancelled` so the
-    /// strip can show "Cancelling…" while the cancel is in flight.
-    pub fn agent_is_cancelling(&self, id: &str) -> bool {
-        self.cancelling_task_ids.contains(id)
-    }
-
-    fn agent_row_status(
-        &self,
-        id: &str,
-        cell: &TaskCell,
-    ) -> crate::tui::bottom_pane::in_flight_agents_view::AgentRowStatus {
-        use crate::tui::bottom_pane::in_flight_agents_view::AgentRowStatus;
-        if self.cancelled_task_ids.contains(id) {
-            AgentRowStatus::Cancelled
-        } else if matches!(
-            cell.status,
-            crate::tui::history_cell::task::TaskStatus::Failed
-        ) {
-            AgentRowStatus::Failed
-        } else if matches!(
-            cell.status,
-            crate::tui::history_cell::task::TaskStatus::Completed
-        ) {
-            AgentRowStatus::Completed
-        } else if matches!(
-            cell.status,
-            crate::tui::history_cell::task::TaskStatus::Interrupted
-        ) {
-            AgentRowStatus::Interrupted
-        } else if self.cancelling_task_ids.contains(id) {
-            AgentRowStatus::Cancelling
-        } else {
-            AgentRowStatus::Live
+        if let Some(projection) = self.agent_runs.get_mut(id) {
+            projection.detail.completed_at = Some(completed_at);
+            projection.terminal_at = Some(completed_at);
         }
     }
 
     /// Look up a TaskCell by id in either the live register or in
-    /// history. Used by the Ctrl+G drilldown to open a TaskDetailView
-    /// for agents that have already completed (the live register
-    /// drains them on completion). Live cells take priority because
-    /// they have fresher elapsed/child counts; if a stale duplicate
-    /// id ever lived in both places, the live one wins.
+    /// history. The agent transcript uses this only as a transient live
+    /// fallback for activity that predates opening the transcript; canonical
+    /// conversation is loaded separately. Live cells take priority because
+    /// they have fresher elapsed/child counts; if a stale duplicate id ever
+    /// lived in both places, the live one wins.
     pub fn task_cell_anywhere(&self, id: &str) -> Option<&TaskCell> {
         if let Some(tc) = self.agent_runs.get(id) {
-            return Some(tc);
+            return Some(tc.detail.as_ref());
         }
         if let Some(tc) = self.live_tasks.get(id).map(|b| b.as_ref()) {
             return Some(tc);
@@ -610,116 +1963,117 @@ impl ChatWidget {
     /// after the live strip has dismissed (session 2a98814b: by the
     /// time the user pressed Ctrl+G, all 4 agents had completed and
     /// the strip was gone — pre-fix, Ctrl+G silently no-op'd).
-    pub fn agents_drilldown_rows(
+    pub fn agent_monitor_snapshot(
         &self,
         max_recent_completed: usize,
-    ) -> Vec<crate::tui::bottom_pane::in_flight_agents_view::AgentRow> {
-        use crate::tui::bottom_pane::in_flight_agents_view::{AgentRow, AgentRowStatus};
+    ) -> crate::tui::bottom_pane::in_flight_agents_view::AgentMonitorSnapshot {
+        use crate::tui::bottom_pane::in_flight_agents_view::{AgentMonitorSnapshot, AgentRow};
 
         let registry_rows: Vec<AgentRow> = self
             .agent_runs
             .order
             .iter()
             .filter_map(|id| {
-                self.agent_runs.get(id).map(|tc| AgentRow {
+                self.agent_runs.get(id).map(|projection| AgentRow {
                     agent_id: id.clone(),
-                    name: tc.description.clone(),
-                    child_count: tc.children.len(),
-                    elapsed_ms: tc
-                        .duration_ms
-                        .unwrap_or_else(|| tc.started_at.elapsed().as_millis() as u64),
-                    status: self.agent_row_status(id, tc),
+                    name: projection.detail.description.clone(),
+                    activity: projection
+                        .activity_counts(self.agent_runs.durable_snapshot_truncated),
+                    run_id: projection.run_id.clone(),
+                    parent_run_id: projection.parent_run_id.clone(),
+                    depth: projection.depth,
+                    provenance: projection
+                        .metadata_source
+                        .unwrap_or(projection.state.source),
+                    elapsed_ms: projection.detail.duration_ms.unwrap_or_else(|| {
+                        projection.detail.started_at.elapsed().as_millis() as u64
+                    }),
+                    state: projection.state,
+                    attention_summary: projection.attention_summary.clone(),
                     fanout: self.agent_runs.fanout_membership(id).cloned(),
+                    control_target: projection.control_target.clone(),
+                    transcript_target: projection.transcript_target,
+                    available_actions: projection.available_actions.clone(),
+                    runtime: projection.runtime_facts.clone(),
                 })
             })
             .collect();
 
-        if !registry_rows.is_empty() {
-            // Live agents always appear; completed/failed are capped at
-            // `max_recent_completed` so a small Ctrl+G list doesn't blow
-            // up after a long-running session that's spawned dozens of
-            // sub-agents. `max_recent_completed=0` means strip-mirror
-            // mode (only-live).
-            let mut rows: Vec<AgentRow> = registry_rows
-                .iter()
-                .filter(|row| {
-                    row.status == AgentRowStatus::Live || row.status == AgentRowStatus::Cancelling
-                })
-                .cloned()
-                .collect();
+        let is_uncertain = |row: &AgentRow| {
+            matches!(
+                row.state.confidence,
+                AgentProjectionConfidence::Stale | AgentProjectionConfidence::Unconfirmed
+            )
+        };
+        let mut rows: Vec<AgentRow> = registry_rows
+            .iter()
+            .filter(|row| row.state.status.is_active() || is_uncertain(row))
+            .cloned()
+            .collect();
+        if max_recent_completed > 0 {
             rows.extend(
                 registry_rows
                     .into_iter()
-                    .filter(|row| {
-                        row.status != AgentRowStatus::Live
-                            && row.status != AgentRowStatus::Cancelling
-                    })
+                    .rev()
+                    .filter(|row| row.state.status.is_terminal() && !is_uncertain(row))
                     .take(max_recent_completed),
             );
-            return rows;
         }
+        AgentMonitorSnapshot {
+            rows: order_agent_monitor_rows_by_lineage(rows),
+            show_root_conversation: false,
+            server_truth_state: self.agent_runs.server_truth_state,
+            durable_snapshot_truncated: self.agent_runs.durable_snapshot_truncated,
+        }
+    }
 
-        let is_control_plane_agent_task = |tc: &TaskCell| {
-            tc.description.starts_with("Spawn agent:")
-                || tc.description.starts_with("Get agent result:")
-        };
-        let is_terminal = |tc: &TaskCell| {
-            !matches!(
-                tc.status,
-                crate::tui::history_cell::task::TaskStatus::Running
-            )
-        };
-
-        // Legacy replay fallback: old transcripts only have generic
-        // ToolStarted/ToolCompleted events, not AgentControl* events.
-        let mut rows: Vec<AgentRow> = self
-            .live_task_order
-            .iter()
-            .filter_map(|id| {
-                self.live_tasks.get(id).and_then(|tc| {
-                    if is_control_plane_agent_task(tc) {
-                        None
-                    } else {
-                        Some(AgentRow {
-                            agent_id: id.clone(),
-                            name: tc.description.clone(),
-                            child_count: tc.children.len(),
-                            elapsed_ms: tc.started_at.elapsed().as_millis() as u64,
-                            status: if self.cancelling_task_ids.contains(id) {
-                                AgentRowStatus::Cancelling
-                            } else {
-                                AgentRowStatus::Live
-                            },
-                            fanout: None,
-                        })
-                    }
-                })
+    pub(crate) fn agent_live_transcript_replay(
+        &self,
+        agent_id: &str,
+        run_id: &str,
+    ) -> (Vec<astra_turn_core::agent_live_event::AgentLiveEvent>, u64) {
+        let Some(key) = self.agent_runs.key_for_run_id(run_id).or_else(|| {
+            self.agent_runs.order.iter().find_map(|key| {
+                self.agent_runs
+                    .get(key)
+                    .filter(|projection| {
+                        key.as_str() == agent_id && projection.run_id.as_deref() == Some(run_id)
+                    })
+                    .map(|_| key.as_str())
             })
-            .collect();
+        }) else {
+            return (Vec::new(), 0);
+        };
+        let Some(projection) = self.agent_runs.get(key) else {
+            return (Vec::new(), 0);
+        };
+        (
+            projection.live_transcript_events.iter().cloned().collect(),
+            projection.live_transcript_dropped,
+        )
+    }
 
-        if max_recent_completed > 0 {
-            let completed: Vec<AgentRow> = self
-                .history
-                .iter()
-                .rev()
-                .filter_map(|cell| cell.as_any_ref().downcast_ref::<TaskCell>())
-                .filter(|tc| is_terminal(tc) && !is_control_plane_agent_task(tc))
-                .take(max_recent_completed)
-                .map(|tc| AgentRow {
-                    agent_id: tc.tool_use_id.clone(),
-                    name: tc.description.clone(),
-                    child_count: tc.children.len(),
-                    elapsed_ms: tc
-                        .duration_ms
-                        .unwrap_or_else(|| tc.started_at.elapsed().as_millis() as u64),
-                    status: task_status_to_agent_row_status(tc.status),
-                    fanout: None,
-                })
-                .collect();
-            rows.extend(completed);
-        }
-
-        rows
+    /// Full Agent Workbench projection for every row currently loaded from
+    /// the local runtime, workspace recovery, and the bounded durable server
+    /// snapshot. Unlike the compact activity strip, the Workbench never
+    /// performs a second client-side terminal-history truncation.
+    pub(crate) fn agent_workbench_snapshot(
+        &self,
+    ) -> crate::tui::bottom_pane::in_flight_agents_view::AgentMonitorSnapshot {
+        let mut snapshot = self.agent_monitor_snapshot(usize::MAX);
+        // The root transcript belongs in an actual run tree, not as a fake
+        // agent row. With no observed children and a confirmed/unbound server
+        // lane, Ctrl+G should acknowledge the empty state without stealing
+        // focus into a one-row workbench. Degraded durable observation still
+        // opens the monitor so its freshness/action state remains visible.
+        snapshot.show_root_conversation = !snapshot.rows.is_empty()
+            || matches!(
+                snapshot.server_truth_state,
+                crate::tui::server_agent_observer::ServerAgentTruthState::Loading
+                    | crate::tui::server_agent_observer::ServerAgentTruthState::Stale
+                    | crate::tui::server_agent_observer::ServerAgentTruthState::Unavailable
+            );
+        snapshot
     }
 
     /// IDs of TaskCells still running in the current turn. The
@@ -732,7 +2086,7 @@ impl ChatWidget {
         &self.in_flight_task_ids
     }
 
-    pub fn mark_agent_controls_cancelling(&mut self, ids: &[String]) {
+    pub fn mark_control_tasks_cancelling(&mut self, ids: &[String]) {
         for id in ids {
             self.cancelling_task_ids.insert(id.clone());
             if let Some(tc) = self.live_tasks.get_mut(id) {
@@ -741,9 +2095,10 @@ impl ChatWidget {
             let Some(agent_key) = self.agent_runs.key_for_tool_use(id).map(str::to_owned) else {
                 continue;
             };
-            self.cancelling_task_ids.insert(agent_key.clone());
-            if let Some(tc) = self.agent_runs.get_mut(&agent_key) {
-                append_agent_live_output(tc, "\nCancelling…\n");
+            if let Some(projection) = self.agent_runs.get_mut(&agent_key) {
+                if projection.set_state(AgentRunState::local_intent(AgentRunStatus::Cancelling)) {
+                    append_agent_live_output(&mut projection.detail, "\nCancelling…\n");
+                }
             }
         }
         // Once we've fanned out cancels for these ids, drop them from
@@ -757,6 +2112,22 @@ impl ChatWidget {
         let to_drop: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
         self.in_flight_task_ids
             .retain(|id| !to_drop.contains(id.as_str()));
+    }
+
+    pub fn mark_agent_control_pending(
+        &mut self,
+        agent_id: &str,
+        action: astra_thin_client::SessionRunAction,
+    ) -> bool {
+        self.agent_runs
+            .get_mut(agent_id)
+            .is_some_and(|projection| projection.begin_control(action))
+    }
+
+    pub fn reject_agent_control(&mut self, agent_id: &str) -> bool {
+        self.agent_runs
+            .get_mut(agent_id)
+            .is_some_and(AgentRunProjection::reject_control)
     }
 
     /// Commit a single-line banner into scrollback confirming how
@@ -797,8 +2168,18 @@ impl ChatWidget {
         &self.history
     }
 
+    pub(crate) fn history_cell_id(&self, index: usize) -> u64 {
+        debug_assert_eq!(self.history.len(), self.history_cell_ids.len());
+        self.history_cell_ids[index]
+    }
+
     pub fn active_cell(&self) -> Option<&dyn HistoryCell> {
         self.active_cell.as_deref()
+    }
+
+    pub(crate) fn active_cell_id(&self) -> Option<u64> {
+        debug_assert_eq!(self.active_cell.is_some(), self.active_cell_id.is_some());
+        self.active_cell_id
     }
 
     /// Drain cells added since the last call. The outer loop uses
@@ -841,59 +2222,60 @@ impl ChatWidget {
 
     /// Swap the backing session id.
     ///
-    /// - If cells accumulated under an empty sid (turn-1 edge case:
-    ///   server hadn't assigned one yet), they get flushed to the
-    ///   new session's JSONL transcript on first assignment. This
-    ///   is what lets resume replay show the user's very first
-    ///   message instead of starting mid-conversation.
-    /// - Cells already persisted under a non-empty sid stay in
-    ///   their original transcript; only the new cells ride under
-    ///   the new id.
+    /// Canonical transcript ownership is the session journal. The widget only
+    /// uses this identity for live projection and never writes a competing
+    /// per-cell transcript file.
     pub fn set_session_id(&mut self, sid: impl Into<String>) {
         self.session_id = sid.into();
-        // Flush any cells that accumulated while sid was empty.
-        self.persist_from_watermark();
     }
 
     /// Replay a previously-persisted turn stream into `history`.
     /// Used by the Phase 4 resume path. Cells land already
     /// finalised — no live state, no further mutation.
     ///
-    /// Advances the persist watermark past the replayed cells so
-    /// subsequent `commit_*` calls don't re-persist them to the
-    /// JSONL (which would double every resumed line on every
-    /// future write).
     pub fn replay(&mut self, events: Vec<TurnEvent>) {
         for ev in events {
             if let Some(cell) = cell_from_persist(ev) {
+                let id = self.allocate_cell_id();
                 self.history.push(cell.into());
+                self.history_cell_ids.push(id);
             }
         }
-        self.persist_watermark = self.history.len();
     }
 
     /// Commit a free-standing `SystemCell` — slash-command responses,
-    /// info banners, inline errors, etc. Goes into `history` and the
-    /// JSONL transcript the same way model-generated cells do, so
-    /// resume replay surfaces them and the Ctrl+O overlay keeps them.
+    /// info banners, inline errors, etc. Goes into local scrollback only;
+    /// control-plane UI rows never become prompt-facing transcript history.
     ///
-    /// Before this, slash-dispatch wrote system lines directly to the
-    /// terminal via `queue_history_lines` — they showed in the live
-    /// scrollback but never made it to disk, so a resumed session
-    /// silently lost every `/model`, `/login`, `/permission` response
-    /// as well as the `Session expired` / "token refreshed" banners.
     pub fn commit_system(&mut self, cell: SystemCell) {
         self.commit_active(); // finalise anything live first
         self.commit_cell(Box::new(cell));
     }
 
+    /// Show a local warning without mixing a UI-health issue into canonical
+    /// conversation history.
+    pub(crate) fn commit_ephemeral_warning(&mut self, message: impl Into<String>) {
+        let id = self.allocate_cell_id();
+        self.history
+            .push(box_into_arc(Box::new(SystemCell::ephemeral_warning(
+                message,
+            ))));
+        self.history_cell_ids.push(id);
+    }
+
     /// Commit a user message directly into history without opening a new turn
     /// or draining the current live tool/assistant state.
     ///
-    /// Used for deferred inputs that become active mid-turn: the transcript
+    /// Used for user intents that become active mid-turn: the transcript
     /// should show the newest user message as a first-class user row, but the
     /// current streaming turn should remain live until the runtime yields.
-    pub fn commit_deferred_user(&mut self, text: impl Into<String>) {
+    pub fn commit_applied_user_intent(
+        &mut self,
+        _intent_id: impl Into<String>,
+        _delivery: astra_turn_types::UserIntentDelivery,
+        _status: astra_turn_types::UserIntentStatus,
+        text: impl Into<String>,
+    ) {
         self.commit_cell(Box::new(UserCell::new(text.into())));
     }
 
@@ -904,7 +2286,7 @@ impl ChatWidget {
     pub fn handle_event(&mut self, ev: AppEvent) {
         match ev {
             AppEvent::User(ue) => self.handle_user(ue),
-            AppEvent::Wire(we) => self.handle_wire(we),
+            AppEvent::Wire(we) => self.handle_wire(*we),
         }
     }
 
@@ -985,6 +2367,10 @@ impl ChatWidget {
                     self.on_agent_live_event(event);
                 }
             }
+            WireEvent::AgentLiveGap(gap) => self.on_agent_live_gap(gap),
+            WireEvent::AgentCommunication(event) => {
+                self.agent_runs.record_communication(&event);
+            }
             WireEvent::TurnComplete(stats) => self.on_turn_complete(*stats),
             WireEvent::TurnError(msg) => self.on_turn_error(msg),
             WireEvent::SystemWarning(msg) => self.on_system_warning(msg),
@@ -1007,26 +2393,18 @@ impl ChatWidget {
         // parallel TaskCell still living in `live_tasks` from an
         // abnormally-ended prior turn (server stream drop with no
         // TurnComplete). Without draining live_tasks here, those
-        // orphans would persist into the new turn and `on_turn_complete`
-        // of the new turn would force-fail them as if they belonged.
+        // orphans would persist into the new turn and be misattributed to
+        // that turn's transcript snapshot.
         self.commit_active();
         self.drain_all_live_tasks();
-        // Drop agent_runs registry entries from the prior turn. The
-        // strip's terminal rows (✓/✗) and stuck-Live rows from a
-        // dropped server stream are turn-scoped UI; carrying them
-        // forward grows the strip unboundedly ("12 parallel agents"
-        // shown for a single new spawn). Drilldown for prior-turn
-        // agents still works via the legacy history-fallback path in
-        // `agents_drilldown_rows` (TaskCells are committed to history
-        // before this point).
-        self.clear_turn_scoped_agent_state();
+        self.end_turn_agent_observation();
         let cell = UserCell::new(text);
         self.commit_cell(Box::new(cell));
     }
 
     /// Finalize and commit every still-live parallel TaskCell.
-    /// Each is `finalize()`d (Running → Failed with placeholder
-    /// error) and moved into history in spawn order. Used by both
+    /// Each is `finalize()`d (Running → Unconfirmed) and moved into
+    /// history in spawn order. Used by both
     /// `on_user_submit` (orphan cleanup across abnormal turn ends)
     /// and `on_turn_complete` (normal end-of-turn drain).
     fn drain_all_live_tasks(&mut self) {
@@ -1042,23 +2420,12 @@ impl ChatWidget {
         self.cancelling_task_ids.clear();
     }
 
-    fn forget_cleared_agent_markers(&mut self, agent_keys: &[&str], tool_use_id: Option<&str>) {
-        for key in agent_keys {
-            if !key.is_empty() {
-                self.cleared_agent_run_ids.remove(*key);
-            }
-        }
-        if let Some(tool_use_id) = tool_use_id {
-            self.cleared_agent_tool_use_ids.remove(tool_use_id);
-        }
-    }
-
-    fn clear_turn_scoped_agent_state(&mut self) {
-        self.cleared_agent_run_ids.extend(self.agent_runs.ids());
-        self.cleared_agent_tool_use_ids
-            .extend(self.agent_runs.bound_tool_use_ids());
-        self.agent_runs = AgentRunRegistry::default();
-        self.cancelled_task_ids.clear();
+    fn end_turn_agent_observation(&mut self) {
+        // A parent turn boundary says nothing about a child Agent's terminal
+        // outcome. Keep the run projection, degrade only active live-stream
+        // observations. Terminal history remains available to the Workbench;
+        // the durable server snapshot is the only bounded authority.
+        self.agent_runs.mark_active_unconfirmed();
     }
 
     fn on_answer_delta(&mut self, delta: &str) {
@@ -1078,7 +2445,7 @@ impl ChatWidget {
             self.active_cell.as_deref().map(cell_kind),
             Some(CellKind::Assistant)
         ) {
-            self.active_cell = Some(Box::new(AssistantCell::new_streaming()));
+            self.install_active_cell(Box::new(AssistantCell::new_streaming()));
         }
 
         if let Some(cell) = self.active_cell.as_mut()
@@ -1104,7 +2471,7 @@ impl ChatWidget {
             self.active_cell.as_deref().map(cell_kind),
             Some(CellKind::Reasoning)
         ) {
-            self.active_cell = Some(Box::new(ReasoningCell::new_streaming()));
+            self.install_active_cell(Box::new(ReasoningCell::new_streaming()));
         }
 
         if let Some(cell) = self.active_cell.as_mut()
@@ -1137,31 +2504,17 @@ impl ChatWidget {
         tool_use_id: String,
         parent_tool_use_id: Option<String>,
     ) {
-        // For `agent` tool calls we ALSO populate `agent_runs` (the
-        // logical-row registry that powers the multi_agent strip and
-        // the Ctrl+G drilldown). The companion
-        // `WireEvent::AgentControlStarted` (emitted by stream_render
-        // when it has access to structured args) is the canonical
-        // path with the real agent_id; this fallback uses a
-        // provisional id derived from the description so legacy
-        // replay paths (which only get `ToolStarted`) still surface
-        // a row. The standard task-like flow below populates
-        // `live_tasks` + `in_flight_task_ids` so cancel-fanout,
-        // child-event routing, and turn-drain invariants hold.
-        if name == "agent" {
-            self.on_agent_control_started(
-                agent_action_from_description(&description)
-                    .unwrap_or("agent")
-                    .to_string(),
-                agent_label_from_description(&description),
+        if name == "agent_fanout" {
+            self.fanout_launch_baselines.insert(
                 tool_use_id.clone(),
-                None,
-                None,
-                None,
+                self.agent_runs.runs.keys().cloned().collect(),
             );
         }
-        let agent_spawn_backgroundable =
-            name == "agent" && agent_action_from_description(&description) == Some("spawn");
+        // Agent lifecycle is populated only by the structured
+        // AgentControl* events. Generic tool descriptions remain display
+        // text and are never parsed as a control protocol.
+        let agent_spawn_backgroundable = name == "agent"
+            && self.agent_runs.action_for_tool_use(&tool_use_id) == Some(AgentControlAction::Spawn);
 
         // Child event → attach to the matching live parent. Tries
         // both the multi-slot live_tasks register (for parallel
@@ -1208,7 +2561,7 @@ impl ChatWidget {
             if cell.name == "bash" && self.bash_background_hint_enabled {
                 cell.set_ctrl_b_background_hint(true);
             }
-            self.active_cell = Some(Box::new(cell));
+            self.install_active_cell(Box::new(cell));
         }
     }
 
@@ -1232,70 +2585,46 @@ impl ChatWidget {
         fanout_slot: Option<astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity>,
         fanout_title: Option<String>,
     ) {
+        let Some(action) = AgentControlAction::from_wire(&action) else {
+            return;
+        };
         let fanout_membership =
             fanout_slot.map(|slot| agent_fanout_membership(slot, fanout_title.as_deref(), &label));
-        // If a prior event already bound this tool_use_id to a row
-        // (e.g. structured AgentControlStarted established the real
-        // agent_id, then a generic ToolStarted arrives without it),
-        // reuse that key instead of creating a provisional duplicate.
-        if agent_id.is_none()
-            && let Some(existing) = self
-                .agent_runs
-                .key_for_tool_use(&tool_use_id)
-                .map(str::to_string)
-        {
-            // Refresh the label / status on the existing entry but
-            // don't create a new row.
-            let existing_key = existing.clone();
-            self.cancelled_task_ids.remove(&existing);
-            self.agent_runs
-                .ensure_running_for_tool_use(existing, label, Some(&tool_use_id));
-            self.agent_runs
-                .set_fanout_membership(&existing_key, fanout_membership);
-            return;
-        }
-
-        let key = agent_id.unwrap_or_else(|| {
-            if action == "agent" {
-                tool_use_id.clone()
-            } else {
-                provisional_agent_key(&tool_use_id)
-            }
-        });
-        let label = if action == "get_result" {
-            key.strip_prefix("pending:")
-                .map(|_| label.clone())
-                .unwrap_or_else(|| agent_display_name(&key, Some(&label)))
-        } else {
-            label
-        };
-        self.cancelled_task_ids.remove(&key);
-        // If a prior `ToolStarted("agent", tool_use_id)` already bound
-        // `tool_use_id → <provisional key>` (either the bare
-        // `tool_use_id` for action=="agent", or `pending:<tool_use_id>`
-        // for action=="spawn"/"get_result"), and a structured
-        // `AgentControlStarted` now arrives with the real `agent_id`,
-        // explicitly rename. Without this, `tool_use_to_key` points at
-        // the provisional key forever and `tool_uses_for_key(real_agent_id)`
-        // returns empty — child tool events never reach the parent
-        // task panel.
-        //
-        // Guard with the provisional-key shape so a stray duplicate
-        // ToolStarted whose agent_id binding has already been promoted
-        // to a real id can't clobber the canonical row.
         let provisional = provisional_agent_key(&tool_use_id);
-        self.forget_cleared_agent_markers(&[&key, &provisional], Some(&tool_use_id));
+        let key = agent_id.unwrap_or_else(|| provisional.clone());
         if let Some(existing) = self
             .agent_runs
             .key_for_tool_use(&tool_use_id)
             .map(str::to_string)
             && existing != key
-            && (existing == tool_use_id || existing == provisional)
         {
             self.agent_runs.rename(&existing, key.clone());
         }
-        self.agent_runs
-            .ensure_running_for_tool_use(key.clone(), label, Some(&tool_use_id));
+        if self.agent_runs.contains_key(&key) {
+            if let Some(projection) = self.agent_runs.get_mut(&key) {
+                projection.detail.description = if action == AgentControlAction::GetResult {
+                    agent_display_name(&key, Some(&label))
+                } else {
+                    label
+                };
+            }
+            self.agent_runs
+                .bind_tool_use(&tool_use_id, key.clone(), action);
+        } else {
+            let state = match action {
+                AgentControlAction::Spawn => AgentRunState::observed(AgentRunStatus::Starting),
+                AgentControlAction::GetResult => {
+                    AgentRunState::unconfirmed(AgentRunStatus::Running)
+                }
+            };
+            let label = if action == AgentControlAction::GetResult {
+                agent_display_name(&key, Some(&label))
+            } else {
+                label
+            };
+            self.agent_runs
+                .ensure_for_tool_use(key.clone(), label, state, &tool_use_id, action);
+        }
         self.agent_runs
             .set_fanout_membership(&key, fanout_membership);
     }
@@ -1311,97 +2640,166 @@ impl ChatWidget {
         tool_use_id: String,
         event_agent_id: Option<String>,
     ) {
+        let Some(control_action) = AgentControlAction::from_wire(&action) else {
+            return;
+        };
         let parsed = output.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        let canonical_run_id = parsed
+            .as_ref()
+            .and_then(|value| value.get("run_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|run_id| !run_id.trim().is_empty())
+            .map(ToString::to_string);
+        let transcript_target = parsed
+            .as_ref()
+            .and_then(|value| value.get("transcript_location"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| transcript_target_from_wire(Some(value)));
         let surface = AgentControlSurface::from_wire(&action, &status, parsed.as_ref());
         let agent_id = event_agent_id.or_else(|| surface.agent_id().map(str::to_string));
         let provisional = provisional_agent_key(&tool_use_id);
-        let fallback_key = if action == "agent" {
-            tool_use_id.clone()
-        } else {
-            provisional.clone()
-        };
-        let key = agent_id.clone().unwrap_or(fallback_key);
-        let late_after_turn_boundary = !self.agent_runs.contains_key(&key)
-            && !self.agent_runs.contains_key(&provisional)
-            && self.agent_runs.key_for_tool_use(&tool_use_id).is_none()
-            && (self.cleared_agent_run_ids.contains(&key)
-                || self.cleared_agent_run_ids.contains(&provisional)
-                || self.cleared_agent_tool_use_ids.contains(&tool_use_id));
-        if late_after_turn_boundary {
+        let key = agent_id
+            .clone()
+            .or_else(|| {
+                self.agent_runs
+                    .key_for_tool_use(&tool_use_id)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| provisional.clone());
+        if control_action == AgentControlAction::Spawn
+            && agent_id.is_none()
+            && matches!(
+                surface.outcome(),
+                AgentControlOutcome::Failed(
+                    agent_control_surface::AgentControlFailureKind::ToolFailed
+                )
+            )
+        {
+            self.agent_runs.remove(&provisional);
             return;
         }
-        self.forget_cleared_agent_markers(&[&key, &provisional], Some(&tool_use_id));
         if key != provisional && self.agent_runs.contains_key(&provisional) {
-            if self.cancelled_task_ids.remove(&provisional) {
-                self.cancelled_task_ids.insert(key.clone());
-            }
-            if self.cancelling_task_ids.remove(&provisional) {
-                self.cancelling_task_ids.insert(key.clone());
-            }
             self.agent_runs.rename(&provisional, key.clone());
         }
         if !self.agent_runs.contains_key(&key) {
-            self.agent_runs.ensure_running(key.clone(), label.clone());
+            // A failed spawn control call without an assigned Agent identity
+            // never created an Agent run. Its generic ToolCell carries the
+            // failure; the Agent monitor must not synthesize a failed child.
+            self.agent_runs.ensure(
+                key.clone(),
+                label.clone(),
+                AgentRunState::unconfirmed(AgentRunStatus::Running),
+            );
         }
+        self.agent_runs
+            .bind_tool_use(&tool_use_id, key.clone(), control_action);
 
-        if surface.is_terminal() {
-            self.cancelling_task_ids.remove(&key);
-        }
-        match surface.cancelled_state_update() {
-            CancelledStateUpdate::Set => {
-                self.cancelled_task_ids.insert(key.clone());
-            }
-            CancelledStateUpdate::Clear => {
-                self.cancelled_task_ids.remove(&key);
-            }
-            CancelledStateUpdate::Preserve => {}
-        }
-
-        let Some(cell) = self.agent_runs.get_mut(&key) else {
+        let Some(projection) = self.agent_runs.get_mut(&key) else {
             return;
         };
-        cell.description = agent_id
-            .as_deref()
-            .map(|id| agent_display_name(id, surface.display_name_hint()))
-            .unwrap_or(label);
+        if AgentRunState::observed(AgentRunStatus::Running).source_rank()
+            >= projection.state.source_rank()
+        {
+            projection.detail.description = agent_id
+                .as_deref()
+                .map(|id| agent_display_name(id, surface.display_name_hint()))
+                .unwrap_or(label);
+        }
+        if let Some(run_id) = canonical_run_id {
+            projection.set_runtime_metadata(
+                AgentProjectionSource::LiveStream,
+                run_id,
+                projection.parent_run_id.clone(),
+                projection.depth,
+                projection.reported_child_agents,
+            );
+        }
+        if let Some(transcript_target) = transcript_target {
+            projection.set_transcript_target(AgentProjectionSource::LiveStream, transcript_target);
+        }
 
         match surface.outcome() {
             AgentControlOutcome::Completed => {
-                complete_agent_cell(cell, duration_ms, parsed.as_ref(), output);
+                if projection.set_state(AgentRunState::observed(AgentRunStatus::Completed)) {
+                    complete_agent_cell(
+                        &mut projection.detail,
+                        duration_ms,
+                        parsed.as_ref(),
+                        output,
+                    );
+                }
             }
-            AgentControlOutcome::Failed(_) => {
-                let failure_message = surface.failure_message();
-                fail_agent_cell(
-                    cell,
-                    duration_ms,
-                    parsed.as_ref(),
-                    failure_message.as_deref().unwrap_or("agent failed"),
-                );
+            AgentControlOutcome::Failed(kind) => {
+                use agent_control_surface::AgentControlFailureKind;
+                let message = surface.failure_message();
+                match kind {
+                    AgentControlFailureKind::AgentFailed => {
+                        if projection.set_state(AgentRunState::observed(AgentRunStatus::Failed)) {
+                            fail_agent_cell(
+                                &mut projection.detail,
+                                duration_ms,
+                                parsed.as_ref(),
+                                message.as_deref().unwrap_or("agent failed"),
+                            );
+                        }
+                    }
+                    AgentControlFailureKind::Interrupted => {
+                        if projection
+                            .set_state(AgentRunState::observed(AgentRunStatus::Interrupted))
+                        {
+                            let message =
+                                message.unwrap_or_else(|| "agent interrupted".to_string());
+                            let summary = crate::tui::agent_control_status::agent_control_result_output_summary(
+                                parsed.as_ref(),
+                                output,
+                            )
+                            .or_else(|| Some(message.clone()));
+                            projection.detail.complete(
+                                "interrupted",
+                                duration_ms,
+                                summary,
+                                Some(message),
+                            );
+                        }
+                    }
+                    AgentControlFailureKind::TimedOut | AgentControlFailureKind::ToolFailed => {
+                        projection.mark_unconfirmed_if_active();
+                        if let Some(message) = message {
+                            append_agent_live_output(
+                                &mut projection.detail,
+                                &format!("\n{message}\n"),
+                            );
+                        }
+                    }
+                }
             }
             AgentControlOutcome::Cancelled => {
                 let fallback = surface
                     .cancelled_reason()
                     .unwrap_or("agent cancelled")
                     .to_string();
-                cell.complete(
-                    "cancelled",
-                    duration_ms,
-                    Some(fallback.clone()),
-                    Some(fallback),
-                );
+                if projection.set_state(AgentRunState::observed(AgentRunStatus::Cancelled)) {
+                    projection.detail.complete(
+                        "cancelled",
+                        duration_ms,
+                        Some(fallback.clone()),
+                        Some(fallback),
+                    );
+                }
             }
             AgentControlOutcome::Running => {
-                cell.status = crate::tui::history_cell::task::TaskStatus::Running;
-                cell.duration_ms = None;
-                if let Some(preview) = surface.running_preview() {
-                    if cell
+                if projection.set_state(AgentRunState::observed(AgentRunStatus::Running))
+                    && let Some(preview) = surface.running_preview()
+                {
+                    if projection
+                        .detail
                         .output_summary
                         .as_deref()
                         .is_some_and(|s| !s.is_empty())
                     {
-                        append_agent_live_output(cell, &format!("\n{preview}\n"));
+                        append_agent_live_output(&mut projection.detail, &format!("\n{preview}\n"));
                     } else {
-                        cell.output_summary = Some(preview);
+                        projection.detail.output_summary = Some(preview);
                     }
                 }
             }
@@ -1409,47 +2807,315 @@ impl ChatWidget {
         }
     }
 
+    /// Project a structured fanout launch receipt into the same run registry
+    /// used by direct agent spawns. A group receipt carries the canonical
+    /// `run_id` for every child; reducing it to a fanout summary would make
+    /// live agents visible but their conversations unreachable.
+    ///
+    /// This consumes only typed receipt fields. A malformed or partial receipt
+    /// creates no guessed run, and later live/server evidence can still fill
+    /// any missing child independently.
+    fn on_agent_fanout_launch_receipt(&mut self, output: &str) {
+        let Ok(receipt) = serde_json::from_str::<serde_json::Value>(output) else {
+            return;
+        };
+        let Some(group_id) = receipt
+            .get("group_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+        let Some(target_count) = receipt
+            .get("target_count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+        else {
+            return;
+        };
+        // A launch reply carries `agents`; a recovered result carries the
+        // registry's `fanout.slots`. Read both when available: the registry
+        // is authoritative for a slot identity if a partial transport reply
+        // omitted a child field.
+        let agents = receipt
+            .get("agents")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .chain(
+                receipt
+                    .get("fanout")
+                    .and_then(|fanout| fanout.get("slots"))
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect::<Vec<_>>();
+        if agents.is_empty() {
+            return;
+        }
+        let group_title = receipt
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(group_id)
+            .to_string();
+        let parent_run_id = receipt
+            .get("parent_run_id")
+            .or_else(|| receipt.get("fanout")?.get("parent_run_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string);
+        let receipt_transcript_target = receipt
+            .get("transcript_location")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| transcript_target_from_wire(Some(value)));
+
+        for agent in agents {
+            let Some(agent_id) = agent
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string)
+            else {
+                continue;
+            };
+            let Some(run_id) = agent
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string)
+            else {
+                continue;
+            };
+            let Some(state) = agent
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .and_then(agent_run_state_from_fanout_receipt)
+            else {
+                continue;
+            };
+            let transcript_target = agent
+                .get("transcript_location")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| transcript_target_from_wire(Some(value)))
+                .or(receipt_transcript_target);
+            let slot_index = agent
+                .get("slot_index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok());
+            let Some(slot_index) = slot_index.filter(|index| *index < target_count) else {
+                continue;
+            };
+            let slot_label = agent
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(agent_id.as_str());
+            let membership =
+                crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership {
+                    group_id: group_id.to_string(),
+                    group_title: group_title.clone(),
+                    target_count,
+                    slot_index,
+                    slot_label: slot_label.to_string(),
+                };
+            self.agent_runs.ensure(
+                agent_id.clone(),
+                agent_display_name(&agent_id, Some(slot_label)),
+                AgentRunState::observed(state),
+            );
+            self.agent_runs
+                .set_fanout_membership(&agent_id, Some(membership));
+            let Some(projection) = self.agent_runs.get_mut(&agent_id) else {
+                continue;
+            };
+            projection.set_runtime_metadata(
+                AgentProjectionSource::LiveStream,
+                run_id,
+                parent_run_id.clone(),
+                1,
+                0,
+            );
+            if let Some(transcript_target) = transcript_target {
+                projection
+                    .set_transcript_target(AgentProjectionSource::LiveStream, transcript_target);
+            }
+        }
+    }
+
     fn on_agent_live_event(&mut self, event: astra_turn_core::agent_live_event::AgentLiveEvent) {
         use astra_turn_core::agent_live_event::AgentLiveEventKind;
 
-        if !self.agent_runs.contains_key(&event.agent_id)
-            && self.cleared_agent_run_ids.contains(&event.agent_id)
+        // A control call is visible before the child runtime has allocated its
+        // canonical identities. The typed start correlation closes that gap at
+        // the first live boundary, so Ctrl+G opens one real conversation
+        // instead of a provisional row that can never receive child output.
+        if let AgentLiveEventKind::Signal(
+            astra_turn_core::agent_live_event::AgentLiveSignal::RunStarted {
+                spawn_tool_call_id: Some(tool_call_id),
+                ..
+            },
+        ) = &event.kind
+            && let Some(provisional_key) = self
+                .agent_runs
+                .key_for_tool_use(tool_call_id)
+                .map(str::to_owned)
         {
-            return;
+            self.agent_runs
+                .rename(&provisional_key, event.agent_id.clone());
         }
-        self.forget_cleared_agent_markers(&[event.agent_id.as_str()], None);
 
+        let run_key = self
+            .agent_runs
+            .key_for_live_event(&event.agent_id, &event.run_id);
         let is_terminal_event = matches!(event.kind, AgentLiveEventKind::AgentTerminated { .. });
         if !is_terminal_event
-            && self.agent_runs.get(&event.agent_id).is_some_and(|cell| {
-                !matches!(
-                    cell.status,
-                    crate::tui::history_cell::task::TaskStatus::Running
-                )
-            })
+            && self
+                .agent_runs
+                .get(&run_key)
+                .is_some_and(|projection| projection.state.status.is_terminal())
         {
             return;
         }
 
-        if let AgentLiveEventKind::AgentTerminated { termination, .. } = &event.kind {
-            self.cancelling_task_ids.remove(&event.agent_id);
-            if matches!(
-                termination,
-                astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled
-            ) {
-                self.cancelled_task_ids.insert(event.agent_id.clone());
-            } else {
-                self.cancelled_task_ids.remove(&event.agent_id);
+        let label = self
+            .agent_runs
+            .get(&run_key)
+            .map(|projection| projection.detail.description.trim())
+            .filter(|description| {
+                !description.is_empty() && *description != event.agent_id && *description != run_key
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| agent_display_name(&event.agent_id, None));
+        let observed_status = match &event.kind {
+            AgentLiveEventKind::AgentTerminated { termination, .. } => {
+                use astra_turn_core::agent_live_event::AgentLiveTermination;
+                match termination {
+                    AgentLiveTermination::Completed => AgentRunStatus::Completed,
+                    AgentLiveTermination::Delegated => AgentRunStatus::Delegated,
+                    AgentLiveTermination::Failed => AgentRunStatus::Failed,
+                    AgentLiveTermination::Interrupted => AgentRunStatus::Interrupted,
+                    AgentLiveTermination::Cancelled => AgentRunStatus::Cancelled,
+                }
             }
+            // Attention is a lifecycle fact, not just another line of live
+            // output. Until the agent receives the requested input or
+            // approval, the run is waiting and the workbench must make that
+            // distinct from model/tool activity.
+            AgentLiveEventKind::Signal(
+                astra_turn_core::agent_live_event::AgentLiveSignal::AskUserPrompted { .. }
+                | astra_turn_core::agent_live_event::AgentLiveSignal::ApprovalRequired { .. }
+                | astra_turn_core::agent_live_event::AgentLiveSignal::WaitingForModel,
+            ) => AgentRunStatus::Waiting,
+            AgentLiveEventKind::OutputDelta(_)
+            | AgentLiveEventKind::ThinkingDelta(_)
+            | AgentLiveEventKind::Status(_)
+            | AgentLiveEventKind::Signal(_)
+            | AgentLiveEventKind::ToolStarted { .. }
+            | AgentLiveEventKind::ToolCompleted { .. } => AgentRunStatus::Running,
+        };
+        let state_accepted = self.agent_runs.ensure(
+            run_key.clone(),
+            label.clone(),
+            AgentRunState::observed(observed_status),
+        );
+        if is_terminal_event && !state_accepted {
+            return;
         }
-        let label = agent_display_name(&event.agent_id, None);
-        self.agent_runs
-            .ensure_running(event.agent_id.clone(), label.clone());
         let mut parent_task_mirror = None;
         {
-            let Some(cell) = self.agent_runs.get_mut(&event.agent_id) else {
+            let Some(projection) = self.agent_runs.get_mut(&run_key) else {
                 return;
             };
+            projection.record_live_transcript_event(&event);
+            let (event_parent_run_id, event_depth) = match &event.kind {
+                AgentLiveEventKind::Signal(
+                    astra_turn_core::agent_live_event::AgentLiveSignal::RunStarted {
+                        parent_run_id,
+                        depth,
+                        ..
+                    },
+                ) => (parent_run_id.clone(), *depth),
+                _ => (projection.parent_run_id.clone(), projection.depth),
+            };
+            // Every typed live event is scoped to an immutable execution run.
+            // `RunStarted` is useful lineage enrichment, but it is not a
+            // prerequisite for transcript identity: token/tool events can
+            // legitimately arrive first or be the only events delivered.
+            if projection.run_id.is_none() {
+                projection.set_runtime_metadata(
+                    AgentProjectionSource::LiveStream,
+                    event.run_id.clone(),
+                    event_parent_run_id,
+                    event_depth,
+                    projection.reported_child_agents,
+                );
+                // A live envelope proves an execution identity, not where
+                // durable history lives or who owns a control lease. Local,
+                // Edge and server streams share this type, so guessing a
+                // local journal or Cancel capability here would make a
+                // remote run look controllable and addressable through the
+                // wrong boundary. Those facts arrive through the typed start
+                // event, launch receipt, local-runtime snapshot, journal
+                // recovery, or durable server projection.
+            }
+            if let AgentLiveEventKind::Signal(
+                astra_turn_core::agent_live_event::AgentLiveSignal::AgentCommunication(
+                    communication,
+                ),
+            ) = &event.kind
+            {
+                match communication.direction {
+                    astra_turn_types::AgentCommunicationDirection::Sent => {
+                        projection.messages_sent = projection.messages_sent.saturating_add(1);
+                    }
+                    astra_turn_types::AgentCommunicationDirection::Received => {
+                        projection.messages_received =
+                            projection.messages_received.saturating_add(1);
+                    }
+                }
+            }
+            if let AgentLiveEventKind::Signal(
+                astra_turn_core::agent_live_event::AgentLiveSignal::RunStarted {
+                    parent_run_id,
+                    depth,
+                    spawn_tool_call_id: _,
+                    transcript_location,
+                },
+            ) = &event.kind
+            {
+                projection.set_runtime_metadata(
+                    AgentProjectionSource::LiveStream,
+                    event.run_id.clone(),
+                    parent_run_id.clone(),
+                    *depth,
+                    0,
+                );
+                projection.set_transcript_target(
+                    AgentProjectionSource::LiveStream,
+                    match transcript_location {
+                        astra_turn_types::AgentTranscriptLocation::LocalJournal => {
+                            crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal
+                        }
+                        astra_turn_types::AgentTranscriptLocation::DurableServer => {
+                            crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer
+                        }
+                    },
+                );
+            }
+            if let AgentLiveEventKind::Signal(signal) = &event.kind
+                && matches!(
+                    signal,
+                    astra_turn_core::agent_live_event::AgentLiveSignal::AskUserPrompted { .. }
+                        | astra_turn_core::agent_live_event::AgentLiveSignal::ApprovalRequired { .. }
+                        | astra_turn_core::agent_live_event::AgentLiveSignal::WaitingForModel
+                )
+            {
+                projection.set_attention_summary(Some(agent_live_signal_summary(signal)));
+            }
+            let cell = &mut projection.detail;
             if cell.description == event.agent_id {
                 cell.description = label;
             }
@@ -1459,6 +3125,17 @@ impl ChatWidget {
                 }
                 AgentLiveEventKind::Status(text) => {
                     append_agent_live_output(cell, &format!("\n{text}\n"));
+                }
+                AgentLiveEventKind::Signal(signal) => {
+                    if !matches!(
+                        signal,
+                        astra_turn_core::agent_live_event::AgentLiveSignal::RunStarted { .. }
+                    ) {
+                        append_agent_live_output(
+                            cell,
+                            &format!("\n{}\n", agent_live_signal_summary(&signal)),
+                        );
+                    }
                 }
                 AgentLiveEventKind::ToolStarted {
                     name,
@@ -1516,7 +3193,7 @@ impl ChatWidget {
                 name,
                 description,
             }) => self.mirror_live_child_started_to_parent_tasks(
-                &event.agent_id,
+                &run_key,
                 &tool_use_id,
                 &name,
                 &description,
@@ -1526,13 +3203,50 @@ impl ChatWidget {
                 status,
                 duration_ms,
             }) => self.mirror_live_child_completed_to_parent_tasks(
-                &event.agent_id,
+                &run_key,
                 &tool_use_id,
                 &status,
                 duration_ms,
             ),
             None => {}
         }
+    }
+
+    fn on_agent_live_gap(&mut self, gap: astra_turn_core::agent_live_event::AgentLiveGap) {
+        let run_key = self
+            .agent_runs
+            .key_for_live_event(&gap.agent_id, &gap.run_id);
+        let label = agent_display_name(&gap.agent_id, None);
+        self.agent_runs.ensure(
+            run_key.clone(),
+            label.clone(),
+            AgentRunState::observed(AgentRunStatus::Running),
+        );
+        let Some(projection) = self.agent_runs.get_mut(&run_key) else {
+            return;
+        };
+        if projection.run_id.is_none() {
+            projection.set_runtime_metadata(
+                AgentProjectionSource::LiveStream,
+                gap.run_id,
+                projection.parent_run_id.clone(),
+                projection.depth,
+                projection.reported_child_agents,
+            );
+        }
+        if projection.detail.description == gap.agent_id {
+            projection.detail.description = label;
+        }
+        projection.set_attention_summary(Some(format!(
+            "Live activity incomplete · {} update{} skipped · syncing durable state",
+            gap.dropped_event_count,
+            if gap.dropped_event_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )));
+        projection.detail.error = None;
     }
 
     fn mirror_live_child_started_to_parent_tasks(
@@ -1575,6 +3289,48 @@ impl ChatWidget {
         tool_use_id: String,
         parent_tool_use_id: Option<String>,
     ) {
+        if name == "agent_fanout"
+            && let Some(output) = output.as_deref()
+        {
+            self.on_agent_fanout_launch_receipt(output);
+        }
+        let fanout_baseline = (name == "agent_fanout").then(|| {
+            self.fanout_launch_baselines
+                .remove(&tool_use_id)
+                .unwrap_or_default()
+        });
+        let receipt_missing = name == "agent_fanout"
+            && !fanout_completion_has_receipt(output_summary.as_deref(), output.as_deref());
+        let observed_new_runs = fanout_baseline
+            .filter(|_| status == "failed" && receipt_missing)
+            .map(|baseline| {
+                self.agent_runs
+                    .runs
+                    .keys()
+                    .filter(|run_key| !baseline.contains(*run_key))
+                    .count()
+            })
+            .filter(|count| *count > 0);
+        let (status, output_summary, output) = match observed_new_runs {
+            Some(count) => (
+                "uncertain".to_string(),
+                Some(format!(
+                    "Observed {count} new agent run{} while the launch receipt was unavailable · Ctrl+G opens each conversation.",
+                    if count == 1 { "" } else { "s" }
+                )),
+                None,
+            ),
+            None if name == "agent_fanout" => {
+                if let Some(summary) =
+                    fanout_rejection_summary(output_summary.as_deref(), output.as_deref())
+                {
+                    (status, Some(summary), None)
+                } else {
+                    (status, output_summary, output)
+                }
+            }
+            None => (status, output_summary, output),
+        };
         // Child completion → update the child row inside its
         // parent Task. If the parent is already terminal/gone we
         // fall back to top-level to stay visible rather than drop.
@@ -1584,20 +3340,6 @@ impl ChatWidget {
             return;
         }
 
-        if name == "agent" {
-            self.on_agent_control_completed(
-                agent_action_from_description(&description)
-                    .unwrap_or("agent")
-                    .to_string(),
-                agent_label_from_description(&description),
-                status.clone(),
-                duration_ms,
-                output.as_deref(),
-                tool_use_id.clone(),
-                None,
-            );
-        }
-
         // Task parent completion → always prune the in-flight set
         // (committed-then-completed tasks still need cleanup). Then
         // try the multi-slot live_tasks register first (parallel
@@ -1605,11 +3347,6 @@ impl ChatWidget {
         if is_task_like_tool(&name) {
             self.in_flight_task_ids.retain(|s| s != &tool_use_id);
             self.cancelling_task_ids.remove(&tool_use_id);
-            if name == "agent"
-                && let Some(agent_cell) = self.agent_runs.get_mut(&tool_use_id)
-            {
-                agent_cell.complete(&status, duration_ms, output_summary.clone(), output.clone());
-            }
             // Multi-slot path: finalize and commit just THIS agent,
             // leaving other parallel agents live and undisturbed.
             if let Some(mut tc) = self.live_tasks.remove(&tool_use_id) {
@@ -1718,7 +3455,7 @@ impl ChatWidget {
         // sequence (shared with on_user_submit).
         self.commit_active();
         self.drain_all_live_tasks();
-        self.clear_turn_scoped_agent_state();
+        self.end_turn_agent_observation();
 
         let summary = TurnSummaryCell {
             elapsed_ms: stats.elapsed_ms,
@@ -1734,8 +3471,18 @@ impl ChatWidget {
         self.commit_cell(Box::new(summary));
     }
 
+    /// Freeze the stream-owned cell when the transport closes, without
+    /// claiming that the complete turn (durability, summary, background
+    /// settlement) has finished. This keeps a completed answer from retaining
+    /// live typing affordances while the turn owner finishes its own work.
+    pub(crate) fn finish_stream_projection(&mut self) {
+        self.commit_active();
+    }
+
     fn on_turn_error(&mut self, msg: String) {
         self.commit_active();
+        self.drain_all_live_tasks();
+        self.end_turn_agent_observation();
         self.commit_cell(Box::new(SystemCell::error(msg)));
     }
 
@@ -1821,49 +3568,48 @@ impl ChatWidget {
 
     // ── Invariant-preserving mutators ────────────────────────────
 
+    fn allocate_cell_id(&mut self) -> u64 {
+        let id = self.next_cell_id;
+        self.next_cell_id = self
+            .next_cell_id
+            .checked_add(1)
+            .expect("transcript cell identity space exhausted");
+        id
+    }
+
+    fn install_active_cell(&mut self, cell: Box<dyn HistoryCell>) {
+        debug_assert!(self.active_cell.is_none());
+        debug_assert!(self.active_cell_id.is_none());
+        self.active_cell_id = Some(self.allocate_cell_id());
+        self.active_cell = Some(cell);
+    }
+
     /// Take the currently-live cell, finalise it, append to
     /// history, and persist. No-op when `active_cell` is None.
     fn commit_active(&mut self) {
         let Some(mut cell) = self.active_cell.take() else {
+            debug_assert!(self.active_cell_id.is_none());
             return;
         };
+        let id = self
+            .active_cell_id
+            .take()
+            .unwrap_or_else(|| self.allocate_cell_id());
         cell.finalize();
         // Box → Arc: the scrollback index shares cells with
         // long-lived render paths (e.g. Ctrl+O overlay) without
         // forcing everyone onto `&dyn`.
         self.history.push(box_into_arc(cell));
-        self.persist_from_watermark();
+        self.history_cell_ids.push(id);
     }
 
     /// Append an already-finalised cell. Used for UserCell /
     /// synthesised ToolCell / TurnSummary etc. — things built
     /// whole rather than streamed.
     fn commit_cell(&mut self, cell: Box<dyn HistoryCell>) {
+        let id = self.allocate_cell_id();
         self.history.push(box_into_arc(cell));
-        self.persist_from_watermark();
-    }
-
-    /// Persist every cell between `persist_watermark` and
-    /// `history.len()`. Best-effort: errors are logged by the
-    /// underlying `transcript_jsonl` helper and the watermark is
-    /// advanced regardless, because the TUI must keep running and
-    /// retrying a flaky write every turn would re-attempt the same
-    /// failure.
-    ///
-    /// When `session_id` is empty (turn-1 edge case: server hasn't
-    /// assigned an id yet) the watermark is NOT advanced, so
-    /// subsequent `set_session_id` can flush the accumulated cells.
-    fn persist_from_watermark(&mut self) {
-        if self.session_id.is_empty() {
-            return;
-        }
-        while self.persist_watermark < self.history.len() {
-            let cell = &self.history[self.persist_watermark];
-            if let Some(ev) = cell.to_persist() {
-                transcript_jsonl::append(&self.session_id, &ev);
-            }
-            self.persist_watermark += 1;
-        }
+        self.history_cell_ids.push(id);
     }
 }
 
@@ -1906,35 +3652,6 @@ fn provisional_agent_key(tool_use_id: &str) -> String {
     format!("pending:{tool_use_id}")
 }
 
-/// LEGACY parser for `agent` tool descriptions. The structured
-/// [`WireEvent::AgentControlStarted`] / `Completed` events carry
-/// `action` directly and are emitted by the live SSE path — those
-/// SHOULD always be used in production. This parser only kicks in
-/// when the only event available is the generic [`WireEvent::ToolStarted`]
-/// (e.g. journal replay of older sessions, where the structured
-/// events didn't exist yet). Tied to the format produced by
-/// `astra_turn_core::tool_preview::agent_preview`.
-fn agent_action_from_description(description: &str) -> Option<&'static str> {
-    if description.starts_with("Spawn agent:") {
-        Some("spawn")
-    } else if description.starts_with("Get agent result:") {
-        Some("get_result")
-    } else {
-        None
-    }
-}
-
-/// Compatibility label extractor for journal replay / older task rows.
-fn agent_label_from_description(description: &str) -> String {
-    description
-        .strip_prefix("Spawn agent:")
-        .or_else(|| description.strip_prefix("Get agent result:"))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(description)
-        .to_string()
-}
-
 fn complete_agent_cell(
     cell: &mut TaskCell,
     duration_ms: u64,
@@ -1947,19 +3664,90 @@ fn complete_agent_cell(
     cell.complete("completed", elapsed.max(duration_ms), result, None);
 }
 
-const MAX_AGENT_LIVE_OUTPUT_CHARS: usize = 100_000;
-
-fn task_status_to_agent_row_status(
-    status: crate::tui::history_cell::task::TaskStatus,
-) -> crate::tui::bottom_pane::in_flight_agents_view::AgentRowStatus {
-    use crate::tui::bottom_pane::in_flight_agents_view::AgentRowStatus;
-    match status {
-        crate::tui::history_cell::task::TaskStatus::Running => AgentRowStatus::Live,
-        crate::tui::history_cell::task::TaskStatus::Completed => AgentRowStatus::Completed,
-        crate::tui::history_cell::task::TaskStatus::Interrupted => AgentRowStatus::Interrupted,
-        crate::tui::history_cell::task::TaskStatus::Failed => AgentRowStatus::Failed,
+pub(crate) fn agent_live_signal_summary(
+    signal: &astra_turn_core::agent_live_event::AgentLiveSignal,
+) -> String {
+    use astra_turn_core::agent_live_event::AgentLiveSignal;
+    match signal {
+        AgentLiveSignal::RunStarted { .. } => "Run started".into(),
+        AgentLiveSignal::WaitingForModel => "Waiting for model".into(),
+        AgentLiveSignal::ModelResponding => "Model responding".into(),
+        AgentLiveSignal::OutputSettled => "Reply ready".into(),
+        AgentLiveSignal::TranscriptCommitted {
+            transcript_location,
+            ..
+        } => format!("Transcript committed · {transcript_location:?}"),
+        AgentLiveSignal::AskUserPrompted { prompt, .. } => {
+            let count = prompt
+                .get("prompt")
+                .and_then(|value| value.get("question_count"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            format!("Input requested · {count} question(s)")
+        }
+        AgentLiveSignal::AskUserResolved { resolution, .. } => {
+            let outcome = resolution
+                .get("audit")
+                .and_then(|value| value.get("response"))
+                .and_then(|value| value.get("outcome"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("resolved");
+            format!("Input request · {outcome}")
+        }
+        AgentLiveSignal::UserIntentApplied {
+            status, content, ..
+        } => format!("Guidance {status:?} · {content}"),
+        AgentLiveSignal::AgentCommunication(event) => {
+            let peer = match event.direction {
+                astra_turn_types::AgentCommunicationDirection::Sent => match &event.to {
+                    astra_turn_types::AgentCommunicationTarget::Direct { address } => {
+                        address.agent_id.as_str()
+                    }
+                    astra_turn_types::AgentCommunicationTarget::Broadcast { delegation_id } => {
+                        delegation_id.as_str()
+                    }
+                    astra_turn_types::AgentCommunicationTarget::Parent => "parent",
+                },
+                astra_turn_types::AgentCommunicationDirection::Received => {
+                    event.from.agent_id.as_str()
+                }
+            };
+            let direction = match event.direction {
+                astra_turn_types::AgentCommunicationDirection::Sent => "sent to",
+                astra_turn_types::AgentCommunicationDirection::Received => "received from",
+            };
+            format!("Message {direction} {peer} · {}", event.payload_kind)
+        }
+        AgentLiveSignal::PermissionAutoApproved { tool, reason } => {
+            astra_turn_core::permission::notice::format_auto_approved_permission(tool, reason)
+                .trim()
+                .to_string()
+        }
+        AgentLiveSignal::ApprovalRequired {
+            tool,
+            display_label,
+            detail,
+            ..
+        } => format!(
+            "Approval required · {}",
+            display_label
+                .as_deref()
+                .or(detail.as_deref())
+                .unwrap_or(tool)
+        ),
+        AgentLiveSignal::AgentControlStarted { label, .. } => {
+            format!("Agent control started · {label}")
+        }
+        AgentLiveSignal::AgentControlCompleted { label, status, .. } => {
+            format!("Agent control {status} · {label}")
+        }
+        AgentLiveSignal::ToolProgress { name, lines, bytes } => {
+            format!("{name} · {lines} lines · {bytes} bytes")
+        }
     }
 }
+
+const MAX_AGENT_LIVE_OUTPUT_CHARS: usize = 100_000;
 
 fn append_agent_live_output(cell: &mut TaskCell, text: &str) {
     if text.is_empty() {
@@ -1980,6 +3768,37 @@ fn append_agent_live_output(cell: &mut TaskCell, text: &str) {
         );
     }
     cell.output_summary = Some(next);
+}
+
+fn agent_live_event_payload_bytes(
+    event: &astra_turn_core::agent_live_event::AgentLiveEvent,
+) -> usize {
+    use astra_turn_core::agent_live_event::AgentLiveEventKind;
+    match &event.kind {
+        AgentLiveEventKind::OutputDelta(text)
+        | AgentLiveEventKind::ThinkingDelta(text)
+        | AgentLiveEventKind::Status(text) => text.len(),
+        AgentLiveEventKind::ToolStarted {
+            name,
+            description,
+            tool_use_id,
+        } => name.len() + description.len() + tool_use_id.len(),
+        AgentLiveEventKind::ToolCompleted {
+            name,
+            description,
+            output_summary,
+            output,
+            tool_use_id,
+            ..
+        } => {
+            name.len()
+                + description.len()
+                + output_summary.as_deref().map_or(0, str::len)
+                + output.as_deref().map_or(0, str::len)
+                + tool_use_id.len()
+        }
+        AgentLiveEventKind::Signal(_) | AgentLiveEventKind::AgentTerminated { .. } => 256,
+    }
 }
 
 fn fail_agent_cell(
@@ -2055,14 +3874,115 @@ fn box_into_arc(b: Box<dyn HistoryCell>) -> Arc<dyn HistoryCell> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::bottom_pane::in_flight_agents_view::AgentRowStatus;
+    use crate::tui::agent_run_projection::{
+        AgentProjectionConfidence, AgentProjectionSource, AgentRunStatus,
+    };
     use crate::tui::history_cell::tool::ToolStatus;
 
     fn fresh() -> ChatWidget {
-        // Empty sid → persistence becomes a no-op (see
-        // `transcript_jsonl::append` / `persist` guard). Lets
-        // tests run without touching $HOME.
+        // A local widget has no durable transcript until the runtime commits
+        // canonical journal items. This keeps reducer tests filesystem-free.
         ChatWidget::new("")
+    }
+
+    fn local_agent_info(
+        agent_id: &str,
+        status: astra_turn_core::orchestration_types::AgentStatus,
+    ) -> astra_turn_core::orchestration_types::SpawnedAgentInfo {
+        let ended_at = status.is_terminal().then(std::time::SystemTime::now);
+        astra_turn_core::orchestration_types::SpawnedAgentInfo {
+            agent_id: agent_id.to_string(),
+            run_id: format!("run-{agent_id}"),
+            parent_run_id: "root-run".to_string(),
+            agent_type: "reviewer".to_string(),
+            description: "Review the runtime contract".to_string(),
+            status,
+            started_at: std::time::SystemTime::now() - std::time::Duration::from_millis(250),
+            ended_at,
+            metrics: astra_turn_core::orchestration_types::SpawnedAgentMetrics::default(),
+            has_permission_issues: false,
+            run_in_background: false,
+            spawn_tool_call_id: None,
+            fanout_slot: None,
+        }
+    }
+
+    fn local_agent_snapshot(
+        agents: Vec<astra_turn_core::orchestration_types::SpawnedAgentInfo>,
+    ) -> crate::tui::local_agent_snapshot::LocalAgentSnapshot {
+        crate::tui::local_agent_snapshot::LocalAgentSnapshot {
+            available: true,
+            agents,
+            fanout_groups: Vec::new(),
+        }
+    }
+
+    fn server_run_node(
+        run_id: &str,
+        status: astra_thin_client::SessionRunLifecycleStatus,
+        event_high_watermark: i64,
+    ) -> astra_thin_client::SessionRunNode {
+        astra_thin_client::SessionRunNode {
+            run_id: run_id.into(),
+            parent_run_id: Some("root-run".into()),
+            root_run_id: Some("root-run".into()),
+            depth: 1,
+            agent_id: Some("reviewer".into()),
+            agent_name: Some("Durable reviewer".into()),
+            status,
+            waiting_for: None,
+            error_code: None,
+            error_message: None,
+            run_event_high_watermark: event_high_watermark,
+            total_tool_calls: 2,
+            runtime: astra_thin_client::SessionRunRuntimeFacts {
+                runtime_profile: Some("agent_binding_registry".into()),
+                model_name: Some("gpt-5".into()),
+                agent_binding_id: Some("reviewer-v2".into()),
+                ..Default::default()
+            },
+            available_actions: vec![astra_thin_client::SessionRunAction::Cancel],
+            created_at: "2026-07-11T00:00:00Z".into(),
+            updated_at: "2026-07-11T00:00:01Z".into(),
+        }
+    }
+
+    fn server_agent_projection(
+        truth_state: crate::tui::server_agent_observer::ServerAgentTruthState,
+        runs: Vec<astra_thin_client::SessionRunNode>,
+        truncated: bool,
+    ) -> crate::tui::server_agent_observer::ServerAgentProjection {
+        crate::tui::server_agent_observer::ServerAgentProjection {
+            sequence: 1,
+            truth_state,
+            snapshot: Some(astra_thin_client::SessionRunTreeSnapshot {
+                schema_version: astra_thin_client::SESSION_RUN_TREE_SCHEMA_VERSION,
+                session_id: "session-1".into(),
+                snapshot_revision: "revision-1".into(),
+                observed_at: "2026-07-11T00:00:02Z".into(),
+                node_limit: 200,
+                truncated,
+                runs,
+            }),
+        }
+    }
+
+    fn restored_local_agent(
+        id: &str,
+        status: &str,
+    ) -> astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
+        astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
+            id: id.to_string(),
+            run_id: format!("run-{id}"),
+            parent_run_id: "root".to_string(),
+            status: status.to_string(),
+            title: "Restored review".to_string(),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            output_tail: Some("last persisted output".to_string()),
+            terminal_reason: None,
+            fanout: None,
+        }
     }
 
     fn tool_started(name: &str, description: &str) -> WireEvent {
@@ -2093,6 +4013,42 @@ mod tests {
         }
     }
 
+    fn agent_control_started(
+        action: &str,
+        label: &str,
+        tool_use_id: &str,
+        agent_id: Option<&str>,
+    ) -> WireEvent {
+        WireEvent::AgentControlStarted {
+            action: action.into(),
+            label: label.into(),
+            tool_use_id: tool_use_id.into(),
+            agent_id: agent_id.map(str::to_string),
+            fanout_slot: None,
+            fanout_title: None,
+        }
+    }
+
+    fn agent_control_completed(
+        action: &str,
+        label: &str,
+        status: &str,
+        duration_ms: u64,
+        output: Option<&str>,
+        tool_use_id: &str,
+        agent_id: Option<&str>,
+    ) -> WireEvent {
+        WireEvent::AgentControlCompleted {
+            action: action.into(),
+            label: label.into(),
+            status: status.into(),
+            duration_ms,
+            output: output.map(str::to_string),
+            tool_use_id: tool_use_id.into(),
+            agent_id: agent_id.map(str::to_string),
+        }
+    }
+
     // ── UserSubmit ───────────────────────────────────────────────
 
     #[test]
@@ -2114,13 +4070,18 @@ mod tests {
     }
 
     #[test]
-    fn commit_deferred_user_keeps_live_active_cell() {
+    fn commit_applied_user_intent_keeps_live_active_cell() {
         let mut w = fresh();
         w.active_cell = Some(Box::new(AssistantCell::new_streaming()));
 
-        w.commit_deferred_user("stop after this tool");
+        w.commit_applied_user_intent(
+            "intent-1",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::Applied,
+            "stop after this tool",
+        );
 
-        assert_eq!(w.history.len(), 1, "deferred input is committed as history");
+        assert_eq!(w.history.len(), 1, "user intent is committed as history");
         let persisted = w.history[0].to_persist().expect("user cell persists");
         assert!(matches!(
             &persisted,
@@ -2129,8 +4090,33 @@ mod tests {
         assert_eq!(
             w.active_cell.as_deref().map(cell_kind),
             Some(CellKind::Assistant),
-            "deferred input must not finalize the live assistant/tool cell"
+            "user intent must not finalize the live assistant/tool cell"
         );
+    }
+
+    #[test]
+    fn active_cell_identity_survives_mid_turn_history_insertion_and_commit() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta(
+            "visible reasoning".into(),
+        )));
+        let live_id = w.active_cell_id().expect("live reasoning identity");
+
+        w.commit_applied_user_intent(
+            "intent-2",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::Applied,
+            "new guidance",
+        );
+
+        assert_eq!(w.active_cell_id(), Some(live_id));
+        assert_ne!(w.history_cell_id(0), live_id);
+
+        w.handle_event(AppEvent::wire(WireEvent::ReasoningDone));
+
+        assert!(w.active_cell().is_none());
+        assert_eq!(w.history_cell_id(1), live_id);
+        assert_eq!(w.history.len(), w.history_cell_ids.len());
     }
 
     // ── AnswerDelta ──────────────────────────────────────────────
@@ -2138,8 +4124,8 @@ mod tests {
     #[test]
     fn answer_delta_creates_assistant_then_accumulates() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("Hello ".into())));
-        w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("world".into())));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta("Hello ".into())));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta("world".into())));
         let cell = w
             .active_cell
             .as_ref()
@@ -2152,13 +4138,34 @@ mod tests {
     }
 
     #[test]
+    fn stream_close_freezes_reply_without_emitting_turn_summary() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
+            "Complete reply".into(),
+        )));
+
+        w.finish_stream_projection();
+
+        assert!(w.active_cell().is_none(), "the live projection must close");
+        assert_eq!(w.history.len(), 1, "transport close must not add a summary");
+        let assistant = w.history[0]
+            .as_any_ref()
+            .downcast_ref::<AssistantCell>()
+            .expect("the reply is committed as an assistant cell");
+        assert!(
+            !assistant.is_live(),
+            "a closed stream cannot retain typing state"
+        );
+    }
+
+    #[test]
     fn answer_delta_finalises_live_reasoning_cell() {
         let mut w = fresh();
         // Begin a reasoning cell then jump straight to answer —
         // models that don't emit ReasoningDone rely on this
         // transition.
-        w.handle_event(AppEvent::Wire(WireEvent::ReasoningDelta("thinking".into())));
-        w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("answer".into())));
+        w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta("thinking".into())));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta("answer".into())));
         // Reasoning must be committed before the assistant cell
         // takes over.
         assert_eq!(w.history.len(), 1);
@@ -2180,8 +4187,8 @@ mod tests {
     #[test]
     fn reasoning_done_commits_reasoning_cell() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ReasoningDelta("step 1".into())));
-        w.handle_event(AppEvent::Wire(WireEvent::ReasoningDone));
+        w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta("step 1".into())));
+        w.handle_event(AppEvent::wire(WireEvent::ReasoningDone));
         assert_eq!(w.history.len(), 1, "reasoning cell committed");
         assert!(w.active_cell.is_none(), "active cleared after done");
     }
@@ -2189,7 +4196,7 @@ mod tests {
     #[test]
     fn reasoning_done_without_reasoning_is_noop() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ReasoningDone));
+        w.handle_event(AppEvent::wire(WireEvent::ReasoningDone));
         assert_eq!(w.history.len(), 0);
         assert!(w.active_cell.is_none());
     }
@@ -2199,12 +4206,12 @@ mod tests {
     #[test]
     fn tool_started_then_completed_commits_cell() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(tool_started("bash", "ls /tmp")));
+        w.handle_event(AppEvent::wire(tool_started("bash", "ls /tmp")));
         assert!(matches!(
             w.active_cell.as_deref().map(cell_kind),
             Some(CellKind::Tool)
         ));
-        w.handle_event(AppEvent::Wire(tool_completed(
+        w.handle_event(AppEvent::wire(tool_completed(
             "bash",
             "",
             "completed",
@@ -2225,7 +4232,7 @@ mod tests {
     #[test]
     fn bash_tool_started_carries_ctrl_b_hint_only_when_enabled() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(tool_started("bash", "sleep 60")));
+        w.handle_event(AppEvent::wire(tool_started("bash", "sleep 60")));
         let cell = w
             .active_cell
             .as_deref()
@@ -2235,7 +4242,7 @@ mod tests {
 
         let mut w = fresh();
         w.set_bash_background_hint_enabled(true);
-        w.handle_event(AppEvent::Wire(tool_started("bash", "sleep 60")));
+        w.handle_event(AppEvent::wire(tool_started("bash", "sleep 60")));
         let cell = w
             .active_cell
             .as_deref()
@@ -2247,7 +4254,7 @@ mod tests {
     #[test]
     fn bash_ctrl_b_hint_updates_existing_active_cell() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(tool_started("bash", "sleep 60")));
+        w.handle_event(AppEvent::wire(tool_started("bash", "sleep 60")));
 
         w.set_bash_background_hint_enabled(true);
         let cell = w
@@ -2270,7 +4277,7 @@ mod tests {
     fn non_bash_tool_started_ignores_ctrl_b_hint_capability() {
         let mut w = fresh();
         w.set_bash_background_hint_enabled(true);
-        w.handle_event(AppEvent::Wire(tool_started("read_file", "src/main.rs")));
+        w.handle_event(AppEvent::wire(tool_started("read_file", "src/main.rs")));
         let cell = w
             .active_cell
             .as_deref()
@@ -2282,20 +4289,23 @@ mod tests {
     #[test]
     fn agent_spawn_task_started_carries_ctrl_b_hint_but_get_result_does_not() {
         let mut spawn = fresh();
-        spawn.handle_event(AppEvent::Wire(tool_started(
-            "agent",
-            "Spawn agent: reviewer",
+        spawn.handle_event(AppEvent::wire(agent_control_started(
+            "spawn", "reviewer", "tu_test", None,
         )));
+        spawn.handle_event(AppEvent::wire(tool_started("agent", "reviewer")));
         let spawn_cell = spawn
             .live_task_cell("tu_test")
             .expect("agent spawn should render as a live TaskCell");
         assert!(spawn_cell.ctrl_b_background_hint);
 
         let mut get_result = fresh();
-        get_result.handle_event(AppEvent::Wire(tool_started(
-            "agent",
-            "Get agent result: reviewer@abc",
+        get_result.handle_event(AppEvent::wire(agent_control_started(
+            "get_result",
+            "reviewer",
+            "tu_test",
+            Some("reviewer@abc"),
         )));
+        get_result.handle_event(AppEvent::wire(tool_started("agent", "reviewer")));
         let get_result_cell = get_result
             .live_task_cell("tu_test")
             .expect("agent get_result should render as a live TaskCell");
@@ -2308,7 +4318,7 @@ mod tests {
         // yields a committed cell. Defensive: journals can
         // sometimes replay events out of order.
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(tool_completed(
+        w.handle_event(AppEvent::wire(tool_completed(
             "bash",
             "echo hi",
             "completed",
@@ -2373,7 +4383,7 @@ mod tests {
         // into `live_tasks` keyed by `tool_use_id`. Verifies the
         // multi-slot register accepts new agents.
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(task_started("tu_parent", "audit cache")));
+        w.handle_event(AppEvent::wire(task_started("tu_parent", "audit cache")));
         let tc = w
             .live_task_cell("tu_parent")
             .expect("task tool must materialise into the live_tasks register");
@@ -2385,8 +4395,8 @@ mod tests {
     #[test]
     fn child_tool_started_routes_under_parent_taskcell() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(task_started("tu_parent", "run things")));
-        w.handle_event(AppEvent::Wire(child_started(
+        w.handle_event(AppEvent::wire(task_started("tu_parent", "run things")));
+        w.handle_event(AppEvent::wire(child_started(
             "tu_parent",
             "tu_child_1",
             "bash",
@@ -2410,14 +4420,14 @@ mod tests {
     #[test]
     fn child_tool_completed_flips_child_status_inside_taskcell() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(task_started("tu_parent", "run")));
-        w.handle_event(AppEvent::Wire(child_started(
+        w.handle_event(AppEvent::wire(task_started("tu_parent", "run")));
+        w.handle_event(AppEvent::wire(child_started(
             "tu_parent",
             "tu_child",
             "bash",
             "ls",
         )));
-        w.handle_event(AppEvent::Wire(child_completed(
+        w.handle_event(AppEvent::wire(child_completed(
             "tu_parent",
             "tu_child",
             "completed",
@@ -2436,7 +4446,7 @@ mod tests {
         // child must still appear somewhere so the user sees
         // activity instead of silent drop.
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(child_started(
+        w.handle_event(AppEvent::wire(child_started(
             "tu_missing_parent",
             "tu_orphan",
             "bash",
@@ -2454,20 +4464,20 @@ mod tests {
     #[test]
     fn task_completed_transitions_taskcell_and_commits() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(task_started("tu_parent", "run")));
-        w.handle_event(AppEvent::Wire(child_started(
+        w.handle_event(AppEvent::wire(task_started("tu_parent", "run")));
+        w.handle_event(AppEvent::wire(child_started(
             "tu_parent",
             "tu_child",
             "bash",
             "ls",
         )));
-        w.handle_event(AppEvent::Wire(child_completed(
+        w.handle_event(AppEvent::wire(child_completed(
             "tu_parent",
             "tu_child",
             "completed",
             10,
         )));
-        w.handle_event(AppEvent::Wire(task_completed(
+        w.handle_event(AppEvent::wire(task_completed(
             "tu_parent",
             "completed",
             100,
@@ -2488,8 +4498,8 @@ mod tests {
     #[test]
     fn agent_tool_started_registers_in_flight_task_id() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(task_started("tu_1", "first")));
-        w.handle_event(AppEvent::Wire(task_started("tu_2", "second")));
+        w.handle_event(AppEvent::wire(task_started("tu_1", "first")));
+        w.handle_event(AppEvent::wire(task_started("tu_2", "second")));
         // Two starts, neither completed — both ids must be
         // addressable so a Ctrl+C cascade can cancel each.
         assert_eq!(
@@ -2518,18 +4528,27 @@ mod tests {
         let mut w = fresh();
         // Three parallel spawns, like a typical multi-angle review
         // turn. None has completed yet.
-        w.handle_event(AppEvent::Wire(task_started(
+        w.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "reviewer-A",
             "spawn-a",
-            "Spawn agent: reviewer-A",
+            Some("reviewer-A@a"),
         )));
-        w.handle_event(AppEvent::Wire(task_started(
+        w.handle_event(AppEvent::wire(task_started("spawn-a", "reviewer-A")));
+        w.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "reviewer-B",
             "spawn-b",
-            "Spawn agent: reviewer-B",
+            Some("reviewer-B@b"),
         )));
-        w.handle_event(AppEvent::Wire(task_started(
+        w.handle_event(AppEvent::wire(task_started("spawn-b", "reviewer-B")));
+        w.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "reviewer-C",
             "spawn-c",
-            "Spawn agent: reviewer-C",
+            Some("reviewer-C@c"),
         )));
+        w.handle_event(AppEvent::wire(task_started("spawn-c", "reviewer-C")));
 
         let in_flight = w.in_flight_task_ids().to_vec();
         assert_eq!(
@@ -2559,10 +4578,10 @@ mod tests {
     #[test]
     fn agent_tool_completed_removes_task_id_from_in_flight() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(task_started("tu_1", "first")));
-        w.handle_event(AppEvent::Wire(task_started("tu_2", "second")));
+        w.handle_event(AppEvent::wire(task_started("tu_1", "first")));
+        w.handle_event(AppEvent::wire(task_started("tu_2", "second")));
         // Completing tu_1 leaves only tu_2 pending.
-        w.handle_event(AppEvent::Wire(task_completed("tu_1", "completed", 50)));
+        w.handle_event(AppEvent::wire(task_completed("tu_1", "completed", 50)));
         assert_eq!(w.in_flight_task_ids(), &["tu_2".to_string()]);
     }
 
@@ -2573,8 +4592,8 @@ mod tests {
         // Ctrl+C doesn't target a stale id from the previous
         // conversation.
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(task_started("tu_1", "first")));
-        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+        w.handle_event(AppEvent::wire(task_started("tu_1", "first")));
+        w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
         assert!(
             w.in_flight_task_ids().is_empty(),
             "turn boundary must reset cancel bookkeeping: {:?}",
@@ -2583,9 +4602,9 @@ mod tests {
     }
 
     #[test]
-    fn turn_complete_clears_agent_runs_and_cancelled_ids() {
+    fn turn_complete_preserves_explicit_terminal_agent_projection() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlStarted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-1".into(),
@@ -2593,7 +4612,7 @@ mod tests {
             fanout_slot: None,
             fanout_title: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             status: "completed".into(),
@@ -2603,29 +4622,25 @@ mod tests {
             agent_id: Some("reviewer-A@abc".into()),
         }));
         assert_eq!(w.agent_run_ids(), vec!["reviewer-A@abc".to_string()]);
-        assert!(
-            w.cancelled_task_ids.contains("reviewer-A@abc"),
-            "terminal cancelled agent should be tracked before the turn boundary"
+        assert_eq!(
+            w.agent_run_state("reviewer-A@abc").unwrap().status,
+            AgentRunStatus::Cancelled
         );
 
-        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+        w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
 
-        assert!(
-            w.agent_run_ids().is_empty(),
-            "turn complete must clear prior-turn agent strip rows: {:?}",
-            w.agent_run_ids()
-        );
-        assert!(
-            w.cancelled_task_ids.is_empty(),
-            "turn complete must clear prior-turn cancelled ids: {:?}",
-            w.cancelled_task_ids
+        assert_eq!(w.agent_run_ids(), vec!["reviewer-A@abc".to_string()]);
+        assert_eq!(
+            w.agent_run_state("reviewer-A@abc").unwrap(),
+            AgentRunState::observed(AgentRunStatus::Cancelled),
+            "a parent turn boundary must not erase or reinterpret an explicit child terminal event"
         );
     }
 
     #[test]
-    fn completed_agent_result_clears_cancelled_tracking() {
+    fn later_completed_result_reconciles_cancelled_projection() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             status: "completed".into(),
@@ -2634,9 +4649,12 @@ mod tests {
             tool_use_id: "spawn-tu-legacy".into(),
             agent_id: Some("reviewer-A@abc".into()),
         }));
-        assert!(w.cancelled_task_ids.contains("reviewer-A@abc"));
+        assert_eq!(
+            w.agent_run_state("reviewer-A@abc").unwrap().status,
+            AgentRunStatus::Cancelled
+        );
 
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlCompleted {
             action: "get_result".into(),
             label: "reviewer-A".into(),
             status: "completed".into(),
@@ -2646,9 +4664,9 @@ mod tests {
             agent_id: Some("reviewer-A@abc".into()),
         }));
 
-        assert!(
-            !w.cancelled_task_ids.contains("reviewer-A@abc"),
-            "non-cancelled terminal result must clear stale cancelled tracking"
+        assert_eq!(
+            w.agent_run_state("reviewer-A@abc").unwrap().status,
+            AgentRunStatus::Completed
         );
         let detail = w.task_cell_anywhere("reviewer-A@abc").unwrap();
         assert!(matches!(
@@ -2660,7 +4678,7 @@ mod tests {
     #[test]
     fn explain_report_with_content_fallback_commits_system_cell() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ExplainReport(vec![
+        w.handle_event(AppEvent::wire(WireEvent::ExplainReport(vec![
             serde_json::json!(
                 {
                     "type": "explain",
@@ -2687,8 +4705,8 @@ mod tests {
         // must not inflate the cancel list (otherwise Ctrl+C
         // would cancel twice and risk cancelling the retry).
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(task_started("tu_1", "first")));
-        w.handle_event(AppEvent::Wire(task_started("tu_1", "first")));
+        w.handle_event(AppEvent::wire(task_started("tu_1", "first")));
+        w.handle_event(AppEvent::wire(task_started("tu_1", "first")));
         assert_eq!(w.in_flight_task_ids(), &["tu_1".to_string()]);
     }
 
@@ -2700,15 +4718,15 @@ mod tests {
     /// already-cancelled ones, so only one new acked-success per
     /// press counted.
     #[test]
-    fn mark_agent_controls_cancelling_drains_in_flight() {
+    fn mark_control_tasks_cancelling_drains_in_flight() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(task_started("tu_1", "first")));
-        w.handle_event(AppEvent::Wire(task_started("tu_2", "second")));
-        w.handle_event(AppEvent::Wire(task_started("tu_3", "third")));
+        w.handle_event(AppEvent::wire(task_started("tu_1", "first")));
+        w.handle_event(AppEvent::wire(task_started("tu_2", "second")));
+        w.handle_event(AppEvent::wire(task_started("tu_3", "third")));
         assert_eq!(w.in_flight_task_ids().len(), 3);
 
         let ids = w.in_flight_task_ids().to_vec();
-        w.mark_agent_controls_cancelling(&ids);
+        w.mark_control_tasks_cancelling(&ids);
 
         assert!(
             w.in_flight_task_ids().is_empty(),
@@ -2801,8 +4819,8 @@ mod tests {
     fn turn_complete_emits_summary() {
         let mut w = fresh();
         w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
-        w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("answer".into())));
-        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::new(
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta("answer".into())));
+        w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
             TurnStats {
                 elapsed_ms: Some(1_500),
                 tokens_in: Some(50),
@@ -2828,7 +4846,7 @@ mod tests {
     fn turn_error_commits_system_error_cell() {
         let mut w = fresh();
         w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
-        w.handle_event(AppEvent::Wire(WireEvent::TurnError(
+        w.handle_event(AppEvent::wire(WireEvent::TurnError(
             "<error>rate limited</error>".into(),
         )));
         assert_eq!(w.history.len(), 2);
@@ -2848,8 +4866,8 @@ mod tests {
     #[test]
     fn tool_started_mid_stream_commits_assistant_first() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("first half ".into())));
-        w.handle_event(AppEvent::Wire(tool_started("bash", "ls")));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta("first half ".into())));
+        w.handle_event(AppEvent::wire(tool_started("bash", "ls")));
         // Assistant should have been committed before the tool
         // took the active slot. Two cells in history: partial
         // assistant + (nothing else yet).
@@ -2911,119 +4929,20 @@ mod tests {
         assert_eq!(w.history().len(), 1, "history survives sid swap");
     }
 
-    // ── Persist watermark (turn-1 edge case) ────────────────────
-
-    /// Run a test body with `$HOME` pointed at a fresh tempdir so
-    /// real `~/.astra/transcripts/` is left alone.
-    fn with_tmp_home<F: FnOnce()>(f: F) {
-        let _home = crate::tests::HomeGuard::temp();
-        f();
-    }
-
     #[test]
-    #[serial_test::serial]
-    fn set_session_id_flushes_cells_committed_under_empty_sid() {
-        // Turn 1 edge case: cells commit before the server returns
-        // a session id. `set_session_id` must retroactively flush
-        // them to the new session's JSONL, so resume replay can
-        // surface the user's very first message.
-        with_tmp_home(|| {
-            let mut w = ChatWidget::new(""); // empty sid — server pending
-            w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
-            w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("hello back".into())));
-            w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+    fn ephemeral_warning_is_visible_without_becoming_canonical_history() {
+        let mut widget = ChatWidget::new("");
+        widget.handle_event(AppEvent::User(UserEvent::Submit("pending identity".into())));
 
-            // Before sid is set, nothing should be on disk yet.
-            assert!(super::super::transcript_jsonl::load("late-sid").is_empty());
+        widget.commit_ephemeral_warning("history write failed");
 
-            // Server finally assigns an id → we flush retroactively.
-            w.set_session_id("late-sid");
-            let events = super::super::transcript_jsonl::load("late-sid");
-            assert!(
-                events
-                    .iter()
-                    .any(|e| matches!(e, TurnEvent::User { text, .. } if text == "hi")),
-                "turn-1 user message must be persisted after sid arrives"
-            );
-            assert!(
-                events
-                    .iter()
-                    .any(|e| matches!(e, TurnEvent::Assistant { .. })),
-                "turn-1 assistant reply must be persisted after sid arrives"
-            );
-            assert!(
-                events
-                    .iter()
-                    .any(|e| matches!(e, TurnEvent::TurnSummary { .. })),
-                "turn-1 summary must be persisted after sid arrives"
-            );
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn post_sid_cells_dont_double_persist_previous_cells() {
-        // Sanity: after the initial flush, committing another turn
-        // must append only that turn's cells — we must NOT re-write
-        // the earlier turn's cells. This is what the persist
-        // watermark guards against.
-        with_tmp_home(|| {
-            let mut w = ChatWidget::new("");
-            w.handle_event(AppEvent::User(UserEvent::Submit("first".into())));
-            w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
-            w.set_session_id("s");
-
-            let count_after_first = super::super::transcript_jsonl::load("s").len();
-
-            w.handle_event(AppEvent::User(UserEvent::Submit("second".into())));
-            w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
-            let count_after_second = super::super::transcript_jsonl::load("s").len();
-
-            assert!(
-                count_after_second > count_after_first,
-                "second turn must add cells: {count_after_first} → {count_after_second}"
-            );
-            // Each commit cycle (UserSubmit + TurnComplete) adds 2
-            // cells: the user + the summary. Duplicate persistence
-            // would give us 4 new rows instead of 2.
-            assert_eq!(
-                count_after_second - count_after_first,
-                2,
-                "second turn should append exactly 2 cells, not double-write earlier ones"
-            );
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn replay_does_not_re_persist_resumed_cells() {
-        // When resuming a session, cells land in `history` via
-        // `replay()` — they already exist on disk. A subsequent
-        // `commit_*` must not re-persist the replayed cells.
-        with_tmp_home(|| {
-            let sid = "s_replay";
-            // Seed a one-turn session on disk.
-            super::super::transcript_jsonl::append(
-                sid,
-                &TurnEvent::User {
-                    ts: None,
-                    text: "seed".into(),
-                },
-            );
-            let before = super::super::transcript_jsonl::load(sid).len();
-            assert_eq!(before, 1);
-
-            let mut w = ChatWidget::new(sid);
-            w.replay(super::super::transcript_jsonl::load(sid));
-            // Commit a new cell — only this cell should land on disk.
-            w.handle_event(AppEvent::User(UserEvent::Submit("new".into())));
-            let after = super::super::transcript_jsonl::load(sid).len();
-            assert_eq!(
-                after,
-                before + 1,
-                "only the new cell should persist; {before} → {after}"
-            );
-        });
+        assert_eq!(widget.history().len(), 2);
+        assert!(matches!(
+            widget.history()[0].to_persist(),
+            Some(TurnEvent::User { .. })
+        ));
+        assert!(widget.history()[1].to_persist().is_none());
+        assert_eq!(widget.history.len(), widget.history_cell_ids.len());
     }
 
     // ── Last user text lookup (Ctrl+R edit-last) ────────────────
@@ -3034,11 +4953,11 @@ mod tests {
         // lookup must still surface the most recent user message.
         let mut w = fresh();
         w.handle_event(AppEvent::User(UserEvent::Submit("first".into())));
-        w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("reply 1".into())));
-        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta("reply 1".into())));
+        w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
         w.handle_event(AppEvent::User(UserEvent::Submit("second".into())));
-        w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("reply 2".into())));
-        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+        w.handle_event(AppEvent::wire(WireEvent::AnswerDelta("reply 2".into())));
+        w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
 
         assert_eq!(w.last_user_text().as_deref(), Some("second"));
     }
@@ -3109,14 +5028,14 @@ mod tests {
     fn two_parallel_task_tools_keep_both_live() {
         let mut w = fresh();
         // Spawn agent A
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "review module X".into(),
             tool_use_id: "agent-A".into(),
             parent_tool_use_id: None,
         }));
         // Spawn agent B (parallel, before A completes)
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "review module Y".into(),
             tool_use_id: "agent-B".into(),
@@ -3151,20 +5070,20 @@ mod tests {
     fn child_events_route_to_correct_parent_when_multiple_live() {
         let mut w = fresh();
         // Spawn A and B
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "A".into(),
             tool_use_id: "agent-A".into(),
             parent_tool_use_id: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "B".into(),
             tool_use_id: "agent-B".into(),
             parent_tool_use_id: None,
         }));
         // Child belongs to A
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "read_file".into(),
             description: "src/foo.rs".into(),
             tool_use_id: "child-A1".into(),
@@ -3190,20 +5109,20 @@ mod tests {
     #[test]
     fn completing_one_parallel_agent_leaves_others_live() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "A".into(),
             tool_use_id: "agent-A".into(),
             parent_tool_use_id: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "B".into(),
             tool_use_id: "agent-B".into(),
             parent_tool_use_id: None,
         }));
         // Complete A
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "A".into(),
             status: "completed".into(),
@@ -3235,7 +5154,7 @@ mod tests {
     fn all_parallel_agents_complete_into_history() {
         let mut w = fresh();
         for id in ["agent-A", "agent-B", "agent-C"] {
-            w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+            w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
                 name: "agent".into(),
                 description: id.into(),
                 tool_use_id: id.into(),
@@ -3244,7 +5163,7 @@ mod tests {
         }
         for id in ["agent-B", "agent-A", "agent-C"] {
             // out-of-order completions
-            w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
+            w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
                 name: "agent".into(),
                 description: id.into(),
                 status: "completed".into(),
@@ -3270,7 +5189,7 @@ mod tests {
     fn in_flight_task_ids_includes_all_parallel_agents() {
         let mut w = fresh();
         for id in ["agent-A", "agent-B", "agent-C"] {
-            w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+            w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
                 name: "agent".into(),
                 description: id.into(),
                 tool_use_id: id.into(),
@@ -3288,14 +5207,14 @@ mod tests {
     /// parallel agents from the previous turn. Otherwise an
     /// abnormally-ended turn (server stream drop with no
     /// TurnComplete) leaks live_tasks across turns and
-    /// `on_turn_complete` of the NEXT turn force-fails them as
-    /// belonging to the new turn.
+    /// `on_turn_complete` of the NEXT turn snapshots them as though
+    /// they belonged to that turn.
     #[test]
     fn user_submit_drains_live_tasks_from_prior_turn() {
         let mut w = fresh();
         // Spawn 2 parallel agents in the implicit prior turn.
         for id in ["agent-A", "agent-B"] {
-            w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+            w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
                 name: "agent".into(),
                 description: id.into(),
                 tool_use_id: id.into(),
@@ -3333,21 +5252,11 @@ mod tests {
         );
     }
 
-    /// CRITICAL regression: `agent_runs` (the registry that powers
-    /// the multi-agent strip + Ctrl+G drilldown) must drop terminal
-    /// rows from the previous turn when a new user turn begins.
-    /// Otherwise the strip carries stale "✓"/"✗" rows forward — the
-    /// reported bug had turn 1's six completed agents still showing
-    /// alongside turn 2's six, totalling "12 parallel agents".
-    /// Live rows belonging to the prior turn are NOT preserved
-    /// either: `drain_all_live_tasks` already finalises them and
-    /// they get committed to history (where Ctrl+G can still find
-    /// them via `task_cell_anywhere` history fallback).
     #[test]
-    fn user_submit_clears_terminal_agent_runs_from_prior_turn() {
+    fn user_submit_preserves_terminal_agent_runs_with_bounded_registry() {
         let mut w = fresh();
         // Turn 1: spawn two agents, both finish.
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlStarted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-1".into(),
@@ -3355,7 +5264,7 @@ mod tests {
             fanout_slot: None,
             fanout_title: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             status: "completed".into(),
@@ -3364,7 +5273,7 @@ mod tests {
             tool_use_id: "spawn-tu-1".into(),
             agent_id: Some("reviewer-A@abc".into()),
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlStarted {
             action: "spawn".into(),
             label: "reviewer-B".into(),
             tool_use_id: "spawn-tu-2".into(),
@@ -3372,7 +5281,7 @@ mod tests {
             fanout_slot: None,
             fanout_title: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-B".into(),
             status: "failed".into(),
@@ -3387,25 +5296,20 @@ mod tests {
             "both completed agents present at end of prior turn"
         );
 
-        // Turn 2 starts. The registry must drop both terminal entries.
+        // Starting the next parent turn does not change child outcomes.
         w.handle_event(AppEvent::User(UserEvent::Submit("next".into())));
         assert_eq!(
             w.agent_run_ids().len(),
-            0,
-            "terminal agent_runs from prior turn must be cleared on user submit, got: {:?}",
+            2,
+            "terminal child projections remain inspectable across parent turns: {:?}",
             w.agent_run_ids()
         );
     }
 
-    /// Live agents from a prior turn (abnormal turn end, e.g. server
-    /// stream drop with no TurnComplete) must also be removed from
-    /// `agent_runs` on user submit. They get finalised and committed
-    /// to history by `drain_all_live_tasks`, so the user can still
-    /// drill into them via Ctrl+G's history-fallback path.
     #[test]
-    fn user_submit_clears_live_agent_runs_from_prior_turn() {
+    fn user_submit_degrades_live_agent_to_unconfirmed_without_erasing_it() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlStarted {
             action: "spawn".into(),
             label: "stuck-agent".into(),
             tool_use_id: "spawn-tu-x".into(),
@@ -3417,11 +5321,13 @@ mod tests {
         assert_eq!(w.agent_run_ids().len(), 1, "agent is live");
 
         w.handle_event(AppEvent::User(UserEvent::Submit("next".into())));
+        assert_eq!(w.agent_run_ids(), vec!["stuck@id".to_string()]);
+        let state = w.agent_run_state("stuck@id").unwrap();
+        assert_eq!(state.status, AgentRunStatus::Starting);
         assert_eq!(
-            w.agent_run_ids().len(),
-            0,
-            "live agent_runs from a dropped prior turn must also be cleared, got: {:?}",
-            w.agent_run_ids()
+            state.confidence,
+            AgentProjectionConfidence::Unconfirmed,
+            "a missing terminal event is uncertainty, not completion or failure"
         );
     }
 
@@ -3433,7 +5339,7 @@ mod tests {
     #[test]
     fn duplicate_tool_started_updates_description() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "initial".into(),
             tool_use_id: "agent-A".into(),
@@ -3441,7 +5347,7 @@ mod tests {
         }));
         // Same id, different description (e.g. server retry with
         // a more detailed task description).
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "refined description".into(),
             tool_use_id: "agent-A".into(),
@@ -3465,7 +5371,7 @@ mod tests {
     #[test]
     fn late_tool_completed_after_turn_complete_is_noop() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "agent-A".into(),
             tool_use_id: "agent-A".into(),
@@ -3473,7 +5379,7 @@ mod tests {
         }));
         let history_len_before_turn_complete = w.history().len();
         // Turn ends — agent-A finalized as Failed and committed.
-        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::new(
+        w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
             TurnStats {
                 elapsed_ms: None,
                 ttft_ms: None,
@@ -3493,7 +5399,7 @@ mod tests {
 
         // Late ToolCompleted for agent-A — must be a no-op, not
         // synthesize a new cell.
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "agent-A".into(),
             status: "completed".into(),
@@ -3512,9 +5418,9 @@ mod tests {
     }
 
     #[test]
-    fn late_agent_control_completed_after_turn_complete_is_noop() {
+    fn late_agent_control_completed_reconciles_retained_projection() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlStarted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-late".into(),
@@ -3522,13 +5428,13 @@ mod tests {
             fanout_slot: None,
             fanout_title: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
-        assert!(
-            w.agent_run_ids().is_empty(),
-            "turn boundary should clear the prior-turn agent row first"
+        w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+        assert_eq!(
+            w.agent_run_state("reviewer-A@late").unwrap().confidence,
+            AgentProjectionConfidence::Unconfirmed
         );
 
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             status: "completed".into(),
@@ -3538,36 +5444,58 @@ mod tests {
             agent_id: Some("reviewer-A@late".into()),
         }));
 
-        assert!(
-            w.agent_run_ids().is_empty(),
-            "late AgentControlCompleted must not resurrect a cleared prior-turn row: {:?}",
-            w.agent_run_ids()
-        );
-        assert!(
-            w.cancelled_task_ids.is_empty(),
-            "late AgentControlCompleted must not restore cancelled state from the prior turn: {:?}",
-            w.cancelled_task_ids
+        assert_eq!(w.agent_run_ids(), vec!["reviewer-A@late".to_string()]);
+        assert_eq!(
+            w.agent_run_state("reviewer-A@late").unwrap().status,
+            AgentRunStatus::Cancelled
         );
     }
 
     #[test]
-    fn late_agent_terminated_after_turn_complete_is_noop() {
+    fn agent_live_gap_marks_projection_incomplete_without_fabricating_output() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::wire(WireEvent::AgentLiveGap(
+            astra_turn_core::agent_live_event::AgentLiveGap {
+                run_id: "run-reviewer".into(),
+                agent_id: "reviewer".into(),
+                dropped_event_count: 2,
+            },
+        )));
+
+        let rows = w.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Running);
+        assert_eq!(rows[0].run_id.as_deref(), Some("run-reviewer"));
+        assert_eq!(
+            rows[0].attention_summary.as_deref(),
+            Some("Live activity incomplete · 2 updates skipped · syncing durable state")
+        );
+        assert!(
+            w.history().is_empty(),
+            "a transport gap must not become a synthetic conversation message"
+        );
+    }
+
+    #[test]
+    fn late_agent_terminated_reconciles_unconfirmed_projection() {
         use astra_turn_core::agent_live_event::{
             AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
         };
 
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@late-term".into(),
             kind: AgentLiveEventKind::OutputDelta("running".into()),
         })));
-        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
-        assert!(
-            w.agent_run_ids().is_empty(),
-            "turn boundary should clear the prior-turn live row first"
+        w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+        assert_eq!(
+            w.agent_run_state("reviewer@late-term").unwrap().confidence,
+            AgentProjectionConfidence::Unconfirmed
         );
 
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@late-term".into(),
             kind: AgentLiveEventKind::AgentTerminated {
                 termination: AgentLiveTermination::Cancelled,
@@ -3576,45 +5504,43 @@ mod tests {
             },
         })));
 
-        assert!(
-            w.agent_run_ids().is_empty(),
-            "late AgentTerminated must not resurrect a cleared prior-turn row: {:?}",
-            w.agent_run_ids()
-        );
-        assert!(
-            w.cancelled_task_ids.is_empty(),
-            "late AgentTerminated must not restore cancelled state from the prior turn: {:?}",
-            w.cancelled_task_ids
+        assert_eq!(
+            w.agent_run_state("reviewer@late-term").unwrap().status,
+            AgentRunStatus::Cancelled
         );
     }
 
     /// REGRESSION (session 2a98814b): pressing Ctrl+G after sub-agents
     /// have completed used to silently no-op. The user lost any way to
-    /// drill into the agents' output. Now `agents_drilldown_rows`
+    /// drill into the agents' output. Now `agent_monitor_snapshot`
     /// returns the most-recent completed Task cells too.
     #[test]
     fn agents_drilldown_includes_recent_completed_after_strip_dismissed() {
         let mut w = fresh();
         // Spawn 3 parallel agents, complete all of them.
         for id in ["agent-A", "agent-B", "agent-C"] {
-            w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
-                name: "agent".into(),
-                description: format!("review {id}"),
-                tool_use_id: id.into(),
-                parent_tool_use_id: None,
-            }));
-        }
-        for id in ["agent-A", "agent-B", "agent-C"] {
-            w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-                name: "agent".into(),
-                description: format!("review {id}"),
-                status: "completed".into(),
-                duration_ms: 12_000,
-                output_summary: Some(format!("done-{id}")),
-                output: None,
-                tool_use_id: id.into(),
-                parent_tool_use_id: None,
-            }));
+            let tool_use_id = format!("spawn-{id}");
+            w.handle_event(AppEvent::wire(agent_control_started(
+                "spawn",
+                id,
+                &tool_use_id,
+                Some(id),
+            )));
+            let output = serde_json::json!({
+                "status": "completed",
+                "agent_id": id,
+                "result": format!("done-{id}")
+            })
+            .to_string();
+            w.handle_event(AppEvent::wire(agent_control_completed(
+                "spawn",
+                id,
+                "completed",
+                12_000,
+                Some(&output),
+                &tool_use_id,
+                Some(id),
+            )));
         }
 
         // Live strip is empty (all completed) — the pre-fix Ctrl+G path.
@@ -3625,7 +5551,7 @@ mod tests {
         );
 
         // New behavior: drilldown rows include the recent completions.
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(
             rows.len(),
             3,
@@ -3635,7 +5561,8 @@ mod tests {
         // All 3 should be flagged as not-live so the view renders the
         // ✓ icon instead of the spinner.
         assert!(
-            rows.iter().all(|r| r.status == AgentRowStatus::Completed),
+            rows.iter()
+                .all(|r| r.state.status == AgentRunStatus::Completed),
             "completed-only rows must report completed status"
         );
         let ids: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
@@ -3653,28 +5580,60 @@ mod tests {
     fn agents_drilldown_with_zero_recent_returns_only_live() {
         let mut w = fresh();
         // Spawn one agent and complete it.
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
-            name: "agent".into(),
-            description: "live-only check".into(),
-            tool_use_id: "agent-X".into(),
-            parent_tool_use_id: None,
-        }));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "live-only check".into(),
-            status: "completed".into(),
-            duration_ms: 1_000,
-            output_summary: None,
-            output: None,
-            tool_use_id: "agent-X".into(),
-            parent_tool_use_id: None,
-        }));
+        w.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "live-only check",
+            "spawn-X",
+            Some("agent-X"),
+        )));
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "spawn",
+            "live-only check",
+            "completed",
+            1_000,
+            Some(r#"{"status":"completed","agent_id":"agent-X","result":"done"}"#),
+            "spawn-X",
+            Some("agent-X"),
+        )));
 
-        let rows = w.agents_drilldown_rows(0);
+        let rows = w.agent_monitor_snapshot(0);
         assert!(
             rows.is_empty(),
             "max_recent_completed=0 must NOT surface completed rows"
         );
+    }
+
+    #[test]
+    fn agent_workbench_does_not_inherit_compact_strip_terminal_limit() {
+        let mut widget = fresh();
+        for index in 0..8 {
+            let agent_id = format!("reviewer-{index}");
+            let tool_use_id = format!("spawn-{index}");
+            widget.handle_event(AppEvent::wire(agent_control_started(
+                "spawn",
+                &agent_id,
+                &tool_use_id,
+                Some(&agent_id),
+            )));
+            let output = serde_json::json!({
+                "status": "completed",
+                "agent_id": agent_id,
+                "result": format!("finding-{index}")
+            })
+            .to_string();
+            widget.handle_event(AppEvent::wire(agent_control_completed(
+                "spawn",
+                &format!("reviewer-{index}"),
+                "completed",
+                1_000,
+                Some(&output),
+                &tool_use_id,
+                Some(&format!("reviewer-{index}")),
+            )));
+        }
+
+        assert_eq!(widget.agent_monitor_snapshot(5).len(), 5);
+        assert_eq!(widget.agent_workbench_snapshot().len(), 8);
     }
 
     /// `task_cell_anywhere` finds completed agents in history so
@@ -3682,13 +5641,13 @@ mod tests {
     #[test]
     fn task_cell_anywhere_finds_completed_in_history() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "find me".into(),
             tool_use_id: "completed-id".into(),
             parent_tool_use_id: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
             name: "agent".into(),
             description: "find me".into(),
             status: "completed".into(),
@@ -3716,61 +5675,67 @@ mod tests {
     fn agents_drilldown_orders_live_before_completed() {
         let mut w = fresh();
         // Complete one, then start a new live one.
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
-            name: "agent".into(),
-            description: "old completed".into(),
-            tool_use_id: "old".into(),
-            parent_tool_use_id: None,
-        }));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "old completed".into(),
-            status: "completed".into(),
-            duration_ms: 500,
-            output_summary: None,
-            output: None,
-            tool_use_id: "old".into(),
-            parent_tool_use_id: None,
-        }));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
-            name: "agent".into(),
-            description: "new live".into(),
-            tool_use_id: "new".into(),
-            parent_tool_use_id: None,
-        }));
+        w.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "old completed",
+            "spawn-old",
+            Some("old"),
+        )));
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "spawn",
+            "old completed",
+            "completed",
+            500,
+            Some(r#"{"status":"completed","agent_id":"old","result":"done"}"#),
+            "spawn-old",
+            Some("old"),
+        )));
+        w.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "new live",
+            "spawn-new",
+            Some("new"),
+        )));
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "spawn",
+            "new live",
+            "completed",
+            0,
+            Some(r#"{"status":"launched","agent_id":"new"}"#),
+            "spawn-new",
+            Some("new"),
+        )));
 
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].agent_id, "new", "live must come first");
-        assert_eq!(rows[0].status, AgentRowStatus::Live);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Running);
         assert_eq!(rows[1].agent_id, "old", "completed must come second");
-        assert_eq!(rows[1].status, AgentRowStatus::Completed);
+        assert_eq!(rows[1].state.status, AgentRunStatus::Completed);
     }
 
     #[test]
     fn agent_spawn_control_tool_creates_logical_agent_row() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
-            name: "agent".into(),
-            description: "Spawn agent: arch-reviewer (code-review)".into(),
-            tool_use_id: "spawn-arch".into(),
-            parent_tool_use_id: None,
-        }));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "Spawn agent: arch-reviewer (code-review)".into(),
-            status: "completed".into(),
-            duration_ms: 0,
-            output_summary: Some("json object".into()),
-            output: Some(
-                r#"{"status":"launched","agent_id":"arch-reviewer@abc12345","description":"Architecture review"}"#
-                    .into(),
+        w.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "arch-reviewer",
+            "spawn-arch",
+            None,
+        )));
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "spawn",
+            "arch-reviewer",
+            "completed",
+            0,
+            Some(
+                r#"{"status":"launched","agent_id":"arch-reviewer@abc12345","description":"Architecture review"}"#,
             ),
-            tool_use_id: "spawn-arch".into(),
-            parent_tool_use_id: None,
-        }));
+            "spawn-arch",
+            Some("arch-reviewer@abc12345"),
+        )));
 
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(
             rows.len(),
             1,
@@ -3778,7 +5743,7 @@ mod tests {
         );
         assert_eq!(rows[0].agent_id, "arch-reviewer@abc12345");
         assert_eq!(rows[0].name, "arch-reviewer");
-        assert_eq!(rows[0].status, AgentRowStatus::Live);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Running);
 
         let detail = w
             .task_cell_anywhere("arch-reviewer@abc12345")
@@ -3789,36 +5754,32 @@ mod tests {
     #[test]
     fn get_result_updates_logical_agent_detail() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "Spawn agent: ux-reviewer (code-review)".into(),
-            status: "completed".into(),
-            duration_ms: 0,
-            output_summary: None,
-            output: Some(
-                r#"{"status":"launched","agent_id":"ux-reviewer@def67890","description":"UX review"}"#
-                    .into(),
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "spawn",
+            "ux-reviewer",
+            "completed",
+            0,
+            Some(
+                r#"{"status":"launched","agent_id":"ux-reviewer@def67890","description":"UX review"}"#,
             ),
-            tool_use_id: "spawn-ux".into(),
-            parent_tool_use_id: None,
-        }));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "Get agent result: ux-reviewer@def67890".into(),
-            status: "completed".into(),
-            duration_ms: 123,
-            output_summary: None,
-            output: Some(
-                r#"{"status":"completed","agent_id":"ux-reviewer@def67890","finish_reason":"normal","result":"finding one\nfinding two"}"#
-                    .into(),
+            "spawn-ux",
+            Some("ux-reviewer@def67890"),
+        )));
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "ux-reviewer",
+            "completed",
+            123,
+            Some(
+                r#"{"status":"completed","agent_id":"ux-reviewer@def67890","finish_reason":"normal","result":"finding one\nfinding two"}"#,
             ),
-            tool_use_id: "result-ux".into(),
-            parent_tool_use_id: None,
-        }));
+            "result-ux",
+            Some("ux-reviewer@def67890"),
+        )));
 
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, AgentRowStatus::Completed);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Completed);
         let detail = w.task_cell_anywhere("ux-reviewer@def67890").unwrap();
         assert_eq!(
             detail.output_summary.as_deref(),
@@ -3829,25 +5790,21 @@ mod tests {
     #[test]
     fn get_result_without_status_still_completes_agent() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "Get agent result: reviewer@abc12345".into(),
-            status: "completed".into(),
-            duration_ms: 77,
-            output_summary: None,
-            output: Some(
-                r#"{"agent_id":"reviewer@abc12345","finish_reason":"normal","result":"done"}"#
-                    .into(),
-            ),
-            tool_use_id: "result-reviewer".into(),
-            parent_tool_use_id: None,
-        }));
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "reviewer",
+            "completed",
+            77,
+            Some(r#"{"agent_id":"reviewer@abc12345","finish_reason":"normal","result":"done"}"#),
+            "result-reviewer",
+            Some("reviewer@abc12345"),
+        )));
 
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent_id, "reviewer@abc12345");
         assert!(
-            rows[0].status == AgentRowStatus::Completed,
+            rows[0].state.status == AgentRunStatus::Completed,
             "get_result output with a result is terminal even when legacy JSON lacks status=completed"
         );
         assert_eq!(
@@ -3862,19 +5819,17 @@ mod tests {
     #[test]
     fn still_running_agent_detail_shows_wait_status() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "Get agent result: reviewer@abc12345".into(),
-            status: "completed".into(),
-            duration_ms: 120_000,
-            output_summary: None,
-            output: Some(
-                r#"{"status":"still_running","agent_id":"reviewer@abc12345","current_status":"running","waited_secs":120,"hint":"call again"}"#
-                    .into(),
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "reviewer",
+            "completed",
+            120_000,
+            Some(
+                r#"{"status":"still_running","agent_id":"reviewer@abc12345","current_status":"running","waited_secs":120,"hint":"call again"}"#,
             ),
-            tool_use_id: "result-reviewer".into(),
-            parent_tool_use_id: None,
-        }));
+            "result-reviewer",
+            Some("reviewer@abc12345"),
+        )));
 
         let detail = w.task_cell_anywhere("reviewer@abc12345").unwrap();
         assert!(matches!(
@@ -3892,23 +5847,22 @@ mod tests {
         use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
 
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@abc12345".into(),
             kind: AgentLiveEventKind::OutputDelta("live token".into()),
         })));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "Get agent result: reviewer@abc12345".into(),
-            status: "completed".into(),
-            duration_ms: 120_000,
-            output_summary: None,
-            output: Some(
-                r#"{"status":"still_running","agent_id":"reviewer@abc12345","current_status":"running","waited_secs":120,"hint":"call again"}"#
-                    .into(),
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "reviewer",
+            "completed",
+            120_000,
+            Some(
+                r#"{"status":"still_running","agent_id":"reviewer@abc12345","current_status":"running","waited_secs":120,"hint":"call again"}"#,
             ),
-            tool_use_id: "result-reviewer".into(),
-            parent_tool_use_id: None,
-        }));
+            "result-reviewer",
+            Some("reviewer@abc12345"),
+        )));
 
         let detail = w.task_cell_anywhere("reviewer@abc12345").unwrap();
         let output = detail.output_summary.as_deref().unwrap_or("");
@@ -3917,64 +5871,528 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_get_result_marks_agent_failed_instead_of_completed() {
-        let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "Get agent result: reviewer@abc12345".into(),
-            status: "completed".into(),
-            duration_ms: 77,
-            output_summary: None,
-            output: Some(
-                r#"{"status":"interrupted","agent_id":"reviewer@abc12345","finish_reason":"budget_exhausted"}"#
-                    .into(),
-            ),
-            tool_use_id: "result-reviewer".into(),
+    fn live_run_start_binds_transcript_location_without_inventing_control_ownership() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal,
+        };
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-child-1".into(),
+            agent_id: "reviewer@run-child-1".into(),
+            kind: AgentLiveEventKind::Signal(AgentLiveSignal::RunStarted {
+                parent_run_id: Some("run-root".into()),
+                depth: 2,
+                spawn_tool_call_id: None,
+                transcript_location: astra_turn_types::AgentTranscriptLocation::DurableServer,
+            }),
+        })));
+
+        let rows = widget.agent_monitor_snapshot(0);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.agent_id, "reviewer@run-child-1");
+        assert_eq!(row.run_id.as_deref(), Some("run-child-1"));
+        assert_eq!(row.parent_run_id.as_deref(), Some("run-root"));
+        assert_eq!(
+            row.depth, 1,
+            "a parent outside the visible agent set is rendered as a visible forest root"
+        );
+        assert!(row.available_actions.is_empty());
+        assert!(row.control_target.is_none());
+        assert_eq!(
+            row.transcript_target,
+            Some(crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer)
+        );
+        assert!(
+            widget
+                .agent_run_cell("reviewer@run-child-1")
+                .unwrap()
+                .output_summary
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn live_agent_attention_is_waiting_not_generic_running_output() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal,
+        };
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-attention".into(),
+            agent_id: "reviewer@attention".into(),
+            kind: AgentLiveEventKind::Signal(AgentLiveSignal::ApprovalRequired {
+                request_id: "approval-1".into(),
+                tool: "bash".into(),
+                approval_kind: "explicit".into(),
+                path: None,
+                detail: Some("git status".into()),
+                display_label: None,
+            }),
+        })));
+
+        let rows = widget.agent_monitor_snapshot(0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Waiting);
+        assert_eq!(
+            rows[0].attention_summary.as_deref(),
+            Some("Approval required · git status")
+        );
+        assert!(matches!(
+            widget
+                .agent_run_cell("reviewer@attention")
+                .map(|cell| cell.status),
+            Some(crate::tui::history_cell::task::TaskStatus::Waiting)
+        ));
+        assert!(
+            widget
+                .agent_run_cell("reviewer@attention")
+                .and_then(|cell| cell.output_summary.as_deref())
+                .is_some_and(|summary| summary.contains("Approval required"))
+        );
+
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-attention".into(),
+            agent_id: "reviewer@attention".into(),
+            kind: AgentLiveEventKind::ToolStarted {
+                name: "bash".into(),
+                description: "git status".into(),
+                tool_use_id: "tool-after-approval".into(),
+            },
+        })));
+        assert_eq!(
+            widget.agent_monitor_snapshot(0).rows[0].state.status,
+            AgentRunStatus::Running,
+            "a post-approval tool event resumes the run"
+        );
+        assert!(
+            widget.agent_monitor_snapshot(0).rows[0]
+                .attention_summary
+                .is_none(),
+            "a resumed run must not retain an old attention reason"
+        );
+    }
+
+    #[test]
+    fn first_live_tool_event_binds_run_identity_without_run_started_signal() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-fanout-slot-1".into(),
+            agent_id: "reviewer@slot-1".into(),
+            kind: AgentLiveEventKind::ToolStarted {
+                name: "read".into(),
+                description: "inspect the scheduler".into(),
+                tool_use_id: "tool-read-1".into(),
+            },
+        })));
+
+        let rows = widget.agent_monitor_snapshot(0);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.run_id.as_deref(), Some("run-fanout-slot-1"));
+        assert_eq!(row.depth, 1);
+        assert_eq!(row.activity.tool_calls, 1);
+        assert!(row.control_target.is_none());
+        assert!(row.transcript_target.is_none());
+        assert!(row.available_actions.is_empty());
+    }
+
+    #[test]
+    fn fanout_with_new_canonical_run_and_no_typed_receipt_is_uncertain() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::ToolStarted {
+            name: "agent_fanout".into(),
+            description: "start parallel review".into(),
+            tool_use_id: "fanout-call-1".into(),
+            parent_tool_use_id: None,
+        }));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-fanout-slot-1".into(),
+            agent_id: "reviewer@slot-1".into(),
+            kind: AgentLiveEventKind::OutputDelta("reviewing".into()),
+        })));
+        widget.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
+            name: "agent_fanout".into(),
+            description: "start parallel review".into(),
+            status: "failed".into(),
+            duration_ms: 3,
+            output_summary: Some("control tool report failed".into()),
+            output: Some("transport completed without a structured result".into()),
+            tool_use_id: "fanout-call-1".into(),
             parent_tool_use_id: None,
         }));
 
-        let rows = w.agents_drilldown_rows(5);
+        let persisted = widget
+            .history()
+            .last()
+            .and_then(|cell| cell.to_persist())
+            .expect("fanout cell is committed");
+        assert!(matches!(
+            persisted,
+            TurnEvent::Tool {
+                status: crate::tui::turn_event::ToolStatus::Uncertain,
+                ..
+            }
+        ));
+        let rows = widget.agent_monitor_snapshot(0);
+        assert!(rows.iter().any(|row| {
+            row.run_id.as_deref() == Some("run-fanout-slot-1")
+                && row.control_target.is_none()
+                && row.transcript_target.is_none()
+                && row.available_actions.is_empty()
+        }));
+    }
+
+    #[test]
+    fn fanout_launch_receipt_makes_each_child_transcript_addressable() {
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::ToolStarted {
+            name: "agent_fanout".into(),
+            description: "start parallel review".into(),
+            tool_use_id: "fanout-call-addressable".into(),
+            parent_tool_use_id: None,
+        }));
+        widget.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
+            name: "agent_fanout".into(),
+            description: "start parallel review".into(),
+            status: "completed".into(),
+            duration_ms: 3,
+            output_summary: None,
+            output: Some(
+                serde_json::json!({
+                    "status": "started",
+                    "group_id": "review-42",
+                    "title": "multi-angle review",
+                    "target_count": 2,
+                    "transcript_location": "durable_server",
+                    "fanout": {
+                        "parent_run_id": "root-run"
+                    },
+                    "agents": [
+                        {
+                            "slot_index": 0,
+                            "id": "correctness",
+                            "agent_id": "reviewer@one",
+                            "run_id": "run-review-one",
+                            "status": "launched",
+                            "transcript_location": "durable_server"
+                        },
+                        {
+                            "slot_index": 1,
+                            "id": "performance",
+                            "agent_id": "reviewer@two",
+                            "run_id": "run-review-two",
+                            "status": "launched",
+                            "transcript_location": "durable_server"
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+            tool_use_id: "fanout-call-addressable".into(),
+            parent_tool_use_id: None,
+        }));
+
+        let rows = widget.agent_monitor_snapshot(0);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| {
+            row.run_id
+                .as_deref()
+                .is_some_and(|run_id| matches!(run_id, "run-review-one" | "run-review-two"))
+                && row.parent_run_id.as_deref() == Some("root-run")
+                && row.fanout.as_ref().is_some_and(|fanout| {
+                    fanout.group_id == "review-42" && fanout.target_count == 2
+                })
+                && row.transcript_target
+                    == Some(crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer)
+                && row.control_target.is_none()
+                && row.available_actions.is_empty()
+        }));
+    }
+
+    #[test]
+    fn recovered_fanout_registry_slots_restore_each_child_transcript_identity() {
+        let mut widget = fresh();
+        widget.on_agent_fanout_launch_receipt(
+            &serde_json::json!({
+                "status": "incomplete",
+                "group_id": "review-recovered",
+                "title": "recovered review",
+                "target_count": 1,
+                "transcript_location": "local_journal",
+                "fanout": {
+                    "parent_run_id": "root-run",
+                    "slots": [{
+                        "slot_index": 0,
+                        "id": "correctness",
+                        "agent_id": "reviewer@one",
+                        "run_id": "run-review-one",
+                        "status": "running"
+                    }]
+                }
+            })
+            .to_string(),
+        );
+
+        let rows = widget.agent_monitor_snapshot(0);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.agent_id, "reviewer@one");
+        assert_eq!(row.run_id.as_deref(), Some("run-review-one"));
+        assert_eq!(row.parent_run_id.as_deref(), Some("root-run"));
+        assert_eq!(
+            row.transcript_target,
+            Some(crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal)
+        );
+        assert!(row.fanout.as_ref().is_some_and(|fanout| {
+            fanout.group_id == "review-recovered" && fanout.slot_label == "correctness"
+        }));
+    }
+
+    #[test]
+    fn malformed_fanout_payload_becomes_an_actionable_rejection_without_raw_json() {
+        let payload = serde_json::json!({
+            "status": "failed",
+            "error_kind": "tool_invalid_args",
+            "error": "Tool arguments were not valid JSON",
+            "advisory": {
+                "kind": "malformed_tool_arguments",
+                "next_step": "Create one new complete JSON tool call that matches the advertised schema."
+            }
+        })
+        .to_string();
+
+        let summary = fanout_rejection_summary(None, Some(&payload))
+            .expect("typed fanout admission failure should have a user surface");
+        assert_eq!(
+            summary,
+            "Fanout did not start · its arguments were invalid, so no agents were launched. Create one new complete JSON tool call that matches the advertised schema."
+        );
+    }
+
+    #[test]
+    fn fanout_receipt_requires_group_identity_and_status() {
+        assert!(!fanout_completion_has_receipt(
+            Some("transport completed without a structured result"),
+            None,
+        ));
+        assert!(!fanout_completion_has_receipt(
+            None,
+            Some(r#"{"status":"started"}"#),
+        ));
+        assert!(fanout_completion_has_receipt(
+            None,
+            Some(r#"{"status":"started","group_id":"review-42"}"#),
+        ));
+    }
+
+    #[test]
+    fn fanout_without_live_evidence_keeps_its_failed_status() {
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::ToolStarted {
+            name: "agent_fanout".into(),
+            description: "start parallel review".into(),
+            tool_use_id: "fanout-call-2".into(),
+            parent_tool_use_id: None,
+        }));
+        widget.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
+            name: "agent_fanout".into(),
+            description: "start parallel review".into(),
+            status: "failed".into(),
+            duration_ms: 3,
+            output_summary: None,
+            output: None,
+            tool_use_id: "fanout-call-2".into(),
+            parent_tool_use_id: None,
+        }));
+
+        let persisted = widget
+            .history()
+            .last()
+            .and_then(|cell| cell.to_persist())
+            .expect("fanout cell is committed");
+        assert!(matches!(
+            persisted,
+            TurnEvent::Tool {
+                status: crate::tui::turn_event::ToolStatus::Failed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn concurrent_runs_of_one_profile_keep_independent_live_projections() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, AgentLiveTermination,
+        };
+
+        let mut widget = fresh();
+        for (run_id, parent_run_id) in [("run-one", "root-one"), ("run-two", "root-two")] {
+            widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+                run_id: run_id.into(),
+                // Server-side profiles are intentionally reusable. The run id,
+                // not this label, separates their conversations.
+                agent_id: "reviewer".into(),
+                kind: AgentLiveEventKind::Signal(AgentLiveSignal::RunStarted {
+                    parent_run_id: Some(parent_run_id.into()),
+                    depth: 1,
+                    spawn_tool_call_id: None,
+                    transcript_location: astra_turn_types::AgentTranscriptLocation::DurableServer,
+                }),
+            })));
+        }
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-one".into(),
+            agent_id: "reviewer".into(),
+            kind: AgentLiveEventKind::OutputDelta("first run finding".into()),
+        })));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-two".into(),
+            agent_id: "reviewer".into(),
+            kind: AgentLiveEventKind::OutputDelta("second run finding".into()),
+        })));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-one".into(),
+            agent_id: "reviewer".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: AgentLiveTermination::Completed,
+                duration_ms: 1,
+                reason: None,
+            },
+        })));
+
+        let rows = widget.agent_monitor_snapshot(0);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.run_id.as_deref() == Some("run-one")
+                && row.state.status == AgentRunStatus::Completed
+        }));
+        assert!(rows.iter().any(|row| {
+            row.run_id.as_deref() == Some("run-two") && row.state.status == AgentRunStatus::Running
+        }));
+        assert!(
+            widget
+                .agent_run_cell("reviewer")
+                .unwrap()
+                .output_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("first run finding")
+        );
+        let second = widget.agent_run_cell("run-two").unwrap();
+        assert!(
+            second
+                .output_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("second run finding")
+        );
+        assert!(
+            !second
+                .output_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("first run finding")
+        );
+    }
+
+    #[test]
+    fn result_timeout_degrades_confidence_without_poisoning_agent_lifecycle() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+
+        let mut w = fresh();
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
+            agent_id: "reviewer@abc12345".into(),
+            kind: AgentLiveEventKind::OutputDelta("working".into()),
+        })));
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "reviewer",
+            "completed",
+            120_000,
+            Some(r#"{"status":"timeout","agent_id":"reviewer@abc12345","waited_secs":120}"#),
+            "result-reviewer",
+            Some("reviewer@abc12345"),
+        )));
+
+        let state = w.agent_run_state("reviewer@abc12345").unwrap();
+        assert_eq!(state.status, AgentRunStatus::Running);
+        assert_eq!(state.confidence, AgentProjectionConfidence::Unconfirmed);
+        let detail = w.task_cell_anywhere("reviewer@abc12345").unwrap();
+        assert_eq!(
+            detail.status,
+            crate::tui::history_cell::task::TaskStatus::Unconfirmed
+        );
+        assert!(
+            detail
+                .output_summary
+                .as_deref()
+                .is_some_and(|output| output.contains("timed out"))
+        );
+    }
+
+    #[test]
+    fn interrupted_get_result_preserves_interrupted_lifecycle() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "reviewer",
+            "completed",
+            77,
+            Some(
+                r#"{"status":"interrupted","agent_id":"reviewer@abc12345","finish_reason":"budget_exhausted"}"#,
+            ),
+            "result-reviewer",
+            Some("reviewer@abc12345"),
+        )));
+
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent_id, "reviewer@abc12345");
-        assert_eq!(rows[0].status, AgentRowStatus::Failed);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Interrupted);
 
         let detail = w.task_cell_anywhere("reviewer@abc12345").unwrap();
         assert!(matches!(
             detail.status,
-            crate::tui::history_cell::task::TaskStatus::Failed
+            crate::tui::history_cell::task::TaskStatus::Interrupted
         ));
         assert_eq!(
             detail.error.as_deref(),
-            Some(crate::tui::agent_control_status::AGENT_RESULT_INTERRUPTED_ERROR)
+            Some(astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_INTERRUPTED_ERROR)
         );
     }
 
     #[test]
     fn interrupted_get_result_preserves_partial_result_text() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
-            name: "agent".into(),
-            description: "Get agent result: reviewer@abc12345".into(),
-            status: "completed".into(),
-            duration_ms: 77,
-            output_summary: None,
-            output: Some(
-                r#"{"status":"interrupted","agent_id":"reviewer@abc12345","result":"partial draft","finish_reason":"budget_exhausted"}"#
-                    .into(),
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "reviewer",
+            "completed",
+            77,
+            Some(
+                r#"{"status":"interrupted","agent_id":"reviewer@abc12345","result":"partial draft","finish_reason":"budget_exhausted"}"#,
             ),
-            tool_use_id: "result-reviewer".into(),
-            parent_tool_use_id: None,
-        }));
+            "result-reviewer",
+            Some("reviewer@abc12345"),
+        )));
 
         let detail = w.task_cell_anywhere("reviewer@abc12345").unwrap();
         assert!(matches!(
             detail.status,
-            crate::tui::history_cell::task::TaskStatus::Failed
+            crate::tui::history_cell::task::TaskStatus::Interrupted
         ));
         assert_eq!(detail.output_summary.as_deref(), Some("partial draft"));
         assert_eq!(
             detail.error.as_deref(),
-            Some(crate::tui::agent_control_status::AGENT_RESULT_INTERRUPTED_ERROR)
+            Some(astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_INTERRUPTED_ERROR)
         );
     }
 
@@ -3983,15 +6401,18 @@ mod tests {
         use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
 
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@abc12345".into(),
             kind: AgentLiveEventKind::OutputDelta("hello ".into()),
         })));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@abc12345".into(),
             kind: AgentLiveEventKind::OutputDelta("world".into()),
         })));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@abc12345".into(),
             kind: AgentLiveEventKind::ToolStarted {
                 name: "bash".into(),
@@ -3999,7 +6420,8 @@ mod tests {
                 tool_use_id: "child-tool".into(),
             },
         })));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@abc12345".into(),
             kind: AgentLiveEventKind::ToolCompleted {
                 name: "bash".into(),
@@ -4022,17 +6444,32 @@ mod tests {
     }
 
     #[test]
-    fn failed_spawn_without_agent_id_is_visible_without_control_plane_fallback() {
+    fn failed_spawn_without_agent_id_stays_in_control_tool_history_only() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "broken-reviewer",
+            "spawn-broken",
+            None,
+        )));
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
-            description: "Spawn agent: broken-reviewer (code-review)".into(),
+            description: "broken-reviewer".into(),
             tool_use_id: "spawn-broken".into(),
             parent_tool_use_id: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
+        w.handle_event(AppEvent::wire(agent_control_completed(
+            "spawn",
+            "broken-reviewer",
+            "failed",
+            10,
+            Some(r#"{"error":"spawn failed"}"#),
+            "spawn-broken",
+            None,
+        )));
+        w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
             name: "agent".into(),
-            description: "Spawn agent: broken-reviewer (code-review)".into(),
+            description: "broken-reviewer".into(),
             status: "failed".into(),
             duration_ms: 10,
             output_summary: None,
@@ -4041,31 +6478,33 @@ mod tests {
             parent_tool_use_id: None,
         }));
 
-        let rows = w.agents_drilldown_rows(5);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].agent_id, "pending:spawn-broken");
-        assert_eq!(rows[0].status, AgentRowStatus::Failed);
+        let rows = w.agent_monitor_snapshot(5);
         assert!(
-            !rows[0].name.starts_with("Spawn agent:"),
-            "failed control calls should stay in the logical agent registry, not fall back to control-plane labels"
+            rows.is_empty(),
+            "a failed control call with no Agent identity must not synthesize an Agent run"
+        );
+        let control = w
+            .task_cell_anywhere("spawn-broken")
+            .expect("the failed control call remains visible in transcript history");
+        assert_eq!(
+            control.status,
+            crate::tui::history_cell::task::TaskStatus::Failed
         );
     }
 
-    /// REGRESSION (reviewer L2-2): the structured
-    /// `WireEvent::AgentControlStarted` path MUST take priority over
-    /// the description-string-prefix legacy parser. When both events
-    /// fire (live SSE), the structured event carries the canonical
-    /// `agent_id` and `action`; the legacy parser is a fallback for
-    /// journal-replay where only `ToolStarted` survives.
-    ///
-    /// Pin: emitting AgentControlStarted with a known agent_id pulls
-    /// the row in by that id, and a follow-up `ToolStarted` for the
-    /// same control call doesn't create a duplicate row.
     #[test]
-    fn structured_agent_control_event_takes_priority_over_legacy_parsing() {
+    fn generic_tool_description_never_drives_agent_identity_or_lifecycle() {
+        let mut generic_only = fresh();
+        generic_only.handle_event(AppEvent::wire(WireEvent::ToolStarted {
+            name: "agent".into(),
+            description: "Spawn agent: looks-like-a-protocol".into(),
+            tool_use_id: "generic-only".into(),
+            parent_tool_use_id: None,
+        }));
+        assert!(generic_only.agent_run_ids().is_empty());
+
         let mut w = fresh();
-        // Structured event arrives first with the real agent_id.
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlStarted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-1".into(),
@@ -4073,22 +6512,19 @@ mod tests {
             fanout_slot: None,
             fanout_title: None,
         }));
-        // Then the generic ToolStarted arrives (stream_render emits both).
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "Spawn agent: reviewer-A (code-review)".into(),
             tool_use_id: "spawn-tu-1".into(),
             parent_tool_use_id: None,
         }));
 
-        let rows = w.agents_drilldown_rows(5);
-        // The agent_id from the structured event should win — NOT
-        // the provisional id derived from tool_use_id by the legacy parser.
+        let rows = w.agent_monitor_snapshot(5);
         let ids: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
         assert_eq!(ids.len(), 1, "spawn lifecycle must produce one logical row");
         assert!(
             ids.contains(&"reviewer-A@abc12345"),
-            "structured agent_id must surface as the row id; got {ids:?}"
+            "only the structured agent_id may surface as the row id; got {ids:?}"
         );
         assert!(
             !ids.iter().any(|id| id.starts_with("pending:")),
@@ -4102,13 +6538,13 @@ mod tests {
         use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
 
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "Spawn agent: reviewer-A (code-review)".into(),
             tool_use_id: "spawn-tu-1".into(),
             parent_tool_use_id: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlStarted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-1".into(),
@@ -4116,7 +6552,8 @@ mod tests {
             fanout_slot: None,
             fanout_title: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer-A@abc12345".into(),
             kind: AgentLiveEventKind::ToolStarted {
                 name: "bash".into(),
@@ -4124,7 +6561,8 @@ mod tests {
                 tool_use_id: "child-tu-1".into(),
             },
         })));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer-A@abc12345".into(),
             kind: AgentLiveEventKind::ToolCompleted {
                 name: "bash".into(),
@@ -4152,13 +6590,14 @@ mod tests {
         use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
 
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: "agent".into(),
             description: "Spawn agent: reviewer-A (code-review)".into(),
             tool_use_id: "spawn-tu-1".into(),
             parent_tool_use_id: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer-A@abc12345".into(),
             kind: AgentLiveEventKind::ToolStarted {
                 name: "bash".into(),
@@ -4166,7 +6605,7 @@ mod tests {
                 tool_use_id: "child-tu-1".into(),
             },
         })));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             status: "completed".into(),
@@ -4178,7 +6617,7 @@ mod tests {
             agent_id: Some("reviewer-A@abc12345".into()),
         }));
 
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent_id, "reviewer-A@abc12345");
         let detail = w
@@ -4196,17 +6635,62 @@ mod tests {
     }
 
     #[test]
+    fn live_spawn_identity_merges_provisional_control_before_child_output() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal,
+        };
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(agent_control_started(
+            "spawn",
+            "Mock child review",
+            "call-spawn-child",
+            None,
+        )));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-child".into(),
+            agent_id: "agent-child".into(),
+            kind: AgentLiveEventKind::Signal(AgentLiveSignal::RunStarted {
+                parent_run_id: Some("run-root".into()),
+                depth: 1,
+                spawn_tool_call_id: Some("call-spawn-child".into()),
+                transcript_location: astra_turn_types::AgentTranscriptLocation::LocalJournal,
+            }),
+        })));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-child".into(),
+            agent_id: "agent-child".into(),
+            kind: AgentLiveEventKind::OutputDelta("child evidence".into()),
+        })));
+
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, "agent-child");
+        assert_eq!(rows[0].name, "Mock child review");
+        let (events, dropped) = widget.agent_live_transcript_replay("agent-child", "run-child");
+        assert_eq!(dropped, 0);
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            AgentLiveEventKind::OutputDelta(text) if text == "child evidence"
+        )));
+    }
+
+    #[test]
     fn first_tool_use_binding_wins_until_explicit_rename() {
         let mut registry = AgentRunRegistry::default();
-        registry.ensure_running_for_tool_use(
+        registry.ensure_for_tool_use(
             "pending:spawn-tu-1".into(),
             "reviewer-A".into(),
-            Some("spawn-tu-1"),
+            AgentRunState::observed(AgentRunStatus::Starting),
+            "spawn-tu-1",
+            AgentControlAction::Spawn,
         );
-        registry.ensure_running_for_tool_use(
+        registry.ensure_for_tool_use(
             "late-other-key".into(),
             "reviewer-B".into(),
-            Some("spawn-tu-1"),
+            AgentRunState::observed(AgentRunStatus::Starting),
+            "spawn-tu-1",
+            AgentControlAction::Spawn,
         );
 
         assert_eq!(
@@ -4226,7 +6710,7 @@ mod tests {
     #[test]
     fn ctrlc_renders_cancelling_state_before_agent_terminated_arrives() {
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlStarted {
             action: "spawn".into(),
             label: "reviewer-A".into(),
             tool_use_id: "spawn-tu-1".into(),
@@ -4235,11 +6719,11 @@ mod tests {
             fanout_title: None,
         }));
 
-        w.mark_agent_controls_cancelling(&["spawn-tu-1".to_string()]);
+        w.mark_control_tasks_cancelling(&["spawn-tu-1".to_string()]);
 
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, AgentRowStatus::Cancelling);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Cancelling);
         assert!(
             w.task_cell_anywhere("reviewer-A@abc12345")
                 .and_then(|tc| tc.output_summary.as_deref())
@@ -4249,11 +6733,12 @@ mod tests {
         w.agent_runs
             .get_mut("reviewer-A@abc12345")
             .expect("logical row")
+            .detail
             .output_summary = Some("x".repeat(100_000));
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(
-            rows[0].status,
-            AgentRowStatus::Cancelling,
+            rows[0].state.status,
+            AgentRunStatus::Cancelling,
             "cancelling status must be structural, not parsed from truncated output text"
         );
     }
@@ -4263,7 +6748,7 @@ mod tests {
         use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
 
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlStarted {
             action: "spawn".into(),
             label: "auth reviewer".into(),
             tool_use_id: "spawn-tu-fanout".into(),
@@ -4271,7 +6756,7 @@ mod tests {
             fanout_slot: Some(AgentFanoutSlotIdentity::new("review-1", 3, 0, None).unwrap()),
             fanout_title: Some("review fanout".into()),
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "auth reviewer".into(),
             status: "completed".into(),
@@ -4281,7 +6766,7 @@ mod tests {
             agent_id: Some("auth@abc12345".into()),
         }));
 
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent_id, "auth@abc12345");
         let fanout = rows[0].fanout.as_ref().expect("fanout membership");
@@ -4298,7 +6783,7 @@ mod tests {
         use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
 
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlStarted {
             action: "spawn".into(),
             label: "storage reviewer".into(),
             tool_use_id: "spawn-tu-fanout".into(),
@@ -4308,7 +6793,8 @@ mod tests {
             ),
             fanout_title: Some("review fanout".into()),
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "storage@abc12345".into(),
             kind: AgentLiveEventKind::ToolStarted {
                 name: "bash".into(),
@@ -4316,7 +6802,7 @@ mod tests {
                 tool_use_id: "child-tu-1".into(),
             },
         })));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::AgentControlCompleted {
             action: "spawn".into(),
             label: "storage reviewer".into(),
             status: "completed".into(),
@@ -4326,7 +6812,7 @@ mod tests {
             agent_id: Some("storage@abc12345".into()),
         }));
 
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent_id, "storage@abc12345");
         let fanout = rows[0].fanout.as_ref().expect("fanout membership");
@@ -4351,7 +6837,8 @@ mod tests {
 
         let mut w = fresh();
         // Establish a live row first.
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@def01234".into(),
             kind: AgentLiveEventKind::OutputDelta("starting".into()),
         })));
@@ -4364,7 +6851,8 @@ mod tests {
         ));
 
         // Sub-agent crashes.
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@def01234".into(),
             kind: AgentLiveEventKind::AgentTerminated {
                 termination: AgentLiveTermination::Failed,
@@ -4390,14 +6878,14 @@ mod tests {
             "reason must be preserved as error so the user can see what crashed"
         );
 
-        let rows = w.agents_drilldown_rows(5);
+        let rows = w.agent_monitor_snapshot(5);
         let target = rows
             .iter()
             .find(|r| r.agent_id == "reviewer@def01234")
             .unwrap();
         assert_eq!(
-            target.status,
-            AgentRowStatus::Failed,
+            target.state.status,
+            AgentRunStatus::Failed,
             "drilldown row must report failed status"
         );
     }
@@ -4409,11 +6897,13 @@ mod tests {
         };
 
         let mut widget = fresh();
-        widget.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@paused".into(),
             kind: AgentLiveEventKind::OutputDelta("partial findings".into()),
         })));
-        widget.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@paused".into(),
             kind: AgentLiveEventKind::AgentTerminated {
                 termination: AgentLiveTermination::Interrupted,
@@ -4429,10 +6919,9 @@ mod tests {
             row.status,
             crate::tui::history_cell::task::TaskStatus::Interrupted
         );
-        assert!(!widget.agent_is_cancelled("reviewer@paused"));
         assert_eq!(
-            widget.agents_drilldown_rows(5)[0].status,
-            AgentRowStatus::Interrupted
+            widget.agent_monitor_snapshot(5)[0].state.status,
+            AgentRunStatus::Interrupted
         );
     }
 
@@ -4446,11 +6935,13 @@ mod tests {
         };
 
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@cancel01".into(),
             kind: AgentLiveEventKind::OutputDelta("running".into()),
         })));
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@cancel01".into(),
             kind: AgentLiveEventKind::AgentTerminated {
                 termination: AgentLiveTermination::Cancelled,
@@ -4460,16 +6951,13 @@ mod tests {
         })));
 
         let row = w.agent_run_cell("reviewer@cancel01").unwrap();
-        assert!(
-            !matches!(
-                row.status,
-                crate::tui::history_cell::task::TaskStatus::Running
-            ),
-            "Cancelled termination must NOT leave the row in Running; got {:?}",
-            row.status
+        assert_eq!(
+            row.status,
+            crate::tui::history_cell::task::TaskStatus::Cancelled,
+            "list and detail must agree that user cancellation is not failure"
         );
-        let rows = w.agents_drilldown_rows(5);
-        assert_eq!(rows[0].status, AgentRowStatus::Cancelled);
+        let rows = w.agent_monitor_snapshot(5);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Cancelled);
     }
 
     /// Completed termination is the happy path: just confirm the
@@ -4482,7 +6970,8 @@ mod tests {
         };
 
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+        w.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
             agent_id: "reviewer@done7777".into(),
             kind: AgentLiveEventKind::AgentTerminated {
                 termination: AgentLiveTermination::Completed,
@@ -4505,8 +6994,9 @@ mod tests {
         };
 
         let mut w = fresh();
-        w.handle_event(AppEvent::Wire(WireEvent::AgentLiveBatch(vec![
+        w.handle_event(AppEvent::wire(WireEvent::AgentLiveBatch(vec![
             AgentLiveEvent {
+                run_id: "test-run".into(),
                 agent_id: "reviewer@done7777".into(),
                 kind: AgentLiveEventKind::AgentTerminated {
                     termination: AgentLiveTermination::Completed,
@@ -4515,6 +7005,7 @@ mod tests {
                 },
             },
             AgentLiveEvent {
+                run_id: "test-run".into(),
                 agent_id: "reviewer@done7777".into(),
                 kind: AgentLiveEventKind::OutputDelta("late token".into()),
             },
@@ -4526,5 +7017,1020 @@ mod tests {
             crate::tui::history_cell::task::TaskStatus::Completed
         ));
         assert_eq!(row.output_summary.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn server_lane_truth_updates_even_without_agent_rows() {
+        use crate::tui::server_agent_observer::{ServerAgentProjection, ServerAgentTruthState};
+
+        let mut widget = fresh();
+        let loading = ServerAgentProjection {
+            sequence: 0,
+            truth_state: ServerAgentTruthState::Loading,
+            snapshot: None,
+        };
+        assert!(widget.reconcile_server_agent_projection(&loading));
+        let snapshot = widget.agent_monitor_snapshot(5);
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.server_truth_state, ServerAgentTruthState::Loading);
+        assert!(snapshot.should_open());
+        assert!(!widget.reconcile_server_agent_projection(&loading));
+
+        let unavailable = ServerAgentProjection {
+            sequence: 1,
+            truth_state: ServerAgentTruthState::Unavailable,
+            snapshot: None,
+        };
+        assert!(widget.reconcile_server_agent_projection(&unavailable));
+        assert_eq!(
+            widget.agent_monitor_snapshot(5).server_truth_state,
+            ServerAgentTruthState::Unavailable
+        );
+    }
+
+    #[test]
+    fn server_only_snapshot_projects_child_run_with_durable_controls() {
+        use astra_thin_client::{
+            SessionRunAction, SessionRunLifecycleStatus, SessionRunTreeSnapshot,
+        };
+
+        let mut widget = fresh();
+        let mut root = server_run_node("root-run", SessionRunLifecycleStatus::Running, 1);
+        root.parent_run_id = None;
+        root.depth = 0;
+        root.agent_id = None;
+        root.agent_name = None;
+        let mut child = server_run_node("child-run", SessionRunLifecycleStatus::Paused, 4);
+        child.waiting_for = Some("user_resume".into());
+        child.available_actions = vec![SessionRunAction::Resume, SessionRunAction::Cancel];
+        let projection = crate::tui::server_agent_observer::ServerAgentProjection {
+            sequence: 1,
+            truth_state: crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            snapshot: Some(SessionRunTreeSnapshot {
+                schema_version: astra_thin_client::SESSION_RUN_TREE_SCHEMA_VERSION,
+                session_id: "session-1".into(),
+                snapshot_revision: "revision-paused".into(),
+                observed_at: "2026-07-11T00:00:02Z".into(),
+                node_limit: 200,
+                truncated: false,
+                runs: vec![child, root],
+            }),
+        };
+
+        assert!(widget.reconcile_server_agent_projection(&projection));
+        let rows = widget.agent_monitor_snapshot(5);
+        assert_eq!(
+            rows.len(),
+            1,
+            "root conversation run is not a sub-agent row"
+        );
+        assert_eq!(rows[0].agent_id, "child-run");
+        assert_eq!(rows[0].state.status, AgentRunStatus::Paused);
+        assert_eq!(rows[0].state.source, AgentProjectionSource::DurableServer);
+        assert_eq!(
+            rows[0].control_target,
+            Some(
+                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "child-run".into(),
+                }
+            )
+        );
+        assert_eq!(
+            rows[0].available_actions,
+            vec![SessionRunAction::Resume, SessionRunAction::Cancel]
+        );
+        assert_eq!(
+            rows[0].runtime.runtime_profile.as_deref(),
+            Some("agent_binding_registry")
+        );
+        assert_eq!(rows[0].runtime.model_name.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            rows[0].runtime.agent_binding_id.as_deref(),
+            Some("reviewer-v2")
+        );
+        assert!(rows[0].runtime.permission.is_none());
+    }
+
+    #[test]
+    fn durable_agent_membership_does_not_infer_from_parentage() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+
+        let mut ordinary_child =
+            server_run_node("ordinary-child-run", SessionRunLifecycleStatus::Running, 1);
+        ordinary_child.agent_id = None;
+        ordinary_child.agent_name = Some("not sufficient identity".into());
+        let mut root_agent = server_run_node(
+            "team-orchestrator-run",
+            SessionRunLifecycleStatus::Running,
+            1,
+        );
+        root_agent.parent_run_id = None;
+        root_agent.root_run_id = Some(root_agent.run_id.clone());
+        root_agent.depth = 0;
+        root_agent.agent_id = Some("team-orchestrator".into());
+
+        let mut widget = fresh();
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![ordinary_child, root_agent],
+            false,
+        ));
+
+        let snapshot = widget.agent_monitor_snapshot(0);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].agent_id, "team-orchestrator-run");
+        assert_eq!(snapshot[0].depth, 1);
+    }
+
+    #[test]
+    fn durable_tree_preserves_lineage_and_separates_tools_from_child_agents() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+
+        let mut widget = fresh();
+        let mut parent = server_run_node("parent-run", SessionRunLifecycleStatus::Running, 2);
+        parent.total_tool_calls = 3;
+        let mut child = server_run_node("nested-run", SessionRunLifecycleStatus::Running, 1);
+        child.parent_run_id = Some("parent-run".into());
+        child.root_run_id = Some("root-run".into());
+        child.depth = 2;
+        child.total_tool_calls = 1;
+
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![child, parent],
+            false,
+        ));
+        let rows = widget.agent_monitor_snapshot(0);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent-run", "nested-run"],
+            "visible hierarchy is parent-first even when snapshots arrive in another order"
+        );
+        let parent = rows
+            .iter()
+            .find(|row| row.agent_id == "parent-run")
+            .unwrap();
+        assert_eq!(parent.activity.tool_calls, 3);
+        assert_eq!(parent.activity.child_agents, 1);
+        assert!(!parent.activity.child_agents_partial);
+        assert_eq!(parent.depth, 1);
+        assert_eq!(parent.provenance, AgentProjectionSource::DurableServer);
+        let child = rows
+            .iter()
+            .find(|row| row.agent_id == "nested-run")
+            .unwrap();
+        assert_eq!(child.activity.tool_calls, 1);
+        assert_eq!(child.activity.child_agents, 0);
+        assert_eq!(child.parent_run_id.as_deref(), Some("parent-run"));
+        assert_eq!(child.depth, 2);
+    }
+
+    #[test]
+    fn visible_forest_does_not_indent_under_a_filtered_parent() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+
+        let mut parent = server_run_node("parent-run", SessionRunLifecycleStatus::Completed, 2);
+        parent.available_actions.clear();
+        let mut child = server_run_node("nested-run", SessionRunLifecycleStatus::Running, 1);
+        child.parent_run_id = Some("parent-run".into());
+        child.depth = 2;
+        let mut widget = fresh();
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![parent, child],
+            false,
+        ));
+
+        let visible = widget.agent_monitor_snapshot(0);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].agent_id, "nested-run");
+        assert_eq!(visible[0].parent_run_id.as_deref(), Some("parent-run"));
+        assert_eq!(
+            visible[0].depth, 1,
+            "presentation depth is relative to visible ancestors"
+        );
+    }
+
+    #[test]
+    fn older_server_snapshot_cannot_regress_a_terminal_run() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+
+        let mut widget = fresh();
+        let mut completed = server_run_node("child-run", SessionRunLifecycleStatus::Completed, 9);
+        completed.available_actions.clear();
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![completed],
+            false,
+        ));
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "child-run",
+                SessionRunLifecycleStatus::Running,
+                8,
+            )],
+            false,
+        ));
+
+        let state = widget.agent_run_state("child-run").unwrap();
+        assert_eq!(state.status, AgentRunStatus::Completed);
+        assert_eq!(state.source, AgentProjectionSource::DurableServer);
+    }
+
+    #[test]
+    fn server_failure_marks_durable_rows_stale_but_keeps_local_capacity_confirmed() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.reconcile_local_agent_snapshot(
+            &local_agent_snapshot(vec![local_agent_info(
+                "local-child",
+                AgentStatus::Running {
+                    activity: "reviewing".into(),
+                },
+            )]),
+            &[],
+        );
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "server-child",
+                SessionRunLifecycleStatus::Running,
+                3,
+            )],
+            false,
+        ));
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Stale,
+            vec![server_run_node(
+                "server-child",
+                SessionRunLifecycleStatus::Running,
+                3,
+            )],
+            false,
+        ));
+
+        assert_eq!(
+            widget.agent_run_state("server-child").unwrap().confidence,
+            AgentProjectionConfidence::Stale
+        );
+        assert_eq!(
+            widget.agent_run_state("local-child").unwrap().confidence,
+            AgentProjectionConfidence::Confirmed
+        );
+        assert_eq!(widget.agent_monitor_snapshot(5).len(), 2);
+    }
+
+    #[test]
+    fn complete_snapshot_omission_degrades_active_run_but_truncation_does_not() {
+        use astra_thin_client::SessionRunLifecycleStatus;
+
+        let confirmed = server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![server_run_node(
+                "server-child",
+                SessionRunLifecycleStatus::Running,
+                3,
+            )],
+            false,
+        );
+        let mut complete_widget = fresh();
+        complete_widget.reconcile_server_agent_projection(&confirmed);
+        complete_widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            Vec::new(),
+            false,
+        ));
+        assert_eq!(
+            complete_widget
+                .agent_run_state("server-child")
+                .unwrap()
+                .confidence,
+            AgentProjectionConfidence::Stale
+        );
+
+        let mut truncated_widget = fresh();
+        truncated_widget.reconcile_server_agent_projection(&confirmed);
+        truncated_widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(
+            truncated_widget
+                .agent_run_state("server-child")
+                .unwrap()
+                .confidence,
+            AgentProjectionConfidence::Confirmed
+        );
+        let snapshot = truncated_widget.agent_monitor_snapshot(5);
+        assert!(snapshot.durable_snapshot_truncated);
+        assert!(snapshot[0].activity.child_agents_partial);
+    }
+
+    #[test]
+    fn rejected_cancel_restores_last_lifecycle_as_stale_instead_of_sticking() {
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.reconcile_local_agent_snapshot(
+            &local_agent_snapshot(vec![local_agent_info(
+                "local-child",
+                AgentStatus::Running {
+                    activity: "reviewing".into(),
+                },
+            )]),
+            &[],
+        );
+        assert!(widget.mark_agent_control_pending(
+            "local-child",
+            astra_thin_client::SessionRunAction::Cancel,
+        ));
+        assert_eq!(
+            widget.agent_run_state("local-child").unwrap().status,
+            AgentRunStatus::Cancelling
+        );
+
+        assert!(widget.reject_agent_control("local-child"));
+        let restored = widget.agent_run_state("local-child").unwrap();
+        assert_eq!(restored.status, AgentRunStatus::Running);
+        assert_eq!(restored.confidence, AgentProjectionConfidence::Stale);
+    }
+
+    #[test]
+    fn pause_and_resume_have_typed_pending_states_and_authoritative_reconciliation() {
+        use astra_thin_client::{SessionRunAction, SessionRunLifecycleStatus};
+
+        let mut widget = fresh();
+        let mut running = server_run_node("server-child", SessionRunLifecycleStatus::Running, 3);
+        running.available_actions = vec![SessionRunAction::Pause, SessionRunAction::Cancel];
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![running],
+            false,
+        ));
+
+        assert!(widget.mark_agent_control_pending("server-child", SessionRunAction::Pause));
+        assert_eq!(
+            widget.agent_run_state("server-child").unwrap().status,
+            AgentRunStatus::Pausing
+        );
+        assert!(widget.reject_agent_control("server-child"));
+        assert_eq!(
+            widget.agent_run_state("server-child").unwrap(),
+            AgentRunState {
+                status: AgentRunStatus::Running,
+                confidence: AgentProjectionConfidence::Stale,
+                source: AgentProjectionSource::DurableServer,
+            }
+        );
+
+        let mut paused = server_run_node("server-child", SessionRunLifecycleStatus::Paused, 4);
+        paused.available_actions = vec![SessionRunAction::Resume, SessionRunAction::Cancel];
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![paused],
+            false,
+        ));
+        assert!(widget.mark_agent_control_pending("server-child", SessionRunAction::Resume));
+        assert_eq!(
+            widget.agent_run_state("server-child").unwrap().status,
+            AgentRunStatus::Resuming
+        );
+
+        let mut resumed = server_run_node("server-child", SessionRunLifecycleStatus::Running, 5);
+        resumed.available_actions = vec![SessionRunAction::Pause, SessionRunAction::Cancel];
+        widget.reconcile_server_agent_projection(&server_agent_projection(
+            crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            vec![resumed],
+            false,
+        ));
+        let state = widget.agent_run_state("server-child").unwrap();
+        assert_eq!(state.status, AgentRunStatus::Running);
+        assert_eq!(state.confidence, AgentProjectionConfidence::Confirmed);
+        assert!(!widget.reject_agent_control("server-child"));
+    }
+
+    #[test]
+    fn runtime_profile_does_not_masquerade_as_execution_provenance() {
+        use astra_thin_client::{SessionRunAction, SessionRunLifecycleStatus};
+
+        for runtime_profile in ["request_scoped_runtime_mcp", "agent_binding_registry"] {
+            let mut widget = fresh();
+            let mut node = server_run_node(
+                &format!("{runtime_profile}-child"),
+                SessionRunLifecycleStatus::Running,
+                1,
+            );
+            node.runtime.runtime_profile = Some(runtime_profile.into());
+            node.available_actions = vec![SessionRunAction::Pause, SessionRunAction::Cancel];
+            widget.reconcile_server_agent_projection(&server_agent_projection(
+                crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+                vec![node],
+                false,
+            ));
+
+            let row = widget.agent_monitor_snapshot(1).into_iter().next().unwrap();
+            assert_eq!(row.state.source, AgentProjectionSource::DurableServer);
+            assert_eq!(row.provenance, AgentProjectionSource::DurableServer);
+            assert_eq!(
+                row.available_actions,
+                vec![SessionRunAction::Pause, SessionRunAction::Cancel]
+            );
+            assert_eq!(
+                row.control_target,
+                Some(
+                    crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                        run_id: format!("{runtime_profile}-child"),
+                    }
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn local_runtime_derives_nested_lineage_without_counting_children_as_tools() {
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut parent = local_agent_info(
+            "parent-agent",
+            AgentStatus::Running {
+                activity: "delegating".into(),
+            },
+        );
+        parent.metrics.tool_calls = 4;
+        let mut child = local_agent_info(
+            "child-agent",
+            AgentStatus::Running {
+                activity: "reviewing".into(),
+            },
+        );
+        child.parent_run_id = parent.run_id.clone();
+        child.metrics.tool_calls = 1;
+
+        let mut widget = fresh();
+        widget.reconcile_local_agent_snapshot(&local_agent_snapshot(vec![child, parent]), &[]);
+        let rows = widget.agent_monitor_snapshot(0);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent-agent", "child-agent"]
+        );
+        let parent = rows
+            .iter()
+            .find(|row| row.agent_id == "parent-agent")
+            .unwrap();
+        assert_eq!(parent.activity.tool_calls, 4);
+        assert_eq!(parent.activity.child_agents, 1);
+        assert!(!parent.activity.child_agents_partial);
+        assert_eq!(parent.depth, 1);
+        assert_eq!(parent.provenance, AgentProjectionSource::LocalRuntime);
+        let child = rows
+            .iter()
+            .find(|row| row.agent_id == "child-agent")
+            .unwrap();
+        assert_eq!(child.activity.tool_calls, 1);
+        assert_eq!(child.activity.child_agents, 0);
+        assert_eq!(child.parent_run_id, parent.run_id);
+        assert_eq!(child.depth, 2);
+    }
+
+    #[test]
+    fn local_control_intent_keeps_runtime_provenance() {
+        use astra_thin_client::SessionRunAction;
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.reconcile_local_agent_snapshot(
+            &local_agent_snapshot(vec![local_agent_info(
+                "local-agent",
+                AgentStatus::Running {
+                    activity: "working".into(),
+                },
+            )]),
+            &[],
+        );
+        assert!(widget.mark_agent_control_pending("local-agent", SessionRunAction::Cancel));
+
+        let snapshot = widget.agent_monitor_snapshot(0);
+        assert_eq!(snapshot[0].state.source, AgentProjectionSource::LocalIntent);
+        assert_eq!(snapshot[0].provenance, AgentProjectionSource::LocalRuntime);
+    }
+
+    #[test]
+    fn local_runtime_snapshot_confirms_live_agent_and_authoritative_result() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
+            agent_id: "reviewer@local".into(),
+            kind: AgentLiveEventKind::OutputDelta("streaming finding".into()),
+        })));
+        assert_eq!(
+            widget
+                .agent_run_state("reviewer@local")
+                .expect("live projection")
+                .confidence,
+            AgentProjectionConfidence::Observed
+        );
+
+        let mut agent = local_agent_info(
+            "reviewer@local",
+            AgentStatus::Completed {
+                result: "authoritative result".into(),
+                finish_reason: Some("normal".into()),
+            },
+        );
+        agent.metrics.tool_calls = 4;
+        agent.metrics.permission_requests = 3;
+        agent.metrics.permission_requests_approved = 2;
+        agent.metrics.tools_blocked = 1;
+        agent.has_permission_issues = true;
+        agent.run_in_background = true;
+        assert!(widget.reconcile_local_agent_snapshot(&local_agent_snapshot(vec![agent]), &[]));
+
+        let state = widget
+            .agent_run_state("reviewer@local")
+            .expect("reconciled projection");
+        assert_eq!(state.status, AgentRunStatus::Completed);
+        assert_eq!(state.confidence, AgentProjectionConfidence::Confirmed);
+        assert_eq!(state.source, AgentProjectionSource::LocalRuntime);
+        let detail = widget
+            .agent_run_cell("reviewer@local")
+            .expect("reconciled detail");
+        assert_eq!(
+            detail.output_summary.as_deref(),
+            Some("authoritative result")
+        );
+        let monitor = widget.agent_monitor_snapshot(5);
+        let row = &monitor[0];
+        assert_eq!(
+            row.activity.tool_calls, 4,
+            "runtime metrics remain visible even when child events were missed"
+        );
+        assert_eq!(row.runtime.runtime_profile.as_deref(), Some("cli_local"));
+        assert_eq!(row.runtime.agent_binding_name.as_deref(), Some("reviewer"));
+        assert_eq!(row.runtime.background, Some(true));
+        assert_eq!(
+            row.runtime.permission,
+            Some(astra_thin_client::SessionRunPermissionFacts {
+                has_issues: true,
+                requests: 3,
+                approved: 2,
+                tools_blocked: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn parent_turn_boundary_does_not_downgrade_runtime_confirmation() {
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        let snapshot = local_agent_snapshot(vec![local_agent_info(
+            "reviewer@running",
+            AgentStatus::Running {
+                activity: "reviewing".into(),
+            },
+        )]);
+        widget.reconcile_local_agent_snapshot(&snapshot, &[]);
+
+        widget.handle_event(AppEvent::User(UserEvent::Submit("continue".into())));
+
+        let state = widget.agent_run_state("reviewer@running").unwrap();
+        assert_eq!(state.status, AgentRunStatus::Running);
+        assert_eq!(state.confidence, AgentProjectionConfidence::Confirmed);
+        assert_eq!(state.source, AgentProjectionSource::LocalRuntime);
+    }
+
+    #[test]
+    fn missing_agent_in_available_runtime_snapshot_becomes_stale_not_failed() {
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.reconcile_local_agent_snapshot(
+            &local_agent_snapshot(vec![local_agent_info(
+                "reviewer@missing",
+                AgentStatus::Running {
+                    activity: "reviewing".into(),
+                },
+            )]),
+            &[],
+        );
+
+        assert!(widget.reconcile_local_agent_snapshot(&local_agent_snapshot(Vec::new()), &[]));
+
+        let state = widget.agent_run_state("reviewer@missing").unwrap();
+        assert_eq!(state.status, AgentRunStatus::Running);
+        assert_eq!(state.confidence, AgentProjectionConfidence::Stale);
+        assert!(!state.is_actionable_active());
+        assert_eq!(
+            widget.agent_run_cell("reviewer@missing").unwrap().status,
+            crate::tui::history_cell::task::TaskStatus::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn agent_live_transcript_replay_preserves_events_observed_before_open() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
+
+        let mut widget = fresh();
+        for kind in [
+            AgentLiveEventKind::ThinkingDelta("inspect ".into()),
+            AgentLiveEventKind::ThinkingDelta("ownership".into()),
+            AgentLiveEventKind::OutputDelta("finding ".into()),
+            AgentLiveEventKind::OutputDelta("one".into()),
+            AgentLiveEventKind::ToolStarted {
+                name: "read_file".into(),
+                description: "src/lib.rs".into(),
+                tool_use_id: "call-1".into(),
+            },
+            AgentLiveEventKind::AgentTerminated {
+                termination: astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                duration_ms: 42,
+                reason: Some("review complete".into()),
+            },
+        ] {
+            widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+                run_id: "run-review".into(),
+                agent_id: "reviewer".into(),
+                kind,
+            })));
+        }
+
+        let (events, dropped) = widget.agent_live_transcript_replay("reviewer", "run-review");
+        assert_eq!(dropped, 0);
+        assert_eq!(events.len(), 4, "adjacent deltas should be coalesced");
+        assert!(matches!(
+            &events[0].kind,
+            AgentLiveEventKind::ThinkingDelta(text) if text == "inspect ownership"
+        ));
+        assert!(matches!(
+            &events[1].kind,
+            AgentLiveEventKind::OutputDelta(text) if text == "finding one"
+        ));
+        assert!(matches!(
+            &events[2].kind,
+            AgentLiveEventKind::ToolStarted { tool_use_id, .. } if tool_use_id == "call-1"
+        ));
+        assert!(matches!(
+            &events[3].kind,
+            AgentLiveEventKind::AgentTerminated { reason: Some(reason), .. }
+                if reason == "review complete"
+        ));
+    }
+
+    #[test]
+    fn workspace_projection_is_stale_evidence_and_unknown_status_is_not_invented() {
+        let mut widget = fresh();
+        let restored = vec![
+            restored_local_agent("reviewer@restored", "running"),
+            restored_local_agent("reviewer@unknown", "future_status"),
+        ];
+
+        assert!(widget.reconcile_local_agent_snapshot(
+            &crate::tui::local_agent_snapshot::LocalAgentSnapshot::default(),
+            &restored,
+        ));
+
+        let state = widget.agent_run_state("reviewer@restored").unwrap();
+        assert_eq!(state.status, AgentRunStatus::Running);
+        assert_eq!(state.confidence, AgentProjectionConfidence::Stale);
+        assert_eq!(state.source, AgentProjectionSource::WorkspaceSnapshot);
+        assert!(!state.is_actionable_active());
+        assert!(widget.agent_run_state("reviewer@unknown").is_none());
+
+        let row = widget
+            .agent_monitor_snapshot(10)
+            .rows
+            .into_iter()
+            .find(|row| row.agent_id == "reviewer@restored")
+            .expect("restored agent row");
+        assert_eq!(row.run_id.as_deref(), Some("run-reviewer@restored"));
+        assert_eq!(row.parent_run_id.as_deref(), Some("root"));
+        assert_eq!(row.depth, 1);
+        assert_eq!(
+            row.transcript_target,
+            Some(crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal)
+        );
+        assert!(row.available_actions.is_empty());
+    }
+
+    #[test]
+    fn restored_workspace_rebuilds_nested_run_lineage_for_transcript_navigation() {
+        let mut widget = fresh();
+        let parent = restored_local_agent("reviewer@parent", "completed");
+        let mut child = restored_local_agent("reviewer@child", "running");
+        child.parent_run_id = parent.run_id.clone();
+
+        widget.reconcile_local_agent_snapshot(
+            &crate::tui::local_agent_snapshot::LocalAgentSnapshot::default(),
+            &[parent.clone(), child],
+        );
+
+        let rows = widget.agent_monitor_snapshot(10).rows;
+        let parent_row = rows
+            .iter()
+            .find(|row| row.run_id.as_deref() == Some(parent.run_id.as_str()))
+            .expect("parent row");
+        let child_row = rows
+            .iter()
+            .find(|row| row.agent_id == "reviewer@child")
+            .expect("child row");
+        assert_eq!(parent_row.depth, 1);
+        assert_eq!(
+            child_row.parent_run_id.as_deref(),
+            Some(parent.run_id.as_str())
+        );
+        assert_eq!(child_row.depth, 2);
+        assert_eq!(
+            child_row.transcript_target,
+            Some(crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal)
+        );
+    }
+
+    #[test]
+    fn state_authority_prevents_regression_but_allows_owner_repair() {
+        let mut projection = AgentRunProjection::new(
+            "agent".into(),
+            "agent".into(),
+            AgentRunState::confirmed_local(AgentRunStatus::Completed),
+        );
+        projection.set_state(AgentRunState::observed(AgentRunStatus::Failed));
+        assert_eq!(
+            projection.state,
+            AgentRunState::confirmed_local(AgentRunStatus::Completed),
+            "late stream terminal state must not replace the runtime terminal state"
+        );
+
+        let mut repaired = AgentRunProjection::new(
+            "agent".into(),
+            "agent".into(),
+            AgentRunState::observed(AgentRunStatus::Completed),
+        );
+        repaired.set_state(AgentRunState::confirmed_local(AgentRunStatus::Running));
+        assert_eq!(
+            repaired.state,
+            AgentRunState::confirmed_local(AgentRunStatus::Running),
+            "the owning runtime may reopen an incorrect live-stream terminal projection"
+        );
+
+        repaired.set_state(AgentRunState::observed(AgentRunStatus::Running));
+        assert_eq!(
+            repaired.state.confidence,
+            AgentProjectionConfidence::Confirmed,
+            "same-status live events must not erase owner confirmation"
+        );
+    }
+
+    #[test]
+    fn rejected_late_terminal_event_cannot_corrupt_authoritative_detail() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
+        };
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.reconcile_local_agent_snapshot(
+            &local_agent_snapshot(vec![local_agent_info(
+                "reviewer@authoritative",
+                AgentStatus::Completed {
+                    result: "verified result".into(),
+                    finish_reason: Some("normal".into()),
+                },
+            )]),
+            &[],
+        );
+
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "test-run".into(),
+            agent_id: "reviewer@authoritative".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: AgentLiveTermination::Failed,
+                duration_ms: 999,
+                reason: Some("late stream failure".into()),
+            },
+        })));
+
+        assert_eq!(
+            widget.agent_run_state("reviewer@authoritative").unwrap(),
+            AgentRunState::confirmed_local(AgentRunStatus::Completed)
+        );
+        let detail = widget.agent_run_cell("reviewer@authoritative").unwrap();
+        assert_eq!(
+            detail.status,
+            crate::tui::history_cell::task::TaskStatus::Completed
+        );
+        assert_eq!(detail.output_summary.as_deref(), Some("verified result"));
+        assert!(detail.error.is_none());
+    }
+
+    #[test]
+    fn rejected_control_result_cannot_corrupt_authoritative_detail() {
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.reconcile_local_agent_snapshot(
+            &local_agent_snapshot(vec![local_agent_info(
+                "reviewer@control",
+                AgentStatus::Completed {
+                    result: "verified result".into(),
+                    finish_reason: Some("normal".into()),
+                },
+            )]),
+            &[],
+        );
+        widget.handle_event(AppEvent::wire(agent_control_completed(
+            "get_result",
+            "reviewer",
+            "completed",
+            999,
+            Some(
+                r#"{"status":"failed","agent_id":"reviewer@control","error":"late control failure"}"#,
+            ),
+            "late-result-tool",
+            Some("reviewer@control"),
+        )));
+
+        assert_eq!(
+            widget.agent_run_state("reviewer@control").unwrap(),
+            AgentRunState::confirmed_local(AgentRunStatus::Completed)
+        );
+        let detail = widget.agent_run_cell("reviewer@control").unwrap();
+        assert_eq!(
+            detail.status,
+            crate::tui::history_cell::task::TaskStatus::Completed
+        );
+        assert_eq!(detail.output_summary.as_deref(), Some("verified result"));
+        assert!(detail.error.is_none());
+    }
+
+    #[test]
+    fn reconciliation_detects_equal_length_result_changes() {
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        let first = local_agent_snapshot(vec![local_agent_info(
+            "reviewer@repair",
+            AgentStatus::Completed {
+                result: "done".into(),
+                finish_reason: Some("normal".into()),
+            },
+        )]);
+        assert!(widget.reconcile_local_agent_snapshot(&first, &[]));
+
+        let repaired = local_agent_snapshot(vec![local_agent_info(
+            "reviewer@repair",
+            AgentStatus::Completed {
+                result: "over".into(),
+                finish_reason: Some("normal".into()),
+            },
+        )]);
+        assert!(widget.reconcile_local_agent_snapshot(&repaired, &[]));
+        assert_eq!(
+            widget
+                .agent_run_cell("reviewer@repair")
+                .unwrap()
+                .output_summary
+                .as_deref(),
+            Some("over")
+        );
+    }
+
+    #[test]
+    fn local_waiting_state_remains_live_but_is_not_rendered_as_working() {
+        use astra_turn_core::orchestration_types::AgentStatus;
+
+        let mut widget = fresh();
+        widget.reconcile_local_agent_snapshot(
+            &local_agent_snapshot(vec![local_agent_info(
+                "reviewer@waiting",
+                AgentStatus::Waiting {
+                    reason: "needs input".into(),
+                },
+            )]),
+            &[],
+        );
+
+        let state = widget.agent_run_state("reviewer@waiting").unwrap();
+        assert_eq!(state.status, AgentRunStatus::Waiting);
+        assert!(state.is_actionable_active());
+        assert_eq!(
+            widget.agent_run_cell("reviewer@waiting").unwrap().status,
+            crate::tui::history_cell::task::TaskStatus::Waiting
+        );
+    }
+
+    #[test]
+    fn typed_communication_updates_the_matching_agent_activity() {
+        let mut widget = fresh();
+        widget.agent_runs.ensure(
+            "reviewer".into(),
+            "Review patch".into(),
+            AgentRunState::observed(AgentRunStatus::Running),
+        );
+        widget
+            .agent_runs
+            .get_mut("reviewer")
+            .unwrap()
+            .set_runtime_metadata(
+                AgentProjectionSource::LiveStream,
+                "run-review".into(),
+                Some("run-root".into()),
+                1,
+                0,
+            );
+
+        let base = astra_turn_types::AgentCommunicationEvent {
+            schema_version: astra_turn_types::AGENT_COMMUNICATION_SCHEMA_VERSION.into(),
+            observed_by: astra_turn_types::AgentCommunicationParty {
+                run_id: "run-review".into(),
+                agent_id: "reviewer".into(),
+            },
+            direction: astra_turn_types::AgentCommunicationDirection::Sent,
+            message_id: "msg-1".into(),
+            from: astra_turn_types::AgentCommunicationParty {
+                run_id: "run-review".into(),
+                agent_id: "reviewer".into(),
+            },
+            to: astra_turn_types::AgentCommunicationTarget::Parent,
+            payload_kind: "progress".into(),
+            summary: Some("review started".into()),
+            response_accepted: None,
+            related_message_id: None,
+            timestamp_ms: 42,
+            correlation_id: None,
+            requires_ack: false,
+        };
+        widget.handle_event(AppEvent::wire(WireEvent::AgentCommunication(base.clone())));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentCommunication(
+            astra_turn_types::AgentCommunicationEvent {
+                direction: astra_turn_types::AgentCommunicationDirection::Received,
+                message_id: "msg-2".into(),
+                ..base.clone()
+            },
+        )));
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(
+            astra_turn_core::agent_live_event::AgentLiveEvent {
+                run_id: "test-run".into(),
+                agent_id: "reviewer".into(),
+                kind: astra_turn_core::agent_live_event::AgentLiveEventKind::Signal(
+                    astra_turn_core::agent_live_event::AgentLiveSignal::AgentCommunication(
+                        astra_turn_types::AgentCommunicationEvent {
+                            message_id: "msg-3".into(),
+                            ..base
+                        },
+                    ),
+                ),
+            },
+        )));
+
+        let rows = widget.agent_workbench_snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].activity.messages_sent, 2);
+        assert_eq!(rows[0].activity.messages_received, 1);
+    }
+
+    #[test]
+    fn durable_local_journal_restores_completed_agent_as_inspectable_transcript() {
+        let mut widget = fresh();
+        let restored = crate::tui::local_agent_journal::LocalJournalAgentRun {
+            agent_id: "reviewer@archive".into(),
+            run_id: "run-archived-review".into(),
+            parent_run_id: Some("root-run".into()),
+            description: "Review the storage patch".into(),
+            status: "completed".into(),
+            duration_ms: 4_200,
+            tool_calls: 7,
+        };
+
+        assert!(widget.reconcile_local_agent_journal_runs(&[restored]));
+
+        let rows = widget.agent_workbench_snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Completed);
+        assert_eq!(rows[0].provenance, AgentProjectionSource::LocalJournal);
+        assert_eq!(rows[0].run_id.as_deref(), Some("run-archived-review"));
+        assert_eq!(
+            rows[0].transcript_target,
+            Some(crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal)
+        );
+        assert_eq!(rows[0].activity.tool_calls, 7);
+        assert_eq!(rows[0].elapsed_ms, 4_200);
+    }
+
+    #[test]
+    fn terminal_journal_cancelled_status_stays_cancelled() {
+        assert_eq!(
+            restored_agent_run_status("cancelled"),
+            Some(AgentRunStatus::Cancelled)
+        );
     }
 }

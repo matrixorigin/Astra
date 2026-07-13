@@ -6,15 +6,15 @@
 //! - Agent live event to work surface SSE conversion
 //! - Agent spawner state to progress event conversion
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use astra_turn_core::agent_live_event::{
-    AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError,
+    AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveGap, AgentLiveSendError,
     AgentLiveTermination,
 };
 
@@ -74,11 +74,9 @@ fn agent_progress_lifecycle_event_key(
     event: &AgentProgressEvent,
 ) -> Option<AgentProgressLifecycleEventKey> {
     let kind = match &event.event_type {
-        ProgressEventType::AgentSpawned { run_id, .. } => {
-            AgentProgressLifecycleEventKind::Spawned {
-                run_id: run_id.clone(),
-            }
-        }
+        ProgressEventType::AgentSpawned { .. } => AgentProgressLifecycleEventKind::Spawned {
+            run_id: event.run_id.clone(),
+        },
         ProgressEventType::Completed { .. } => AgentProgressLifecycleEventKind::Completed,
         ProgressEventType::Interrupted { .. } => AgentProgressLifecycleEventKind::Interrupted,
         ProgressEventType::Failed { .. } => AgentProgressLifecycleEventKind::Failed,
@@ -127,14 +125,24 @@ fn has_agent_progress_lifecycle_event_sent(
 pub(super) struct WorkSurfaceAgentLiveEventSink {
     tx: mpsc::Sender<Value>,
     execution_metadata: Option<Value>,
+    gap_tracker: WorkSurfaceAgentLiveGapTracker,
 }
 
 impl WorkSurfaceAgentLiveEventSink {
-    pub(super) fn new(tx: mpsc::Sender<Value>, execution_metadata: Option<Value>) -> Self {
+    pub(super) fn new(
+        tx: mpsc::Sender<Value>,
+        execution_metadata: Option<Value>,
+        gap_tracker: WorkSurfaceAgentLiveGapTracker,
+    ) -> Self {
         Self {
             tx,
             execution_metadata,
+            gap_tracker,
         }
+    }
+
+    fn record_gap(&self, gap: AgentLiveGap) {
+        self.gap_tracker.record(gap);
     }
 }
 
@@ -144,9 +152,15 @@ impl AgentLiveEventSink for WorkSurfaceAgentLiveEventSink {
         match self.tx.try_send(value) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // Work surface receiver is behind — drop rather than block the
-                // SSE emitter thread. The frontend will catch up on the next
-                // poll / refresh.
+                // Progress is coalescible, but a drop must be observable. A
+                // an independent gap tracker wakes the stream fanout, so the
+                // client repairs from authoritative state even if this was
+                // the final event emitted by the child.
+                self.record_gap(AgentLiveGap {
+                    run_id: event.run_id.clone(),
+                    agent_id: event.agent_id.clone(),
+                    dropped_event_count: 1,
+                });
                 Err(AgentLiveSendError::Dropped)
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -154,6 +168,96 @@ impl AgentLiveEventSink for WorkSurfaceAgentLiveEventSink {
             }
         }
     }
+
+    fn send_gap(&self, gap: AgentLiveGap) -> Result<(), AgentLiveSendError> {
+        self.record_gap(gap);
+        Ok(())
+    }
+}
+
+/// Coalesces lost live activity outside the bounded event queue. A watch
+/// revision wakes the stream fanout even when the queue stays full and no
+/// later agent event arrives, while the map retains one repair fact per
+/// durable run/agent identity.
+#[derive(Debug, Clone)]
+pub(super) struct WorkSurfaceAgentLiveGapTracker {
+    pending_gaps: Arc<Mutex<PendingAgentLiveGaps>>,
+    revision_tx: watch::Sender<u64>,
+}
+
+impl WorkSurfaceAgentLiveGapTracker {
+    pub(super) fn new() -> (Self, watch::Receiver<u64>) {
+        let (revision_tx, revision_rx) = watch::channel(0);
+        (
+            Self {
+                pending_gaps: Arc::new(Mutex::new(PendingAgentLiveGaps::default())),
+                revision_tx,
+            },
+            revision_rx,
+        )
+    }
+
+    fn record(&self, gap: AgentLiveGap) {
+        lock_pending_agent_live_gaps(&self.pending_gaps).record(gap);
+        self.revision_tx.send_modify(|revision| {
+            *revision = revision.wrapping_add(1);
+        });
+    }
+
+    pub(super) fn drain(&self) -> Vec<AgentLiveGap> {
+        lock_pending_agent_live_gaps(&self.pending_gaps).drain()
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingAgentLiveGaps {
+    by_run_and_agent: BTreeMap<(String, String), u64>,
+}
+
+impl PendingAgentLiveGaps {
+    fn record(&mut self, gap: AgentLiveGap) {
+        let count = self
+            .by_run_and_agent
+            .entry((gap.run_id, gap.agent_id))
+            .or_default();
+        *count = count.saturating_add(gap.dropped_event_count);
+    }
+
+    fn drain(&mut self) -> Vec<AgentLiveGap> {
+        std::mem::take(&mut self.by_run_and_agent)
+            .into_iter()
+            .map(|((run_id, agent_id), dropped_event_count)| AgentLiveGap {
+                run_id,
+                agent_id,
+                dropped_event_count,
+            })
+            .collect()
+    }
+}
+
+fn lock_pending_agent_live_gaps(
+    pending_gaps: &Arc<Mutex<PendingAgentLiveGaps>>,
+) -> std::sync::MutexGuard<'_, PendingAgentLiveGaps> {
+    match pending_gaps.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(
+                target: "astra_runtime::work_surface",
+                "agent live gap tracker lock poisoned; recovering pending gap facts"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+pub(super) fn agent_live_gap_to_work_surface_sse(gap: AgentLiveGap) -> Value {
+    json!({
+        "type": "agent_live_gap",
+        "run_id": gap.run_id,
+        "agent_id": gap.agent_id,
+        "dropped_event_count": gap.dropped_event_count,
+        "repair": "refresh_run_snapshot",
+    })
 }
 
 pub(super) fn agent_live_event_to_work_surface_sse(
@@ -184,6 +288,13 @@ pub(super) fn agent_live_event_to_work_surface_sse(
             "agent_id": event.agent_id.as_str(),
             "event_kind": "status",
             "content": content,
+            "timestamp": timestamp,
+        }),
+        AgentLiveEventKind::Signal(signal) => json!({
+            "type": "agent_live_event",
+            "agent_id": event.agent_id.as_str(),
+            "event_kind": "signal",
+            "signal": signal,
             "timestamp": timestamp,
         }),
         AgentLiveEventKind::ToolStarted {
@@ -244,6 +355,9 @@ pub(super) fn agent_live_event_to_work_surface_sse(
             })
         }
     };
+    if let Some(fields) = value.as_object_mut() {
+        fields.insert("run_id".to_string(), Value::String(event.run_id.clone()));
+    }
     merge_agent_live_execution_metadata(&mut value, execution_metadata);
     value
 }
@@ -326,9 +440,9 @@ fn system_time_epoch_ms(time: SystemTime) -> u64 {
 fn agent_spawned_progress_event_from_state(state: &SpawnedAgentState) -> AgentProgressEvent {
     AgentProgressEvent {
         agent_id: state.agent_id.clone(),
+        run_id: state.run_id.clone(),
+        parent_run_id: state.parent_run_id.clone(),
         event_type: ProgressEventType::AgentSpawned {
-            run_id: state.run_id.clone(),
-            parent_run_id: state.parent_run_id.clone(),
             agent_type: state.agent_type.clone(),
             description: state.description.clone(),
             fanout_slot: state.fanout_slot.clone(),
@@ -350,6 +464,8 @@ fn agent_lifecycle_progress_event_from_state(
     }
     Some(AgentProgressEvent {
         agent_id: state.agent_id.clone(),
+        run_id: state.run_id.clone(),
+        parent_run_id: state.parent_run_id.clone(),
         event_type,
         timestamp_epoch_ms: SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -470,4 +586,74 @@ pub(super) fn merge_agent_lifecycle_before_terminal_events(
         out.extend(agent_lifecycle_events);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_event(run_id: &str, agent_id: &str, content: &str) -> AgentLiveEvent {
+        AgentLiveEvent {
+            run_id: run_id.to_string(),
+            agent_id: agent_id.to_string(),
+            kind: AgentLiveEventKind::Status(content.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_live_events_wake_the_independent_gap_tracker_without_followup() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let (gap_tracker, mut gap_revision) = WorkSurfaceAgentLiveGapTracker::new();
+        let sink = WorkSurfaceAgentLiveEventSink::new(tx.clone(), None, gap_tracker.clone());
+        tx.try_send(json!({"type": "backlog"}))
+            .expect("first backlog item");
+        tx.try_send(json!({"type": "backlog"}))
+            .expect("second backlog item");
+
+        assert!(matches!(
+            sink.send(live_event("run-a", "reviewer", "dropped")),
+            Err(AgentLiveSendError::Dropped)
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), gap_revision.changed())
+            .await
+            .expect("drop must wake the independent gap lane")
+            .expect("gap tracker remains alive");
+        assert_eq!(
+            gap_tracker.drain(),
+            vec![AgentLiveGap {
+                run_id: "run-a".into(),
+                agent_id: "reviewer".into(),
+                dropped_event_count: 1,
+            }]
+        );
+        assert!(rx.recv().await.is_some());
+        assert!(rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn forwarded_live_gap_preserves_its_reconciliation_identity_and_count() {
+        let (tx, _rx) = mpsc::channel(1);
+        let (gap_tracker, mut gap_revision) = WorkSurfaceAgentLiveGapTracker::new();
+        let sink = WorkSurfaceAgentLiveEventSink::new(tx, None, gap_tracker.clone());
+
+        sink.send_gap(AgentLiveGap {
+            run_id: "run-nested".into(),
+            agent_id: "reviewer@child".into(),
+            dropped_event_count: 4,
+        })
+        .expect("a forwarded gap is a durable-reconciliation fact, not a stream write");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), gap_revision.changed())
+            .await
+            .expect("forwarded gap must wake the independent repair lane")
+            .expect("gap tracker remains alive");
+        assert_eq!(
+            gap_tracker.drain(),
+            vec![AgentLiveGap {
+                run_id: "run-nested".into(),
+                agent_id: "reviewer@child".into(),
+                dropped_event_count: 4,
+            }]
+        );
+    }
 }

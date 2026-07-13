@@ -13,6 +13,7 @@
 //! background tasks running on different Tokio worker threads.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -23,6 +24,7 @@ use std::sync::{
 };
 
 use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
+use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
 
 use crate::interaction_contract::{
     InteractionContract, InteractionIdentity, InteractionKind, approval_decision_status,
@@ -539,6 +541,15 @@ impl Drop for JournalDirGuard {
     }
 }
 
+/// Returns the current thread's test/local sessions-root override, if one is
+/// installed. Callers that offload journal work to a blocking thread can carry
+/// this explicit scope across the thread boundary; thread-local state is not
+/// inherited by Tokio workers.
+#[must_use]
+pub fn current_journal_dir_override() -> Option<PathBuf> {
+    LOCAL_SESSIONS_DIR_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
 /// Redirect session journal + workspace + step checkpoint paths process-wide.
 ///
 /// Use this only in tests that intentionally exercise cross-thread async
@@ -916,6 +927,22 @@ pub struct CoordinationMeta {
     /// Optional upstream event ids when this event is caused by multiple parents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_event_ids: Option<Vec<String>>,
+}
+
+/// Canonical prompt-history item emitted by a local root or delegated run.
+///
+/// The owning session journal keeps one item stream per execution run.
+/// `run_id` and `agent_id` identify that execution, while `item_seq` is
+/// monotonic within it. `source_event_id` is immutable across retries, replay
+/// and pagination; consumers must never use message text as an identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTranscriptItem {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_event_id: String,
+    pub run_id: String,
+    pub agent_id: String,
+    pub item_seq: u64,
+    pub message: serde_json::Value,
 }
 
 /// Edge permission / cloud policy fingerprint at a point in time (for cloud–edge audit alignment).
@@ -1346,6 +1373,9 @@ pub struct JournalEvent {
     /// Multi-agent or handoff correlation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordination: Option<CoordinationMeta>,
+    /// Canonical conversation item for a local root or delegated run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_item: Option<SessionTranscriptItem>,
     /// Edge policy snapshot for cloud–edge audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_policy: Option<EdgePolicySnapshot>,
@@ -1445,6 +1475,8 @@ pub enum JournalEventType {
     AgentSpawned,
     /// A spawned agent terminated (completed, failed, or cancelled).
     AgentTerminated,
+    /// One canonical prompt-history item from a local root or delegated run.
+    TranscriptItem,
     /// Subtask or plan verification completed (acceptance-criteria gate result).
     VerificationCompleted,
     /// Plan was edited (subtask added/removed/reordered, goal changed).
@@ -1667,6 +1699,12 @@ impl JournalWriter {
         validate_session_id(session_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let path = journal_file_path(session_id);
+        if path.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("journal path is a directory: {}", path.display()),
+            ));
+        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -1716,6 +1754,15 @@ impl JournalWriter {
     /// Batch-append multiple events without fsync (best-effort, for interrupted turns).
     pub fn append_bulk_no_sync(&self, events: &[JournalEvent]) -> std::io::Result<()> {
         self.append_bulk_inner(events, false)
+    }
+
+    /// Commit prior no-sync appends to the local durable boundary without
+    /// manufacturing another journal event. Long-running child agents can
+    /// expose live pages after each round, then pay one fsync at terminal
+    /// settlement before advertising transcript reconciliation to the UI.
+    pub fn sync_data(&self) -> std::io::Result<()> {
+        let file = open_locked_journal_file(&self.path)?;
+        file.sync_data()
     }
 
     fn append_bulk_inner(&self, events: &[JournalEvent], sync: bool) -> std::io::Result<()> {
@@ -2003,6 +2050,17 @@ fn annotate_dropped_turn_events(events: &mut [JournalEvent], dropped_events: u64
 }
 
 fn parse_journal_text(content: &str) -> (Vec<JournalEvent>, usize, usize) {
+    let (mut events, non_empty_lines, malformed_lines) =
+        parse_journal_text_in_append_order(content);
+    stabilize_event_order(&mut events);
+    (events, non_empty_lines, malformed_lines)
+}
+
+/// Parse physical append order without timestamp repair. This is the cursor
+/// order for append-only streams such as a root conversation: a timestamp can
+/// drift, but a completed durable write has one unambiguous position in the
+/// journal.
+fn parse_journal_text_in_append_order(content: &str) -> (Vec<JournalEvent>, usize, usize) {
     let mut events = Vec::new();
     let mut non_empty_lines = 0usize;
     let mut malformed_lines = 0usize;
@@ -2017,7 +2075,6 @@ fn parse_journal_text(content: &str) -> (Vec<JournalEvent>, usize, usize) {
             Err(_) => malformed_lines += 1,
         }
     }
-    stabilize_event_order(&mut events);
     (events, non_empty_lines, malformed_lines)
 }
 
@@ -2031,6 +2088,106 @@ pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
     }
     let content = std::fs::read_to_string(&path)?;
     Ok(parse_journal_text(&content).0)
+}
+
+/// Read a session journal in physical append order.
+///
+/// This is intentionally distinct from [`read_journal`], whose chronological
+/// projection repairs clock drift for timeline consumers. Transcript cursors
+/// need durable append order instead: a cursor must not move when a host clock
+/// is corrected after a record has been written.
+pub fn read_journal_append_order(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let path = journal_file_path(session_id);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(&path)?;
+    Ok(parse_journal_text_in_append_order(&content).0)
+}
+
+/// Complete append-only journal records available after a durable byte cursor.
+///
+/// The cursor advances only over newline-terminated JSONL records. A concurrent
+/// writer may have opened or partially written its final line; leaving that
+/// suffix for the next pass prevents a derived projection from recording a
+/// malformed or half-written event and then advancing past it.
+#[derive(Debug, Clone)]
+pub struct JournalAppendDelta {
+    pub events: Vec<JournalEvent>,
+    pub next_offset: u64,
+}
+
+pub fn read_journal_append_delta(
+    session_id: &str,
+    offset: u64,
+) -> std::io::Result<JournalAppendDelta> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let path = journal_file_path(session_id);
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && offset == 0 => {
+            return Ok(JournalAppendDelta {
+                events: Vec::new(),
+                next_offset: 0,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata()?.len();
+    if offset > len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "journal {session_id} shrank below durable outbox cursor: cursor={offset} bytes={len}"
+            ),
+        ));
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut suffix = Vec::new();
+    file.read_to_end(&mut suffix)?;
+    let complete_len = suffix
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    if complete_len == 0 {
+        return Ok(JournalAppendDelta {
+            events: Vec::new(),
+            next_offset: offset,
+        });
+    }
+    let complete = std::str::from_utf8(&suffix[..complete_len]).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("journal {session_id} contains non-UTF-8 JSONL: {error}"),
+        )
+    })?;
+    let mut events = Vec::new();
+    for (line_index, line) in complete.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event = serde_json::from_str::<JournalEvent>(line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "journal {session_id} has invalid JSONL at append line {}: {error}",
+                    line_index + 1
+                ),
+            )
+        })?;
+        events.push(event);
+    }
+    Ok(JournalAppendDelta {
+        events,
+        next_offset: offset.saturating_add(complete_len as u64),
+    })
 }
 
 /// Read the last `limit` events from a session journal file.
@@ -2322,6 +2479,27 @@ pub struct AskUserJournalResponse {
     pub answers: Option<serde_json::Value>,
 }
 
+/// Canonical durable ask-user request.  Responses must be bound to one of
+/// these records before they can affect a run; a bearer token alone does not
+/// authorize a caller to invent a questionnaire request id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskUserJournalRequest {
+    pub request_id: String,
+    pub run_id: Option<String>,
+    pub turn: Option<u32>,
+    pub prompt: serde_json::Value,
+}
+
+/// Result of atomically recording the terminal answer for an ask-user
+/// request.  This mirrors approval decisions: retrying the exact callback is
+/// safe, but a conflicting late answer never overwrites the first outcome.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AskUserResponseAppendOutcome {
+    Appended,
+    Idempotent,
+    Conflict(AskUserJournalResponse),
+}
+
 impl AskUserJournalResponse {
     pub fn interaction_contract(
         &self,
@@ -2356,6 +2534,136 @@ pub fn find_latest_ask_user_response_for_run(
     run_id: &str,
 ) -> std::io::Result<Option<AskUserJournalResponse>> {
     find_latest_ask_user_response_impl(session_id, request_id, Some(run_id))
+}
+
+pub fn find_latest_ask_user_prompted_for_run(
+    session_id: &str,
+    request_id: &str,
+    run_id: &str,
+) -> std::io::Result<Option<AskUserJournalRequest>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let events = read_journal(session_id)?;
+    for event in events.into_iter().rev() {
+        if event.event_type != JournalEventType::AskUserPrompted {
+            continue;
+        }
+        let Some(metadata) = event.metadata.as_ref() else {
+            continue;
+        };
+        let Some(found_request_id) = ask_user_metadata_str(metadata, "request_id") else {
+            continue;
+        };
+        if found_request_id != request_id {
+            continue;
+        }
+        let found_run_id = ask_user_metadata_str(metadata, "run_id");
+        if found_run_id.as_deref() != Some(run_id) {
+            continue;
+        }
+        let Some(prompt) = metadata
+            .get("ask_user")
+            .and_then(|ask_user| ask_user.get("prompt"))
+            .cloned()
+        else {
+            continue;
+        };
+        return Ok(Some(AskUserJournalRequest {
+            request_id: found_request_id,
+            run_id: found_run_id,
+            turn: event.turn,
+            prompt,
+        }));
+    }
+    Ok(None)
+}
+
+fn ask_user_response_from_event(
+    event: &JournalEvent,
+    request_id: &str,
+    run_id: &str,
+) -> Option<AskUserJournalResponse> {
+    if event.event_type != JournalEventType::AskUserResponse {
+        return None;
+    }
+    let metadata = event.metadata.as_ref()?;
+    let found_request_id = ask_user_metadata_str(metadata, "request_id")?;
+    if found_request_id != request_id {
+        return None;
+    }
+    let found_run_id = ask_user_metadata_str(metadata, "run_id");
+    if found_run_id.as_deref() != Some(run_id) {
+        return None;
+    }
+    let status = ask_user_metadata_str(metadata, "status")?;
+    let answers = metadata
+        .get("ask_user")
+        .and_then(|ask_user| ask_user.get("answers"))
+        .filter(|answers| !answers.is_null())
+        .cloned();
+    Some(AskUserJournalResponse {
+        request_id: found_request_id,
+        run_id: found_run_id,
+        status,
+        answers,
+    })
+}
+
+/// Append a terminal ask-user response while holding the journal lock.
+///
+/// This is intentionally not `find + JournalWriter::append`: responses may
+/// be retried across pods or race the timeout closer, and that split protocol
+/// would leave two contradictory answers in durable history.
+pub fn append_ask_user_response_for_run_if_absent(
+    session_id: &str,
+    turn: Option<u32>,
+    request_id: &str,
+    run_id: &str,
+    status: &str,
+    answers: Option<serde_json::Value>,
+) -> std::io::Result<AskUserResponseAppendOutcome> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if run_id.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "run_id required",
+        ));
+    }
+
+    let path = journal_file_path(session_id);
+    let mut file = open_locked_journal_file(&path)?;
+    let mut content = String::new();
+    file.seek(SeekFrom::Start(0))?;
+    file.read_to_string(&mut content)?;
+    let events = parse_journal_text(&content).0;
+    for event in events.iter().rev() {
+        let Some(existing) = ask_user_response_from_event(event, request_id, run_id) else {
+            continue;
+        };
+        return if existing.status == status && existing.answers == answers {
+            Ok(AskUserResponseAppendOutcome::Idempotent)
+        } else {
+            Ok(AskUserResponseAppendOutcome::Conflict(existing))
+        };
+    }
+
+    let event = JournalEvent::ask_user_response(
+        Some(session_id),
+        turn,
+        request_id,
+        Some(run_id),
+        status,
+        answers,
+    );
+    let events = prepend_session_start_if_needed(&path, std::slice::from_ref(&event))?;
+    let buf = serialize_journal_events(events.as_ref())?;
+    file.write_all(&buf)?;
+    file.sync_data()?;
+    update_cached_session_start_state_from_events(&path, events.as_ref());
+    Ok(AskUserResponseAppendOutcome::Appended)
 }
 
 fn find_latest_ask_user_response_impl(
@@ -3206,6 +3514,7 @@ impl JournalEvent {
             memoria_ms: None,
             session_lineage: None,
             coordination: None,
+            transcript_item: None,
             edge_policy: None,
             context_assembly_trace: None,
             routing_domain_hint: None,
@@ -3408,6 +3717,59 @@ impl TraceSpanBuilder {
 }
 
 impl JournalEvent {
+    /// Persist one canonical conversation item in its owning local session
+    /// journal. Returns `None` for malformed messages without a role.
+    pub fn transcript_item(
+        session_id: &str,
+        run_id: &str,
+        agent_id: &str,
+        item_seq: u64,
+        message: &serde_json::Value,
+    ) -> Option<Self> {
+        let role = message.get("role")?.as_str()?.trim();
+        if role.is_empty() || run_id.trim().is_empty() || agent_id.trim().is_empty() {
+            return None;
+        }
+
+        let message = if journal_content_redact_enabled() {
+            serde_json::json!({
+                "role": role,
+                "content": journal_content_marker(&message.to_string()),
+            })
+        } else {
+            message.clone()
+        };
+        let mut event = Self::base(JournalEventType::TranscriptItem, Some(session_id));
+        event.transcript_item = Some(SessionTranscriptItem {
+            source_event_id: local_transcript_source_event_id(
+                session_id, run_id, agent_id, item_seq,
+            ),
+            run_id: run_id.to_string(),
+            agent_id: agent_id.to_string(),
+            item_seq,
+            message,
+        });
+        Some(event)
+    }
+
+    /// Persist bounded, typed non-conversational evidence inside a local
+    /// child's canonical transcript lane. This uses the same run-local
+    /// sequence as messages so replay preserves the order in which the agent
+    /// encountered coordination and permission boundaries.
+    pub fn transcript_evidence(
+        session_id: &str,
+        run_id: &str,
+        agent_id: &str,
+        item_seq: u64,
+        evidence: &astra_turn_types::AgentTranscriptEvidence,
+    ) -> Option<Self> {
+        let message = serde_json::json!({
+            "role": "event",
+            "evidence": evidence,
+        });
+        Self::transcript_item(session_id, run_id, agent_id, item_seq, &message)
+    }
+
     /// Record that this session was forked from `lineage.parent_session_id`.
     pub fn session_fork(
         session_id: Option<&str>,
@@ -3853,20 +4215,29 @@ impl JournalEvent {
         self
     }
 
-    /// Attach structured user-input events that arrived after the turn had
-    /// already started. The top-level `user_input` remains the human-readable
-    /// turn input; this metadata preserves individual mid-turn input events for
-    /// resume/session-history projections.
-    pub fn with_deferred_user_inputs<'a, I>(mut self, inputs: I) -> Self
+    /// Attach typed user intents that were applied while the run was active.
+    /// The top-level `user_input` remains the human-readable turn input; this
+    /// ledger preserves identity and delivery semantics for replay and audit.
+    pub fn with_applied_user_intents<'a, I>(mut self, intents: I) -> Self
     where
-        I: IntoIterator<Item = (usize, &'a str)>,
+        I: IntoIterator<
+            Item = (
+                &'a str,
+                UserIntentDelivery,
+                UserIntentStatus,
+                usize,
+                &'a str,
+            ),
+        >,
     {
         let redacted = journal_content_redact_enabled();
-        let events = inputs
+        let events = intents
             .into_iter()
-            .filter_map(|(event_index, content)| {
+            .filter_map(|(intent_id, delivery, status, event_index, content)| {
+                let intent_id = intent_id.trim();
                 let content = content.trim();
-                if content.is_empty() {
+                if intent_id.is_empty() || content.is_empty() || status != UserIntentStatus::Applied
+                {
                     return None;
                 }
                 let content = if redacted {
@@ -3875,6 +4246,9 @@ impl JournalEvent {
                     truncate(content, 500)
                 };
                 Some(serde_json::json!({
+                    "intent_id": intent_id,
+                    "delivery": delivery,
+                    "status": status,
                     "event_index": event_index,
                     "content": content,
                 }))
@@ -3891,10 +4265,7 @@ impl JournalEvent {
             });
         }
         if let Some(obj) = metadata.as_object_mut() {
-            obj.insert(
-                "deferred_user_inputs".into(),
-                serde_json::Value::Array(events),
-            );
+            obj.insert("user_intents".into(), serde_json::Value::Array(events));
         }
         self
     }
@@ -4825,6 +5196,24 @@ impl JournalEvent {
         evt
     }
 }
+
+/// Stable identity for one logical item in a local run transcript.
+///
+/// Retrying an ambiguous append must reproduce this value. The message payload
+/// is deliberately excluded: a retry must not become a second object merely
+/// because a provider reformatted equivalent content, while a conflicting
+/// payload at the same run sequence remains a data-integrity conflict for the
+/// reader to surface rather than a silently distinct transcript item.
+fn local_transcript_source_event_id(
+    session_id: &str,
+    run_id: &str,
+    agent_id: &str,
+    item_seq: u64,
+) -> String {
+    let identity = serde_json::json!([session_id, run_id, agent_id, item_seq]);
+    let digest = Sha256::digest(identity.to_string().as_bytes());
+    format!("local-transcript:sha256:{digest:x}")
+}
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -5221,6 +5610,85 @@ mod approval_tests {
             found.answers.unwrap()["answers"][0]["answers"][0].as_str(),
             Some("yes")
         );
+    }
+
+    #[test]
+    fn ask_user_prompt_lookup_and_terminal_append_are_run_scoped_and_atomic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-ask-user-atomic").unwrap();
+        let prompt = serde_json::json!({
+            "questions": [{"question": "Continue?", "options": []}]
+        });
+        writer
+            .append(&JournalEvent::ask_user_prompted(
+                Some("sess-ask-user-atomic"),
+                Some(7),
+                "ask-atomic",
+                Some("run-a"),
+                prompt.clone(),
+            ))
+            .unwrap();
+
+        let required =
+            find_latest_ask_user_prompted_for_run("sess-ask-user-atomic", "ask-atomic", "run-a")
+                .unwrap()
+                .expect("canonical ask_user request");
+        assert_eq!(required.turn, Some(7));
+        assert_eq!(required.prompt, prompt);
+        assert!(
+            find_latest_ask_user_prompted_for_run("sess-ask-user-atomic", "ask-atomic", "run-b",)
+                .unwrap()
+                .is_none(),
+            "a request id may not cross run boundaries"
+        );
+
+        let answers = serde_json::json!({"answers": []});
+        assert_eq!(
+            append_ask_user_response_for_run_if_absent(
+                "sess-ask-user-atomic",
+                required.turn,
+                "ask-atomic",
+                "run-a",
+                "submitted",
+                Some(answers.clone()),
+            )
+            .unwrap(),
+            AskUserResponseAppendOutcome::Appended
+        );
+        assert_eq!(
+            append_ask_user_response_for_run_if_absent(
+                "sess-ask-user-atomic",
+                required.turn,
+                "ask-atomic",
+                "run-a",
+                "submitted",
+                Some(answers),
+            )
+            .unwrap(),
+            AskUserResponseAppendOutcome::Idempotent
+        );
+        let conflict = append_ask_user_response_for_run_if_absent(
+            "sess-ask-user-atomic",
+            required.turn,
+            "ask-atomic",
+            "run-a",
+            "timeout",
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            conflict,
+            AskUserResponseAppendOutcome::Conflict(AskUserJournalResponse { status, .. })
+                if status == "submitted"
+        ));
+
+        let terminal_events = read_journal("sess-ask-user-atomic")
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == JournalEventType::AskUserResponse)
+            .count();
+        assert_eq!(terminal_events, 1);
     }
 
     #[test]
@@ -7480,6 +7948,62 @@ mod tests {
         assert_eq!(evt.user_input.as_deref(), Some("hello"));
         assert_eq!(evt.assistant_output.as_deref(), Some("world"));
 
+        // ── Local child transcript preserves typed identity and raw message ──
+        let message = serde_json::json!({
+            "role": "assistant",
+            "content": "child answer",
+            "reasoning_content": "checked the invariant",
+        });
+        let evt =
+            JournalEvent::transcript_item("parent-session", "local-run", "reviewer", 7, &message)
+                .expect("valid transcript message");
+        assert_eq!(evt.event_type, JournalEventType::TranscriptItem);
+        assert_eq!(evt.session_id.as_deref(), Some("parent-session"));
+        let payload = evt.transcript_item.expect("typed transcript payload");
+        assert!(
+            payload
+                .source_event_id
+                .starts_with("local-transcript:sha256:")
+        );
+        assert_eq!(payload.run_id, "local-run");
+        assert_eq!(payload.agent_id, "reviewer");
+        assert_eq!(payload.item_seq, 7);
+        assert_eq!(payload.message, message);
+        let retry = JournalEvent::transcript_item(
+            "parent-session",
+            "local-run",
+            "reviewer",
+            7,
+            &serde_json::json!({"role": "assistant", "content": "provider retried"}),
+        )
+        .expect("retry transcript message");
+        assert_eq!(
+            retry
+                .transcript_item
+                .as_ref()
+                .expect("retry payload")
+                .source_event_id,
+            payload.source_event_id
+        );
+
+        // Redaction covers the entire raw provider message, including tool
+        // arguments and reasoning fields, rather than only visible content.
+        unsafe { std::env::set_var("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
+        let redacted =
+            JournalEvent::transcript_item("parent-session", "local-run", "reviewer", 8, &message)
+                .unwrap()
+                .transcript_item
+                .unwrap()
+                .message;
+        assert_eq!(redacted["role"], "assistant");
+        assert!(
+            redacted["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("<redacted:")
+        );
+        assert!(redacted.get("reasoning_content").is_none());
+
         // ── Turn error redacts user input ──
         unsafe { std::env::set_var("ASTRA_JOURNAL_CONTENT_REDACT", "1") };
         let evt =
@@ -9400,6 +9924,11 @@ mod turn_event_buffer_tests {
         assert_eq!(events[0].event_type, JournalEventType::SessionStart);
         assert_eq!(events[1].event_type, JournalEventType::TraceSpan);
         assert_eq!(events[2].event_type, JournalEventType::ConfigChange);
+
+        let append_order = read_journal_append_order(sid).unwrap();
+        assert_eq!(append_order[0].event_type, JournalEventType::SessionStart);
+        assert_eq!(append_order[1].event_type, JournalEventType::ConfigChange);
+        assert_eq!(append_order[2].event_type, JournalEventType::TraceSpan);
     }
 }
 

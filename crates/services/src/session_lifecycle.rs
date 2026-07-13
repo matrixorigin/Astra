@@ -204,10 +204,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_todo_idempotency WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "session_plan_todos",
-        sql: "DELETE FROM session_plan_todos WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "harness_snapshots",
         sql: "DELETE FROM harness_snapshots WHERE session_id = ? AND user_id = ?",
     },

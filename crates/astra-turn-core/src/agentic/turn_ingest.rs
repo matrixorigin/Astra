@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::interaction_types::tool_counts_as_external_observation;
-use crate::response_guard::{RESPONSE_GUARD_BLOCKED_FINISH_REASON, apply_response_guards};
+use crate::response_guard::{RESPONSE_GUARD_REDACTED_FINISH_REASON, apply_response_guards};
 use crate::tool::args::shape::tool_call_name;
 use astra_pipeline::step_recorder::StepRecorder;
 
@@ -166,7 +166,7 @@ pub fn ingest_agentic_turn_stream(
         if let Some(replacement) = guard.replacement {
             agent_warn!("response_guard", "Guard triggered, replacing LLM output");
             *st.final_text = replacement;
-            *st.last_finish_reason = Some(RESPONSE_GUARD_BLOCKED_FINISH_REASON.to_string());
+            *st.last_finish_reason = Some(RESPONSE_GUARD_REDACTED_FINISH_REASON.to_string());
             persist_final_assistant_message(st.messages, st.final_text.as_str());
             return AgenticTurnIngestOutcome::Break;
         }
@@ -1064,7 +1064,7 @@ mod tests {
         );
         assert_eq!(
             pack.last_finish_reason.as_deref(),
-            Some(crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON)
+            Some(crate::response_guard::RESPONSE_GUARD_REDACTED_FINISH_REASON)
         );
         assert_eq!(
             pack.messages.last().unwrap()["content"],

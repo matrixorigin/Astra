@@ -505,7 +505,6 @@ pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_PAUSED: &str = "paused";
 pub const STATUS_CANCELLED: &str = "cancelled";
 pub const STATUS_WAITING: &str = "waiting";
-pub const STATUS_INPUT_QUEUED: &str = "input-queued";
 pub const STATUS_VERIFICATION_FAILED: &str = "verification_failed";
 
 // ─── Sub-Run State Machine ──────────────────────────────────────────────────

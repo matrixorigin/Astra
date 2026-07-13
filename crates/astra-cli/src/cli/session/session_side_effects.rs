@@ -1,63 +1,112 @@
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
 use astra_services::session_journal;
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 /// Cloud journal ingestion is server-owned; CLI keeps the local journal path.
-fn enqueue_ingestion(
-    _state: &SessionState,
-    event: &session_journal::JournalEvent,
-    schedule_background_drain: bool,
-) {
-    let store = astra_services::SyncOutboxStore::local();
-    if event
-        .session_id
-        .as_deref()
-        .is_none_or(|session_id| session_id.trim().is_empty())
-    {
-        if let Err(error) = store.record_skipped_journal_event(
-            event,
-            astra_services::SyncOutboxSkipKind::MissingSessionId,
-            "journal event has no session_id and cannot be delivered to /events",
-        ) {
+fn enqueue_ingestion(_state: &SessionState, event: &session_journal::JournalEvent) {
+    enqueue_ingestion_batch(_state, std::slice::from_ref(event));
+}
+
+/// Notify the asynchronous journal→outbox projector about every source session
+/// represented by an appended journal batch. The local journal is canonical;
+/// the projector owns durable outbox batching and crash recovery by source
+/// watermark, so this turn-local call never waits for its lock or fsync.
+fn enqueue_ingestion_batch(_state: &SessionState, events: &[session_journal::JournalEvent]) {
+    enqueue_ingestion_events(events);
+}
+
+/// Schedule journal-to-outbox projection for records written by a deferred
+/// local sidecar. The journal is already durable at this point; this is only a
+/// latency hint for the independently recoverable projector.
+pub(crate) fn enqueue_ingestion_events(events: &[session_journal::JournalEvent]) {
+    let mut source_sessions = BTreeSet::new();
+    for event in events {
+        if event
+            .session_id
+            .as_deref()
+            .is_none_or(|session_id| session_id.trim().is_empty())
+        {
             tracing::warn!(
                 target: "astra_cli::cloud_sync",
-                ?error,
                 event_type = ?event.event_type,
-                "failed to record skipped sync outbox event"
+                "skipping journal-to-outbox projection hint for event without a session_id"
             );
+            continue;
         }
-        tracing::warn!(
-            target: "astra_cli::cloud_sync",
-            event_type = ?event.event_type,
-            "skipping sync outbox enqueue for journal event without a session_id"
-        );
+        source_sessions.insert(event.session_id.as_deref().unwrap_or_default().to_string());
+    }
+    let scheduled = !source_sessions.is_empty()
+        && source_sessions.iter().all(|session_id| {
+            crate::cli::cloud_sync::schedule_sync_outbox_journal_ingestion(session_id)
+        });
+    if !scheduled {
+        // Non-interactive one-shot/tests can append journals without a Tokio
+        // runtime. They still need a correct durable outbox boundary; this
+        // fallback is outside the live TUI completion path.
+        enqueue_ingestion_batch_without_runtime(events);
+    }
+}
+
+fn enqueue_ingestion_batch_without_runtime(events: &[session_journal::JournalEvent]) {
+    if events.is_empty() {
         return;
     }
-    match store.enqueue_journal_event(event) {
-        Ok(_) if schedule_background_drain => crate::cli::cloud_sync::schedule_sync_outbox_drain(),
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(
-                target: "astra_cli::cloud_sync",
-                ?error,
-                event_type = ?event.event_type,
-                session_id = event.session_id.as_deref().unwrap_or(""),
-                "failed to enqueue journal event into durable sync outbox"
-            );
+    let store = astra_services::SyncOutboxStore::local();
+    let mut deliverable = Vec::with_capacity(events.len());
+    for event in events {
+        if event
+            .session_id
+            .as_deref()
+            .is_none_or(|session_id| session_id.trim().is_empty())
+        {
+            if let Err(error) = store.record_skipped_journal_event(
+                event,
+                astra_services::SyncOutboxSkipKind::MissingSessionId,
+                "journal event has no session_id and cannot be delivered to /events",
+            ) {
+                tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    ?error,
+                    event_type = ?event.event_type,
+                    "failed to record skipped sync outbox event"
+                );
+            }
+            continue;
         }
+        deliverable.push(event.clone());
+    }
+    if deliverable.is_empty() {
+        return;
+    }
+    match store.enqueue_journal_events(&deliverable) {
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            target: "astra_cli::cloud_sync",
+            ?error,
+            event_count = deliverable.len(),
+            "failed to enqueue journal events into durable sync outbox"
+        ),
     }
 }
 
 pub(crate) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
-    enqueue_ingestion(state, event, true);
+    enqueue_ingestion(state, event);
+}
+
+pub(crate) fn enqueue_ingestion_batch_pub(
+    state: &SessionState,
+    events: &[session_journal::JournalEvent],
+) {
+    enqueue_ingestion_batch(state, events);
 }
 
 pub(crate) fn enqueue_ingestion_for_immediate_drain_pub(
     state: &SessionState,
     event: &session_journal::JournalEvent,
 ) {
-    enqueue_ingestion(state, event, false);
+    enqueue_ingestion(state, event);
 }
 
 pub(crate) fn drop_unattributed_memory_recalls_at_turn_end(session_id: Option<&str>) -> usize {

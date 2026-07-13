@@ -77,6 +77,22 @@ pub(crate) fn commit_plan_transition_notice(
 
 pub(crate) fn slash_plan_goal(text: &str) -> Option<&str> {
     let rest = text.trim().strip_prefix("/plan")?;
+    if !rest.is_empty() && !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
     let goal = rest.trim();
     (!goal.is_empty()).then_some(goal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slash_plan_goal;
+
+    #[test]
+    fn inline_plan_goal_requires_an_exact_command_token() {
+        assert_eq!(slash_plan_goal("/plan ship it"), Some("ship it"));
+        assert_eq!(slash_plan_goal("  /plan   ship it  "), Some("ship it"));
+        assert_eq!(slash_plan_goal("/plan"), None);
+        assert_eq!(slash_plan_goal("/planner ship it"), None);
+    }
 }

@@ -1,27 +1,61 @@
-//! Post-commit side effects that run after the primary turn is durable.
+//! Deferred post-commit projections for an already-durable turn.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use super::turn_commit::DeferredTurnSidecarWork;
 use crate::cli::notifications;
-use crate::cli::session::session_improvement;
 use crate::cli::session::session_projection::{
     CslCheckpointFields, build_full_session_state_compact,
-    rebuild_continuation_anchor_from_live_state,
 };
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_side_effects::drop_unattributed_memory_recalls_at_turn_end;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
 
-pub(crate) async fn run_turn_post_commit_tasks(
+/// CSL is a local continuation projection of a primary journal turn, not its
+/// durability boundary. It runs on the post-commit worker, so latency must not
+/// turn into cancellation: dropping an in-flight projection creates an
+/// avoidable continuation gap on the next resume.
+const PLAN_MIRROR_SYNC_BUDGET: Duration = Duration::from_millis(750);
+
+struct PlanMirrorRefresh {
+    api: astra_thin_client::ThinClient,
+    token: String,
+    session_id: String,
+}
+
+/// Fully owned work handed from turn settlement to a serialized worker. No
+/// mutable `SessionState` crosses this boundary, so a slow disk or server can
+/// never keep the next turn from starting.
+pub(crate) struct TurnPostCommitJob {
+    session_id: Option<String>,
+    turn: u32,
+    final_messages: Vec<serde_json::Value>,
+    csl_state: astra_turn_core::conversation_log::SessionStateCompact,
+    csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
+    deferred_sidecars: Option<DeferredTurnSidecarWork>,
+    plan_mirror: Option<PlanMirrorRefresh>,
+    notification: Option<(notifications::NotificationConfig, Duration)>,
+}
+
+/// Result of a post-commit job. The event loop applies it only when the
+/// session identity still matches; stale completions cannot overwrite a later
+/// resume/rebind.
+pub(crate) struct TurnPostCommitCompletion {
+    pub(crate) session_id: Option<String>,
+    pub(crate) csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
+    plan_mirror: Option<Result<Option<astra_runtime::plan::PlanModeState>, String>>,
+    pub(crate) errors: Vec<String>,
+}
+
+pub(crate) fn prepare_turn_post_commit_job(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     final_messages: Vec<serde_json::Value>,
     csl_checkpoint_fields: CslCheckpointFields,
     turn_start: Instant,
-    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
-) {
+) -> TurnPostCommitJob {
     let dropped = drop_unattributed_memory_recalls_at_turn_end(state.session_id.as_deref());
     if dropped > 0 {
         tracing::debug!(
@@ -31,65 +65,204 @@ pub(crate) async fn run_turn_post_commit_tasks(
         );
     }
 
-    rebuild_continuation_anchor_from_live_state(state).await;
-    persist_turn_csl_snapshot(state, final_messages, csl_checkpoint_fields).await;
-    sync_plan_mode_mirror_after_turn(state, api, profile, ui).await;
-    session_improvement::check_skill_improvement_async(state).await;
-    maybe_spawn_turn_completion_notification(state, turn_start.elapsed());
-}
-
-async fn persist_turn_csl_snapshot(
-    state: &mut SessionState,
-    final_messages: Vec<serde_json::Value>,
-    csl_checkpoint_fields: CslCheckpointFields,
-) {
-    let turn = state.turn;
-    let prev_state = state
+    let csl_state = state
         .csl_manager
         .as_ref()
         .map(|manager| manager.last_session_state().clone())
+        .map(|previous| build_full_session_state_compact(state, csl_checkpoint_fields, &previous))
         .unwrap_or_default();
-    let session_state = build_full_session_state_compact(state, csl_checkpoint_fields, &prev_state);
-    if let Some(manager) = state.csl_manager.as_mut()
-        && let Err(error) = manager
-            .persist_turn(turn, &final_messages, &session_state)
-            .await
-    {
-        astra_core::agent_warn!("csl", "persist failed: {error}");
+    let notification = notification_for_turn(state, turn_start.elapsed());
+    let plan_mirror = state
+        .plan_mode_active()
+        .then(|| {
+            state
+                .session_id
+                .as_deref()
+                .filter(|session_id| !session_id.trim().is_empty())
+                .zip(session_runtime::current_access_token(profile))
+                .map(|(session_id, token)| PlanMirrorRefresh {
+                    api: api.clone(),
+                    token,
+                    session_id: session_id.to_string(),
+                })
+        })
+        .flatten();
+    // The active session keeps its manager while this job is queued. The
+    // worker receives a fresh manager and reconciles from durable CSL state,
+    // which keeps rapid consecutive turns ordered without leaving a temporary
+    // `None` manager that would silently skip later projections.
+    let csl_manager = state
+        .csl_manager
+        .as_ref()
+        .and(state.session_id.as_deref())
+        .and_then(build_local_csl_manager);
+    TurnPostCommitJob {
+        session_id: state.session_id.clone(),
+        turn: state.turn,
+        final_messages,
+        csl_state,
+        csl_manager,
+        deferred_sidecars: None,
+        plan_mirror,
+        notification,
     }
 }
 
-async fn sync_plan_mode_mirror_after_turn(
-    state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
+fn build_local_csl_manager(
+    session_id: &str,
+) -> Option<astra_turn_core::conversation_log::manager::CslManager> {
+    let store = std::sync::Arc::new(
+        astra_turn_core::conversation_log::file_store::FileCslStore::new(
+            astra_services::session_journal::local_owner_sessions_dir(),
+        ),
+    );
+    match astra_turn_core::conversation_log::manager::CslManager::new(
+        store,
+        session_id.to_string(),
+        Default::default(),
+    ) {
+        Ok(manager) => Some(manager),
+        Err(error) => {
+            astra_core::agent_warn!(
+                "csl",
+                "manager init for deferred projection failed: {error}"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn attach_deferred_sidecars(
+    job: &mut TurnPostCommitJob,
+    deferred_sidecars: Option<DeferredTurnSidecarWork>,
 ) {
-    if state.plan_mode_active()
-        && let Some(token) = session_runtime::current_access_token(profile)
-        && let Err(error) =
-            crate::cli::plan::plan_lifecycle::sync_remote_plan_mode_state(api, &token, state).await
-    {
-        state.plan_mode_sync_error = Some(error.clone());
-        ui.show_warning(&format!(
-            "  Plan mirror sync failed; local plan may be stale. Send another planning turn after the server recovers, or use /plan to exit and re-enter before `go`. ({error})"
+    job.deferred_sidecars = deferred_sidecars;
+}
+
+pub(crate) async fn execute_turn_post_commit_job(
+    mut job: TurnPostCommitJob,
+) -> TurnPostCommitCompletion {
+    let mut errors = Vec::new();
+    if let Some(sidecars) = job.deferred_sidecars.take() {
+        match tokio::task::spawn_blocking(move || sidecars.execute()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(error) => errors.push(format!("post-commit sidecar worker failed: {error}")),
+        }
+    }
+
+    let csl_manager = match job.csl_manager.take() {
+        None => None,
+        Some(mut manager) => match manager
+            .persist_turn(job.turn, &job.final_messages, &job.csl_state)
+            .await
+        {
+            Ok(()) => Some(manager),
+            Err(error) => {
+                errors.push(format!(
+                    "CSL projection failed; journal continuation remains available: {error}"
+                ));
+                // Keep the manager: a transient append failure must not make
+                // all later turns silently stop producing CSL projections.
+                Some(manager)
+            }
+        },
+    };
+
+    let plan_mirror = match job.plan_mirror.take() {
+        None => None,
+        Some(refresh) => Some(
+            match tokio::time::timeout(
+                PLAN_MIRROR_SYNC_BUDGET,
+                crate::cli::plan::plan_lifecycle::fetch_remote_plan_mode_state(
+                    &refresh.api,
+                    &refresh.token,
+                    &refresh.session_id,
+                ),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "plan mirror sync exceeded {}ms",
+                    PLAN_MIRROR_SYNC_BUDGET.as_millis()
+                )),
+            },
+        ),
+    };
+    if let Some(Err(error)) = plan_mirror.as_ref() {
+        errors.push(format!(
+            "plan mirror refresh failed; local plan remains usable: {error}"
         ));
-        astra_core::agent_warn!("plan", "failed to sync mirrored plan mode state: {error}");
+    }
+
+    if let Some((config, elapsed)) = job.notification.take() {
+        if tokio::time::timeout(
+            Duration::from_millis(250),
+            notifications::notify_completion(&config, "Astra", "Turn completed", elapsed),
+        )
+        .await
+        .is_err()
+        {
+            tracing::debug!("completion notification exceeded deferred post-commit budget");
+        }
+    }
+    TurnPostCommitCompletion {
+        session_id: job.session_id,
+        csl_manager,
+        plan_mirror,
+        errors,
     }
 }
 
-fn maybe_spawn_turn_completion_notification(state: &SessionState, elapsed: std::time::Duration) {
+/// Applies a worker completion to the current live session. A completion from
+/// a prior session is intentionally ignored: its journal is already durable,
+/// but it must never reattach a stale CSL manager after resume/fork/rebind.
+pub(crate) fn apply_turn_post_commit_completion(
+    completion: TurnPostCommitCompletion,
+    state: &mut SessionState,
+) -> Vec<String> {
+    if completion.session_id != state.session_id {
+        tracing::debug!(
+            completed_session_id = ?completion.session_id,
+            current_session_id = ?state.session_id,
+            "ignored stale deferred turn-post-commit completion"
+        );
+        return Vec::new();
+    }
+    if let Some(manager) = completion.csl_manager {
+        // The worker is serialized. Replacing an older manager with its newer
+        // completion preserves the latest CSL sequence after rapid turns.
+        state.csl_manager = Some(manager);
+    }
+    if state.plan_mode_active() {
+        if let Some(plan_mirror) = completion.plan_mirror {
+            match plan_mirror {
+                Ok(plan) => {
+                    state.cloud_plan_mirror = plan;
+                    state.plan_mode_sync_error = None;
+                }
+                Err(error) => state.plan_mode_sync_error = Some(error),
+            }
+        }
+    }
+    if !completion.errors.is_empty() {
+        state.session_persistence_error = Some(completion.errors.join("; "));
+    }
+    completion.errors
+}
+
+fn notification_for_turn(
+    state: &SessionState,
+    elapsed: std::time::Duration,
+) -> Option<(notifications::NotificationConfig, Duration)> {
     let notif_config = notifications::NotificationConfig {
         enabled: state.notifications_enabled,
         method: state.notification_method,
         min_duration_secs: state.notification_threshold_secs,
     };
-    if notif_config.enabled && notif_config.exceeds_threshold(elapsed) {
-        tokio::spawn(async move {
-            notifications::notify_completion(&notif_config, "Astra", "Turn completed", elapsed)
-                .await;
-        });
-    }
+    (notif_config.enabled && notif_config.exceeds_threshold(elapsed))
+        .then_some((notif_config, elapsed))
 }
 
 pub(crate) fn extract_csl_fields_from_result(_result: &StreamResult) -> CslCheckpointFields {
@@ -99,34 +272,62 @@ pub(crate) fn extract_csl_fields_from_result(_result: &StreamResult) -> CslCheck
 #[cfg(test)]
 mod tests {
     use super::{
-        build_full_session_state_compact, extract_csl_fields_from_result,
-        persist_turn_csl_snapshot, run_turn_post_commit_tasks,
+        apply_turn_post_commit_completion, build_full_session_state_compact,
+        execute_turn_post_commit_job, extract_csl_fields_from_result, prepare_turn_post_commit_job,
     };
     use crate::cli::session::session_projection::CslCheckpointFields;
     use crate::cli::session::session_state::SessionState;
+    use astra_turn_core::conversation_log::{AppendMeta, CslEntry, CslStore, CslStoreError};
     use std::time::Instant;
-    use wiremock::matchers::{header, method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
+    fn test_api() -> astra_thin_client::ThinClient {
+        astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap()
     }
 
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
+    struct DelayedCslStore(std::time::Duration);
+
+    #[async_trait::async_trait]
+    impl CslStore for DelayedCslStore {
+        async fn append(
+            &self,
+            _session_id: &str,
+            _entry: &CslEntry,
+            _meta: &AppendMeta,
+        ) -> Result<(), CslStoreError> {
+            tokio::time::sleep(self.0).await;
+            Ok(())
         }
-    }
 
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.as_deref() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
+        async fn load_from_latest_snapshot(
+            &self,
+            _session_id: &str,
+        ) -> Result<Vec<CslEntry>, CslStoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn load_after(
+            &self,
+            _session_id: &str,
+            _after_seq: u64,
+        ) -> Result<Vec<CslEntry>, CslStoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn truncate_before(
+            &self,
+            _session_id: &str,
+            _before_seq: u64,
+        ) -> Result<u64, CslStoreError> {
+            Ok(0)
+        }
+
+        async fn fork(
+            &self,
+            _parent_session_id: &str,
+            _new_session_id: &str,
+            _fork_after_turn: u32,
+        ) -> Result<u64, CslStoreError> {
+            Ok(0)
         }
     }
 
@@ -179,7 +380,18 @@ mod tests {
             serde_json::json!({"role": "assistant", "content": "ok"}),
         ];
 
-        persist_turn_csl_snapshot(&mut state, final_messages, CslCheckpointFields).await;
+        let api = test_api();
+        let job = prepare_turn_post_commit_job(
+            &mut state,
+            &api,
+            None,
+            final_messages,
+            CslCheckpointFields,
+            Instant::now(),
+        );
+        let completion = execute_turn_post_commit_job(job).await;
+        assert!(completion.errors.is_empty(), "{:?}", completion.errors);
+        apply_turn_post_commit_completion(completion, &mut state);
 
         let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
         let mat = astra_turn_core::conversation_log::materialize(&entries).unwrap();
@@ -193,29 +405,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_csl_projection_completes_without_being_cancelled() {
+        use astra_turn_core::conversation_log::manager::CslManager;
+
+        let session_id = format!("csl-projection-budget-{}", uuid::Uuid::new_v4());
+        let manager = CslManager::new(
+            std::sync::Arc::new(DelayedCslStore(std::time::Duration::from_millis(30))),
+            session_id.clone(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut state = SessionState {
+            session_id: Some(session_id),
+            csl_manager: Some(manager),
+            turn: 1,
+            ..Default::default()
+        };
+
+        let api = test_api();
+        let job = prepare_turn_post_commit_job(
+            &mut state,
+            &api,
+            None,
+            Vec::new(),
+            CslCheckpointFields,
+            Instant::now(),
+        );
+        let completion = execute_turn_post_commit_job(job).await;
+        assert!(completion.errors.is_empty(), "{:?}", completion.errors);
+        assert!(completion.csl_manager.is_some());
+    }
+
+    #[test]
+    fn preparing_deferred_projection_keeps_active_manager_available() {
+        let session_id = format!("csl-active-manager-{}", uuid::Uuid::new_v4());
+        let manager = astra_turn_core::conversation_log::manager::CslManager::new(
+            std::sync::Arc::new(DelayedCslStore(std::time::Duration::ZERO)),
+            session_id.clone(),
+            Default::default(),
+        )
+        .unwrap();
+        let mut state = SessionState {
+            session_id: Some(session_id),
+            csl_manager: Some(manager),
+            ..Default::default()
+        };
+
+        let _job = prepare_turn_post_commit_job(
+            &mut state,
+            &test_api(),
+            None,
+            Vec::new(),
+            CslCheckpointFields,
+            Instant::now(),
+        );
+        assert!(state.csl_manager.is_some());
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn turn_commit_drops_unattributed_recall_without_positive_feedback() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let server = MockServer::start().await;
-        let _api_url = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
-        let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
-        Mock::given(method("POST"))
-            .and(path("/memory/feedback/m1"))
-            .and(header("authorization", "Bearer token"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let mut state = SessionState::default();
         let session_id = "sess-memory-drain";
         state.session_id = Some(session_id.to_string());
         astra_tools::memoria::MemoriaToolGateway::reset_recall_ledger(session_id);
         astra_tools::memoria::MemoriaToolGateway::record_recall(session_id, 1, vec!["m1".into()]);
-        let mut ui = crate::tests::TestUi::default();
-
-        run_turn_post_commit_tasks(
+        let api = test_api();
+        let _job = prepare_turn_post_commit_job(
             &mut state,
             &api,
             None,
@@ -224,75 +481,12 @@ mod tests {
                 "The turn completed without attributable memory usage.",
             )),
             Instant::now(),
-            &mut ui,
-        )
-        .await;
+        );
 
         assert_eq!(
             astra_tools::memoria::MemoriaToolGateway::pending_recall_count(session_id),
             0,
             "turn completion must synchronously drop unattributed recall state"
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn run_turn_post_commit_tasks_warns_and_marks_plan_mirror_stale_when_sync_fails() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let _env = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/plans"))
-            .and(header("authorization", "Bearer token"))
-            .and(query_param("session_id", "sess-1"))
-            .and(query_param("phase", "planning"))
-            .and(query_param("limit", "1"))
-            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
-                "detail": "boom"
-            })))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let mut state = SessionState::default();
-        state.session_id = Some("sess-1".to_string());
-        state
-            .perm_manager
-            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
-        state.cloud_plan_mirror = Some(astra_runtime::plan::PlanModeState::new(
-            "Ship auth".to_string(),
-        ));
-        let mut ui = crate::tests::TestUi::default();
-
-        run_turn_post_commit_tasks(
-            &mut state,
-            &api,
-            None,
-            Vec::new(),
-            CslCheckpointFields,
-            Instant::now(),
-            &mut ui,
-        )
-        .await;
-
-        let error = state
-            .plan_mode_sync_error
-            .as_deref()
-            .expect("sync failure should be recorded");
-        assert!(error.contains("500"), "got: {error}");
-        assert_eq!(
-            state
-                .cloud_plan_mirror
-                .as_ref()
-                .map(|plan| plan.goal.as_str()),
-            Some("Ship auth"),
-        );
-        assert!(
-            ui.warnings
-                .iter()
-                .any(|msg| msg.contains("Plan mirror sync failed")),
-            "user should see an actionable warning when plan sync fails: {:?}",
-            ui.warnings
         );
     }
 }

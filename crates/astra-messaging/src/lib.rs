@@ -17,6 +17,10 @@ pub mod types;
 
 // Re-export key types for convenience.
 pub use ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
+pub use astra_turn_types::{
+    AGENT_COMMUNICATION_SCHEMA_VERSION, AgentCommunicationDirection, AgentCommunicationEvent,
+    AgentCommunicationParty, AgentCommunicationTarget,
+};
 pub use db_transport::{
     CleanupScheduler, DatabaseTransport, TransportMetrics as DbTransportMetrics,
 };
@@ -32,5 +36,5 @@ pub use send_tool::SendResult;
 pub use transport::{MessageStream, MessageTransport};
 pub use types::{
     AgentAddress, AgentMessage, AgentSignal, MailboxError, MessagePayload, MessageTarget,
-    RequestType,
+    RequestType, agent_communication_event,
 };

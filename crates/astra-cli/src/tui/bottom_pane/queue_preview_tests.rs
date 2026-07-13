@@ -1,10 +1,28 @@
 #![cfg(test)]
 
 use super::BottomPane;
-use super::{DeferredFollowupPop, deferred_input_preview_fingerprint};
 use crate::tui::task_status::TaskStatus;
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::time::Instant;
+
+fn accept_guidance(pane: &mut BottomPane, intent_id: &str, text: &str) {
+    assert!(pane.accept_user_intent(
+        intent_id,
+        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+        astra_turn_types::UserIntentStatus::AcceptedLocal,
+        text,
+    ));
+}
+
+fn apply_guidance(pane: &mut BottomPane, intent_id: &str, text: &str) -> Option<String> {
+    pane.apply_user_intent(
+        intent_id,
+        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+        astra_turn_types::UserIntentStatus::Applied,
+        text,
+    )
+    .map(|intent| intent.text)
+}
 
 fn render_text(pane: &BottomPane, area: Rect) -> String {
     let mut buf = Buffer::empty(area);
@@ -43,7 +61,7 @@ fn active_turn_placeholder_explains_queue_vs_interrupt() {
 
     let rendered = render_text(&pane, Rect::new(0, 0, 80, 5));
     assert!(
-        rendered.contains("Message astra"),
+        rendered.contains("Message Astra"),
         "active composer should keep the same primary prompt as idle; got {rendered:?}"
     );
     assert!(
@@ -64,12 +82,35 @@ fn idle_composer_uses_clean_prompt_and_editor_hint() {
 
     let rendered = render_text(&pane, Rect::new(0, 0, 80, 5));
     assert!(
-        rendered.contains("Message astra"),
+        rendered.contains("Message Astra"),
         "idle composer should render a short prompt; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Ctrl+E opens editor") || rendered.contains("Shift+Enter newline"),
+        rendered.contains("Alt+E editor") || rendered.contains("Shift+Enter newline"),
         "idle composer should keep an in-panel helper hint; got {rendered:?}"
+    );
+}
+
+#[test]
+fn next_turn_queue_confirms_visibility_and_preserves_fifo() {
+    let mut pane = BottomPane::new();
+    assert!(pane.queue_next_turn_submission("summarize the findings".into()));
+    assert!(pane.queue_next_turn_submission("then prepare the patch".into()));
+
+    let rendered = render_text(&pane, Rect::new(0, 0, 90, 10));
+    assert!(
+        rendered.contains("Next message queued"),
+        "a locally accepted next turn must be visible immediately; got {rendered:?}"
+    );
+    assert!(rendered.contains("summarize the findings"), "{rendered:?}");
+    assert!(rendered.contains("then prepare the patch"), "{rendered:?}");
+
+    assert_eq!(
+        pane.take_queued_next_turn_submissions()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["summarize the findings", "then prepare the patch"],
+        "the next-turn lane must retain the user's submission order"
     );
 }
 
@@ -82,7 +123,7 @@ fn narrow_active_composer_degrades_helper_without_losing_stop_hint() {
 
     let rendered = render_text(&pane, Rect::new(0, 0, 42, 5));
     assert!(
-        rendered.contains("Message astra"),
+        rendered.contains("Message Astra"),
         "narrow composer should keep the primary prompt; got {rendered:?}"
     );
     assert!(
@@ -117,89 +158,46 @@ fn helper_row_stays_visible_after_typing_begins() {
 }
 
 #[test]
-fn pop_applied_deferred_followup_returns_head_on_matching_preview() {
-    // Contract: the server emits `__deferred_input_applied__:<preview>`
-    // per dequeued item, where `<preview>` is the server's own truncation
-    // of the dequeued text. The client recomputes the fingerprint from
-    // its head and compares — a match means it is safe to commit the
-    // head verbatim. This test pins both halves of the contract: the
-    // fingerprint algorithm must match the server's, and a match must
-    // pop the head regardless of how the server's truncation behaves
-    // for long / multi-line / wide input.
+fn applied_followups_resolve_by_identity_not_queue_position() {
     let mut pane = BottomPane::new();
-    pane.queue_deferred_followup("first queued message");
-    pane.queue_deferred_followup(
-        "a very long second message whose preview would truncate differently \
-         than the server's 80-char status line and therefore never match under \
-         the old implementation, causing it to be dropped out of order",
-    );
+    accept_guidance(&mut pane, "input-1", "first queued message");
+    accept_guidance(&mut pane, "input-2", "second queued message");
 
-    // First applied signal: preview must match "first queued message".
-    let first_preview = deferred_input_preview_fingerprint("first queued message");
     assert_eq!(
-        pane.pop_applied_deferred_followup(&first_preview),
-        DeferredFollowupPop::Applied("first queued message".to_string()),
-        "matching preview must pop the head, independent of preview text"
+        apply_guidance(&mut pane, "input-2", "runtime preview differs"),
+        Some("runtime preview differs".to_string()),
+        "an out-of-order applied event must resolve its own input"
     );
-    // Second applied signal: preview recomputed from the actual head text.
-    let long_text = "a very long second message whose preview would truncate differently \
-         than the server's 80-char status line and therefore never match under \
-         the old implementation, causing it to be dropped out of order";
-    let second_preview = deferred_input_preview_fingerprint(long_text);
-    match pane.pop_applied_deferred_followup(&second_preview) {
-        DeferredFollowupPop::Applied(text) => assert!(
-            text.starts_with("a very long second"),
-            "second applied signal must pop the next head when preview matches; got {text:?}"
-        ),
-        other => panic!("expected Applied, got {other:?}"),
-    }
-    // Popping an empty queue yields Empty, not a panic or a phantom drop.
-    let stray_preview = deferred_input_preview_fingerprint("stray");
-    assert!(
-        matches!(
-            pane.pop_applied_deferred_followup(&stray_preview),
-            DeferredFollowupPop::Empty
-        ),
-        "popping an empty queue yields Empty, not a panic or a phantom drop"
+    assert_eq!(
+        apply_guidance(&mut pane, "input-1", "first queued message"),
+        Some("first queued message".to_string())
+    );
+    assert_eq!(
+        apply_guidance(&mut pane, "input-1", "first queued message"),
+        None,
+        "replayed applied events must be idempotent"
     );
 }
 
 #[test]
-fn pop_applied_deferred_followup_surfaces_desync_instead_of_corrupting_history() {
-    // Regression: a bare FIFO pop trusted the server's "exactly one status
-    // line per item, in strict order" invariant. If the server ever drops
-    // or reorders an event, every subsequent pop commits the *wrong* text
-    // as the user's input. The fingerprint check turns that silent
-    // corruption into a visible, recoverable failure: on mismatch the
-    // entire local queue is dropped and returned as `Desync`.
+fn unknown_applied_input_does_not_corrupt_pending_local_inputs() {
     let mut pane = BottomPane::new();
-    pane.queue_deferred_followup("head that should have been applied");
-    pane.queue_deferred_followup("second item, now orphaned by desync");
-    pane.queue_deferred_followup("third item, also orphaned");
+    accept_guidance(&mut pane, "input-local", "local pending input");
 
-    // Server preview does NOT match the local head — desync.
-    let mismatched_preview = "something the server dequeued that we never queued";
-    match pane.pop_applied_deferred_followup(&mismatched_preview) {
-        DeferredFollowupPop::Desync { dropped } => {
-            assert_eq!(
-                dropped.len(),
-                3,
-                "desync must drop the entire local queue so no wrong text is committed; got {dropped:?}"
-            );
-            assert_eq!(dropped[0], "head that should have been applied");
-            assert_eq!(dropped[2], "third item, also orphaned");
-        }
-        other => panic!("expected Desync, got {other:?}"),
-    }
-
-    // After desync, the queue is empty — a stray applied signal yields Empty.
-    let stray_preview = deferred_input_preview_fingerprint("stray");
-    assert!(
-        matches!(
-            pane.pop_applied_deferred_followup(&stray_preview),
-            DeferredFollowupPop::Empty
-        ),
-        "post-desync queue must be empty"
+    assert_eq!(
+        apply_guidance(&mut pane, "input-other-client", "input from another client"),
+        Some("input from another client".to_string()),
+        "authoritative input from another attached client should reach history"
+    );
+    assert_eq!(
+        apply_guidance(&mut pane, "input-local", "runtime content"),
+        Some("runtime content".to_string()),
+        "an unrelated applied event must not drop local pending input"
+    );
+    assert_eq!(
+        apply_guidance(&mut pane, "input-other-client", "input from another client"),
+        None,
+        "replayed external input must not duplicate transcript history"
     );
 }
 
@@ -249,26 +247,72 @@ fn restore_into_composer_ignores_blank_input() {
 }
 
 #[test]
-fn queued_followup_panel_renders_immediate_feedback() {
+fn pending_user_intent_panel_renders_immediate_feedback() {
     let mut pane = BottomPane::new();
     pane.set_task_status(TaskStatus::TurnRunning {
         started_at: Instant::now(),
     });
-    pane.queue_deferred_followup("hi from the user");
+    accept_guidance(&mut pane, "input-1", "hi from the user");
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
     assert!(
-        rendered.contains("Esc sends now"),
-        "queued follow-up panel should lead with the action verb; got {rendered:?}"
+        rendered.contains("Queued for current run"),
+        "queued follow-up panel should name its delivery semantics; got {rendered:?}"
     );
     assert!(
-        rendered.contains("next tool"),
-        "queued follow-up panel should explain the accurate trigger; got {rendered:?}"
+        rendered.contains("next model boundary"),
+        "intent panel should explain when guidance applies; got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("queued"),
+        "intent panel should show the typed queue acknowledgement; got {rendered:?}"
     );
     assert!(
         rendered.contains("hi from the user"),
         "queued follow-up panel should show the queued message preview; got {rendered:?}"
     );
+}
+
+#[test]
+fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
+    let mut pane = BottomPane::new();
+    assert!(pane.accept_agent_guide(
+        "intent-agent-1".into(),
+        "internal-run-id".into(),
+        "Reviewer".into(),
+        "inspect the failing test".into(),
+    ));
+
+    let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
+    assert!(rendered.contains("Sending guidance to Reviewer"));
+    assert!(!rendered.contains("internal-run-id"));
+    assert!(pane.take_unapplied_user_intents().is_empty());
+    assert!(pane.promote_agent_guide_accepted("intent-agent-1"));
+    let pending = pane
+        .remove_agent_guide("intent-agent-1")
+        .expect("targeted guidance remains owned by the agent lane");
+    assert_eq!(
+        pending.status,
+        astra_turn_types::UserIntentStatus::AcceptedRemote
+    );
+}
+
+#[test]
+fn guidance_during_tool_execution_explains_the_real_application_boundary() {
+    let mut pane = BottomPane::new();
+    pane.set_task_status(TaskStatus::ToolExecuting {
+        name: "agent_fanout".into(),
+        started_at: Instant::now(),
+    });
+    accept_guidance(&mut pane, "input-during-tool", "review the latest finding");
+
+    let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
+    assert!(rendered.contains("Queued for current run"), "{rendered:?}");
+    assert!(
+        rendered.contains("applies after current tool"),
+        "{rendered:?}"
+    );
+    assert!(!rendered.contains("accepted locally"), "{rendered:?}");
 }
 
 #[test]

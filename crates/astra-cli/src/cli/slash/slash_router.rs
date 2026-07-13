@@ -69,11 +69,8 @@ fn find_model_list_entry<'a>(
     })
 }
 
-/// Slash-command fallback path used by the TUI for state-bearing
-/// commands (`/clear`, `/undo`, `/redo`, `/compact`, `/explain`,
-/// `/verbose`, `/reflect`, `/model`, etc.) that are dispatched from
-/// `tui::slash_dispatch::SlashResult::Fallback`. Returns `Ok(true)`
-/// when the caller should exit.
+/// Shared slash-command implementation for non-TUI command-line use.
+/// Returns `Ok(true)` when the caller should exit.
 pub(crate) async fn handle_slash_command(
     line: &str,
     api: &astra_thin_client::ThinClient,

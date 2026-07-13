@@ -5,12 +5,13 @@
 //! etc. Rendered as compact labeled rows so they read like product
 //! feedback rather than raw terminal logs.
 //!
-//! Persists as [`TurnEvent::System`]. Never live — the text is
-//! fully known at construction time, same as `UserCell`.
+//! Durable variants persist as [`TurnEvent::System`]. Explicit ephemeral
+//! warnings render in the current UI but return no persistence record. System
+//! cells are never live — the text is fully known at construction time.
 
 use std::any::Any;
 
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
@@ -22,6 +23,7 @@ pub(crate) struct SystemCell {
     level: SystemLevel,
     presentation: SystemPresentation,
     ts: Option<String>,
+    durable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,12 +33,26 @@ enum SystemPresentation {
 }
 
 impl SystemCell {
+    /// A local TUI/control action entered by the user, such as `/allow`.
+    /// Actions remain visible across resume but are not conversational user
+    /// messages and must never be supplied to the model as such.
+    pub fn action(command: impl Into<String>) -> Self {
+        Self {
+            message: command.into(),
+            level: SystemLevel::Action,
+            presentation: SystemPresentation::Standard,
+            ts: None,
+            durable: true,
+        }
+    }
+
     pub fn info(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             level: SystemLevel::Info,
             presentation: SystemPresentation::Standard,
             ts: None,
+            durable: true,
         }
     }
 
@@ -46,6 +62,7 @@ impl SystemCell {
             level: SystemLevel::Info,
             presentation: SystemPresentation::BackgroundTask,
             ts: None,
+            durable: true,
         }
     }
 
@@ -62,6 +79,7 @@ impl SystemCell {
             level: SystemLevel::Response,
             presentation: SystemPresentation::Standard,
             ts: None,
+            durable: true,
         }
     }
 
@@ -71,6 +89,17 @@ impl SystemCell {
             level: SystemLevel::Warning,
             presentation: SystemPresentation::Standard,
             ts: None,
+            durable: true,
+        }
+    }
+
+    pub fn ephemeral_warning(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            level: SystemLevel::Warning,
+            presentation: SystemPresentation::Standard,
+            ts: None,
+            durable: false,
         }
     }
 
@@ -86,6 +115,7 @@ impl SystemCell {
             level: SystemLevel::Error,
             presentation: SystemPresentation::Standard,
             ts: None,
+            durable: true,
         }
     }
 
@@ -102,6 +132,7 @@ impl SystemCell {
                 level,
                 presentation: SystemPresentation::Standard,
                 ts,
+                durable: true,
             }),
             _ => None,
         }
@@ -118,36 +149,42 @@ impl SystemCell {
 
 impl HistoryCell for SystemCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        let theme = crate::tui::theme::current();
         let (prefix, label_style, body_style) = match self.presentation {
             SystemPresentation::BackgroundTask => (
                 "↳ Background · ",
-                Style::default().cyan().bold(),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.gutter).bold(),
+                Style::default().fg(theme.fg),
             ),
             SystemPresentation::Standard => match self.level {
+                SystemLevel::Action => (
+                    "› ",
+                    Style::default().fg(theme.accent),
+                    Style::default().fg(theme.fg),
+                ),
                 SystemLevel::Info => (
                     "ℹ Note · ",
                     Style::default()
-                        .fg(crate::tui::theme::current().dim)
+                        .fg(theme.dim)
                         .add_modifier(ratatui::style::Modifier::DIM),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(theme.dim),
                 ),
                 SystemLevel::Response => (
                     "Result · ",
                     Style::default()
-                        .fg(crate::tui::theme::current().dim)
+                        .fg(theme.dim)
                         .add_modifier(ratatui::style::Modifier::DIM),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme.fg),
                 ),
                 SystemLevel::Warning => (
                     "⚠ Warning · ",
-                    Style::default().yellow().bold(),
-                    Style::default().yellow(),
+                    Style::default().fg(theme.warn).bold(),
+                    Style::default().fg(theme.warn),
                 ),
                 SystemLevel::Error => (
                     "✖ Error · ",
-                    Style::default().red().bold(),
-                    Style::default().red(),
+                    Style::default().fg(theme.error).bold(),
+                    Style::default().fg(theme.error),
                 ),
             },
         };
@@ -179,6 +216,9 @@ impl HistoryCell for SystemCell {
     }
 
     fn to_persist(&self) -> Option<TurnEvent> {
+        if !self.durable {
+            return None;
+        }
         Some(TurnEvent::System {
             ts: self.ts.clone(),
             level: self.level,
@@ -316,6 +356,10 @@ mod tests {
     #[test]
     fn persist_roundtrip_for_each_level() {
         for (mk, lv) in [
+            (
+                SystemCell::action("/allow") as SystemCell,
+                SystemLevel::Action,
+            ),
             (SystemCell::info("a") as SystemCell, SystemLevel::Info),
             (SystemCell::background_task("bg"), SystemLevel::Info),
             (SystemCell::response("d"), SystemLevel::Response),

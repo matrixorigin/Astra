@@ -10,8 +10,8 @@
 //! so users can page through the full breakdown on a small overlay.
 //!
 //! Keeping rendering line-oriented (rather than manual Rect layout)
-//! means the tests can assert against `Vec<Line>` directly and the
-//! scroll logic stays trivial.
+//! keeps terminal drawing simple. Navigation, however, is driven by typed
+//! layout metadata rather than by re-reading the rendered strings.
 //!
 //! Approximate shape:
 //!
@@ -37,6 +37,8 @@
 
 #![allow(dead_code)]
 
+use std::ops::Range;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -44,8 +46,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use super::model::{
-    Category, CategoryKind, ContextBreakdown, HistorySummary, MemoryItem, PressureBand, Section,
-    SkillItem, ToolItem, TurnDetail,
+    Category, CategoryKind, ContextBreakdown, HistoryEvidenceSource, HistorySummary, MemoryItem,
+    PressureBand, Section, SkillItem, ToolItem, TurnDetail,
 };
 
 /// Grid geometry. The grid lives in the left column of the two-pane
@@ -100,6 +102,60 @@ impl ViewState {
     }
 }
 
+/// One render pass plus the semantic positions the interactive wrapper needs.
+///
+/// The visible text is presentation only: a section can have a dynamic
+/// heading and item bodies can contain arbitrary model/user text.  Scrolling
+/// and focus must therefore use this typed layout rather than scanning spans
+/// for labels or marker glyphs after rendering.
+#[derive(Debug)]
+pub(crate) struct ContextLayout {
+    pub lines: Vec<Line<'static>>,
+    section_starts: Vec<(Section, u16)>,
+    selected_item_lines: Option<Range<u16>>,
+}
+
+impl ContextLayout {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            section_starts: Vec::new(),
+            selected_item_lines: None,
+        }
+    }
+
+    fn record_section(&mut self, section: Section, start: usize) {
+        self.section_starts.push((section, start as u16));
+    }
+
+    fn record_selected_item(&mut self, lines: Option<Range<usize>>) {
+        if let Some(lines) = lines {
+            self.selected_item_lines = Some(lines.start as u16..lines.end as u16);
+        }
+    }
+
+    fn trim_trailing_blanks(&mut self) {
+        while self
+            .lines
+            .last()
+            .map(|line| line.spans.is_empty())
+            .unwrap_or(false)
+        {
+            self.lines.pop();
+        }
+    }
+
+    pub(crate) fn section_start(&self, section: Section) -> Option<u16> {
+        self.section_starts
+            .iter()
+            .find_map(|(candidate, start)| (*candidate == section).then_some(*start))
+    }
+
+    pub(crate) fn selected_item_line_range(&self) -> Option<Range<u16>> {
+        self.selected_item_lines.clone()
+    }
+}
+
 /// Ratatui render shim used by `ContextPanelView` and tests.
 pub(crate) fn render(b: &ContextBreakdown, area: Rect, buf: &mut Buffer) {
     render_with(b, area, buf, 0, ViewState::default())
@@ -119,17 +175,18 @@ pub(crate) fn render_with(
         return;
     }
     let band = b.band();
+    let theme = crate::tui::theme::current();
     let outer = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(theme.gutter_frozen))
         .title(title_line(b, band));
     let inner = outer.inner(area);
     outer.render(area, buf);
 
-    if b.limit == 0 && b.categories.is_empty() {
+    if !b.has_observable_data() {
         let msg = Line::from(Span::styled(
             "  no context trace yet — run a turn first",
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
         ));
         Paragraph::new(msg).render(inner, buf);
         return;
@@ -163,10 +220,10 @@ pub(crate) fn line_count(b: &ContextBreakdown, inner_width: u16) -> u16 {
 }
 
 pub(crate) fn line_count_with(b: &ContextBreakdown, inner_width: u16, state: ViewState) -> u16 {
-    if b.limit == 0 && b.categories.is_empty() {
+    if !b.has_observable_data() {
         return 0;
     }
-    build_lines_with(b, inner_width, state).len() as u16
+    build_layout_with(b, inner_width, state).lines.len() as u16
 }
 
 /// How many items in the given section are selectable when it's
@@ -198,35 +255,18 @@ pub(crate) fn section_line_index(
     state: ViewState,
     target: Section,
 ) -> Option<u16> {
-    if !b.section_non_empty(target) {
-        return None;
-    }
-    let lines = build_lines_with(b, inner_width, state);
-    let heading_text = match target {
-        Section::SystemPrompt
-        | Section::History
-        | Section::Session
-        | Section::PromptSignals
-        | Section::Compaction
-        | Section::Decisions => target.label(),
-        Section::Tools => "Tools · /tool",
-        Section::Memory => "Memory · /memory",
-        Section::Skills => {
-            // Skills heading varies depending on whether we're in
-            // the tokenless fallback form or the full one. Match on
-            // the core label, ignoring any explanatory suffix.
-            "Skills · /skills"
-        }
-    };
-    lines
-        .iter()
-        .position(|l| line_contains(l, heading_text))
-        .map(|i| i as u16)
+    build_layout_with(b, inner_width, state).section_start(target)
 }
 
-fn line_contains(line: &Line<'_>, needle: &str) -> bool {
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    text.contains(needle)
+/// Typed extent of the currently selected expanded item. The workbench uses
+/// this to keep the whole item visible without treating a decorative marker
+/// in arbitrary rendered content as a navigation signal.
+pub(crate) fn selected_item_line_range(
+    b: &ContextBreakdown,
+    inner_width: u16,
+    state: ViewState,
+) -> Option<Range<u16>> {
+    build_layout_with(b, inner_width, state).selected_item_line_range()
 }
 
 pub(crate) fn desired_height(b: &ContextBreakdown) -> u16 {
@@ -234,7 +274,7 @@ pub(crate) fn desired_height(b: &ContextBreakdown) -> u16 {
     // capped at 20 rows here; the view wrapper enables scrolling
     // when content exceeds that budget.  The empty-breakdown case
     // still needs a minimum of 3 (border + stub row).
-    if b.limit == 0 && b.categories.is_empty() {
+    if !b.has_observable_data() {
         return 3;
     }
     // Top block: GRID_ROWS side-by-side with the legend, plus header,
@@ -253,7 +293,7 @@ pub(crate) fn desired_height(b: &ContextBreakdown) -> u16 {
 /// view, no focus highlight. Retained for stateless callers and
 /// legacy tests. Defers to [`build_lines_with`] under the hood.
 pub(crate) fn build_lines(b: &ContextBreakdown, inner_width: u16) -> Vec<Line<'static>> {
-    build_lines_with(b, inner_width, ViewState::default())
+    build_layout_with(b, inner_width, ViewState::default()).lines
 }
 
 /// State-aware version of [`build_lines`]. Honors the focus
@@ -264,14 +304,40 @@ pub(crate) fn build_lines_with(
     inner_width: u16,
     state: ViewState,
 ) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
+    build_layout_with(b, inner_width, state).lines
+}
+
+/// Build the visible lines and their semantic navigation metadata together.
+/// This is the single source of truth for context panel geometry.
+pub(crate) fn build_layout_with(
+    b: &ContextBreakdown,
+    inner_width: u16,
+    state: ViewState,
+) -> ContextLayout {
+    let mut layout = ContextLayout::new();
+
+    if b.limit == 0 && b.categories.is_empty() {
+        layout.lines.push(Line::from(Span::styled(
+            "  Exact prompt composition is not available yet; session state below is current local evidence.",
+            Style::default()
+                .fg(crate::tui::theme::current().dim)
+                .add_modifier(Modifier::DIM),
+        )));
+        layout.lines.push(Line::default());
+        render_section(&mut layout, b, state, Section::Session);
+        render_section(&mut layout, b, state, Section::Skills);
+        render_section(&mut layout, b, state, Section::History);
+        render_section(&mut layout, b, state, Section::Compaction);
+        layout.trim_trailing_blanks();
+        return layout;
+    }
 
     // Header — model token counts + compression hint.
-    out.push(header_line(b));
+    layout.lines.push(header_line(b));
     if b.compression_triggered {
-        out.push(Line::from(Span::styled(
+        layout.lines.push(Line::from(Span::styled(
             "  ⚠ compression triggered on the last turn",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(crate::tui::theme::current().warn),
         )));
     }
     // Top-of-panel hint tracks the current interaction mode so the
@@ -294,42 +360,40 @@ pub(crate) fn build_lines_with(
     } else {
         "  Tab focus · Enter close · j/k scroll · Esc close"
     };
-    out.push(Line::from(Span::styled(
+    layout.lines.push(Line::from(Span::styled(
         hint,
         Style::default().add_modifier(Modifier::DIM),
     )));
-    out.push(Line::default());
+    layout.lines.push(Line::default());
 
     // Top block: grid on the left, category legend on the right.
     // Computed together so both columns stay aligned even when the
     // legend has more rows than the grid (5) — we pad whichever
     // side is shorter with blank spans.
-    out.extend(top_block_lines(b, inner_width));
-    out.push(Line::default());
+    layout.lines.extend(top_block_lines(b, inner_width));
+    layout.lines.push(Line::default());
 
     // Nested sub-sections. Only rendered when non-empty.
-    render_section(&mut out, b, state, Section::Session);
-    render_section(&mut out, b, state, Section::SystemPrompt);
-    render_section(&mut out, b, state, Section::PromptSignals);
-    render_section(&mut out, b, state, Section::Tools);
-    render_section(&mut out, b, state, Section::Skills);
-    render_section(&mut out, b, state, Section::Memory);
-    render_section(&mut out, b, state, Section::History);
-    render_section(&mut out, b, state, Section::Compaction);
-    render_section(&mut out, b, state, Section::Decisions);
+    render_section(&mut layout, b, state, Section::Session);
+    render_section(&mut layout, b, state, Section::SystemPrompt);
+    render_section(&mut layout, b, state, Section::PromptSignals);
+    render_section(&mut layout, b, state, Section::Tools);
+    render_section(&mut layout, b, state, Section::Skills);
+    render_section(&mut layout, b, state, Section::Memory);
+    render_section(&mut layout, b, state, Section::History);
+    render_section(&mut layout, b, state, Section::Compaction);
+    render_section(&mut layout, b, state, Section::Decisions);
 
     // Drop the last blank line if we pushed one — trailing blanks
     // render as empty lines at the bottom of the scroll view which
     // feels unfinished.
-    while out.last().map(|l| l.spans.is_empty()).unwrap_or(false) {
-        out.pop();
-    }
+    layout.trim_trailing_blanks();
 
-    out
+    layout
 }
 
 fn render_section(
-    out: &mut Vec<Line<'static>>,
+    layout: &mut ContextLayout,
     b: &ContextBreakdown,
     state: ViewState,
     section: Section,
@@ -337,9 +401,12 @@ fn render_section(
     if !b.section_non_empty(section) {
         return;
     }
+    let start = layout.lines.len();
+    layout.record_section(section, start);
+    let out = &mut layout.lines;
     let focused = state.focus == Some(section);
     let expanded = state.is_expanded(section);
-    match section {
+    let selected_item = match section {
         Section::SystemPrompt => {
             out.push(section_heading_for(
                 Section::SystemPrompt,
@@ -359,36 +426,42 @@ fn render_section(
                 }
             }
             out.push(Line::default());
+            None
         }
         Section::Tools => {
             out.push(section_heading_for(Section::Tools, focused, expanded));
-            if state.is_drilled(Section::Tools) {
+            let selected = if state.is_drilled(Section::Tools) {
                 render_tool_drill(out, &b.tools, state.selected_item);
+                None
             } else if expanded {
-                append_tools_expanded(out, &b.tools, state.selected_item);
+                append_tools_expanded(out, &b.tools, state.selected_item)
             } else {
                 for t in &b.tools {
                     out.push(section_row(&format!(" {}", t.name), t.tokens));
                 }
-            }
+                None
+            };
             out.push(Line::default());
+            selected
         }
         Section::Skills => {
             append_skill_section(out, &b.skills, focused, expanded);
+            None
         }
         Section::Memory => {
             if state.is_drilled(Section::Memory) {
                 out.push(section_heading_for(Section::Memory, focused, expanded));
                 render_memory_drill(out, &b.memories, state.selected_item);
                 out.push(Line::default());
-                return;
-            }
-            if !b.memories.is_empty() {
-                append_memory_section(out, &b.memories, focused, expanded, state.selected_item);
+                None
+            } else if !b.memories.is_empty() {
+                let selected =
+                    append_memory_section(out, &b.memories, focused, expanded, state.selected_item);
                 if expanded && !b.memory_focus.is_empty() {
                     append_memory_focus(out, &b.memory_focus);
                     out.push(Line::default());
                 }
+                selected
             } else if !b.memory_focus.is_empty() {
                 // No selected memories this turn but retrieval
                 // or prompt injection still happened. Show the
@@ -401,6 +474,9 @@ fn render_section(
                     append_memory_focus_collapsed(out, &b.memory_focus);
                 }
                 out.push(Line::default());
+                None
+            } else {
+                None
             }
         }
         Section::History => {
@@ -408,25 +484,29 @@ fn render_section(
                 out.push(section_heading_for(Section::History, focused, expanded));
                 render_history_drill(out, &b.history.turns, state.selected_item);
                 out.push(Line::default());
+                None
             } else {
-                append_history_section(out, &b.history, focused, expanded, state.selected_item);
+                append_history_section(out, &b.history, focused, expanded, state.selected_item)
             }
         }
         Section::Session => {
             if let Some(s) = b.session_summary.as_ref() {
                 append_session_section(out, s, focused, expanded);
             }
+            None
         }
         Section::PromptSignals => {
             append_prompt_signals_section(out, &b.prompt_signals, focused, expanded);
+            None
         }
         Section::Decisions => {
             if state.is_drilled(Section::Decisions) {
                 out.push(section_heading_for(Section::Decisions, focused, expanded));
                 render_decision_drill(out, &b.decisions, state.selected_item);
                 out.push(Line::default());
+                None
             } else {
-                append_decisions_section(out, &b.decisions, focused, expanded, state.selected_item);
+                append_decisions_section(out, &b.decisions, focused, expanded, state.selected_item)
             }
         }
         Section::Compaction => {
@@ -434,6 +514,7 @@ fn render_section(
                 out.push(section_heading_for(Section::Compaction, focused, expanded));
                 render_compaction_drill(out, &b.compaction, state.selected_item);
                 out.push(Line::default());
+                None
             } else {
                 append_compaction_section(
                     out,
@@ -441,10 +522,11 @@ fn render_section(
                     focused,
                     expanded,
                     state.selected_item,
-                );
+                )
             }
         }
-    }
+    };
+    layout.record_selected_item(selected_item);
 }
 
 fn header_line(b: &ContextBreakdown) -> Line<'static> {
@@ -457,7 +539,7 @@ fn header_line(b: &ContextBreakdown) -> Line<'static> {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  ({pct:.1}%)"),
+            format!("  current prompt ({pct:.1}%)"),
             Style::default().fg(b.band().color()),
         ),
     ])
@@ -533,8 +615,9 @@ fn render_grid_cells(b: &ContextBreakdown) -> Vec<Span<'static>> {
         remaining_tokens = remaining_tokens.saturating_sub(cat.tokens as u64);
     }
     // Remaining cells are free space.
+    let theme = crate::tui::theme::current();
     for _ in 0..remaining_cells {
-        out.push(grid_glyph(false, Color::DarkGray));
+        out.push(grid_glyph(false, theme.dim));
     }
     out
 }
@@ -567,6 +650,7 @@ fn legend_lines(b: &ContextBreakdown, width: usize) -> Vec<Line<'static>> {
 }
 
 fn legend_row(cat: &Category, label_width: usize) -> Line<'static> {
+    let theme = crate::tui::theme::current();
     let mark = Span::styled("⛁ ", Style::default().fg(cat.kind.color()));
     let label = Span::styled(
         format!("{:<w$}", cat.kind.label(), w = label_width),
@@ -578,18 +662,19 @@ fn legend_row(cat: &Category, label_width: usize) -> Line<'static> {
     );
     let pct = Span::styled(
         format!("  ({:>4.1}%)", cat.pct_of_limit),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.dim),
     );
     Line::from(vec![mark, label, tokens, pct])
 }
 
 fn free_space_row(free_tokens: u32, limit: u32, label_width: usize) -> Line<'static> {
+    let theme = crate::tui::theme::current();
     let pct = if limit == 0 {
         0.0
     } else {
         free_tokens as f64 / limit as f64 * 100.0
     };
-    let mark = Span::styled("⛶ ", Style::default().fg(Color::DarkGray));
+    let mark = Span::styled("⛶ ", Style::default().fg(theme.dim));
     let label = Span::styled(
         format!("{:<w$}", "Free space", w = label_width),
         Style::default().add_modifier(Modifier::DIM),
@@ -598,10 +683,7 @@ fn free_space_row(free_tokens: u32, limit: u32, label_width: usize) -> Line<'sta
         format!("  {:>7}", fmt_tokens(free_tokens)),
         Style::default().add_modifier(Modifier::DIM),
     );
-    let pct_span = Span::styled(
-        format!("  ({pct:>4.1}%)"),
-        Style::default().fg(Color::DarkGray),
-    );
+    let pct_span = Span::styled(format!("  ({pct:>4.1}%)"), Style::default().fg(theme.dim));
     Line::from(vec![mark, label, tokens, pct_span])
 }
 
@@ -664,14 +746,29 @@ fn append_history_section(
     focused: bool,
     expanded: bool,
     selected_item: usize,
-) {
+) -> Option<Range<usize>> {
     if h.is_empty() {
-        return;
+        return None;
     }
+    let mut selected_lines = None;
     out.push(section_heading_for(Section::History, focused, expanded));
     // Collapsed view: just the aggregate counts.
     let mut turn_spans: Vec<Span<'static>> = vec![Span::raw("    └ ")];
-    turn_spans.push(Span::raw(format!("{} turns", h.total_turns)));
+    match h.evidence_source {
+        HistoryEvidenceSource::PromptTrace => {
+            turn_spans.push(Span::raw(format!("{} turns", h.total_turns)));
+        }
+        HistoryEvidenceSource::LocalVisibleConversation => {
+            turn_spans.push(Span::raw(format!(
+                "{} visible conversation items",
+                h.total_turns
+            )));
+            turn_spans.push(Span::styled(
+                "  (prompt trace unavailable)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
     if h.retained > 0 || h.compressed > 0 || h.dropped > 0 {
         turn_spans.push(Span::styled(
             format!(
@@ -708,9 +805,13 @@ fn append_history_section(
         // Walk turns in the model's order (sorted ascending by
         // turn index); item selection uses that same flat index.
         for (i, t) in h.turns.iter().enumerate() {
+            let item_start = out.len();
             let selected = i == selected_item;
             let compressed = t.compressed_from.is_some();
             out.extend(turn_detail_lines(t, compressed, selected));
+            if selected {
+                selected_lines = Some(item_start..out.len());
+            }
         }
         if !h.dropped_indices.is_empty() {
             let rendered_indices: Vec<String> =
@@ -722,6 +823,7 @@ fn append_history_section(
         }
     }
     out.push(Line::default());
+    selected_lines
 }
 
 fn turn_detail_lines(t: &TurnDetail, compressed: bool, selected: bool) -> Vec<Line<'static>> {
@@ -767,7 +869,7 @@ fn turn_detail_lines(t: &TurnDetail, compressed: bool, selected: bool) -> Vec<Li
         if t.has_tool_calls {
             spans.push(Span::styled(
                 "  [tools]".to_string(),
-                Style::default().fg(Color::Magenta),
+                Style::default().fg(crate::tui::theme::current().command),
             ));
         }
     }
@@ -799,7 +901,11 @@ fn turn_detail_lines(t: &TurnDetail, compressed: bool, selected: bool) -> Vec<Li
     out
 }
 
-fn append_tools_expanded(out: &mut Vec<Line<'static>>, tools: &[ToolItem], selected_item: usize) {
+fn append_tools_expanded(
+    out: &mut Vec<Line<'static>>,
+    tools: &[ToolItem],
+    selected_item: usize,
+) -> Option<Range<usize>> {
     out.push(Line::from(vec![
         Span::raw("    "),
         Span::styled(
@@ -807,7 +913,9 @@ fn append_tools_expanded(out: &mut Vec<Line<'static>>, tools: &[ToolItem], selec
             Style::default().add_modifier(Modifier::DIM),
         ),
     ]));
+    let mut selected_lines = None;
     for (i, t) in tools.iter().enumerate() {
+        let item_start = out.len();
         let selected = i == selected_item;
         let marker: Span<'static> = if selected {
             Span::styled(
@@ -829,7 +937,11 @@ fn append_tools_expanded(out: &mut Vec<Line<'static>>, tools: &[ToolItem], selec
                 Style::default().add_modifier(Modifier::DIM),
             ),
         ]));
+        if selected {
+            selected_lines = Some(item_start..out.len());
+        }
     }
+    selected_lines
 }
 
 /// Drill view for a single visible tool.
@@ -880,7 +992,7 @@ fn render_history_drill(out: &mut Vec<Line<'static>>, turns: &[TurnDetail], sele
         ),
         Span::styled(
             if t.has_tool_calls { "  [tools]" } else { "" }.to_string(),
-            Style::default().fg(Color::Magenta),
+            Style::default().fg(crate::tui::theme::current().command),
         ),
     ]));
     if let Some((orig, method)) = &t.compressed_from {
@@ -1026,10 +1138,11 @@ fn append_memory_section(
     focused: bool,
     expanded: bool,
     selected_item: usize,
-) {
+) -> Option<Range<usize>> {
     if memories.is_empty() {
-        return;
+        return None;
     }
+    let mut selected_lines = None;
     out.push(section_heading_for(Section::Memory, focused, expanded));
     if expanded {
         out.push(Line::from(vec![
@@ -1041,6 +1154,7 @@ fn append_memory_section(
         ]));
     }
     for (i, m) in memories.iter().enumerate() {
+        let item_start = out.len();
         let selected = expanded && i == selected_item;
         let marker: Span<'static> = if selected {
             Span::styled(
@@ -1104,8 +1218,12 @@ fn append_memory_section(
                 ]));
             }
         }
+        if selected {
+            selected_lines = Some(item_start..out.len());
+        }
     }
     out.push(Line::default());
+    selected_lines
 }
 
 /// When the Memory section is expanded, render the richer
@@ -1332,7 +1450,7 @@ fn append_session_section(
         Span::raw("    └ "),
         Span::styled(
             format!(
-                "in {}  ·  out {}  ·  cache-read {}  ·  cache-create {}",
+                "session totals · in {}  ·  out {}  ·  cache-read {}  ·  cache-create {}",
                 fmt_tokens_u64(s.prompt_tokens),
                 fmt_tokens_u64(s.completion_tokens),
                 fmt_tokens_u64(s.cache_read_tokens),
@@ -1341,6 +1459,34 @@ fn append_session_section(
             Style::default().add_modifier(Modifier::DIM),
         ),
     ]));
+
+    if let Some(request) = s.request_context {
+        let usage = request.usage;
+        let pct = if usage.limit_tokens == 0 {
+            0.0
+        } else {
+            usage.used_tokens as f64 / usage.limit_tokens as f64 * 100.0
+        };
+        let provenance = match usage.source {
+            astra_turn_types::ContextWindowUsageSource::Estimated => "estimated",
+            astra_turn_types::ContextWindowUsageSource::ProviderReported => "provider measured",
+        };
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                format!(
+                    "{} context · {:.0}% · {}/{} · {provenance}",
+                    request.scope.label(),
+                    pct,
+                    fmt_tokens_u64(usage.used_tokens),
+                    fmt_tokens_u64(usage.limit_tokens),
+                ),
+                Style::default().fg(crate::tui::theme::current().accent),
+            ),
+        ]));
+    }
+
+    append_read_activity(out, &s.read_activity, expanded);
 
     if expanded {
         if let Some(a) = &s.continuation_anchor {
@@ -1394,6 +1540,77 @@ fn append_session_section(
     }
 
     out.push(Line::default());
+}
+
+fn append_read_activity(
+    out: &mut Vec<Line<'static>>,
+    activity: &super::model::ReadActivity,
+    expanded: bool,
+) {
+    use super::model::ReadActivity;
+
+    match activity {
+        ReadActivity::Loading => out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                "read_file activity · loading durable session evidence…",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ])),
+        ReadActivity::Unavailable(reason) => out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                format!("read_file activity unavailable · {reason}"),
+                Style::default().fg(crate::tui::theme::current().dim),
+            ),
+        ])),
+        ReadActivity::Available(summary) if !summary.has_activity() => out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                "read_file activity · no recorded requests in this session",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ])),
+        ReadActivity::Available(summary) => {
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::styled(
+                    format!(
+                        "read_file activity · {} requests · {} executed · {} files",
+                        summary.requested, summary.executed, summary.distinct_files
+                    ),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+            if expanded {
+                out.push(Line::from(vec![
+                    Span::raw("        "),
+                    Span::styled(
+                        format!(
+                            "{} reused/suppressed · {} rejected/deferred · {} exact repeats from {} fully identified requests",
+                            summary.reused_or_suppressed,
+                            summary.other_not_executed,
+                            summary.exact_repeat_requests,
+                            summary.requests_with_exact_identity,
+                        ),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                ]));
+                if summary.repeats_after_recorded_compaction > 0 {
+                    out.push(Line::from(vec![
+                        Span::raw("        "),
+                        Span::styled(
+                            format!(
+                                "{} exact repeat(s) followed a recorded compaction · correlation only, not proof of cause",
+                                summary.repeats_after_recorded_compaction
+                            ),
+                            Style::default().fg(crate::tui::theme::current().dim),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
 }
 
 fn append_prompt_signals_section(
@@ -1471,10 +1688,11 @@ fn append_decisions_section(
     focused: bool,
     expanded: bool,
     selected_item: usize,
-) {
+) -> Option<Range<usize>> {
     if decisions.is_empty() {
-        return;
+        return None;
     }
+    let mut selected_lines = None;
     out.push(section_heading_for(Section::Decisions, focused, expanded));
     if expanded {
         out.push(Line::from(vec![
@@ -1486,6 +1704,7 @@ fn append_decisions_section(
         ]));
     }
     for (i, d) in decisions.iter().enumerate() {
+        let item_start = out.len();
         let selected = expanded && i == selected_item;
         let marker: Span<'static> = if selected {
             Span::styled(
@@ -1543,8 +1762,12 @@ fn append_decisions_section(
                 }
             }
         }
+        if selected {
+            selected_lines = Some(item_start..out.len());
+        }
     }
     out.push(Line::default());
+    selected_lines
 }
 
 fn append_compaction_section(
@@ -1553,10 +1776,11 @@ fn append_compaction_section(
     focused: bool,
     expanded: bool,
     selected_item: usize,
-) {
+) -> Option<Range<usize>> {
     if c.is_empty() {
-        return;
+        return None;
     }
+    let mut selected_lines = None;
     out.push(section_heading_for(Section::Compaction, focused, expanded));
     // Aggregate lines (always shown).
     let trig = if c.triggered_this_turn {
@@ -1569,7 +1793,7 @@ fn append_compaction_section(
         Span::styled(
             trig.to_string(),
             if c.triggered_this_turn {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(crate::tui::theme::current().warn)
             } else {
                 Style::default().fg(Color::DarkGray)
             },
@@ -1610,6 +1834,36 @@ fn append_compaction_section(
             )),
         ]));
     }
+    if !c.stages.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                format!(
+                    "{} pipeline stage{} freed {}",
+                    c.stages.len(),
+                    if c.stages.len() == 1 { "" } else { "s" },
+                    fmt_tokens(c.stages.iter().map(|stage| stage.tokens_freed).sum()),
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        if expanded {
+            for stage in &c.stages {
+                out.push(Line::from(vec![
+                    Span::raw("        └ "),
+                    Span::raw(stage.stage.clone()),
+                    Span::styled(
+                        format!(
+                            " · {} · freed {}",
+                            stage.method,
+                            fmt_tokens(stage.tokens_freed)
+                        ),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                ]));
+            }
+        }
+    }
     // Per-event detail on expand.
     if expanded && !c.events.is_empty() {
         out.push(Line::from(vec![
@@ -1620,6 +1874,7 @@ fn append_compaction_section(
             ),
         ]));
         for (i, e) in c.events.iter().enumerate() {
+            let item_start = out.len();
             let selected = i == selected_item;
             let marker: Span<'static> = if selected {
                 Span::styled(
@@ -1666,9 +1921,13 @@ fn append_compaction_section(
                     }
                 }
             }
+            if selected {
+                selected_lines = Some(item_start..out.len());
+            }
         }
     }
     out.push(Line::default());
+    selected_lines
 }
 
 fn render_compaction_drill(
@@ -1806,6 +2065,22 @@ fn section_row(label: &str, tokens: u32) -> Line<'static> {
 }
 
 fn title_line(b: &ContextBreakdown, band: PressureBand) -> Line<'static> {
+    if !b.has_observable_data() {
+        return Line::from(Span::styled(
+            " Context · no evidence yet ",
+            Style::default()
+                .fg(crate::tui::theme::current().dim)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if b.limit == 0 && b.categories.is_empty() {
+        return Line::from(Span::styled(
+            " Context · partial evidence ",
+            Style::default()
+                .fg(crate::tui::theme::current().warn)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     let pct = b.usage_percent();
     let headline = format!(" Context window ({pct:.0}% · {}) ", band.label());
     Line::from(vec![Span::styled(
@@ -1932,7 +2207,7 @@ fn fmt_tokens(n: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::ContextBreakdown;
+    use super::super::model::{ContextBreakdown, ContextSnapshot, SessionSummary};
     use super::*;
     use crate::tui::testing::render::{buffer_to_string, draw_widget};
     use astra_turn_core::context_assembly_trace::{
@@ -1965,6 +2240,7 @@ mod tests {
             tool_schema_tokens: tools,
             user_message_tokens: user,
             total_used: total,
+            usage_source: Default::default(),
             budget_pressure: pressure,
             compression_triggered: false,
         };
@@ -2023,7 +2299,6 @@ mod tests {
 
     #[test]
     fn snapshot_history_expanded_with_wrapped_previews_100x30() {
-        use super::super::model::ContextSnapshot;
         let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
         t.history.total_turns_available = 3;
         t.history.turns_retained = vec![
@@ -2032,42 +2307,24 @@ mod tests {
                 role: "user".into(),
                 tokens: 80,
                 has_tool_calls: false,
+                content_preview: "user: Can you refactor the auth module so the session validator lives in its own file?".into(),
             },
             TurnRetention {
                 turn_index: 1,
                 role: "assistant".into(),
                 tokens: 4_200,
                 has_tool_calls: true,
+                content_preview: "assistant: I'll start by reading auth.rs and mapping out every caller. Let me look at the module structure first, then identify what to move. The validate_session function has three call sites that I'll need to update.".into(),
             },
             TurnRetention {
                 turn_index: 2,
                 role: "user".into(),
                 tokens: 40,
                 has_tool_calls: false,
+                content_preview: "user: Thanks — now make the helper private.".into(),
             },
         ];
-        let mut snap = ContextSnapshot::default();
-        snap.history_previews.insert(
-            0,
-            "Can you refactor the auth module so the session validator \
-             lives in its own file?"
-                .into(),
-        );
-        snap.history_previews.insert(
-            1,
-            "I'll start by reading auth.rs and mapping out every caller.".into(),
-        );
-        snap.history_previews
-            .insert(2, "Thanks — now make the helper private.".into());
-        snap.history_bodies.insert(
-            1,
-            "I'll start by reading auth.rs and mapping out every caller.\n\n\
-             Let me look at the module structure first, then identify what\n\
-             to move. The validate_session function has three call sites\n\
-             that I'll need to update."
-                .into(),
-        );
-        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::History),
             expanded: Some(Section::History),
@@ -2086,7 +2343,6 @@ mod tests {
 
     #[test]
     fn snapshot_history_drill_100x30() {
-        use super::super::model::ContextSnapshot;
         let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
         t.history.total_turns_available = 1;
         t.history.turns_retained = vec![TurnRetention {
@@ -2094,21 +2350,10 @@ mod tests {
             role: "assistant".into(),
             tokens: 4_200,
             has_tool_calls: true,
+            content_preview:
+                "assistant: I'll start by reading auth.rs and mapping out every caller.".into(),
         }];
-        let mut snap = ContextSnapshot::default();
-        snap.history_bodies.insert(
-            0,
-            "I'll start by reading auth.rs and mapping out every caller.\n\n\
-             Let me look at the module structure first, then identify what\n\
-             to move. The validate_session function has three call sites\n\
-             that I'll need to update.\n\n\
-             Plan:\n\
-             1. Extract validate_session into src/auth/session_validator.rs.\n\
-             2. Update main.rs, middleware.rs, and test_utils.rs.\n\
-             3. Run the test suite and verify nothing regressed."
-                .into(),
-        );
-        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::History),
             expanded: Some(Section::History),
@@ -2134,6 +2379,7 @@ mod tests {
             role: "user".into(),
             tokens: 50,
             has_tool_calls: false,
+            content_preview: String::new(),
         }];
         let b = ContextBreakdown::from_trace(&t);
         let text: String = build_lines(&b, 80)
@@ -2254,8 +2500,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_history_includes_turn_previews_when_snapshot_provides_them() {
-        use super::super::model::ContextSnapshot;
+    fn expanded_history_uses_prompt_trace_previews() {
         let mut t = trace(100_000, 2_000, 8_000, 0, 0, 0);
         t.history.total_turns_available = 2;
         t.history.turns_retained = vec![
@@ -2264,20 +2509,17 @@ mod tests {
                 role: "user".into(),
                 tokens: 50,
                 has_tool_calls: false,
+                content_preview: "user: can you refactor the auth module".into(),
             },
             TurnRetention {
                 turn_index: 1,
                 role: "assistant".into(),
                 tokens: 1_200,
                 has_tool_calls: true,
+                content_preview: "assistant: I'll start by reading auth.rs…".into(),
             },
         ];
-        let mut snap = ContextSnapshot::default();
-        snap.history_previews
-            .insert(0, "can you refactor the auth module".into());
-        snap.history_previews
-            .insert(1, "I'll start by reading auth.rs…".into());
-        let b = ContextBreakdown::from_trace_with(&t, &snap);
+        let b = ContextBreakdown::from_trace(&t);
         let state = ViewState {
             focus: Some(Section::History),
             expanded: Some(Section::History),
@@ -2564,7 +2806,9 @@ mod tests {
 
     #[test]
     fn session_section_renders_when_snapshot_carries_summary() {
-        use super::super::model::{ContextSnapshot, SessionSummary};
+        use super::super::model::{
+            ContextSnapshot, RequestContextEvidence, RequestContextScope, SessionSummary,
+        };
         let t = trace(100_000, 1_000, 0, 0, 0, 0);
         let mut snap = ContextSnapshot::default();
         snap.session = Some(SessionSummary {
@@ -2577,9 +2821,14 @@ mod tests {
             completion_tokens: 300,
             cache_read_tokens: 800,
             cache_creation_tokens: 0,
+            request_context: Some(RequestContextEvidence {
+                usage: astra_turn_types::ContextWindowUsage::provider_reported(25_000, 100_000),
+                scope: RequestContextScope::LastCompletedRequest,
+            }),
             continuation_anchor: Some("refactoring auth".into()),
             queued_message: None,
             diagnostics_context: None,
+            read_activity: Default::default(),
         });
         let b = ContextBreakdown::from_trace_with(&t, &snap);
         let state = ViewState {
@@ -2598,7 +2847,61 @@ mod tests {
         assert!(text.contains("test-model-x"));
         assert!(text.contains("$0.1200"));
         assert!(text.contains("/ $1.00"));
+        assert!(
+            text.contains(
+                "last completed request context · 25% · 25.0k/100.0k · provider measured"
+            ),
+            "request context is distinct from session totals: {text}"
+        );
         assert!(text.contains("refactoring auth"));
+    }
+
+    #[test]
+    fn partial_evidence_view_keeps_known_session_and_history_visible() {
+        use super::super::model::{ContextSnapshot, SessionSummary, VisibleConversationItem};
+        let mut snap = ContextSnapshot::default();
+        snap.session = Some(SessionSummary {
+            session_id: "session-known".into(),
+            turn: 4,
+            model: Some("model-known".into()),
+            total_cost: 0.02,
+            max_budget: 1.0,
+            prompt_tokens: 1_000,
+            completion_tokens: 200,
+            cache_read_tokens: 300,
+            cache_creation_tokens: 0,
+            request_context: None,
+            continuation_anchor: None,
+            queued_message: None,
+            diagnostics_context: None,
+            read_activity: Default::default(),
+        });
+        snap.visible_conversation.push(VisibleConversationItem {
+            role: "user".into(),
+            preview: "keep this task moving".into(),
+            body: "keep this task moving".into(),
+        });
+        let breakdown = ContextBreakdown::from_snapshot_without_trace(&snap);
+
+        let text: String = build_lines_with(
+            &breakdown,
+            80,
+            ViewState {
+                focus: Some(Section::History),
+                expanded: Some(Section::History),
+                selected_item: 0,
+                drilled: false,
+            },
+        )
+        .iter()
+        .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ");
+        assert!(text.contains("Exact prompt composition is not available yet"));
+        assert!(text.contains("Session · budget & state"));
+        assert!(text.contains("History · conversation turns"));
+        assert!(text.contains("prompt trace unavailable"));
+        assert!(text.contains("keep this task moving"));
     }
 
     #[test]
@@ -2664,12 +2967,14 @@ mod tests {
                 role: "user".into(),
                 tokens: 180,
                 has_tool_calls: false,
+                content_preview: String::new(),
             },
             TurnRetention {
                 turn_index: 2,
                 role: "assistant".into(),
                 tokens: 4_200,
                 has_tool_calls: true,
+                content_preview: String::new(),
             },
         ];
         t.history.turns_compressed = vec![TurnCompression {
@@ -2746,6 +3051,7 @@ mod tests {
             role: "user".into(),
             tokens: 100,
             has_tool_calls: false,
+            content_preview: String::new(),
         }];
         let b = ContextBreakdown::from_trace(&t);
         let state = ViewState::collapsed(Some(Section::History));
@@ -2808,7 +3114,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_history_selected_turn_has_marker() {
+    fn expanded_history_exposes_typed_selected_item_geometry() {
         let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
         t.history.total_turns_available = 3;
         t.history.turns_retained = vec![
@@ -2817,52 +3123,89 @@ mod tests {
                 role: "user".into(),
                 tokens: 80,
                 has_tool_calls: false,
+                content_preview: String::new(),
             },
             TurnRetention {
                 turn_index: 1,
                 role: "assistant".into(),
                 tokens: 200,
                 has_tool_calls: false,
+                content_preview: String::new(),
             },
             TurnRetention {
                 turn_index: 2,
                 role: "user".into(),
                 tokens: 40,
                 has_tool_calls: false,
+                content_preview: String::new(),
             },
         ];
         let b = ContextBreakdown::from_trace(&t);
-        let state = ViewState {
+        let first = ViewState {
             focus: Some(Section::History),
             expanded: Some(Section::History),
-            selected_item: 1,
+            selected_item: 0,
             drilled: false,
         };
-        let lines = build_lines_with(&b, 80, state);
-        let marker_rows: Vec<String> = lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .filter(|s| s.contains('▸'))
-            .collect();
-        assert_eq!(
-            marker_rows.len(),
-            1,
-            "exactly one selected row: {marker_rows:?}"
-        );
+        let second = ViewState {
+            selected_item: 1,
+            ..first
+        };
+        let first_range = selected_item_line_range(&b, 80, first)
+            .expect("first retained turn has a typed layout range");
+        let second_range = selected_item_line_range(&b, 80, second)
+            .expect("second retained turn has a typed layout range");
+
+        assert!(first_range.start < first_range.end);
+        assert!(second_range.start < second_range.end);
         assert!(
-            marker_rows[0].contains("#1 assistant"),
-            "marker lands on the selected turn: {marker_rows:?}"
+            first_range.end <= second_range.start,
+            "item ranges follow the model order without inspecting rendered text"
         );
     }
 
     #[test]
-    fn history_drill_shows_full_body_not_collapsed_preview() {
-        use super::super::model::ContextSnapshot;
+    fn local_context_evidence_has_real_scroll_geometry_without_a_prompt_trace() {
+        let mut snapshot = ContextSnapshot::default();
+        snapshot.session = Some(SessionSummary {
+            session_id: "session-local".into(),
+            turn: 4,
+            model: Some("model-local".into()),
+            total_cost: 0.02,
+            max_budget: 1.0,
+            prompt_tokens: 1_200,
+            completion_tokens: 800,
+            cache_read_tokens: 300,
+            cache_creation_tokens: 0,
+            request_context: None,
+            continuation_anchor: None,
+            queued_message: None,
+            diagnostics_context: None,
+            read_activity: Default::default(),
+        });
+        snapshot.visible_conversation = vec![
+            super::super::model::VisibleConversationItem {
+                role: "user".into(),
+                preview: "first request".into(),
+                body: "first request".into(),
+            },
+            super::super::model::VisibleConversationItem {
+                role: "assistant".into(),
+                preview: "follow-up request".into(),
+                body: "follow-up request".into(),
+            },
+        ];
+
+        let breakdown = ContextBreakdown::from_snapshot_without_trace(&snapshot);
+        let state = ViewState::default();
+        assert!(line_count_with(&breakdown, 80, state) > 0);
+        assert!(section_line_index(&breakdown, 80, state, Section::Session).is_some());
+        assert!(section_line_index(&breakdown, 80, state, Section::History).is_some());
+    }
+
+    #[test]
+    fn prompt_trace_history_drill_does_not_join_an_unrelated_local_body() {
+        use super::super::model::VisibleConversationItem;
         let mut t = trace(100_000, 2_000, 0, 0, 0, 0);
         t.history.total_turns_available = 1;
         t.history.turns_retained = vec![TurnRetention {
@@ -2870,13 +3213,14 @@ mod tests {
             role: "user".into(),
             tokens: 300,
             has_tool_calls: false,
+            content_preview: "user: First prompt-history item.".into(),
         }];
-        let body = "First paragraph.\n\nSecond paragraph that is much longer \
-                    and would normally be truncated by the collapsed-preview renderer."
-            .to_string();
         let mut snap = ContextSnapshot::default();
-        snap.history_previews.insert(0, "First paragraph.".into());
-        snap.history_bodies.insert(0, body.clone());
+        snap.visible_conversation.push(VisibleConversationItem {
+            role: "user".into(),
+            preview: "local transcript item".into(),
+            body: "local transcript body that must not be attributed to the prompt trace".into(),
+        });
         let b = ContextBreakdown::from_trace_with(&t, &snap);
         let state = ViewState {
             focus: Some(Section::History),
@@ -2889,10 +3233,8 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(
-            text.contains("Second paragraph"),
-            "full body missing: {text}"
-        );
+        assert!(text.contains("First prompt-history item"), "{text}");
+        assert!(!text.contains("local transcript body"), "{text}");
         assert!(text.contains("Esc back"), "drill hint missing: {text}");
     }
 
@@ -2971,6 +3313,7 @@ mod tests {
             role: "user".into(),
             tokens: 50,
             has_tool_calls: false,
+            content_preview: String::new(),
         }];
         t.memory.memories_selected = vec![MemorySelection {
             memory_id: "m".into(),

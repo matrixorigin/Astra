@@ -84,6 +84,7 @@ pub(crate) async fn apply_user_cancelled_turn(
     result: Result<StreamResult, crate::TurnFailure>,
     turn_start: Instant,
     _ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
+    post_commit_tx: Option<&tokio::sync::mpsc::Sender<super::turn_post_commit::TurnPostCommitJob>>,
 ) {
     state.last_turn_interrupted = true;
     match result {
@@ -96,6 +97,7 @@ pub(crate) async fn apply_user_cancelled_turn(
                 stream_result,
                 turn_start,
                 &mut SilentUi,
+                post_commit_tx,
             )
             .await;
             state.last_turn_interrupted = false;
@@ -152,7 +154,6 @@ mod tests {
             },
         };
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
-
         apply_user_cancelled_turn(
             &mut state,
             &api,
@@ -161,6 +162,7 @@ mod tests {
             Err(failure),
             Instant::now(),
             &mut crate::cli::ui_adapter::LineUiAdapter,
+            None,
         )
         .await;
 
@@ -203,7 +205,6 @@ mod tests {
 
         let initial_turn = state.turn;
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
-
         apply_user_cancelled_turn(
             &mut state,
             &api,
@@ -212,6 +213,7 @@ mod tests {
             Ok(stream_result),
             Instant::now(),
             &mut crate::cli::ui_adapter::LineUiAdapter,
+            None,
         )
         .await;
 
@@ -239,7 +241,6 @@ mod tests {
             partial: crate::PartialTurnData::default(),
         };
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
-
         apply_user_cancelled_turn(
             &mut state,
             &api,
@@ -248,6 +249,7 @@ mod tests {
             Err(failure),
             Instant::now(),
             &mut crate::cli::ui_adapter::LineUiAdapter,
+            None,
         )
         .await;
 

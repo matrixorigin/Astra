@@ -244,6 +244,7 @@ mod tests {
         parent_run_id: &str,
         status: AgentStatus,
     ) -> SpawnedAgentInfo {
+        let ended_at = status.is_terminal().then(SystemTime::now);
         SpawnedAgentInfo {
             agent_id: agent_id.to_string(),
             run_id: run_id.to_string(),
@@ -252,9 +253,11 @@ mod tests {
             description: "test agent".to_string(),
             status,
             started_at: SystemTime::now(),
+            ended_at,
             metrics: SpawnedAgentMetrics::default(),
             has_permission_issues: false,
             run_in_background: false,
+            spawn_tool_call_id: None,
             fanout_slot: None,
         }
     }

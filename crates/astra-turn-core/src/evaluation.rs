@@ -2063,7 +2063,7 @@ mod tests {
             serde_json::json!({
                 "status": "interrupted",
                 "agent_id": "reviewer@abc",
-                "finish_reason": "response_guard_blocked",
+                "finish_reason": "empty_completion",
                 "incomplete": true,
                 "result": "partial review"
             })

@@ -8,7 +8,7 @@
 
 services:
   matrixone-init:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:4.0.0-rc4}
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
     user: root
     entrypoint:
       [
@@ -23,7 +23,7 @@ services:
       - mo-net
 
   matrixone:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:4.0.0-rc4}
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
     hostname: matrixone
     user: "${UID:-1000}:${GID:-1000}"
     depends_on:

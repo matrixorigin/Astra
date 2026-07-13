@@ -57,6 +57,7 @@ fn setup() -> (
 
 fn fan_out(delegation_id: &str, agents: Vec<&str>) -> DelegationRequest {
     DelegationRequest {
+        session_id: "test-session".into(),
         delegation_id: delegation_id.into(),
         parent_run_id: format!("parent-{delegation_id}"),
         task: "nested cancel probe".into(),

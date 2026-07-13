@@ -105,19 +105,6 @@ fn primary_row_does_not_expose_legacy_scope_or_match_target_labels() {
     }
 }
 
-// ─── focus_reject shortcut ────────────────────────────────────────
-
-#[test]
-fn focus_reject_jumps_to_reject_regardless_of_origin() {
-    let mut row = ButtonRow::primary();
-    row.focus_reject();
-    assert_eq!(row.focused().unwrap().label, "No");
-
-    row.move_left(); // now on Always
-    row.focus_reject();
-    assert_eq!(row.focused().unwrap().label, "No");
-}
-
 // ─── Batch row ────────────────────────────────────────────────────
 
 #[test]

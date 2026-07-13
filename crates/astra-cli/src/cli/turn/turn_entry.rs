@@ -136,6 +136,10 @@ fn is_high_severity_risk(risk: &astra_runtime::tool_sandbox::CommandRisk) -> boo
 pub(crate) struct TurnContext<'a> {
     pub(crate) api: &'a astra_thin_client::ThinClient,
     pub(crate) profile: Option<&'a str>,
+    /// TUI installs a bounded, serialized post-commit worker. Headless
+    /// callers leave this empty and await their own derived projections.
+    pub(crate) post_commit_tx:
+        Option<tokio::sync::mpsc::Sender<super::turn_post_commit::TurnPostCommitJob>>,
 }
 
 async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {

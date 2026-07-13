@@ -68,6 +68,9 @@ pub(crate) struct SubRunHost {
     /// child LLM rounds are written to the parent's journal with an
     /// `agent_id` tag so the unified timeline can interleave them.
     pub(crate) journal: Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
+    /// Stable parent-owned identity for local child transcript persistence.
+    /// Temporary server chat identities must never be used for this journal.
+    pub(crate) journal_identity: Option<SubRunJournalIdentity>,
     /// Per-response completion token limit from the skill manifest.
     pub(crate) max_completion_tokens: Option<u32>,
     /// Effort level from the skill manifest.
@@ -108,6 +111,158 @@ pub(crate) struct SubRunHost {
     pub(crate) fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState,
 }
 
+pub(crate) struct SubRunJournalIdentity {
+    pub(crate) session_id: String,
+    pub(crate) run_id: String,
+    pub(crate) next_item_seq: u64,
+    /// Latest successfully appended conversational assistant item. Tool-call
+    /// envelopes also use the assistant role, so only visible model content
+    /// advances this acknowledgement identity.
+    pub(crate) last_assistant_source_event_id: Option<String>,
+}
+
+impl SubRunHost {
+    /// Flush newly appended canonical prompt-history messages into the parent
+    /// session journal. This is called after every successful model ingest and
+    /// once more when the loop exits so interrupted tool rounds are retained.
+    #[must_use]
+    pub(crate) fn flush_agent_transcript(&mut self, state: &AgenticLoopState) -> bool {
+        let (Some(journal), Some(identity)) = (&self.journal, &mut self.journal_identity) else {
+            return true;
+        };
+        let captured = state.take_run_transcript_capture();
+        let mut events = Vec::new();
+        let mut accepted_messages = Vec::new();
+        let mut assistant_source_event_id = None;
+        let mut next_item_seq = identity.next_item_seq;
+        for message in captured {
+            let Some(role) = message.get("role").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if role == "system" {
+                continue;
+            }
+            if let Some(event) = astra_services::session_journal::JournalEvent::transcript_item(
+                &identity.session_id,
+                &identity.run_id,
+                &self.agent_id,
+                next_item_seq,
+                &message,
+            ) {
+                if role == "assistant" && assistant_message_has_visible_content(&message) {
+                    assistant_source_event_id = event
+                        .transcript_item
+                        .as_ref()
+                        .map(|item| item.source_event_id.clone());
+                }
+                next_item_seq = next_item_seq.saturating_add(1);
+                events.push(event);
+                accepted_messages.push(message);
+            }
+        }
+        if events.is_empty() {
+            return true;
+        }
+        match journal.append_bulk_no_sync(&events) {
+            Ok(()) => {
+                identity.next_item_seq = next_item_seq;
+                if assistant_source_event_id.is_some() {
+                    identity.last_assistant_source_event_id = assistant_source_event_id;
+                }
+                true
+            }
+            Err(error) => {
+                state.restore_run_transcript_capture_front(accepted_messages);
+                tracing::warn!(
+                    %error,
+                    session_id = %identity.session_id,
+                    run_id = %identity.run_id,
+                    count = events.len(),
+                    "failed to append local child transcript; batch retained for retry"
+                );
+                false
+            }
+        }
+    }
+
+    /// Flush and fsync the local child transcript, returning the exact
+    /// assistant item that proves a canonical reader has caught up to this
+    /// durable boundary. No acknowledgement is produced for partial output
+    /// that never became a canonical assistant message.
+    pub(crate) async fn finalize_agent_transcript(
+        &mut self,
+        state: &AgenticLoopState,
+    ) -> Option<String> {
+        if !self.flush_agent_transcript(state) {
+            return None;
+        }
+        let (Some(journal), Some(identity)) = (&self.journal, &self.journal_identity) else {
+            return None;
+        };
+        let source_event_id = identity.last_assistant_source_event_id.clone()?;
+        let journal = Arc::clone(journal);
+        let sync_result = tokio::task::spawn_blocking(move || journal.sync_data()).await;
+        if let Err(error) = sync_result
+            .map_err(|error| format!("transcript fsync task failed: {error}"))
+            .and_then(|result| result.map_err(|error| error.to_string()))
+        {
+            tracing::warn!(
+                %error,
+                session_id = %identity.session_id,
+                run_id = %identity.run_id,
+                "local child transcript fsync failed; live suffix remains authoritative"
+            );
+            return None;
+        }
+        Some(source_event_id)
+    }
+
+    fn persist_agent_transcript_evidence(
+        &mut self,
+        evidence: astra_turn_types::AgentTranscriptEvidence,
+    ) {
+        let (Some(journal), Some(identity)) = (&self.journal, &mut self.journal_identity) else {
+            return;
+        };
+        let Some(event) = astra_services::session_journal::JournalEvent::transcript_evidence(
+            &identity.session_id,
+            &identity.run_id,
+            &self.agent_id,
+            identity.next_item_seq,
+            &evidence,
+        ) else {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                run_id = %identity.run_id,
+                "local agent transcript evidence was rejected"
+            );
+            return;
+        };
+        match journal.append_bulk_no_sync(&[event]) {
+            Ok(()) => {
+                identity.next_item_seq = identity.next_item_seq.saturating_add(1);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %identity.session_id,
+                    run_id = %identity.run_id,
+                    "failed to append local child transcript evidence"
+                );
+            }
+        }
+    }
+}
+
+fn assistant_message_has_visible_content(message: &serde_json::Value) -> bool {
+    ["content", "reasoning_content"].into_iter().any(|field| {
+        message
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    })
+}
+
 /// A progress event emitted by a sub-run agent.
 #[derive(Debug, Clone)]
 pub(crate) struct SubRunProgressEvent {
@@ -126,7 +281,7 @@ pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -
         )
     };
     state.final_text = failure_output.clone();
-    state.messages.push(json!({
+    state.push_prompt_history_message(json!({
         "role": "assistant",
         "content": failure_output.clone(),
     }));
@@ -358,6 +513,22 @@ impl AgenticLoopHost for SubRunHost {
         }
     }
 
+    fn on_agent_communication(&mut self, event: astra_messaging::AgentCommunicationEvent) {
+        self.persist_agent_transcript_evidence(
+            astra_turn_types::AgentTranscriptEvidence::AgentCommunication {
+                event: event.clone(),
+            },
+        );
+        let stream_event = crate::cli::chat_stream::StreamEvent::AgentCommunication(event);
+        if let Some(sink) = self.stream_event_sink.as_ref() {
+            sink.send(stream_event);
+        } else if let Some(tx) = self.stream_event_tx.as_ref()
+            && let Err(error) = tx.try_send(stream_event)
+        {
+            tracing::warn!(%error, agent_id = %self.agent_id, "sub-run stream event queue unavailable");
+        }
+    }
+
     fn is_quiet(&self) -> bool {
         self.progress_tx.is_none()
     }
@@ -390,6 +561,8 @@ impl AgenticLoopHost for SubRunHost {
             );
         }
 
+        let _ = self.flush_agent_transcript(state);
+
         // Unified timeline: emit the LATEST round event tagged with
         // agent_id to the parent's journal so the timeline renderer
         // can interleave child rounds with parent rounds.
@@ -403,8 +576,12 @@ impl AgenticLoopHost for SubRunHost {
         // completed — should be emitted.
         if let Some(ref journal) = self.journal {
             if let Some(round_summary) = state.recent_rounds.last() {
+                let journal_session_id = self
+                    .journal_identity
+                    .as_ref()
+                    .map(|identity| identity.session_id.as_str());
                 let mut buf = astra_services::session_journal::TurnEventBuffer::begin_turn(
-                    state.current_session_id.as_deref(),
+                    journal_session_id,
                     state.current_round_index.saturating_add(1),
                 );
                 buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
@@ -417,14 +594,17 @@ impl AgenticLoopHost for SubRunHost {
                     tool_call_names: round_summary.tool_call_names.clone(),
                     finish_reason: round_summary.finish_reason.clone(),
                     source: Some("child_agent".to_string()),
-                    run_id: state.current_run_id.clone(),
+                    run_id: self
+                        .journal_identity
+                        .as_ref()
+                        .map(|identity| identity.run_id.clone()),
                     agent_id: Some(self.agent_id.clone()),
                     ..Default::default()
                 });
                 let events = buf.drain();
                 crate::cli::cli_config::cli_utils::append_bulk_journal_events_no_sync_or_warn(
                     journal,
-                    state.current_session_id.as_deref(),
+                    journal_session_id,
                     &events,
                     "skill_subrun:flush_round_events",
                 );
@@ -575,6 +755,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
             journal: None,
+            journal_identity: None,
         };
 
         let messages = vec![
@@ -629,6 +810,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             observation_store: None,
             observation_journal: Default::default(),
             messages,
+            run_transcript_capture: None,
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
@@ -647,6 +829,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             recursion_depth: child_recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,
+            final_output_ready_notified: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -696,7 +879,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 ..Default::default()
             },
             messaging: Default::default(),
-            deferred_input: Default::default(),
+            user_intents: Default::default(),
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: None,
@@ -932,7 +1115,8 @@ fn attach_subrun_tool_surface(
 mod tests {
     use super::{
         CliSkillSubRunExecutor, SUBRUN_MAX_CUMULATIVE_TOKENS, SUBRUN_MAX_TURNS, SubRunHost,
-        attach_runtime_volatile_injections, attach_subrun_tool_surface, resolve_subrun_schemas,
+        SubRunJournalIdentity, attach_runtime_volatile_injections, attach_subrun_tool_surface,
+        resolve_subrun_schemas,
     };
     use astra_runtime::turn::agentic_loop::host::ASK_USER_TOOL_NAME;
     use astra_runtime::turn::agentic_loop::host::{
@@ -957,6 +1141,45 @@ mod tests {
                 "parameters": { "type": "object", "properties": {} }
             }
         })
+    }
+
+    fn subrun_host_with_journal(
+        journal: std::sync::Arc<astra_services::session_journal::JournalWriter>,
+        session_id: String,
+        next_item_seq: u64,
+        last_assistant_source_event_id: Option<String>,
+    ) -> SubRunHost {
+        let root = PathBuf::from(".");
+        SubRunHost {
+            api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            token: String::new(),
+            model: None,
+            project_root: root.clone(),
+            executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
+            all_schemas: Vec::new(),
+            valid_tool_names: HashSet::new(),
+            perm_manager: PermissionManager::with_project(true, &root),
+            journal: Some(journal),
+            journal_identity: Some(SubRunJournalIdentity {
+                session_id,
+                run_id: "child-run".into(),
+                next_item_seq,
+                last_assistant_source_event_id,
+            }),
+            max_completion_tokens: None,
+            effort: None,
+            agent_type: None,
+            cancel_token: None,
+            skill_resolver: None,
+            progress_tx: None,
+            agent_id: "reviewer@test".into(),
+            stream_event_tx: None,
+            stream_event_sink: None,
+            tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(3),
+            inherited_prefix: None,
+            fork_cache_sink: None,
+            fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+        }
     }
 
     #[test]
@@ -1011,6 +1234,7 @@ mod tests {
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
             journal: None,
+            journal_identity: None,
         };
         assert!(host.is_quiet());
     }
@@ -1042,8 +1266,88 @@ mod tests {
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
             journal: None,
+            journal_identity: None,
         };
         assert!(!host.is_quiet());
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_flush_never_acknowledges_an_older_assistant_item() {
+        let session_id = format!("transcript-flush-failure-{}", uuid::Uuid::new_v4());
+        let journal = std::sync::Arc::new(
+            astra_services::session_journal::JournalWriter::new(&session_id).unwrap(),
+        );
+        let journal_path = journal.path().clone();
+        std::fs::create_dir(journal.path()).unwrap();
+
+        let mut host = subrun_host_with_journal(
+            journal.clone(),
+            session_id,
+            7,
+            Some("older-assistant-item".into()),
+        );
+        let mut state = astra_runtime::turn::agentic_loop::host::make_test_loop_state();
+        let newest = json!({"role": "assistant", "content": "new result"});
+        state.begin_run_transcript_capture([newest.clone()]);
+
+        assert_eq!(host.finalize_agent_transcript(&state).await, None);
+        assert_eq!(
+            state.take_run_transcript_capture(),
+            vec![newest],
+            "failed append must remain retryable"
+        );
+        {
+            let identity = host.journal_identity.as_ref().unwrap();
+            assert_eq!(identity.next_item_seq, 7);
+            assert_eq!(
+                identity.last_assistant_source_event_id.as_deref(),
+                Some("older-assistant-item")
+            );
+        }
+
+        drop(host);
+        drop(journal);
+        std::fs::remove_dir(journal_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_flush_returns_identity_present_in_the_synced_local_journal() {
+        let session_id = format!("transcript-flush-success-{}", uuid::Uuid::new_v4());
+        let journal = std::sync::Arc::new(
+            astra_services::session_journal::JournalWriter::new(&session_id).unwrap(),
+        );
+        let journal_path = journal.path().clone();
+        let mut host = subrun_host_with_journal(journal.clone(), session_id.clone(), 1, None);
+        let mut state = astra_runtime::turn::agentic_loop::host::make_test_loop_state();
+        state.begin_run_transcript_capture([
+            json!({"role": "user", "content": "review this"}),
+            json!({
+                "role": "assistant",
+                "reasoning_content": "checked the invariant",
+                "content": "the invariant holds"
+            }),
+        ]);
+
+        let committed = host
+            .finalize_agent_transcript(&state)
+            .await
+            .expect("assistant transcript identity");
+        let events = astra_services::session_journal::read_journal(&session_id).unwrap();
+        let committed_item = events
+            .iter()
+            .filter_map(|event| event.transcript_item.as_ref())
+            .find(|item| item.source_event_id == committed)
+            .expect("committed identity must resolve in canonical journal");
+        assert_eq!(committed_item.message["content"], "the invariant holds");
+        assert_eq!(
+            committed_item.message["reasoning_content"],
+            "checked the invariant"
+        );
+        assert!(state.take_run_transcript_capture().is_empty());
+
+        drop(host);
+        drop(journal);
+        std::fs::remove_file(journal_path).unwrap();
     }
 
     #[test]
@@ -1072,6 +1376,7 @@ mod tests {
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
             journal: None,
+            journal_identity: None,
         };
         host.inject_tool_schema(astra_runtime::turn::skill_tool::skill_tool_schema_v2());
         assert!(host.valid_tool_names.contains("skill"));
@@ -1104,6 +1409,7 @@ mod tests {
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
             journal: None,
+            journal_identity: None,
         };
         host.inject_tool_schema(schema("not_registered"));
         assert!(host.valid_tool_names.is_empty());

@@ -14,6 +14,9 @@ Use these files as the canonical configuration references:
 ### Database: MatrixOne
 
 - `MATRIXONE_HOST`, `MATRIXONE_PORT`, `MATRIXONE_USER`, `MATRIXONE_PASSWORD`
+- `ASTRA_MYSQL_CLIENT_TLS_ARG` (optional) — one TLS option supported by the installed MySQL client. Leave unset to negotiate TLS when the client supports `--ssl-mode` (TLS when available, plaintext otherwise); clients without that option retain their default. Use an explicit option such as `--ssl-mode=REQUIRED` or `--skip-ssl` only when the endpoint has an explicit policy.
+- `ASTRA_TUI_THEME` (optional) — terminal rendering profile: `auto` (default), `dark`, `light`, `dark-ansi`, `light-ansi`, or `plain`. Use an ANSI profile for terminals or multiplexers that do not reliably render truecolor; `NO_COLOR=1` also selects `plain`.
+- `ASTRA_TUI_GLYPHS` (optional) — `unicode` (default) or `ascii`. Select `ascii` for terminals or fonts that do not reliably render box-drawing and state glyphs; all state labels and actions remain available.
 - `ASTRA_DATABASE` — logical database name
 - `ASTRA_DATABASE_PREFIX` (optional) — effective name = `{PREFIX}{ASTRA_DATABASE}`
 - `ASTRA_AUTO_CREATE_DATABASE` — `1` to auto-create database at startup

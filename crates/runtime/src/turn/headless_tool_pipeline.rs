@@ -2081,8 +2081,14 @@ mod tests {
             executed.execution.result_str
         );
         assert!(
-            executed.execution.result_str.contains("offset"),
+            executed.execution.result_str.contains("start_line")
+                && executed.execution.result_str.contains("end_line"),
             "got: {}",
+            executed.execution.result_str
+        );
+        assert!(
+            !executed.execution.result_str.contains("offset/limit"),
+            "large-file guidance must not advertise the removed pagination contract: {}",
             executed.execution.result_str
         );
     }

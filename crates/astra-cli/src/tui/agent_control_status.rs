@@ -1,4 +1,3 @@
-pub(crate) use astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_INTERRUPTED_ERROR;
 pub(crate) use astra_turn_core::orchestration::agent_result_wire::AgentToolWireOutcomeKind as AgentControlWireOutcomeKind;
 pub(crate) use astra_turn_core::orchestration::agent_result_wire::agent_tool_error_message as agent_control_error_message;
 pub(crate) use astra_turn_core::orchestration::agent_result_wire::agent_tool_interrupted_message as agent_control_interrupted_message;
@@ -10,7 +9,8 @@ pub(crate) use astra_turn_core::orchestration::agent_result_wire::project_agent_
 mod tests {
     use std::str::FromStr;
 
-    use super::{AGENT_RESULT_INTERRUPTED_ERROR, agent_control_interrupted_message};
+    use super::agent_control_interrupted_message;
+    use astra_turn_core::orchestration::agent_result_wire::AGENT_RESULT_INTERRUPTED_ERROR;
     use astra_turn_core::orchestration::agent_result_wire::AgentToolResultStatusKind;
 
     #[test]

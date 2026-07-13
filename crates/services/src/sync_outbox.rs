@@ -14,13 +14,13 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub const SYNC_OUTBOX_SCHEMA_VERSION: u32 = 1;
+pub const SYNC_OUTBOX_SCHEMA_VERSION: u32 = 2;
 pub const SYNC_OUTBOX_MAX_ATTEMPTS: u32 = 5;
 pub const SYNC_OUTBOX_IN_FLIGHT_LEASE_MS: u64 = 5 * 60 * 1000;
 pub const SYNC_OUTBOX_ACKED_RETAINED_RECORDS: usize = 128;
@@ -87,6 +87,11 @@ pub fn sync_outbox_canonical_payload_hash(payload: &Value) -> String {
 pub struct SyncOutboxFile {
     pub schema_version: u32,
     pub ack_watermark: u64,
+    /// Per-source byte watermark for canonical session journals. The outbox is
+    /// a derived delivery projection, so a process can recover a lost
+    /// in-memory enqueue by replaying only journal bytes beyond this offset.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub journal_source_offsets: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acked_tombstones: Vec<SyncOutboxAckTombstone>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -123,6 +128,7 @@ impl Default for SyncOutboxFile {
         Self {
             schema_version: SYNC_OUTBOX_SCHEMA_VERSION,
             ack_watermark: 0,
+            journal_source_offsets: BTreeMap::new(),
             acked_tombstones: Vec::new(),
             skipped_records: Vec::new(),
             records: Vec::new(),
@@ -135,6 +141,23 @@ pub enum SyncOutboxEnqueueOutcome {
     Inserted { record_id: String, sequence: u64 },
     Duplicate { record_id: String, sequence: u64 },
     Poisoned { record_id: String, sequence: u64 },
+}
+
+/// Result of atomically projecting one append-only journal delta into the
+/// outbox. A stale source offset means another process already advanced this
+/// source; callers must reread from the returned offset instead of guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncOutboxJournalDeltaOutcome {
+    Appended {
+        scanned_events: usize,
+        inserted: usize,
+        duplicates: usize,
+        poisoned: usize,
+        skipped: usize,
+    },
+    StaleSourceOffset {
+        actual_offset: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,83 +244,133 @@ impl SyncOutboxStore {
         &self,
         event: &JournalEvent,
     ) -> std::io::Result<SyncOutboxEnqueueOutcome> {
-        let candidate = build_record(event, 0, unix_ms()?)?;
+        let mut outcomes = self.enqueue_journal_events(std::slice::from_ref(event))?;
+        // One input produces exactly one typed outcome. Keeping the single
+        // event method as a thin wrapper means callers retain its precise
+        // contract while multi-event turn sidecars share one lock/fsync.
+        Ok(outcomes
+            .pop()
+            .expect("single outbox enqueue always returns one outcome"))
+    }
+
+    /// Enqueue a journal batch as one durable outbox transaction.
+    ///
+    /// Each event retains the same stable-id deduplication and poison rules as
+    /// [`Self::enqueue_journal_event`]. The difference is purely transactional:
+    /// callers that already committed an ordered journal sidecar batch do not
+    /// pay one cross-process lock, file rewrite, and directory fsync per
+    /// event.
+    pub fn enqueue_journal_events(
+        &self,
+        events: &[JournalEvent],
+    ) -> std::io::Result<Vec<SyncOutboxEnqueueOutcome>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = unix_ms()?;
+        let candidates = events
+            .iter()
+            .map(|event| build_record(event, 0, now))
+            .collect::<std::io::Result<Vec<_>>>()?;
         self.with_state(|state| {
-            if let Some(index) = state
-                .records
-                .iter()
-                .position(|record| record.record_id == candidate.record_id)
-            {
-                let existing = &mut state.records[index];
-                if existing.payload_hash == candidate.payload_hash {
-                    return Ok(SyncOutboxEnqueueOutcome::Duplicate {
-                        record_id: existing.record_id.clone(),
-                        sequence: existing.sequence,
-                    });
-                }
-                existing.state = SyncOutboxRecordState::Poisoned;
-                existing.poison_kind = Some(SyncOutboxPoisonKind::PayloadHashMismatch);
-                existing.poison_reason = Some(format!(
-                    "same stable event id has different payload hash: existing={} incoming={}",
-                    existing.payload_hash, candidate.payload_hash
-                ));
-                existing.last_error = existing.poison_reason.clone();
-                existing.updated_at_unix_ms = unix_ms()?;
-                let outcome = SyncOutboxEnqueueOutcome::Poisoned {
-                    record_id: existing.record_id.clone(),
-                    sequence: existing.sequence,
-                };
-                state.recompute_ack_watermark();
-                return Ok(outcome);
-            }
-            if let Some(tombstone) = state
-                .acked_tombstones
-                .iter()
-                .find(|tombstone| tombstone.record_id == candidate.record_id)
-            {
-                if !tombstone.payload_hash.is_empty()
-                    && tombstone.payload_hash == candidate.payload_hash
-                {
-                    return Ok(SyncOutboxEnqueueOutcome::Duplicate {
-                        record_id: tombstone.record_id.clone(),
-                        sequence: tombstone.sequence,
-                    });
-                }
+            candidates
+                .into_iter()
+                .map(|candidate| enqueue_candidate(state, candidate, now))
+                .collect()
+        })
+    }
 
-                let mut record = candidate;
-                record.sequence = state.next_sequence();
-                record.state = SyncOutboxRecordState::Poisoned;
-                record.poison_kind = Some(SyncOutboxPoisonKind::PayloadHashMismatch);
-                record.poison_reason = Some(if tombstone.payload_hash.is_empty() {
-                    format!(
-                        "compacted ack tombstone payload hash missing: record_id={}",
-                        tombstone.record_id
-                    )
-                } else {
-                    format!(
-                        "compacted ack tombstone payload hash mismatch: tombstone={} incoming={}",
-                        tombstone.payload_hash, record.payload_hash
-                    )
+    /// Return the durable cursor for an append-only canonical journal.
+    pub fn journal_source_offset(&self, session_id: &str) -> std::io::Result<u64> {
+        self.with_state_readonly(|state| {
+            Ok(state
+                .journal_source_offsets
+                .get(session_id)
+                .copied()
+                .unwrap_or(0))
+        })
+    }
+
+    /// Project a journal byte range into the outbox and advance that journal's
+    /// cursor in the exact same durable transaction.
+    ///
+    /// The source reader runs outside the outbox lock. `expected_offset` is
+    /// therefore compared under the lock so multiple CLI processes cannot
+    /// independently project overlapping ranges and accidentally move the
+    /// cursor backwards.
+    pub fn append_journal_delta(
+        &self,
+        source_session_id: &str,
+        expected_offset: u64,
+        next_offset: u64,
+        events: &[JournalEvent],
+    ) -> std::io::Result<SyncOutboxJournalDeltaOutcome> {
+        if next_offset < expected_offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "journal source offset cannot move backwards",
+            ));
+        }
+        let now = unix_ms()?;
+        let candidates = events
+            .iter()
+            .filter(|event| {
+                event
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|session_id| !session_id.trim().is_empty())
+            })
+            .map(|event| build_record(event, 0, now))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        self.with_state(|state| {
+            let actual_offset = state
+                .journal_source_offsets
+                .get(source_session_id)
+                .copied()
+                .unwrap_or(0);
+            if actual_offset != expected_offset {
+                return Ok(SyncOutboxJournalDeltaOutcome::StaleSourceOffset { actual_offset });
+            }
+
+            let mut inserted = 0;
+            let mut duplicates = 0;
+            let mut poisoned = 0;
+            for candidate in candidates {
+                match enqueue_candidate(state, candidate, now)? {
+                    SyncOutboxEnqueueOutcome::Inserted { .. } => inserted += 1,
+                    SyncOutboxEnqueueOutcome::Duplicate { .. } => duplicates += 1,
+                    SyncOutboxEnqueueOutcome::Poisoned { .. } => poisoned += 1,
+                }
+            }
+            let skipped = events
+                .len()
+                .saturating_sub(inserted + duplicates + poisoned);
+            for event in events.iter().filter(|event| {
+                event
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|session_id| session_id.trim().is_empty())
+            }) {
+                state.skipped_records.push(SyncOutboxSkippedRecord {
+                    kind: SyncOutboxSkipKind::MissingSessionId,
+                    event_type: event_type_string(&event.event_type),
+                    event_ts: Some(event.ts.clone()).filter(|ts| !ts.trim().is_empty()),
+                    reason: "journal event has no session_id and cannot be delivered to /events"
+                        .to_string(),
+                    observed_at_unix_ms: now,
                 });
-                record.last_error = record.poison_reason.clone();
-                let outcome = SyncOutboxEnqueueOutcome::Poisoned {
-                    record_id: record.record_id.clone(),
-                    sequence: record.sequence,
-                };
-                state.records.push(record);
-                state.recompute_ack_watermark();
-                return Ok(outcome);
             }
-
-            let mut record = candidate;
-            record.sequence = state.next_sequence();
-            let outcome = SyncOutboxEnqueueOutcome::Inserted {
-                record_id: record.record_id.clone(),
-                sequence: record.sequence,
-            };
-            state.records.push(record);
-            state.recompute_ack_watermark();
-            Ok(outcome)
+            state.compact_skipped_records();
+            state
+                .journal_source_offsets
+                .insert(source_session_id.to_string(), next_offset);
+            Ok(SyncOutboxJournalDeltaOutcome::Appended {
+                scanned_events: events.len(),
+                inserted,
+                duplicates,
+                poisoned,
+                skipped,
+            })
         })
     }
 
@@ -595,6 +668,86 @@ impl SyncOutboxStore {
             }
         }
     }
+}
+
+fn enqueue_candidate(
+    state: &mut SyncOutboxFile,
+    candidate: SyncOutboxRecord,
+    now: u64,
+) -> std::io::Result<SyncOutboxEnqueueOutcome> {
+    if let Some(index) = state
+        .records
+        .iter()
+        .position(|record| record.record_id == candidate.record_id)
+    {
+        let existing = &mut state.records[index];
+        if existing.payload_hash == candidate.payload_hash {
+            return Ok(SyncOutboxEnqueueOutcome::Duplicate {
+                record_id: existing.record_id.clone(),
+                sequence: existing.sequence,
+            });
+        }
+        existing.state = SyncOutboxRecordState::Poisoned;
+        existing.poison_kind = Some(SyncOutboxPoisonKind::PayloadHashMismatch);
+        existing.poison_reason = Some(format!(
+            "same stable event id has different payload hash: existing={} incoming={}",
+            existing.payload_hash, candidate.payload_hash
+        ));
+        existing.last_error = existing.poison_reason.clone();
+        existing.updated_at_unix_ms = now;
+        let outcome = SyncOutboxEnqueueOutcome::Poisoned {
+            record_id: existing.record_id.clone(),
+            sequence: existing.sequence,
+        };
+        state.recompute_ack_watermark();
+        return Ok(outcome);
+    }
+    if let Some(tombstone) = state
+        .acked_tombstones
+        .iter()
+        .find(|tombstone| tombstone.record_id == candidate.record_id)
+    {
+        if !tombstone.payload_hash.is_empty() && tombstone.payload_hash == candidate.payload_hash {
+            return Ok(SyncOutboxEnqueueOutcome::Duplicate {
+                record_id: tombstone.record_id.clone(),
+                sequence: tombstone.sequence,
+            });
+        }
+
+        let mut record = candidate;
+        record.sequence = state.next_sequence();
+        record.state = SyncOutboxRecordState::Poisoned;
+        record.poison_kind = Some(SyncOutboxPoisonKind::PayloadHashMismatch);
+        record.poison_reason = Some(if tombstone.payload_hash.is_empty() {
+            format!(
+                "compacted ack tombstone payload hash missing: record_id={}",
+                tombstone.record_id
+            )
+        } else {
+            format!(
+                "compacted ack tombstone payload hash mismatch: tombstone={} incoming={}",
+                tombstone.payload_hash, record.payload_hash
+            )
+        });
+        record.last_error = record.poison_reason.clone();
+        let outcome = SyncOutboxEnqueueOutcome::Poisoned {
+            record_id: record.record_id.clone(),
+            sequence: record.sequence,
+        };
+        state.records.push(record);
+        state.recompute_ack_watermark();
+        return Ok(outcome);
+    }
+
+    let mut record = candidate;
+    record.sequence = state.next_sequence();
+    let outcome = SyncOutboxEnqueueOutcome::Inserted {
+        record_id: record.record_id.clone(),
+        sequence: record.sequence,
+    };
+    state.records.push(record);
+    state.recompute_ack_watermark();
+    Ok(outcome)
 }
 
 fn lock_exclusive_with_timeout(lock: &std::fs::File, timeout: Duration) -> std::io::Result<()> {
@@ -1135,6 +1288,67 @@ mod tests {
         assert_eq!(status.pending, 1);
         assert_eq!(status.ready, 1);
         assert_eq!(status.ack_watermark, 0);
+    }
+
+    #[test]
+    fn batch_enqueue_preserves_event_order_and_single_event_deduplication() {
+        let (_temp, _guard, store) = test_store();
+        let first = event("first");
+        let mut second = event("second");
+        second.ts = "2026-07-08T00:00:01Z".to_string();
+
+        let outcomes = store
+            .enqueue_journal_events(&[first.clone(), second.clone(), first.clone()])
+            .expect("batch enqueue");
+
+        assert!(matches!(
+            outcomes.as_slice(),
+            [
+                SyncOutboxEnqueueOutcome::Inserted { sequence: 1, .. },
+                SyncOutboxEnqueueOutcome::Inserted { sequence: 2, .. },
+                SyncOutboxEnqueueOutcome::Duplicate { sequence: 1, .. },
+            ]
+        ));
+        let status = store.status().expect("status after batch enqueue");
+        assert_eq!(status.total, 2);
+        assert_eq!(status.pending, 2);
+    }
+
+    #[test]
+    fn journal_delta_projection_advances_source_cursor_atomically() {
+        let (_temp, _guard, store) = test_store();
+        let first = event("first");
+        let mut second = event("second");
+        second.ts = "2026-07-08T00:00:01Z".to_string();
+
+        let outcome = store
+            .append_journal_delta("session-a", 0, 256, &[first.clone(), second.clone()])
+            .expect("append journal delta");
+        assert!(matches!(
+            outcome,
+            SyncOutboxJournalDeltaOutcome::Appended {
+                scanned_events: 2,
+                inserted: 2,
+                duplicates: 0,
+                poisoned: 0,
+                skipped: 0,
+            }
+        ));
+        assert_eq!(
+            store
+                .journal_source_offset("session-a")
+                .expect("source offset"),
+            256
+        );
+
+        let stale = store
+            .append_journal_delta("session-a", 0, 512, &[first, second])
+            .expect("stale source offset is a normal outcome");
+        assert_eq!(
+            stale,
+            SyncOutboxJournalDeltaOutcome::StaleSourceOffset { actual_offset: 256 }
+        );
+        assert_eq!(store.status().expect("status").pending, 2);
     }
 
     #[test]

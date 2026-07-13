@@ -10,7 +10,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use async_trait::async_trait;
 use dashmap::DashMap;
 
-use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
+use super::{
+    CslEntry, CslStore, CslStoreError, MaterializedState, materialize, validate_session_id,
+};
 
 const LOG_FILENAME: &str = "conversation_log.jsonl";
 static APPEND_LOCKS: LazyLock<DashMap<PathBuf, Arc<Mutex<()>>>> = LazyLock::new(DashMap::new);
@@ -30,6 +32,24 @@ impl FileCslStore {
 
     fn log_path(&self, session_id: &str) -> PathBuf {
         self.base_dir.join(session_id).join(LOG_FILENAME)
+    }
+
+    /// Load canonical conversation state from the local file store in a
+    /// synchronous caller. The blocking contract is explicit so async/UI
+    /// callers can move it to `spawn_blocking`; one-shot and app-server
+    /// continuation use it during request preparation.
+    pub fn load_materialized_blocking(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<MaterializedState>, CslStoreError> {
+        validate_session_id(session_id)?;
+        let entries = Self::read_all_entries(&self.log_path(session_id))?;
+        let Some(snapshot_idx) = entries.iter().rposition(CslEntry::is_snapshot) else {
+            return Ok(None);
+        };
+        materialize(&entries[snapshot_idx..])
+            .map(Some)
+            .map_err(Into::into)
     }
 
     /// Read all entries from the JSONL file. Returns empty vec if file doesn't exist.
@@ -325,6 +345,28 @@ mod tests {
         assert_eq!(state.messages.len(), 3);
         assert_eq!(state.messages[0]["content"], "hello");
         assert_eq!(state.messages[2]["content"], "resp2");
+    }
+
+    #[test]
+    fn blocking_materialized_load_returns_latest_canonical_state() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileCslStore::new(tmp.path());
+        let sid = "blocking-load";
+        let path = store.log_path(sid);
+        FileCslStore::append_entry(&path, &make_snapshot(1, 1, vec![user_msg("first")])).unwrap();
+        FileCslStore::append_entry(&path, &make_delta(2, 2, vec![assistant_msg("second")]))
+            .unwrap();
+
+        let materialized = store
+            .load_materialized_blocking(sid)
+            .unwrap()
+            .expect("canonical state");
+
+        assert_eq!(materialized.last_seq, 2);
+        assert_eq!(materialized.last_turn, 2);
+        assert_eq!(materialized.messages.len(), 2);
+        assert_eq!(materialized.messages[0]["content"], "first");
+        assert_eq!(materialized.messages[1]["content"], "second");
     }
 
     #[tokio::test]

@@ -331,25 +331,28 @@ mod stream_bridge_tests {
     use crate::tui::stream_bridge;
 
     #[tokio::test]
-    async fn per_turn_bridge_sends_turn_complete_after_all_tokens() {
+    async fn per_turn_bridge_sends_stream_closed_after_all_tokens() {
         let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
         let stream_tx = stream_bridge::create_per_turn_bridge(tui_tx);
 
         // Send two tokens then drop the sender (simulates turn end)
         stream_tx
             .send(StreamEvent::Token("hello ".to_string()))
+            .await
             .unwrap();
         stream_tx
             .send(StreamEvent::Token("world".to_string()))
+            .await
             .unwrap();
         drop(stream_tx);
 
-        // Receive: should get Token, Token, TurnComplete in order
+        // Receive: should get Token, Token, TurnStreamClosed in order. Durable
+        // turn completion is owned by the turn-settlement path, not this bridge.
         let mut events = Vec::new();
         while let Some(evt) = tui_rx.recv().await {
-            let is_complete = matches!(evt, TuiAppEvent::TurnComplete);
+            let is_closed = matches!(evt, TuiAppEvent::TurnStreamClosed);
             events.push(evt);
-            if is_complete {
+            if is_closed {
                 break;
             }
         }
@@ -363,7 +366,7 @@ mod stream_bridge_tests {
         assert!(matches!(&events[1], TuiAppEvent::Token(t) if t == "world"));
         assert!(matches!(
             &events[events.len() - 1],
-            TuiAppEvent::TurnComplete
+            TuiAppEvent::TurnStreamClosed
         ));
     }
 }

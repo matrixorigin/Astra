@@ -97,6 +97,10 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
     collector.record_token_budget(astra_turn_core::context_assembly_trace::TokenBudgetTrace {
         max_tokens: max as u32,
         total_used: measured as u32,
+        usage_source: state
+            .last_measured_prompt_tokens
+            .map(|_| astra_turn_types::ContextWindowUsageSource::ProviderReported)
+            .unwrap_or(astra_turn_types::ContextWindowUsageSource::Estimated),
         budget_pressure,
         compression_triggered: state.budget_wrapup_injected,
         ..Default::default()
@@ -108,13 +112,11 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
     }
     if collector.has_data() {
         // Defer journal write to turn-commit path to prevent ghost assemblies.
-        // Store only the first trace for this outer turn so the journal records
-        // the initial context assembly, not a later internal iteration after
-        // tool-call messages have already been appended.
-        if state.telemetry.pending_context_assembly_trace.is_none() {
-            state.telemetry.pending_context_assembly_trace =
-                Some((session_turn, trace.to_json_value()));
-        }
+        // An outer turn can issue multiple LLM requests. The latest request
+        // is the only honest answer to "what context is active now?"; keeping
+        // the first one made long tool turns look artificially small.
+        state.telemetry.pending_context_assembly_trace =
+            Some((session_turn, trace.to_json_value()));
     }
     persist_latest_context_trace_signal(state).await;
 }
@@ -633,6 +635,20 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
+    // The answer itself belongs to the interactive critical path. Everything
+    // below this boundary is durable/derived settlement and must never keep a
+    // displayed answer looking live just because a database, workspace, or
+    // checkpoint is slow.
+    ensure_terminal_text(state);
+    if !state.final_text.is_empty() && !state.final_text_streamed {
+        host.render_final_text(&state.final_text);
+        state.final_text_streamed = true;
+    }
+    if !state.final_text.is_empty() && !state.final_output_ready_notified {
+        host.on_final_output_ready(state).await;
+        state.final_output_ready_notified = true;
+    }
+
     finalize_turn_trace(state).await;
     drop_unattributed_memory_recalls_at_turn_end(state);
 
@@ -643,7 +659,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
 
     reset_per_turn_advisory_state(state);
     state.refresh_task_board_snapshot().await;
-    ensure_terminal_text(state);
     update_working_memory_for_turn_settlement(state);
 
     // ── Harness: SessionEnd (observe only, fire at most once) ──
@@ -666,10 +681,6 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     );
 
     try_write_heavy_checkpoint(state);
-    if !state.final_text.is_empty() && !state.final_text_streamed {
-        host.render_final_text(&state.final_text);
-        state.final_text_streamed = true;
-    }
 }
 
 fn update_working_memory_for_turn_settlement(state: &mut AgenticLoopState) {
@@ -839,8 +850,9 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         } else {
             ""
         };
-        // ── Surface pre-existing interruption reason (e.g. circuit breaker) ──
-        // When the loop was aborted by BudgetExhausted, GuardAbort, etc.
+        // ── Surface pre-existing interruption reason ──
+        // When a real execution boundary (for example BudgetExhausted) stops
+        // the loop, the user deserves to know why instead of only that tools ran.
         // the user deserves to know *why*, not just that tools ran.
         let reason_note = match state.interruption.as_ref() {
             Some(i)
@@ -1843,6 +1855,7 @@ mod tests {
         assert_eq!(state.final_text, "Final answer");
         assert_eq!(host.rendered_final_text.len(), 1);
         assert_eq!(host.rendered_final_text[0], "Final answer");
+        assert_eq!(host.final_output_ready, vec!["Final answer"]);
     }
 
     #[tokio::test]
@@ -2037,7 +2050,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_turn_trace_preserves_first_pending_trace_within_outer_turn() {
+    async fn finalize_turn_trace_keeps_latest_request_trace_within_outer_turn() {
         let mut state = make_state();
         state.max_turns = 40;
         state.remaining_turns = 39; // outer turn 1
@@ -2078,14 +2091,25 @@ mod tests {
             role: "assistant".to_string(),
             tokens: 123,
             has_tool_calls: true,
+            content_preview: String::new(),
         }]);
         second.record_token_budget_estimate(5_000, 123, 0, 2_000, 100, 7_223, 100_000, 0.07223);
         state.telemetry.turn_trace_collector = Some(second);
         finalize_turn_trace(&mut state).await;
 
+        let latest_pending = state
+            .telemetry
+            .pending_context_assembly_trace
+            .as_ref()
+            .expect("latest pending trace should be set");
+        assert_ne!(latest_pending.1, first_pending.1);
+        assert_eq!(latest_pending.0, 1);
         assert_eq!(
-            state.telemetry.pending_context_assembly_trace,
-            Some(first_pending)
+            latest_pending.1["history"]["turns_retained"]
+                .as_array()
+                .expect("turns_retained should be an array")
+                .len(),
+            1
         );
     }
 

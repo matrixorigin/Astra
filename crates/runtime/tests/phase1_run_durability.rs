@@ -12,9 +12,9 @@ use astra_runtime::{
 };
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
-    DurableRunRecord, RunInputData, RunInputRecord, RunLifecycleService, RunListCursor,
-    RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord, SSE_HEARTBEAT_INTERVAL_SECS,
-    ToolOutputBatchItem, transform_run_event_for_client,
+    DurableRunRecord, RunLifecycleService, RunListCursor, RunListRecord, RunMutationRecord,
+    RunStateStore, RunStatusRecord, RunUserIntentData, RunUserIntentRecord,
+    SSE_HEARTBEAT_INTERVAL_SECS, ToolOutputBatchItem, transform_run_event_for_client,
 };
 use async_trait::async_trait;
 use axum::{
@@ -382,12 +382,13 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         })
     }
 
-    async fn submit_run_input(
+    async fn submit_run_user_intent(
         &self,
         run_id: String,
         user_id: String,
-        input: RunInputData,
-    ) -> Result<RunInputRecord, (StatusCode, Json<ErrorResponse>)> {
+        input: RunUserIntentData,
+    ) -> Result<RunUserIntentRecord, (StatusCode, Json<ErrorResponse>)> {
+        let intent_id = input.intent_id.clone();
         let store = self.store().await;
         let run = store
             .load_run(&user_id, &run_id)
@@ -411,8 +412,11 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
             ));
         }
         let duplicate = run.events.iter().any(|event| {
-            event.get("idempotency_key").and_then(Value::as_str)
-                == Some(input.idempotency_key.as_str())
+            event
+                .get("data")
+                .and_then(|data| data.get("intent_id"))
+                .and_then(Value::as_str)
+                == Some(input.intent_id.as_str())
         });
         if !duplicate {
             store
@@ -420,9 +424,12 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
                     &user_id,
                     &run_id,
                     json!({
-                        "event_type": "user_input",
-                        "idempotency_key": input.idempotency_key,
-                        "data": {"input": input.input},
+                        "event_type": "user_intent",
+                        "data": {
+                            "intent_id": input.intent_id,
+                            "delivery": input.delivery,
+                            "input": input.input,
+                        },
                     }),
                 )
                 .await
@@ -432,32 +439,11 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
                         Json(ErrorResponse::new(error)),
                     )
                 })?;
-            store
-                .update_run_status(&user_id, &run_id, "running", None, None)
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(ErrorResponse::new(error)),
-                    )
-                })?;
-            store
-                .append_event(
-                    &user_id,
-                    &run_id,
-                    json!({"event_type": "run_resumed", "data": {"source": "approval_input"}}),
-                )
-                .await
-                .map_err(|error| {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(ErrorResponse::new(error)),
-                    )
-                })?;
         }
-        Ok(RunInputRecord {
+        Ok(RunUserIntentRecord {
             run_id,
-            accepted: true,
+            intent_id,
+            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
             duplicate,
         })
     }
@@ -477,11 +463,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
                     Json(ErrorResponse::new(error)),
                 )
             })?;
-        Ok(RunMutationRecord {
-            run_id,
-            status: "waiting".to_string(),
-            previous_status: "running".to_string(),
-        })
+        Ok(RunMutationRecord::applied(run_id, "waiting", "running"))
     }
 }
 
@@ -518,14 +500,19 @@ async fn http_get_run_stream(app: &Router, run_id: &str, last_index: u32) -> Vec
     parse_sse_events(&String::from_utf8_lossy(&bytes))
 }
 
-async fn http_post_run_input(app: &Router, run_id: &str, key: &str, input: Value) {
+async fn http_post_user_intent(app: &Router, run_id: &str, key: &str, input: Value) {
     let request = Request::builder()
         .method("POST")
-        .uri(format!("/chat/runs/{run_id}/input"))
+        .uri(format!("/chat/runs/{run_id}/intents"))
         .header("authorization", HTTP_TOKEN)
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({"idempotency_key": key, "input": input}).to_string(),
+            json!({
+                "intent_id": key,
+                "delivery": "guide_current_run",
+                "input": input
+            })
+            .to_string(),
         ))
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
@@ -570,7 +557,7 @@ async fn l2_recovery_ignores_live_runs_owned_by_other_pods() {
     let owner_b = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("owner-b");
     assert!(
         owner_b
-            .find_recoverable_running_runs()
+            .claim_recoverable_active_runs(16)
             .await
             .unwrap()
             .iter()
@@ -580,7 +567,7 @@ async fn l2_recovery_ignores_live_runs_owned_by_other_pods() {
 
     assert!(
         owner_a
-            .find_recoverable_running_runs()
+            .claim_recoverable_active_runs(16)
             .await
             .unwrap()
             .iter()
@@ -958,7 +945,10 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
     );
     *active_store.write().await = store_b.clone();
 
-    for (idx, decision) in ["approve-read", "approve-write"].into_iter().enumerate() {
+    for (idx, guidance) in ["read before editing", "run focused tests first"]
+        .into_iter()
+        .enumerate()
+    {
         active_store
             .read()
             .await
@@ -993,11 +983,11 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         client_indexes.extend(waiting_indexes.iter().map(|idx| *idx as i64));
         next_index = waiting_indexes.last().copied().unwrap() as u32 + 1;
 
-        http_post_run_input(
+        http_post_user_intent(
             &app,
             &run_id,
-            &format!("approval-key-{idx}"),
-            json!({"approval": decision}),
+            &format!("intent-{idx}"),
+            json!({"content": guidance}),
         )
         .await;
         let resumed = http_get_run_stream(&app, &run_id, next_index).await;
@@ -1007,8 +997,8 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             .collect::<Vec<_>>();
         assert_eq!(
             resumed_indexes.len(),
-            2,
-            "approval input should append user_input and run_resumed over HTTP"
+            1,
+            "active-run guidance should append exactly one typed intent event"
         );
         client_indexes.extend(resumed_indexes.iter().map(|idx| *idx as i64));
         next_index = resumed_indexes.last().copied().unwrap() as u32 + 1;

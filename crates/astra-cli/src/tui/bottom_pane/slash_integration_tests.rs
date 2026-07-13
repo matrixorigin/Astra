@@ -38,23 +38,21 @@ fn items() -> Vec<SlashItem> {
     ]
 }
 
-/// Items exercising aliases + usage_boost + subcommands.
-fn items_with_aliases() -> Vec<SlashItem> {
+/// Items exercising usage ranking and curated discoverability.
+fn ranked_items() -> Vec<SlashItem> {
     vec![
+        SlashItem::simple("/help", "show help"),
         SlashItem {
-            name: "/help",
-            description: "show help",
+            name: "/history".into(),
+            description: "browse history".into(),
             subcommands: &[],
-            aliases: &["h", "?"],
-            usage_boost: 0,
+            usage_boost: 100,
             ..Default::default()
         },
         SlashItem {
-            name: "/history",
-            description: "browse history",
-            subcommands: &[],
-            aliases: &[],
-            usage_boost: 100,
+            name: "/debug".into(),
+            description: "advanced diagnostics".into(),
+            primary: false,
             ..Default::default()
         },
         SlashItem::simple("/model", "pick a model"),
@@ -282,45 +280,34 @@ fn enter_on_empty_matches_does_not_submit_garbage() {
 
 // ─── Task-6 end-to-end coverage ───────────────────────────────────
 //
-// These tests lock in Task-1 (alias matching + usage_boost ranking),
-// Task-2 (PageUp/PageDown / Home / End navigation), and confirm the
-// fuzzy/prefix ordering contract from Task-3 end-to-end.
+// These tests lock in curated discovery, usage ranking, navigation, and
+// fuzzy/prefix ordering through the real BottomPane input path.
 
-fn fresh_with_aliases() -> BottomPane {
+fn fresh_with_ranked_items() -> BottomPane {
     let mut bp = BottomPane::new();
-    bp.set_slash_items(items_with_aliases());
+    bp.set_slash_items(ranked_items());
     bp
 }
 
 #[test]
-fn alias_query_surfaces_command() {
-    // `/h` with aliases=["h","?"] on /help should still surface /help
-    // via the alias path even though /history also starts with "h".
-    let mut bp = fresh_with_aliases();
-    type_string(&mut bp, "/h");
+fn bare_menu_hides_search_only_actions() {
+    let mut bp = fresh_with_ranked_items();
+    type_string(&mut bp, "/");
     assert!(bp.slash_menu_is_open());
     let names = bp.slash_menu_names();
-    assert!(
-        names.iter().any(|n| n == "/help"),
-        "/h should include /help (alias or prefix); got {names:?}"
-    );
-    assert!(
-        names.iter().any(|n| n == "/history"),
-        "/h should still match /history by prefix; got {names:?}"
-    );
+    assert!(names.iter().any(|n| n == "/help"));
+    assert!(!names.iter().any(|n| n == "/debug"), "{names:?}");
 }
 
 #[test]
-fn question_mark_alias_resolves_to_help() {
-    // `?` is a pure alias — no command literally starts with '?'.
-    // This is the regression test for alias-only lookup.
-    let mut bp = fresh_with_aliases();
-    type_string(&mut bp, "/?");
+fn typed_query_finds_search_only_actions() {
+    let mut bp = fresh_with_ranked_items();
+    type_string(&mut bp, "/deb");
     assert!(bp.slash_menu_is_open());
     let names = bp.slash_menu_names();
     assert!(
-        names.iter().any(|n| n == "/help"),
-        "alias '?' must resolve to /help; got {names:?}"
+        names.iter().any(|n| n == "/debug"),
+        "typed search must find advanced actions; got {names:?}"
     );
 }
 

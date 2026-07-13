@@ -60,6 +60,17 @@ impl ToolProgressSink {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants sent through channel and matched on receiver side
 pub enum StreamEvent {
+    /// Context occupancy estimated from the request before the runtime has
+    /// assembled its system prompt. This is a per-request value, never a
+    /// session aggregate.
+    ContextWindowEstimated(astra_turn_types::ContextWindowUsage),
+    /// Exact system-prompt token count reported by the runtime's context
+    /// assembler. Consumers combine this with the preceding estimate.
+    ContextSystemPromptTokens(u32),
+    /// Provider-confirmed input occupancy for the just-completed request.
+    /// The number includes the canonical fresh/cache-read/cache-write input
+    /// buckets exactly once.
+    ContextWindowMeasured(u64),
     /// LLM token chunk.
     Token(String),
     /// Model thinking/reasoning started or stopped.
@@ -137,11 +148,31 @@ pub enum StreamEvent {
     WaitingForModel,
     /// First SSE frame received — model is responding.
     ModelResponding,
+    /// The agentic loop has accepted the final model output for this turn.
+    /// No more assistant tokens or tool rounds will be produced, although
+    /// local turn settlement (journaling, summaries, telemetry) can still be
+    /// running. UI consumers use this as the accurate boundary between live
+    /// generation and finalization.
+    AssistantOutputSettled,
     /// Status line from headless tool execution (diff, diagnostic, etc.).
     StatusLine(String),
+    /// A mid-turn input reached the runtime's next safe model boundary.
+    UserIntentApplied {
+        intent_id: String,
+        delivery: astra_turn_types::UserIntentDelivery,
+        status: astra_turn_types::UserIntentStatus,
+        event_index: usize,
+        content: String,
+    },
     /// Live event from a spawned child agent. This travels on an
     /// app-level live lane, not the parent turn-completion lane.
     AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),
+    /// The live agent transport skipped coalescible activity. Consumers must
+    /// reconcile the affected run from durable state instead of treating the
+    /// remaining live suffix as complete.
+    AgentLiveGap(astra_turn_core::agent_live_event::AgentLiveGap),
+    /// Typed, bounded evidence for an inter-agent message lifecycle.
+    AgentCommunication(astra_turn_types::AgentCommunicationEvent),
     /// Local policy approved a tool without showing an interactive prompt.
     PermissionAutoApproved { tool: String, reason: String },
     /// Explain report from the turn (debug / introspection data).
@@ -154,7 +185,15 @@ pub enum StreamEvent {
     Compaction(astra_turn_core::compaction_types::CompactionEvent),
 }
 
-pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;
+/// Per-consumer stream buffer. Backpressure must reach the producer instead
+/// of moving an unbounded queue between the stream bridge and the UI.
+pub const STREAM_EVENT_CHANNEL_CAPACITY: usize = 1024;
+pub type StreamEventTx = mpsc::Sender<StreamEvent>;
+pub type StreamEventRx = mpsc::Receiver<StreamEvent>;
+
+pub fn stream_event_channel() -> (StreamEventTx, StreamEventRx) {
+    mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY)
+}
 
 pub trait StreamEventSink: Send + Sync + std::fmt::Debug {
     fn send(&self, event: StreamEvent);
@@ -256,7 +295,46 @@ impl ApprovalRequest {
     }
 }
 
-pub type ApprovalRequestTx = mpsc::UnboundedSender<ApprovalRequest>;
+/// Interactive requests are control boundaries, not a best-effort event lane.
+/// Keep their queue finite so a stalled renderer cannot turn model output into
+/// unbounded process memory. A full queue is reported to the caller as an
+/// explicit busy state; it must never be silently treated as delivered.
+pub const INTERACTIVE_REQUEST_CHANNEL_CAPACITY: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractiveRequestEnqueueError {
+    /// The TUI is still presenting earlier requests.
+    Busy,
+    /// The interactive surface has gone away (for example, during shutdown).
+    Unavailable,
+}
+
+impl std::fmt::Display for InteractiveRequestEnqueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("interactive request queue is busy"),
+            Self::Unavailable => f.write_str("interactive request surface is unavailable"),
+        }
+    }
+}
+
+/// Enqueue an interaction without allowing a producer to accumulate an
+/// unbounded backlog. Callers surface the returned state in their tool result
+/// rather than waiting forever or pretending that a prompt was shown.
+pub fn enqueue_interactive_request<T>(
+    tx: &mpsc::Sender<T>,
+    request: T,
+) -> Result<(), InteractiveRequestEnqueueError> {
+    match tx.try_send(request) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err(InteractiveRequestEnqueueError::Busy),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(InteractiveRequestEnqueueError::Unavailable)
+        }
+    }
+}
+
+pub type ApprovalRequestTx = mpsc::Sender<ApprovalRequest>;
 
 pub(crate) type AskUserAnnotation = astra_tools::AskUserAnnotation;
 pub(crate) type AskUserAnswers = astra_tools::AskUserAnswers;
@@ -277,7 +355,7 @@ pub struct AskUserRequest {
     pub response_tx: tokio::sync::oneshot::Sender<AskUserResponse>,
 }
 
-pub type AskUserRequestTx = mpsc::UnboundedSender<AskUserRequest>;
+pub type AskUserRequestTx = mpsc::Sender<AskUserRequest>;
 
 /// Outcome of the plan-review overlay surfaced when the model calls
 /// `exit_plan_mode` without an explicit `approved` field.
@@ -303,7 +381,7 @@ pub struct PlanReviewRequest {
     pub response_tx: tokio::sync::oneshot::Sender<PlanReviewDecision>,
 }
 
-pub type PlanReviewRequestTx = mpsc::UnboundedSender<PlanReviewRequest>;
+pub type PlanReviewRequestTx = mpsc::Sender<PlanReviewRequest>;
 
 /// Parameters for a single agentic chat turn — groups the many arguments
 /// to `stream_chat_sse` into a named struct to reduce cognitive load.
@@ -652,19 +730,25 @@ impl<'a> ChatTurnParams<'a> {
 
 #[cfg(test)]
 mod tests {
-    //! Regression guard for the "chat -m skips agent_spawner init"
-    //! bug. One-shot `chat -m` goes through
-    //! `ChatTurnParams::basic_cli` without `run_chat_repl`; before
-    //! the fix that helper hardcoded `agent_spawner: None`, so the
-    //! LLM's `agent(action='spawn', ...)` calls always returned "Agent
-    //! spawning not available in this context".
-    //!
-    //! A full end-to-end test here would require mocking the
-    //! async method with lifetime parameter (non-trivial to satisfy),
-    //! so we instead write a *structural*
-    //! regression: verify by AST that the `basic_cli` function
-    //! clones `ctx.agent_spawner` into the returned
-    //! `ChatTurnParams` (not a hard-coded `None`). The grep is
-    //! scoped to the same source file so it breaks immediately if
-    //! someone reverts the fix.
+    use super::{InteractiveRequestEnqueueError, enqueue_interactive_request};
+
+    #[test]
+    fn interactive_request_queue_is_bounded_and_reports_delivery_state() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        enqueue_interactive_request(&tx, "first").expect("first request is accepted");
+        assert_eq!(
+            enqueue_interactive_request(&tx, "second"),
+            Err(InteractiveRequestEnqueueError::Busy),
+            "a saturated interactive lane must be visible to the producer"
+        );
+        assert_eq!(rx.try_recv(), Ok("first"));
+
+        drop(rx);
+        assert_eq!(
+            enqueue_interactive_request(&tx, "after-close"),
+            Err(InteractiveRequestEnqueueError::Unavailable),
+            "shutdown must not be mistaken for a queued prompt"
+        );
+    }
 }

@@ -19,7 +19,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget},
 };
@@ -144,15 +144,16 @@ impl PlanReviewView {
     }
 
     fn render_plan_body(&self, area: Rect, buf: &mut Buffer) {
+        let theme = crate::tui::theme::current();
         let md_body =
             render_markdown_text_with_width(&self.plan_markdown, Some(area.width as usize));
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(theme.dim))
             .title(Span::styled(
                 " Plan ",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ));
         Paragraph::new(md_body)
@@ -162,6 +163,7 @@ impl PlanReviewView {
     }
 
     fn render_choices(&self, area: Rect, buf: &mut Buffer) {
+        let theme = crate::tui::theme::current();
         let lines: Vec<Line> = CHOICES
             .iter()
             .enumerate()
@@ -169,17 +171,18 @@ impl PlanReviewView {
                 let marker = if idx == self.selected { "●" } else { "○" };
                 let style = if idx == self.selected {
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.selected_fg)
+                        .bg(theme.selected_bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Gray)
+                    Style::default().fg(theme.fg)
                 };
                 Line::from(vec![
                     Span::raw("  "),
                     Span::styled(marker, style),
                     Span::raw(" "),
                     Span::styled(*label, style),
-                    Span::styled(format!("   {desc}"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("   {desc}"), Style::default().fg(theme.dim)),
                 ])
             })
             .collect();

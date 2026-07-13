@@ -17,9 +17,10 @@ pub use agent_result_status::{
     render_agent_tool_budget_unfinished_detail, summarize_agent_tool_budget_result,
 };
 pub use agent_tool::{
-    AgentToolContext, handle_agent_fanout_tool, handle_agent_get_result_action,
-    handle_agent_spawn_action, handle_agent_tool, normalize_agent_spawn_args,
-    recover_agent_fanout_tool_result, render_agent_runtime_binding_error,
+    AgentToolContext, AgentTranscriptLocation, handle_agent_fanout_tool,
+    handle_agent_get_result_action, handle_agent_spawn_action, handle_agent_tool,
+    normalize_agent_spawn_args, recover_agent_fanout_tool_result,
+    render_agent_runtime_binding_error,
 };
 pub use agent_trace_status::{
     AGENT_TRACE_EVENT_CANCELLED, AGENT_TRACE_EVENT_COMPLETED, AGENT_TRACE_EVENT_FAILED,
@@ -50,9 +51,9 @@ pub use permission_sync::{
     PermissionSyncContext, PermissionSyncHandle, PermissionUpdate,
 };
 pub use spawner::{
-    AgentHistoryRecord, AgentStatus, DynamicAgentSpawner, InheritedChildPrefix, PermissionSummary,
-    SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunConfig, SpawnRunResult,
-    SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics, SpawnedAgentState,
-    WaitForAgentOutcome, project_subrun_status_to_spawn,
+    AgentHistoryRecord, AgentStatus, DurableAgentReconciler, DynamicAgentSpawner,
+    InheritedChildPrefix, PermissionSummary, ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext,
+    SpawnError, SpawnRunConfig, SpawnRunResult, SpawnStatusProjection, SpawnedAgentInfo,
+    SpawnedAgentMetrics, SpawnedAgentState, WaitForAgentOutcome, project_subrun_status_to_spawn,
     spawn_completion_status_from_finish_reason,
 };

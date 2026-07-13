@@ -8,13 +8,9 @@
 //! routed in by `ChatWidget` when a wire event carries
 //! `parent_tool_use_id = <this cell's tool_use_id>`.
 //!
-//! Three visual states:
-//! - **Running** — accent arrow, shimmer title, children render
-//!   live underneath.
-//! - **Completed** — green arrow, `Task · <name> · done · 42ms`
-//!   title, output
-//!   summary folded under the children.
-//! - **Failed** — red arrow, same layout plus an error line.
+//! Lifecycle rendering is typed: running, completed, interrupted, failed,
+//! cancelled, or unconfirmed when the live stream ended without a terminal
+//! event. Only explicit failure carries failure styling.
 //!
 //! Persists as a compact summary (count of children, final status,
 //! duration) via `TurnEvent::Task` — full child detail is already
@@ -24,21 +20,41 @@ use std::any::Any;
 use std::time::Instant;
 
 use super::truncate_by_width;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use super::HistoryCell;
 use crate::cli::tool_result_status::tool_result_status_is_success;
-use crate::tui::agent_control_status::AGENT_RESULT_INTERRUPTED_ERROR;
 use crate::tui::history_cell::tool::humanize_tool_name;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskStatus {
     Running,
+    Waiting,
     Completed,
     Interrupted,
     Failed,
+    Cancelled,
+    /// The live projection ended without an explicit terminal event.
+    /// This is neither failure nor interruption.
+    Unconfirmed,
+}
+
+impl TaskStatus {
+    pub(crate) fn is_active(self) -> bool {
+        matches!(self, TaskStatus::Running | TaskStatus::Waiting)
+    }
+
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Completed
+                | TaskStatus::Interrupted
+                | TaskStatus::Failed
+                | TaskStatus::Cancelled
+        )
+    }
 }
 
 /// A single child event rendered inside the task body. Minimal
@@ -146,6 +162,7 @@ impl TaskCell {
     ) {
         self.status = match status_str {
             "interrupted" => TaskStatus::Interrupted,
+            "cancelled" => TaskStatus::Cancelled,
             status if tool_result_status_is_success(status) => TaskStatus::Completed,
             _ => TaskStatus::Failed,
         };
@@ -155,41 +172,31 @@ impl TaskCell {
         self.error = error;
     }
 
-    fn is_agent_result_wait(&self) -> bool {
-        self.description.starts_with("Get agent result:")
-    }
-
-    pub(crate) fn is_interrupted_wait(&self) -> bool {
-        self.status == TaskStatus::Interrupted
-            || (self.status == TaskStatus::Failed
-                && self.is_agent_result_wait()
-                && self.error.as_deref() == Some(AGENT_RESULT_INTERRUPTED_ERROR))
-    }
-
     fn arrow(&self) -> Span<'static> {
+        let theme = crate::tui::theme::current();
         match self.status {
             TaskStatus::Running => {
                 let theme = crate::tui::theme::current();
                 Span::styled("▶ ", Style::default().fg(theme.accent).bold())
             }
-            TaskStatus::Completed => Span::styled("▶ ", Style::default().fg(Color::Green).bold()),
-            TaskStatus::Interrupted => {
-                Span::styled("▶ ", Style::default().fg(Color::Yellow).bold())
-            }
-            TaskStatus::Failed if self.is_interrupted_wait() => {
-                Span::styled("▶ ", Style::default().fg(Color::Yellow).bold())
-            }
-            TaskStatus::Failed => Span::styled("▶ ", Style::default().fg(Color::Red).bold()),
+            TaskStatus::Waiting => Span::styled("… ", Style::default().fg(theme.warn).bold()),
+            TaskStatus::Completed => Span::styled("▶ ", Style::default().fg(theme.success).bold()),
+            TaskStatus::Interrupted => Span::styled("▶ ", Style::default().fg(theme.warn).bold()),
+            TaskStatus::Failed => Span::styled("▶ ", Style::default().fg(theme.error).bold()),
+            TaskStatus::Cancelled => Span::styled("■ ", Style::default().fg(theme.dim).bold()),
+            TaskStatus::Unconfirmed => Span::styled("? ", Style::default().fg(theme.dim).bold()),
         }
     }
 
     fn title_text(&self) -> &'static str {
         match self.status {
             TaskStatus::Running => "running",
+            TaskStatus::Waiting => "waiting",
             TaskStatus::Completed => "done",
             TaskStatus::Interrupted => "interrupted",
-            TaskStatus::Failed if self.is_interrupted_wait() => "interrupted",
             TaskStatus::Failed => "failed",
+            TaskStatus::Cancelled => "cancelled",
+            TaskStatus::Unconfirmed => "status unconfirmed",
         }
     }
 
@@ -227,6 +234,7 @@ const COLLAPSE_THRESHOLD: usize = 3;
 impl HistoryCell for TaskCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let dim = Style::default().dim();
+        let theme = crate::tui::theme::current();
         let w = width as usize;
         let max_child_w = w.saturating_sub(6);
 
@@ -237,8 +245,13 @@ impl HistoryCell for TaskCell {
         } else {
             ""
         };
-        let header = if self.status == TaskStatus::Running {
-            let meta = format!(" · {}{}", self.elapsed_str(), background_hint);
+        let header = if self.status.is_active() {
+            let state_hint = if self.status == TaskStatus::Waiting {
+                "waiting · "
+            } else {
+                ""
+            };
+            let meta = format!(" · {state_hint}{}{}", self.elapsed_str(), background_hint);
             let desc = trimmed_desc(
                 &self.description,
                 w.saturating_sub(2 + task_label.width() + 3 + meta.width()),
@@ -270,8 +283,7 @@ impl HistoryCell for TaskCell {
 
         // Children rendering: inline while running or ≤ threshold,
         // collapsed summary when completed with many children.
-        let should_collapse =
-            self.status != TaskStatus::Running && self.children.len() > COLLAPSE_THRESHOLD;
+        let should_collapse = !self.status.is_active() && self.children.len() > COLLAPSE_THRESHOLD;
 
         if should_collapse {
             // Collapsed summary: "  └ 12 steps · 10 done, 2 failed"
@@ -300,12 +312,12 @@ impl HistoryCell for TaskCell {
             // `  ├ Read src/main.rs · 20ms`.
             let total = self.children.len();
             for (i, child) in self.children.iter().enumerate() {
-                let is_last = i + 1 == total && self.status != TaskStatus::Running;
+                let is_last = i + 1 == total && !self.status.is_active();
                 let connector = if is_last { "  └ " } else { "  ├ " };
                 let name_style = match child.status {
-                    ChildStatus::Running => Style::default().fg(Color::Gray).bold(),
-                    ChildStatus::Success => Style::default().fg(Color::Green).bold(),
-                    ChildStatus::Failed => Style::default().fg(Color::Red).bold(),
+                    ChildStatus::Running => Style::default().fg(theme.dim).bold(),
+                    ChildStatus::Success => Style::default().fg(theme.success).bold(),
+                    ChildStatus::Failed => Style::default().fg(theme.error).bold(),
                 };
                 let meta = match child.status {
                     ChildStatus::Running => None,
@@ -325,7 +337,6 @@ impl HistoryCell for TaskCell {
                             + if meta.is_some() { 3 } else { 0 },
                     ),
                 );
-                let theme = crate::tui::theme::current();
                 let mut spans = vec![
                     Span::styled(connector.to_string(), dim),
                     Span::styled(name, name_style),
@@ -364,7 +375,7 @@ impl HistoryCell for TaskCell {
         // Keep it in the same tree language as the child rows rather than
         // switching to a different arrow glyph mid-cell.
         if let Some(ref summary) = self.output_summary
-            && self.status != TaskStatus::Running
+            && !self.status.is_active()
         {
             if should_collapse {
                 let lc = summary.lines().count();
@@ -397,15 +408,15 @@ impl HistoryCell for TaskCell {
         }
 
         if let Some(ref err) = self.error {
-            let (icon_style, text_style) = if self.is_interrupted_wait() {
+            let (icon_style, text_style) = if self.status == TaskStatus::Interrupted {
                 (
-                    Style::default().fg(Color::Yellow).bold(),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme.warn).bold(),
+                    Style::default().fg(theme.warn),
                 )
             } else {
                 (
-                    Style::default().fg(Color::Red).bold(),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(theme.error).bold(),
+                    Style::default().fg(theme.error),
                 )
             };
             lines.push(Line::from(vec![
@@ -426,22 +437,14 @@ impl HistoryCell for TaskCell {
     }
 
     fn is_live(&self) -> bool {
-        self.status == TaskStatus::Running
+        self.status.is_active()
     }
 
     fn finalize(&mut self) {
-        if self.status == TaskStatus::Running {
-            self.status = TaskStatus::Failed;
-            self.completed_at = Some(Instant::now());
+        if self.status.is_active() {
+            self.status = TaskStatus::Unconfirmed;
             if self.duration_ms.is_none() {
                 self.duration_ms = Some(self.started_at.elapsed().as_millis() as u64);
-            }
-            if self.error.is_none() {
-                self.error = Some(if self.is_agent_result_wait() {
-                    AGENT_RESULT_INTERRUPTED_ERROR.into()
-                } else {
-                    "Task did not complete before the turn ended.".into()
-                });
             }
         }
     }
@@ -484,6 +487,17 @@ mod tests {
     }
 
     #[test]
+    fn waiting_task_stays_live_and_renders_its_distinct_state() {
+        let mut task = TaskCell::new_running("tu_parent", "needs user input");
+        task.status = TaskStatus::Waiting;
+
+        assert!(task.is_live());
+        let output = render(&task, 80, 2);
+        assert!(output.contains("waiting"), "{output}");
+        assert!(!output.contains("running"), "{output}");
+    }
+
+    #[test]
     fn complete_transitions_out_of_running() {
         let mut t = TaskCell::new_running("tu_parent", "do work");
         t.complete("completed", 1234, Some("done".into()), None);
@@ -501,37 +515,16 @@ mod tests {
     }
 
     #[test]
-    fn finalize_demotes_stuck_running_to_failed_with_placeholder_error() {
+    fn finalize_marks_stuck_running_as_unconfirmed_without_inventing_an_error() {
         let mut t = TaskCell::new_running("tu_parent", "slow");
         t.finalize();
-        assert_eq!(t.status, TaskStatus::Failed);
+        assert_eq!(t.status, TaskStatus::Unconfirmed);
         assert!(t.duration_ms.is_some());
-        assert!(
-            t.completed_at.is_some(),
-            "finalize is a terminal transition and must stamp local completion time"
-        );
-        assert!(t.error.is_some(), "finalize must stamp a reason");
-    }
+        assert!(t.completed_at.is_none());
+        assert!(t.error.is_none());
 
-    #[test]
-    fn finalize_get_agent_result_renders_as_interrupted_not_failed() {
-        let mut t = TaskCell::new_running("tu_parent", "Get agent result: reviewer@abc");
-        t.push_child_started("child-1", "bash", "git diff");
-        t.push_child_completed("child-1", "completed", 20);
-
-        t.finalize();
-
-        let out = render(&t, 100, 4);
-        let normalized = out.replace('\n', " ");
-        assert!(
-            out.contains("Task · Get agent result: reviewer@abc · interrupted"),
-            "{out}"
-        );
-        assert!(
-            !out.contains("Task · Get agent result: reviewer@abc · failed"),
-            "{out}"
-        );
-        assert!(normalized.contains(AGENT_RESULT_INTERRUPTED_ERROR), "{out}");
+        let out = render(&t, 100, 2);
+        assert!(out.contains("status unconfirmed"), "{out}");
     }
 
     // ── Children ───────────────────────────────────────────────────

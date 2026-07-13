@@ -210,8 +210,9 @@ impl ContextTraceSignal {
 /// Durable projection for a background shell owned by a session.
 ///
 /// This is intentionally not a process handle. On resume, non-terminal rows
-/// are restored as visible stale handles so the user can inspect captured
-/// output without the UI pretending it can still control an old process.
+/// retain their last-observed lifecycle state and are marked as restored
+/// snapshots with no live control. This keeps observation freshness separate
+/// from the task's lifecycle instead of inventing a terminal outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundShellTaskProjection {
     pub id: String,
@@ -231,9 +232,10 @@ pub struct BackgroundShellTaskProjection {
 /// Durable projection for a background local agent owned by a session.
 ///
 /// This stores the user/model-visible lifecycle state, not a runtime handle.
-/// On resume, non-terminal agents are restored as stale/unavailable tasks:
-/// the previous local executor is gone, but the task remains visible with the
-/// latest known tail/result/error for inspection.
+/// On resume, non-terminal agents retain their last-observed lifecycle state
+/// and are marked as restored snapshots: the previous local executor is gone,
+/// but the task remains visible with the latest known tail/result/error for
+/// inspection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundLocalAgentFanoutProjection {
     pub group_id: String,
@@ -246,6 +248,8 @@ pub struct BackgroundLocalAgentFanoutProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundLocalAgentTaskProjection {
     pub id: String,
+    pub run_id: String,
+    pub parent_run_id: String,
     pub status: String,
     pub title: String,
     pub started_at_ms: u64,
@@ -1259,6 +1263,8 @@ mod tests {
             WorkspaceMetadata::with_context("sess-bg-agent", "gpt-4", "/tmp", Some("main"));
         ws.background_local_agent_tasks = vec![BackgroundLocalAgentTaskProjection {
             id: "agent-1".into(),
+            run_id: "run-agent-1".into(),
+            parent_run_id: "root".into(),
             status: "running".into(),
             title: "review auth flow".into(),
             started_at_ms: 1_766_000_000_123,

@@ -61,22 +61,22 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
     )));
 
     // Model reasons first.
-    w.handle_event(AppEvent::Wire(WireEvent::ReasoningDelta(
+    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta(
         "user wants X. ".into(),
     )));
-    w.handle_event(AppEvent::Wire(WireEvent::ReasoningDelta(
+    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta(
         "I'll do Y.".into(),
     )));
-    w.handle_event(AppEvent::Wire(WireEvent::ReasoningDone));
+    w.handle_event(AppEvent::wire(WireEvent::ReasoningDone));
 
     // Tool invocation mid-turn.
-    w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+    w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
         name: "bash".into(),
         description: "ls /tmp".into(),
         tool_use_id: "tu_drv_1".into(),
         parent_tool_use_id: None,
     }));
-    w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
+    w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
         name: "bash".into(),
         description: String::new(),
         status: "completed".into(),
@@ -88,15 +88,15 @@ fn canonical_turn_commits_every_cell_kind_in_order() {
     }));
 
     // Answer streams in two chunks.
-    w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta(
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
         "Here is the plan:\n\n".into(),
     )));
-    w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta(
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
         "- step one\n- step two\n".into(),
     )));
 
     // Turn ends — widget emits the summary.
-    w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::new(
+    w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
         TurnStats {
             elapsed_ms: Some(1_500),
             ttft_ms: Some(400),
@@ -131,13 +131,13 @@ fn canonical_turn_snapshots_full_scrollback() {
     let mut w = ChatWidget::new("");
 
     w.handle_event(AppEvent::User(UserEvent::Submit("run ls".into())));
-    w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+    w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
         name: "bash".into(),
         description: "ls /tmp".into(),
         tool_use_id: "tu_drv_2".into(),
         parent_tool_use_id: None,
     }));
-    w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
+    w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
         name: "bash".into(),
         description: String::new(),
         status: "completed".into(),
@@ -147,10 +147,10 @@ fn canonical_turn_snapshots_full_scrollback() {
         tool_use_id: "tu_drv_2".into(),
         parent_tool_use_id: None,
     }));
-    w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta(
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
         "There are 3 files.".into(),
     )));
-    w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::new(
+    w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
         TurnStats {
             elapsed_ms: Some(1_200),
             ttft_ms: Some(400),
@@ -174,11 +174,11 @@ fn interleaved_reasoning_and_answer_collapses_reasoning_first() {
     // Assistant ✓ (not a single mixed cell).
     let mut w = ChatWidget::new("");
     w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
-    w.handle_event(AppEvent::Wire(WireEvent::ReasoningDelta(
+    w.handle_event(AppEvent::wire(WireEvent::ReasoningDelta(
         "some thought".into(),
     )));
-    w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta("answer".into())));
-    w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::new(
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta("answer".into())));
+    w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::new(
         TurnStats {
             elapsed_ms: Some(500),
             ..Default::default()
@@ -206,13 +206,13 @@ fn two_back_to_back_tools_both_commit() {
 
     for (i, dur) in [(1u64, 10u64), (2, 20)] {
         let tid = format!("tu_drv_b2b_{i}");
-        w.handle_event(AppEvent::Wire(WireEvent::ToolStarted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolStarted {
             name: format!("t{i}"),
             description: format!("call {i}"),
             tool_use_id: tid.clone(),
             parent_tool_use_id: None,
         }));
-        w.handle_event(AppEvent::Wire(WireEvent::ToolCompleted {
+        w.handle_event(AppEvent::wire(WireEvent::ToolCompleted {
             name: format!("t{i}"),
             description: String::new(),
             status: "completed".into(),
@@ -224,7 +224,7 @@ fn two_back_to_back_tools_both_commit() {
         }));
     }
 
-    w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+    w.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
     // user + t1 + t2 + summary
     assert_eq!(w.history().len(), 4);
 }
@@ -233,10 +233,10 @@ fn two_back_to_back_tools_both_commit() {
 fn turn_error_mid_stream_commits_partial_assistant_then_error() {
     let mut w = ChatWidget::new("");
     w.handle_event(AppEvent::User(UserEvent::Submit("hi".into())));
-    w.handle_event(AppEvent::Wire(WireEvent::AnswerDelta(
+    w.handle_event(AppEvent::wire(WireEvent::AnswerDelta(
         "half an answer".into(),
     )));
-    w.handle_event(AppEvent::Wire(WireEvent::TurnError("rate limited".into())));
+    w.handle_event(AppEvent::wire(WireEvent::TurnError("rate limited".into())));
 
     // User + partial Assistant + SystemError. No summary on
     // error-ended turns.

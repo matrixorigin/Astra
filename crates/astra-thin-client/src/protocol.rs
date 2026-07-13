@@ -113,20 +113,100 @@ pub struct SessionUpdateRequest {
     pub status: Option<String>,
 }
 
-/// `POST /chat/runs/{run_id}/input` body.
+/// `POST /chat/runs/{run_id}/intents` body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RunInputRequest {
-    pub idempotency_key: String,
+pub struct RunUserIntentRequest {
+    pub intent_id: String,
+    pub delivery: astra_turn_types::UserIntentDelivery,
     #[serde(default)]
     pub input: Value,
 }
 
-/// `POST /chat/runs/{run_id}/input` response.
+/// `POST /chat/runs/{run_id}/intents` response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RunInputResponse {
+pub struct RunUserIntentResponse {
     pub run_id: String,
-    pub accepted: bool,
+    pub intent_id: String,
+    pub status: astra_turn_types::UserIntentStatus,
     pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTranscriptItem {
+    pub session_id: String,
+    pub item_seq: i64,
+    pub run_id: Option<String>,
+    pub role: String,
+    pub content: String,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub reasoning_status: Option<String>,
+    /// Structured tool calls carried by an assistant message. Empty for
+    /// ordinary conversation and for servers that have not projected tool
+    /// evidence into this page.
+    #[serde(default)]
+    pub tool_calls: Vec<SessionTranscriptToolCall>,
+    /// Structured linkage for a tool-result message.
+    #[serde(default)]
+    pub tool_result: Option<SessionTranscriptToolResult>,
+    /// Structured non-conversational evidence associated with this agent run.
+    /// It is visible in the transcript but never part of prompt-facing
+    /// user/assistant/tool history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<astra_turn_types::AgentTranscriptEvidence>,
+    /// Stable canonical event identity when this item was projected from a
+    /// server-side trace event. Local journal items omit it.
+    #[serde(default)]
+    pub source_event_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTranscriptToolCall {
+    pub tool_use_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTranscriptToolResult {
+    pub tool_use_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTranscriptPageRef {
+    pub page_seq: i64,
+    pub start_item_seq: i64,
+    pub end_item_seq: i64,
+    pub item_count: i64,
+    pub page_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTranscriptPage {
+    pub session_id: String,
+    pub items: Vec<SessionTranscriptItem>,
+    pub page_refs: Vec<SessionTranscriptPageRef>,
+    pub next_before_seq: Option<i64>,
+    pub has_more: bool,
+}
+
+/// The server-owned projection a transcript reader asks for. `Session` is an
+/// explicit audit/debug scope; user-facing root conversations and delegated
+/// runs must choose their distinct scopes instead of relying on an omitted
+/// `run_id` convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTranscriptReadScope<'a> {
+    Session,
+    RootConversation,
+    Run(&'a str),
 }
 
 /// `POST /tools/result` (§5.5).
@@ -269,6 +349,23 @@ pub enum ApprovalKind {
     Explicit,
 }
 
+/// `POST /user-prompts/respond`.
+///
+/// The response payload is left as JSON at the transport boundary because
+/// thin clients do not depend on the server tool crate. The server parses it
+/// into the canonical questionnaire answer type and validates it against the
+/// durable prompt before recording any terminal outcome.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserPromptRespondRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers: Option<Value>,
+}
+
 /// `POST /agents/edge` — matches server `EdgeRegisterRequest` (Phase 3 registry).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EdgeRegisterRequest {
@@ -378,6 +475,7 @@ pub enum StreamEvent {
         agent_id: Value,
         task: Value,
     },
+    AgentCommunication(astra_turn_types::AgentCommunicationEvent),
     AgentSpawned {
         agent_id: String,
         run_id: String,
@@ -413,6 +511,20 @@ pub enum StreamEvent {
     },
     RunCancelled {
         run_id: Option<String>,
+    },
+    RunUserIntentAccepted {
+        run_id: String,
+        intent_id: String,
+        delivery: astra_turn_types::UserIntentDelivery,
+        index: u64,
+    },
+    RunUserIntentApplied {
+        run_id: String,
+        intent_id: String,
+        delivery: astra_turn_types::UserIntentDelivery,
+        event_index: u64,
+        content: String,
+        index: u64,
     },
     RunError {
         message: String,
@@ -466,6 +578,14 @@ pub enum StreamEvent {
         approval_kind: ApprovalKind,
         path: Option<String>,
         detail: Option<String>,
+        raw: Value,
+    },
+    /// A durable ask-user interaction. `prompt` is the canonical question
+    /// payload and `run_id` identifies the run that is waiting for input.
+    UserPromptRequired {
+        request_id: String,
+        run_id: Option<String>,
+        prompt: Value,
         raw: Value,
     },
     Error {
@@ -565,6 +685,10 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             agent_id: obj.get("agent_id").cloned().unwrap_or(Value::Null),
             task: obj.get("task").cloned().unwrap_or(Value::Null),
         },
+        "agent_communication" => StreamEvent::AgentCommunication(
+            serde_json::from_value(raw.clone())
+                .map_err(|_| crate::error::ThinClientError::InvalidSseJson(raw.clone()))?,
+        ),
         "agent_spawned" => StreamEvent::AgentSpawned {
             agent_id: get_str(&obj, "agent_id"),
             run_id: get_str(&obj, "run_id"),
@@ -601,6 +725,32 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
         "run_cancelled" => StreamEvent::RunCancelled {
             run_id: optional_str(&obj, "run_id"),
         },
+        "user_intent_accepted" => {
+            let status: astra_turn_types::UserIntentStatus = required_field(&obj, "status", &raw)?;
+            if status != astra_turn_types::UserIntentStatus::AcceptedRemote {
+                return Err(crate::error::ThinClientError::InvalidSseJson(raw));
+            }
+            StreamEvent::RunUserIntentAccepted {
+                run_id: required_field(&obj, "run_id", &raw)?,
+                intent_id: required_field(&obj, "intent_id", &raw)?,
+                delivery: required_field(&obj, "delivery", &raw)?,
+                index: required_field(&obj, "index", &raw)?,
+            }
+        }
+        "user_intent_applied" => {
+            let status: astra_turn_types::UserIntentStatus = required_field(&obj, "status", &raw)?;
+            if status != astra_turn_types::UserIntentStatus::Applied {
+                return Err(crate::error::ThinClientError::InvalidSseJson(raw));
+            }
+            StreamEvent::RunUserIntentApplied {
+                run_id: required_field(&obj, "run_id", &raw)?,
+                intent_id: required_field(&obj, "intent_id", &raw)?,
+                delivery: required_field(&obj, "delivery", &raw)?,
+                event_index: required_field(&obj, "event_index", &raw)?,
+                content: required_field(&obj, "content", &raw)?,
+                index: required_field(&obj, "index", &raw)?,
+            }
+        }
         "run_error" => StreamEvent::RunError {
             message: obj
                 .get("message")
@@ -678,6 +828,12 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
                 }),
             raw,
         },
+        "user_prompt_required" => StreamEvent::UserPromptRequired {
+            request_id: get_str(&obj, "request_id"),
+            run_id: optional_str(&obj, "run_id"),
+            prompt: obj.get("prompt").cloned().unwrap_or(Value::Null),
+            raw,
+        },
         "error" => StreamEvent::Error {
             message: obj
                 .get("message")
@@ -716,6 +872,22 @@ fn optional_str(obj: &serde_json::Map<String, Value>, key: &str) -> Option<Strin
     obj.get(key)
         .and_then(|v| v.as_str())
         .map(std::string::ToString::to_string)
+}
+
+fn required_field<T>(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    raw: &Value,
+) -> Result<T, crate::error::ThinClientError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let value = obj
+        .get(key)
+        .cloned()
+        .ok_or_else(|| crate::error::ThinClientError::InvalidSseJson(raw.clone()))?;
+    serde_json::from_value(value)
+        .map_err(|_| crate::error::ThinClientError::InvalidSseJson(raw.clone()))
 }
 
 #[cfg(test)]
@@ -796,6 +968,41 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         let back: ApprovalRespondRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn user_prompt_response_and_required_stream_event_preserve_typed_identity() {
+        let response = UserPromptRespondRequest {
+            request_id: "prompt-1".into(),
+            session_id: "sess-1".into(),
+            run_id: "run-1".into(),
+            cancelled: false,
+            answers: Some(json!({"answers": []})),
+        };
+        let round_trip: UserPromptRespondRequest =
+            serde_json::from_value(serde_json::to_value(&response).unwrap()).unwrap();
+        assert_eq!(round_trip, response);
+
+        match classify_stream_event(json!({
+            "type": "user_prompt_required",
+            "request_id": "prompt-1",
+            "run_id": "run-1",
+            "prompt": {"questions": [{"question": "Continue?"}]}
+        }))
+        .unwrap()
+        {
+            StreamEvent::UserPromptRequired {
+                request_id,
+                run_id,
+                prompt,
+                ..
+            } => {
+                assert_eq!(request_id, "prompt-1");
+                assert_eq!(run_id.as_deref(), Some("run-1"));
+                assert_eq!(prompt["questions"][0]["question"], "Continue?");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
@@ -1059,6 +1266,35 @@ mod tests {
     }
 
     #[test]
+    fn classify_agent_communication_preserves_typed_identity() {
+        let value = serde_json::json!({
+            "type": "agent_communication",
+            "schema_version": "astra.agent_communication.v1",
+            "observed_by": {"run_id": "run-review", "agent_id": "reviewer"},
+            "direction": "received",
+            "message_id": "msg-1",
+            "from": {"run_id": "run-code", "agent_id": "coder"},
+            "to": {"kind": "direct", "address": {"run_id": "run-review", "agent_id": "reviewer"}},
+            "payload_kind": "text",
+            "summary": "Please review the patch",
+            "timestamp_ms": 42,
+            "requires_ack": true
+        });
+
+        let StreamEvent::AgentCommunication(event) = classify_stream_event(value).unwrap() else {
+            panic!("expected typed agent communication event");
+        };
+        assert_eq!(event.observed_by.run_id, "run-review");
+        assert_eq!(event.observed_by.agent_id, "reviewer");
+        assert_eq!(event.from.run_id, "run-code");
+        assert_eq!(
+            event.direction,
+            astra_turn_types::AgentCommunicationDirection::Received
+        );
+        assert_eq!(event.summary.as_deref(), Some("Please review the patch"));
+    }
+
+    #[test]
     fn classify_usage() {
         let value = serde_json::json!({
             "type": "usage",
@@ -1237,6 +1473,72 @@ mod tests {
     }
 
     #[test]
+    fn classify_run_user_intent_lifecycle_preserves_run_and_event_identity() {
+        let accepted = classify_stream_event(serde_json::json!({
+            "type": "user_intent_accepted",
+            "run_id": "run-child",
+            "intent_id": "intent-7",
+            "delivery": "guide_current_run",
+            "status": "accepted_remote",
+            "index": 12
+        }))
+        .unwrap();
+        assert!(matches!(
+            accepted,
+            StreamEvent::RunUserIntentAccepted {
+                run_id,
+                intent_id,
+                index: 12,
+                ..
+            } if run_id == "run-child" && intent_id == "intent-7"
+        ));
+
+        let applied = classify_stream_event(serde_json::json!({
+            "type": "user_intent_applied",
+            "run_id": "run-child",
+            "intent_id": "intent-7",
+            "delivery": "guide_current_run",
+            "status": "applied",
+            "event_index": 7,
+            "content": "inspect the failing test",
+            "index": 13
+        }))
+        .unwrap();
+        assert!(matches!(
+            applied,
+            StreamEvent::RunUserIntentApplied {
+                run_id,
+                intent_id,
+                event_index: 7,
+                content,
+                index: 13,
+                ..
+            } if run_id == "run-child"
+                && intent_id == "intent-7"
+                && content == "inspect the failing test"
+        ));
+    }
+
+    #[test]
+    fn malformed_run_user_intent_event_is_not_downgraded_to_other() {
+        let error = classify_stream_event(serde_json::json!({
+            "type": "user_intent_applied",
+            "run_id": "run-child",
+            "intent_id": "intent-7",
+            "delivery": "guide_current_run",
+            "status": "accepted_remote",
+            "event_index": 7,
+            "content": "wrong lifecycle status",
+            "index": 13
+        }))
+        .expect_err("applied event with accepted status must fail closed");
+        assert!(matches!(
+            error,
+            crate::error::ThinClientError::InvalidSseJson(_)
+        ));
+    }
+
+    #[test]
     fn classify_error_event() {
         let v = serde_json::json!({
             "type": "error",
@@ -1390,5 +1692,39 @@ mod tests {
     fn tool_result_deser_null_edge_agent_id_is_rejected() {
         let json = r#"{"session_id":"s1","run_id":"r1","turn_chain_id":"c1","request_id":"req1","edge_agent_id":null,"status":"success","output":"ok","duration_ms":10,"result_hash":"h"}"#;
         assert!(serde_json::from_str::<ToolResultRequest>(json).is_err());
+    }
+
+    #[test]
+    fn transcript_item_decodes_legacy_and_typed_tool_evidence() {
+        let legacy: SessionTranscriptItem = serde_json::from_value(serde_json::json!({
+            "session_id": "session-1",
+            "item_seq": 1,
+            "run_id": "run-1",
+            "role": "assistant",
+            "content": "done",
+            "created_at": "2026-07-12T00:00:00"
+        }))
+        .unwrap();
+        assert!(legacy.tool_calls.is_empty());
+        assert!(legacy.tool_result.is_none());
+        assert!(legacy.source_event_id.is_none());
+
+        let typed: SessionTranscriptItem = serde_json::from_value(serde_json::json!({
+            "session_id": "session-1",
+            "item_seq": -1,
+            "run_id": "run-1",
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "tool_use_id": "call-1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"src/lib.rs\"}"
+            }],
+            "source_event_id": "event-call-1",
+            "created_at": "2026-07-12T00:00:00"
+        }))
+        .unwrap();
+        assert_eq!(typed.tool_calls[0].name, "read_file");
+        assert_eq!(typed.source_event_id.as_deref(), Some("event-call-1"));
     }
 }

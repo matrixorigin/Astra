@@ -9,6 +9,7 @@ pub mod conflict_resolver;
 #[cfg(feature = "server")]
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
+pub mod session_run_tree;
 #[cfg(feature = "server")]
 pub mod team_orchestrator_traits;
 #[cfg(feature = "server")]
@@ -26,9 +27,9 @@ use astra_services::auth::{SessionActivityCursor, SessionActivityRecord, Session
 use astra_services::{
     AdminAuditRecord, AdminFeedbackStatsRecord, AdminInitRecord, AdminTokenRecord,
     AdminUserRoleRecord, AuthTokenRecord, AuthUserRecord, CancelRunRecord, ChatRequestData,
-    ChatRunRecord, RunListCursor, RunListRecord, RunMutationRecord, RunStatusRecord,
-    SessionArtifactListCursor, SessionListRecord, SessionRecord, run_list_cursor_db_updated_at,
-    run_list_cursor_run_id,
+    ChatRunRecord, RunContinuationRecord, RunListCursor, RunListRecord, RunMutationDisposition,
+    RunMutationRecord, RunStatusRecord, SessionArtifactListCursor, SessionListRecord,
+    SessionRecord, run_list_cursor_db_updated_at, run_list_cursor_run_id,
 };
 #[cfg(feature = "server")]
 use astra_tools::AskUserPrompt;
@@ -42,6 +43,11 @@ pub use chat_route::{ChatRouteResponse, classify_chat_route};
 pub use edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_TIMEOUT_SECS,
     EdgeClientMessage, EdgeServerMessage,
+};
+pub use session_run_tree::{
+    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunCapabilityServerRefs,
+    SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
+    SessionRunTreeSnapshot,
 };
 
 #[cfg(feature = "server")]
@@ -427,6 +433,9 @@ pub struct RunMutationResponse {
     pub run_id: String,
     pub status: String,
     pub previous_status: String,
+    pub disposition: RunMutationDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<RunContinuationRecord>,
 }
 
 #[cfg(feature = "server")]
@@ -1134,6 +1143,8 @@ impl From<RunMutationRecord> for RunMutationResponse {
             run_id: value.run_id,
             status: value.status,
             previous_status: value.previous_status,
+            disposition: value.disposition,
+            continuation: value.continuation,
         }
     }
 }

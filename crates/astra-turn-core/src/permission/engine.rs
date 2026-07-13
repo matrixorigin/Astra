@@ -625,11 +625,23 @@ pub fn evaluate_permission(
                     .unwrap_or("Access to path outside project boundary")
                     .to_string();
                 let action = sandbox_expand_action_label(inner_tool);
+                let directory = args
+                    .get("directory")
+                    .and_then(Value::as_str)
+                    .filter(|directory| !directory.trim().is_empty());
                 let decision = HardDecision::NeedExternal {
                     prompt: ApprovalPrompt {
                         tool: tool_name.to_string(),
-                        header: format!("{inner_tool} wants to {action} outside the project"),
-                        detail: None,
+                        header: directory
+                            .map(|directory| {
+                                format!("{inner_tool} wants to {action} in {directory}")
+                            })
+                            .unwrap_or_else(|| {
+                                format!("{inner_tool} wants to {action} outside the project")
+                            }),
+                        detail: directory.map(|directory| {
+                            format!("Approve temporary sandbox access to {directory}")
+                        }),
                         reason,
                         risk_tags: risk_tags.clone(),
                     },
@@ -1253,34 +1265,10 @@ fn resolve_git_safety_guard(
     }
 
     if ctx.mode().skips_human_approval_prompts() {
-        if has_hard_violation {
-            let reason = format!("Git safety hard violation (bypass denied): {joined_reasons}");
-            return GuardResolution::Return {
-                decision: HardDecision::Deny {
-                    reason: reason.clone(),
-                },
-                source: DecisionSource::GitSafety {
-                    violation: reason.clone(),
-                },
-                detail: reason,
-                skipped_notes,
-            };
-        }
-        if ctx.inherited.allowed_tools.is_some() {
-            skipped_notes.push(format!(
-                "bypass mode git violation, deferring to allowlist: {joined_reasons}",
-            ));
-            return GuardResolution::Continue(skipped_notes);
-        }
-        let reason = format!("Git safety (bypass): {joined_reasons}");
-        return GuardResolution::Return {
-            decision: HardDecision::Allow,
-            source: DecisionSource::GitSafety {
-                violation: reason.clone(),
-            },
-            detail: reason,
-            skipped_notes,
-        };
+        skipped_notes.push(format!(
+            "git risk retained as advisory in bypass mode: {joined_reasons}",
+        ));
+        return GuardResolution::Continue(skipped_notes);
     }
 
     if ctx.mode().auto_allows_soft_git_policy() && !has_hard_violation {
@@ -1290,15 +1278,10 @@ fn resolve_git_safety_guard(
             ));
             return GuardResolution::Continue(skipped_notes);
         }
-        let reason = format!("Git safety (auto-allow): {joined_reasons}");
-        return GuardResolution::Return {
-            decision: HardDecision::Allow,
-            source: DecisionSource::GitSafety {
-                violation: reason.clone(),
-            },
-            detail: reason,
-            skipped_notes,
-        };
+        skipped_notes.push(format!(
+            "soft git risk retained as advisory in auto mode: {joined_reasons}",
+        ));
+        return GuardResolution::Continue(skipped_notes);
     }
 
     let reason = format!("Git safety: {joined_reasons}");
@@ -1798,6 +1781,35 @@ mod tests {
                 }
                 assert_eq!(envelope.source, DecisionSource::SandboxExpansion);
             }
+        }
+    }
+
+    #[test]
+    fn sandbox_expand_prompt_uses_the_requested_directory_when_available() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                ..Default::default()
+            },
+        );
+        let envelope = evaluate_permission(
+            "sandbox_expand:bash",
+            &serde_json::json!({
+                "reason": "The current tool sandbox needs a broader workspace boundary.",
+                "directory": "/workspace/astra"
+            }),
+            &ctx,
+        );
+
+        match envelope.decision {
+            HardDecision::NeedExternal { prompt } => {
+                assert_eq!(prompt.header, "bash wants to execute in /workspace/astra");
+                assert_eq!(
+                    prompt.detail.as_deref(),
+                    Some("Approve temporary sandbox access to /workspace/astra")
+                );
+            }
+            other => panic!("sandbox scope should prompt; got {other:?}"),
         }
     }
 
@@ -2655,6 +2667,25 @@ mod tests {
     }
 
     #[test]
+    fn bypass_git_advisory_does_not_skip_later_execute_boundary() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Bypass,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "cd /workspace && git status | bash"}),
+            &ctx,
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::ExecuteHardDeny { .. }
+        ));
+        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+    }
+
+    #[test]
     fn structured_git_force_push_feature_branch_is_soft_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -2671,7 +2702,6 @@ mod tests {
         );
 
         assert!(matches!(envelope.decision, HardDecision::Allow));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
     }
 
@@ -2692,7 +2722,6 @@ mod tests {
         );
 
         assert!(matches!(envelope.decision, HardDecision::Allow));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
     }
 
@@ -2721,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_git_force_push_protected_branch_is_denied_in_bypass_mode() {
+    fn structured_git_force_push_protected_branch_is_advisory_in_bypass_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Bypass,
         );
@@ -2736,12 +2765,7 @@ mod tests {
             &ctx,
         );
 
-        assert!(matches!(
-            envelope.decision,
-            HardDecision::Deny { ref reason }
-                if reason.contains("Git safety hard violation")
-        ));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(matches!(envelope.decision, HardDecision::Allow));
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
     }
 

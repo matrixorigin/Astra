@@ -9,8 +9,8 @@ use super::{
 use astra_runtime::tool_sandbox::validate_path;
 use astra_sandbox::is_internal_safe_path;
 use astra_tools::fs_ops::{
-    check_anchor_vs_replacement_size, convert_read_file_args, normalize_read_file_line_range,
-    read_to_string_lossy, str_replace_fail, validate_read_file_args,
+    check_anchor_vs_replacement_size, normalize_read_file_line_range, read_to_string_lossy,
+    str_replace_fail, validate_read_file_args,
 };
 use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
 use astra_turn_core::tool_result_semantics::TOOL_SUCCESS_SENTINEL;
@@ -233,8 +233,7 @@ impl ToolExecutor {
         args: &Value,
         tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
     ) -> String {
-        let args = convert_read_file_args(args);
-        if let Err(error) = validate_read_file_args(&args) {
+        if let Err(error) = validate_read_file_args(args) {
             return error;
         }
         let path_str = match args.get("path").and_then(Value::as_str) {
@@ -3646,8 +3645,8 @@ type Handler interface {
 
         let result = executor.read_file(&serde_json::json!({
             "file": "numbered.txt",
-            "offset": 1,
-            "limit": 300
+            "start_line": 1,
+            "end_line": 300
         }));
 
         assert!(result.contains("unknown field `file`"), "{result}");
@@ -3667,9 +3666,9 @@ type Handler interface {
 
         let result = executor.read_file(&serde_json::json!({
             "path": "test.txt",
-            "offset": "1"
+            "start_line": "1"
         }));
-        assert!(result.contains("`offset`"), "{result}");
+        assert!(result.contains("`start_line`"), "{result}");
         assert!(result.contains("positive integer"), "{result}");
 
         let result = executor.read_file(&serde_json::json!({
@@ -3679,17 +3678,14 @@ type Handler interface {
         assert!(result.contains("`outline`"), "{result}");
         assert!(result.contains("boolean"), "{result}");
 
-        // offset+limit cannot express reversed ranges — any offset+limit
-        // combination is always valid (offset=3,limit=1 → lines 3-3).
         let result = executor.read_file(&serde_json::json!({
             "path": "test.txt",
-            "offset": 3,
-            "limit": 100
+            "start_line": 3,
+            "end_line": 1
         }));
-        // offset 3 + limit 100 on a 3-line file auto-clamps — no error.
         assert!(
-            !result.contains("Error"),
-            "large limit on small file should auto-clamp, got: {result}"
+            result.contains("must not exceed"),
+            "reversed range must be rejected, got: {result}"
         );
     }
 
@@ -3713,15 +3709,15 @@ type Handler interface {
             "end_line": 300
         }));
 
-        // Reversed ranges are accepted (normalized downstream).
-        // But the file has only 1 line → auto-expand kicks in → full file returned.
+        // Structural validation runs before small-file auto-expansion: a
+        // reversed range is malformed even when the file has one line.
         assert!(
-            !result.contains("must be <="),
-            "reversed range should not fail with auto-expand, got: {result}"
+            result.contains("must not exceed"),
+            "reversed range must be rejected before auto-expand, got: {result}"
         );
         assert!(
-            result.contains("Auto-expanded"),
-            "expected auto-expand for 1-line file, got: {result}"
+            !result.contains("Auto-expanded"),
+            "a malformed range must not produce a misleading full-file read: {result}"
         );
     }
 

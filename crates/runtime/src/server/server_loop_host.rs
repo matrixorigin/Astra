@@ -13,7 +13,7 @@
 //!       → post_tool_policy(): stall/dedup/guard
 //! ```
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -64,7 +64,7 @@ use astra_services::multi_agent::EdgeDispatchService;
 use astra_services::runs::{RequestedTurnInteractionMode, TurnIntentExecutionPolicy};
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
-    AgentLiveEvent, AgentLiveEventKind, SharedAgentLiveEventSink,
+    AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     FallbackOutcome, RateLimitAction, try_resolve_fallback,
@@ -76,8 +76,6 @@ use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 
-const MAX_PENDING_PROGRESS_AGENTS: usize = 128;
-const MAX_PENDING_PROGRESS_PER_AGENT: usize = 8;
 const MAX_STREAMED_TURN_EVENT_BUFFER: usize = 2_048;
 const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
@@ -253,7 +251,6 @@ fn record_llm_main_attempt_metrics(
 pub(crate) struct RunScopedAgentProgressFilter {
     pub(crate) run_ids: HashSet<String>,
     pub(crate) agent_ids: HashSet<String>,
-    pub(crate) pending_by_agent: HashMap<String, VecDeque<AgentProgressEvent>>,
 }
 
 impl RunScopedAgentProgressFilter {
@@ -263,56 +260,16 @@ impl RunScopedAgentProgressFilter {
         Self {
             run_ids,
             agent_ids: HashSet::new(),
-            pending_by_agent: HashMap::new(),
         }
     }
 
     pub(crate) fn accept(&mut self, event: AgentProgressEvent) -> Vec<AgentProgressEvent> {
-        if self.agent_ids.contains(&event.agent_id) {
+        if self.run_ids.contains(&event.parent_run_id) || self.run_ids.contains(&event.run_id) {
+            self.run_ids.insert(event.run_id.clone());
+            self.agent_ids.insert(event.agent_id.clone());
             return vec![event];
         }
-
-        if let ProgressEventType::AgentSpawned {
-            run_id,
-            parent_run_id,
-            ..
-        } = &event.event_type
-        {
-            if self.run_ids.contains(parent_run_id) || self.run_ids.contains(run_id) {
-                self.run_ids.insert(run_id.clone());
-                self.agent_ids.insert(event.agent_id.clone());
-                let mut accepted = self
-                    .pending_by_agent
-                    .remove(&event.agent_id)
-                    .unwrap_or_default();
-                accepted.push_back(event);
-                return accepted.into_iter().collect();
-            }
-
-            self.pending_by_agent.remove(&event.agent_id);
-            return Vec::new();
-        }
-
-        self.remember_pending(event);
         Vec::new()
-    }
-
-    fn remember_pending(&mut self, event: AgentProgressEvent) {
-        if !self.pending_by_agent.contains_key(&event.agent_id)
-            && self.pending_by_agent.len() >= MAX_PENDING_PROGRESS_AGENTS
-            && let Some(key) = self.pending_by_agent.keys().next().cloned()
-        {
-            self.pending_by_agent.remove(&key);
-        }
-
-        let pending = self
-            .pending_by_agent
-            .entry(event.agent_id.clone())
-            .or_default();
-        if pending.len() >= MAX_PENDING_PROGRESS_PER_AGENT {
-            pending.pop_front();
-        }
-        pending.push_back(event);
     }
 }
 
@@ -1282,6 +1239,7 @@ struct PromptMemoryRecallCache {
 
 #[derive(Clone)]
 struct AgentLiveMirror {
+    run_id: String,
     agent_id: String,
     sink: SharedAgentLiveEventSink,
 }
@@ -2440,6 +2398,7 @@ impl ServerAgenticLoopHost {
             return;
         };
         if let Err(err) = mirror.sink.send(AgentLiveEvent {
+            run_id: mirror.run_id.clone(),
             agent_id: mirror.agent_id.clone(),
             kind,
         }) {
@@ -2577,8 +2536,17 @@ impl ServerAgenticLoopHost {
         self.approval_audit_context = Some(context);
     }
 
-    pub fn set_agent_live_event_sink(&mut self, agent_id: String, sink: SharedAgentLiveEventSink) {
-        self.agent_live_mirror = Some(AgentLiveMirror { agent_id, sink });
+    pub fn set_agent_live_event_sink(
+        &mut self,
+        run_id: String,
+        agent_id: String,
+        sink: SharedAgentLiveEventSink,
+    ) {
+        self.agent_live_mirror = Some(AgentLiveMirror {
+            run_id,
+            agent_id,
+            sink,
+        });
     }
 
     /// Set the cancellation handles used when client disconnects.
@@ -4624,26 +4592,56 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
     }
 
-    fn on_deferred_user_input(&mut self, input: &Value) {
-        let Some(raw_skills) = input.get("active_skills") else {
+    async fn on_final_output_ready(&mut self, _state: &AgenticLoopState) {
+        self.emit_event(json!({ "type": "assistant_output_settled" }));
+    }
+
+    fn on_agent_communication(&mut self, event: astra_messaging::AgentCommunicationEvent) {
+        let Ok(Value::Object(mut payload)) = serde_json::to_value(event) else {
+            tracing::error!(
+                target: "astra_runtime::agent_communication",
+                "failed to serialize typed agent communication evidence"
+            );
             return;
         };
+        payload.insert(
+            "type".to_string(),
+            Value::String("agent_communication".to_string()),
+        );
+        self.emit_event(Value::Object(payload));
+    }
 
-        let active_skills: Vec<Value> = raw_skills
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|skill| !skill.is_empty())
-            .map(|skill| Value::String(skill.to_string()))
-            .collect();
+    fn apply_user_intent_context(&mut self, event: &crate::turn::run_control::QueuedUserIntent) {
+        if let Some(raw_skills) = event.input.get("active_skills") {
+            let active_skills: Vec<Value> = raw_skills
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|skill| !skill.is_empty())
+                .map(|skill| Value::String(skill.to_string()))
+                .collect();
 
-        if active_skills.is_empty() {
-            self.edge_profile.remove("active_skills");
-        } else {
-            self.edge_profile
-                .insert("active_skills".to_string(), Value::Array(active_skills));
+            if active_skills.is_empty() {
+                self.edge_profile.remove("active_skills");
+            } else {
+                self.edge_profile
+                    .insert("active_skills".to_string(), Value::Array(active_skills));
+            }
+        }
+    }
+
+    fn on_user_intent_applied(&mut self, event: &crate::turn::run_control::QueuedUserIntent) {
+        if let Some(content) = crate::turn::run_control::user_intent_content(&event.input) {
+            self.emit_event(json!({
+                "type": "user_intent_applied",
+                "intent_id": event.intent_id,
+                "delivery": event.delivery,
+                "status": astra_turn_types::UserIntentStatus::Applied,
+                "event_index": event.event_index,
+                "content": content,
+            }));
         }
     }
 
@@ -5878,6 +5876,11 @@ fn json_value_type(value: &Value) -> &'static str {
 pub(crate) fn agent_live_event_kind_from_server_sse(event: &Value) -> Option<AgentLiveEventKind> {
     let event_type = event.get("type").and_then(Value::as_str)?;
     match event_type {
+        "agent_live_event" if event.get("event_kind").and_then(Value::as_str) == Some("signal") => {
+            serde_json::from_value::<AgentLiveSignal>(event.get("signal")?.clone())
+                .ok()
+                .map(AgentLiveEventKind::Signal)
+        }
         "text_delta" => event
             .get("content")
             .and_then(Value::as_str)
@@ -5910,6 +5913,64 @@ pub(crate) fn agent_live_event_kind_from_server_sse(event: &Value) -> Option<Age
                 tool_use_id,
             })
         }
+        "user_intent_applied" => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::UserIntentApplied {
+                intent_id: event.get("intent_id")?.as_str()?.to_string(),
+                delivery: serde_json::from_value(event.get("delivery")?.clone()).ok()?,
+                status: serde_json::from_value(event.get("status")?.clone()).ok()?,
+                event_index: usize::try_from(event.get("event_index")?.as_u64()?).ok()?,
+                content: event.get("content")?.as_str()?.to_string(),
+            },
+        )),
+        "agent_communication" => {
+            serde_json::from_value::<astra_turn_types::AgentCommunicationEvent>(event.clone())
+                .ok()
+                .map(AgentLiveSignal::AgentCommunication)
+                .map(AgentLiveEventKind::Signal)
+        }
+        "approval_required" => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::ApprovalRequired {
+                request_id: event.get("request_id")?.as_str()?.to_string(),
+                tool: event.get("tool")?.as_str()?.to_string(),
+                approval_kind: event
+                    .get("approval_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("explicit")
+                    .to_string(),
+                path: event
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                detail: event
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                display_label: event
+                    .get("display_label")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            },
+        )),
+        "ask_user_prompted" => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::AskUserPrompted {
+                request_id: event.get("request_id")?.as_str()?.to_string(),
+                prompt: event
+                    .get("prompt")
+                    .or_else(|| event.pointer("/ask_user/prompt"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            },
+        )),
+        "ask_user_resolved" | "ask_user_error" | "ask_user_cancelled" => Some(
+            AgentLiveEventKind::Signal(AgentLiveSignal::AskUserResolved {
+                request_id: event.get("request_id")?.as_str()?.to_string(),
+                resolution: event
+                    .get("resolution")
+                    .or_else(|| event.get("ask_user"))
+                    .cloned()
+                    .unwrap_or_else(|| event.clone()),
+            }),
+        ),
         _ => None,
     }
 }
@@ -6047,16 +6108,14 @@ pub(crate) fn progress_event_to_sse(
 
     let event = match &evt.event_type {
         ProgressEventType::AgentSpawned {
-            run_id,
-            parent_run_id,
             agent_type,
             description,
             fanout_slot,
         } => json!({
             "type": "agent_spawned",
             "agent_id": agent_id,
-            "run_id": run_id,
-            "parent_run_id": parent_run_id,
+            "run_id": &evt.run_id,
+            "parent_run_id": &evt.parent_run_id,
             "agent_type": agent_type,
             "description": description,
             "fanout_slot": fanout_slot,
@@ -6207,7 +6266,26 @@ pub(crate) fn progress_event_to_sse(
             "timestamp": ts,
         }),
     };
-    Some(merge_progress_metadata(event, evt.metadata.as_ref()))
+    Some(merge_progress_metadata(
+        merge_progress_scope(event, evt),
+        evt.metadata.as_ref(),
+    ))
+}
+
+fn merge_progress_scope(
+    mut event: Value,
+    progress: &crate::orchestration::AgentProgressEvent,
+) -> Value {
+    let Some(event_obj) = event.as_object_mut() else {
+        return event;
+    };
+    event_obj
+        .entry("run_id")
+        .or_insert_with(|| Value::String(progress.run_id.clone()));
+    event_obj
+        .entry("parent_run_id")
+        .or_insert_with(|| Value::String(progress.parent_run_id.clone()));
+    event
 }
 
 fn merge_progress_metadata(mut event: Value, metadata: Option<&Value>) -> Value {
@@ -7353,6 +7431,7 @@ mod tests {
             live_event_sink: None,
             trace_context: None,
             execution_metadata: None,
+            transcript_location: crate::orchestration::AgentTranscriptLocation::DurableServer,
         });
         executor
     }
@@ -8268,7 +8347,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_user_input_updates_active_skills_in_edge_profile() {
+    fn durable_user_intent_event_follows_local_context_application() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -8277,19 +8356,45 @@ mod tests {
         )
         .build();
 
-        host.on_deferred_user_input(&json!({
-            "content": "Use the release format.",
-            "active_skills": ["release-manager", "deploy-auditor"],
-        }));
+        let first = crate::turn::run_control::QueuedUserIntent {
+            intent_id: "input-1".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+            event_index: 4,
+            input: json!({
+                "content": "Use the release format.",
+                "active_skills": ["release-manager", "deploy-auditor"],
+            }),
+        };
+        host.apply_user_intent_context(&first);
         assert_eq!(
             host.edge_profile.get("active_skills"),
             Some(&json!(["release-manager", "deploy-auditor"]))
         );
 
-        host.on_deferred_user_input(&json!({
-            "content": "No special output formatting now.",
-            "active_skills": [],
-        }));
+        host.on_user_intent_applied(&first);
+        assert_eq!(
+            host.emitted_events.last(),
+            Some(&json!({
+                "type": "user_intent_applied",
+                "intent_id": "input-1",
+                "delivery": "guide_current_run",
+                "status": "applied",
+                "event_index": 4,
+                "content": "Requested active skills: release-manager, deploy-auditor.\nUse the release format.",
+            }))
+        );
+
+        host.apply_user_intent_context(&crate::turn::run_control::QueuedUserIntent {
+            intent_id: "input-2".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+            event_index: 6,
+            input: json!({
+                "content": "No special output formatting now.",
+                "active_skills": [],
+            }),
+        });
         assert!(
             host.edge_profile.get("active_skills").is_none(),
             "explicitly empty deferred active_skills should clear prior run-level skill hints"
@@ -8395,6 +8500,54 @@ mod tests {
         let events = host.take_emitted_events();
         assert_eq!(events.len(), 1);
         assert!(host.emitted_events.is_empty());
+    }
+
+    #[test]
+    fn agent_communication_emits_client_ready_typed_evidence() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .build();
+        let event = astra_turn_types::AgentCommunicationEvent {
+            schema_version: astra_turn_types::AGENT_COMMUNICATION_SCHEMA_VERSION.to_string(),
+            observed_by: astra_turn_types::AgentCommunicationParty {
+                run_id: "run-review".into(),
+                agent_id: "reviewer".into(),
+            },
+            direction: astra_turn_types::AgentCommunicationDirection::Received,
+            message_id: "msg-1".into(),
+            from: astra_turn_types::AgentCommunicationParty {
+                run_id: "run-code".into(),
+                agent_id: "coder".into(),
+            },
+            to: astra_turn_types::AgentCommunicationTarget::Direct {
+                address: astra_turn_types::AgentCommunicationParty {
+                    run_id: "run-review".into(),
+                    agent_id: "reviewer".into(),
+                },
+            },
+            payload_kind: "text".into(),
+            summary: Some("review this".into()),
+            response_accepted: None,
+            related_message_id: None,
+            timestamp_ms: 42,
+            correlation_id: None,
+            requires_ack: false,
+        };
+
+        host.on_agent_communication(event);
+
+        assert_eq!(host.emitted_events.len(), 1);
+        assert_eq!(host.emitted_events[0]["type"], "agent_communication");
+        assert_eq!(
+            host.emitted_events[0]["observed_by"]["run_id"],
+            "run-review"
+        );
+        assert_eq!(host.emitted_events[0]["from"]["agent_id"], "coder");
+        assert_eq!(host.emitted_events[0]["summary"], "review this");
     }
 
     #[test]
@@ -9570,6 +9723,7 @@ mod tests {
 
         AgenticLoopState {
             messages: Vec::new(),
+            run_transcript_capture: None,
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
@@ -9582,6 +9736,7 @@ mod tests {
             recursion_depth: 0,
             final_text: String::new(),
             final_text_streamed: false,
+            final_output_ready_notified: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -9622,7 +9777,7 @@ mod tests {
             hooks: Default::default(),
             cancellation: Default::default(),
             messaging: Default::default(),
-            deferred_input: Default::default(),
+            user_intents: Default::default(),
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
@@ -12395,14 +12550,53 @@ mod tests {
     }
 
     #[test]
+    fn server_sse_runtime_evidence_remains_typed_in_agent_live_lane() {
+        let intent = super::agent_live_event_kind_from_server_sse(&json!({
+            "type": "user_intent_applied",
+            "intent_id": "intent-1",
+            "delivery": "guide_current_run",
+            "status": "applied",
+            "event_index": 4,
+            "content": "Check the retry path"
+        }))
+        .expect("intent evidence");
+        assert!(matches!(
+            intent,
+            AgentLiveEventKind::Signal(AgentLiveSignal::UserIntentApplied {
+                intent_id,
+                event_index: 4,
+                ..
+            }) if intent_id == "intent-1"
+        ));
+
+        let approval = super::agent_live_event_kind_from_server_sse(&json!({
+            "type": "approval_required",
+            "request_id": "approval-1",
+            "tool": "bash",
+            "approval_kind": "explicit",
+            "display_label": "$ cargo test"
+        }))
+        .expect("approval evidence");
+        assert!(matches!(
+            approval,
+            AgentLiveEventKind::Signal(AgentLiveSignal::ApprovalRequired {
+                request_id,
+                tool,
+                display_label: Some(label),
+                ..
+            }) if request_id == "approval-1" && tool == "bash" && label == "$ cargo test"
+        ));
+    }
+
+    #[test]
     fn progress_event_agent_spawned_to_sse() {
         use crate::orchestration::{AgentProgressEvent, ProgressEventType};
 
         let evt = AgentProgressEvent {
             agent_id: "agent-1".to_string(),
+            run_id: "run-123".to_string(),
+            parent_run_id: "run-000".to_string(),
             event_type: ProgressEventType::AgentSpawned {
-                run_id: "run-123".to_string(),
-                parent_run_id: "run-000".to_string(),
                 agent_type: "explore".to_string(),
                 description: "Search codebase".to_string(),
                 fanout_slot: None,
@@ -12414,6 +12608,7 @@ mod tests {
         assert_eq!(sse["type"], "agent_spawned");
         assert_eq!(sse["agent_id"], "agent-1");
         assert_eq!(sse["run_id"], "run-123");
+        assert_eq!(sse["parent_run_id"], "run-000");
         assert_eq!(sse["agent_type"], "explore");
     }
 
@@ -12423,9 +12618,9 @@ mod tests {
 
         let evt = AgentProgressEvent {
             agent_id: "agent-1".to_string(),
+            run_id: "run-123".to_string(),
+            parent_run_id: "run-000".to_string(),
             event_type: ProgressEventType::AgentSpawned {
-                run_id: "run-123".to_string(),
-                parent_run_id: "run-000".to_string(),
                 agent_type: "explore".to_string(),
                 description: "Search codebase".to_string(),
                 fanout_slot: None,
@@ -12452,6 +12647,8 @@ mod tests {
 
         let evt = AgentProgressEvent {
             agent_id: "agent-2".to_string(),
+            run_id: "run-child".to_string(),
+            parent_run_id: "run-root".to_string(),
             event_type: ProgressEventType::Completed {
                 result_summary: "Done".to_string(),
                 total_tool_calls: 5,
@@ -12465,6 +12662,29 @@ mod tests {
         assert_eq!(sse["type"], "agent_completed");
         assert_eq!(sse["status"], "completed");
         assert_eq!(sse["total_tool_calls"], 5);
+        assert_eq!(sse["run_id"], "run-child");
+        assert_eq!(sse["parent_run_id"], "run-root");
+    }
+
+    #[test]
+    fn scoped_progress_is_accepted_before_agent_spawned_arrives() {
+        use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+
+        let mut filter = super::RunScopedAgentProgressFilter::new("run-root".to_string());
+        let accepted = filter.accept(AgentProgressEvent {
+            agent_id: "reviewer@child".to_string(),
+            run_id: "run-child".to_string(),
+            parent_run_id: "run-root".to_string(),
+            event_type: ProgressEventType::Started {
+                description: "review the storage layer".to_string(),
+            },
+            timestamp_epoch_ms: 1,
+            metadata: None,
+        });
+
+        assert_eq!(accepted.len(), 1);
+        assert!(filter.agent_ids.contains("reviewer@child"));
+        assert!(filter.run_ids.contains("run-child"));
     }
 
     #[test]
@@ -12516,6 +12736,8 @@ mod tests {
         for (event_type, status, expected_fields) in cases {
             let evt = AgentProgressEvent {
                 agent_id: "agent-live".to_string(),
+                run_id: "run-live".to_string(),
+                parent_run_id: "run-root".to_string(),
                 event_type,
                 timestamp_epoch_ms: 1234,
                 metadata: None,
@@ -12537,6 +12759,8 @@ mod tests {
 
         let evt = AgentProgressEvent {
             agent_id: "agent-2".to_string(),
+            run_id: "run-child".to_string(),
+            parent_run_id: "run-root".to_string(),
             event_type: ProgressEventType::Interrupted {
                 reason: "budget_exhausted".to_string(),
                 partial_summary: "Partial".to_string(),
@@ -12559,6 +12783,8 @@ mod tests {
 
         let failed = AgentProgressEvent {
             agent_id: "agent-f".to_string(),
+            run_id: "run-failed".to_string(),
+            parent_run_id: "run-root".to_string(),
             event_type: ProgressEventType::Failed {
                 error: "boom".to_string(),
             },
@@ -12567,6 +12793,8 @@ mod tests {
         };
         let cancelled = AgentProgressEvent {
             agent_id: "agent-c".to_string(),
+            run_id: "run-cancelled".to_string(),
+            parent_run_id: "run-root".to_string(),
             event_type: ProgressEventType::Cancelled {
                 reason: "user request".to_string(),
             },
@@ -12589,6 +12817,8 @@ mod tests {
 
         let evt = AgentProgressEvent {
             agent_id: "agent-3".to_string(),
+            run_id: "run-idle".to_string(),
+            parent_run_id: "run-root".to_string(),
             event_type: ProgressEventType::Idle,
             timestamp_epoch_ms: 3000,
             metadata: None,

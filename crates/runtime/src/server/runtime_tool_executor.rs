@@ -78,8 +78,6 @@ use crate::server::tool_work_surface_events::{
 use crate::tool_sandbox::SandboxPolicy;
 use astra_turn_core::file_edit_journal::FileEditJournal;
 
-use astra_tools::plan_task_mirror;
-
 mod tool_handlers;
 
 #[cfg(test)]
@@ -3820,6 +3818,7 @@ esac
             live_event_sink: None,
             trace_context: None,
             execution_metadata: None,
+            transcript_location: crate::orchestration::AgentTranscriptLocation::DurableServer,
         }
     }
 
@@ -5592,13 +5591,17 @@ esac
         assert!(result.is_error, "{result:?}");
         let value: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(value["status"], "failed");
-        assert!(
-            value["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("top-level `action='spawn'`"),
-            "{}",
-            result.output
+        assert_eq!(
+            value["error_kind"].as_str(),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
         );
     }
 
@@ -6654,7 +6657,7 @@ esac
         std::fs::write(dir.path().join("big.txt"), &large).unwrap();
         let result = exec.execute("read_file", &json!({"path": "big.txt"})).await;
         assert!(result.contains("Large file preview"), "got: {result}");
-        assert!(result.contains("offset/limit"), "got: {result}");
+        assert!(result.contains("start_line/end_line"), "got: {result}");
     }
 
     #[tokio::test]
@@ -8726,7 +8729,7 @@ esac
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_approved_mirrors_plan_into_user_visible_step_tasks() {
+    async fn model_exit_plan_mode_waits_for_trusted_approval_without_creating_todos() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
@@ -8786,7 +8789,7 @@ esac
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_approved_rolls_back_partial_task_board_mirror_failure() {
+    async fn model_exit_plan_mode_leaves_existing_todos_untouched() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "rollback server plan".into(),
@@ -8863,7 +8866,7 @@ esac
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_approved_fails_closed_when_task_board_reload_fails_after_snapshot() {
+    async fn model_exit_plan_mode_does_not_read_or_write_todos() {
         struct SnapshotThenLoadFailStore {
             load_calls: Arc<std::sync::atomic::AtomicUsize>,
             mutate_calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -8972,7 +8975,7 @@ esac
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_approved_does_not_collide_with_existing_async_or_subagent_task_title() {
+    async fn model_exit_plan_mode_preserves_unrelated_background_tasks() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
@@ -9039,479 +9042,6 @@ esac
                     .is_none()
             }),
             "model-submitted exit_plan_mode must not create or claim approved-plan tasks before trusted approval: {tasks:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn exit_plan_mode_approved_does_not_reuse_retired_cli_style_plan_tree() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "ship user-visible plan".into(),
-            "alice".into(),
-        );
-        state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "step-1".into(),
-                title: "sync task board".into(),
-                status: astra_services::task_orchestrator::TaskStatus::Pending,
-                ..Default::default()
-            });
-        repo.save("alice", "plan-reuse-cli-tree", &mut state, None)
-            .await
-            .unwrap();
-        repo.set_active_plan("alice", "reuse-session", Some("plan-reuse-cli-tree"))
-            .await
-            .unwrap();
-
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.session_id = "reuse-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-        let cli_style = exec
-            .task_manager
-            .create(&json!({
-                "title": "ship user-visible plan",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_fingerprint": fingerprint
-                },
-                "subtasks": [
-                    { "id": "step-1", "title": "sync task board" }
-                ]
-            }))
-            .await;
-        assert!(cli_style.contains("created"), "{cli_style}");
-
-        let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
-            .await;
-        assert!(
-            result.contains("submitted for trusted user approval"),
-            "exit_plan_mode approved must submit for trusted approval; got: {result}"
-        );
-
-        let approved_plan_tasks: Vec<_> = exec
-            .task_manager
-            .snapshot()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("source"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("approved_plan")
-            })
-            .collect();
-        assert_eq!(
-            approved_plan_tasks.len(),
-            1,
-            "model-submitted exit_plan_mode must not create a new approved-plan step task before trusted approval: {approved_plan_tasks:?}"
-        );
-        assert!(
-            approved_plan_tasks
-                .iter()
-                .all(|task| task.subtasks.len() == 1),
-            "retired tree-shaped history should remain untouched while approval is pending: {approved_plan_tasks:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn exit_plan_mode_approved_does_not_reopen_completed_plan_history() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state =
-            astra_plan::PlanModeState::new_with_owner("repeat server plan".into(), "alice".into());
-        state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "step-1".into(),
-                title: "repeatable server step".into(),
-                status: astra_services::task_orchestrator::TaskStatus::Pending,
-                ..Default::default()
-            });
-        repo.save("alice", "plan-repeat-server", &mut state, None)
-            .await
-            .unwrap();
-        repo.set_active_plan("alice", "repeat-server-session", Some("plan-repeat-server"))
-            .await
-            .unwrap();
-
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.session_id = "repeat-server-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let existing = exec
-            .task_manager
-            .create(&json!({
-                "title": "repeatable server step",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_id": "plan-repeat-server",
-                    "plan_goal": "repeat server plan",
-                    "plan_subtask_id": "step-1",
-                    "plan_fingerprint": plan_task_mirror::plan_task_board_fingerprint(&state.plan)
-                }
-            }))
-            .await;
-        assert!(existing.contains("created"), "{existing}");
-        let started = exec
-            .task_manager
-            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
-            .await;
-        assert!(!started.starts_with("Error:"), "{started}");
-        let completed = exec
-            .task_manager
-            .update(&json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
-        assert!(!completed.starts_with("Error:"), "{completed}");
-
-        let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
-            .await;
-        assert!(
-            result.contains("submitted for trusted user approval"),
-            "first submission must stay pending for trusted approval; got: {result}"
-        );
-
-        repo.set_active_plan("alice", "repeat-server-session", Some("plan-repeat-server"))
-            .await
-            .unwrap();
-        let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
-            .await;
-        assert!(
-            result.contains("submitted for trusted user approval"),
-            "repeat submission must stay pending for trusted approval; got: {result}"
-        );
-
-        let approved_plan_tasks: Vec<_> = exec
-            .task_manager
-            .snapshot()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("source"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("approved_plan")
-            })
-            .collect();
-        assert_eq!(
-            approved_plan_tasks.len(),
-            1,
-            "model-submitted exit_plan_mode must not reopen completed approved-plan history before trusted approval: {approved_plan_tasks:?}"
-        );
-        assert!(
-            approved_plan_tasks
-                .iter()
-                .any(|task| task.status.is_completed()),
-            "completed history should remain completed: {approved_plan_tasks:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn exit_plan_mode_approved_does_not_reuse_cli_style_tree_for_different_goal() {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state =
-            astra_plan::PlanModeState::new_with_owner("new visible goal".into(), "alice".into());
-        state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "step-1".into(),
-                title: "shared step".into(),
-                status: astra_services::task_orchestrator::TaskStatus::Pending,
-                ..Default::default()
-            });
-        repo.save("alice", "plan-new-visible-goal", &mut state, None)
-            .await
-            .unwrap();
-        repo.set_active_plan(
-            "alice",
-            "different-goal-session",
-            Some("plan-new-visible-goal"),
-        )
-        .await
-        .unwrap();
-
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.session_id = "different-goal-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-        let old_cli_style = exec
-            .task_manager
-            .create(&json!({
-                "title": "old visible goal",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_goal": "old visible goal",
-                    "plan_fingerprint": fingerprint
-                },
-                "subtasks": [
-                    { "id": "step-1", "title": "shared step" }
-                ]
-            }))
-            .await;
-        assert!(old_cli_style.contains("created"), "{old_cli_style}");
-
-        let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
-            .await;
-        assert!(
-            result.contains("submitted for trusted user approval"),
-            "exit_plan_mode approved must submit for trusted approval; got: {result}"
-        );
-
-        let approved_plan_tasks: Vec<_> = exec
-            .task_manager
-            .snapshot()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("source"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("approved_plan")
-            })
-            .collect();
-        assert_eq!(
-            approved_plan_tasks.len(),
-            1,
-            "model-submitted exit_plan_mode must not create new approved-plan step tasks before trusted approval: {approved_plan_tasks:?}"
-        );
-        let old_task = approved_plan_tasks
-            .iter()
-            .find(|task| task.title == "old visible goal")
-            .expect("old CLI-style task remains distinct");
-        assert!(
-            old_task
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("plan_id"))
-                .is_none(),
-            "old different-goal task must not be claimed by the new plan: {old_task:?}"
-        );
-        assert_eq!(old_task.subtasks.len(), 1, "{old_task:?}");
-    }
-
-    #[tokio::test]
-    async fn exit_plan_mode_approved_does_not_reuse_stale_server_history_when_fingerprint_changes()
-    {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "ship user-visible plan".into(),
-            "alice".into(),
-        );
-        state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "step-1".into(),
-                title: "old task board sync".into(),
-                status: astra_services::task_orchestrator::TaskStatus::Pending,
-                ..Default::default()
-            });
-        let stale_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-        repo.save("alice", "plan-same-id-new-steps", &mut state, None)
-            .await
-            .unwrap();
-
-        state.plan.subtasks[0].title = "new task board sync".into();
-        let _fresh_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-        repo.save("alice", "plan-same-id-new-steps", &mut state, None)
-            .await
-            .unwrap();
-        repo.set_active_plan("alice", "same-id-session", Some("plan-same-id-new-steps"))
-            .await
-            .unwrap();
-
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.session_id = "same-id-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let stale_tree = exec
-            .task_manager
-            .create(&json!({
-                "title": "ship user-visible plan",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_id": "plan-same-id-new-steps",
-                    "plan_fingerprint": stale_fingerprint,
-                },
-                "subtasks": [
-                    { "id": "step-1", "title": "old task board sync" }
-                ]
-            }))
-            .await;
-        assert!(stale_tree.contains("created"), "{stale_tree}");
-
-        let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
-            .await;
-        assert!(
-            result.contains("submitted for trusted user approval"),
-            "exit_plan_mode approved must submit for trusted approval; got: {result}"
-        );
-
-        let approved_plan_tasks: Vec<_> = exec
-            .task_manager
-            .snapshot()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("source"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("approved_plan")
-            })
-            .collect();
-        assert_eq!(
-            approved_plan_tasks.len(),
-            1,
-            "model-submitted exit_plan_mode must not create fresh approved-plan tasks before trusted approval: {approved_plan_tasks:?}"
-        );
-        assert!(
-            approved_plan_tasks.iter().any(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_fingerprint"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some(stale_fingerprint.as_str())
-                    && task
-                        .subtasks
-                        .iter()
-                        .any(|subtask| subtask.title == "old task board sync")
-            }),
-            "stale tree-shaped history should remain distinct rather than being silently mutated: {approved_plan_tasks:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn exit_plan_mode_approved_does_not_reuse_stale_server_history_when_dependencies_change()
-    {
-        let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "ship dependency-aware plan".into(),
-            "alice".into(),
-        );
-        state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "step-1".into(),
-                title: "build core".into(),
-                status: astra_services::task_orchestrator::TaskStatus::Pending,
-                ..Default::default()
-            });
-        state
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "step-2".into(),
-                title: "verify core".into(),
-                depends_on: vec!["step-1".into()],
-                status: astra_services::task_orchestrator::TaskStatus::Pending,
-                ..Default::default()
-            });
-        let stale_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-        repo.save("alice", "plan-same-id-new-deps", &mut state, None)
-            .await
-            .unwrap();
-
-        state.plan.subtasks[1].depends_on.clear();
-        let fresh_fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-        assert_ne!(
-            stale_fingerprint, fresh_fingerprint,
-            "dependency changes must affect task-board fingerprint"
-        );
-        repo.save("alice", "plan-same-id-new-deps", &mut state, None)
-            .await
-            .unwrap();
-        repo.set_active_plan("alice", "same-deps-session", Some("plan-same-id-new-deps"))
-            .await
-            .unwrap();
-
-        let (mut exec, _dir) = test_executor();
-        exec.set_plan_repository(repo.clone() as Arc<dyn astra_plan::PlanRepository>);
-        exec.session_id = "same-deps-session".to_string();
-        exec.user_id = "alice".to_string();
-
-        let stale_tree = exec
-            .task_manager
-            .create(&json!({
-                "title": "ship dependency-aware plan",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_id": "plan-same-id-new-deps",
-                    "plan_fingerprint": stale_fingerprint,
-                },
-                "subtasks": [
-                    { "id": "step-1", "title": "build core" },
-                    { "id": "step-2", "title": "verify core", "depends_on": ["step-1"] }
-                ]
-            }))
-            .await;
-        assert!(stale_tree.contains("created"), "{stale_tree}");
-
-        let result = exec
-            .execute("exit_plan_mode", &json!({"approved": true}))
-            .await;
-        assert!(
-            result.contains("submitted for trusted user approval"),
-            "exit_plan_mode approved must submit for trusted approval; got: {result}"
-        );
-
-        let approved_plan_tasks: Vec<_> = exec
-            .task_manager
-            .snapshot()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("source"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("approved_plan")
-            })
-            .collect();
-        assert_eq!(
-            approved_plan_tasks.len(),
-            1,
-            "model-submitted exit_plan_mode must not create fresh step tasks before trusted approval: {approved_plan_tasks:?}"
-        );
-        let verify = approved_plan_tasks
-            .iter()
-            .find(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_fingerprint"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some(stale_fingerprint.as_str())
-            })
-            .expect("stale retired task remains");
-        assert!(
-            verify
-                .subtasks
-                .iter()
-                .any(|subtask| subtask.depends_on.iter().any(|dep| dep == "step-1")),
-            "stale dependency-bearing history should remain untouched while approval is pending: {verify:?}"
         );
     }
 

@@ -266,6 +266,33 @@ pub fn sandbox_expand_dir_from_denial(args: &Value, sandbox_msg: &str) -> Option
         .and_then(|p| sandbox_expand_dir_from_pathish(&p))
 }
 
+/// Resolve a sandbox-retry scope when a bash command is rooted in the known
+/// workspace but contains only relative paths. The command runner already
+/// executes that form against `workspace_root`; asking the user to approve
+/// exactly that directory is more truthful than claiming no concrete scope
+/// exists.
+///
+/// An explicit absolute/home path remains authoritative. If it could not be
+/// accepted by [`sandbox_expand_dir_from_denial`] (for example because it is
+/// sensitive), this fallback is deliberately disabled rather than offering a
+/// workspace approval that cannot grant the requested access.
+#[must_use]
+pub fn sandbox_expand_dir_from_denial_or_workspace(
+    args: &Value,
+    sandbox_msg: &str,
+    workspace_root: &Path,
+) -> Option<PathBuf> {
+    if let Some(dir) = sandbox_expand_dir_from_denial(args, sandbox_msg) {
+        return Some(dir);
+    }
+
+    let command = args.get("command").and_then(Value::as_str)?;
+    if extract_first_sandbox_expand_path(command).is_some() {
+        return None;
+    }
+    checked_expand_path(workspace_root.to_path_buf(), true)
+}
+
 fn sandbox_expand_dir_from_path_args(args: &Value) -> Option<PathBuf> {
     for key in SANDBOX_PATH_ARG_KEYS {
         if let Some(dir) = args
@@ -626,7 +653,7 @@ fn normalize_sandbox_denied_message(message: &str) -> Cow<'_, str> {
 #[must_use]
 pub fn sandbox_retry_no_expand_dir_output(tool: &str, sandbox_msg: &str) -> String {
     format!(
-        "Error: {tool} was blocked by the sandbox, but Astra could not safely choose a concrete non-sensitive directory to approve.\nPath check: {sandbox_msg}"
+        "Error: {tool} was blocked by the sandbox. Access was not widened because this request does not identify an approvable non-sensitive directory.\nNext: use a concrete workspace path; sensitive or system locations cannot be approved.\nPath check: {sandbox_msg}"
     )
 }
 
@@ -681,7 +708,8 @@ mod tests {
         glob_preflight_base_from_absolute_pattern, is_sandbox_denied, is_sandbox_denied_result,
         sandbox_denied_message, sandbox_denied_message_from_result,
         sandbox_denied_tool_result_fields, sandbox_expand_dir_from_args,
-        sandbox_expand_dir_from_denial, sandbox_retry_no_expand_dir_output,
+        sandbox_expand_dir_from_denial, sandbox_expand_dir_from_denial_or_workspace,
+        sandbox_retry_no_expand_dir_output,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -1237,8 +1265,36 @@ mod tests {
 
         assert!(!output.contains(SANDBOX_DENIED_PREFIX));
         assert!(!is_sandbox_denied(&output));
-        assert!(output.contains("concrete non-sensitive directory"));
+        assert!(output.contains("does not identify an approvable non-sensitive directory"));
+        assert!(output.contains("concrete workspace path"));
         assert!(output.contains("Path check:"));
+    }
+
+    #[test]
+    fn relative_bash_denial_uses_the_known_workspace_as_the_approval_scope() {
+        let root = std::env::current_dir().expect("workspace root");
+        let args = json!({
+            "command": "find crates -name '*.rs' -exec sed -i 's/old/new/g' {} +"
+        });
+
+        let scope = sandbox_expand_dir_from_denial_or_workspace(
+            &args,
+            "sandbox policy denied this workspace command",
+            &root,
+        );
+
+        assert_eq!(scope, Some(root));
+    }
+
+    #[test]
+    fn sensitive_absolute_bash_denial_cannot_fall_back_to_workspace_scope() {
+        let root = std::env::current_dir().expect("workspace root");
+        let args = json!({"command": "cat /etc/shadow"});
+
+        assert_eq!(
+            sandbox_expand_dir_from_denial_or_workspace(&args, "path denied", &root,),
+            None
+        );
     }
 
     // ── Integration invariant (regression guard for session 3b7ac18f)

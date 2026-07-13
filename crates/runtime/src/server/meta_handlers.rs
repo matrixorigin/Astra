@@ -261,7 +261,11 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("# TYPE astra_interaction_approval_ledger_insert_total counter"),
+            text.contains("# TYPE astra_interaction_approval_lookup_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_interaction_approval_resolution_total counter"),
             "{text}"
         );
         assert!(

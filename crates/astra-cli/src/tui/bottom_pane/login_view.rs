@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
-use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
+use super::view::{BottomPaneView, CancellationEvent, ViewCompletion, ViewResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoginMode {
@@ -71,7 +71,7 @@ pub(crate) struct LoginView {
     values: Vec<String>,
     focus: usize,
     error: Option<String>,
-    done_value: Option<String>,
+    submitted: Option<ViewResult>,
     cancelled: bool,
 }
 
@@ -82,7 +82,7 @@ impl LoginView {
             values: mode.fields().iter().map(|_| String::new()).collect(),
             focus: 0,
             error: None,
-            done_value: None,
+            submitted: None,
             cancelled: false,
         }
     }
@@ -102,9 +102,16 @@ impl LoginView {
                 return;
             }
         }
-        self.done_value = Some(match self.mode {
-            LoginMode::Login => self.values.join("\n"),
-            LoginMode::Register => self.values.join("\n"),
+        self.submitted = Some(match self.mode {
+            LoginMode::Login => ViewResult::Login {
+                username: self.values[0].clone(),
+                password: self.values[1].clone(),
+            },
+            LoginMode::Register => ViewResult::Register {
+                username: self.values[0].clone(),
+                email: self.values[1].clone(),
+                password: self.values[2].clone(),
+            },
         });
     }
 
@@ -210,7 +217,7 @@ impl BottomPaneView for LoginView {
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        if self.cancelled || self.done_value.is_some() {
+        if self.cancelled || self.submitted.is_some() {
             return None;
         }
         let x = 6
@@ -227,7 +234,7 @@ impl BottomPaneView for LoginView {
     }
 
     fn is_complete(&self) -> bool {
-        self.cancelled || self.done_value.is_some()
+        self.cancelled || self.submitted.is_some()
     }
 
     fn completion(&self) -> Option<ViewCompletion> {
@@ -237,11 +244,8 @@ impl BottomPaneView for LoginView {
                 reopen: None,
             });
         }
-        self.done_value.clone().map(|raw| ViewCompletion {
-            result: Some(match self.mode {
-                LoginMode::Login => format!("__login__\n{raw}"),
-                LoginMode::Register => format!("__register__\n{raw}"),
-            }),
+        self.submitted.clone().map(|result| ViewCompletion {
+            result: Some(result),
             reopen: None,
         })
     }
@@ -319,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_with_both_fields_completes_with_encoded_result() {
+    fn enter_with_both_fields_completes_with_typed_credentials() {
         let mut v = LoginView::new(LoginMode::Login);
         for c in "alice".chars() {
             v.handle_key(ck(c, KeyModifiers::NONE));
@@ -331,7 +335,13 @@ mod tests {
         v.handle_key(k(KeyCode::Enter));
         assert!(v.is_complete());
         let result = v.completion().unwrap().result.unwrap();
-        assert_eq!(result, "__login__\nalice\nsecret");
+        assert_eq!(
+            result,
+            super::super::view::ViewResult::Login {
+                username: "alice".into(),
+                password: "secret".into(),
+            }
+        );
     }
 
     #[test]
@@ -377,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn register_encodes_result_with_register_sentinel() {
+    fn register_completes_with_typed_credentials() {
         let mut v = LoginView::new(LoginMode::Register);
         for c in "alice".chars() {
             v.handle_key(ck(c, KeyModifiers::NONE));
@@ -392,6 +402,13 @@ mod tests {
         }
         v.handle_key(k(KeyCode::Enter));
         let vc = v.completion().unwrap();
-        assert_eq!(vc.result.unwrap(), "__register__\nalice\na@b.c\npw");
+        assert_eq!(
+            vc.result.unwrap(),
+            super::super::view::ViewResult::Register {
+                username: "alice".into(),
+                email: "a@b.c".into(),
+                password: "pw".into(),
+            }
+        );
     }
 }

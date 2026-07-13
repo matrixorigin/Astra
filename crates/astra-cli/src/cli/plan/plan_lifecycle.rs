@@ -214,12 +214,22 @@ pub(crate) async fn sync_remote_plan_mode_state(
         return Ok(());
     };
 
-    let Some(plan_id) = active_remote_planning_plan_id(api, token, session_id).await? else {
-        state.cloud_plan_mirror = None;
-        state.plan_mode_sync_error = None;
-        return Ok(());
-    };
+    state.cloud_plan_mirror = fetch_remote_plan_mode_state(api, token, session_id).await?;
+    state.plan_mode_sync_error = None;
+    Ok(())
+}
 
+/// Fetches the remote plan projection without mutating a live session. This
+/// lets the TUI's serialized post-commit worker refresh a mirror without
+/// borrowing the active turn state.
+pub(crate) async fn fetch_remote_plan_mode_state(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    session_id: &str,
+) -> Result<Option<plan::PlanModeState>, String> {
+    let Some(plan_id) = active_remote_planning_plan_id(api, token, session_id).await? else {
+        return Ok(None);
+    };
     let plan_state = api
         .get_plan_json(token, &plan_id)
         .await
@@ -229,13 +239,11 @@ pub(crate) async fn sync_remote_plan_mode_state(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    state.cloud_plan_mirror = Some(build_plan_mode_state(
+    Ok(Some(build_plan_mode_state(
         goal,
         plan_state.get("plan").cloned(),
         plan_state.get("version").and_then(Value::as_u64),
-    ));
-    state.plan_mode_sync_error = None;
-    Ok(())
+    )))
 }
 
 pub(crate) async fn fresh_token_for_plan(

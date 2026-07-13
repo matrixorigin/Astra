@@ -20,21 +20,29 @@ pub(crate) fn stdout_color_level() -> StdoutColorLevel {
 }
 
 pub(crate) fn best_color(target: (u8, u8, u8)) -> Color {
-    let color_level = stdout_color_level();
-    if color_level == StdoutColorLevel::TrueColor {
-        Color::Rgb(target.0, target.1, target.2)
-    } else if color_level == StdoutColorLevel::Ansi256 {
-        if let Some((i, _)) = xterm_fixed_colors().min_by(|(_, a), (_, b)| {
-            perceptual_distance(*a, target)
-                .partial_cmp(&perceptual_distance(*b, target))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            Color::Indexed(i as u8)
-        } else {
-            Color::default()
+    best_color_for(stdout_color_level(), target)
+}
+
+/// Quantize a desired RGB colour for a declared terminal capability level.
+///
+/// This is kept separate from [`best_color`] so a theme can choose a complete
+/// 256-colour palette deterministically instead of treating xterm-256color as
+/// a 16-colour terminal merely because it lacks truecolour support.
+pub(crate) fn best_color_for(color_level: StdoutColorLevel, target: (u8, u8, u8)) -> Color {
+    match color_level {
+        StdoutColorLevel::TrueColor => Color::Rgb(target.0, target.1, target.2),
+        StdoutColorLevel::Ansi256 => {
+            if let Some((i, _)) = xterm_fixed_colors().min_by(|(_, a), (_, b)| {
+                perceptual_distance(*a, target)
+                    .partial_cmp(&perceptual_distance(*b, target))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                Color::Indexed(i as u8)
+            } else {
+                Color::default()
+            }
         }
-    } else {
-        Color::default()
+        StdoutColorLevel::Ansi16 | StdoutColorLevel::Unknown => Color::default(),
     }
 }
 
@@ -249,8 +257,22 @@ pub(crate) const XTERM_COLORS: [(u8, u8, u8); 256] = [
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultColors, OscColorSlot, parse_color_spec, parse_colorfgbg, parse_osc_color_response,
+        DefaultColors, OscColorSlot, StdoutColorLevel, best_color_for, parse_color_spec,
+        parse_colorfgbg, parse_osc_color_response,
     };
+    use ratatui::style::Color;
+
+    #[test]
+    fn ansi256_quantization_keeps_a_real_indexed_colour() {
+        assert!(matches!(
+            best_color_for(StdoutColorLevel::Ansi256, (19, 49, 40)),
+            Color::Indexed(_)
+        ));
+        assert_eq!(
+            best_color_for(StdoutColorLevel::Ansi16, (19, 49, 40)),
+            Color::Reset
+        );
+    }
 
     #[test]
     fn parses_osc11_rgb_response_with_st_terminator() {

@@ -1,8 +1,7 @@
 use crate::cli::{
     chat_stream::{ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse},
     cli_config::cli_utils::{
-        compact_or_raw, map_thin_err, persist_profile_last_session_or_warn, prefix_chars,
-        print_json_or_raw, urlencoding,
+        map_thin_err, persist_profile_last_session_or_warn, prefix_chars, urlencoding,
     },
     permission_manager::PermissionManager,
     session::session_state::{ContinuationAnchor, ExplainMode, SessionState},
@@ -388,6 +387,40 @@ fn append_history_edit_rollback_error(
     }
 }
 
+/// Create and bind a fresh server session without owning any presentation.
+/// Both the text CLI and TUI call this transaction; each surface renders its
+/// own acknowledgement after the authoritative `SessionState` rebind lands.
+pub(crate) async fn start_fresh_session(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+    state: &mut SessionState,
+) -> Result<String, String> {
+    let body = api
+        .post_sessions_json(token, &serde_json::json!({}))
+        .await
+        .map_err(map_thin_err)?;
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let session_id = value
+        .get("session_id")
+        .or_else(|| value.get("id"))
+        .and_then(|value| value.as_str())
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or_else(|| "session service returned no session identity".to_string())?
+        .to_string();
+
+    persist_profile_last_session_or_warn(
+        profile,
+        &session_id,
+        "slash_state:clear_starts_fresh_session",
+    );
+    state.prepare_for_session_rebind().await;
+    state.reset_for_new_session();
+    state.set_session_id(session_id.clone());
+    crate::cli::session::session_startup::initialize_journal_pub(state, &session_id);
+    Ok(session_id)
+}
+
 #[derive(Debug, Clone)]
 struct UndoFileRevertError {
     message: String,
@@ -510,37 +543,10 @@ pub(crate) async fn handle_state_command(
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
                 return Ok(());
             };
-            let body = api
-                .post_sessions_json(tok, &serde_json::json!({}))
-                .await
-                .map_err(map_thin_err)?;
-            let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            let new_sid = value
-                .get("session_id")
-                .or_else(|| value.get("id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if let Some(sid) = &new_sid {
-                persist_profile_last_session_or_warn(
-                    profile,
-                    sid,
-                    "slash_state:clear_starts_fresh_session",
-                );
-            }
-            state.prepare_for_session_rebind().await;
-            state.reset_for_new_session();
-            if let Some(ref sid) = new_sid {
-                state.set_session_id(sid.clone());
-            } else {
-                state.clear_session_id();
-            }
-            if let Some(ref sid) = new_sid {
-                crate::cli::session::session_startup::initialize_journal_pub(state, sid);
-            }
-            let display = new_sid.as_deref().unwrap_or("(none)");
+            let session_id = start_fresh_session(api, profile, tok, state).await?;
             eprintln!(
                 "{}",
-                format!("  \u{2713}  New session: {}", display).green()
+                format!("  \u{2713}  New session: {session_id}").green()
             );
         }
 
@@ -1091,81 +1097,13 @@ pub(crate) async fn handle_state_command(
             }
         }
 
-        "/reflect" => {
-            let sid = match state.session_id.as_deref() {
-                Some(s) => s.to_string(),
-                None => {
-                    eprintln!("{}", "  No active session.".yellow());
-                    return Ok(());
-                }
-            };
-            let reflect_args = parse_reflect_args(arg);
-            // `/reflect diff` short-circuits: render the local tool-health
-            // delta between the most recently synced entries and the live
-            // session entries, so the agent can audit its own tuning
-            // without needing a server round-trip.
-            if reflect_args.diff {
-                let out = render_reflect_diff(state);
-                eprint!("{out}");
-                return Ok(());
-            }
-            if let Some(body) =
-                crate::cli::self_command::try_render_reflect_surface_for_session_with_profile(
-                    &sid,
-                    reflect_args.request(20),
-                    profile,
-                )
-                .await?
-            {
-                render_reflect_report(&body, &sid);
-                return Ok(());
-            }
-
-            let Some(tok) = token else {
-                eprintln!(
-                    "{}",
-                    "  Reflect needs either local session artifacts or a logged-in server session."
-                        .yellow()
-                );
-                return Ok(());
-            };
-            let mut rel = astra_thin_client::paths::chat_session_reflect(&sid)
-                .trim_start_matches('/')
-                .to_string();
-            let mut query_parts: Vec<String> = Vec::new();
-            if reflect_args.topic != "overview" {
-                query_parts.push(format!("topic={}", urlencoding(&reflect_args.topic)));
-            }
-            if let Some(facet) = reflect_args.facet.as_deref() {
-                query_parts.push(format!("facet={}", urlencoding(facet)));
-            }
-            if reflect_args.depth != "diagnostic" {
-                query_parts.push(format!("depth={}", urlencoding(&reflect_args.depth)));
-            }
-            if let Some(question) = reflect_args
-                .question
-                .as_deref()
-                .filter(|question| !question.is_empty())
-            {
-                query_parts.push(format!("question={}", urlencoding(question)));
-            }
-            if !query_parts.is_empty() {
-                rel = format!("{rel}?{}", query_parts.join("&"));
-            }
-            match api.get_authed_path_text(tok, &rel).await {
-                Ok(body) => render_reflect_report(&body, &sid),
-                Err(astra_thin_client::ThinClientError::Api {
-                    status,
-                    body: err_body,
-                }) => {
-                    eprintln!(
-                        "{}",
-                        format!("  ✗ API Error ({}): {}", status, compact_or_raw(&err_body)).red()
-                    );
-                }
-                Err(e) => eprintln!("{}", format!("  ✗ Reflect failed: {e}").red()),
-            }
-        }
+        "/reflect" => match load_reflect_surface(state, api, profile, token, arg).await {
+            Ok(ReflectSurface::Diff { body }) => eprint!("{body}"),
+            Ok(ReflectSurface::Report {
+                session_id, body, ..
+            }) => render_reflect_report(&body, &session_id),
+            Err(error) => eprintln!("{}", format!("  ✗ {error}").red()),
+        },
         _ => unreachable!("unexpected state command: {cmd}"),
     }
 
@@ -1192,6 +1130,147 @@ impl ParsedReflectArgs {
             self.question.as_deref().unwrap_or(""),
         )
     }
+}
+
+/// Authoritative source used to build a user-visible reflection. The source is
+/// part of the result because an equivalent-looking report from a local journal
+/// versus the server has different freshness and recovery guarantees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReflectEvidenceSource {
+    LocalArtifacts,
+    Server,
+}
+
+/// A read-only reflection result. It deliberately contains no apply/mutation
+/// action: plan, task, memory, and permission changes remain separate typed
+/// workflows that can consume its evidence later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReflectSurface {
+    Diff {
+        body: String,
+    },
+    Report {
+        session_id: String,
+        source: ReflectEvidenceSource,
+        body: String,
+    },
+}
+
+/// Load a reflection through the same fallback order in every interactive
+/// surface: local canonical artifacts first, then the durable server only when
+/// local state is absent. Local corruption remains an error instead of being
+/// hidden by a remote result.
+pub(crate) async fn load_reflect_surface(
+    state: &SessionState,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: Option<&str>,
+    arg: &str,
+) -> Result<ReflectSurface, String> {
+    let session_id = state
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.trim().is_empty())
+        .ok_or_else(|| "Reflect needs an active session.".to_string())?
+        .to_string();
+    let reflect_args = parse_reflect_args(arg);
+
+    if reflect_args.diff {
+        return Ok(ReflectSurface::Diff {
+            body: render_reflect_diff(state),
+        });
+    }
+
+    load_reflect_report_for_session_with_args(&session_id, api, profile, token, reflect_args).await
+}
+
+/// Whether a reflection request is the local, immediately available diff
+/// variant. The workbench uses this to keep purely local inspection on the
+/// input path while scheduling report retrieval as a background effect.
+pub(crate) fn is_reflect_diff_request(arg: &str) -> bool {
+    parse_reflect_args(arg).diff
+}
+
+/// Load a read-only reflection report for an already captured session
+/// identity. This keeps local-artifact-first fallback identical across CLI,
+/// Server Only and Edge+Server without retaining a mutable `SessionState`
+/// borrow while filesystem or server evidence is pending.
+pub(crate) async fn load_reflect_report_for_session(
+    session_id: &str,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: Option<&str>,
+    arg: &str,
+) -> Result<ReflectSurface, String> {
+    let reflect_args = parse_reflect_args(arg);
+    if reflect_args.diff {
+        return Err("Reflection diff needs the live session state.".into());
+    }
+    load_reflect_report_for_session_with_args(session_id, api, profile, token, reflect_args).await
+}
+
+async fn load_reflect_report_for_session_with_args(
+    session_id: &str,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: Option<&str>,
+    reflect_args: ParsedReflectArgs,
+) -> Result<ReflectSurface, String> {
+    if let Some(body) =
+        crate::cli::self_command::try_render_reflect_surface_for_session_with_profile(
+            session_id,
+            reflect_args.request(20),
+            profile,
+        )
+        .await?
+    {
+        return Ok(ReflectSurface::Report {
+            session_id: session_id.to_string(),
+            source: ReflectEvidenceSource::LocalArtifacts,
+            body,
+        });
+    }
+
+    let token = token.ok_or_else(|| {
+        "Reflect needs local session artifacts or a logged-in server session.".to_string()
+    })?;
+    let rel = reflect_request_path(session_id, &reflect_args);
+    let body = api
+        .get_authed_path_text(token, &rel)
+        .await
+        .map_err(|error| format!("Reflect failed: {error}"))?;
+    Ok(ReflectSurface::Report {
+        session_id: session_id.to_string(),
+        source: ReflectEvidenceSource::Server,
+        body,
+    })
+}
+
+fn reflect_request_path(session_id: &str, reflect_args: &ParsedReflectArgs) -> String {
+    let mut rel = astra_thin_client::paths::chat_session_reflect(session_id)
+        .trim_start_matches('/')
+        .to_string();
+    let mut query_parts: Vec<String> = Vec::new();
+    if reflect_args.topic != "overview" {
+        query_parts.push(format!("topic={}", urlencoding(&reflect_args.topic)));
+    }
+    if let Some(facet) = reflect_args.facet.as_deref() {
+        query_parts.push(format!("facet={}", urlencoding(facet)));
+    }
+    if reflect_args.depth != "diagnostic" {
+        query_parts.push(format!("depth={}", urlencoding(&reflect_args.depth)));
+    }
+    if let Some(question) = reflect_args
+        .question
+        .as_deref()
+        .filter(|question| !question.is_empty())
+    {
+        query_parts.push(format!("question={}", urlencoding(question)));
+    }
+    if !query_parts.is_empty() {
+        rel = format!("{rel}?{}", query_parts.join("&"));
+    }
+    rel
 }
 
 fn parse_reflect_args(arg: &str) -> ParsedReflectArgs {
@@ -1367,183 +1446,157 @@ pub(crate) fn render_reflect_diff(state: &SessionState) -> String {
 
 /// Render a `ReflectReport` as a compact, colored terminal report.
 fn render_reflect_report(body: &str, session_id: &str) {
-    let Ok(report) = serde_json::from_str::<serde_json::Value>(body) else {
-        print_json_or_raw(body);
-        return;
+    let report = match parse_reflection_report(body) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("{}", format!("  {error}").yellow());
+            return;
+        }
     };
-
-    let overview = &report["overview"];
-    let short_sid = prefix_chars(session_id, 8);
-
-    // Header
+    let display_session = if report.session_id.is_empty() {
+        session_id
+    } else {
+        &report.session_id
+    };
     eprintln!(
         "{}",
-        format!("🔍 Session Diagnosis — {short_sid}")
-            .magenta()
+        format!("Reflection · {}", prefix_chars(display_session, 8))
             .bold()
+            .cyan()
     );
-    eprintln!("{}", "─────────────────────────────────────".dim());
+    for line in reflection_report_lines(&report) {
+        eprintln!("  {line}");
+    }
+}
 
-    // Overview line
-    let total_events = overview["total_events"].as_i64().unwrap_or(0);
-    let total_decisions = overview["total_decisions"].as_i64().unwrap_or(0);
-    let dur = overview["duration_minutes"]
-        .as_f64()
-        .map(|d| format!(", {d:.0}min"))
-        .unwrap_or_default();
-    eprintln!(
-        "  {} {total_events} events, {total_decisions} decisions{dur}",
-        "Overview:".bold()
-    );
+/// Decode the current reflection contract. Callers retain this typed payload
+/// until presentation so evidence, scope, and advisory proposals cannot be
+/// mistaken for a flat diagnostic text blob.
+pub(crate) fn parse_reflection_report(
+    body: &str,
+) -> Result<astra_services::reflect::ReflectReport, String> {
+    serde_json::from_str(body)
+        .map_err(|error| format!("Reflection returned an invalid typed report: {error}"))
+}
 
-    // Top skills
-    if let Some(skills) = overview["top_skills"].as_array()
-        && !skills.is_empty()
+/// Compact line-mode projection for the current `ReflectReport` contract.
+/// It reports only observed data and explicit advisory proposals; it does not
+/// infer a healthy outcome merely because no finding was returned.
+pub(crate) fn reflection_report_lines(
+    report: &astra_services::reflect::ReflectReport,
+) -> Vec<String> {
+    let coverage = &report.data_coverage;
+    let mut lines = vec![
+        format!("Session · {}", prefix_chars(&report.session_id, 8)),
+        format!(
+            "Scope · {} / {} · {} · {}",
+            report.topic, report.facet, report.horizon, report.depth
+        ),
+        format!(
+            "Coverage · {} · {} · {} events · {} decisions",
+            coverage.overall, coverage.source, coverage.events, coverage.decisions
+        ),
+    ];
+
+    if !report.summary.trim().is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Summary · {}", report.summary));
+    }
+
+    for warning in &coverage.warnings {
+        lines.push(format!("Coverage warning · {warning}"));
+    }
+
+    if !report.observations.is_empty() {
+        lines.push(String::new());
+        lines.push("Observed findings".into());
+        for observation in &report.observations {
+            lines.push(format!(
+                "  [{}] {}",
+                observation.severity, observation.summary
+            ));
+            lines.push(format!("    observation · {}", observation.ref_id));
+            if !observation.evidence_refs.is_empty() {
+                lines.push(format!(
+                    "    evidence refs · {}",
+                    compact_refs(&observation.evidence_refs)
+                ));
+            }
+        }
+    }
+
+    if !report.failure_clusters.is_empty() {
+        lines.push(String::new());
+        lines.push("Failure clusters".into());
+        for cluster in &report.failure_clusters {
+            lines.push(format!("  {} · {}", cluster.label, cluster.summary));
+            lines.push(format!("    cluster · {}", cluster.cluster_ref));
+            if !cluster.observation_refs.is_empty() {
+                lines.push(format!(
+                    "    observations · {}",
+                    compact_refs(&cluster.observation_refs)
+                ));
+            }
+        }
+    }
+
+    if !report.evidence.is_empty() {
+        lines.push(String::new());
+        lines.push("Evidence".into());
+        for evidence in &report.evidence {
+            lines.push(format!(
+                "  {} · {}",
+                evidence.evidence_class, evidence.summary
+            ));
+            lines.push(format!("    source · {}", evidence.source));
+            lines.push(format!("    ref · {}", evidence.ref_id));
+        }
+    }
+
+    if !report.action_hints.is_empty() {
+        lines.push(String::new());
+        lines.push("Advisory next steps".into());
+        for hint in &report.action_hints {
+            lines.push(format!("  {} · {}", hint.target_type, hint.summary));
+            if !hint.observation_refs.is_empty() {
+                lines.push(format!(
+                    "    supported by · {}",
+                    compact_refs(&hint.observation_refs)
+                ));
+            }
+        }
+    }
+
+    if report.budget_result.truncated {
+        let omitted = &report.budget_result.omitted;
+        lines.push(String::new());
+        lines.push(format!(
+            "Evidence is bounded · omitted {} observations, {} previews, {} hints",
+            omitted.observations, omitted.evidence_previews, omitted.action_hints
+        ));
+        if let Some(cursor) = report.budget_result.next_cursor.as_deref() {
+            lines.push(format!("Continuation cursor · {cursor}"));
+        }
+    }
+
+    if report.observations.is_empty()
+        && report.evidence.is_empty()
+        && report.action_hints.is_empty()
+        && report.failure_clusters.is_empty()
     {
-        let skill_strs: Vec<String> = skills
-            .iter()
-            .filter_map(|s| {
-                let name = s[0].as_str()?;
-                let cnt = s[1].as_i64()?;
-                Some(format!("{name}({cnt})"))
-            })
-            .collect();
-        eprintln!("  {} {}", "Skills:".bold(), skill_strs.join(", "));
+        lines.push(String::new());
+        lines.push("No observation records were returned for this scope.".into());
     }
 
-    // Errors summary
-    let error_count = overview["error_count"].as_i64().unwrap_or(0);
-    let error_rate = overview["error_rate_pct"].as_f64().unwrap_or(0.0);
-    if error_count > 0 {
-        let err_str = format!("  Errors: {error_count} ({error_rate:.1}%)");
-        if error_rate > 30.0 {
-            eprintln!("{}", err_str.red().bold());
-        } else if error_rate > 15.0 {
-            eprintln!("{}", err_str.yellow());
-        } else {
-            eprintln!("  {} {error_count} ({error_rate:.1}%)", "Errors:".bold());
-        }
+    lines
+}
+
+fn compact_refs(refs: &[String]) -> String {
+    let mut values: Vec<&str> = refs.iter().take(2).map(String::as_str).collect();
+    if refs.len() > values.len() {
+        values.push("…");
     }
-
-    // ── Diagnoses (primary output — root-cause analysis) ────────────
-    let has_diagnoses = report["diagnoses"]
-        .as_array()
-        .is_some_and(|d| !d.is_empty());
-    let has_insights = report["insights"]
-        .as_array()
-        .is_some_and(|arr| arr.iter().any(|i| i["severity"].as_str() != Some("info")));
-    let has_recs = report["recommendations"]
-        .as_array()
-        .is_some_and(|r| !r.is_empty());
-
-    if has_diagnoses {
-        eprintln!();
-        eprintln!("  {}", "Root-Cause Analysis:".bold());
-        if let Some(diagnoses) = report["diagnoses"].as_array() {
-            for diag in diagnoses {
-                let severity = diag["severity"].as_str().unwrap_or("info");
-                let summary = diag["summary"].as_str().unwrap_or("");
-                let fix = diag["fix_hint"].as_str().unwrap_or("");
-
-                match severity {
-                    "critical" => eprintln!("  🔴 {}", summary.red().bold()),
-                    "warning" => eprintln!("  ⚠️ {}", summary.yellow()),
-                    _ => eprintln!("  ℹ️ {}", summary),
-                }
-
-                // Show sample errors (truncated)
-                if let Some(samples) = diag["samples"].as_array() {
-                    for (i, sample) in samples.iter().enumerate() {
-                        if i >= 2 {
-                            break;
-                        }
-                        if let Some(s) = sample.as_str() {
-                            let truncated: String = s.chars().take(80).collect();
-                            eprintln!("    {} {}", "│".dim(), truncated.dim());
-                        }
-                    }
-                }
-
-                if !fix.is_empty() {
-                    eprintln!("    {} {}", "→".green(), fix.green());
-                }
-            }
-        }
-    }
-
-    // ── Insights (secondary — statistical observations) ─────────────
-    if has_insights {
-        eprintln!();
-        let empty = vec![];
-        let insights_arr = report["insights"].as_array().unwrap_or(&empty);
-        let non_info_insights: Vec<_> = insights_arr
-            .iter()
-            .filter(|i| i["severity"].as_str() != Some("info"))
-            .collect();
-        for insight in non_info_insights {
-            let severity = insight["severity"].as_str().unwrap_or("info");
-            let message = insight["message"].as_str().unwrap_or("");
-            let evidence = insight["evidence"].as_str().unwrap_or("");
-            let line = if evidence.is_empty() {
-                message.to_string()
-            } else {
-                format!("{message} — {evidence}")
-            };
-            match severity {
-                "critical" => eprintln!("  🔴 {}", line.red().bold()),
-                "warning" => eprintln!("  ⚠️ {}", line.yellow()),
-                _ => eprintln!("  ℹ️ {}", line.dim()),
-            }
-        }
-    }
-
-    // ── Recommendations ─────────────────────────────────────────────
-    if has_recs {
-        eprintln!();
-        eprintln!("  {}", "Fix Actions:".bold());
-        if let Some(recs) = report["recommendations"].as_array() {
-            for rec in recs {
-                if let Some(r) = rec.as_str() {
-                    eprintln!("    {} {}", "→".green(), r);
-                }
-            }
-        }
-    }
-
-    // ── Healthy session or empty? Show appropriate feedback ─────────
-    if !has_diagnoses && !has_insights && !has_recs {
-        eprintln!();
-        if total_events == 0 {
-            eprintln!("  ℹ️ {}", "Empty session — no events recorded yet.".dim());
-        } else if error_count == 0 {
-            eprintln!("  ✅ {}", "Session healthy — no errors detected.".green());
-            // Show event distribution as useful info
-            if let Some(types) = overview["top_event_types"].as_array()
-                && !types.is_empty()
-            {
-                let type_strs: Vec<String> = types
-                    .iter()
-                    .filter_map(|t| {
-                        let name = t[0].as_str()?;
-                        let cnt = t[1].as_i64()?;
-                        Some(format!("{name}({cnt})"))
-                    })
-                    .collect();
-                eprintln!("  {} {}", "Events:".bold(), type_strs.join(", "));
-            }
-        } else {
-            eprintln!("  ℹ️ {}", "No actionable issues found.".dim());
-        }
-        eprintln!();
-        eprintln!(
-            "  {}",
-            "Tip: /reflect execution/errors — inspect tool and runtime errors".dim()
-        );
-        eprintln!(
-            "  {}",
-            "     /reflect runtime performance — inspect latency".dim()
-        );
-    }
+    values.join(" · ")
 }
 
 #[cfg(test)]
@@ -1556,6 +1609,38 @@ mod state_command_tests {
     use astra_services::session_journal::{self, JournalEventType};
     use wiremock::matchers::{header_exists, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn remote_reflect_payload(
+        session_id: &str,
+        topic: &str,
+        facet: &str,
+        depth: &str,
+        summary: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "tool": "reflect",
+            "session_id": session_id,
+            "analysis_view": format!("{topic}_{facet}"),
+            "topic": topic,
+            "facet": facet,
+            "depth": depth,
+            "horizon": "session",
+            "source_policy": "auto",
+            "include_context": false,
+            "data_coverage": {
+                "overall": "fresh",
+                "source": "server_db",
+                "events": 1,
+                "decisions": 0
+            },
+            "summary": summary,
+            "observations": [],
+            "evidence": [],
+            "action_hints": [],
+            "failure_clusters": []
+        })
+    }
 
     #[serial_test::serial]
     #[tokio::test]
@@ -1934,34 +2019,15 @@ mod state_command_tests {
         Mock::given(method("GET"))
             .and(path(format!("/chat/session/{sid}/reflect")))
             .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "schema_version": 1,
-                "tool": "reflect",
-                "session_id": sid,
-                "analysis_view": "overview",
-                "topic": "overview",
-                "facet": "overview",
-                "depth": "diagnostic",
-                "horizon": "session",
-                "source_policy": "auto",
-                "include_context": false,
-                "data_coverage": {"overall":"fresh","source":"server_db","events":1,"decisions":0},
-                "overview": {
-                    "total_events": 1,
-                    "total_decisions": 0,
-                    "duration_minutes": null,
-                    "unique_skills_used": 0,
-                    "error_count": 0,
-                    "error_rate_pct": 0.0,
-                    "top_event_types": [],
-                    "top_skills": []
-                },
-                "summary": "remote reflect",
-                "diagnoses": [],
-                "insights": [],
-                "recommendations": [],
-                "graph_slice": {"nodes":[],"edges":[],"budget_result":{"truncated":false}}
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(remote_reflect_payload(
+                    &sid,
+                    "overview",
+                    "overview",
+                    "diagnostic",
+                    "remote reflect",
+                )),
+            )
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
@@ -1996,34 +2062,15 @@ mod state_command_tests {
             .and(query_param("facet", "trace"))
             .and(query_param("depth", "forensic"))
             .and(query_param("question", "why bash & tools?"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "schema_version": 1,
-                "tool": "reflect",
-                "session_id": sid,
-                "analysis_view": "execution_trace",
-                "topic": "execution",
-                "facet": "trace",
-                "depth": "forensic",
-                "horizon": "session",
-                "source_policy": "auto",
-                "include_context": false,
-                "data_coverage": {"overall":"fresh","source":"server_db","events":1,"decisions":0},
-                "overview": {
-                    "total_events": 1,
-                    "total_decisions": 0,
-                    "duration_minutes": null,
-                    "unique_skills_used": 0,
-                    "error_count": 0,
-                    "error_rate_pct": 0.0,
-                    "top_event_types": [],
-                    "top_skills": []
-                },
-                "summary": "remote reflect",
-                "diagnoses": [],
-                "insights": [],
-                "recommendations": [],
-                "graph_slice": {"nodes":[],"edges":[],"budget_result":{"truncated":false}}
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(remote_reflect_payload(
+                    &sid,
+                    "execution",
+                    "trace",
+                    "forensic",
+                    "remote reflect",
+                )),
+            )
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
@@ -2054,34 +2101,15 @@ mod state_command_tests {
         Mock::given(method("GET"))
             .and(path(format!("/chat/session/{sid}/reflect")))
             .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "schema_version": 1,
-                "tool": "reflect",
-                "session_id": sid,
-                "analysis_view": "overview",
-                "topic": "overview",
-                "facet": "overview",
-                "depth": "diagnostic",
-                "horizon": "session",
-                "source_policy": "auto",
-                "include_context": false,
-                "data_coverage": {"overall":"fresh","source":"server_db","events":1,"decisions":0},
-                "overview": {
-                    "total_events": 1,
-                    "total_decisions": 0,
-                    "duration_minutes": null,
-                    "unique_skills_used": 0,
-                    "error_count": 0,
-                    "error_rate_pct": 0.0,
-                    "top_event_types": [],
-                    "top_skills": []
-                },
-                "summary": "remote reflect should not mask local corruption",
-                "diagnoses": [],
-                "insights": [],
-                "recommendations": [],
-                "graph_slice": {"nodes":[],"edges":[],"budget_result":{"truncated":false}}
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(remote_reflect_payload(
+                    &sid,
+                    "overview",
+                    "overview",
+                    "diagnostic",
+                    "remote reflect should not mask local corruption",
+                )),
+            )
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
@@ -2092,18 +2120,9 @@ mod state_command_tests {
         let mut state = SessionState::default();
         state.set_session_id(sid);
 
-        let error = handle_state_command(
-            "/reflect",
-            "",
-            StateCommandContext {
-                api: &api,
-                profile: None,
-                token: Some("test-token"),
-            },
-            &mut state,
-        )
-        .await
-        .expect_err("local artifact errors must surface instead of falling back");
+        let error = super::load_reflect_surface(&state, &api, None, Some("test-token"), "")
+            .await
+            .expect_err("local artifact errors must surface instead of falling back");
 
         assert!(error.contains("failed to read session journal"), "{error}");
     }
@@ -2111,7 +2130,9 @@ mod state_command_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_reflect_args, render_reflect_diff};
+    use super::{
+        parse_reflect_args, parse_reflection_report, reflection_report_lines, render_reflect_diff,
+    };
     use crate::cli::session::session_state::SessionState;
 
     #[test]
@@ -2122,6 +2143,82 @@ mod tests {
         assert_eq!(args.facet, None);
         assert_eq!(args.depth, "diagnostic");
         assert_eq!(args.question, None);
+    }
+
+    #[test]
+    fn reflection_projection_preserves_typed_evidence_and_advisory_proposals() {
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "tool": "reflect",
+            "session_id": "74eff903-30bb-45df-b36d-5826f1a4638c",
+            "analysis_view": "overview",
+            "topic": "execution",
+            "facet": "errors",
+            "depth": "diagnostic",
+            "horizon": "session",
+            "source_policy": "auto",
+            "include_context": false,
+            "data_coverage": {
+                "overall": "fresh",
+                "source": "session_journal",
+                "events": 9,
+                "decisions": 2
+            },
+            "summary": "One repeated failure is supported by local evidence.",
+            "observations": [{
+                "ref_id": "urn:astra:observation:local:reflect:session:diagnosis:0",
+                "topic": "execution",
+                "facet": "errors",
+                "kind": "diagnosis:permission",
+                "severity": "warning",
+                "summary": "Repeated command failure",
+                "confidence": {"evidence": 0.9},
+                "evidence_refs": ["urn:astra:artifact:local:reflect:session:sample:0"]
+            }],
+            "evidence": [{
+                "ref_id": "urn:astra:artifact:local:reflect:session:sample:0",
+                "evidence_class": "observed_evidence",
+                "source": "session_journal",
+                "summary": "permission denied",
+                "confidence": {"evidence": 0.9}
+            }],
+            "action_hints": [{
+                "target_type": "user_guidance",
+                "summary": "Narrow the command scope",
+                "confidence": {"evidence": 0.9},
+                "observation_refs": ["urn:astra:observation:local:reflect:session:diagnosis:0"]
+            }]
+        })
+        .to_string();
+
+        let report = parse_reflection_report(&body).expect("current reflect payload");
+        let lines = reflection_report_lines(&report);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Coverage · fresh · session_journal · 9 events · 2 decisions")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  [warning] Repeated command failure")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "    source · session_journal")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  user_guidance · Narrow the command scope")
+        );
+        assert!(
+            lines.iter().any(|line| line
+                == "    supported by · urn:astra:observation:local:reflect:session:diagnosis:0"),
+            "an advisory must retain its supporting observation reference"
+        );
     }
 
     #[test]

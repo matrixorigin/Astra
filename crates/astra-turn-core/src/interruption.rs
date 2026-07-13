@@ -45,14 +45,6 @@ pub enum InterruptionKind {
     HarnessBlocked,
     /// Harness debug breakpoint hit → session paused.
     HarnessPaused,
-    /// Turn guard pipeline aborted the loop (e.g. repeated correction streak
-    /// exceeded the abort threshold). Captures *why* the guard pipeline halted
-    /// the turn so resumption surfaces the reason instead of an opaque final
-    /// text string.
-    GuardAbort,
-    /// A response guard replaced the model's final text before it became
-    /// user-visible. This is not a successful completion.
-    ResponseGuardBlocked,
     /// Generic legacy interruption marker from pre-structured agent result paths.
     Interrupted,
     /// Executor task/channel disappeared before a terminal result was delivered.
@@ -80,8 +72,6 @@ impl InterruptionKind {
             Self::StreamIdle => "stream_idle",
             Self::HarnessBlocked => "harness_blocked",
             Self::HarnessPaused => "harness_paused",
-            Self::GuardAbort => "guard_abort",
-            Self::ResponseGuardBlocked => "response_guard_blocked",
             Self::Interrupted => "interrupted",
             Self::ExecutorDropped => "executor_dropped",
         }
@@ -106,8 +96,6 @@ impl InterruptionKind {
             "stream_idle" => Some(Self::StreamIdle),
             "harness_blocked" => Some(Self::HarnessBlocked),
             "harness_paused" => Some(Self::HarnessPaused),
-            "guard_abort" => Some(Self::GuardAbort),
-            "response_guard_blocked" => Some(Self::ResponseGuardBlocked),
             "interrupted" => Some(Self::Interrupted),
             "executor_dropped" => Some(Self::ExecutorDropped),
             _ => None,
@@ -129,7 +117,6 @@ impl InterruptionKind {
             | Self::ServerOverload
             | Self::StreamTransport
             | Self::StreamIdle
-            | Self::ResponseGuardBlocked
             | Self::Interrupted
             | Self::ExecutorDropped => true,
             Self::ContextOverflow => true, // resumable with compaction
@@ -137,9 +124,6 @@ impl InterruptionKind {
             Self::ApprovalRejected => true,
             Self::HarnessBlocked => false,
             Self::HarnessPaused => true,
-            // Guard aborts are recoverable: the next turn can proceed under a
-            // fresh guard streak. Progress made before the abort is preserved.
-            Self::GuardAbort => true,
         }
     }
 }
@@ -184,9 +168,7 @@ impl ResumeMode {
     #[must_use]
     pub fn default_for_interruption(kind: InterruptionKind) -> Self {
         match kind {
-            InterruptionKind::EmptyCompletion | InterruptionKind::ResponseGuardBlocked => {
-                Self::Settle
-            }
+            InterruptionKind::EmptyCompletion => Self::Settle,
             _ => Self::Continue,
         }
     }
@@ -382,23 +364,6 @@ impl InterruptionRecord {
                 "[{}] The run paused after a read-heavy stall.{tool_note}{checkpoint_note}{cause_note}{action_note}",
                 kind.label()
             ),
-            // Surface the guard-specific abort reason (stored in error_detail)
-            // instead of the opaque label. Without this, a guard pipeline abort
-            // shows "[guard_abort] N tool call(s) completed." with no indication
-            // of *why* the guard halted the turn — the reason lived only in
-            // `state.final_text`, which resume/checkpoint UIs do not display.
-            InterruptionKind::GuardAbort => {
-                let reason = summary
-                    .error_detail
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|d| !d.is_empty())
-                    .unwrap_or("a loop guard detected a repeated failure pattern");
-                format!(
-                    "[{}] The run was stopped by a loop guard: {reason}.{tool_note}{checkpoint_note}{action_note}",
-                    kind.label()
-                )
-            }
             _ => format!(
                 "[{kind}]{tool_note}{checkpoint_note}{cause_note}{action_note}",
                 kind = kind.label()
@@ -810,8 +775,6 @@ mod tests {
             InterruptionKind::StreamIdle,
             InterruptionKind::HarnessBlocked,
             InterruptionKind::HarnessPaused,
-            InterruptionKind::GuardAbort,
-            InterruptionKind::ResponseGuardBlocked,
             InterruptionKind::Interrupted,
             InterruptionKind::ExecutorDropped,
         ];
@@ -842,7 +805,6 @@ mod tests {
         assert!(InterruptionKind::CumulativeBudgetExceeded.is_resumable());
         assert!(InterruptionKind::ServerOverload.is_resumable());
         assert!(InterruptionKind::CooldownRejected.is_resumable());
-        assert!(InterruptionKind::ResponseGuardBlocked.is_resumable());
         assert!(InterruptionKind::Interrupted.is_resumable());
         assert!(InterruptionKind::ExecutorDropped.is_resumable());
         // non-resumable

@@ -662,4 +662,19 @@ mod tests {
         assert_eq!(action, TextAreaAction::Unhandled);
         assert_eq!(textarea.text(), "");
     }
+
+    #[test]
+    fn ctrl_e_keeps_its_composer_line_end_contract() {
+        let mut textarea = TextArea::new();
+        textarea.set_text("first line\nsecond line");
+
+        textarea.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(textarea.cursor_byte(), "first line\n".len());
+
+        assert_eq!(
+            textarea.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            TextAreaAction::Changed
+        );
+        assert_eq!(textarea.cursor_byte(), "first line\nsecond line".len());
+    }
 }

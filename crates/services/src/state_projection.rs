@@ -341,13 +341,6 @@ fn decode_artifact_acl_row(
     })
 }
 
-fn decode_backlog_todo_id(
-    row: &impl StateProjectionDbRow,
-    backlog_pool_id: &str,
-) -> Result<String, StateProjectionError> {
-    state_projection_row_string(row, "restore_backlog_pool", backlog_pool_id, "todo_id")
-}
-
 fn decode_run_acl_row(
     row: &impl StateProjectionDbRow,
     run_id: &str,
@@ -401,83 +394,6 @@ fn decode_run_projection_row(
         retry_of: state_projection_row_optional_string(row, OPERATION, run_id, "retry_of")?,
         retry_scope: state_projection_row_optional_string(row, OPERATION, run_id, "retry_scope")?,
     })
-}
-
-/// One row to be inserted into `session_plan_todos` when a plan is
-/// approved via `exit_plan_mode`. The struct mirrors the columns the
-/// seed step writes; richer fields (`payload_json`, `acceptance_checks`,
-/// `effort`, `files`) round-trip through the original plan_step_runs
-/// table and are not duplicated here.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlanTodoSeed {
-    pub todo_id: String,
-    pub user_id: String,
-    pub session_id: String,
-    pub plan_id: String,
-    pub title: String,
-    /// 0-based index in the plan's subtask order. Used as both the
-    /// SQL `priority` column and as the implicit dependency chain
-    /// when subtasks declare `depends_on` against earlier IDs.
-    pub priority: i32,
-    /// Reserved for nested subtask trees; flat plans use 0.
-    pub depth: i32,
-}
-
-/// Sink for `PlanTodoSeed` rows. Production uses the SQLx-backed
-/// `DatabaseStateProjectionStore::seed_session_plan_todos`; tests use
-/// an in-memory `Vec<PlanTodoSeed>` capture so they can verify the
-/// shape of the seed without standing up MatrixOne.
-#[async_trait::async_trait]
-pub trait PlanTodoSink: Send + Sync + std::fmt::Debug {
-    async fn seed(&self, todos: Vec<PlanTodoSeed>) -> Result<(), String>;
-    /// U-6: mark prior plan's seeded rows as `superseded` so they
-    /// don't show alongside the new plan's items in `task_board.list`.
-    /// `keep_plan_id` is the active plan whose rows MUST stay
-    /// active.
-    async fn supersede_other_plans(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        keep_plan_id: &str,
-    ) -> Result<u64, String>;
-}
-
-/// Adapter wrapping `DatabaseStateProjectionStore` so it implements
-/// `PlanTodoSink`. Kept as a thin wrapper so the production sink can
-/// delegate to the existing `seed_session_plan_todos` method without
-/// the trait bound polluting `DatabaseStateProjectionStore`'s public
-/// API.
-#[derive(Clone, Debug)]
-pub struct DatabasePlanTodoSink {
-    store: DatabaseStateProjectionStore,
-}
-
-impl DatabasePlanTodoSink {
-    pub fn new(store: DatabaseStateProjectionStore) -> Self {
-        Self { store }
-    }
-}
-
-#[async_trait::async_trait]
-impl PlanTodoSink for DatabasePlanTodoSink {
-    async fn seed(&self, todos: Vec<PlanTodoSeed>) -> Result<(), String> {
-        self.store
-            .seed_session_plan_todos(&todos)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn supersede_other_plans(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        keep_plan_id: &str,
-    ) -> Result<u64, String> {
-        self.store
-            .supersede_session_plan_todos(user_id, session_id, keep_plan_id)
-            .await
-            .map_err(|e| e.to_string())
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1372,109 +1288,6 @@ impl DatabaseStateProjectionStore {
         }
     }
 
-    /// Mark every active `session_plan_todos` row for this session
-    /// that does NOT belong to `keep_plan_id` as `superseded`. Used
-    /// when the user re-enters plan mode with a fresh plan: the prior
-    /// plan's seeded items would otherwise stay `active` and pollute
-    /// `task_board.list` results next to the new plan's items.
-    ///
-    /// Returns the number of rows transitioned. `keep_plan_id` is
-    /// the new active plan; passing `None` would supersede every
-    /// active row in the session — currently no caller wants that
-    /// so the API requires the keep id explicitly to prevent a
-    /// careless mass-supersede.
-    pub async fn supersede_session_plan_todos(
-        &self,
-        user_id: &str,
-        session_id: &str,
-        keep_plan_id: &str,
-    ) -> Result<u64, StateProjectionError> {
-        let result = sqlx::query(
-            "UPDATE session_plan_todos \
-             SET status = 'superseded', updated_at = CURRENT_TIMESTAMP(6) \
-             WHERE user_id = ? \
-               AND session_id = ? \
-               AND status = 'active' \
-               AND (plan_id IS NULL OR plan_id <> ?)",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(keep_plan_id)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "supersede_session_plan_todos",
-            entity: session_id.to_string(),
-            source,
-        })?;
-        Ok(result.rows_affected())
-    }
-
-    /// Insert one row per `PlanTodoSeed` into `session_plan_todos`.
-    /// Idempotent on `todo_id`: re-running the same seed batch is a no-op
-    /// because we use `INSERT IGNORE`. Order is preserved via `priority`
-    /// so the next turn picks subtasks in the order the model authored
-    /// them — `depends_on` chains still hold.
-    ///
-    /// This is the production sink wired into `tool_exit_plan_mode`
-    /// after the model's `approved=true` path. The trait-based
-    /// `PlanTodoSink` indirection keeps the executor testable without
-    /// standing up MatrixOne.
-    pub async fn seed_session_plan_todos(
-        &self,
-        seeds: &[PlanTodoSeed],
-    ) -> Result<(), StateProjectionError> {
-        if seeds.is_empty() {
-            return Ok(());
-        }
-        for seed in seeds {
-            sqlx::query(
-                "INSERT IGNORE INTO session_plan_todos
-                    (todo_id, user_id, session_id, plan_id, title, status, priority, depth)
-                 VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
-            )
-            .bind(&seed.todo_id)
-            .bind(&seed.user_id)
-            .bind(&seed.session_id)
-            .bind(&seed.plan_id)
-            .bind(&seed.title)
-            .bind(seed.priority)
-            .bind(seed.depth)
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| StateProjectionError::Database {
-                operation: "seed_session_plan_todos",
-                entity: seed.todo_id.clone(),
-                source,
-            })?;
-        }
-        Ok(())
-    }
-
-    pub async fn restore_backlog_pool(
-        &self,
-        user_id: &str,
-        backlog_pool_id: &str,
-    ) -> Result<Vec<String>, StateProjectionError> {
-        let rows = sqlx::query(
-            "SELECT todo_id FROM session_plan_todos FORCE INDEX (idx_session_plan_todos_pool)
-             WHERE user_id = ? AND backlog_pool_id = ? AND status = 'backlog'
-             ORDER BY updated_at DESC LIMIT 100",
-        )
-        .bind(user_id)
-        .bind(backlog_pool_id)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| StateProjectionError::Database {
-            operation: "restore_backlog_pool",
-            entity: backlog_pool_id.to_string(),
-            source,
-        })?;
-        rows.into_iter()
-            .map(|row| decode_backlog_todo_id(&row, backlog_pool_id))
-            .collect()
-    }
-
     pub async fn create_retry_run_and_supersede(
         &self,
         user_id: &str,
@@ -2071,7 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_acl_and_backlog_todo_decode_fail_loudly() {
+    fn artifact_acl_decode_fails_loudly() {
         let artifact = decode_artifact_acl_row(&FakeStateProjectionRow::complete(), "artifact-1")
             .expect("artifact acl decodes");
         assert_eq!(artifact.user_id, "user-1");
@@ -2092,16 +1905,6 @@ mod tests {
                 column,
             );
         }
-
-        assert_eq!(
-            decode_backlog_todo_id(&FakeStateProjectionRow::complete(), "pool-1")
-                .expect("todo id decodes"),
-            "todo-1"
-        );
-        assert_database_error_mentions(
-            decode_backlog_todo_id(&FakeStateProjectionRow::fail_on("todo_id"), "pool-1"),
-            "todo_id",
-        );
     }
 
     #[test]

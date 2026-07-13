@@ -43,7 +43,7 @@ struct SpeculatingHost {
 
 #[async_trait]
 impl SseStreamHost for SpeculatingHost {
-    fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+    async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
     fn on_stream_complete(&mut self) {}
 
     async fn execute_tool(
@@ -308,7 +308,7 @@ async fn complex_speculation_off_is_serial() {
     struct NoSpecHost;
     #[async_trait]
     impl SseStreamHost for NoSpecHost {
-        fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+        async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
         fn on_stream_complete(&mut self) {}
         async fn execute_tool(
             &mut self,

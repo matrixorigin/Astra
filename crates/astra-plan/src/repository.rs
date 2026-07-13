@@ -98,7 +98,9 @@ pub struct NewStepRun<'a> {
 #[derive(Debug, Clone)]
 pub struct SavedPlanInfo {
     pub name: String,
+    pub session_id: Option<String>,
     pub goal: String,
+    pub version: u64,
     pub progress_pct: u32,
     pub subtask_count: usize,
     pub status: String,
@@ -184,6 +186,60 @@ pub trait PlanRepository: Send + Sync {
         error: Option<&str>,
         artifact_ref: Option<&str>,
     ) -> Result<String, PlanLoadError>;
+
+    /// Atomically persist a plan-step transition to `in_progress` and append
+    /// its open attempt. Implementations that own durable storage must update
+    /// the plan version and the attempt row in one transaction: a taskboard
+    /// projection must never observe a started attempt with a stale plan step
+    /// (or the reverse).
+    async fn save_existing_and_start_step_run(
+        &self,
+        _user_id: &str,
+        _plan_id: &str,
+        _state: &mut PlanModeState,
+        _expected_version: u64,
+        _input: NewStepRun<'_>,
+    ) -> Result<String, PlanLoadError> {
+        Err(PlanLoadError::Internal(
+            "plan repository does not support atomic step-start persistence".to_string(),
+        ))
+    }
+
+    /// Atomically persist a terminal plan-step transition and its completed
+    /// attempt. See [`Self::save_existing_and_start_step_run`] for why this
+    /// cannot be modelled as two best-effort writes.
+    async fn save_existing_and_record_completed_step_run(
+        &self,
+        _user_id: &str,
+        _plan_id: &str,
+        _state: &mut PlanModeState,
+        _expected_version: u64,
+        _input: NewStepRun<'_>,
+        _error: Option<&str>,
+        _artifact_ref: Option<&str>,
+    ) -> Result<String, PlanLoadError> {
+        Err(PlanLoadError::Internal(
+            "plan repository does not support atomic completed-step persistence".to_string(),
+        ))
+    }
+
+    /// Atomically persist a terminal plan-step transition and finalize an
+    /// existing open attempt.
+    async fn save_existing_and_finalize_step_run(
+        &self,
+        _user_id: &str,
+        _plan_id: &str,
+        _state: &mut PlanModeState,
+        _expected_version: u64,
+        _run_id: &str,
+        _status: TaskStatus,
+        _error: Option<&str>,
+        _artifact_ref: Option<&str>,
+    ) -> Result<(), PlanLoadError> {
+        Err(PlanLoadError::Internal(
+            "plan repository does not support atomic step-finalization persistence".to_string(),
+        ))
+    }
 
     /// Finalize an existing step-run with its outcome. Status/finished_at/error
     /// are the mutable fields; everything else is immutable.
@@ -280,6 +336,61 @@ pub struct CloudPlanRepository {
 impl CloudPlanRepository {
     pub fn new(pool: Pool<MySql>) -> Self {
         Self { pool }
+    }
+
+    /// Update an existing plan under its optimistic version guard inside an
+    /// already-open transaction. Step-run mutations call this helper so the
+    /// plan projection and its attempt evidence commit or roll back together.
+    async fn save_existing_in_transaction(
+        tx: &mut sqlx::Transaction<'_, MySql>,
+        user_id: &str,
+        plan_id: &str,
+        state: &mut PlanModeState,
+        expected_version: u64,
+    ) -> Result<(), PlanLoadError> {
+        validate_plan_id(plan_id)?;
+        ensure_state_owner(user_id, state)?;
+        let next_version = expected_version
+            .checked_add(1)
+            .ok_or_else(|| PlanLoadError::Internal("plan version overflow".to_string()))?;
+        let mut persisted_state = state.clone();
+        persisted_state.version = next_version;
+        let plan_json = serde_json::to_string(&persisted_state)
+            .map_err(|error| PlanLoadError::Internal(error.to_string()))?;
+        let update = sqlx::query(
+            "UPDATE plans \
+             SET goal = ?, phase = ?, version = ?, plan_json = ?, plan_md = ?, \
+                 progress_pct = ?, subtask_count = ?, updated_at = NOW(6) \
+             WHERE user_id = ? AND plan_id = ? AND version = ?",
+        )
+        .bind(&persisted_state.goal)
+        .bind(persisted_state.infer_phase().as_str())
+        .bind(next_version as i64)
+        .bind(plan_json)
+        .bind(persisted_state.plan_md.as_deref())
+        .bind(persisted_state.plan.progress_pct() as i32)
+        .bind(persisted_state.plan.subtasks.len() as i32)
+        .bind(user_id)
+        .bind(plan_id)
+        .bind(expected_version as i64)
+        .execute(&mut **tx)
+        .await
+        .map_err(map_sqlx)?;
+        if update.rows_affected() == 0 {
+            let latest: Option<(i64,)> =
+                sqlx::query_as("SELECT version FROM plans WHERE user_id = ? AND plan_id = ?")
+                    .bind(user_id)
+                    .bind(plan_id)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(map_sqlx)?;
+            return Err(PlanLoadError::conflict(
+                expected_version,
+                latest.map(|(version,)| version as u64).unwrap_or(0),
+            ));
+        }
+        state.version = next_version;
+        Ok(())
     }
 }
 
@@ -553,7 +664,7 @@ impl PlanRepository for CloudPlanRepository {
         // disk. `subtask_count` is maintained by `save()` so this avoids
         // parsing O(N) plan blobs just to render the list page.
         let mut sql = String::from(
-            "SELECT plan_id, goal, phase, progress_pct, subtask_count \
+            "SELECT plan_id, session_id, goal, phase, version, progress_pct, subtask_count \
              FROM plans WHERE user_id = ?",
         );
         if filter.session_id.is_some() {
@@ -578,13 +689,17 @@ impl PlanRepository for CloudPlanRepository {
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let plan_id: String = row.try_get("plan_id").map_err(map_sqlx)?;
+            let session_id: Option<String> = row.try_get("session_id").map_err(map_sqlx)?;
             let goal: String = row.try_get("goal").map_err(map_sqlx)?;
             let phase: String = row.try_get("phase").map_err(map_sqlx)?;
+            let version: i64 = row.try_get("version").map_err(map_sqlx)?;
             let progress_pct: i32 = row.try_get("progress_pct").map_err(map_sqlx)?;
             let subtask_count: i32 = row.try_get("subtask_count").map_err(map_sqlx)?;
             out.push(SavedPlanInfo {
                 name: plan_id,
+                session_id,
                 goal,
+                version: version as u64,
                 progress_pct: progress_pct as u32,
                 subtask_count: subtask_count as usize,
                 status: phase,
@@ -782,6 +897,119 @@ impl PlanRepository for CloudPlanRepository {
                 input.attempt,
             )),
         }
+    }
+
+    async fn save_existing_and_start_step_run(
+        &self,
+        user_id: &str,
+        plan_id: &str,
+        state: &mut PlanModeState,
+        expected_version: u64,
+        input: NewStepRun<'_>,
+    ) -> Result<String, PlanLoadError> {
+        let run_id = Uuid::new_v4().to_string();
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        Self::save_existing_in_transaction(&mut tx, user_id, plan_id, state, expected_version)
+            .await?;
+        let insert = sqlx::query(
+            "INSERT INTO plan_step_runs \
+                 (user_id, run_id, plan_id, subtask_id, attempt, status, session_id, \
+                  started_at, request_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6), ?)",
+        )
+        .bind(user_id)
+        .bind(&run_id)
+        .bind(plan_id)
+        .bind(input.subtask_id)
+        .bind(input.attempt)
+        .bind(input.status.as_str())
+        .bind(input.session_id)
+        .bind(input.request_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            map_step_run_insert_error(error, plan_id, input.subtask_id, input.attempt)
+        })?;
+        debug_assert_eq!(insert.rows_affected(), 1);
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(run_id)
+    }
+
+    async fn save_existing_and_record_completed_step_run(
+        &self,
+        user_id: &str,
+        plan_id: &str,
+        state: &mut PlanModeState,
+        expected_version: u64,
+        input: NewStepRun<'_>,
+        error: Option<&str>,
+        artifact_ref: Option<&str>,
+    ) -> Result<String, PlanLoadError> {
+        let run_id = Uuid::new_v4().to_string();
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        Self::save_existing_in_transaction(&mut tx, user_id, plan_id, state, expected_version)
+            .await?;
+        let insert = sqlx::query(
+            "INSERT INTO plan_step_runs \
+                 (user_id, run_id, plan_id, subtask_id, attempt, status, session_id, \
+                  started_at, finished_at, request_id, error, artifact_ref) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6), ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(&run_id)
+        .bind(plan_id)
+        .bind(input.subtask_id)
+        .bind(input.attempt)
+        .bind(input.status.as_str())
+        .bind(input.session_id)
+        .bind(input.request_id)
+        .bind(error)
+        .bind(artifact_ref)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            map_step_run_insert_error(error, plan_id, input.subtask_id, input.attempt)
+        })?;
+        debug_assert_eq!(insert.rows_affected(), 1);
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(run_id)
+    }
+
+    async fn save_existing_and_finalize_step_run(
+        &self,
+        user_id: &str,
+        plan_id: &str,
+        state: &mut PlanModeState,
+        expected_version: u64,
+        run_id: &str,
+        status: TaskStatus,
+        error: Option<&str>,
+        artifact_ref: Option<&str>,
+    ) -> Result<(), PlanLoadError> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        Self::save_existing_in_transaction(&mut tx, user_id, plan_id, state, expected_version)
+            .await?;
+        let result = sqlx::query(
+            "UPDATE plan_step_runs \
+             SET status = ?, finished_at = NOW(6), error = ?, artifact_ref = ? \
+             WHERE user_id = ? AND run_id = ? AND plan_id = ? AND finished_at IS NULL",
+        )
+        .bind(status.as_str())
+        .bind(error)
+        .bind(artifact_ref)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(plan_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() == 0 {
+            return Err(PlanLoadError::NotFound(format!(
+                "step_run {run_id} not found in plan {plan_id} or already finalized"
+            )));
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(())
     }
 
     async fn finalize_step_run(
@@ -1073,7 +1301,9 @@ fn saved_plan_info(plan_id: &str, state: &PlanModeState) -> SavedPlanInfo {
     };
     SavedPlanInfo {
         name: plan_id.to_string(),
+        session_id: state.session_hint.clone(),
         goal: state.goal.clone(),
+        version: state.version,
         progress_pct: state.plan.progress_pct(),
         subtask_count: state.plan.subtasks.len(),
         status: status.to_string(),
@@ -1304,6 +1534,153 @@ impl PlanRepository for InMemoryPlanRepository {
         Ok(run_id)
     }
 
+    async fn save_existing_and_start_step_run(
+        &self,
+        user_id: &str,
+        plan_id: &str,
+        state: &mut PlanModeState,
+        expected_version: u64,
+        input: NewStepRun<'_>,
+    ) -> Result<String, PlanLoadError> {
+        validate_plan_id(plan_id)?;
+        ensure_state_owner(user_id, state)?;
+        let run_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
+        let plan_key = (user_id.to_string(), plan_id.to_string());
+        let Some(actual) = guard.plans.get(&plan_key).map(|stored| stored.version) else {
+            return Err(PlanLoadError::conflict(expected_version, 0));
+        };
+        if actual != expected_version {
+            return Err(PlanLoadError::conflict(expected_version, actual));
+        }
+        if guard.step_runs.iter().any(|((uid, _), run)| {
+            uid == user_id
+                && run.plan_id == plan_id
+                && run.subtask_id == input.subtask_id
+                && run.attempt == input.attempt
+        }) {
+            return Err(PlanLoadError::Conflict {
+                expected: input.attempt as u64,
+                actual: input.attempt as u64,
+            });
+        }
+        state.version = expected_version + 1;
+        guard.plans.insert(plan_key, state.clone());
+        guard.step_runs.insert(
+            (user_id.to_string(), run_id.clone()),
+            PlanStepRun {
+                run_id: run_id.clone(),
+                plan_id: plan_id.to_string(),
+                subtask_id: input.subtask_id.to_string(),
+                attempt: input.attempt,
+                status: input.status,
+                session_id: input.session_id.to_string(),
+                started_at: now,
+                finished_at: None,
+                request_id: input.request_id.to_string(),
+                error: None,
+                artifact_ref: None,
+            },
+        );
+        Ok(run_id)
+    }
+
+    async fn save_existing_and_record_completed_step_run(
+        &self,
+        user_id: &str,
+        plan_id: &str,
+        state: &mut PlanModeState,
+        expected_version: u64,
+        input: NewStepRun<'_>,
+        error: Option<&str>,
+        artifact_ref: Option<&str>,
+    ) -> Result<String, PlanLoadError> {
+        validate_plan_id(plan_id)?;
+        ensure_state_owner(user_id, state)?;
+        let run_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
+        let plan_key = (user_id.to_string(), plan_id.to_string());
+        let Some(actual) = guard.plans.get(&plan_key).map(|stored| stored.version) else {
+            return Err(PlanLoadError::conflict(expected_version, 0));
+        };
+        if actual != expected_version {
+            return Err(PlanLoadError::conflict(expected_version, actual));
+        }
+        if guard.step_runs.iter().any(|((uid, _), run)| {
+            uid == user_id
+                && run.plan_id == plan_id
+                && run.subtask_id == input.subtask_id
+                && run.attempt == input.attempt
+        }) {
+            return Err(PlanLoadError::Conflict {
+                expected: input.attempt as u64,
+                actual: input.attempt as u64,
+            });
+        }
+        state.version = expected_version + 1;
+        guard.plans.insert(plan_key, state.clone());
+        guard.step_runs.insert(
+            (user_id.to_string(), run_id.clone()),
+            PlanStepRun {
+                run_id: run_id.clone(),
+                plan_id: plan_id.to_string(),
+                subtask_id: input.subtask_id.to_string(),
+                attempt: input.attempt,
+                status: input.status,
+                session_id: input.session_id.to_string(),
+                started_at: now,
+                finished_at: Some(now),
+                request_id: input.request_id.to_string(),
+                error: error.map(str::to_string),
+                artifact_ref: artifact_ref.map(str::to_string),
+            },
+        );
+        Ok(run_id)
+    }
+
+    async fn save_existing_and_finalize_step_run(
+        &self,
+        user_id: &str,
+        plan_id: &str,
+        state: &mut PlanModeState,
+        expected_version: u64,
+        run_id: &str,
+        status: TaskStatus,
+        error: Option<&str>,
+        artifact_ref: Option<&str>,
+    ) -> Result<(), PlanLoadError> {
+        validate_plan_id(plan_id)?;
+        ensure_state_owner(user_id, state)?;
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
+        let plan_key = (user_id.to_string(), plan_id.to_string());
+        let Some(actual) = guard.plans.get(&plan_key).map(|stored| stored.version) else {
+            return Err(PlanLoadError::conflict(expected_version, 0));
+        };
+        if actual != expected_version {
+            return Err(PlanLoadError::conflict(expected_version, actual));
+        }
+        let run_key = (user_id.to_string(), run_id.to_string());
+        let Some(run) = guard.step_runs.get(&run_key) else {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        };
+        if run.plan_id != plan_id || run.finished_at.is_some() {
+            return Err(PlanLoadError::NotFound(run_id.to_string()));
+        }
+        state.version = expected_version + 1;
+        guard.plans.insert(plan_key, state.clone());
+        let run = guard
+            .step_runs
+            .get_mut(&run_key)
+            .expect("checked plan step run must remain present under write lock");
+        run.status = status;
+        run.finished_at = Some(Utc::now());
+        run.error = error.map(str::to_string);
+        run.artifact_ref = artifact_ref.map(str::to_string);
+        Ok(())
+    }
+
     async fn finalize_step_run(
         &self,
         user_id: &str,
@@ -1497,6 +1874,179 @@ mod tests {
         assert_eq!(loaded.goal, "test goal");
         assert_eq!(loaded.created_by.as_deref(), Some("u-1"));
         assert_eq!(loaded.plan_md.as_deref(), Some("# test plan"));
+    }
+
+    #[tokio::test]
+    async fn atomic_step_writes_keep_plan_projection_and_attempt_evidence_in_lockstep() {
+        let repo = InMemoryPlanRepository::new();
+        let mut initial = PlanModeState::new_with_owner("ship durable work".into(), "u-1".into());
+        initial.plan.subtasks = vec![
+            astra_services::task_orchestrator::SubtaskPlan {
+                id: "build".into(),
+                title: "Build projection".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            },
+            astra_services::task_orchestrator::SubtaskPlan {
+                id: "verify".into(),
+                title: "Verify projection".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            },
+        ];
+        repo.save("u-1", "plan-atomic", &mut initial, None)
+            .await
+            .expect("seed plan");
+
+        let mut started = repo.load("u-1", "plan-atomic").await.unwrap();
+        started.plan.subtasks[0].status = TaskStatus::InProgress;
+        let run_id = repo
+            .save_existing_and_start_step_run(
+                "u-1",
+                "plan-atomic",
+                &mut started,
+                1,
+                NewStepRun {
+                    plan_id: "plan-atomic",
+                    subtask_id: "build",
+                    attempt: 1,
+                    status: TaskStatus::InProgress,
+                    session_id: "session-a",
+                    request_id: "run-a",
+                },
+            )
+            .await
+            .expect("atomically start step");
+        assert_eq!(started.version, 2);
+
+        let mut finished = repo.load("u-1", "plan-atomic").await.unwrap();
+        finished.plan.subtasks[0].status = TaskStatus::Completed;
+        repo.save_existing_and_finalize_step_run(
+            "u-1",
+            "plan-atomic",
+            &mut finished,
+            2,
+            &run_id,
+            TaskStatus::Completed,
+            None,
+            Some("artifact://build"),
+        )
+        .await
+        .expect("atomically finish step");
+
+        let mut completed = repo.load("u-1", "plan-atomic").await.unwrap();
+        completed.plan.subtasks[1].status = TaskStatus::Completed;
+        let completed_run_id = repo
+            .save_existing_and_record_completed_step_run(
+                "u-1",
+                "plan-atomic",
+                &mut completed,
+                3,
+                NewStepRun {
+                    plan_id: "plan-atomic",
+                    subtask_id: "verify",
+                    attempt: 1,
+                    status: TaskStatus::Completed,
+                    session_id: "session-a",
+                    request_id: "run-b",
+                },
+                None,
+                Some("artifact://verify"),
+            )
+            .await
+            .expect("atomically record completed step");
+
+        let persisted = repo.load("u-1", "plan-atomic").await.unwrap();
+        assert_eq!(persisted.version, 4);
+        assert!(
+            persisted
+                .plan
+                .subtasks
+                .iter()
+                .all(|subtask| subtask.status == TaskStatus::Completed)
+        );
+        let started_run = repo
+            .get_step_run("u-1", "plan-atomic", &run_id)
+            .await
+            .unwrap();
+        assert_eq!(started_run.status, TaskStatus::Completed);
+        assert!(started_run.finished_at.is_some());
+        let completed_run = repo
+            .get_step_run("u-1", "plan-atomic", &completed_run_id)
+            .await
+            .unwrap();
+        assert_eq!(completed_run.status, TaskStatus::Completed);
+        assert!(completed_run.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn atomic_step_write_conflict_leaves_plan_and_attempts_unchanged() {
+        let repo = InMemoryPlanRepository::new();
+        let mut initial = PlanModeState::new_with_owner("goal".into(), "u-1".into());
+        initial
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "step".into(),
+                title: "Step".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            });
+        repo.save("u-1", "plan-conflict", &mut initial, None)
+            .await
+            .unwrap();
+        let mut first = repo.load("u-1", "plan-conflict").await.unwrap();
+        first.plan.subtasks[0].status = TaskStatus::InProgress;
+        repo.save_existing_and_start_step_run(
+            "u-1",
+            "plan-conflict",
+            &mut first,
+            1,
+            NewStepRun {
+                plan_id: "plan-conflict",
+                subtask_id: "step",
+                attempt: 1,
+                status: TaskStatus::InProgress,
+                session_id: "session-a",
+                request_id: "run-a",
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut stale = initial;
+        stale.plan.subtasks[0].status = TaskStatus::Completed;
+        let error = repo
+            .save_existing_and_record_completed_step_run(
+                "u-1",
+                "plan-conflict",
+                &mut stale,
+                1,
+                NewStepRun {
+                    plan_id: "plan-conflict",
+                    subtask_id: "step",
+                    attempt: 2,
+                    status: TaskStatus::Completed,
+                    session_id: "session-a",
+                    request_id: "run-b",
+                },
+                None,
+                None,
+            )
+            .await
+            .expect_err("stale plan version must not append an orphan attempt");
+        assert!(matches!(error, PlanLoadError::Conflict { .. }));
+
+        let persisted = repo.load("u-1", "plan-conflict").await.unwrap();
+        assert_eq!(persisted.version, 2);
+        assert_eq!(persisted.plan.subtasks[0].status, TaskStatus::InProgress);
+        assert_eq!(
+            repo.list_step_runs("u-1", "plan-conflict", None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -53,15 +53,15 @@ impl TurnContext {
 /// the bottom pane, the new loop handles scrollback.
 pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
     match ev {
-        TuiAppEvent::Token(text) => Some(AppEvent::Wire(WireEvent::AnswerDelta(text))),
-        TuiAppEvent::ThinkingChunk(text) => Some(AppEvent::Wire(WireEvent::ReasoningDelta(text))),
-        TuiAppEvent::ThinkingStopped => Some(AppEvent::Wire(WireEvent::ReasoningDone)),
+        TuiAppEvent::Token(text) => Some(AppEvent::wire(WireEvent::AnswerDelta(text))),
+        TuiAppEvent::ThinkingChunk(text) => Some(AppEvent::wire(WireEvent::ReasoningDelta(text))),
+        TuiAppEvent::ThinkingStopped => Some(AppEvent::wire(WireEvent::ReasoningDone)),
         TuiAppEvent::ToolStarted {
             name,
             description,
             tool_use_id,
             parent_tool_use_id,
-        } => Some(AppEvent::Wire(WireEvent::ToolStarted {
+        } => Some(AppEvent::wire(WireEvent::ToolStarted {
             name,
             description,
             tool_use_id,
@@ -74,7 +74,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
             agent_id,
             fanout_slot,
             fanout_title,
-        } => Some(AppEvent::Wire(WireEvent::AgentControlStarted {
+        } => Some(AppEvent::wire(WireEvent::AgentControlStarted {
             action,
             label,
             tool_use_id,
@@ -91,7 +91,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
             output,
             tool_use_id,
             parent_tool_use_id,
-        } => Some(AppEvent::Wire(WireEvent::ToolCompleted {
+        } => Some(AppEvent::wire(WireEvent::ToolCompleted {
             name,
             description,
             status,
@@ -109,7 +109,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
             output,
             tool_use_id,
             agent_id,
-        } => Some(AppEvent::Wire(WireEvent::AgentControlCompleted {
+        } => Some(AppEvent::wire(WireEvent::AgentControlCompleted {
             action,
             label,
             status,
@@ -119,26 +119,36 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
             agent_id,
         })),
         TuiAppEvent::ToolOutput { name, lines, bytes } => {
-            Some(AppEvent::Wire(WireEvent::ToolOutput { name, lines, bytes }))
+            Some(AppEvent::wire(WireEvent::ToolOutput { name, lines, bytes }))
         }
-        TuiAppEvent::AgentLive(event) => Some(AppEvent::Wire(WireEvent::AgentLive(event))),
+        TuiAppEvent::AgentLive(event) => Some(AppEvent::wire(WireEvent::AgentLive(event))),
         TuiAppEvent::AgentLiveBatch(events) => {
-            Some(AppEvent::Wire(WireEvent::AgentLiveBatch(events)))
+            Some(AppEvent::wire(WireEvent::AgentLiveBatch(events)))
         }
-        TuiAppEvent::TurnComplete => Some(AppEvent::Wire(WireEvent::TurnComplete(Box::new(
+        TuiAppEvent::AgentLiveGap(gap) => Some(AppEvent::wire(WireEvent::AgentLiveGap(gap))),
+        TuiAppEvent::AgentCommunication(event) => {
+            Some(AppEvent::wire(WireEvent::AgentCommunication(event)))
+        }
+        TuiAppEvent::TurnComplete => Some(AppEvent::wire(WireEvent::TurnComplete(Box::new(
             ctx.into_stats(),
         )))),
-        TuiAppEvent::TurnError(msg) => Some(AppEvent::Wire(WireEvent::TurnError(msg))),
-        TuiAppEvent::SystemWarning(msg) => Some(AppEvent::Wire(WireEvent::SystemWarning(msg))),
-        TuiAppEvent::SystemInfo(msg) => Some(AppEvent::Wire(WireEvent::SystemInfo(msg))),
-        TuiAppEvent::ExplainReport(items) => Some(AppEvent::Wire(WireEvent::ExplainReport(items))),
-        TuiAppEvent::VerdictReport(items) => Some(AppEvent::Wire(WireEvent::VerdictReport(items))),
-        TuiAppEvent::Compaction(event) => Some(AppEvent::Wire(WireEvent::Compaction(event))),
+        TuiAppEvent::TurnError(msg) => Some(AppEvent::wire(WireEvent::TurnError(msg))),
+        TuiAppEvent::SystemWarning(msg) => Some(AppEvent::wire(WireEvent::SystemWarning(msg))),
+        TuiAppEvent::SystemInfo(msg) => Some(AppEvent::wire(WireEvent::SystemInfo(msg))),
+        TuiAppEvent::ExplainReport(items) => Some(AppEvent::wire(WireEvent::ExplainReport(items))),
+        TuiAppEvent::VerdictReport(items) => Some(AppEvent::wire(WireEvent::VerdictReport(items))),
+        TuiAppEvent::Compaction(event) => Some(AppEvent::wire(WireEvent::Compaction(event))),
         // Bottom-pane-only events — ChatWidget doesn't care.
-        TuiAppEvent::ThinkingStarted
+        TuiAppEvent::ContextWindowEstimated(_)
+        | TuiAppEvent::ContextSystemPromptTokens(_)
+        | TuiAppEvent::ContextWindowMeasured(_)
+        | TuiAppEvent::AssistantOutputSettled
+        | TuiAppEvent::TurnStreamClosed
+        | TuiAppEvent::ThinkingStarted
         | TuiAppEvent::WaitingForModel
         | TuiAppEvent::ModelResponding
         | TuiAppEvent::StatusLine(_)
+        | TuiAppEvent::UserIntentApplied { .. }
         | TuiAppEvent::PermissionAutoApproved { .. } => None,
     }
 }
@@ -149,10 +159,17 @@ mod tests {
     use super::{TurnContext, translate};
     use crate::tui::app_event::TuiAppEvent;
 
+    fn wire(event: &Option<AppEvent>) -> Option<&WireEvent> {
+        match event {
+            Some(AppEvent::Wire(event)) => Some(event.as_ref()),
+            Some(AppEvent::User(_)) | None => None,
+        }
+    }
+
     #[test]
     fn token_to_answer_delta() {
         let out = translate(TuiAppEvent::Token("hi".into()), TurnContext::default());
-        assert!(matches!(out, Some(AppEvent::Wire(WireEvent::AnswerDelta(s))) if s == "hi"));
+        assert!(matches!(wire(&out), Some(WireEvent::AnswerDelta(s)) if s == "hi"));
     }
 
     #[test]
@@ -161,16 +178,13 @@ mod tests {
             TuiAppEvent::ThinkingChunk("x".into()),
             TurnContext::default(),
         );
-        assert!(matches!(out, Some(AppEvent::Wire(WireEvent::ReasoningDelta(s))) if s == "x"));
+        assert!(matches!(wire(&out), Some(WireEvent::ReasoningDelta(s)) if s == "x"));
     }
 
     #[test]
     fn thinking_stopped_to_reasoning_done() {
         let out = translate(TuiAppEvent::ThinkingStopped, TurnContext::default());
-        assert!(matches!(
-            out,
-            Some(AppEvent::Wire(WireEvent::ReasoningDone))
-        ));
+        assert!(matches!(wire(&out), Some(WireEvent::ReasoningDone)));
     }
 
     #[test]
@@ -185,7 +199,7 @@ mod tests {
             TurnContext::default(),
         );
         assert!(
-            matches!(&started, Some(AppEvent::Wire(WireEvent::ToolStarted { name, description, tool_use_id, parent_tool_use_id }))
+            matches!(wire(&started), Some(WireEvent::ToolStarted { name, description, tool_use_id, parent_tool_use_id })
                 if name == "bash" && description == "ls" && tool_use_id == "tu_test" && parent_tool_use_id.is_none())
         );
 
@@ -202,12 +216,12 @@ mod tests {
             },
             TurnContext::default(),
         );
-        match &completed {
-            Some(AppEvent::Wire(WireEvent::ToolCompleted {
+        match wire(&completed) {
+            Some(WireEvent::ToolCompleted {
                 status,
                 duration_ms: 42,
                 ..
-            })) => assert_eq!(status, "completed"),
+            }) => assert_eq!(status, "completed"),
             other => panic!("unexpected tool completed event: {other:?}"),
         }
     }
@@ -225,8 +239,8 @@ mod tests {
             cumulative_cost_usd: Some(0.014),
         };
         let out = translate(TuiAppEvent::TurnComplete, ctx);
-        match out {
-            Some(AppEvent::Wire(WireEvent::TurnComplete(stats))) => {
+        match wire(&out) {
+            Some(WireEvent::TurnComplete(stats)) => {
                 assert_eq!(stats.elapsed_ms, Some(1_500));
                 assert_eq!(stats.ttft_ms, Some(400));
                 assert_eq!(stats.tools, 2);
@@ -242,9 +256,7 @@ mod tests {
             TuiAppEvent::TurnError("rate limited".into()),
             TurnContext::default(),
         );
-        assert!(
-            matches!(out, Some(AppEvent::Wire(WireEvent::TurnError(s))) if s == "rate limited")
-        );
+        assert!(matches!(wire(&out), Some(WireEvent::TurnError(s)) if s == "rate limited"));
     }
 
     #[test]
@@ -253,9 +265,7 @@ mod tests {
             TuiAppEvent::SystemWarning("not logged in".into()),
             TurnContext::default(),
         );
-        assert!(
-            matches!(out, Some(AppEvent::Wire(WireEvent::SystemWarning(s))) if s == "not logged in")
-        );
+        assert!(matches!(wire(&out), Some(WireEvent::SystemWarning(s)) if s == "not logged in"));
     }
 
     #[test]
@@ -264,9 +274,7 @@ mod tests {
             TuiAppEvent::SystemInfo("token refreshed".into()),
             TurnContext::default(),
         );
-        assert!(
-            matches!(out, Some(AppEvent::Wire(WireEvent::SystemInfo(s))) if s == "token refreshed")
-        );
+        assert!(matches!(wire(&out), Some(WireEvent::SystemInfo(s)) if s == "token refreshed"));
     }
 
     #[test]
@@ -280,6 +288,13 @@ mod tests {
             TuiAppEvent::WaitingForModel,
             TuiAppEvent::ModelResponding,
             TuiAppEvent::StatusLine("hello".into()),
+            TuiAppEvent::UserIntentApplied {
+                intent_id: "input-1".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index: 1,
+                content: "guide".into(),
+            },
         ] {
             assert!(
                 translate(ev.clone(), TurnContext::default()).is_none(),

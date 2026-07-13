@@ -7,12 +7,12 @@
 //! Scoring features:
 //! * Fuzzy scoring via `nucleo-matcher::Atom`.
 //! * Per-item `usage_boost` nudges frequently-used commands to the top.
-//! * Optional aliases: `/h` finds `/help` when `aliases=["h"]`.
 //! * Returns match positions for highlight rendering.
 
 #![allow(dead_code)]
 
-use crate::cli::command_registry::TuiHandler;
+use std::borrow::Cow;
+
 use nucleo_matcher::{
     Config, Matcher, Utf32Str,
     pattern::{Atom, AtomKind, CaseMatching, Normalization},
@@ -22,23 +22,21 @@ use nucleo_matcher::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SlashItem {
     /// Full command token including leading `/`, e.g. `/help`.
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     /// One-line description shown beside the name.
-    pub description: &'static str,
+    pub description: Cow<'static, str>,
     /// Static sub-tokens surfaced once the user types a trailing space.
     /// Matches the `(token, description)` shape in the command registry.
     pub subcommands: &'static [(&'static str, &'static str)],
     /// Dynamic sub-tokens injected at runtime (e.g. MCP server/tool names).
     /// Merged with `subcommands` when the menu is constructed.
     pub extra_subcommands: Vec<(String, String)>,
-    /// Optional short aliases (without leading `/`), e.g. `["h"]` for `/help`.
-    pub aliases: &'static [&'static str],
     /// Frequency hint — higher means "show sooner on ties".
     pub usage_boost: u32,
+    /// Included in the curated list shown for a bare `/`.
+    pub primary: bool,
     /// Command group for categorized rendering in the popup.
     pub group: Option<crate::cli::command_registry::CommandGroup>,
-    /// How the command behaves in the TUI — e.g. shows a panel or modal.
-    pub tui_handler: crate::cli::command_registry::TuiHandler,
     /// Example usages shown in help output.
     pub usage_examples: &'static [&'static str],
 }
@@ -46,14 +44,13 @@ pub(crate) struct SlashItem {
 impl Default for SlashItem {
     fn default() -> Self {
         Self {
-            name: "",
-            description: "",
+            name: Cow::Borrowed(""),
+            description: Cow::Borrowed(""),
             subcommands: &[],
             extra_subcommands: Vec::new(),
-            aliases: &[],
             usage_boost: 0,
+            primary: true,
             group: None,
-            tui_handler: TuiHandler::Inline,
             usage_examples: &[],
         }
     }
@@ -63,14 +60,13 @@ impl SlashItem {
     /// Minimal constructor for the common case.
     pub const fn simple(name: &'static str, description: &'static str) -> Self {
         Self {
-            name,
-            description,
+            name: Cow::Borrowed(name),
+            description: Cow::Borrowed(description),
             subcommands: &[],
             extra_subcommands: Vec::new(),
-            aliases: &[],
             usage_boost: 0,
+            primary: true,
             group: None,
-            tui_handler: TuiHandler::Inline,
             usage_examples: &[],
         }
     }
@@ -194,30 +190,17 @@ fn score_one(
     let mut name_indices: Vec<u32> = Vec::new();
     let name_score = atom.indices(name_haystack, matcher, &mut name_indices);
 
-    // Secondary: each alias.
-    let mut alias_score: Option<u16> = None;
-    for alias in item.aliases {
-        let alias_lower = alias.to_ascii_lowercase();
-        let mut ab = Vec::new();
-        let hay = Utf32Str::new(alias_lower.as_str(), &mut ab);
-        if let Some(s) = atom.score(hay, matcher) {
-            alias_score = Some(alias_score.map_or(s, |cur| cur.max(s)));
-        }
-    }
-
-    // Tertiary: description.
+    // Secondary: description.
     let desc_lower = item.description.to_ascii_lowercase();
     let mut db = Vec::new();
     let desc_haystack = Utf32Str::new(desc_lower.as_str(), &mut db);
     let desc_score = atom.score(desc_haystack, matcher);
 
-    let name_hit = name_score.is_some() || alias_score.is_some();
-    let base = match (name_score, alias_score, desc_score) {
-        (Some(ns), Some(aliass), _) => ns.max(aliass) as u32,
-        (Some(ns), None, _) => ns as u32,
-        (None, Some(aliass), _) => aliass as u32,
-        (None, None, Some(ds)) => ds as u32 / 2,
-        (None, None, None) => return None,
+    let name_hit = name_score.is_some();
+    let base = match (name_score, desc_score) {
+        (Some(ns), _) => ns as u32,
+        (None, Some(ds)) => ds as u32 / 2,
+        (None, None) => return None,
     };
 
     let mut bonus = 0u32;
@@ -267,27 +250,24 @@ impl SlashMenu {
             .iter()
             .map(|item| {
                 // Static subcommands from the compile-time registry.
-                let static_items = item.subcommands.iter().map(|(sub_name, sub_desc)| {
-                    let full: &'static str =
-                        Box::leak(format!("{} {sub_name}", item.name).into_boxed_str());
-                    SlashItem {
-                        name: full,
-                        description: sub_desc,
+                let static_items = item
+                    .subcommands
+                    .iter()
+                    .map(|(sub_name, sub_desc)| SlashItem {
+                        name: Cow::Owned(format!("{} {sub_name}", item.name)),
+                        description: Cow::Borrowed(sub_desc),
                         ..Default::default()
-                    }
-                });
+                    });
                 // Dynamic subcommands injected at runtime (e.g. connected MCP
                 // server names and tool identifiers).
-                let dynamic_items = item.extra_subcommands.iter().map(|(sub_name, sub_desc)| {
-                    let full: &'static str =
-                        Box::leak(format!("{} {sub_name}", item.name).into_boxed_str());
-                    let desc: &'static str = Box::leak(sub_desc.clone().into_boxed_str());
-                    SlashItem {
-                        name: full,
-                        description: desc,
-                        ..Default::default()
-                    }
-                });
+                let dynamic_items =
+                    item.extra_subcommands
+                        .iter()
+                        .map(|(sub_name, sub_desc)| SlashItem {
+                            name: Cow::Owned(format!("{} {sub_name}", item.name)),
+                            description: Cow::Owned(sub_desc.clone()),
+                            ..Default::default()
+                        });
                 static_items.chain(dynamic_items).collect()
             })
             .collect();
@@ -308,7 +288,12 @@ impl SlashMenu {
     }
 
     fn reset_to_all(&mut self) {
-        let mut idx: Vec<usize> = (0..self.items.len()).collect();
+        let mut idx: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.primary.then_some(index))
+            .collect();
         idx.sort_by(|&a, &b| {
             self.items[b]
                 .usage_boost
@@ -384,7 +369,7 @@ impl SlashMenu {
                             let sub_suffix = item
                                 .name
                                 .strip_prefix(parent_prefix.as_str())
-                                .unwrap_or(item.name);
+                                .unwrap_or(item.name.as_ref());
                             score_token(token, sub_suffix).map(|s| (i, s))
                         })
                         .collect();

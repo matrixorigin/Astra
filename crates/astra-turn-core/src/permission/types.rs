@@ -158,12 +158,16 @@ impl PermissionMode {
         }
     }
 
-    /// Human label for the status-line mode chip.
+    /// Human label for the active tool-policy chip.
+    ///
+    /// `Plan` is the internal read-only preset used by the policy engine. The
+    /// product label deliberately names the capability rather than pretending
+    /// it is the session's Plan lifecycle.
     pub fn chip_text(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
             Self::Bypass => "Bypass",
-            Self::Plan => "Plan",
+            Self::Plan => "Read-only",
             Self::AcceptEdits => "Edits",
             Self::Prompt => "Ask",
             Self::Deny => "Deny",
@@ -1311,6 +1315,7 @@ mod tests {
         let parsed = "plan".parse::<PermissionMode>().unwrap();
         assert_eq!(parsed, PermissionMode::Plan);
         assert_eq!(parsed.to_string(), "plan");
+        assert_eq!(parsed.chip_text(), "Read-only");
     }
 
     #[test]

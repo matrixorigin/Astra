@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
@@ -302,6 +302,7 @@ impl AskUserView {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let theme = crate::tui::theme::current();
         let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
         let mut line_width = 0usize;
         for idx in 0..=self.submit_tab() {
@@ -322,12 +323,13 @@ impl AskUserView {
             }
             let style = if active {
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.selected_fg)
+                    .bg(theme.selected_bg)
                     .add_modifier(Modifier::BOLD)
             } else if answered {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(theme.success)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme.dim)
             };
             lines
                 .last_mut()
@@ -373,6 +375,7 @@ impl AskUserView {
     }
 
     fn render_standard_question(&self, area: Rect, buf: &mut Buffer) {
+        let theme = crate::tui::theme::current();
         let Some(question) = self.current_question() else {
             return;
         };
@@ -394,7 +397,7 @@ impl AskUserView {
         Paragraph::new(question.question.as_str())
             .style(
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )
             .wrap(Wrap { trim: false })
@@ -418,10 +421,11 @@ impl AskUserView {
             let pointer = if focused { "›" } else { " " };
             let style = if focused {
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.selected_fg)
+                    .bg(theme.selected_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(theme.fg)
             };
             Widget::render(
                 Line::from(vec![
@@ -440,7 +444,7 @@ impl AskUserView {
                     Widget::render(
                         Line::from(Span::styled(
                             format!("        {line}"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.dim),
                         )),
                         Rect::new(chunks[1].x, y, chunks[1].width, 1),
                         buf,
@@ -454,10 +458,11 @@ impl AskUserView {
             let focused = Self::is_other_row(question, state);
             let style = if focused {
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.selected_fg)
+                    .bg(theme.selected_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(theme.quote)
             };
             Widget::render(
                 Line::from(vec![
@@ -481,7 +486,7 @@ impl AskUserView {
                 .borders(Borders::ALL)
                 .title(" Your answer ");
             if Self::is_other_row(question, state) {
-                block = block.border_style(Style::default().fg(Color::Green));
+                block = block.border_style(Style::default().fg(theme.accent));
             }
             let inner = block.inner(chunks[2]);
             Widget::render(block, chunks[2], buf);
@@ -489,7 +494,7 @@ impl AskUserView {
                 Widget::render(
                     Line::from(Span::styled(
                         "Type your answer here",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme.dim),
                     )),
                     inner,
                     buf,
@@ -527,6 +532,7 @@ impl AskUserView {
     }
 
     fn render_notes_box(&self, area: Rect, buf: &mut Buffer) {
+        let theme = crate::tui::theme::current();
         let Some(state) = self.current_state() else {
             return;
         };
@@ -535,15 +541,15 @@ impl AskUserView {
         }
         let mut block = Block::default().borders(Borders::ALL).title(" Notes ");
         if self.notes_focus {
-            block = block.border_style(Style::default().fg(Color::Green));
+            block = block.border_style(Style::default().fg(theme.accent));
         }
         let inner = block.inner(area);
         Widget::render(block, area, buf);
         if state.notes_input.is_empty() {
             Widget::render(
                 Line::from(vec![
-                    Span::styled("Notes: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled("press n to add notes", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Notes: ", Style::default().fg(theme.dim)),
+                    Span::styled("press n to add notes", Style::default().fg(theme.dim)),
                 ]),
                 inner,
                 buf,
@@ -554,6 +560,7 @@ impl AskUserView {
     }
 
     fn render_preview_question(&self, area: Rect, buf: &mut Buffer) {
+        let theme = crate::tui::theme::current();
         let Some(question) = self.current_question() else {
             return;
         };
@@ -574,7 +581,7 @@ impl AskUserView {
         Paragraph::new(question.question.as_str())
             .style(
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )
             .wrap(Wrap { trim: false })
@@ -596,10 +603,11 @@ impl AskUserView {
             let pointer = if focused { "›" } else { " " };
             let style = if focused {
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.selected_fg)
+                    .bg(theme.selected_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(theme.fg)
             };
             Widget::render(
                 Line::from(vec![
@@ -607,7 +615,7 @@ impl AskUserView {
                     Span::styled(choice.label.clone(), style),
                     Span::styled(
                         if selected { " ✓" } else { "" },
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(theme.success),
                     ),
                 ]),
                 Rect::new(side[0].x, y, side[0].width, 1),
@@ -622,7 +630,7 @@ impl AskUserView {
                     Widget::render(
                         Line::from(Span::styled(
                             format!("       {line}"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.dim),
                         )),
                         Rect::new(side[0].x, y, side[0].width, 1),
                         buf,
@@ -650,12 +658,13 @@ impl AskUserView {
     }
 
     fn render_submit(&self, area: Rect, buf: &mut Buffer) {
+        let theme = crate::tui::theme::current();
         let mut y = area.y;
         Widget::render(
             Line::from(Span::styled(
                 "Review answers",
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )),
             Rect::new(area.x, y, area.width, 1),
@@ -671,7 +680,7 @@ impl AskUserView {
                     Span::styled(
                         format!("  {} ", question.header),
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(theme.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(self.answer_summary(idx)),
@@ -688,7 +697,7 @@ impl AskUserView {
                     Widget::render(
                         Line::from(Span::styled(
                             format!("      notes: {notes}"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.dim),
                         )),
                         Rect::new(area.x, y, area.width, 1),
                         buf,
@@ -852,6 +861,7 @@ impl BottomPaneView for AskUserView {
             return;
         }
 
+        let theme = crate::tui::theme::current();
         let outer = Block::default().borders(Borders::ALL).title(" ask_user ");
         let inner = outer.inner(area);
         Widget::render(outer, area, buf);
@@ -876,7 +886,7 @@ impl BottomPaneView for AskUserView {
         Widget::render(
             Line::from(Span::styled(
                 format!("  {}", self.summary_line()),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             )),
             chunks[0],
             buf,
@@ -884,7 +894,7 @@ impl BottomPaneView for AskUserView {
 
         if let Some(context) = &self.prompt.context {
             Paragraph::new(context.as_str())
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme.dim))
                 .wrap(Wrap { trim: false })
                 .render(chunks[1], buf);
         }
@@ -907,7 +917,7 @@ impl BottomPaneView for AskUserView {
                 Widget::render(
                     Line::from(Span::styled(
                         format!("  {validation}"),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(theme.warn),
                     )),
                     Rect::new(chunks[4].x, chunks[4].y, chunks[4].width, 1),
                     buf,

@@ -2,5 +2,5 @@
 source: crates/astra-cli/src/tui/history_cell/tool.rs
 expression: "render(&ok_tool(\"bash\", \"ls /tmp\", 42), 80, 3)"
 ---
-• Ran Bash · 42ms
+● Ran Bash · 42ms
   └ ls /tmp

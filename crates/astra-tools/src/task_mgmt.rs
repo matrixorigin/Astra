@@ -71,6 +71,71 @@ pub struct SessionTask {
     pub archived_at: Option<String>,
 }
 
+/// Truthful, bounded projection used by cross-session task surfaces.
+///
+/// This is intentionally smaller than [`SessionTask`]: remote APIs can serve
+/// an actionable overview without downloading descriptions, dependency
+/// graphs, subtasks, or arbitrary metadata. Consumers must not fabricate
+/// those omitted fields just to reuse the full task type.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenTaskSummary {
+    pub id: String,
+    pub title: String,
+    pub status: SessionTaskStatusKind,
+    pub updated_at: String,
+}
+
+impl From<&SessionTask> for OpenTaskSummary {
+    fn from(task: &SessionTask) -> Self {
+        Self {
+            id: task.id.clone(),
+            title: task.title.clone(),
+            status: task.status,
+            updated_at: task.updated_at.clone(),
+        }
+    }
+}
+
+fn bounded_open_task_summaries(
+    sessions: Vec<(String, Vec<SessionTask>)>,
+    limit: usize,
+) -> Vec<(String, Vec<OpenTaskSummary>)> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut flat: Vec<(String, OpenTaskSummary)> = sessions
+        .into_iter()
+        .flat_map(|(session_id, tasks)| {
+            tasks
+                .into_iter()
+                .filter(|task| task.status.is_open_work())
+                .map(move |task| (session_id.clone(), OpenTaskSummary::from(&task)))
+        })
+        .collect();
+    flat.sort_by(|(session_a, task_a), (session_b, task_b)| {
+        task_b
+            .updated_at
+            .cmp(&task_a.updated_at)
+            .then_with(|| session_a.cmp(session_b))
+            .then_with(|| task_a.id.cmp(&task_b.id))
+    });
+    flat.truncate(limit);
+
+    let mut grouped: Vec<(String, Vec<OpenTaskSummary>)> = Vec::new();
+    for (session_id, task) in flat {
+        if let Some((_, tasks)) = grouped
+            .iter_mut()
+            .find(|(existing, _)| existing == &session_id)
+        {
+            tasks.push(task);
+        } else {
+            grouped.push((session_id, vec![task]));
+        }
+    }
+    grouped
+}
+
 pub fn detach_dependency_edges_for_task_ids(
     task_id: &str,
     blocks: &mut Vec<String>,
@@ -603,6 +668,33 @@ pub struct TaskMutationResult {
 pub type TaskMutation =
     Box<dyn FnOnce(Vec<SessionTask>, u32) -> Result<TaskMutationResult, String> + Send>;
 
+/// Structured availability evidence for task-store reads. This is separate
+/// from task truth: a consumer may still hold confirmed rows while the store
+/// is temporarily unreachable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TaskStoreHealth {
+    #[default]
+    Unknown,
+    Ready,
+    AuthenticationRequired,
+    SessionUnavailable,
+    ServiceUnavailable,
+    TransportUnavailable,
+    ProtocolMismatch,
+}
+
+impl TaskStoreHealth {
+    /// Transient failures can reconcile on a timer. Authentication and wire
+    /// contract failures need new external evidence (sign-in/config/update),
+    /// so consumers should wait for an explicit dirty/rebind signal.
+    pub fn allows_automatic_retry(self) -> bool {
+        matches!(
+            self,
+            Self::Unknown | Self::Ready | Self::ServiceUnavailable | Self::TransportUnavailable
+        )
+    }
+}
+
 /// Process-wide storage backend for session task lists.
 ///
 /// Conceptually every session_id addresses an independent vec; the store
@@ -611,6 +703,12 @@ pub type TaskMutation =
 /// lives in [`TaskManager`] so it is shared by all backends.
 #[async_trait]
 pub trait TaskStore: Send + Sync {
+    /// Last structured read-path health observed by this store. Implementations
+    /// that cannot classify failures may keep the default `Unknown` evidence.
+    fn health_snapshot(&self) -> TaskStoreHealth {
+        TaskStoreHealth::Unknown
+    }
+
     /// Load every task for this session in stable order.
     async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String>;
 
@@ -919,6 +1017,20 @@ pub trait TaskStore: Send + Sync {
         }
         Ok(out)
     }
+
+    /// Load the minimal truthful projection needed by a bounded
+    /// cross-session overview. The default adapts stores that already return
+    /// full tasks; remote stores should override this to avoid transferring
+    /// fields the overview cannot render.
+    async fn load_open_task_summaries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<OpenTaskSummary>)>, String> {
+        Ok(bounded_open_task_summaries(
+            self.load_open_sessions(limit).await?,
+            limit,
+        ))
+    }
 }
 
 /// In-memory store for tests and offline CLI mode. Holds a map
@@ -1203,12 +1315,20 @@ impl TaskStore for InMemoryTaskStore {
             .filter(|(_, s)| !s.tasks.is_empty())
             .map(|(sid, s)| (sid.clone(), s.tasks.clone()))
             .collect();
-        // Deterministic order: the HashMap's iteration is random,
-        // but callers want a stable view for snapshot diffs in the
-        // multi-session observer. Sort by session_id — the row-level
-        // sort on updated_at happens in `task_board_multi::flatten`.
+        // Deterministic order for full-session consumers. The bounded summary
+        // projection below independently orders actionable rows by recency.
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
+    }
+
+    async fn load_open_task_summaries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<OpenTaskSummary>)>, String> {
+        Ok(bounded_open_task_summaries(
+            self.load_all_sessions().await?,
+            limit,
+        ))
     }
 }
 
@@ -3073,78 +3193,6 @@ impl TaskManager {
             Ok(response) => response,
             Err(e) => format!("Error: {e}"),
         }
-    }
-
-    /// Sync an approved-plan mirror task to a terminal status.
-    ///
-    /// Approved-plan tasks mirror the plan state machine. They can move from
-    /// pending directly to a terminal state without weakening user task rules.
-    pub async fn sync_approved_plan_mirror_terminal_status(
-        &self,
-        task_id: &str,
-        status: SessionTaskStatusKind,
-    ) -> Result<(), String> {
-        if !status.can_be_archived() {
-            return Err(format!(
-                "approved-plan mirror sync only supports terminal statuses, got '{status}'"
-            ));
-        }
-        let task_id = task_id.to_string();
-        let now = chrono::Utc::now().to_rfc3339();
-
-        self.store
-            .mutate(
-                &self.sid(),
-                Box::new(move |mut tasks, _next_task_id| {
-                    let Some(task) = tasks.iter_mut().find(|task| task.id == task_id) else {
-                        return Err(format!("task '{}' not found", task_id));
-                    };
-                    let metadata = task
-                        .metadata
-                        .as_ref()
-                        .ok_or_else(|| format!("task '{}' is not an approved-plan mirror", task_id))?;
-                    let source = metadata.get("source").and_then(Value::as_str);
-                    let has_subtask_id = metadata
-                        .get("plan_subtask_id")
-                        .and_then(Value::as_str)
-                        .is_some();
-                    if source != Some("approved_plan") || !has_subtask_id {
-                        return Err(format!("task '{}' is not an approved-plan step mirror", task_id));
-                    }
-                    let previous_status = task.status;
-                    if previous_status == status {
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response: String::new(),
-                        });
-                    }
-                    if matches!(
-                        previous_status,
-                        SessionTaskStatusKind::Completed
-                            | SessionTaskStatusKind::Failed
-                            | SessionTaskStatusKind::Cancelled
-                            | SessionTaskStatusKind::Archived
-                    ) {
-                        return Err(format!(
-                            "task '{}' is already terminal ({previous_status}); refusing to rewrite plan history",
-                            task_id
-                        ));
-                    }
-                    task.status = status;
-                    task.updated_at = now.clone();
-                    if status == SessionTaskStatusKind::Archived {
-                        task.archived_at = Some(now);
-                    }
-                    Ok(TaskMutationResult {
-                        tasks,
-                        next_task_id: None,
-                        response: String::new(),
-                    })
-                }),
-            )
-            .await
-            .map(|_| ())
     }
 
     /// Stop/cancel a running task.
@@ -6228,6 +6276,21 @@ mod tests {
                 .iter()
                 .all(|title| title.ends_with("-a") || title.ends_with("-b")),
             "open tasks from multiple sessions remain eligible: {rows:?}"
+        );
+
+        let summaries = store
+            .load_open_task_summaries(2)
+            .await
+            .expect("load_open_task_summaries");
+        let summaries: Vec<&OpenTaskSummary> = summaries
+            .iter()
+            .flat_map(|(_, tasks)| tasks.iter())
+            .collect();
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().all(|task| task.status.is_open_work()));
+        assert!(
+            summaries.iter().all(|task| !task.updated_at.is_empty()),
+            "summary projection must retain authoritative recency"
         );
     }
 

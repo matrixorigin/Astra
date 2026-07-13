@@ -3,6 +3,10 @@
 //! This crate provides foundational types used during turn execution,
 //! extracted from the monolithic runtime crate for better modularity.
 
+mod agent_communication;
+mod agent_transcript_evidence;
+mod agent_transcript_location;
+mod context_window;
 mod correction_signal;
 mod implicit_feedback;
 mod memory_ranking;
@@ -12,7 +16,15 @@ mod result_quality;
 mod runtime_scaffolding;
 pub mod session_facts;
 mod tool_idempotency;
+mod user_intent;
 
+pub use agent_communication::{
+    AGENT_COMMUNICATION_SCHEMA_VERSION, AgentCommunicationDirection, AgentCommunicationEvent,
+    AgentCommunicationParty, AgentCommunicationTarget,
+};
+pub use agent_transcript_evidence::AgentTranscriptEvidence;
+pub use agent_transcript_location::AgentTranscriptLocation;
+pub use context_window::{ContextWindowUsage, ContextWindowUsageSource};
 pub use correction_signal::{
     UserCorrectionSignalKind, classify_user_correction_signal, has_durable_correction_directive,
     is_user_correction_signal,
@@ -36,3 +48,4 @@ pub use runtime_scaffolding::{
     scaffolding_body_prefixes_for_filtering,
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
+pub use user_intent::{UserIntentDelivery, UserIntentStatus};

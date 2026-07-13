@@ -48,17 +48,19 @@ async fn execute_delegation_with_source_agent_fallback(
     source_agent_id: &str,
     forward_headers: &std::collections::HashMap<String, String>,
     llm_token_service: Option<&astra_services::LlmTokenServiceConfig>,
+    live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
 ) -> Result<astra_services::coordination::DelegationResult, String> {
     let candidates: Vec<&str> = source_agent_alias_candidates(source_agent_id).collect();
     let mut last_err = None;
     for (index, candidate) in candidates.iter().enumerate() {
         match engine
-            .execute_with_forward_headers(
+            .execute_with_forward_headers_and_live_events(
                 request.clone(),
                 candidate,
                 None,
                 forward_headers.clone(),
                 llm_token_service.cloned(),
+                live_event_sink.clone(),
             )
             .await
         {
@@ -147,7 +149,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                 "content": Value::Null,
                 "tool_calls": tc_entries,
             });
-            state.messages.push(assistant_msg);
+            state.push_prompt_history_message(assistant_msg);
             for tc in &delegate_calls {
                 let id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
                 let tool_msg = serde_json::json!({
@@ -160,7 +162,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                         state.delegations_this_turn
                     ),
                 });
-                state.messages.push(tool_msg);
+                state.push_prompt_history_message(tool_msg);
             }
         }
         return DelegationInterceptionResult {
@@ -212,6 +214,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             &state.skills.request_constraints,
             adaptive_delegation_context.as_ref(),
             &state.delegation_chain,
+            host.agent_live_event_sink(),
         )
         .await
     } else {
@@ -280,7 +283,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             } else if astra_turn_core::edge_ledger::history_has_reasoning(&state.messages) {
                 assistant_msg["reasoning_content"] = Value::String(String::new());
             }
-            state.messages.push(assistant_msg);
+            state.push_prompt_history_message(assistant_msg);
         }
         for result in &delegation_results {
             let summary_for_model =
@@ -293,7 +296,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                 "tool_call_id": result.call_id,
                 "content": summary_for_model,
             });
-            state.messages.push(tool_msg.clone());
+            state.push_prompt_history_message(tool_msg.clone());
             state.tool_results.push(tool_msg);
             state.stall.tool_call_records.push(ToolCallRecord {
                 name: DELEGATE_TOOL_NAME.to_string(),
@@ -383,15 +386,15 @@ pub(crate) fn parse_delegation_request(
     };
 
     let mut context = std::collections::HashMap::new();
-    context.insert(
-        "session_id".to_string(),
-        Value::String(session_id.to_string()),
-    );
     if let Some(ctx) = args.get("context").and_then(Value::as_object) {
         for (k, v) in ctx {
             context.insert(k.clone(), v.clone());
         }
     }
+    // Session lineage is runtime identity, never model-provided task context.
+    // Remove this reserved key entirely rather than allowing it to travel to a
+    // child prompt as ambiguous metadata.
+    context.remove("session_id");
     if let Some(policy) = adaptive_policy {
         context.insert("adaptive_coordination".to_string(), policy);
     }
@@ -400,6 +403,7 @@ pub(crate) fn parse_delegation_request(
 
     Ok(astra_services::coordination::DelegationRequest {
         delegation_id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
         parent_run_id: parent_run_id.to_string(),
         task,
         pattern,
@@ -779,6 +783,7 @@ pub(crate) async fn partition_and_execute_delegations(
     request_constraints: &RequestConstraints,
     adaptive_context: Option<&DelegationAdaptiveContext>,
     parent_delegation_chain: &[String],
+    live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
 ) -> (Vec<DelegationExecutionResult>, Vec<Value>) {
     let source_agent_id = self_agent_id;
     let mut delegation_results = Vec::new();
@@ -836,6 +841,7 @@ pub(crate) async fn partition_and_execute_delegations(
                         source_agent_id,
                         forward_headers,
                         llm_token_service,
+                        live_event_sink.clone(),
                     )
                     .await
                     {
@@ -1192,8 +1198,29 @@ mod tests {
         assert_eq!(req.task, "write tests");
         assert_eq!(req.parent_run_id, "run-123");
         assert_eq!(req.depth, 2);
-        assert!(req.context.contains_key("session_id"));
+        assert_eq!(req.session_id, "session-456");
+        assert!(!req.context.contains_key("session_id"));
         assert!(req.context.contains_key("repo"));
+    }
+
+    #[test]
+    fn parse_delegation_request_keeps_session_identity_out_of_tool_control() {
+        let tool_call = json!({
+            "id": "call_abc",
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"write tests\", \"agents\": [\"coder\"], \"context\": {\"session_id\": \"other-session\"}}"
+            }
+        });
+
+        let request =
+            parse_delegation_request(&tool_call, "run-123", "trusted-session", 0, None).unwrap();
+        assert_eq!(request.session_id, "trusted-session");
+        assert!(
+            !request.context.contains_key("session_id"),
+            "runtime identity is not child task context"
+        );
     }
 
     #[test]
@@ -1715,6 +1742,7 @@ mod tests {
             &RequestConstraints::default(),
             None,
             &[],
+            None,
         )
         .await;
 
@@ -1752,6 +1780,7 @@ mod tests {
             &RequestConstraints::default(),
             None,
             &[],
+            None,
         )
         .await;
 
@@ -1780,6 +1809,7 @@ mod tests {
             &RequestConstraints::default(),
             None,
             &[],
+            None,
         )
         .await;
 
@@ -1813,6 +1843,7 @@ mod tests {
             &RequestConstraints::default(),
             None,
             &[],
+            None,
         )
         .await;
 

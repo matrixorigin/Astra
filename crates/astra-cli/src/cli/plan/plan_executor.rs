@@ -124,6 +124,10 @@ pub enum PlanUpdate {
     /// Return the durable task state back to the session state after execution ends,
     /// so re-runs can reuse the contract instead of regenerating it.
     DurableStateReturn(Box<crate::cli::durable_bridge::DurableTaskState>),
+    /// Non-blocking evidence that affects the trustworthiness of the durable
+    /// plan projection. The executor continues with its local facts, while
+    /// the workbench makes the cross-device lag explicit.
+    Advisory { title: String, detail: String },
 }
 
 /// Commands sent from the plan monitor to a background plan executor.
@@ -943,28 +947,22 @@ use crate::StreamResult;
 use crate::cli::chat_stream::ChatTurnParams;
 use crate::cli::permission_manager::PermissionManager;
 
-/// Post a start + finish pair to `/plans/{plan_id}/step-runs` so the cloud
-/// `plan_step_runs` table carries an audit row for this attempt.
-///
-/// Called by the CLI executor immediately after a subtask completes. The
-/// helper is fire-and-forget from the executor's point of view: a network
-/// or server failure logs a warning but does not abort the run.
-///
-/// Returns `Some(run_id)` on successful round-trip; `None` if either the
-/// start or finish call failed, or when the caller lacks a cloud `plan_id`.
-///
-/// # Parameters
-/// * `api` — thin client with auth header already baked.
-/// * `plan_id` — cloud plan_id; `None` short-circuits to a no-op.
-/// * `subtask_id` + `attempt` — identify the attempt row.
-/// * `session_id` + `request_id` — trace-correlation keys written to the row.
-/// * `status` — terminal status for the attempt (`completed` / `failed` / `cancelled`).
-/// * `error` — human-readable error, only used when status != Completed.
-///
-/// On the happy path (terminal status) this makes a single POST to
-/// `/step-runs/completed`. For attempts that must start `in_progress` and
-/// finalize later the caller should use the start + finish pair directly;
-/// this helper is the terminal-only shortcut the CLI uses on subtask-done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CloudStepRunPersistence {
+    /// The current executor has no cloud-linked plan or lacks a durable
+    /// request/session identity. Local-only plan execution remains valid.
+    NotLinked,
+    /// The server accepted the attempt and returned its durable identity.
+    Recorded(String),
+    /// A cloud-linked plan failed to record this attempt. This is advisory to
+    /// execution but must be surfaced to the user; it is never silently
+    /// treated as a successful durable write.
+    Failed,
+}
+
+/// Record one cloud-linked step attempt without turning a temporary server
+/// outage into a hard execution stop. Callers must surface `Failed` as typed
+/// advisory evidence; it is not a successful durable write.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_cloud_step_run(
     api: &astra_thin_client::ThinClient,
@@ -976,10 +974,12 @@ pub(crate) async fn record_cloud_step_run(
     request_id: &str,
     status: TaskStatus,
     error: Option<&str>,
-) -> Option<String> {
-    let pid = plan_id?;
+) -> CloudStepRunPersistence {
+    let Some(pid) = plan_id else {
+        return CloudStepRunPersistence::NotLinked;
+    };
     if pid.is_empty() || session_id.is_empty() || request_id.is_empty() {
-        return None;
+        return CloudStepRunPersistence::NotLinked;
     }
     // One-shot /step-runs/completed requires a terminal status. If a caller
     // passes a non-terminal status fall back to start + finish so the
@@ -996,7 +996,9 @@ pub(crate) async fn record_cloud_step_run(
         match api.post_plan_step_run_completed(token, pid, &body).await {
             Ok(resp) => serde_json::from_str::<serde_json::Value>(&resp)
                 .ok()
-                .and_then(|v| v.get("run_id").and_then(|r| r.as_str()).map(str::to_string)),
+                .and_then(|v| v.get("run_id").and_then(|r| r.as_str()).map(str::to_string))
+                .map(CloudStepRunPersistence::Recorded)
+                .unwrap_or(CloudStepRunPersistence::Failed),
             Err(e) => {
                 tracing::warn!(
                     target: "astra_cli::plan_executor",
@@ -1005,7 +1007,7 @@ pub(crate) async fn record_cloud_step_run(
                     error = %e,
                     "one-shot step-run POST failed; skipping cloud attempt persistence",
                 );
-                None
+                CloudStepRunPersistence::Failed
             }
         }
     } else {
@@ -1028,12 +1030,14 @@ pub(crate) async fn record_cloud_step_run(
                     error = %e,
                     "step-run start POST failed; skipping cloud attempt persistence",
                 );
-                return None;
+                return CloudStepRunPersistence::Failed;
             }
         };
         serde_json::from_str::<serde_json::Value>(&start_resp)
             .ok()
             .and_then(|v| v.get("run_id").and_then(|r| r.as_str()).map(str::to_string))
+            .map(CloudStepRunPersistence::Recorded)
+            .unwrap_or(CloudStepRunPersistence::Failed)
     }
 }
 
@@ -1486,8 +1490,7 @@ async fn plan_executor_task(
             let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
 
             // Create stream event channel for real-time LLM/tool visibility
-            let (stream_tx, mut stream_rx) =
-                tokio::sync::mpsc::unbounded_channel::<chat_stream::StreamEvent>();
+            let (stream_tx, mut stream_rx) = chat_stream::stream_event_channel();
             let stream_update_tx = update_tx.clone();
             let stream_subtask_id = next_id.to_string();
             let stream_forwarder = tokio::spawn(async move {
@@ -1506,7 +1509,9 @@ async fn plan_executor_task(
 
             // Create approval request channel for async permission dialogs
             let (approval_tx, mut approval_rx) =
-                tokio::sync::mpsc::unbounded_channel::<chat_stream::ApprovalRequest>();
+                tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
+                    chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+                );
             let approval_update_tx = update_tx.clone();
             let approval_forwarder = tokio::spawn(async move {
                 while let Some(req) = approval_rx.recv().await {
@@ -1810,9 +1815,10 @@ async fn plan_executor_task(
                                 done,
                             );
                             emit_event(&update_tx, event);
-                            // Mirror the attempt to cloud plan_step_runs when
-                            // we have a plan_id + session_id + request_id.
-                            // Fire-and-forget — executor keeps running on failure.
+                            // Persist attempt evidence when this plan is cloud-linked.
+                            // A temporary failure remains non-blocking, but is
+                            // emitted as typed advisory evidence rather than
+                            // being silently discarded.
                             let request_id = result
                                 .run_id
                                 .clone()
@@ -1820,7 +1826,7 @@ async fn plan_executor_task(
                                 .unwrap_or_else(|| format!("turn-{}", ctx.turn));
                             let session_for_run = ctx.session_id.clone().unwrap_or_default();
                             if !session_for_run.is_empty() {
-                                let _ = record_cloud_step_run(
+                                let persistence = record_cloud_step_run(
                                     &ctx.api,
                                     &ctx.token,
                                     ctx.plan_id.as_deref(),
@@ -1832,6 +1838,14 @@ async fn plan_executor_task(
                                     None,
                                 )
                                 .await;
+                                if persistence == CloudStepRunPersistence::Failed {
+                                    let _ = update_tx.send(PlanUpdate::Advisory {
+                                        title: "Plan evidence not synced".to_string(),
+                                        detail: format!(
+                                            "Completed step {next_id} is visible locally, but its server attempt record could not be confirmed. It may be missing after resume."
+                                        ),
+                                    });
+                                }
                             }
                             let _ = update_tx.send(PlanUpdate::SubtaskStatusSync {
                                 id: next_id.clone(),
@@ -2079,11 +2093,12 @@ async fn plan_executor_task(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundPlanContext, ChannelSink, PlanCommand, PlanExecutorHandle, PlanOutputSink,
-        PlanUpdate, StderrSink, annotate_plan_subtask_event, browser_verification_gap_report,
-        compact_subtask_history_entry, create_plan_channels, failed_verification_status,
-        has_any_unresolved_verification_failure, high_failure_tool_evidence, is_credential_error,
-        plan_completion_action, record_cloud_step_run, render_verifier_failure_hint,
+        BackgroundPlanContext, ChannelSink, CloudStepRunPersistence, PlanCommand,
+        PlanExecutorHandle, PlanOutputSink, PlanUpdate, StderrSink, annotate_plan_subtask_event,
+        browser_verification_gap_report, compact_subtask_history_entry, create_plan_channels,
+        failed_verification_status, has_any_unresolved_verification_failure,
+        high_failure_tool_evidence, is_credential_error, plan_completion_action,
+        record_cloud_step_run, render_verifier_failure_hint,
         report_contains_browser_verification_gap, sanitize_unverified_acceptance_claims,
         spawn_plan_executor,
     };
@@ -3857,7 +3872,8 @@ All acceptance checks pass:
             final_state: "completed".into(),
             interruption_kind: None,
             final_messages: Vec::new(),
-            deferred_user_inputs: Vec::new(),
+            run_transcript_messages: Vec::new(),
+            applied_user_intents: Vec::new(),
             background_agent_results: Vec::new(),
         };
 
@@ -4078,8 +4094,8 @@ All acceptance checks pass:
     // ── record_cloud_step_run contract ──────────────────────────────────────
 
     #[tokio::test]
-    async fn record_cloud_step_run_noop_when_plan_id_is_none() {
-        // No plan_id → returns None immediately, never touches the network.
+    async fn record_cloud_step_run_marks_unlinked_plans_without_touching_network() {
+        // No plan_id → returns an explicit unlinked outcome immediately.
         // We point the client at a closed port; if the helper tried to dial
         // it the call would error out (which it must NOT do — None is the
         // contract for "no cloud plan linked").
@@ -4096,14 +4112,14 @@ All acceptance checks pass:
             None,
         )
         .await;
-        assert!(run_id.is_none(), "no plan_id must short-circuit to None");
+        assert_eq!(run_id, CloudStepRunPersistence::NotLinked);
     }
 
     #[tokio::test]
-    async fn record_cloud_step_run_noop_when_session_or_request_missing() {
+    async fn record_cloud_step_run_marks_missing_session_or_request_as_unlinked() {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         // Empty session_id.
-        assert!(
+        assert_eq!(
             record_cloud_step_run(
                 &api,
                 "tok",
@@ -4115,11 +4131,11 @@ All acceptance checks pass:
                 TaskStatus::Completed,
                 None
             )
-            .await
-            .is_none()
+            .await,
+            CloudStepRunPersistence::NotLinked
         );
         // Empty request_id.
-        assert!(
+        assert_eq!(
             record_cloud_step_run(
                 &api,
                 "tok",
@@ -4131,14 +4147,15 @@ All acceptance checks pass:
                 TaskStatus::Completed,
                 None
             )
-            .await
-            .is_none()
+            .await,
+            CloudStepRunPersistence::NotLinked
         );
     }
 
     #[tokio::test]
-    async fn record_cloud_step_run_returns_none_on_network_error() {
-        // Closed-port client → start POST fails → helper returns None without panicking.
+    async fn record_cloud_step_run_marks_network_failure_as_unconfirmed_evidence() {
+        // Closed-port client → no durable write, but the outcome remains
+        // distinguishable from a local-only plan.
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let run_id = record_cloud_step_run(
             &api,
@@ -4152,9 +4169,6 @@ All acceptance checks pass:
             None,
         )
         .await;
-        assert!(
-            run_id.is_none(),
-            "network failure must not panic; helper is fire-and-forget"
-        );
+        assert_eq!(run_id, CloudStepRunPersistence::Failed);
     }
 }

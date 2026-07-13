@@ -3,14 +3,12 @@
 use std::time::Instant;
 
 use super::turn_learning::TurnLearningSnapshot;
-use crate::cli::cli_config::cli_utils;
 use crate::cli::session::session_lessons;
-use crate::cli::session::session_recovery;
 use crate::cli::session::session_side_effects::{
-    build_bridge_pipeline_journal_events, enqueue_ingestion_pub,
+    build_bridge_pipeline_journal_events, enqueue_ingestion_events, enqueue_ingestion_pub,
 };
 use crate::cli::session::session_state::SessionState;
-use crate::cli::stream::streaming_types::StreamResult;
+use crate::cli::stream::streaming_types::{StreamResult, root_run_transcript_events};
 use astra_services::session_journal;
 
 fn cache_pending_context_assembly_trace(state: &mut SessionState, trace_json: &serde_json::Value) {
@@ -55,16 +53,6 @@ pub(crate) fn stall_type_confidence(stall_type: &str) -> f64 {
     TurnStallType::parse(stall_type).confidence()
 }
 
-fn rewrite_workspace_persistence_error(
-    state: &SessionState,
-    session_id: &str,
-    persistence_error: Option<String>,
-) -> std::io::Result<()> {
-    let mut workspace = session_recovery::workspace_metadata_from_live_state(state, session_id);
-    workspace.last_persistence_error = persistence_error;
-    astra_services::session_workspace::write_workspace(&workspace)
-}
-
 #[derive(Default)]
 struct TurnCommitIssues {
     messages: Vec<String>,
@@ -90,85 +78,236 @@ impl TurnCommitIssues {
 pub(crate) struct TurnCommitOutcome {
     /// True when the primary turn event is durable (or no durable session exists).
     ///
-    /// Sidecar/workspace failures may still set `persistence_error` while this
-    /// remains true; callers should rollback live turn state only when this is
-    /// false.
+    /// Only primary-journal failure makes this false. Deferred projection
+    /// errors arrive through the managed post-commit completion channel.
     pub(crate) turn_persisted: bool,
     /// Summary of durable degradation encountered during commit.
     pub(crate) persistence_error: Option<String>,
 }
 
-fn persist_workspace_and_checkpoint(
-    state: &SessionState,
-    session_id: &str,
-    result: &StreamResult,
-    issues: &mut TurnCommitIssues,
-    sidecar_events: &mut Vec<session_journal::JournalEvent>,
-) -> bool {
-    let mut workspace = session_recovery::workspace_metadata_from_live_state(state, session_id);
-    let mut checkpoint_event = None;
-    let mut checkpoint_to_cleanup = None;
+/// A sidecar projection is deliberately separate from the journal turn
+/// boundary. It owns only copies of data that are already represented by the
+/// primary event, so it can be serialized by the UI's post-commit queue
+/// without borrowing or delaying the next live turn.
+pub(crate) struct DeferredTurnSidecarWork {
+    session_id: String,
+    model: String,
+    turn: u32,
+    total_prompt_tokens: u64,
+    total_completion_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
+    permission_mode: String,
+    discovered_skills: Vec<String>,
+    contract_state_json: Option<String>,
+    sidecar_events: Vec<session_journal::JournalEvent>,
+    turn_observability_events: Vec<session_journal::JournalEvent>,
+    tools_used: Vec<String>,
+    journal_dir_override: Option<std::path::PathBuf>,
+}
 
-    if astra_services::session_checkpoint::should_checkpoint(
-        workspace.turn_count,
-        astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
-    ) {
-        let checkpoint_number = workspace.checkpoints.len() as u32 + 1;
-        let checkpoint = astra_services::session_checkpoint::Checkpoint {
-            number: checkpoint_number,
-            turn: workspace.turn_count,
-            title: format!("Turn {} checkpoint", workspace.turn_count),
-            summary: format!(
-                "Accumulated {} tokens ({} in, {} out). Tools: {}",
-                workspace.total_tokens_in + workspace.total_tokens_out,
-                workspace.total_tokens_in,
-                workspace.total_tokens_out,
-                result.tools_used.join(", "),
-            ),
-            tools_used: result.tools_used.clone(),
-            total_tokens: workspace.total_tokens_in + workspace.total_tokens_out,
-            had_stalls: false,
-            error_count: 0,
+impl DeferredTurnSidecarWork {
+    fn from_live_turn(
+        state: &SessionState,
+        result: &StreamResult,
+        line: &str,
+        learning_snap: &TurnLearningSnapshot,
+        turn_observability_events: Vec<session_journal::JournalEvent>,
+    ) -> Option<Self> {
+        let session_id = state.session_id.as_deref()?.to_string();
+        // The root transcript is part of the primary journal commit, not a
+        // derived projection. This worker owns only artifacts which may lag
+        // without making a settled conversation disappear from Ctrl+O.
+        let mut sidecar_events = Vec::new();
+        if let Some((_internal_turn, trace_json)) = &result.pending_context_assembly_trace {
+            sidecar_events.push(session_journal::JournalEvent::context_assembly_recorded(
+                Some(&session_id),
+                state.turn,
+                trace_json.clone(),
+            ));
+        }
+        extend_runtime_sidecar_events(&mut sidecar_events, state, line, result, learning_snap);
+
+        Some(Self {
+            session_id,
+            model: astra_core::model_override::normalize_model_override(state.model.as_deref())
+                .unwrap_or("unknown")
+                .to_string(),
+            turn: state.turn,
+            total_prompt_tokens: state.total_prompt_tokens,
+            total_completion_tokens: state.total_completion_tokens,
+            total_cache_read_tokens: state.total_cache_read_tokens,
+            total_cache_creation_tokens: state.total_cache_creation_tokens,
+            permission_mode: state.perm_manager.mode().to_string(),
+            discovered_skills: state.discovered_skills.iter().cloned().collect(),
             contract_state_json: state
                 .durable_task_state
                 .as_ref()
                 .and_then(|durable| serde_json::to_string(&durable.contract).ok()),
-        };
+            sidecar_events,
+            turn_observability_events,
+            tools_used: result.tools_used.clone(),
+            journal_dir_override: session_journal::current_journal_dir_override(),
+        })
+    }
 
-        match astra_services::session_checkpoint::write_checkpoint(session_id, &checkpoint) {
-            Ok(_path) => {
-                workspace.record_checkpoint();
-                checkpoint_event = Some(session_journal::JournalEvent::checkpoint(
-                    Some(session_id),
-                    workspace.turn_count,
-                    &checkpoint.summary,
-                    checkpoint.total_tokens,
-                    checkpoint.tools_used.len(),
-                ));
-                checkpoint_to_cleanup = Some(checkpoint);
+    /// Executes all derived local persistence after the primary journal event
+    /// is durable. Callers must serialize work for a session to preserve the
+    /// workspace/checkpoint order.
+    pub(crate) fn execute(mut self) -> Result<(), String> {
+        let _journal_dir_guard = self
+            .journal_dir_override
+            .as_deref()
+            .map(session_journal::JournalDirGuard::new);
+        let mut projection_errors = Vec::new();
+        let mut workspace =
+            match astra_services::session_workspace::read_workspace_optional(&self.session_id) {
+                Ok(Some(workspace)) => workspace,
+                Ok(None) => astra_services::session_workspace::WorkspaceMetadata::new(
+                    &self.session_id,
+                    &self.model,
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        %error,
+                        "rebuilding deferred workspace projection after read failure"
+                    );
+                    astra_services::session_workspace::WorkspaceMetadata::new(
+                        &self.session_id,
+                        &self.model,
+                    )
+                }
+            };
+        workspace.turn_count = workspace.turn_count.max(self.turn);
+        workspace.total_tokens_in = workspace.total_tokens_in.max(self.total_prompt_tokens);
+        workspace.total_tokens_out = workspace.total_tokens_out.max(self.total_completion_tokens);
+        workspace.total_cache_read_tokens = workspace
+            .total_cache_read_tokens
+            .max(self.total_cache_read_tokens);
+        workspace.total_cache_creation_tokens = workspace
+            .total_cache_creation_tokens
+            .max(self.total_cache_creation_tokens);
+        workspace.status = "active".to_string();
+        workspace.updated_at = chrono::Utc::now().to_rfc3339();
+        workspace.permission_mode = Some(self.permission_mode);
+        workspace.discovered_skills = self.discovered_skills;
+        workspace.contract_json = self.contract_state_json;
+
+        let mut written_checkpoint = None;
+        if astra_services::session_checkpoint::should_checkpoint(
+            workspace.turn_count,
+            astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
+        ) {
+            let checkpoint = astra_services::session_checkpoint::Checkpoint {
+                number: workspace.checkpoints.len() as u32 + 1,
+                turn: workspace.turn_count,
+                title: format!("Turn {} checkpoint", workspace.turn_count),
+                summary: format!(
+                    "Accumulated {} tokens ({} in, {} out). Tools: {}",
+                    workspace.total_tokens_in + workspace.total_tokens_out,
+                    workspace.total_tokens_in,
+                    workspace.total_tokens_out,
+                    self.tools_used.join(", "),
+                ),
+                tools_used: self.tools_used.clone(),
+                total_tokens: workspace.total_tokens_in + workspace.total_tokens_out,
+                had_stalls: false,
+                error_count: 0,
+                contract_state_json: workspace.contract_json.clone(),
+            };
+            match astra_services::session_checkpoint::write_checkpoint(
+                &self.session_id,
+                &checkpoint,
+            ) {
+                Ok(_) => {
+                    workspace.record_checkpoint();
+                    self.sidecar_events
+                        .push(session_journal::JournalEvent::checkpoint(
+                            Some(&self.session_id),
+                            workspace.turn_count,
+                            &checkpoint.summary,
+                            checkpoint.total_tokens,
+                            checkpoint.tools_used.len(),
+                        ));
+                    written_checkpoint = Some(checkpoint);
+                }
+                Err(error) => {
+                    projection_errors.push(format!("failed to write session checkpoint: {error}"))
+                }
             }
+        }
+
+        workspace.last_persistence_error =
+            (!projection_errors.is_empty()).then(|| projection_errors.join("; "));
+        if let Err(error) = astra_services::session_workspace::write_workspace(&workspace) {
+            if let Some(checkpoint) = written_checkpoint.as_ref()
+                && let Err(cleanup_error) = astra_services::session_checkpoint::remove_checkpoint(
+                    &self.session_id,
+                    checkpoint,
+                )
+            {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    %cleanup_error,
+                    "failed to remove checkpoint after workspace write failure"
+                );
+            }
+            return Err(format!("failed to write workspace metadata: {error}"));
+        }
+
+        let pipeline_events = match build_bridge_pipeline_journal_events(
+            Some(&self.session_id),
+            self.turn,
+            &self.model,
+            &self.turn_observability_events,
+        ) {
+            Ok(events) => events,
             Err(error) => {
-                issues.record_error("write session checkpoint", error);
+                let error = format!("failed to build bridge pipeline journal events: {error}");
+                projection_errors.push(error.clone());
+                workspace.last_persistence_error = Some(projection_errors.join("; "));
+                if let Err(rewrite_error) =
+                    astra_services::session_workspace::write_workspace(&workspace)
+                {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        %rewrite_error,
+                        "failed to persist deferred pipeline projection error in workspace"
+                    );
+                }
+                return Err(error);
             }
+        };
+        self.sidecar_events.extend(self.turn_observability_events);
+        self.sidecar_events.extend(pipeline_events);
+        if self.sidecar_events.is_empty() {
+            return Ok(());
+        }
+
+        let journal = session_journal::JournalWriter::new(&self.session_id)
+            .map_err(|error| format!("failed to open sidecar journal: {error}"))?;
+        if let Err(error) = journal.append_bulk(&self.sidecar_events) {
+            workspace.last_persistence_error =
+                Some(format!("failed to append turn sidecar events: {error}"));
+            if let Err(rewrite_error) =
+                astra_services::session_workspace::write_workspace(&workspace)
+            {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    %rewrite_error,
+                    "failed to persist deferred sidecar error in workspace"
+                );
+            }
+            return Err(format!("failed to append turn sidecar events: {error}"));
+        }
+        enqueue_ingestion_events(&self.sidecar_events);
+        if projection_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(projection_errors.join("; "))
         }
     }
-
-    workspace.last_persistence_error = issues.summary();
-    if let Err(error) = astra_services::session_workspace::write_workspace(&workspace) {
-        issues.record_error("write workspace metadata", error);
-        if let Some(checkpoint) = checkpoint_to_cleanup.as_ref()
-            && let Err(cleanup_error) =
-                astra_services::session_checkpoint::remove_checkpoint(session_id, checkpoint)
-        {
-            issues.record_error("remove unreferenced session checkpoint", cleanup_error);
-        }
-        return false;
-    }
-
-    if let Some(event) = checkpoint_event {
-        sidecar_events.push(event);
-    }
-    true
 }
 
 fn extend_runtime_sidecar_events(
@@ -237,26 +376,14 @@ fn build_primary_turn_event(
     line: &str,
     result: &mut StreamResult,
     turn_start: Instant,
-    issues: &mut TurnCommitIssues,
 ) -> (
     session_journal::JournalEvent,
     Vec<session_journal::JournalEvent>,
 ) {
-    let mut turn_observability_events = std::mem::take(&mut result.turn_observability_events);
-    let bridge_pipeline_events = match build_bridge_pipeline_journal_events(
-        state.session_id.as_deref(),
-        state.turn,
-        astra_core::model_override::normalize_model_override(state.model.as_deref())
-            .unwrap_or("unknown"),
-        &turn_observability_events,
-    ) {
-        Ok(events) => events,
-        Err(error) => {
-            issues.record_error("build bridge pipeline journal events", error);
-            Vec::new()
-        }
-    };
-    turn_observability_events.extend(bridge_pipeline_events);
+    // Observability expansion can read a long journal and is therefore a
+    // derived sidecar. Keep only the raw source events here; the serialized
+    // post-commit worker enriches them after the primary turn is durable.
+    let turn_observability_events = std::mem::take(&mut result.turn_observability_events);
 
     let effective_user_input = result.effective_user_input(line);
     let mut turn_event = session_journal::JournalEvent::turn(
@@ -288,16 +415,16 @@ fn build_primary_turn_event(
     )
     .with_memoria_time(result.memoria_ms)
     .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
-    turn_event = turn_event.with_deferred_user_inputs(
-        result
-            .deferred_user_inputs
-            .iter()
-            .map(|input| (input.event_index, input.content.as_str())),
-    );
-
-    let git_root = session_recovery::session_workspace_git_root(state.session_id.as_deref());
-    let (git_head, git_branch) = cli_utils::git_snapshot(git_root.as_deref());
-    turn_event = turn_event.with_git_snapshot(git_head, git_branch);
+    turn_event =
+        turn_event.with_applied_user_intents(result.applied_user_intents.iter().map(|intent| {
+            (
+                intent.intent_id.as_str(),
+                intent.delivery,
+                intent.status,
+                intent.event_index,
+                intent.content.as_str(),
+            )
+        }));
 
     turn_event.llm_rounds = result.llm_rounds;
     let tool_ms: u64 = result
@@ -320,13 +447,18 @@ fn build_primary_turn_event(
     (turn_event, turn_observability_events)
 }
 
-pub(crate) fn commit_turn_journal_workspace_and_sidecars(
+pub(crate) struct PrimaryTurnCommit {
+    pub(crate) outcome: TurnCommitOutcome,
+    pub(crate) deferred_sidecars: Option<DeferredTurnSidecarWork>,
+}
+
+pub(crate) fn commit_primary_turn(
     state: &mut SessionState,
     line: &str,
     result: &mut StreamResult,
     learning_snap: &TurnLearningSnapshot,
     turn_start: Instant,
-) -> TurnCommitOutcome {
+) -> PrimaryTurnCommit {
     let has_stalls = !result.stall_events.is_empty();
     let mut issues = TurnCommitIssues::default();
     let mut turn_persisted = state.session_id.is_none();
@@ -335,77 +467,58 @@ pub(crate) fn commit_turn_journal_workspace_and_sidecars(
     }
 
     if let Some(journal) = state.journal.as_ref() {
-        let mut workspace_written_for_turn = false;
-        // Phase 1: build and append the primary turn event. The turn event is
-        // the commit gate; later sidecars may fail without rolling back history.
+        // The root transcript is the same user-facing truth as the turn
+        // boundary. Append both in one durable batch so a completed turn is
+        // immediately visible to Ctrl+O even while derived projections are
+        // queued behind slow workspace, CSL, or telemetry work.
         let (turn_event, turn_observability_events) =
-            build_primary_turn_event(state, line, result, turn_start, &mut issues);
+            build_primary_turn_event(state, line, result, turn_start);
+        let mut primary_events = vec![turn_event.clone()];
+        primary_events.extend(root_run_transcript_events(
+            state.session_id.as_deref(),
+            result.run_id.as_deref(),
+            &result.run_transcript_messages,
+        ));
 
-        turn_persisted = match journal.append(&turn_event) {
+        turn_persisted = match journal.append_bulk(&primary_events) {
             Ok(()) => {
                 state.last_turn_event = Some(turn_event.clone());
-                enqueue_ingestion_pub(state, &turn_event);
+                for event in &primary_events {
+                    enqueue_ingestion_pub(state, event);
+                }
                 true
             }
             Err(error) => {
-                issues.record_error("append turn event", error);
+                issues.record_error("append primary turn batch", error);
                 false
             }
         };
 
-        let mut sidecar_events = Vec::new();
-        // Phase 2: stage sidecar events. They are batched later to avoid
-        // per-event fsyncs, but not allowed to hide durability degradation.
-        if turn_persisted {
-            sidecar_events.extend(turn_observability_events);
+        let deferred_sidecars = turn_persisted
+            .then(|| {
+                DeferredTurnSidecarWork::from_live_turn(
+                    state,
+                    result,
+                    line,
+                    learning_snap,
+                    turn_observability_events,
+                )
+            })
+            .flatten();
+        let persistence_error = issues.into_summary();
+        state.session_persistence_error = persistence_error.clone();
 
-            if let Some((_internal_turn, trace_json)) = &result.pending_context_assembly_trace {
-                let assembly_event = session_journal::JournalEvent::context_assembly_recorded(
-                    state.session_id.as_deref(),
-                    state.turn,
-                    trace_json.clone(),
-                );
-                sidecar_events.push(assembly_event);
-            }
+        if has_stalls {
+            session_lessons::checkpoint_lessons_from_runtime(state);
         }
 
-        // Phase 3: write workspace/checkpoint state. Checkpoint journal events
-        // are published only after workspace metadata can reference them.
-        if turn_persisted && let Some(session_id) = state.session_id.as_deref() {
-            workspace_written_for_turn = persist_workspace_and_checkpoint(
-                state,
-                session_id,
-                result,
-                &mut issues,
-                &mut sidecar_events,
-            );
-        }
-
-        // Phase 4: publish remaining sidecars in one append. If this fails, the
-        // primary turn remains committed but the session is marked degraded.
-        if turn_persisted {
-            extend_runtime_sidecar_events(&mut sidecar_events, state, line, result, learning_snap);
-
-            if !sidecar_events.is_empty()
-                && let Err(error) = journal.append_bulk(&sidecar_events)
-            {
-                issues.record_error("append turn sidecar events", error);
-                if workspace_written_for_turn
-                    && let Some(session_id) = state.session_id.as_deref()
-                    && let Err(workspace_error) =
-                        rewrite_workspace_persistence_error(state, session_id, issues.summary())
-                {
-                    issues.record_error(
-                        "write workspace metadata after sidecar failure",
-                        workspace_error,
-                    );
-                }
-            } else {
-                for event in &sidecar_events {
-                    enqueue_ingestion_pub(state, event);
-                }
-            }
-        }
+        return PrimaryTurnCommit {
+            outcome: TurnCommitOutcome {
+                turn_persisted,
+                persistence_error,
+            },
+            deferred_sidecars,
+        };
     } else if state.session_id.is_some() {
         issues.record_error("commit durable turn state", "session journal missing");
     }
@@ -417,9 +530,12 @@ pub(crate) fn commit_turn_journal_workspace_and_sidecars(
         session_lessons::checkpoint_lessons_from_runtime(state);
     }
 
-    TurnCommitOutcome {
-        turn_persisted,
-        persistence_error,
+    PrimaryTurnCommit {
+        outcome: TurnCommitOutcome {
+            turn_persisted,
+            persistence_error,
+        },
+        deferred_sidecars: None,
     }
 }
 
@@ -446,14 +562,77 @@ fn merge_interruption_metadata(
 }
 #[cfg(test)]
 mod tests {
-    use super::{
-        commit_turn_journal_workspace_and_sidecars, merge_interruption_metadata,
-        rewrite_workspace_persistence_error, stall_type_confidence,
-    };
+    use super::{commit_primary_turn, merge_interruption_metadata, stall_type_confidence};
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::turn_learning::analyze_chat_turn_learning;
     use astra_services::session_journal;
+    use serde_json::json;
     use std::time::Instant;
+
+    fn commit_primary_and_project_sidecars(
+        state: &mut SessionState,
+        line: &str,
+        result: &mut crate::cli::stream::streaming_types::StreamResult,
+        learning: &crate::cli::turn::turn_learning::TurnLearningSnapshot,
+        turn_start: Instant,
+    ) -> super::TurnCommitOutcome {
+        let primary = commit_primary_turn(state, line, result, learning, turn_start);
+        let outcome = primary.outcome.clone();
+        if let Some(sidecars) = primary.deferred_sidecars
+            && let Err(error) = sidecars.execute()
+        {
+            state.session_persistence_error = Some(error);
+        }
+        outcome
+    }
+
+    #[test]
+    fn primary_turn_commit_is_durable_before_derived_sidecars_run() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("primary-before-sidecars-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            turn: 1,
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("durable answer");
+        let learning = analyze_chat_turn_learning("inspect", state.turn, &[], &result);
+
+        let primary = commit_primary_turn(
+            &mut state,
+            "inspect",
+            &mut result,
+            &learning,
+            Instant::now(),
+        );
+        assert!(primary.outcome.turn_persisted);
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == session_journal::JournalEventType::Turn)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == session_journal::JournalEventType::TurnEvaluation),
+            "derived evaluation must not delay the primary journal boundary"
+        );
+
+        primary
+            .deferred_sidecars
+            .expect("durable turn should enqueue derived projections")
+            .execute()
+            .unwrap();
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == session_journal::JournalEventType::TurnEvaluation)
+        );
+    }
 
     #[test]
     fn commit_turn_persists_turn_evaluation_event() {
@@ -487,7 +666,7 @@ mod tests {
 
         let learning =
             analyze_chat_turn_learning("git status", state.turn, &state.recent_tools, &result);
-        commit_turn_journal_workspace_and_sidecars(
+        commit_primary_and_project_sidecars(
             &mut state,
             "git status",
             &mut result,
@@ -509,6 +688,77 @@ mod tests {
         assert_eq!(metadata["signal_count"], 2);
         assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
         assert_eq!(metadata["signals"][1]["kind"], "all_tools_healthy");
+    }
+
+    #[test]
+    fn primary_commit_persists_root_capture_before_deferred_sidecars() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("test-root-transcript-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            turn: 1,
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("done");
+        result.run_id = Some("run-root-turn-1".into());
+        result.run_transcript_messages = vec![
+            json!({"role": "user", "content": "inspect the scheduler"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]}),
+            json!({"role": "tool", "tool_call_id": "call-1", "content": "scheduler is safe"}),
+            json!({"role": "assistant", "content": "Done."}),
+            json!({"role": "system", "content": "runtime context must not persist"}),
+        ];
+        let learning =
+            analyze_chat_turn_learning("inspect the scheduler", state.turn, &[], &result);
+
+        let primary = commit_primary_turn(
+            &mut state,
+            "inspect the scheduler",
+            &mut result,
+            &learning,
+            Instant::now(),
+        );
+        assert!(primary.outcome.turn_persisted);
+
+        let items = session_journal::read_journal(&sid)
+            .expect("journal should be readable")
+            .into_iter()
+            .filter_map(|event| event.transcript_item)
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 4);
+        assert!(items.iter().all(|item| item.run_id == "run-root-turn-1"));
+        assert!(items.iter().all(|item| item.agent_id == "root"));
+        assert_eq!(
+            items.iter().map(|item| item.item_seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(items[0].message["content"], "inspect the scheduler");
+        assert_eq!(items[1].message["tool_calls"][0]["id"], "call-1");
+        assert_eq!(items[2].message["tool_call_id"], "call-1");
+        assert_eq!(items[3].message["content"], "Done.");
+
+        let append_order = session_journal::read_journal_append_order(&sid)
+            .expect("append-ordered journal should be readable");
+        let primary_turn = append_order
+            .iter()
+            .position(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .expect("primary turn must be persisted");
+        let first_transcript = append_order
+            .iter()
+            .position(|event| event.event_type == session_journal::JournalEventType::TranscriptItem)
+            .expect("root transcript must be persisted");
+        assert!(
+            primary_turn < first_transcript,
+            "root transcript must follow the primary turn in the same durable journal batch"
+        );
+        assert!(
+            !append_order.iter().any(|event| {
+                event.event_type == session_journal::JournalEventType::TurnEvaluation
+            }),
+            "derived evaluation must not be required before the transcript is readable"
+        );
     }
 
     #[test]
@@ -535,7 +785,7 @@ mod tests {
         result.tool_calls_count = 3;
 
         let learning = analyze_chat_turn_learning("continue", state.turn, &[], &result);
-        commit_turn_journal_workspace_and_sidecars(
+        commit_primary_and_project_sidecars(
             &mut state,
             "continue",
             &mut result,
@@ -622,7 +872,7 @@ mod tests {
         result.pending_context_assembly_trace = Some((99, trace.to_json_value()));
 
         let learning = analyze_chat_turn_learning("continue", state.turn, &[], &result);
-        commit_turn_journal_workspace_and_sidecars(
+        commit_primary_and_project_sidecars(
             &mut state,
             "continue",
             &mut result,
@@ -662,7 +912,7 @@ mod tests {
         let mut result = crate::tests::stub_stream_result("hello");
         let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
 
-        commit_turn_journal_workspace_and_sidecars(
+        commit_primary_and_project_sidecars(
             &mut state,
             "hello",
             &mut result,
@@ -674,7 +924,7 @@ mod tests {
             .session_persistence_error
             .as_deref()
             .expect("journal append failure should degrade persistence state");
-        assert!(error.contains("append turn event"), "{error}");
+        assert!(error.contains("append primary turn batch"), "{error}");
         assert!(
             astra_services::session_workspace::read_workspace_optional(
                 state.session_id.as_deref().unwrap()
@@ -702,7 +952,7 @@ mod tests {
         let mut result = crate::tests::stub_stream_result("hello");
         let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
 
-        commit_turn_journal_workspace_and_sidecars(
+        commit_primary_and_project_sidecars(
             &mut state,
             "hello",
             &mut result,
@@ -747,7 +997,7 @@ mod tests {
         let mut result = crate::tests::stub_stream_result("hello");
         let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
 
-        commit_turn_journal_workspace_and_sidecars(
+        commit_primary_and_project_sidecars(
             &mut state,
             "hello",
             &mut result,
@@ -779,7 +1029,7 @@ mod tests {
         let mut result = crate::tests::stub_stream_result("hello");
         let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
 
-        let outcome = commit_turn_journal_workspace_and_sidecars(
+        let outcome = commit_primary_and_project_sidecars(
             &mut state,
             "hello",
             &mut result,
@@ -810,41 +1060,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rewrite_workspace_persistence_error_updates_workspace_metadata() {
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let sid = format!(
-            "test-turn-commit-sidecar-workspace-error-{}",
-            uuid::Uuid::new_v4()
-        );
-        let state = SessionState {
-            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
-            session_id: Some(sid.clone()),
-            model: Some("gpt-5".into()),
-            turn: 1,
-            total_prompt_tokens: 11,
-            total_completion_tokens: 13,
-            ..Default::default()
-        };
-
-        rewrite_workspace_persistence_error(
-            &state,
-            &sid,
-            Some("failed to append turn sidecar events: disk full".to_string()),
-        )
-        .expect("workspace error rewrite should succeed");
-
-        let persisted = astra_services::session_workspace::read_workspace(&sid)
-            .expect("workspace should be written");
-        assert_eq!(
-            persisted.last_persistence_error.as_deref(),
-            Some("failed to append turn sidecar events: disk full")
-        );
-        assert_eq!(persisted.turn_count, 1);
-        assert_eq!(persisted.total_tokens_in, 11);
-        assert_eq!(persisted.total_tokens_out, 13);
-    }
-
     #[cfg(unix)]
     #[test]
     fn commit_turn_removes_checkpoint_artifacts_when_workspace_write_fails() {
@@ -872,7 +1087,7 @@ mod tests {
         let mut result = crate::tests::stub_stream_result("hello");
         let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
 
-        commit_turn_journal_workspace_and_sidecars(
+        commit_primary_and_project_sidecars(
             &mut state,
             "hello",
             &mut result,
@@ -921,7 +1136,7 @@ mod tests {
         let mut result = crate::tests::stub_stream_result("hello");
         let learning = analyze_chat_turn_learning("hello", state.turn, &[], &result);
 
-        commit_turn_journal_workspace_and_sidecars(
+        commit_primary_and_project_sidecars(
             &mut state,
             "hello",
             &mut result,

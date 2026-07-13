@@ -121,6 +121,7 @@ mod tests {
         delegation_id: &str,
     ) -> DelegationRequest {
         DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: delegation_id.into(),
             parent_run_id: parent_run_id.into(),
             task: "test task".into(),
@@ -754,9 +755,18 @@ mod tests {
         // The collection loop should abort tasks and return promptly.
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), engine_handle).await;
 
+        let delegation = result
+            .expect("fan-out should complete within 2s after cancel")
+            .expect("fan-out task should join")
+            .expect("fan-out cancellation should return a terminal delegation result");
+        assert_eq!(delegation.agent_results.len(), 2);
         assert!(
-            result.is_ok(),
-            "fan-out should complete within 2s after cancel (not block forever)"
+            delegation
+                .agent_results
+                .iter()
+                .all(|result| result.status == astra_core::STATUS_CANCELLED),
+            "every force-aborted child must be represented as cancelled: {:?}",
+            delegation.agent_results
         );
     }
 
@@ -789,9 +799,18 @@ mod tests {
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), engine_handle).await;
 
+        let delegation = result
+            .expect("fork should complete within 2s after cancel")
+            .expect("fork task should join")
+            .expect("fork cancellation should return a terminal delegation result");
+        assert_eq!(delegation.agent_results.len(), 2);
         assert!(
-            result.is_ok(),
-            "fork should complete within 2s after cancel (not block forever)"
+            delegation
+                .agent_results
+                .iter()
+                .all(|result| result.status == astra_core::STATUS_CANCELLED),
+            "every force-aborted fork child must be represented as cancelled: {:?}",
+            delegation.agent_results
         );
     }
 

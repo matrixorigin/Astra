@@ -4,11 +4,13 @@ use crate::cli::theme;
 use crossterm::style::Stylize;
 
 pub(crate) const PERMISSION_COMMAND_USAGE: &str =
-    "auto, bypass, plan, accept_edits, prompt, deny, rules, trust, untrust, trace";
+    "auto, bypass, read_only, accept_edits, prompt, deny, rules, trust, untrust, trace";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionCommandAction<'a> {
-    Cycle,
+    /// No mode was named. Interactive surfaces may open the typed picker;
+    /// line-mode clients must show the current setting and explicit choices.
+    ChooseMode,
     SetMode(PermissionMode),
     ShowRules,
     TrustWorkspace,
@@ -22,7 +24,7 @@ pub(crate) enum PermissionCommandAction<'a> {
 pub(crate) fn parse_permission_command(arg: &str) -> PermissionCommandAction<'_> {
     let arg = arg.trim();
     if arg.is_empty() {
-        return PermissionCommandAction::Cycle;
+        return PermissionCommandAction::ChooseMode;
     }
 
     if arg == "trace --export" {
@@ -38,6 +40,11 @@ pub(crate) fn parse_permission_command(arg: &str) -> PermissionCommandAction<'_>
     }
 
     match arg {
+        "read_only" | "readonly" => PermissionCommandAction::SetMode(PermissionMode::Plan),
+        // Plan lifecycle is not a permission-preset command. `/plan` owns
+        // authoring, approval and execution transitions; its read-only policy
+        // is represented here as `read_only`.
+        "plan" => PermissionCommandAction::Unknown(arg),
         "rules" => PermissionCommandAction::ShowRules,
         "trust" => PermissionCommandAction::TrustWorkspace,
         "untrust" => PermissionCommandAction::UntrustWorkspace,
@@ -46,24 +53,6 @@ pub(crate) fn parse_permission_command(arg: &str) -> PermissionCommandAction<'_>
             Ok(mode) => PermissionCommandAction::SetMode(mode),
             Err(_) => PermissionCommandAction::Unknown(arg),
         },
-    }
-}
-
-/// Next mode when cycling `/allow` with no argument.
-///
-/// `Deny` and `Bypass` are intentionally not cycle targets. `Deny` is sticky:
-/// it must only be exited by an explicit `/allow prompt` (or another named
-/// mode). `Bypass` is reachable only via explicit `/allow bypass` / CLI flag;
-/// cycling from it returns to Prompt. This keeps Shift+Tab from adjacent
-/// Auto → Bypass escalation.
-pub(crate) fn next_permission_mode_for_cycle(current: PermissionMode) -> PermissionMode {
-    match current {
-        PermissionMode::Deny => PermissionMode::Deny,
-        PermissionMode::Prompt => PermissionMode::AcceptEdits,
-        PermissionMode::AcceptEdits => PermissionMode::Plan,
-        PermissionMode::Plan => PermissionMode::Auto,
-        PermissionMode::Auto => PermissionMode::Prompt,
-        PermissionMode::Bypass => PermissionMode::Prompt,
     }
 }
 
@@ -91,11 +80,12 @@ pub(crate) fn permission_mode_feedback(mode: PermissionMode) -> String {
 
 pub(crate) fn handle_permission_command(arg: &str, state: &mut SessionState) {
     match parse_permission_command(arg) {
-        PermissionCommandAction::Cycle => {
-            let next = next_permission_mode_for_cycle(state.perm_manager.mode());
-            state.perm_manager.set_mode(next);
-            crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(state);
-            print_permission_mode(next);
+        PermissionCommandAction::ChooseMode => {
+            let current = permission_mode_display_label(state.perm_manager.mode());
+            eprintln!("  Permission mode: {current}");
+            eprintln!(
+                "  Choose explicitly: /allow prompt | accept_edits | read_only | auto | bypass | deny\n  Planning workflow: /plan"
+            );
         }
         PermissionCommandAction::SetMode(mode) => {
             state.perm_manager.set_mode(mode);
@@ -167,10 +157,7 @@ fn print_permission_mode(mode: PermissionMode) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PermissionCommandAction, handle_permission_command, next_permission_mode_for_cycle,
-        parse_permission_command,
-    };
+    use super::{PermissionCommandAction, handle_permission_command, parse_permission_command};
     use crate::cli::permission_manager::PermissionMode;
     use crate::cli::session::session_state::SessionState;
     use astra_runtime::plan;
@@ -181,7 +168,7 @@ mod tests {
             ("auto", PermissionMode::Auto),
             ("bypass", PermissionMode::Bypass),
             ("skip", PermissionMode::Bypass),
-            ("plan", PermissionMode::Plan),
+            ("read_only", PermissionMode::Plan),
             ("accept_edits", PermissionMode::AcceptEdits),
             ("prompt", PermissionMode::Prompt),
             ("deny", PermissionMode::Deny),
@@ -198,7 +185,7 @@ mod tests {
 
     #[test]
     fn parser_rejects_removed_permission_aliases() {
-        for alias in ["all", "default", "ask", "status", "accept-edits"] {
+        for alias in ["all", "default", "ask", "status", "accept-edits", "plan"] {
             assert_eq!(
                 parse_permission_command(alias),
                 PermissionCommandAction::Unknown(alias),
@@ -209,7 +196,10 @@ mod tests {
 
     #[test]
     fn parser_handles_non_mode_actions() {
-        assert_eq!(parse_permission_command(""), PermissionCommandAction::Cycle);
+        assert_eq!(
+            parse_permission_command(""),
+            PermissionCommandAction::ChooseMode
+        );
         assert_eq!(
             parse_permission_command("rules"),
             PermissionCommandAction::ShowRules
@@ -237,47 +227,17 @@ mod tests {
     }
 
     #[test]
-    fn cycle_order_matches_user_facing_picker() {
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Prompt),
-            PermissionMode::AcceptEdits
-        );
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::AcceptEdits),
-            PermissionMode::Plan
-        );
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Plan),
-            PermissionMode::Auto
-        );
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Auto),
-            PermissionMode::Prompt
-        );
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Bypass),
-            PermissionMode::Prompt
-        );
-        // `Bypass` is explicit-only, and `Deny` is sticky under the cycle:
-        // neither can be reached by a bare `/allow`.
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Deny),
-            PermissionMode::Deny
-        );
-    }
-
-    #[test]
-    fn cycling_out_of_plan_clears_pending_local_plan_entry() {
+    fn unspecified_permission_command_does_not_mutate_current_mode() {
         let mut state = SessionState::default();
         state.cloud_plan_mirror = Some(plan::PlanModeState::new(String::new()));
         state.perm_manager.set_mode(PermissionMode::Plan);
 
         handle_permission_command("", &mut state);
 
-        assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Plan);
         assert!(
-            state.cloud_plan_mirror.is_none(),
-            "leaving Plan mode must clear a bare-/plan pending goal"
+            state.cloud_plan_mirror.is_some(),
+            "choosing no mode must not mutate plan state"
         );
     }
 }

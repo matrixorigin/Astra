@@ -1070,6 +1070,7 @@ mod tests {
             tool_schema_tokens: 10_000,
             user_message_tokens: 1_000,
             total_used: (100_000.0 * pressure) as u32,
+            usage_source: Default::default(),
             budget_pressure: pressure,
             compression_triggered: compressed,
         }

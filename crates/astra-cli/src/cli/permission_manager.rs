@@ -271,8 +271,7 @@ fn sandbox_expand_sensitive_target_denial(name: &str, args: &serde_json::Value) 
     if !name.starts_with("sandbox_expand:") {
         return None;
     }
-    let reason = args.get("reason").and_then(serde_json::Value::as_str)?;
-    let target = parse_sandbox_target_path(reason)?;
+    let target = sandbox_expand_target_path(args)?;
     if !sandbox_expand_target_is_sensitive(&target) {
         return None;
     }
@@ -280,6 +279,18 @@ fn sandbox_expand_sensitive_target_denial(name: &str, args: &serde_json::Value) 
         "Sensitive path cannot be approved through sandbox expansion: {}",
         target.display()
     ))
+}
+
+fn sandbox_expand_target_path(args: &serde_json::Value) -> Option<PathBuf> {
+    args.get("directory")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            args.get("reason")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_sandbox_target_path)
+        })
 }
 
 /// Check whether a sandbox-expansion target is a sensitive path
@@ -563,18 +574,6 @@ pub(crate) struct PermissionModeMirror {
 impl PermissionModeMirror {
     pub(crate) fn current(&self) -> PermissionMode {
         decode_mode_for_mirror(self.inner.load(std::sync::atomic::Ordering::Acquire))
-    }
-
-    /// Stage a new mode without borrowing the `PermissionManager`.
-    /// The owning manager picks this up on its next turn boundary
-    /// via [`PermissionManager::pull_mode_from_mirror`]. Used by
-    /// mid-turn Shift+Tab where the agentic loop holds `&mut state`
-    /// and the UI cannot reach the manager directly.
-    pub(crate) fn stage(&self, mode: PermissionMode) {
-        self.inner.store(
-            encode_mode_for_mirror(mode),
-            std::sync::atomic::Ordering::Release,
-        );
     }
 
     /// Test-only constructor: build a mirror from a pre-encoded u8.
@@ -1332,21 +1331,6 @@ impl PermissionManager {
     pub(crate) fn mode_mirror_handle(&self) -> PermissionModeMirror {
         PermissionModeMirror {
             inner: std::sync::Arc::clone(&self.mode_mirror),
-        }
-    }
-
-    /// Re-sync `self.mode` from the atomic mirror. Used at turn
-    /// boundaries when a UI event (mid-turn Shift+Tab) wrote to the
-    /// mirror without being able to borrow `&mut self`. Cheap; no-op
-    /// when already in sync.
-    pub(crate) fn pull_mode_from_mirror(&mut self) {
-        let mirror =
-            decode_mode_for_mirror(self.mode_mirror.load(std::sync::atomic::Ordering::Acquire));
-        if self.mode != mirror {
-            self.mode = mirror;
-            if let Some(session_id) = self.active_session_id.as_deref() {
-                persist_permission_mode_to_workspace(session_id, mirror);
-            }
         }
     }
 
@@ -3387,11 +3371,7 @@ impl PermissionManager {
                     GateOutcome::Deny("Sandbox expansion denied for session".into())
                 };
             }
-            let reason = args
-                .get("reason")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Access to path outside project boundary");
-            if let Some(target) = parse_sandbox_target_path(reason)
+            if let Some(target) = sandbox_expand_target_path(args)
                 && self.path_under_trusted_root(&target)
             {
                 return GateOutcome::Allow;
@@ -7128,19 +7108,17 @@ mod tests {
     }
 
     #[test]
-    fn bypass_mode_denies_git_hard_violation_without_prompt() {
+    fn bypass_mode_keeps_git_risk_as_evidence_without_prompting() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
         let args = serde_json::json!({
             "command": "git restore --staged --worktree crates/foo/src/lib.rs"
         });
 
-        match pm.check_nonblocking("bash", &args) {
-            GateOutcome::Deny(reason) => {
-                assert!(reason.contains("Git safety hard violation"), "{reason}");
-            }
-            other => panic!("expected hard git denial in bypass mode, got {other:?}"),
-        }
+        assert!(matches!(
+            pm.check_nonblocking("bash", &args),
+            GateOutcome::Allow
+        ));
     }
 
     #[test]
@@ -8429,10 +8407,10 @@ mod tests {
 
     // ── Mode mirror lifecycle ──────────────────────────────────
     //
-    // The mirror lets the TUI inner-tick path read the live mode
-    // and lets mid-turn Shift+Tab stage a new mode while the
-    // agentic loop holds `&mut state`. These tests pin both
-    // directions of the contract.
+    // The mirror lets the TUI inner-tick path read the active mode while the
+    // agentic loop holds `&mut state`. Pending picker selections remain in
+    // the UI intent lane until the turn ends, so this value is never merely a
+    // future policy. These tests pin that contract.
 
     #[test]
     fn mode_mirror_encode_and_current() {
@@ -8472,33 +8450,17 @@ mod tests {
     }
 
     #[test]
-    fn mode_mirror_stage_pull_lifecycle() {
+    fn mode_mirror_tracks_only_active_manager_policy() {
         let mut pm = PermissionManager::new(false);
-        let mirror = pm.mode_mirror_handle();
 
-        // stage() does NOT mutate pm.mode(); only pull does
         assert_eq!(pm.mode(), PermissionMode::Prompt);
-        mirror.stage(PermissionMode::Plan);
-        assert_eq!(
-            pm.mode(),
-            PermissionMode::Prompt,
-            "stage alone must not mutate self.mode; the host must pull explicitly"
-        );
-        pm.pull_mode_from_mirror();
-        assert_eq!(
-            pm.mode(),
-            PermissionMode::Plan,
-            "pull_mode_from_mirror must adopt the staged mode"
-        );
-
-        // pull is a no-op when nothing was staged (idempotent)
-        pm.pull_mode_from_mirror();
-        assert_eq!(pm.mode(), PermissionMode::Plan);
-
-        // handles are clonable and share the same mirror
+        // Handles are clonable and report the manager's active mode. A
+        // staged UI selection lives outside this mirror until the current
+        // turn ends, so the footer can never label it as already active.
         let h1 = pm.mode_mirror_handle();
         let h2 = pm.mode_mirror_handle();
-        h1.stage(PermissionMode::Auto);
+        pm.set_mode(PermissionMode::Auto);
+        assert_eq!(h1.current(), PermissionMode::Auto);
         assert_eq!(h2.current(), PermissionMode::Auto);
     }
 

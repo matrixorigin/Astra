@@ -5,7 +5,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{BottomPane, BottomPaneAction};
-use crate::tui::mention_menu::provider::{FileKind, StaticFileProvider};
+use crate::tui::mention_menu::provider::{FileEntry, FileKind, FileProvider, StaticFileProvider};
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -32,6 +32,30 @@ fn fresh() -> BottomPane {
 fn type_string(bp: &mut BottomPane, s: &str) {
     for c in s.chars() {
         let _ = bp.handle_key(key(c));
+    }
+}
+
+#[derive(Debug, Default)]
+struct RevisionProvider {
+    revision: std::sync::atomic::AtomicU64,
+    entries: std::sync::Mutex<Vec<FileEntry>>,
+}
+
+impl RevisionProvider {
+    fn publish(&self, entries: Vec<FileEntry>) {
+        *self.entries.lock().unwrap() = entries;
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl FileProvider for RevisionProvider {
+    fn list(&self, _relative_dir: &str) -> Vec<FileEntry> {
+        self.entries.lock().unwrap().clone()
+    }
+
+    fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -89,6 +113,22 @@ fn typing_narrows_to_matching_file() {
         names.iter().any(|n| n == "README.md"),
         "expected README.md; got {names:?}"
     );
+}
+
+#[test]
+fn provider_revision_refreshes_open_menu_without_another_keypress() {
+    let provider = std::sync::Arc::new(RevisionProvider::default());
+    let mut pane = BottomPane::new();
+    pane.set_file_provider(provider.clone());
+    type_string(&mut pane, "@rea");
+    assert!(pane.mention_menu_names().is_empty());
+
+    provider.publish(vec![FileEntry {
+        path: "README.md".into(),
+        kind: FileKind::File,
+    }]);
+    assert!(pane.pre_draw_tick(std::time::Instant::now()));
+    assert_eq!(pane.mention_menu_names(), vec!["README.md"]);
 }
 
 #[test]

@@ -29,7 +29,7 @@ use astra_turn_core::{
 use serde_json::{Value, json};
 
 use super::chat_stream::StreamEvent;
-use super::skill_subrun::SubRunHost;
+use super::skill_subrun::{SubRunHost, SubRunJournalIdentity};
 use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::edge_tools;
 
@@ -153,6 +153,7 @@ pub(crate) fn build_child_messages(
 
 #[derive(Clone)]
 struct AgentLiveStreamEventSink {
+    run_id: String,
     agent_id: String,
     sink: SharedAgentLiveEventSink,
 }
@@ -160,6 +161,7 @@ struct AgentLiveStreamEventSink {
 impl std::fmt::Debug for AgentLiveStreamEventSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentLiveStreamEventSink")
+            .field("run_id", &self.run_id)
             .field("agent_id", &self.agent_id)
             .finish_non_exhaustive()
     }
@@ -167,10 +169,21 @@ impl std::fmt::Debug for AgentLiveStreamEventSink {
 
 impl super::chat_stream::StreamEventSink for AgentLiveStreamEventSink {
     fn send(&self, event: StreamEvent) {
+        if let StreamEvent::AgentLiveGap(gap) = event {
+            if let Err(err) = self.sink.send_gap(gap) {
+                astra_core::agent_warn!(
+                    "spawn_subrun",
+                    "failed to forward live-gap notice for {}: {err:?}",
+                    self.agent_id
+                );
+            }
+            return;
+        }
         if let Some(kind) = stream_event_to_agent_live_kind(event)
             && let Err(err) = self
                 .sink
                 .send(astra_turn_core::agent_live_event::AgentLiveEvent {
+                    run_id: self.run_id.clone(),
                     agent_id: self.agent_id.clone(),
                     kind,
                 })
@@ -184,18 +197,21 @@ impl super::chat_stream::StreamEventSink for AgentLiveStreamEventSink {
     }
 }
 
-fn agent_live_stream_event_sink(
+pub(crate) fn agent_live_stream_event_sink(
+    run_id: String,
     agent_id: String,
     sink: Option<SharedAgentLiveEventSink>,
 ) -> Option<super::chat_stream::SharedStreamEventSink> {
     Some(Arc::new(AgentLiveStreamEventSink {
+        run_id,
         agent_id,
         sink: sink?,
     }))
 }
 
-fn emit_agent_terminated(
+pub(crate) fn emit_agent_terminated(
     sink: Option<&SharedAgentLiveEventSink>,
+    run_id: &str,
     agent_id: &str,
     started_at: std::time::Instant,
     termination: astra_turn_core::agent_live_event::AgentLiveTermination,
@@ -206,6 +222,7 @@ fn emit_agent_terminated(
         return;
     };
     if let Err(err) = sink.send(AgentLiveEvent {
+        run_id: run_id.to_string(),
         agent_id: agent_id.to_string(),
         kind: AgentLiveEventKind::AgentTerminated {
             termination,
@@ -220,10 +237,38 @@ fn emit_agent_terminated(
     }
 }
 
+pub(crate) fn emit_agent_transcript_committed(
+    sink: Option<&SharedAgentLiveEventSink>,
+    run_id: &str,
+    agent_id: &str,
+    source_event_id: String,
+    transcript_location: astra_turn_types::AgentTranscriptLocation,
+) {
+    use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal};
+    let Some(sink) = sink else {
+        return;
+    };
+    if let Err(error) = sink.send(AgentLiveEvent {
+        run_id: run_id.to_string(),
+        agent_id: agent_id.to_string(),
+        kind: AgentLiveEventKind::Signal(AgentLiveSignal::TranscriptCommitted {
+            source_event_id,
+            transcript_location,
+        }),
+    }) {
+        tracing::debug!(
+            %run_id,
+            %agent_id,
+            ?error,
+            "canonical transcript commit was not delivered to the live workbench"
+        );
+    }
+}
+
 fn stream_event_to_agent_live_kind(
     event: StreamEvent,
 ) -> Option<astra_turn_core::agent_live_event::AgentLiveEventKind> {
-    use astra_turn_core::agent_live_event::AgentLiveEventKind;
+    use astra_turn_core::agent_live_event::{AgentLiveEventKind, AgentLiveSignal};
     match event {
         StreamEvent::Token(text) => Some(AgentLiveEventKind::OutputDelta(text)),
         StreamEvent::ThinkingChunk(text) => Some(AgentLiveEventKind::ThinkingDelta(text)),
@@ -256,47 +301,92 @@ fn stream_event_to_agent_live_kind(
             tool_use_id,
         }),
         StreamEvent::WaitingForModel => {
-            Some(AgentLiveEventKind::Status("waiting for model".to_string()))
+            Some(AgentLiveEventKind::Signal(AgentLiveSignal::WaitingForModel))
         }
         StreamEvent::ModelResponding => {
-            Some(AgentLiveEventKind::Status("model responding".to_string()))
+            Some(AgentLiveEventKind::Signal(AgentLiveSignal::ModelResponding))
         }
-        StreamEvent::AskUserPrompted { prompt, .. } => Some(AgentLiveEventKind::Status(format!(
-            "ask_user waiting ({} questions)",
-            prompt
-                .get("prompt")
-                .and_then(|value| value.get("question_count"))
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0)
-        ))),
-        StreamEvent::AskUserResolved { resolution, .. } => {
-            Some(AgentLiveEventKind::Status(format!(
-                "ask_user {}",
-                resolution
-                    .get("audit")
-                    .and_then(|value| value.get("response"))
-                    .and_then(|value| value.get("outcome"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("resolved")
-            )))
+        StreamEvent::AssistantOutputSettled => {
+            Some(AgentLiveEventKind::Signal(AgentLiveSignal::OutputSettled))
         }
+        StreamEvent::AskUserPrompted { request_id, prompt } => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::AskUserPrompted { request_id, prompt },
+        )),
+        StreamEvent::AskUserResolved {
+            request_id,
+            resolution,
+        } => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::AskUserResolved {
+                request_id,
+                resolution,
+            },
+        )),
         StreamEvent::StatusLine(text) => Some(AgentLiveEventKind::Status(text)),
-        StreamEvent::PermissionAutoApproved { tool, reason } => Some(AgentLiveEventKind::Status(
-            astra_turn_core::permission::notice::format_auto_approved_permission(&tool, &reason)
-                .trim()
-                .to_string(),
+        StreamEvent::UserIntentApplied {
+            intent_id,
+            delivery,
+            status,
+            event_index,
+            content,
+        } => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::UserIntentApplied {
+                intent_id,
+                delivery,
+                status,
+                event_index,
+                content,
+            },
         )),
-        StreamEvent::AgentControlStarted { label, .. } => Some(AgentLiveEventKind::Status(
-            format!("agent control started: {label}"),
+        StreamEvent::AgentCommunication(event) => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::AgentCommunication(event),
         )),
-        StreamEvent::AgentControlCompleted { label, status, .. } => Some(
-            AgentLiveEventKind::Status(format!("agent control {status}: {label}")),
-        ),
-        StreamEvent::ToolOutput { name, lines, bytes } => Some(AgentLiveEventKind::Status(
-            format!("{name} streaming: {lines} lines, {bytes} bytes"),
+        StreamEvent::PermissionAutoApproved { tool, reason } => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::PermissionAutoApproved { tool, reason },
         )),
-        StreamEvent::Thinking(_)
+        StreamEvent::AgentControlStarted {
+            action,
+            label,
+            tool_use_id,
+            ..
+        } => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::AgentControlStarted {
+                action,
+                label,
+                tool_use_id,
+            },
+        )),
+        StreamEvent::AgentControlCompleted {
+            action,
+            label,
+            status,
+            duration_ms,
+            output,
+            tool_use_id,
+            agent_id,
+        } => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::AgentControlCompleted {
+                action,
+                label,
+                status,
+                duration_ms,
+                output,
+                tool_use_id,
+                agent_id,
+            },
+        )),
+        StreamEvent::ToolOutput { name, lines, bytes } => {
+            Some(AgentLiveEventKind::Signal(AgentLiveSignal::ToolProgress {
+                name,
+                lines,
+                bytes,
+            }))
+        }
+        StreamEvent::ContextWindowEstimated(_)
+        | StreamEvent::ContextSystemPromptTokens(_)
+        | StreamEvent::ContextWindowMeasured(_)
+        | StreamEvent::Thinking(_)
         | StreamEvent::AgentLive(_)
+        | StreamEvent::AgentLiveGap(_)
         | StreamEvent::Compaction(_)
         | StreamEvent::ExplainReport(_)
         | StreamEvent::ExplainText(_)
@@ -373,7 +463,7 @@ impl CliSpawnAgentExecutor {
 
     /// Install the parent's bg task command queue so spawned children
     /// can inspect or stop background shell tasks.
-    pub fn with_bg_task_commands(
+    pub(crate) fn with_bg_task_commands(
         mut self,
         commands: Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
     ) -> Self {
@@ -391,12 +481,28 @@ impl CliSpawnAgentExecutor {
         self
     }
 
-    /// Install the parent session's journal writer for unified timeline.
-    pub fn with_journal(
-        mut self,
-        journal: std::sync::Arc<astra_services::session_journal::JournalWriter>,
-    ) -> Self {
-        self.journal = Some(journal);
+    /// Bind this executor to one canonical local session transcript.
+    ///
+    /// A spawned agent is a run inside that session, so its journal writer and
+    /// active session identity must be installed together. Keeping them as one
+    /// operation prevents a live agent row whose run can never be reopened as
+    /// a transcript. Journal availability is an observability degradation, not
+    /// a reason to reject useful agent work: the executor keeps its session
+    /// identity for tools and logs the persistence failure.
+    pub(crate) fn with_session_transcript(mut self, session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        self.journal = match astra_services::session_journal::JournalWriter::new(&session_id) {
+            Ok(writer) => Some(Arc::new(writer)),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    %error,
+                    "local spawned-agent transcript journal is unavailable"
+                );
+                None
+            }
+        };
+        self.active_session_id = Some(session_id);
         self
     }
 
@@ -418,11 +524,6 @@ impl CliSpawnAgentExecutor {
         self.skill_resolver = resolver;
         self
     }
-
-    pub fn with_active_session_id(mut self, session_id: impl Into<String>) -> Self {
-        self.active_session_id = Some(session_id.into());
-        self
-    }
 }
 
 #[async_trait]
@@ -437,8 +538,39 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // multi_agent strip row stuck in the `live` state forever
         // (reviewer L2-5 — UX C1 + Arch M1).
         let live_event_sink_for_terminal = config.live_event_sink.clone();
+        let run_id_for_terminal = config.run_id.clone();
         let agent_id_for_terminal = config.agent_id.clone();
         let started_at = std::time::Instant::now();
+
+        // A child transcript is inspectable from the moment the run exists,
+        // not only after its tool receipt reaches the parent. This start fact
+        // is critical (not token telemetry), so the TUI can open the local
+        // canonical journal even if fanout reporting later fails.
+        if let Some(sink) = config.live_event_sink.as_ref()
+            && let Err(error) = sink.send(astra_turn_core::agent_live_event::AgentLiveEvent {
+                run_id: config.run_id.clone(),
+                agent_id: config.agent_id.clone(),
+                kind: astra_turn_core::agent_live_event::AgentLiveEventKind::Signal(
+                    astra_turn_core::agent_live_event::AgentLiveSignal::RunStarted {
+                        parent_run_id: config
+                            .inherited_prefix
+                            .as_ref()
+                            .map(|prefix| prefix.parent_run_id.clone()),
+                        depth: u32::from(config.recursion_depth),
+                        spawn_tool_call_id: config.spawn_tool_call_id.clone(),
+                        transcript_location:
+                            astra_turn_types::AgentTranscriptLocation::LocalJournal,
+                    },
+                ),
+            })
+        {
+            tracing::debug!(
+                agent_id = %config.agent_id,
+                run_id = %config.run_id,
+                ?error,
+                "spawned agent start was not delivered to the live workbench"
+            );
+        }
 
         let inherited_permissions: InheritedPermissions = config.inherited_permissions.clone();
         let perm_manager = super::permission_manager::PermissionManager::with_inherited(
@@ -462,6 +594,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             Err(err) => {
                 emit_agent_terminated(
                     live_event_sink_for_terminal.as_ref(),
+                    &run_id_for_terminal,
                     &agent_id_for_terminal,
                     started_at,
                     astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
@@ -509,6 +642,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             agent_id: config.agent_id.clone(),
             stream_event_tx: None,
             stream_event_sink: agent_live_stream_event_sink(
+                config.run_id.clone(),
                 config.agent_id.clone(),
                 config.live_event_sink.clone(),
             ),
@@ -519,6 +653,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             fork_cache_sink: self.fork_cache_sink.clone(),
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
             journal: self.journal.clone(),
+            journal_identity: None,
         };
 
         // Build system message from agent type definition
@@ -561,6 +696,22 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             &config.task,
             force_reasoning_field,
         );
+        if host.journal.is_some() {
+            if let Some(session_id) = self.active_session_id.as_ref() {
+                host.journal_identity = Some(SubRunJournalIdentity {
+                    session_id: session_id.clone(),
+                    run_id: config.run_id.clone(),
+                    next_item_seq: 1,
+                    last_assistant_source_event_id: None,
+                });
+            } else {
+                tracing::warn!(
+                    agent_id = %config.agent_id,
+                    run_id = %config.run_id,
+                    "child journal is configured without a parent session identity"
+                );
+            }
+        }
 
         // Build restricted tools based on agent type's allowed_tools
         let restricted_tools: HashSet<String> = if config.allowed_tools.iter().any(|t| t == "*") {
@@ -634,6 +785,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             observation_store: None,
             observation_journal: Default::default(),
             messages,
+            run_transcript_capture: None,
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
@@ -648,6 +800,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,
+            final_output_ready_notified: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -699,7 +852,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 progress_emitter: config.progress_emitter,
                 ..Default::default()
             },
-            deferred_input: Default::default(),
+            user_intents: Default::default(),
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: None,
@@ -776,7 +929,30 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             }
         }
 
+        // The child's own task is canonical user conversation, not merely a
+        // launch-card description. Persist it before the first network/model
+        // boundary so opening a newly started local agent has the same useful
+        // transcript seed as a durable server run. System and inherited prefix
+        // are provider context, so only the final child task starts the
+        // canonical run transcript.
+        if host.journal_identity.is_some() {
+            state.begin_run_transcript_capture(state.messages.last().cloned());
+        }
+        let _ = host.flush_agent_transcript(&state);
+
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        // The happy-path hook normally keeps this current. A terminal flush
+        // retains tool messages appended after the last successful ingest and
+        // partial history from cancelled/failed loops.
+        if let Some(source_event_id) = host.finalize_agent_transcript(&state).await {
+            emit_agent_transcript_committed(
+                live_event_sink_for_terminal.as_ref(),
+                &run_id_for_terminal,
+                &agent_id_for_terminal,
+                source_event_id,
+                astra_turn_types::AgentTranscriptLocation::LocalJournal,
+            );
+        }
 
         let tool_calls = state.total_tool_calls as u32;
         let agent_id = config.agent_id.clone();
@@ -841,6 +1017,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let emit_terminated = |termination, reason: Option<String>| {
             emit_agent_terminated(
                 live_event_sink_for_terminal.as_ref(),
+                &run_id_for_terminal,
                 &agent_id_for_terminal,
                 started_at,
                 termination,
@@ -1054,6 +1231,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 mod tests {
     use super::{
         CliSpawnAgentExecutor, TokenProvider, agent_live_stream_event_sink, build_child_messages,
+        emit_agent_transcript_committed,
     };
     use crate::lock_recovery::LockRecovery;
     use astra_runtime::orchestration::{
@@ -1062,6 +1240,7 @@ mod tests {
     };
     use astra_turn_core::agent_live_event::{
         AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError,
+        SharedAgentLiveEventSink,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -1078,11 +1257,22 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
-    struct RecordingLiveSink(std::sync::Mutex<Vec<AgentLiveEvent>>);
+    struct RecordingLiveSink {
+        events: std::sync::Mutex<Vec<AgentLiveEvent>>,
+        gaps: std::sync::Mutex<Vec<astra_turn_core::agent_live_event::AgentLiveGap>>,
+    }
 
     impl AgentLiveEventSink for RecordingLiveSink {
         fn send(&self, event: AgentLiveEvent) -> Result<(), AgentLiveSendError> {
-            self.0.lock_recover().push(event);
+            self.events.lock_recover().push(event);
+            Ok(())
+        }
+
+        fn send_gap(
+            &self,
+            gap: astra_turn_core::agent_live_event::AgentLiveGap,
+        ) -> Result<(), AgentLiveSendError> {
+            self.gaps.lock_recover().push(gap);
             Ok(())
         }
     }
@@ -1099,6 +1289,29 @@ mod tests {
              one via with_token_provider"
         );
         assert!(executor.default_model.is_none());
+        assert!(executor.journal.is_none());
+        assert!(executor.active_session_id.is_none());
+    }
+
+    #[test]
+    fn session_transcript_binding_installs_matching_journal_and_identity() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
+        let session_id = format!("spawn-transcript-{}", uuid::Uuid::new_v4());
+        let executor =
+            CliSpawnAgentExecutor::new(api, "token".to_string(), PathBuf::from("/tmp"), None)
+                .with_session_transcript(session_id.clone());
+
+        assert_eq!(
+            executor.active_session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            executor.journal.as_ref().map(|journal| journal.path()),
+            Some(&astra_services::session_journal::journal_file_path(
+                &session_id
+            ))
+        );
     }
 
     #[test]
@@ -1123,9 +1336,12 @@ mod tests {
     #[test]
     fn agent_live_stream_event_sink_translates_directly_without_stream_channel() {
         let live_sink = Arc::new(RecordingLiveSink::default());
-        let stream_sink =
-            agent_live_stream_event_sink("reviewer@abc12345".into(), Some(live_sink.clone()))
-                .expect("sink");
+        let stream_sink = agent_live_stream_event_sink(
+            "run-reviewer-1".into(),
+            "reviewer@abc12345".into(),
+            Some(live_sink.clone()),
+        )
+        .expect("sink");
 
         stream_sink.send(StreamEvent::Token("hello".into()));
         stream_sink.send(StreamEvent::ToolStarted {
@@ -1134,15 +1350,76 @@ mod tests {
             tool_use_id: "tool-1".into(),
             parent_tool_use_id: None,
         });
+        stream_sink.send(StreamEvent::PermissionAutoApproved {
+            tool: "bash".into(),
+            reason: "session rule".into(),
+        });
 
-        let events = live_sink.0.lock_recover();
-        assert_eq!(events.len(), 2);
+        let events = live_sink.events.lock_recover();
+        assert_eq!(events.len(), 3);
         assert!(matches!(events[0].kind, AgentLiveEventKind::OutputDelta(_)));
         assert!(matches!(
             events[1].kind,
             AgentLiveEventKind::ToolStarted { .. }
         ));
+
+        stream_sink.send(StreamEvent::AgentLiveGap(
+            astra_turn_core::agent_live_event::AgentLiveGap {
+                run_id: "run-reviewer-1".into(),
+                agent_id: "reviewer@abc12345".into(),
+                dropped_event_count: 2,
+            },
+        ));
+        assert_eq!(
+            live_sink.gaps.lock_recover().as_slice(),
+            [astra_turn_core::agent_live_event::AgentLiveGap {
+                run_id: "run-reviewer-1".into(),
+                agent_id: "reviewer@abc12345".into(),
+                dropped_event_count: 2,
+            }],
+            "nested stream gaps must retain their typed repair semantics"
+        );
         assert_eq!(events[0].agent_id, "reviewer@abc12345");
+        assert!(matches!(
+            &events[2].kind,
+            AgentLiveEventKind::Signal(
+                astra_turn_core::agent_live_event::AgentLiveSignal::PermissionAutoApproved {
+                    tool,
+                    reason,
+                }
+            ) if tool == "bash" && reason == "session rule"
+        ));
+    }
+
+    #[test]
+    fn local_transcript_commit_is_emitted_as_typed_identity() {
+        let live_sink = Arc::new(RecordingLiveSink::default());
+        let sink: SharedAgentLiveEventSink = live_sink.clone();
+        emit_agent_transcript_committed(
+            Some(&sink),
+            "run-reviewer-1",
+            "reviewer@abc12345",
+            "local-transcript:sha256:abc".into(),
+            astra_turn_types::AgentTranscriptLocation::LocalJournal,
+        );
+
+        let events = live_sink.events.lock_recover();
+        assert!(matches!(
+            events.as_slice(),
+            [AgentLiveEvent {
+                run_id,
+                agent_id,
+                kind: AgentLiveEventKind::Signal(
+                    astra_turn_core::agent_live_event::AgentLiveSignal::TranscriptCommitted {
+                        source_event_id,
+                        transcript_location:
+                            astra_turn_types::AgentTranscriptLocation::LocalJournal,
+                    }
+                ),
+            }] if run_id == "run-reviewer-1"
+                && agent_id == "reviewer@abc12345"
+                && source_event_id == "local-transcript:sha256:abc"
+        ));
     }
 
     /// REGRESSION (session 82ff91e5): sub-agent spawns failed with
@@ -1237,7 +1514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_resolution_failure_emits_terminal_live_event() {
+    async fn token_resolution_failure_preserves_the_local_transcript_binding() {
         let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
         let provider: TokenProvider = std::sync::Arc::new(|| panic!("token store poisoned"));
         let live_sink = Arc::new(RecordingLiveSink::default());
@@ -1250,6 +1527,7 @@ mod tests {
             .execute(SpawnRunConfig {
                 run_id: "run-1".into(),
                 agent_id: "reviewer@panic".into(),
+                spawn_tool_call_id: Some("spawn-call-1".into()),
                 recursion_depth: 1,
                 agent_type: "task".into(),
                 task: "review".into(),
@@ -1276,12 +1554,83 @@ mod tests {
             .expect_err("token provider panic should fail execute");
 
         assert!(err.contains("token provider task failed"), "{err}");
-        let events = live_sink.0.lock_recover();
-        assert_eq!(events.len(), 1);
+        let events = live_sink.events.lock_recover();
+        assert_eq!(events.len(), 2);
         assert!(matches!(
             events[0].kind,
+            AgentLiveEventKind::Signal(
+                astra_turn_core::agent_live_event::AgentLiveSignal::RunStarted {
+                    transcript_location: astra_turn_types::AgentTranscriptLocation::LocalJournal,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            events[1].kind,
             AgentLiveEventKind::AgentTerminated { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn spawned_llm_output_reaches_the_live_sink_end_to_end() {
+        let mock = crate::cli::mock_llm::MockLlmServer::start(
+            crate::cli::mock_llm::MockScenario::TextOnly,
+        )
+        .await
+        .expect("mock LLM");
+        let api = astra_thin_client::ThinClient::new(&mock.base_url, None).expect("test api");
+        let live_sink = Arc::new(RecordingLiveSink::default());
+        let (inherited_permissions, permission_context) = test_permission_context();
+        let executor =
+            CliSpawnAgentExecutor::new(api, "test-token".into(), std::env::temp_dir(), None);
+
+        let result = executor
+            .execute(SpawnRunConfig {
+                run_id: "run-live-output".into(),
+                agent_id: "reviewer@run-live-output".into(),
+                spawn_tool_call_id: Some("call-spawn-live".into()),
+                recursion_depth: 1,
+                agent_type: "task".into(),
+                task: "Return one concise finding.".into(),
+                system_prompt_addendum: String::new(),
+                model: Some("mock-model".into()),
+                max_turns: 1,
+                allowed_tools: Vec::new(),
+                read_only: true,
+                working_dir: std::env::temp_dir(),
+                mailbox: None,
+                progress_emitter: None,
+                context_cache: None,
+                inherited_permissions,
+                parent_address: None,
+                permission_context,
+                inherited_skills: Vec::new(),
+                live_event_sink: Some(live_sink.clone()),
+                inherited_prefix: None,
+                execution_metadata: None,
+                is_fork_child: false,
+                delegation_chain: Vec::new(),
+            })
+            .await
+            .expect("spawned run");
+        assert_eq!(result.status, "completed");
+        let events = live_sink.events.lock_recover();
+        assert!(matches!(
+            events.first().map(|event| &event.kind),
+            Some(AgentLiveEventKind::Signal(
+                astra_turn_core::agent_live_event::AgentLiveSignal::RunStarted {
+                    spawn_tool_call_id: Some(tool_call_id),
+                    ..
+                }
+            )) if tool_call_id == "call-spawn-live"
+        ));
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.kind,
+                AgentLiveEventKind::OutputDelta(text) if !text.trim().is_empty()
+            )),
+            "events: {events:?}"
+        );
     }
 
     /// Bug1 regression: when inherited prefix ends with a user or tool

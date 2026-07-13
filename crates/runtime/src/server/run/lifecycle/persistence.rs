@@ -26,9 +26,9 @@ use astra_services::{
 };
 use astra_tools::task_mgmt::SessionTask;
 use astra_turn_core::contracts::{
-    TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
-    TurnSkillSelectionRecord, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
+    TurnDecisionAuditRecord, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
+    TurnObserverWorker, TurnSkillSelectionRecord, TurnToolEventPersistPlan, TurnToolEventRecord,
+    TurnToolEventWriter,
 };
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
@@ -464,6 +464,17 @@ impl PostLoopPersistContext {
                     self.model_name.as_deref(),
                 )
                 .await;
+                let _ = persist_server_loop_transcript_items(
+                    Some(pool),
+                    &self.user_id,
+                    &self.session_id,
+                    &self.run_id,
+                    None,
+                    &self.user_message,
+                    state,
+                    false,
+                )
+                .await;
                 return Err(msg);
             }
         };
@@ -539,6 +550,38 @@ impl PostLoopPersistContext {
             return Err(msg);
         }
 
+        // The transcript gets one ordered durable sequence in this same
+        // transaction. The terminal assistant item is committed after durable
+        // run evidence, so approval/coordination boundaries remain before the
+        // answer without reader-side reordering.
+        if let Err(error) = persist_server_loop_transcript_items_in_tx(
+            &mut tx,
+            &self.user_id,
+            &self.session_id,
+            &self.run_id,
+            None,
+            &self.user_message,
+            state,
+            false,
+        )
+        .await
+        {
+            let msg = format!("transcript items tx failed: {error}");
+            tracing::warn!(
+                session_id = %self.session_id,
+                error = %error,
+                "post-loop: transcript item persistence failed, rolling back MO transaction"
+            );
+            if let Err(rb_err) = tx.rollback().await {
+                tracing::error!(
+                    session_id = %self.session_id,
+                    error = %rb_err,
+                    "post-loop: rollback failed after transcript item tx failure"
+                );
+            }
+            return Err(msg);
+        }
+
         // Best-effort commit: on failure, rollback naturally drops the tx.
         if let Err(error) = tx.commit().await {
             let msg = format!("MO transaction commit failed: {}", error);
@@ -550,6 +593,31 @@ impl PostLoopPersistContext {
             return Err(msg);
         }
         Ok(())
+    }
+
+    pub(crate) async fn materialize_run_transcript_evidence(
+        &self,
+        state: &AgenticLoopState,
+    ) -> Result<(), String> {
+        let Some(pool) = self.shared_pool.as_ref() else {
+            return Ok(());
+        };
+        let terminal_assistant = terminal_assistant_transcript_item(
+            &self.user_id,
+            &self.session_id,
+            &self.run_id,
+            None,
+            &self.user_message,
+            state,
+        );
+        materialize_server_run_transcript_evidence(
+            pool,
+            &self.user_id,
+            &self.session_id,
+            &self.run_id,
+            terminal_assistant,
+        )
+        .await
     }
 }
 
@@ -1051,7 +1119,7 @@ async fn persist_server_loop_core_events_impl(
 ) -> Result<(), String> {
     if user_message.is_empty()
         && state.final_text.is_empty()
-        && state.deferred_input.delivered_user_inputs().is_empty()
+        && state.user_intents.applied_user_intents().is_empty()
     {
         return Ok(());
     }
@@ -1098,14 +1166,13 @@ async fn persist_server_loop_core_events_impl(
         None
     };
 
-    let deferred_user_message_events = state
-        .deferred_input
-        .delivered_user_inputs()
+    let user_intent_events = state
+        .user_intents
+        .applied_user_intents()
         .iter()
-        .map(|input| {
-            let event_index = input.event_index.to_string();
+        .map(|intent| {
             let mut event = TraceEvent::new(
-                trace_event_id("deferred_user", &[run_id, &event_index]),
+                trace_event_id("user_intent", &[run_id, &intent.intent_id]),
                 session_id,
                 user_id,
                 "user_message",
@@ -1116,7 +1183,13 @@ async fn persist_server_loop_core_events_impl(
             event.parent_run_id = parent_run_id.map(ToString::to_string);
             event.agent_id = Some(agent_id.unwrap_or("root-agent").to_string());
             event.parent_agent_id = parent_agent_id.map(ToString::to_string);
-            event.content = Some(input.content.clone());
+            event.content = Some(intent.content.clone());
+            event.metadata = serde_json::json!({
+                "intent_id": intent.intent_id,
+                "delivery": intent.delivery,
+                "status": intent.status,
+                "event_index": intent.event_index,
+            });
             event.parent_event_id = user_query_event
                 .as_ref()
                 .map(|event| event.event_id.clone());
@@ -1155,56 +1228,14 @@ async fn persist_server_loop_core_events_impl(
         None
     };
 
-    let mut events = Vec::with_capacity(2 + deferred_user_message_events.len());
+    let mut events = Vec::with_capacity(2 + user_intent_events.len());
     if let Some(event) = user_query_event.clone() {
         events.push(event);
     }
-    events.extend(deferred_user_message_events.iter().cloned());
+    events.extend(user_intent_events.iter().cloned());
     if let Some(event) = llm_response_event.clone() {
         events.push(event);
     }
-
-    let plan = TurnCorePersistPlan {
-        user_query_event: user_query_event.as_ref().map(|event| TurnCoreEventRecord {
-            event_id: event.event_id.clone(),
-            user_id: event.user_id.clone(),
-            session_id: event.session_id.clone(),
-            run_id: Some(run_id.to_string()),
-            agent_id: event.agent_id.clone(),
-            event_type: "user_query".to_string(),
-            content: event.content.clone().unwrap_or_default(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: trace.causal_chain_id.clone(),
-            turn_seq: Some(trace.turn_seq),
-            llm_model_used: None,
-            token_usage: None,
-            llm_params: None,
-            reasoning_content: None,
-        }),
-        llm_response_event: llm_response_event
-            .as_ref()
-            .map(|event| TurnCoreEventRecord {
-                event_id: event.event_id.clone(),
-                user_id: event.user_id.clone(),
-                session_id: event.session_id.clone(),
-                run_id: Some(run_id.to_string()),
-                agent_id: event.agent_id.clone(),
-                event_type: "llm_response".to_string(),
-                content: event.content.clone().unwrap_or_default(),
-                parent_event_id: event.parent_event_id.clone(),
-                parent_event_ids: event.parent_event_id.iter().cloned().collect(),
-                causal_chain_id: trace.causal_chain_id.clone(),
-                turn_seq: Some(trace.turn_seq),
-                llm_model_used: event.llm_model_used.clone(),
-                token_usage: event.token_usage.clone(),
-                llm_params: None,
-                reasoning_content: None,
-            }),
-        snapshot_link_plan: None,
-    };
-    let transcript_items =
-        transcript_items_from_core_plan(&plan, run_id, &deferred_user_message_events);
 
     match external_tx {
         Some(tx) => {
@@ -1217,8 +1248,6 @@ async fn persist_server_loop_core_events_impl(
                 // writing transcript items into a dirty transaction.
                 return Err(e.to_string());
             }
-            persist_session_transcript_items_in_tx(tx, user_id, session_id, &transcript_items)
-                .await;
         }
         None => {
             if let Err(e) = writer.write_many(events).await {
@@ -1238,9 +1267,6 @@ async fn persist_server_loop_core_events_impl(
                 )
                 .await;
             }
-            if let Some(p) = pool {
-                persist_session_transcript_items(p, user_id, session_id, &transcript_items).await;
-            }
         }
     }
     Ok(())
@@ -1250,40 +1276,207 @@ pub(crate) struct TranscriptPersistItem {
     pub(crate) run_id: String,
     pub(crate) role: &'static str,
     pub(crate) content: String,
+    /// Structured transcript-only data. This stays outside prompt-facing
+    /// content while preserving tool, reasoning, and evidence identity across
+    /// the server/edge boundary.
+    pub(crate) payload: Option<TranscriptPersistPayload>,
     pub(crate) source_event_id: String,
 }
 
-fn transcript_items_from_core_plan(
-    plan: &TurnCorePersistPlan,
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TranscriptPersistPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tool_calls: Vec<astra_thin_client::SessionTranscriptToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_result: Option<astra_thin_client::SessionTranscriptToolResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence: Option<astra_turn_types::AgentTranscriptEvidence>,
+}
+
+fn transcript_tool_text(full: Option<&String>, preview: Option<&String>) -> String {
+    let Some(text) = full.or(preview) else {
+        return String::new();
+    };
+    parse_json_str(Some(text))
+        .map(|value| redact_trace_value(&value).to_string())
+        .unwrap_or_else(|| truncate_trace_text(text, 2_000))
+}
+
+fn transcript_items_from_server_loop(
+    user_id: &str,
+    session_id: &str,
     run_id: &str,
-    deferred_user_message_events: &[TraceEvent],
+    trace_context: Option<&TraceContext>,
+    user_message: &str,
+    state: &AgenticLoopState,
+    include_terminal_assistant: bool,
 ) -> Vec<TranscriptPersistItem> {
-    let mut items = Vec::with_capacity(2 + deferred_user_message_events.len());
-    if let Some(event) = &plan.user_query_event {
-        items.push(TranscriptPersistItem {
+    let trace = trace_context
+        .cloned()
+        .unwrap_or_else(|| server_trace_context(user_id, session_id, run_id, state.session_turn));
+    let mut core_items = Vec::new();
+    if !user_message.is_empty() {
+        core_items.push(TranscriptPersistItem {
             run_id: run_id.to_string(),
             role: "user",
-            content: event.content.clone(),
-            source_event_id: event.event_id.clone(),
+            content: user_message.to_string(),
+            payload: None,
+            source_event_id: trace.root_event_id.clone(),
         });
     }
-    for event in deferred_user_message_events {
-        items.push(TranscriptPersistItem {
+    for intent in state.user_intents.applied_user_intents() {
+        core_items.push(TranscriptPersistItem {
             run_id: run_id.to_string(),
             role: "user",
-            content: event.content.clone().unwrap_or_default(),
-            source_event_id: event.event_id.clone(),
+            content: intent.content.clone(),
+            payload: None,
+            source_event_id: trace_event_id("user_intent", &[run_id, &intent.intent_id]),
         });
     }
-    if let Some(event) = &plan.llm_response_event {
-        items.push(TranscriptPersistItem {
+    let assistant = terminal_assistant_transcript_item(
+        user_id,
+        session_id,
+        run_id,
+        Some(&trace),
+        user_message,
+        state,
+    );
+
+    for (index, record) in state.stall.tool_call_records.iter().enumerate() {
+        if record.is_synthetic_placeholder() {
+            continue;
+        }
+        let call_id = tool_trace_call_id(run_id, index, record);
+        let tool_name = record.name.clone();
+        core_items.push(TranscriptPersistItem {
             run_id: run_id.to_string(),
             role: "assistant",
-            content: event.content.clone(),
-            source_event_id: event.event_id.clone(),
+            content: String::new(),
+            payload: Some(TranscriptPersistPayload {
+                tool_calls: vec![astra_thin_client::SessionTranscriptToolCall {
+                    tool_use_id: call_id.clone(),
+                    name: tool_name.clone(),
+                    arguments: transcript_tool_text(
+                        record.args_full.as_ref(),
+                        record.args_preview.as_ref(),
+                    ),
+                }],
+                ..Default::default()
+            }),
+            source_event_id: trace_event_id("tool_start", &[run_id, &call_id]),
+        });
+        core_items.push(TranscriptPersistItem {
+            run_id: run_id.to_string(),
+            role: "tool",
+            content: transcript_tool_text(
+                record.result_full.as_ref(),
+                record.result_preview.as_ref(),
+            ),
+            payload: Some(TranscriptPersistPayload {
+                tool_result: Some(astra_thin_client::SessionTranscriptToolResult {
+                    tool_use_id: call_id.clone(),
+                    name: Some(tool_name),
+                    status: Some(if record.ok { "completed" } else { "failed" }.to_string()),
+                    duration_ms: Some(record.ms),
+                }),
+                ..Default::default()
+            }),
+            source_event_id: trace_event_id(
+                if record.ok {
+                    "tool_call_completed"
+                } else {
+                    "tool_call_failed"
+                },
+                &[run_id, &call_id],
+            ),
         });
     }
-    items
+    if include_terminal_assistant && let Some(assistant) = assistant {
+        core_items.push(assistant);
+    }
+    core_items
+}
+
+fn terminal_assistant_transcript_item(
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    trace_context: Option<&TraceContext>,
+    _user_message: &str,
+    state: &AgenticLoopState,
+) -> Option<TranscriptPersistItem> {
+    if state.final_text.is_empty() {
+        return None;
+    }
+    let trace = trace_context
+        .cloned()
+        .unwrap_or_else(|| server_trace_context(user_id, session_id, run_id, state.session_turn));
+    Some(TranscriptPersistItem {
+        run_id: run_id.to_string(),
+        role: "assistant",
+        content: state.final_text.clone(),
+        payload: None,
+        source_event_id: trace_event_id("response", &[run_id, &trace.turn_id]),
+    })
+}
+
+pub(crate) async fn persist_server_loop_transcript_items(
+    pool: Option<&SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    trace_context: Option<&TraceContext>,
+    user_message: &str,
+    state: &AgenticLoopState,
+    include_terminal_assistant: bool,
+) -> Result<Option<String>, String> {
+    let Some(pool) = pool else {
+        return Ok(None);
+    };
+    let items = transcript_items_from_server_loop(
+        user_id,
+        session_id,
+        run_id,
+        trace_context,
+        user_message,
+        state,
+        include_terminal_assistant,
+    );
+    let committed_assistant = items
+        .iter()
+        .rev()
+        .find(|item| item.role == "assistant" && !item.content.trim().is_empty())
+        .map(|item| item.source_event_id.clone());
+    persist_session_transcript_items(pool, user_id, session_id, &items).await?;
+    Ok(committed_assistant)
+}
+
+async fn persist_server_loop_transcript_items_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    trace_context: Option<&TraceContext>,
+    user_message: &str,
+    state: &AgenticLoopState,
+    include_terminal_assistant: bool,
+) -> Result<(), String> {
+    let items = transcript_items_from_server_loop(
+        user_id,
+        session_id,
+        run_id,
+        trace_context,
+        user_message,
+        state,
+        include_terminal_assistant,
+    );
+    persist_session_transcript_items_inner_in_tx(tx, user_id, session_id, &items)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn persist_session_transcript_items(
@@ -1291,9 +1484,9 @@ pub(crate) async fn persist_session_transcript_items(
     user_id: &str,
     session_id: &str,
     items: &[TranscriptPersistItem],
-) {
+) -> Result<(), String> {
     if items.is_empty() {
-        return;
+        return Ok(());
     }
     let mut tx = match pool.get().begin().await {
         Ok(tx) => tx,
@@ -1302,7 +1495,7 @@ pub(crate) async fn persist_session_transcript_items(
                 "server-loop",
                 "failed to begin transaction for transcript items for session {session_id}: {error}"
             );
-            return;
+            return Err(format!("failed to begin transcript transaction: {error}"));
         }
     };
     if let Err(error) =
@@ -1318,33 +1511,327 @@ pub(crate) async fn persist_session_transcript_items(
                 "failed to rollback after transcript items failure for session {session_id}: {rb_err}"
             );
         }
-        return;
+        return Err(format!("failed to persist transcript items: {error}"));
     }
     if let Err(error) = tx.commit().await {
         astra_core::agent_error!(
             "server-loop",
             "failed to commit transcript items for session {session_id}: {error}"
         );
+        return Err(format!("failed to commit transcript items: {error}"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+struct TranscriptReasoningProjection {
+    text: String,
+    done: bool,
+}
+
+impl TranscriptReasoningProjection {
+    fn append_delta(&mut self, delta: &str) {
+        if !delta.is_empty() && !self.text.ends_with(delta) {
+            self.text.push_str(delta);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty() && !self.done
     }
 }
 
-/// Variant that uses an existing transaction instead of creating its own.
-pub(crate) async fn persist_session_transcript_items_in_tx(
+fn transcript_event_fields(payload: &Value) -> &Value {
+    payload
+        .get("data")
+        .filter(|value| value.is_object())
+        .unwrap_or(payload)
+}
+
+fn transcript_event_string(payload: &Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn apply_reasoning_event_payload(projection: &mut TranscriptReasoningProjection, payload: &Value) {
+    let event_type = payload
+        .get("event_type")
+        .or_else(|| payload.get("type"))
+        .and_then(Value::as_str);
+    match event_type {
+        Some("reasoning_delta" | "thinking_delta" | "reasoning_message_content") => {
+            let content = payload
+                .get("content")
+                .and_then(Value::as_str)
+                .or_else(|| payload.pointer("/data/content").and_then(Value::as_str))
+                .or_else(|| payload.pointer("/data/chunk").and_then(Value::as_str))
+                .or_else(|| payload.pointer("/data/reasoning").and_then(Value::as_str))
+                .filter(|content| !content.trim().is_empty());
+            if let Some(content) = content {
+                projection.append_delta(content);
+            }
+        }
+        Some("reasoning_done" | "thinking_done") => projection.done = true,
+        _ => {}
+    }
+}
+
+fn transcript_evidence_items_from_run_event(
+    run_id: &str,
+    event_id: &str,
+    event_type: &str,
+    payload: &Value,
+) -> Vec<TranscriptPersistItem> {
+    let approval_item = |source_event_id: String, fields: &Value| {
+        let request_id = transcript_event_string(fields, "request_id")
+            .or_else(|| transcript_event_string(fields, "approval_id"));
+        let tool = transcript_event_string(fields, "tool")
+            .or_else(|| transcript_event_string(fields, "tool_name"));
+        request_id
+            .zip(tool)
+            .map(|(request_id, tool)| TranscriptPersistItem {
+                run_id: run_id.to_string(),
+                role: "event",
+                content: String::new(),
+                payload: Some(TranscriptPersistPayload {
+                    evidence: Some(
+                        astra_turn_types::AgentTranscriptEvidence::ApprovalRequired {
+                            request_id,
+                            tool,
+                            approval_kind: transcript_event_string(fields, "approval_kind")
+                                .unwrap_or_else(|| "standard".to_string()),
+                            display_label: transcript_event_string(fields, "display_label"),
+                            detail: transcript_event_string(fields, "detail"),
+                        },
+                    ),
+                    ..Default::default()
+                }),
+                source_event_id,
+            })
+    };
+
+    match event_type {
+        "approval_request" | "approval_required" => {
+            approval_item(event_id.to_string(), transcript_event_fields(payload))
+                .into_iter()
+                .collect()
+        }
+        "approval_batch_required" => transcript_event_fields(payload)
+            .get("requests")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|request| {
+                let request_id = transcript_event_string(request, "request_id")
+                    .or_else(|| transcript_event_string(request, "approval_id"))?;
+                let source_event_id = format!("{event_id}:approval:{}", trace_hash(&[&request_id]));
+                approval_item(source_event_id, request)
+            })
+            .collect(),
+        "agent_communication" => {
+            let Ok(event) = serde_json::from_value::<astra_turn_types::AgentCommunicationEvent>(
+                transcript_event_fields(payload).clone(),
+            ) else {
+                tracing::warn!(
+                    event_id,
+                    "skipping malformed agent communication transcript evidence"
+                );
+                return Vec::new();
+            };
+            vec![TranscriptPersistItem {
+                run_id: run_id.to_string(),
+                role: "event",
+                content: String::new(),
+                payload: Some(TranscriptPersistPayload {
+                    evidence: Some(
+                        astra_turn_types::AgentTranscriptEvidence::AgentCommunication { event },
+                    ),
+                    ..Default::default()
+                }),
+                source_event_id: event_id.to_string(),
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+async fn update_run_assistant_transcript_reasoning_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
     session_id: &str,
-    items: &[TranscriptPersistItem],
-) {
-    if items.is_empty() {
-        return;
+    run_id: &str,
+    reasoning: &TranscriptReasoningProjection,
+) -> Result<(), sqlx::Error> {
+    if reasoning.is_empty() {
+        return Ok(());
     }
+    let row = sqlx::query(
+        "SELECT item_seq, role, content, payload_json
+         FROM session_transcript_items
+         WHERE session_id = ? AND user_id = ? AND run_id = ?
+           AND role = 'assistant' AND content <> ''
+         ORDER BY item_seq DESC
+         LIMIT 1
+         FOR UPDATE",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let item_seq = row.try_get::<i64, _>("item_seq")?;
+    let role = row.try_get::<String, _>("role")?;
+    let content = row.try_get::<String, _>("content")?;
+    let payload_json = row.try_get::<Option<String>, _>("payload_json")?;
+    let mut payload = payload_json
+        .as_deref()
+        .map(serde_json::from_str::<TranscriptPersistPayload>)
+        .transpose()
+        .map_err(|error| {
+            sqlx::Error::Protocol(format!(
+                "decode stored transcript payload for run {run_id}: {error}"
+            ))
+        })?
+        .unwrap_or_default();
+    payload.reasoning = (!reasoning.text.is_empty()).then(|| reasoning.text.clone());
+    payload.reasoning_status = payload.reasoning.as_ref().map(|_| {
+        if reasoning.done {
+            "complete".to_string()
+        } else {
+            "streaming".to_string()
+        }
+    });
+    let payload_json = serde_json::to_string(&payload).map_err(|error| {
+        sqlx::Error::Protocol(format!(
+            "serialize transcript reasoning for run {run_id}: {error}"
+        ))
+    })?;
+    sqlx::query(
+        "UPDATE session_transcript_items
+         SET payload_json = ?, content_hash = ?
+         WHERE session_id = ? AND user_id = ? AND item_seq = ?",
+    )
+    .bind(&payload_json)
+    .bind(transcript_content_hash(
+        &role,
+        &content,
+        Some(&payload_json),
+    ))
+    .bind(session_id)
+    .bind(user_id)
+    .bind(item_seq)
+    .execute(&mut **tx)
+    .await?;
+    sync_transcript_page_inner(tx, user_id, session_id, transcript_page_seq(item_seq)).await
+}
+
+pub(crate) async fn materialize_server_run_transcript_evidence(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    terminal_assistant: Option<TranscriptPersistItem>,
+) -> Result<(), String> {
+    let rows = sqlx::query(
+        "SELECT event_id, event_type, payload_json
+         FROM agent_run_events
+         WHERE session_id = ? AND user_id = ? AND run_id = ?
+           AND event_type IN (
+                'reasoning_delta', 'reasoning_message_content', 'reasoning_done',
+                'thinking_delta', 'thinking_done',
+                'approval_request', 'approval_required', 'approval_batch_required',
+                'agent_communication'
+           )
+         ORDER BY event_idx ASC",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .bind(run_id)
+    .fetch_all(pool.get())
+    .await
+    .map_err(|error| error.to_string())?;
+    if rows.is_empty() && terminal_assistant.is_none() {
+        return Ok(());
+    }
+
+    let mut reasoning = TranscriptReasoningProjection::default();
+    let mut items = Vec::new();
+    for row in rows {
+        let event_id = row
+            .try_get::<String, _>("event_id")
+            .map_err(|error| error.to_string())?;
+        let event_type = row
+            .try_get::<String, _>("event_type")
+            .map_err(|error| error.to_string())?;
+        let payload_json = row
+            .try_get::<String, _>("payload_json")
+            .map_err(|error| error.to_string())?;
+        let payload = match serde_json::from_str::<Value>(&payload_json) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(event_id, error = %error, "skipping malformed durable transcript event");
+                continue;
+            }
+        };
+        apply_reasoning_event_payload(&mut reasoning, &payload);
+        items.extend(transcript_evidence_items_from_run_event(
+            run_id,
+            &event_id,
+            &event_type,
+            &payload,
+        ));
+    }
+    if let Some(terminal_assistant) = terminal_assistant {
+        items.push(terminal_assistant);
+    }
+
+    let mut tx = pool
+        .get()
+        .begin()
+        .await
+        .map_err(|error| error.to_string())?;
     if let Err(error) =
-        persist_session_transcript_items_inner_in_tx(tx, user_id, session_id, items).await
+        persist_session_transcript_items_inner_in_tx(&mut tx, user_id, session_id, &items).await
     {
-        astra_core::agent_error!(
-            "server-loop",
-            "failed to persist transcript items in tx for session {session_id}: {error}"
-        );
+        return Err(rollback_materialized_transcript_transaction(
+            tx,
+            "persisting transcript items",
+            error,
+        )
+        .await);
+    }
+    if let Err(error) = update_run_assistant_transcript_reasoning_in_tx(
+        &mut tx, user_id, session_id, run_id, &reasoning,
+    )
+    .await
+    {
+        return Err(rollback_materialized_transcript_transaction(
+            tx,
+            "updating assistant reasoning projection",
+            error,
+        )
+        .await);
+    }
+    tx.commit().await.map_err(|error| error.to_string())
+}
+
+async fn rollback_materialized_transcript_transaction(
+    tx: sqlx::Transaction<'_, sqlx::MySql>,
+    failed_stage: &str,
+    operation_error: sqlx::Error,
+) -> String {
+    match tx.rollback().await {
+        Ok(()) => format!("{failed_stage} failed: {operation_error}"),
+        Err(rollback_error) => format!(
+            "{failed_stage} failed: {operation_error}; transaction rollback also failed: {rollback_error}"
+        ),
     }
 }
 
@@ -1756,7 +2243,8 @@ pub(crate) async fn persist_session_transcript_items_inner_in_tx(
         "SELECT 1 AS owned
          FROM agent_sessions
          WHERE session_id = ? AND user_id = ?
-         LIMIT 1",
+         LIMIT 1
+         FOR UPDATE",
     )
     .bind(session_id)
     .bind(user_id)
@@ -1795,11 +2283,22 @@ pub(crate) async fn persist_session_transcript_items_inner_in_tx(
         }
 
         let item_seq = next_seq;
+        let payload_json = item
+            .payload
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                sqlx::Error::Protocol(format!(
+                    "serialize transcript payload for {}: {error}",
+                    item.source_event_id
+                ))
+            })?;
         sqlx::query(
             "INSERT INTO session_transcript_items
-             (session_id, item_seq, user_id, run_id, role, content,
+             (session_id, item_seq, user_id, run_id, role, content, payload_json,
               source_event_id, source_event_idx, content_hash, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NOW(6))",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NOW(6))",
         )
         .bind(session_id)
         .bind(item_seq)
@@ -1807,8 +2306,13 @@ pub(crate) async fn persist_session_transcript_items_inner_in_tx(
         .bind(&item.run_id)
         .bind(item.role)
         .bind(&item.content)
+        .bind(&payload_json)
         .bind(&item.source_event_id)
-        .bind(transcript_content_hash(item.role, &item.content))
+        .bind(transcript_content_hash(
+            item.role,
+            &item.content,
+            payload_json.as_deref(),
+        ))
         .execute(&mut **tx)
         .await?;
         dirty_pages.insert(transcript_page_seq(item_seq));
@@ -1916,11 +2420,15 @@ async fn sync_transcript_page_inner(
     Ok(())
 }
 
-fn transcript_content_hash(role: &str, content: &str) -> String {
+fn transcript_content_hash(role: &str, content: &str, payload_json: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(role.as_bytes());
     hasher.update([0]);
     hasher.update(content.as_bytes());
+    hasher.update([0]);
+    if let Some(payload_json) = payload_json {
+        hasher.update(payload_json.as_bytes());
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -2646,6 +3154,111 @@ mod tests {
     }
 
     #[test]
+    fn canonical_run_transcript_keeps_tool_history_before_terminal_assistant() {
+        let trace = server_trace_context("user-1", "session-1", "run-1", 3);
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.final_text = "implemented the fix".to_string();
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                tool_call_id: Some("call-1".to_string()),
+                name: "read_file".to_string(),
+                ok: true,
+                ms: 12,
+                args_full: Some(r#"{"path":"src/lib.rs"}"#.to_string()),
+                result_full: Some("pub fn main() {}".to_string()),
+                ..Default::default()
+            });
+
+        let items = transcript_items_from_server_loop(
+            "user-1",
+            "session-1",
+            "run-1",
+            Some(&trace),
+            "inspect the implementation",
+            &state,
+            true,
+        );
+
+        assert_eq!(
+            items.iter().map(|item| item.role).collect::<Vec<_>>(),
+            vec!["user", "assistant", "tool", "assistant"]
+        );
+        assert_eq!(items[0].source_event_id, trace.root_event_id);
+        assert_eq!(
+            items[1].source_event_id,
+            trace_event_id("tool_start", &["run-1", "call-1"])
+        );
+        assert_eq!(
+            items[2].source_event_id,
+            trace_event_id("tool_call_completed", &["run-1", "call-1"])
+        );
+        assert_eq!(
+            items[3].source_event_id,
+            trace_event_id("response", &["run-1", &trace.turn_id])
+        );
+        let call = items[1]
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.tool_calls.first())
+            .expect("tool call remains typed in canonical transcript");
+        assert_eq!(call.name, "read_file");
+        assert_eq!(call.arguments, r#"{"path":"src/lib.rs"}"#);
+        let result = items[2]
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.tool_result.as_ref())
+            .expect("tool result remains typed in canonical transcript");
+        assert_eq!(result.tool_use_id, "call-1");
+        assert_eq!(result.status.as_deref(), Some("completed"));
+        assert_eq!(items[3].content, "implemented the fix");
+    }
+
+    #[test]
+    fn durable_run_evidence_and_reasoning_keep_typed_identity() {
+        let mut reasoning = TranscriptReasoningProjection::default();
+        apply_reasoning_event_payload(
+            &mut reasoning,
+            &json!({"event_type": "reasoning_message_content", "data": {"content": "checking invariants"}}),
+        );
+        apply_reasoning_event_payload(&mut reasoning, &json!({"type": "thinking_done"}));
+        assert_eq!(reasoning.text, "checking invariants");
+        assert!(reasoning.done);
+
+        let items = transcript_evidence_items_from_run_event(
+            "run-1",
+            "event-approval-batch",
+            "approval_batch_required",
+            &json!({
+                "data": {
+                    "requests": [
+                        {"request_id": "approval-1", "tool": "bash", "detail": "cargo test"},
+                        {"request_id": "approval-2", "tool": "write_file", "detail": "src/lib.rs"}
+                    ]
+                }
+            }),
+        );
+
+        assert_eq!(items.len(), 2);
+        assert_ne!(items[0].source_event_id, items[1].source_event_id);
+        let stable_keys = items
+            .iter()
+            .map(|item| {
+                item.payload
+                    .as_ref()
+                    .and_then(|payload| payload.evidence.as_ref())
+                    .expect("approval remains structured evidence")
+                    .stable_key()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stable_keys,
+            vec!["approval:approval-1", "approval:approval-2"]
+        );
+    }
+
+    #[test]
     fn llm_round_trace_events_use_canonical_token_usage() {
         let trace = server_trace_context("user-1", "session-1", "run-1", 3);
         let events = build_llm_round_trace_events(
@@ -3021,12 +3634,18 @@ mod tests {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.session_turn = 7;
         state.final_text = "assistant final".to_string();
-        state.deferred_input.record_delivered_user_inputs(&[
-            crate::turn::agentic_loop::host::DeferredUserInputRecord {
+        state.user_intents.record_applied_user_intents(&[
+            crate::turn::agentic_loop::host::AppliedUserIntent {
+                intent_id: "intent-2".to_string(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
                 event_index: 3,
                 content: "queued two".to_string(),
             },
-            crate::turn::agentic_loop::host::DeferredUserInputRecord {
+            crate::turn::agentic_loop::host::AppliedUserIntent {
+                intent_id: "intent-3".to_string(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
                 event_index: 4,
                 content: "queued three".to_string(),
             },
@@ -3074,7 +3693,7 @@ mod tests {
             .filter(|row| row.try_get::<String, _>("event_type").unwrap() == "llm_response")
             .collect::<Vec<_>>();
         assert_eq!(user_query_rows.len(), 1, "run must have one audit turn");
-        assert_eq!(user_message_rows.len(), 2, "deferred inputs are messages");
+        assert_eq!(user_message_rows.len(), 2, "user intents are messages");
         assert_eq!(response_rows.len(), 1, "run must have one final response");
         let root_event_id = user_query_rows[0].try_get::<String, _>("event_id").unwrap();
         assert_eq!(
@@ -3176,31 +3795,27 @@ mod tests {
                 run_id: run_id.clone(),
                 role: "user",
                 content: "hello".to_string(),
+                payload: None,
                 source_event_id: Uuid::new_v4().to_string(),
             },
             TranscriptPersistItem {
                 run_id: run_id.clone(),
                 role: "user",
                 content: "second input".to_string(),
+                payload: None,
                 source_event_id: Uuid::new_v4().to_string(),
             },
             TranscriptPersistItem {
                 run_id: run_id.clone(),
                 role: "assistant",
                 content: "world".to_string(),
+                payload: None,
                 source_event_id: Uuid::new_v4().to_string(),
             },
         ];
-        let mut owner_tx = db.begin().await.expect("begin owner transcript tx");
-        persist_session_transcript_items_inner_in_tx(
-            &mut owner_tx,
-            &owner_user_id,
-            &session_id,
-            &items,
-        )
-        .await
-        .expect("owner transcript persist");
-        owner_tx.commit().await.expect("commit owner transcript tx");
+        persist_session_transcript_items(&pool, &owner_user_id, &session_id, &items)
+            .await
+            .expect("owner transcript persist");
 
         let page = sqlx::query(
             "SELECT user_id, start_item_seq, end_item_seq, item_count
@@ -3288,6 +3903,7 @@ mod tests {
                 run_id,
                 role: "assistant",
                 content: "wrong owner".to_string(),
+                payload: None,
                 source_event_id: Uuid::new_v4().to_string(),
             }],
         )
@@ -3334,5 +3950,71 @@ mod tests {
 
         cleanup_transcript_fixture_for_owner(&db, &session_id, &owner_user_id).await;
         cleanup_transcript_fixture_for_owner(&db, &session_id, &other_user_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn server_transcript_commit_returns_exact_committed_assistant_identity() {
+        let pool = setup_pool().await;
+        let db = pool.get().clone();
+        let session_id = Uuid::new_v4().to_string();
+        let user_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        cleanup_transcript_fixture_for_owner(&db, &session_id, &user_id).await;
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
+             VALUES (?, ?, 'transcript-commit-it', 'active', 0)",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(&db)
+        .await
+        .expect("insert transcript commit session");
+
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.final_text = "identity-backed answer".into();
+        state.session_turn = 7;
+        let expected = terminal_assistant_transcript_item(
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            "inspect identity",
+            &state,
+        )
+        .expect("terminal assistant item")
+        .source_event_id;
+
+        let committed = persist_server_loop_transcript_items(
+            Some(&pool),
+            &user_id,
+            &session_id,
+            &run_id,
+            None,
+            "inspect identity",
+            &state,
+            true,
+        )
+        .await
+        .expect("server transcript commit");
+        assert_eq!(committed.as_deref(), Some(expected.as_str()));
+
+        let stored = sqlx::query(
+            "SELECT source_event_id
+             FROM session_transcript_items
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND role = 'assistant'
+             ORDER BY item_seq DESC LIMIT 1",
+        )
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .fetch_one(&db)
+        .await
+        .expect("read committed assistant identity")
+        .try_get::<String, _>("source_event_id")
+        .expect("decode source_event_id");
+        assert_eq!(stored, expected);
+
+        cleanup_transcript_fixture_for_owner(&db, &session_id, &user_id).await;
     }
 }

@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 /// previous heavy snapshot), not the entire accumulated history. If there are fewer heavy files
 /// than journal turns, the latest heavy file is used and a warning is recorded.
 /// Retention: fallback handler for `/debug` — called from slash_router.rs.
-/// In TUI mode this is shadowed by TuiHandler::Panel (InfoView).
-/// Kept for headless / non-interactive execution paths.
+/// Interactive users should prefer the native `/inspect` surface; `/debug`
+/// remains an explicit legacy handoff until its remaining diagnostics migrate.
 pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
     let session_id = if arg.is_empty() {
         match &state.session_id {

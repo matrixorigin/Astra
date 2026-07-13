@@ -7,7 +7,10 @@
 pub(crate) type VerdictEvent = astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DeferredStreamUserInput {
+pub(crate) struct AppliedStreamUserIntent {
+    pub(crate) intent_id: String,
+    pub(crate) delivery: astra_turn_types::UserIntentDelivery,
+    pub(crate) status: astra_turn_types::UserIntentStatus,
     pub(crate) event_index: usize,
     pub(crate) content: String,
 }
@@ -31,6 +34,10 @@ pub(crate) struct PartialTurnData {
     /// Partial text the model generated before the turn was interrupted.
     /// Preserved in conversation history so the next turn has context.
     pub partial_text: String,
+    /// Exact prompt-history items captured before the failed runtime loop
+    /// returned. This survives independently of `partial_text`, which is only
+    /// a user-facing suffix and cannot represent tools or reasoning.
+    pub run_transcript_messages: Vec<serde_json::Value>,
 }
 
 /// A turn failure that carries partial data for post-mortem analysis.
@@ -74,6 +81,39 @@ pub(crate) fn apply_partial_turn_data_to_error_event(
     if !partial.tools_used.is_empty() {
         event.tools_used = Some(partial.tools_used.clone());
     }
+}
+
+/// Convert root append-boundary capture into the local durable transcript
+/// contract used by child runs. `run_id + item_seq`, not content, is the
+/// identity used by readers to make an ambiguous append retry idempotent.
+pub(crate) fn root_run_transcript_events(
+    session_id: Option<&str>,
+    run_id: Option<&str>,
+    messages: &[serde_json::Value],
+) -> Vec<astra_services::session_journal::JournalEvent> {
+    let (Some(session_id), Some(run_id)) = (session_id, run_id) else {
+        return Vec::new();
+    };
+    if session_id.trim().is_empty() || run_id.trim().is_empty() {
+        return Vec::new();
+    }
+
+    messages
+        .iter()
+        .filter(|message| {
+            !matches!(
+                message.get("role").and_then(serde_json::Value::as_str),
+                Some("system") | None
+            )
+        })
+        .enumerate()
+        .filter_map(|(index, message)| {
+            let item_seq = u64::try_from(index).ok()?.saturating_add(1);
+            astra_services::session_journal::JournalEvent::transcript_item(
+                session_id, run_id, "root", item_seq, message,
+            )
+        })
+        .collect()
 }
 
 /// Result of a streaming chat turn, including token counts and tool usage data.
@@ -139,10 +179,16 @@ pub(crate) struct StreamResult {
     pub(crate) interruption_kind: Option<String>,
     /// Full messages array after this turn — used by CslManager for persistence.
     pub(crate) final_messages: Vec<serde_json::Value>,
-    /// Structured user input events delivered while the turn was already active.
-    /// This is the durable fact source for mid-turn user input; `final_messages`
+    /// Exact prompt-history items appended by this root execution run.
+    ///
+    /// This is captured at the runtime append boundary before compaction may
+    /// rewrite `final_messages`. It is the local root counterpart to a child
+    /// run's canonical transcript capture, not a prompt reconstruction hint.
+    pub(crate) run_transcript_messages: Vec<serde_json::Value>,
+    /// Structured user intents applied while the turn was already active.
+    /// This is the durable fact source for active-run guidance; `final_messages`
     /// is only a prompt projection fallback.
-    pub(crate) deferred_user_inputs: Vec<DeferredStreamUserInput>,
+    pub(crate) applied_user_intents: Vec<AppliedStreamUserIntent>,
     /// Results from background-spawned agents collected after the agentic
     /// loop ended. Each entry is (agent_id, result_text).
     pub(crate) background_agent_results: Vec<(String, String)>,
@@ -151,22 +197,24 @@ pub(crate) struct StreamResult {
 impl StreamResult {
     /// User input that should represent this committed turn in durable history.
     ///
-    /// The runtime can ingest deferred user messages while a turn is executing.
+    /// The runtime can apply user guidance while a turn is executing.
     /// Those messages are already appended to `final_messages` as prompt-facing
     /// user messages, so durable history must derive from final prompt history
     /// instead of only the original line submitted at turn start.
     pub(crate) fn effective_user_input(&self, primary_line: &str) -> String {
-        if !self.deferred_user_inputs.is_empty() {
-            return effective_user_input_from_deferred(primary_line, &self.deferred_user_inputs);
+        if !self.applied_user_intents.is_empty() {
+            return effective_user_input_from_applied_user_intents(
+                primary_line,
+                &self.applied_user_intents,
+            );
         }
         effective_user_input_from_messages(primary_line, &self.final_messages)
     }
 
     /// Latest user instruction that should drive follow-up suggestions,
-    /// relevance checks, and continuation anchors. If deferred input arrived,
-    /// this is the final deferred user message, not the original turn line.
+    /// relevance checks, and continuation anchors.
     pub(crate) fn latest_user_input(&self, primary_line: &str) -> String {
-        if let Some(input) = self.deferred_user_inputs.last() {
+        if let Some(input) = self.applied_user_intents.last() {
             return input.content.clone();
         }
         latest_user_input_from_messages(primary_line, &self.final_messages)
@@ -183,9 +231,9 @@ impl StreamResult {
     }
 }
 
-fn effective_user_input_from_deferred(
+fn effective_user_input_from_applied_user_intents(
     primary_line: &str,
-    inputs: &[DeferredStreamUserInput],
+    inputs: &[AppliedStreamUserIntent],
 ) -> String {
     let primary = primary_line.trim();
     let mut parts = Vec::new();
@@ -249,7 +297,7 @@ fn user_inputs_from_current_turn(
 #[cfg(test)]
 mod user_input_tests {
     use super::{
-        DeferredStreamUserInput, effective_user_input_from_deferred,
+        AppliedStreamUserIntent, effective_user_input_from_applied_user_intents,
         effective_user_input_from_messages, latest_user_input_from_messages,
     };
     use serde_json::json;
@@ -257,18 +305,24 @@ mod user_input_tests {
     #[test]
     fn effective_user_input_prefers_structured_deferred_events() {
         let inputs = vec![
-            DeferredStreamUserInput {
+            AppliedStreamUserIntent {
+                intent_id: "intent-2".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
                 event_index: 4,
                 content: "2".to_string(),
             },
-            DeferredStreamUserInput {
+            AppliedStreamUserIntent {
+                intent_id: "intent-3".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
                 event_index: 5,
                 content: "3".to_string(),
             },
         ];
 
         assert_eq!(
-            effective_user_input_from_deferred("1", &inputs),
+            effective_user_input_from_applied_user_intents("1", &inputs),
             "1\n\n2\n\n3"
         );
     }
@@ -348,7 +402,8 @@ impl Default for StreamResult {
             final_state: "completed".to_string(),
             interruption_kind: None,
             final_messages: Vec::new(),
-            deferred_user_inputs: Vec::new(),
+            run_transcript_messages: Vec::new(),
+            applied_user_intents: Vec::new(),
             background_agent_results: Vec::new(),
         }
     }

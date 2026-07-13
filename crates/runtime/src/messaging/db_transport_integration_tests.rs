@@ -119,6 +119,7 @@ mod tests {
             }
             other => panic!("expected Text, got: {other:?}"),
         }
+        stream_b.acknowledge(&received).await.unwrap();
 
         let status = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -193,22 +194,21 @@ mod tests {
         transport.broadcast(del, msg).await.unwrap();
 
         // All members should receive (including sender, matching InProcessTransport behavior).
-        let r1 = tokio::time::timeout(Duration::from_secs(2), stream_w1.recv()).await;
-        let r2 = tokio::time::timeout(Duration::from_secs(2), stream_w2.recv()).await;
-        let r_leader = tokio::time::timeout(Duration::from_secs(2), stream_leader.recv()).await;
-
-        assert!(
-            r1.is_ok() && r1.unwrap().is_some(),
-            "worker-1 should receive broadcast"
-        );
-        assert!(
-            r2.is_ok() && r2.unwrap().is_some(),
-            "worker-2 should receive broadcast"
-        );
-        assert!(
-            r_leader.is_ok() && r_leader.unwrap().is_some(),
-            "leader should receive own broadcast"
-        );
+        let r1 = tokio::time::timeout(Duration::from_secs(2), stream_w1.recv())
+            .await
+            .expect("worker-1 broadcast timeout")
+            .expect("worker-1 stream closed");
+        let r2 = tokio::time::timeout(Duration::from_secs(2), stream_w2.recv())
+            .await
+            .expect("worker-2 broadcast timeout")
+            .expect("worker-2 stream closed");
+        let r_leader = tokio::time::timeout(Duration::from_secs(2), stream_leader.recv())
+            .await
+            .expect("leader broadcast timeout")
+            .expect("leader stream closed");
+        stream_w1.acknowledge(&r1).await.unwrap();
+        stream_w2.acknowledge(&r2).await.unwrap();
+        stream_leader.acknowledge(&r_leader).await.unwrap();
 
         cleanup(&pool).await;
     }
@@ -253,6 +253,7 @@ mod tests {
             if let MessagePayload::Text { content, .. } = &msg.payload {
                 received.push(content.clone());
             }
+            stream_b.acknowledge(&msg).await.unwrap();
         }
         assert_eq!(received, vec!["msg-0", "msg-1", "msg-2", "msg-3", "msg-4"]);
 
@@ -313,6 +314,7 @@ mod tests {
             }
             _ => panic!("unexpected payload"),
         }
+        stream_b.acknowledge(&received).await.unwrap();
 
         let status = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -708,6 +710,7 @@ mod tests {
             }
             other => panic!("expected Text, got: {other:?}"),
         }
+        stream.acknowledge(&received).await.unwrap();
 
         let extra = tokio::time::timeout(Duration::from_millis(300), stream.recv()).await;
         assert!(

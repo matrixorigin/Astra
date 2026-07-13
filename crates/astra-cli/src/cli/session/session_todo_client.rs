@@ -11,7 +11,7 @@
 //! the LLM/UI consumes; on error a stringified failure suitable to
 //! return as an `Error: ...` ToolResult.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const TODOS_HTTP_TIMEOUT_SECS: u64 = 15;
@@ -24,6 +24,66 @@ struct ExecuteTodoResponse {
 #[derive(Deserialize)]
 struct LoadTodosResponse {
     tasks: Vec<astra_tools::task_mgmt::SessionTask>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UserTodoEntry {
+    session_id: String,
+    todo_id: String,
+    title: String,
+    status: String,
+    updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_title: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UserTodosResponse {
+    tasks: Vec<UserTodoEntry>,
+    total: usize,
+}
+
+#[derive(Debug)]
+struct TodoReadError {
+    health: astra_tools::task_mgmt::TaskStoreHealth,
+    message: String,
+}
+
+impl TodoReadError {
+    fn new(health: astra_tools::task_mgmt::TaskStoreHealth, message: impl Into<String>) -> Self {
+        Self {
+            health,
+            message: message.into(),
+        }
+    }
+}
+
+fn health_for_http_status(
+    status: reqwest::StatusCode,
+    not_found_health: astra_tools::task_mgmt::TaskStoreHealth,
+) -> astra_tools::task_mgmt::TaskStoreHealth {
+    use astra_tools::task_mgmt::TaskStoreHealth;
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        TaskStoreHealth::AuthenticationRequired
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        not_found_health
+    } else if status.is_server_error()
+        || matches!(
+            status,
+            reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+        )
+    {
+        TaskStoreHealth::ServiceUnavailable
+    } else {
+        TaskStoreHealth::ProtocolMismatch
+    }
 }
 
 fn format_cloud_error(status: reqwest::StatusCode, body: &str) -> String {
@@ -163,28 +223,97 @@ pub async fn list_user_todos(
     token: Option<&str>,
     status: &str,
 ) -> Result<String, String> {
+    let response = fetch_user_todos(cloud_base, token, status)
+        .await
+        .map_err(|error| error.message)?;
+    let summary_count = response.total;
+    let body = serde_json::to_string(&response).map_err(|e| format!("encode response: {e}"))?;
+    Ok(format!(
+        "Cross-session todos: {summary_count} {status} item(s)\n{body}"
+    ))
+}
+
+async fn fetch_user_todos(
+    cloud_base: &str,
+    token: Option<&str>,
+    status: &str,
+) -> Result<UserTodosResponse, TodoReadError> {
     let url = format!(
         "{}/users/me/todos?status={}",
         cloud_base.trim_end_matches('/'),
         status
     );
-    let resp = build_request(reqwest::Method::GET, &url, token)?
+    let resp = build_request(reqwest::Method::GET, &url, token)
+        .map_err(|error| {
+            TodoReadError::new(
+                astra_tools::task_mgmt::TaskStoreHealth::TransportUnavailable,
+                error,
+            )
+        })?
         .send()
         .await
-        .map_err(|e| format!("network: {e}"))?;
+        .map_err(|e| {
+            TodoReadError::new(
+                astra_tools::task_mgmt::TaskStoreHealth::TransportUnavailable,
+                format!("network: {e}"),
+            )
+        })?;
     let status_code = resp.status();
     if !status_code.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format_cloud_error(status_code, &body));
+        return Err(TodoReadError::new(
+            health_for_http_status(
+                status_code,
+                astra_tools::task_mgmt::TaskStoreHealth::ProtocolMismatch,
+            ),
+            format_cloud_error(status_code, &body),
+        ));
     }
-    let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
-    let summary_count = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v.get("total").and_then(|t| t.as_u64()))
-        .unwrap_or(0);
-    Ok(format!(
-        "Cross-session todos: {summary_count} {status} item(s)\n{body}"
-    ))
+    resp.json().await.map_err(|e| {
+        TodoReadError::new(
+            astra_tools::task_mgmt::TaskStoreHealth::ProtocolMismatch,
+            format!("decode response: {e}"),
+        )
+    })
+}
+
+async fn load_open_todo_summaries(
+    cloud_base: &str,
+    token: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(String, Vec<astra_tools::task_mgmt::OpenTaskSummary>)>, TodoReadError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let response = fetch_user_todos(cloud_base, token, "active").await?;
+    let mut grouped: Vec<(String, Vec<astra_tools::task_mgmt::OpenTaskSummary>)> = Vec::new();
+    for entry in response.tasks.into_iter().take(limit) {
+        let status = astra_tools::task_mgmt::SessionTaskStatusKind::from_status_str(&entry.status);
+        if !status.is_open_work() {
+            return Err(TodoReadError::new(
+                astra_tools::task_mgmt::TaskStoreHealth::ProtocolMismatch,
+                format!(
+                    "cloud active todo '{}' has non-open status '{}'",
+                    entry.todo_id, entry.status
+                ),
+            ));
+        }
+        let summary = astra_tools::task_mgmt::OpenTaskSummary {
+            id: entry.todo_id,
+            title: entry.title,
+            status,
+            updated_at: entry.updated_at,
+        };
+        if let Some((_, tasks)) = grouped
+            .iter_mut()
+            .find(|(session_id, _)| session_id == &entry.session_id)
+        {
+            tasks.push(summary);
+        } else {
+            grouped.push((entry.session_id, vec![summary]));
+        }
+    }
+    Ok(grouped)
 }
 
 /// `GET /sessions/{sid}/todos` — full list, used by the task board
@@ -194,32 +323,88 @@ pub async fn load_todos(
     token: Option<&str>,
     session_id: &str,
 ) -> Result<Vec<astra_tools::task_mgmt::SessionTask>, String> {
+    load_todos_read(cloud_base, token, session_id)
+        .await
+        .map_err(|error| error.message)
+}
+
+async fn load_todos_read(
+    cloud_base: &str,
+    token: Option<&str>,
+    session_id: &str,
+) -> Result<Vec<astra_tools::task_mgmt::SessionTask>, TodoReadError> {
     let url = format!(
         "{}/sessions/{}/todos",
         cloud_base.trim_end_matches('/'),
         session_id
     );
-    let resp = build_request(reqwest::Method::GET, &url, token)?
+    let resp = build_request(reqwest::Method::GET, &url, token)
+        .map_err(|error| {
+            TodoReadError::new(
+                astra_tools::task_mgmt::TaskStoreHealth::TransportUnavailable,
+                error,
+            )
+        })?
         .send()
         .await
-        .map_err(|e| format!("network: {e}"))?;
+        .map_err(|e| {
+            TodoReadError::new(
+                astra_tools::task_mgmt::TaskStoreHealth::TransportUnavailable,
+                format!("network: {e}"),
+            )
+        })?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format_cloud_error(status, &body));
+        return Err(TodoReadError::new(
+            health_for_http_status(
+                status,
+                astra_tools::task_mgmt::TaskStoreHealth::SessionUnavailable,
+            ),
+            format_cloud_error(status, &body),
+        ));
     }
-    let parsed: LoadTodosResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("decode response: {e}"))?;
+    let parsed: LoadTodosResponse = resp.json().await.map_err(|e| {
+        TodoReadError::new(
+            astra_tools::task_mgmt::TaskStoreHealth::ProtocolMismatch,
+            format!("decode response: {e}"),
+        )
+    })?;
     Ok(parsed.tasks)
 }
 
 // ─── HttpTaskStore ─────────────────────────────────────────────────
 
-use astra_tools::task_mgmt::{SessionTask, TaskMutation, TaskStore};
+use astra_tools::task_mgmt::{
+    OpenTaskSummary, SessionTask, TaskMutation, TaskStore, TaskStoreHealth,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+fn task_store_health_code(health: TaskStoreHealth) -> u8 {
+    match health {
+        TaskStoreHealth::Unknown => 0,
+        TaskStoreHealth::Ready => 1,
+        TaskStoreHealth::AuthenticationRequired => 2,
+        TaskStoreHealth::SessionUnavailable => 3,
+        TaskStoreHealth::ServiceUnavailable => 4,
+        TaskStoreHealth::TransportUnavailable => 5,
+        TaskStoreHealth::ProtocolMismatch => 6,
+    }
+}
+
+fn task_store_health_from_code(code: u8) -> TaskStoreHealth {
+    match code {
+        1 => TaskStoreHealth::Ready,
+        2 => TaskStoreHealth::AuthenticationRequired,
+        3 => TaskStoreHealth::SessionUnavailable,
+        4 => TaskStoreHealth::ServiceUnavailable,
+        5 => TaskStoreHealth::TransportUnavailable,
+        6 => TaskStoreHealth::ProtocolMismatch,
+        _ => TaskStoreHealth::Unknown,
+    }
+}
 
 /// A read-only `TaskStore` backed by the server's REST API. The
 /// observer polls `load()` → `GET /sessions/{sid}/todos`; mutations
@@ -228,8 +413,30 @@ use std::sync::Arc;
 /// immediately (≤50ms dirty window).
 pub struct HttpTaskStore {
     cloud_base: String,
-    token: Option<String>,
+    credentials: TaskStoreCredentials,
     notify_tx: tokio::sync::broadcast::Sender<String>,
+    health: AtomicU8,
+}
+
+/// The task board is a long-lived TUI dependency. Its credentials must not be
+/// a startup snapshot: login and token refresh can happen after the observer
+/// has been created. Tests and one-shot callers may still deliberately supply
+/// a fixed token, so make that distinction explicit instead of silently
+/// treating a stale startup token as current authentication.
+enum TaskStoreCredentials {
+    Fixed(Option<String>),
+    Profile(Option<String>),
+}
+
+impl TaskStoreCredentials {
+    fn access_token(&self) -> Option<String> {
+        match self {
+            Self::Fixed(token) => token.clone(),
+            Self::Profile(profile) => {
+                crate::cli::session::session_runtime::current_access_token(profile.as_deref())
+            }
+        }
+    }
 }
 
 impl HttpTaskStore {
@@ -240,8 +447,26 @@ impl HttpTaskStore {
         let (tx, _) = tokio::sync::broadcast::channel(32);
         let store = Arc::new(Self {
             cloud_base: cloud_base.into(),
-            token,
+            credentials: TaskStoreCredentials::Fixed(token),
             notify_tx: tx.clone(),
+            health: AtomicU8::new(task_store_health_code(TaskStoreHealth::Unknown)),
+        });
+        (store, tx)
+    }
+
+    /// Build a store for the interactive CLI. The access token is resolved at
+    /// request time so an existing task board converges after `/login` or a
+    /// silent refresh without a TUI restart.
+    pub fn for_profile(
+        cloud_base: impl Into<String>,
+        profile: Option<&str>,
+    ) -> (Arc<Self>, tokio::sync::broadcast::Sender<String>) {
+        let (tx, _) = tokio::sync::broadcast::channel(32);
+        let store = Arc::new(Self {
+            cloud_base: cloud_base.into(),
+            credentials: TaskStoreCredentials::Profile(profile.map(str::to_owned)),
+            notify_tx: tx.clone(),
+            health: AtomicU8::new(task_store_health_code(TaskStoreHealth::Unknown)),
         });
         (store, tx)
     }
@@ -249,8 +474,47 @@ impl HttpTaskStore {
 
 #[async_trait]
 impl TaskStore for HttpTaskStore {
+    fn health_snapshot(&self) -> TaskStoreHealth {
+        task_store_health_from_code(self.health.load(Ordering::Acquire))
+    }
+
     async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
-        load_todos(&self.cloud_base, self.token.as_deref(), session_id).await
+        let token = self.credentials.access_token();
+        match load_todos_read(&self.cloud_base, token.as_deref(), session_id).await {
+            Ok(tasks) => {
+                self.health.store(
+                    task_store_health_code(TaskStoreHealth::Ready),
+                    Ordering::Release,
+                );
+                Ok(tasks)
+            }
+            Err(error) => {
+                self.health
+                    .store(task_store_health_code(error.health), Ordering::Release);
+                Err(error.message)
+            }
+        }
+    }
+
+    async fn load_open_task_summaries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<OpenTaskSummary>)>, String> {
+        let token = self.credentials.access_token();
+        match load_open_todo_summaries(&self.cloud_base, token.as_deref(), limit).await {
+            Ok(summaries) => {
+                self.health.store(
+                    task_store_health_code(TaskStoreHealth::Ready),
+                    Ordering::Release,
+                );
+                Ok(summaries)
+            }
+            Err(error) => {
+                self.health
+                    .store(task_store_health_code(error.health), Ordering::Release);
+                Err(error.message)
+            }
+        }
     }
 
     async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
@@ -298,21 +562,28 @@ impl TaskStore for HttpTaskStore {
 // Each test wires a fresh wiremock server playing the role of
 // astra-server's `/sessions/{sid}/todos*` endpoints, builds the real
 // HttpTaskStore + TaskBoardObserver, and asserts the observable
-// behaviour (mutations land within an SLA, completed tasks age out).
+// behaviour (mutations land within an SLA and terminal tasks remain
+// inspectable through the canonical projection).
 // No MatrixOne, no axum, no SSE.
 // ───────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod wiring_e2e {
-    use super::{HttpTaskStore, copy_todos_for_fork, execute_todo_action, list_user_todos};
+    use super::{
+        HttpTaskStore, copy_todos_for_fork, execute_todo_action, health_for_http_status,
+        list_user_todos,
+    };
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::lock_recovery::LockRecovery;
-    use crate::tui::task_board_observer::{COMPLETED_TASK_TTL, TaskBoardObserver};
-    use astra_tools::task_mgmt::{SessionTask, TaskStore};
+    use crate::test_utils::ProcessEnvGuard;
+    use crate::tests::isolate_credentials;
+    use crate::tui::task_board_observer::TaskBoardObserver;
+    use astra_tools::task_mgmt::{SessionTask, TaskStore, TaskStoreHealth};
     use serde_json::{Value, json};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     /// Build a stub server that:
@@ -460,6 +731,47 @@ mod wiring_e2e {
         assert_eq!(snap.tasks[0].title, "first task");
     }
 
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn profile_backed_store_uses_credentials_written_after_startup() {
+        let _credentials = isolate_credentials();
+        let _access_token = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let mut credentials = CredentialsFile {
+            current_profile: Some("task-board".to_string()),
+            ..Default::default()
+        };
+        credentials.profiles.insert(
+            "task-board".to_string(),
+            Profile {
+                access_token: Some("token-at-startup".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&credentials).expect("write initial credentials");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/session-a/todos"))
+            .and(header("authorization", "Bearer token-after-refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tasks": [] })))
+            .mount(&server)
+            .await;
+        let (store, _notify_tx) = HttpTaskStore::for_profile(server.uri(), Some("task-board"));
+
+        credentials
+            .profiles
+            .get_mut("task-board")
+            .expect("profile must exist")
+            .access_token = Some("token-after-refresh".to_string());
+        save_credentials(&credentials).expect("write refreshed credentials");
+
+        let tasks = store
+            .load("session-a")
+            .await
+            .expect("task board must use the refreshed token");
+        assert!(tasks.is_empty());
+    }
+
     #[tokio::test]
     async fn list_user_todos_summary_names_requested_status() {
         let server = MockServer::start().await;
@@ -479,6 +791,189 @@ mod wiring_e2e {
         assert!(
             output.starts_with("Cross-session todos: 2 completed item(s)"),
             "summary should name the requested status, not always active: {output}"
+        );
+    }
+
+    #[test]
+    fn task_read_http_statuses_map_to_structured_recovery_classes() {
+        assert_eq!(
+            health_for_http_status(
+                reqwest::StatusCode::UNAUTHORIZED,
+                TaskStoreHealth::ProtocolMismatch
+            ),
+            TaskStoreHealth::AuthenticationRequired
+        );
+        assert_eq!(
+            health_for_http_status(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                TaskStoreHealth::ProtocolMismatch
+            ),
+            TaskStoreHealth::ServiceUnavailable
+        );
+        assert_eq!(
+            health_for_http_status(
+                reqwest::StatusCode::NOT_FOUND,
+                TaskStoreHealth::SessionUnavailable
+            ),
+            TaskStoreHealth::SessionUnavailable
+        );
+        assert_eq!(
+            health_for_http_status(
+                reqwest::StatusCode::NOT_FOUND,
+                TaskStoreHealth::ProtocolMismatch
+            ),
+            TaskStoreHealth::ProtocolMismatch
+        );
+        assert_eq!(
+            health_for_http_status(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                TaskStoreHealth::ProtocolMismatch
+            ),
+            TaskStoreHealth::ServiceUnavailable
+        );
+        assert_eq!(
+            health_for_http_status(
+                reqwest::StatusCode::BAD_REQUEST,
+                TaskStoreHealth::SessionUnavailable
+            ),
+            TaskStoreHealth::ProtocolMismatch
+        );
+    }
+
+    #[tokio::test]
+    async fn http_store_cross_session_summaries_reach_the_tui_without_fabricated_tasks() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/me/todos"))
+            .and(query_param("status", "active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tasks": [
+                    {
+                        "session_id": "session-b",
+                        "todo_id": "task-b1",
+                        "title": "newest remote work",
+                        "status": "in_progress",
+                        "updated_at": "2026-07-11T12:03:00Z",
+                        "session_started_at": "2026-07-11T12:00:00Z",
+                        "session_title": "Remote B"
+                    },
+                    {
+                        "session_id": "session-a",
+                        "todo_id": "task-a1",
+                        "title": "queued remote work",
+                        "status": "pending",
+                        "updated_at": "2026-07-11T12:02:00Z"
+                    },
+                    {
+                        "session_id": "session-b",
+                        "todo_id": "task-b2",
+                        "title": "paused remote work",
+                        "status": "paused",
+                        "updated_at": "2026-07-11T12:01:00Z"
+                    }
+                ],
+                "total": 3
+            })))
+            .mount(&server)
+            .await;
+
+        let (store, _notify_tx) = HttpTaskStore::new(server.uri(), None);
+        let bounded = store
+            .load_open_task_summaries(2)
+            .await
+            .expect("typed cross-session read");
+        assert_eq!(
+            bounded.iter().map(|(_, tasks)| tasks.len()).sum::<usize>(),
+            2
+        );
+        assert_eq!(bounded[0].0, "session-b");
+        assert_eq!(bounded[0].1[0].id, "task-b1");
+        assert_eq!(bounded[0].1[0].updated_at, "2026-07-11T12:03:00Z");
+        assert_eq!(bounded[1].0, "session-a");
+
+        let observer = TaskBoardObserver::new(store as Arc<dyn TaskStore>, "session-a");
+        observer.toggle_view_mode();
+        wait_until(
+            || {
+                observer
+                    .multi_snapshot()
+                    .per_session
+                    .iter()
+                    .map(|(_, tasks)| tasks.len())
+                    .sum::<usize>()
+                    == 3
+            },
+            500,
+            || observer.maybe_refresh(),
+        )
+        .await
+        .expect("HTTP cross-session summaries must reach the all-sessions TUI lane");
+        let snapshot = observer.multi_snapshot();
+        assert_eq!(snapshot.per_session.len(), 2);
+        assert_eq!(snapshot.per_session[0].0, "session-b");
+        assert_eq!(snapshot.per_session[0].1[1].title, "paused remote work");
+    }
+
+    #[tokio::test]
+    async fn http_store_rejects_non_open_rows_from_the_active_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/me/todos"))
+            .and(query_param("status", "active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "tasks": [{
+                    "session_id": "session-a",
+                    "todo_id": "task-done",
+                    "title": "should not be active",
+                    "status": "completed",
+                    "updated_at": "2026-07-11T12:00:00Z"
+                }],
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let (store, _notify_tx) = HttpTaskStore::new(server.uri(), None);
+        let error = store
+            .load_open_task_summaries(200)
+            .await
+            .expect_err("active endpoint contract violations must fail closed");
+        assert!(
+            error.contains("task-done") && error.contains("completed"),
+            "{error}"
+        );
+        assert_eq!(store.health_snapshot(), TaskStoreHealth::ProtocolMismatch);
+    }
+
+    #[tokio::test]
+    async fn http_store_service_failure_reaches_observer_as_structured_health() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/session-a/todos"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "detail": "session_todos storage unavailable"
+            })))
+            .mount(&server)
+            .await;
+
+        let (store, _notify_tx) = HttpTaskStore::new(server.uri(), None);
+        let observer = TaskBoardObserver::new(store.clone() as Arc<dyn TaskStore>, "session-a");
+        observer.maybe_refresh();
+        wait_until(
+            || {
+                observer.truth_state()
+                    == crate::tui::task_board_observer::TaskBoardTruthState::Unavailable
+            },
+            500,
+            || observer.maybe_refresh(),
+        )
+        .await
+        .expect("failed storage read must reach observer truth");
+
+        assert_eq!(store.health_snapshot(), TaskStoreHealth::ServiceUnavailable);
+        assert_eq!(
+            observer.active_projection().store_health(),
+            TaskStoreHealth::ServiceUnavailable
         );
     }
 
@@ -602,14 +1097,11 @@ mod wiring_e2e {
         );
     }
 
-    /// REGRESSION: completed tasks used to linger forever — only "all
-    /// completed" triggered a board-wide hide. With per-task TTL, a row
-    /// completed for longer than COMPLETED_TASK_TTL drops out of the
-    /// render snapshot but the truth snapshot keeps it for counts/audit.
-    /// We don't actually wait 30s; we force `completed_at` into the past
-    /// and assert the partition.
+    /// Completion is durable history, not a transient toast: the real HTTP
+    /// store path must keep a terminal row inspectable in the same canonical
+    /// task-board projection that reported its completion.
     #[tokio::test]
-    async fn completed_task_ages_out_of_render_snapshot_via_http_path() {
+    async fn completed_task_remains_renderable_via_http_path() {
         let (server, _state) = spawn_mock_server().await;
         let (store, notify_tx) = HttpTaskStore::new(server.uri(), None);
         let store_dyn: Arc<dyn TaskStore> = store.clone();
@@ -667,22 +1159,14 @@ mod wiring_e2e {
         .await
         .expect("completion must propagate");
 
-        // Fresh: the row stays in the render snapshot so the user sees
-        // the ✔ land.
-        assert_eq!(
-            observer.snapshot_for_render().tasks.len(),
-            1,
-            "fresh completion must still render"
-        );
-
-        // Force the TTL into the past — equivalent to 31s having passed.
-        observer
-            .testing_force_completed_at_past("task-1", COMPLETED_TASK_TTL + Duration::from_secs(1));
         assert!(
-            observer.snapshot_for_render().tasks.is_empty(),
-            "completed row past TTL must drop from render snapshot"
+            observer
+                .snapshot_for_render()
+                .tasks
+                .iter()
+                .any(|task| task.id == "task-1" && task.status.is_completed()),
+            "completed row must remain visible until a deliberate archive/delete"
         );
-        // Truth snapshot still carries the row — task-board counts reflect the full set.
         assert_eq!(observer.snapshot().tasks.len(), 1);
     }
 }

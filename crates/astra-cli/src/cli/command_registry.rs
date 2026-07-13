@@ -2,8 +2,7 @@
 //!
 //! This module consolidates:
 //! - Command names and descriptions
-//! - Group categorization (with icons)
-//! - Aliases
+//! - Group categorization
 //! - Subcommand completions
 //! - Argument hints
 //!
@@ -41,21 +40,6 @@ impl CommandGroup {
         CommandGroup::System,
     ];
 
-    /// Icon for this group (emoji).
-    pub const fn icon(&self) -> &'static str {
-        match self {
-            CommandGroup::Core => "⚡",
-            CommandGroup::Workspace => "📂",
-            CommandGroup::Observability => "🔭",
-            CommandGroup::SessionPlan => "📋",
-            CommandGroup::MemoryTasks => "🧠",
-            CommandGroup::Skills => "📦",
-            CommandGroup::Mcp => "🔌",
-            CommandGroup::TeamAccount => "👥",
-            CommandGroup::System => "🔧",
-        }
-    }
-
     /// Display title for this group.
     pub const fn title(&self) -> &'static str {
         match self {
@@ -72,19 +56,26 @@ impl CommandGroup {
     }
 }
 
-/// How a slash command is handled inside the TUI.
+/// Whether a slash command can be completed inside the workbench.
+///
+/// A command that is unavailable here is still valid for non-interactive
+/// command-line use. It must never cause the workbench to tear itself down and
+/// hand control to a different UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TuiHandler {
-    /// Opens a native TUI panel (e.g. /context → ContextPanel).
-    Panel,
-    /// Opens a TUI selector or picker (e.g. /model → model picker).
-    Selector,
-    /// Sent as chat input to the LLM (original REPL behavior).
-    ChatForward,
-    /// Handled inline in the dispatch function (e.g. /exit, /help).
-    Inline,
-    /// Tears down the TUI, runs the legacy slash handler, then restores the TUI.
-    Fallback,
+pub enum TuiCommandRoute {
+    /// Handled without tearing down the TUI.
+    Native,
+    /// Has no truthful workbench action yet.
+    Unavailable,
+}
+
+/// How prominently an action appears in interactive discovery surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandDiscoverability {
+    /// Shown when the user opens `/` or command help with no query.
+    Primary,
+    /// Hidden from the default list but available through typed search.
+    SearchOnly,
 }
 
 /// Metadata for a single slash command.
@@ -96,14 +87,19 @@ pub struct CommandMeta {
     pub description: &'static str,
     /// Which group this command belongs to.
     pub group: CommandGroup,
-    /// Whether this is an alias for another command.
-    pub is_alias: bool,
     /// Subcommand completions (token, description) for Tab completion.
     pub subcommands: &'static [(&'static str, &'static str)],
+    /// Workbench-specific completions. `None` means the command's complete
+    /// CLI surface is also available in the TUI; `Some` prevents a native
+    /// command from advertising subcommands that would leave the workbench or
+    /// merely print an unavailable usage string.
+    pub tui_subcommands: Option<&'static [(&'static str, &'static str)]>,
     /// Argument hint shown inline (e.g., "<name>").
     pub arg_hint: Option<&'static str>,
-    /// How this command is handled inside the TUI.
-    pub tui_handler: TuiHandler,
+    /// How this command is delivered inside the TUI.
+    pub tui_route: TuiCommandRoute,
+    /// Whether this command belongs in the default curated action surface.
+    pub discoverability: CommandDiscoverability,
     /// Usage examples for the help display (without leading `/`).
     pub usage_examples: &'static [&'static str],
 }
@@ -115,18 +111,13 @@ impl CommandMeta {
             name,
             description,
             group,
-            is_alias: false,
             subcommands: &[],
+            tui_subcommands: None,
             arg_hint: None,
-            tui_handler: TuiHandler::ChatForward,
+            tui_route: TuiCommandRoute::Unavailable,
+            discoverability: CommandDiscoverability::SearchOnly,
             usage_examples: &[],
         }
-    }
-
-    /// Mark as an alias.
-    pub const fn alias(mut self) -> Self {
-        self.is_alias = true;
-        self
     }
 
     /// Add subcommands for Tab completion.
@@ -138,16 +129,49 @@ impl CommandMeta {
         self
     }
 
+    /// Narrow subcommand discovery to actions with a real in-workbench
+    /// interaction. The command remains available to non-interactive CLI
+    /// callers through [`Self::subcommands`].
+    pub const fn with_tui_subcommands(
+        mut self,
+        subcommands: &'static [(&'static str, &'static str)],
+    ) -> Self {
+        self.tui_subcommands = Some(subcommands);
+        self
+    }
+
+    pub const fn visible_tui_subcommands(&self) -> &'static [(&'static str, &'static str)] {
+        match self.tui_subcommands {
+            Some(subcommands) => subcommands,
+            None => self.subcommands,
+        }
+    }
+
     /// Add argument hint.
     pub const fn with_arg_hint(mut self, hint: &'static str) -> Self {
         self.arg_hint = Some(hint);
         self
     }
 
-    /// Set how this command is handled inside the TUI.
-    pub const fn with_tui_handler(mut self, handler: TuiHandler) -> Self {
-        self.tui_handler = handler;
+    /// Set how this command is delivered inside the TUI.
+    pub const fn with_tui_route(mut self, route: TuiCommandRoute) -> Self {
+        self.tui_route = route;
         self
+    }
+
+    /// Promote this command into the default curated action surface.
+    pub const fn primary(mut self) -> Self {
+        self.discoverability = CommandDiscoverability::Primary;
+        self
+    }
+
+    pub const fn is_primary(&self) -> bool {
+        matches!(self.discoverability, CommandDiscoverability::Primary)
+    }
+
+    /// Whether this action can be discovered and completed inside the TUI.
+    pub const fn is_available_in_tui(&self) -> bool {
+        matches!(self.tui_route, TuiCommandRoute::Native)
     }
 
     /// Add usage examples for help display.
@@ -172,8 +196,6 @@ const STATS_SUBCOMMANDS: &[(&str, &str)] = &[
     ("learn", "Learning insights: patterns, drift, exploration"),
     ("tools", "Tool performance: calls, timing, success rate"),
 ];
-
-const HEALTH_SUBCOMMANDS: &[(&str, &str)] = &[("detail", "Per-tool breakdown")];
 
 const SYNC_SUBCOMMANDS: &[(&str, &str)] = &[("log", "Server-owned sync log hint")];
 
@@ -217,28 +239,6 @@ const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
     ("read", "Read a resource: /mcp read <server>:<uri>"),
     ("ping", "Ping: /mcp ping [server]"),
     ("history", "Recent MCP tool-call history"),
-    ("add", "Add server: /mcp add <name> <command> [args…]"),
-    ("remove", "Remove server: /mcp remove <name>"),
-    (
-        "prompt",
-        "Invoke prompt: /mcp prompt <server>:<name> [args]",
-    ),
-    (
-        "complete",
-        "Arg completions: /mcp complete <server>:prompt:<name> <arg> [value]",
-    ),
-    (
-        "log-level",
-        "Set log level: /mcp log-level <server> <level>",
-    ),
-    (
-        "subscribe",
-        "Subscribe to resource: /mcp subscribe <server>:<uri>",
-    ),
-    (
-        "unsubscribe",
-        "Unsubscribe: /mcp unsubscribe <server>:<uri>",
-    ),
 ];
 
 const TASK_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -248,6 +248,8 @@ const TASK_SUBCOMMANDS: &[(&str, &str)] = &[
     ("result", "Task result (needs id)"),
     ("status", "Task status (needs id/query)"),
 ];
+
+const TUI_TASK_SUBCOMMANDS: &[(&str, &str)] = &[("list", "Open background work")];
 
 const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
     // ── Browse ──
@@ -281,6 +283,17 @@ const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
     ("health", "Memory hygiene status"),
 ];
 
+// The workbench exposes only memory actions that complete on a native
+// surface. Mutation/branch/checkpoint commands remain line-mode work until
+// they gain an inspectable scoped flow instead of a text-only fallback.
+const TUI_MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("list", "Browse remembered facts"),
+    ("search", "Search remembered facts (needs a query)"),
+    ("stats", "Open memory statistics"),
+    ("health", "Open memory health"),
+    ("session", "Show memory for this session"),
+];
+
 const PROFILE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("show", "Show the current user profile"),
     ("edit", "Edit a preference"),
@@ -293,11 +306,9 @@ const PROFILE_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 // Subcommands surfaced by the `/session ` popup.  Kept tight so
-// completion shows only the high-value entry points; rarer
-// diagnostic forms (cleanup / drift / errors / trace / verify /
-// adaptive / switch) still work via the line-mode fallback but
-// aren't advertised — most users reach them through dedicated
-// slash commands or the /diag tooling instead.
+// completion shows only the high-value workbench entry points. Rarer
+// diagnostics are deliberately not exposed here until they have a real
+// in-workbench interaction.
 const SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
     ("analyze", "Counter-only diagnostics for a session"),
     ("export", "Write a markdown transcript to disk"),
@@ -328,7 +339,10 @@ const ALLOW_SUBCOMMANDS: &[(&str, &str)] = &[
         "bypass",
         "Skip approval prompts; catastrophic and policy hard-denies still apply",
     ),
-    ("plan", "Read-only investigation mode; mutations are denied"),
+    (
+        "read_only",
+        "Read-only tool capability; use /plan to enter the planning workflow",
+    ),
     (
         "accept_edits",
         "Auto-approve workspace-local file edits while still prompting for shell and external writes",
@@ -361,14 +375,6 @@ const TEAM_SUBCOMMANDS: &[(&str, &str)] = &[
     ("snapshot", "Save a team snapshot"),
 ];
 
-const AGENT_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("help", "Show agent help"),
-    ("list", "List spawned agents"),
-    ("logs", "Show agent logs"),
-    ("status", "Show agent status"),
-    ("stop", "Stop an agent"),
-];
-
 const MESSAGING_SUBCOMMANDS: &[(&str, &str)] = &[
     ("dlq", "Show dead letter queue"),
     ("help", "Show messaging help"),
@@ -382,15 +388,15 @@ const COMPACT_SUBCOMMANDS: &[(&str, &str)] = &[
     ("summary-only", "Summarize without trimming"),
 ];
 
-const CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("diff", "Show differences from defaults"),
-    ("export", "Export configuration to file"),
-    ("paths", "Show config file paths"),
-    ("show", "Show current configuration"),
-    ("sources", "Show where each value came from"),
-];
+const CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[("edit", "Open the runtime configuration editor")];
 
 const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
+
+const TUI_AGENT_SUBCOMMANDS: &[(&str, &str)] = &[("list", "Open the agent workbench")];
+
+// `/skill` itself opens the `$` skill browser. Do not advertise marketplace
+// management commands in the TUI until they have a first-class native flow.
+const TUI_SKILL_SUBCOMMANDS: &[(&str, &str)] = &[];
 
 // ── The unified command registry ────────────────────────────────────────────
 
@@ -403,7 +409,8 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Core,
     )
     .with_subcommands(HELP_SUBCOMMANDS)
-    .with_tui_handler(TuiHandler::Inline),
+    .with_tui_route(TuiCommandRoute::Native)
+    .primary(),
     CommandMeta::new(
         "/model",
         "Open the model picker, show current model, or switch",
@@ -411,71 +418,60 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(MODEL_SUBCOMMANDS)
     .with_arg_hint("[info | list | clear | <name>]")
-    .with_tui_handler(TuiHandler::Selector),
-    CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
-        .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Native)
+    .primary(),
+CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new("/undo", "Undo last turn(s): /undo [N]", CommandGroup::Core)
         .with_arg_hint("[N]")
-        .with_tui_handler(TuiHandler::Fallback),
+        .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/redo",
         "Redo undone turn(s): /redo [N]",
         CommandGroup::Core,
     )
     .with_arg_hint("[N]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/checkpoint",
         "Manual save: /checkpoint [label] — JSON + session md + journal",
         CommandGroup::Core,
     )
     .with_arg_hint("[label]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/history",
-        "Conversation turns; /history grep <q> filters in-memory",
+        "Browse conversation history; the workbench opens the complete transcript",
         CommandGroup::Core,
-    ),
+    )
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/copy",
         "Copy last response to clipboard",
         CommandGroup::Core,
-    ),
+    )
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/resume",
         "Resume a session: /resume [session_id]",
         CommandGroup::Core,
     )
     .with_arg_hint("[session_id]")
-    .with_tui_handler(TuiHandler::Panel),
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/timeline",
         "Browse this session's turn-by-turn journal timeline",
         CommandGroup::Core,
     )
-    .with_tui_handler(TuiHandler::Panel),
-    CommandMeta::new(
-        "/table",
-        "Run a SQL query and render the result as a navigable table",
-        CommandGroup::Core,
-    )
-    .with_arg_hint("<sql>")
-    .with_tui_handler(TuiHandler::Panel),
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/worktrees",
         "List git worktrees for this repo with per-worktree session counts",
         CommandGroup::Core,
     )
-    .with_tui_handler(TuiHandler::Panel),
-    CommandMeta::new(
-        "/panels",
-        "Cheat sheet of all TUI-native panels",
-        CommandGroup::Core,
-    )
-    .with_tui_handler(TuiHandler::Inline),
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new("/exit", "Exit astra", CommandGroup::Core)
-        .with_tui_handler(TuiHandler::Inline),
-    CommandMeta::new("/quit", "Exit astra (alias for /exit)", CommandGroup::Core).alias(),
+        .with_tui_route(TuiCommandRoute::Native),
     // ── Workspace ─────────────────────────────────────────────────────────
     CommandMeta::new(
         "/grep",
@@ -483,7 +479,7 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Workspace,
     )
     .with_arg_hint("<pattern>")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/diff",
         "Colored git diff (staged, stat, show <rev>, …)",
@@ -491,7 +487,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(DIFF_SUBCOMMANDS)
     .with_arg_hint("[staged|unstaged|stat|show <rev>]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/review",
         "LLM review of git changes: /review [latest|<rev>|working]",
@@ -499,7 +495,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(REVIEW_SUBCOMMANDS)
     .with_arg_hint("[latest|<rev>|working]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     // ── Session & plan ───────────────────────────────────────────────────
     CommandMeta::new(
         "/session",
@@ -507,85 +503,49 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::SessionPlan,
     )
     .with_subcommands(SESSION_SUBCOMMANDS)
-    .with_arg_hint("[list | history | fork | analyze | export]"),
-    // session sub-commands — aliases, no TUI handler needed
-    CommandMeta::new(
-        "/session history",
-        "Session journal-style history",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/session errors",
-        "Session errors from journal",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/session export",
-        "Export session to timestamped Markdown in cwd",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/session fork",
-        "Fork session — new id, copy journal (multi-agent / experiments)",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/session list",
-        "All journals + cwd / git / age from workspace",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/session cleanup",
-        "Clean stale sessions: --days N, --force, --compress",
-        CommandGroup::SessionPlan,
-    ),
-    CommandMeta::new(
-        "/session verify",
-        "Verify session integrity",
-        CommandGroup::SessionPlan,
-    ),
+    .with_arg_hint("[list | history | fork | analyze | export]")
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/plan",
-        "Enter plan mode; optionally start with a description",
+        "Enter or approve plan mode; describe the plan in the composer",
         CommandGroup::SessionPlan,
     )
-    .with_arg_hint("[description]")
-    .with_tui_handler(TuiHandler::Inline),
+    .with_tui_route(TuiCommandRoute::Native)
+    .primary(),
     CommandMeta::new(
         "/report",
         "Last delivery report (/report save = JSON)",
         CommandGroup::SessionPlan,
     )
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     // ── Memory & tasks ────────────────────────────────────────────────────
     CommandMeta::new(
         "/memory",
-        "Memoria: browse/search/stats in-panel; health pane; details/manage text-first",
+        "Browse, search, and inspect remembered facts",
         CommandGroup::MemoryTasks,
     )
     .with_subcommands(MEMORY_SUBCOMMANDS)
-    .with_arg_hint("[list|ls|search <q>|stats|show <id>|session|help]"),
+    .with_tui_subcommands(TUI_MEMORY_SUBCOMMANDS)
+    .with_arg_hint("[list|ls|search <q>|stats|show <id>|session|help]")
+    .with_tui_route(TuiCommandRoute::Native)
+    .primary(),
     CommandMeta::new(
         "/task",
-        "Background tasks: list, pending, status, run <prompt>, result <id>",
+        "Open background work",
         CommandGroup::MemoryTasks,
     )
     .with_subcommands(TASK_SUBCOMMANDS)
-    .with_arg_hint("[list|pending|status <id>|run <prompt>|result <id>]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_subcommands(TUI_TASK_SUBCOMMANDS)
+    .with_arg_hint("[list]")
+    .with_tui_route(TuiCommandRoute::Native)
+    .primary(),
     // ── Observability ─────────────────────────────────────────────────────
     CommandMeta::new(
         "/explain",
         "Cycle explain: off → on (API) → verbose (+stderr)",
         CommandGroup::Observability,
     )
-    .with_tui_handler(TuiHandler::Fallback),
-    CommandMeta::new(
-        "/verbose",
-        "(removed — use /stats)",
-        CommandGroup::Observability,
-    )
-    .alias(),
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/compact",
         "Summarize & trim history (quick | no-memoria, …)",
@@ -593,38 +553,34 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(COMPACT_SUBCOMMANDS)
     .with_arg_hint("[quick|no-memoria|summary-only]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/reflect",
         "Reflect on session observations (topic/facet, e.g. execution/errors)",
         CommandGroup::Observability,
     )
-    .with_tui_handler(TuiHandler::Fallback),
-    CommandMeta::new(
-        "/turn",
-        "(removed — use /timeline, Enter to drill into a turn)",
-        CommandGroup::Observability,
-    )
-    .alias(),
+    .with_arg_hint("[topic[/facet] [depth] [question] | diff]")
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/debug",
         "Developer-oriented session debugger: messages, tools, injections",
         CommandGroup::Observability,
     )
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/cache",
         "Prompt-cache summary and diagnosis for the active session",
         CommandGroup::Observability,
     )
     .with_arg_hint("[diagnosis|diag|detail]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/inspect",
-        "Harness snapshots and exports: budget, tools, context, diff, trace, …",
+        "Open the runtime inspector",
         CommandGroup::Observability,
     )
-    .with_arg_hint("[budget|tools|context|cache|json|diff|history N|trace|forensics|export path]"),
+    .with_tui_route(TuiCommandRoute::Native)
+    .primary(),
     CommandMeta::new(
         "/stats",
         "Session analytics: overview, history, tools, cost, health, learning",
@@ -632,28 +588,28 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(STATS_SUBCOMMANDS)
     .with_arg_hint("[cost|health|history|learn|tools]")
-    .with_tui_handler(TuiHandler::Selector),
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/lsp",
         "LSP backend status: /lsp [status]",
         CommandGroup::Observability,
     )
     .with_arg_hint("[status]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/telemetry",
         "Deep observability traces: turns, drift, decisions, profile, context",
         CommandGroup::Observability,
     )
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/config",
-        "Runtime config: panel for edit; show|paths|sources|diff|export stay text-first",
+        "Open the runtime configuration editor",
         CommandGroup::Observability,
     )
     .with_subcommands(CONFIG_SUBCOMMANDS)
-    .with_arg_hint("[edit|show|paths|sources|diff|export [path]]")
-    .with_tui_handler(TuiHandler::Panel),
+    .with_arg_hint("[edit]")
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/sync",
         "Cloud sync status (server-owned)",
@@ -661,7 +617,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(SYNC_SUBCOMMANDS)
     .with_arg_hint("[log|push|pull]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/context",
         "Open the context panel (TUI) or dump a snapshot to disk",
@@ -669,56 +625,39 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(&[("dump", "Write a JSON snapshot of the live context to disk")])
     .with_arg_hint("[dump [path]]")
-    .with_tui_handler(TuiHandler::Panel),
+    .with_tui_route(TuiCommandRoute::Native)
+    .primary(),
     CommandMeta::new(
         "/rewind",
         "Rewind conversation to an earlier turn",
         CommandGroup::Observability,
     )
     .with_arg_hint("<turn>")
-    .with_tui_handler(TuiHandler::Fallback),
-    CommandMeta::new("/version", "Version info", CommandGroup::Observability),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/info",
         "System info at a glance: version, session, model, permissions, skills",
         CommandGroup::Observability,
     )
-    .with_tui_handler(TuiHandler::Panel),
-    CommandMeta::new("/whoami", "Alias for /info", CommandGroup::Observability)
-        .alias()
-        .with_tui_handler(TuiHandler::Panel),
-    CommandMeta::new(
-        "/health",
-        "Alias for /stats health",
-        CommandGroup::Observability,
-    )
-    .alias()
-    .with_subcommands(HEALTH_SUBCOMMANDS)
-    .with_arg_hint("[detail]")
-    .with_tui_handler(TuiHandler::Fallback),
-    CommandMeta::new(
-        "/experiment",
-        "(removed — use /profile experiments)",
-        CommandGroup::Observability,
-    )
-    .alias(),
+    .with_tui_route(TuiCommandRoute::Native),
     // ── Skills ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/skill",
-        "Skills: browse|list|info|install|publish|search|new|test|dev|system|…",
+        "Browse and activate available skills",
         CommandGroup::Skills,
     )
     .with_subcommands(SKILL_SUBCOMMANDS)
+    .with_tui_subcommands(TUI_SKILL_SUBCOMMANDS)
     .with_arg_hint("[browse|list|info|install|publish|search|new|test|dev|feedback|…]")
-    .with_tui_handler(TuiHandler::Selector),
+    .with_tui_route(TuiCommandRoute::Native),
     // ── MCP ───────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/mcp",
-        "MCP: list|tools|inspect|prompts|resources|read|ping|add|remove|…",
+        "MCP discovery: servers, tools, prompts, resources, and health",
         CommandGroup::Mcp,
     )
     .with_subcommands(MCP_SUBCOMMANDS)
-    .with_arg_hint("[subcommand]  e.g. tools, inspect <server>:<tool>")
+    .with_arg_hint("[servers|tools|inspect|prompts|resources|read|ping|history]")
     .with_usage_examples(&[
         "mcp list",
         "mcp tools",
@@ -726,10 +665,8 @@ pub static COMMANDS: &[CommandMeta] = &[
         "mcp inspect <server>:<tool>",
         "mcp read <server>:<uri>",
         "mcp ping [server]",
-        "mcp add <name> <command> [args…]",
-        "mcp remove <name>",
     ])
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Native),
     // ── Team & account ───────────────────────────────────────────────────
     CommandMeta::new(
         "/team",
@@ -738,15 +675,15 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(TEAM_SUBCOMMANDS)
     .with_arg_hint("[list|info|create|add-member|context|run|…]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/agent",
-        "Spawned agents: list, status, stop, logs",
+        "Observe and guide agents; inspect, pause, resume, or stop active runs",
         CommandGroup::TeamAccount,
     )
-    .with_subcommands(AGENT_SUBCOMMANDS)
-    .with_arg_hint("[list|status|stop|logs|help]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_subcommands(TUI_AGENT_SUBCOMMANDS)
+    .with_tui_route(TuiCommandRoute::Native)
+    .primary(),
     CommandMeta::new(
         "/messaging",
         "Inter-agent messaging: metrics, dlq, status",
@@ -754,21 +691,21 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(MESSAGING_SUBCOMMANDS)
     .with_arg_hint("[metrics|dlq|status|help]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/login",
         "Authenticate with the API",
         CommandGroup::TeamAccount,
     )
-    .with_tui_handler(TuiHandler::Panel),
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/register",
         "Register a new account",
         CommandGroup::TeamAccount,
     )
-    .with_tui_handler(TuiHandler::Panel),
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new("/logout", "Logout from the API", CommandGroup::TeamAccount)
-        .with_tui_handler(TuiHandler::Fallback),
+        .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/profile",
         "Profile preferences: show, edit, scenario, stats, tools, experiments, reset",
@@ -776,36 +713,38 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(PROFILE_SUBCOMMANDS)
     .with_arg_hint("[show|edit <key> <value>|scenario|stats|tools|experiments|reset]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     CommandMeta::new(
         "/memory-setup",
         "Guided Memoria configuration",
         CommandGroup::TeamAccount,
     )
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     // ── System ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/allow",
-        "Permission mode: /allow [auto|bypass|plan|accept_edits|prompt|deny|rules|trust|untrust|trace]",
+        "Tool policy: /allow [auto|bypass|read_only|accept_edits|prompt|deny|rules|trust|untrust|trace] · planning: /plan",
         CommandGroup::System,
     )
     .with_subcommands(ALLOW_SUBCOMMANDS)
-    .with_arg_hint("[auto|bypass|accept_edits|plan|prompt|deny|rules|trust|untrust|trace]")
-    .with_tui_handler(TuiHandler::Inline),
+    .with_arg_hint("[auto|bypass|read_only|accept_edits|prompt|deny|rules|trust|untrust|trace]")
+    .with_tui_route(TuiCommandRoute::Native)
+    .primary(),
     CommandMeta::new(
         "/instructions",
         "Project instructions: /instructions [show|reload|off]",
         CommandGroup::System,
     )
     .with_subcommands(INSTRUCTIONS_SUBCOMMANDS)
-    .with_arg_hint("[show|reload|off]"),
+    .with_arg_hint("[show|reload|off]")
+    .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/diagnostics",
         "Binary, API, auth, environment checks",
         CommandGroup::System,
     )
     .with_arg_hint("— run all checks")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
     // Note: /lsp is in Observability group, not duplicated here
     CommandMeta::new(
         "/bug",
@@ -813,7 +752,7 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::System,
     )
     .with_arg_hint("[copy|save]")
-    .with_tui_handler(TuiHandler::Fallback),
+    .with_tui_route(TuiCommandRoute::Unavailable),
 ];
 
 // ── Query functions ─────────────────────────────────────────────────────────
@@ -850,28 +789,26 @@ pub fn resolve_command_meta(input: &str) -> Option<&'static CommandMeta> {
 
 /// Suggest commands similar to the input (for typo correction / fuzzy matching).
 pub fn suggest_commands(input: &str, limit: usize) -> Vec<&'static str> {
-    let mut scored: Vec<(usize, bool, usize, &'static str)> = COMMANDS
+    let mut scored: Vec<(usize, usize, &'static str)> = COMMANDS
         .iter()
         .map(|m| {
             (
                 suggestion_score(m.name, input).saturating_add(command_usage::usage_boost(m.name)),
-                m.is_alias,
                 m.name.len(),
                 m.name,
             )
         })
-        .filter(|(score, _, _, _)| *score > 0)
+        .filter(|(score, _, _)| *score > 0)
         .collect();
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| a.3.cmp(b.3))
+            .then_with(|| a.2.cmp(b.2))
     });
     scored
         .into_iter()
         .take(limit)
-        .map(|(_, _, _, cmd)| cmd)
+        .map(|(_, _, cmd)| cmd)
         .collect()
 }
 
@@ -919,24 +856,24 @@ pub fn completion_candidates(prefix: &str) -> Vec<(&'static str, &'static str)> 
         .filter(|m| m.name.starts_with(prefix))
         .map(|m| (m.name, m.description))
         .collect();
-    // Sort: non-aliases first, then aliases, then by name
+    // Prefer the user's frequent commands, then stable command-name order.
     rows.sort_by(|(a_name, _), (b_name, _)| {
         let a_usage = command_usage::usage_count(a_name);
         let b_usage = command_usage::usage_count(b_name);
-        let a_alias = COMMANDS
-            .iter()
-            .find(|m| m.name == *a_name)
-            .is_some_and(|m| m.is_alias);
-        let b_alias = COMMANDS
-            .iter()
-            .find(|m| m.name == *b_name)
-            .is_some_and(|m| m.is_alias);
-        b_usage
-            .cmp(&a_usage)
-            .then_with(|| a_alias.cmp(&b_alias))
-            .then_with(|| a_name.cmp(b_name))
+        b_usage.cmp(&a_usage).then_with(|| a_name.cmp(b_name))
     });
     rows
+}
+
+/// Registered commands that have a complete native workbench interaction.
+///
+/// This is deliberately separate from `COMMANDS`: the registry also serves
+/// non-interactive CLI entry points, while the TUI must not advertise actions
+/// that would require a terminal handoff.
+pub fn tui_commands() -> impl Iterator<Item = &'static CommandMeta> {
+    COMMANDS
+        .iter()
+        .filter(|command| command.is_available_in_tui())
 }
 
 /// Get subcommand completions for a parent command.
@@ -949,7 +886,7 @@ pub fn subcommand_completions(parent: &str) -> Option<&'static [(&'static str, &
 
 /// Get commands belonging to a specific group.
 pub fn commands_by_group(group: CommandGroup) -> impl Iterator<Item = &'static CommandMeta> {
-    COMMANDS.iter().filter(move |m| m.group == group)
+    tui_commands().filter(move |command| command.group == group)
 }
 
 /// Fuzzy completion candidates: returns matches scored by quality (best first).
@@ -958,14 +895,13 @@ pub fn fuzzy_completion_candidates(
     partial: &str,
     score_fn: impl Fn(&str, &str) -> Option<usize>,
 ) -> Vec<(&'static str, &'static str)> {
-    let mut scored: Vec<(usize, u32, bool, &'static str, &'static str)> = COMMANDS
+    let mut scored: Vec<(usize, u32, &'static str, &'static str)> = COMMANDS
         .iter()
         .filter_map(|m| {
             score_fn(m.name, partial).map(|s| {
                 (
                     s.saturating_add(command_usage::usage_boost(m.name)),
                     command_usage::usage_count(m.name),
-                    m.is_alias,
                     m.name,
                     m.description,
                 )
@@ -975,12 +911,11 @@ pub fn fuzzy_completion_candidates(
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| a.3.cmp(b.3))
+            .then_with(|| a.2.cmp(b.2))
     });
     scored
         .into_iter()
-        .map(|(_, _, _, name, desc)| (name, desc))
+        .map(|(_, _, name, desc)| (name, desc))
         .collect()
 }
 
@@ -997,9 +932,9 @@ pub fn get_arg_hint(command: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, CommandGroup, TuiHandler, completion_candidates, fuzzy_completion_candidates,
-        get_arg_hint, resolve_command, resolve_command_meta, subcommand_completions,
-        suggest_commands,
+        COMMANDS, CommandGroup, TuiCommandRoute, completion_candidates,
+        fuzzy_completion_candidates, get_arg_hint, resolve_command, resolve_command_meta,
+        subcommand_completions, suggest_commands, tui_commands,
     };
     use crate::cli::command_usage;
 
@@ -1039,10 +974,21 @@ mod tests {
     }
 
     #[test]
-    fn aliases_are_marked() {
-        let quit = COMMANDS.iter().find(|m| m.name == "/quit");
-        assert!(quit.is_some(), "/quit should exist");
-        assert!(quit.unwrap().is_alias, "/quit should be marked as alias");
+    fn duplicate_and_obsolete_entry_points_are_removed() {
+        for command in [
+            "/quit",
+            "/whoami",
+            "/health",
+            "/panels",
+            "/turn",
+            "/verbose",
+            "/experiment",
+        ] {
+            assert!(
+                resolve_command_meta(command).is_none(),
+                "removed command {command} must not remain in the action surface"
+            );
+        }
     }
 
     #[test]
@@ -1103,16 +1049,39 @@ mod tests {
     }
 
     #[test]
+    fn workbench_subcommands_only_advertise_native_actions() {
+        let task = resolve_command_meta("/task").expect("task command registered");
+        assert!(task.subcommands.iter().any(|(name, _)| *name == "run"));
+        assert_eq!(
+            task.visible_tui_subcommands(),
+            [("list", "Open background work")]
+        );
+
+        let agent = resolve_command_meta("/agent").expect("agent command registered");
+        assert_eq!(
+            agent.visible_tui_subcommands(),
+            [("list", "Open the agent workbench")]
+        );
+
+        let inspect = resolve_command_meta("/inspect").expect("inspect command registered");
+        assert!(inspect.visible_tui_subcommands().is_empty());
+        assert_eq!(inspect.arg_hint, None);
+
+        let plan = resolve_command_meta("/plan").expect("plan command registered");
+        assert_eq!(plan.arg_hint, None);
+    }
+
+    #[test]
     fn allow_command_lists_accept_edits_mode() {
         let allow = COMMANDS
             .iter()
             .find(|meta| meta.name == "/allow")
             .expect("/allow command");
         assert!(allow.description.contains("accept_edits"));
-        assert!(allow.description.contains("plan"));
+        assert!(allow.description.contains("read_only"));
         assert_eq!(
             allow.arg_hint,
-            Some("[auto|bypass|accept_edits|plan|prompt|deny|rules|trust|untrust|trace]")
+            Some("[auto|bypass|read_only|accept_edits|prompt|deny|rules|trust|untrust|trace]")
         );
 
         let subs = subcommand_completions("/allow").expect("/allow subcommands");
@@ -1123,7 +1092,8 @@ mod tests {
         assert!(!subs.iter().any(|(tok, _)| *tok == "ask"));
         assert!(!subs.iter().any(|(tok, _)| *tok == "all"));
         assert!(!subs.iter().any(|(tok, _)| *tok == "status"));
-        assert!(subs.iter().any(|(tok, _)| *tok == "plan"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "read_only"));
+        assert!(!subs.iter().any(|(tok, _)| *tok == "plan"));
         assert!(subs.iter().any(|(tok, _)| *tok == "trust"));
         assert!(subs.iter().any(|(tok, _)| *tok == "untrust"));
         assert!(subs.iter().any(|(tok, _)| *tok == "trace"));
@@ -1198,52 +1168,35 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_completion_candidates_keep_aliases() {
-        let rows = fuzzy_completion_candidates("/qit", |tok, partial| {
-            if tok == "/quit" && partial == "/qit" {
+    fn fuzzy_completion_candidates_find_canonical_commands() {
+        let rows = fuzzy_completion_candidates("/modl", |tok, partial| {
+            if tok == "/model" && partial == "/modl" {
                 Some(1)
             } else {
                 None
             }
         });
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "/quit");
+        assert_eq!(rows[0].0, "/model");
     }
 
-    // ── resolve_command_meta / TuiHandler routing tests ──────────────────
+    // ── resolve_command_meta / TUI delivery tests ────────────────────────
 
     #[test]
-    fn resolve_command_meta_returns_tui_handler_panel() {
-        // /context is explicitly marked as Panel
-        let meta = resolve_command_meta("/context").expect("should resolve /context");
-        assert_eq!(meta.tui_handler, TuiHandler::Panel);
-    }
-
-    #[test]
-    fn resolve_command_meta_returns_tui_handler_selector() {
-        // /model is explicitly marked as Selector
-        let meta = resolve_command_meta("/model").expect("should resolve /model");
-        assert_eq!(meta.tui_handler, TuiHandler::Selector);
+    fn native_routes_cover_inline_panels_and_selectors_without_decorative_subtypes() {
+        for command in [
+            "/help", "/model", "/clear", "/context", "/mcp", "/task", "/agent", "/reflect",
+        ] {
+            let meta = resolve_command_meta(command).unwrap_or_else(|| panic!("missing {command}"));
+            assert_eq!(meta.tui_route, TuiCommandRoute::Native, "{command}");
+        }
     }
 
     #[test]
-    fn resolve_command_meta_returns_tui_handler_fallback() {
-        // /clear is explicitly marked as Fallback
-        let meta = resolve_command_meta("/clear").expect("should resolve /clear");
-        assert_eq!(meta.tui_handler, TuiHandler::Fallback);
-    }
-
-    #[test]
-    fn resolve_command_meta_returns_tui_handler_inline() {
-        // /help is explicitly marked as Inline
-        let meta = resolve_command_meta("/help").expect("should resolve /help");
-        assert_eq!(meta.tui_handler, TuiHandler::Inline);
-    }
-
-    #[test]
-    fn resolve_command_meta_uses_fallback_for_non_native_commands() {
-        let meta = resolve_command_meta("/mcp").expect("should resolve /mcp");
-        assert_eq!(meta.tui_handler, TuiHandler::Fallback);
+    fn resolve_command_meta_marks_non_native_action_unavailable_in_tui() {
+        let meta = resolve_command_meta("/undo").expect("should resolve /undo");
+        assert_eq!(meta.tui_route, TuiCommandRoute::Unavailable);
+        assert!(!meta.is_available_in_tui());
     }
 
     #[test]
@@ -1262,74 +1215,65 @@ mod tests {
     }
 
     #[test]
-    fn resolve_command_meta_prefix_match_also_resolves_handler() {
-        // /reg prefixes to /register which is marked as Panel
+    fn resolve_command_meta_prefix_match_also_resolves_route() {
         let meta = resolve_command_meta("/reg").expect("should resolve /reg → /register");
         assert_eq!(meta.name, "/register");
-        assert_eq!(meta.tui_handler, TuiHandler::Panel);
+        assert_eq!(meta.tui_route, TuiCommandRoute::Native);
     }
 
     #[test]
-    fn info_and_aliases_are_discoverable() {
+    fn primary_action_surface_is_curated_and_native() {
         let info = resolve_command_meta("/info").expect("should resolve /info");
-        assert_eq!(info.tui_handler, TuiHandler::Panel);
+        assert_eq!(info.tui_route, TuiCommandRoute::Native);
 
-        let whoami = resolve_command_meta("/whoami").expect("should resolve /whoami");
-        assert!(whoami.is_alias, "/whoami should be treated as an alias");
-
-        let health = resolve_command_meta("/health").expect("should resolve /health");
-        assert!(health.is_alias, "/health should be treated as an alias");
+        let names: Vec<_> = COMMANDS
+            .iter()
+            .filter(|command| command.is_primary())
+            .map(|command| command.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "/help", "/model", "/plan", "/memory", "/task", "/inspect", "/context", "/agent",
+                "/allow",
+            ]
+        );
+        assert!(
+            COMMANDS
+                .iter()
+                .filter(|command| command.is_primary())
+                .all(|command| command.tui_route == TuiCommandRoute::Native)
+        );
     }
 
     #[test]
-    fn fallback_commands_do_not_drop_into_chat_forward() {
-        for cmd in [
-            "/checkpoint",
-            "/grep",
-            "/diff",
-            "/review",
-            "/report",
-            "/task",
-            "/debug",
-            "/lsp",
-            "/telemetry",
-            "/health",
-            "/sync",
-            "/rewind",
-            "/mcp",
-            "/team",
-            "/agent",
-            "/messaging",
-            "/logout",
-            "/profile",
-            "/memory-setup",
-            "/diagnostics",
-            "/bug",
-        ] {
-            let meta = resolve_command_meta(cmd).unwrap_or_else(|| panic!("missing {cmd}"));
-            assert_eq!(
-                meta.tui_handler,
-                TuiHandler::Fallback,
-                "{cmd} should preserve slash execution instead of forwarding to chat"
-            );
-        }
+    fn tui_discovery_exposes_only_actions_the_workbench_can_complete() {
+        let commands: Vec<_> = tui_commands().collect();
+        assert!(!commands.is_empty());
+        assert!(commands.iter().all(|command| command.is_available_in_tui()));
+        assert!(
+            !commands.iter().any(|command| command.name == "/undo"),
+            "a terminal-only command must not appear in the TUI command surface"
+        );
     }
 
     #[test]
-    fn all_handled_commands_have_explicit_handler_or_default_chat_forward() {
-        // Sanity check: every command has a tui_handler set (ChatForward is the default)
-        for cmd in COMMANDS {
-            if cmd.is_alias {
-                continue;
-            }
-            // All handlers are valid variants
-            match cmd.tui_handler {
-                TuiHandler::Panel
-                | TuiHandler::Selector
-                | TuiHandler::Inline
-                | TuiHandler::Fallback
-                | TuiHandler::ChatForward => {}
-            }
-        }
+    fn tui_subcommand_discovery_hides_line_mode_only_memory_and_skill_actions() {
+        let memory = resolve_command_meta("/memory").expect("memory command");
+        let memory_subcommands: Vec<_> = memory
+            .visible_tui_subcommands()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            memory_subcommands,
+            vec!["list", "search", "stats", "health", "session"]
+        );
+
+        let skill = resolve_command_meta("/skill").expect("skill command");
+        assert!(
+            skill.visible_tui_subcommands().is_empty(),
+            "the workbench skill browser is the only native skill action"
+        );
     }
 }

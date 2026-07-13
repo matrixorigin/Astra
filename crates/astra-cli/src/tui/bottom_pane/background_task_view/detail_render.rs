@@ -3,7 +3,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 
@@ -22,7 +22,7 @@ pub(crate) fn render_detail(
         fallback(area, buf);
         return;
     };
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(crate::tui::theme::current().dim);
     let title_style = Style::default()
         .fg(row.status.color())
         .add_modifier(Modifier::BOLD);
@@ -90,42 +90,53 @@ pub(crate) fn render_detail(
             Span::raw(label.to_string()),
         ]));
     }
+    if let Some(inactive_ms) = row.no_recent_output_ms {
+        lines.push(Line::from(vec![
+            Span::styled("  activity ", dim),
+            Span::raw(format!(
+                "no output observed for {} · advisory only",
+                format_elapsed(inactive_ms)
+            )),
+        ]));
+    }
     if let Some(output_ref) = row.output_ref.as_deref() {
         lines.push(Line::from(vec![
             Span::styled("  ref ", dim),
             Span::raw(output_ref.to_string()),
         ]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("  Tail", dim)));
     let tail = row
         .output_tail
         .as_deref()
         .map(str::trim_end)
         .filter(|tail| !tail.is_empty())
         .unwrap_or_else(|| row.status.empty_output_state());
-    for line in tail.lines().take(DETAIL_TAIL_LINES) {
-        lines.push(Line::from(format!("  {}", line)));
-    }
-    if row.status.is_killable() && row.live_control.can_stop() {
+    let tail_lines = tail.lines().collect::<Vec<_>>();
+    let body_height = area.height.saturating_sub(2) as usize;
+    let minimum_tail_lines = tail_lines.len().min(3);
+    let metadata_capacity = body_height.saturating_sub(2 + minimum_tail_lines).max(1);
+    lines.truncate(metadata_capacity);
+    let tail_capacity = body_height
+        .saturating_sub(lines.len() + 2)
+        .min(DETAIL_TAIL_LINES)
+        .min(tail_lines.len());
+    if tail_capacity > 0 {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            detail_actions_label(row.kind.supports_output_action(), true, area.width as usize),
-            dim,
-        )));
-    } else {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            detail_actions_label(
-                row.kind.supports_output_action(),
-                false,
-                area.width as usize,
-            ),
-            dim,
-        )));
+        lines.push(Line::from(Span::styled("  Latest output", dim)));
+        for line in &tail_lines[tail_lines.len() - tail_capacity..] {
+            lines.push(Line::from(format!("  {line}")));
+        }
     }
 
-    for (i, line) in lines.into_iter().take(area.height as usize).enumerate() {
+    for (i, line) in lines.into_iter().take(body_height).enumerate() {
         buf.set_line(area.x, area.y + i as u16, &line, area.width);
     }
+    let can_stop = row.status.is_killable() && row.live_control.can_stop();
+    let action = detail_actions_label(can_stop, area.width as usize);
+    buf.set_line(
+        area.x,
+        area.y + area.height.saturating_sub(1),
+        &Line::from(Span::styled(action, dim)),
+        area.width,
+    );
 }

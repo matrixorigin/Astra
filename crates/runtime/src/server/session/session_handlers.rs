@@ -1,4 +1,5 @@
 use crate::db_row::RowExt;
+use crate::server::run::lifecycle::TranscriptPersistPayload;
 use crate::server::*;
 use astra_core::{STATUS_CANCELLED, error_response, is_duplicate_key_error};
 use astra_services::context_manifest::session_artifact_raw_payload_is_available;
@@ -198,8 +199,42 @@ fn user_anchor_memory_response(item: UserAnchorMemoryItem) -> UserAnchorMemoryRe
 #[derive(Deserialize, Default)]
 pub(crate) struct TranscriptQuery {
     pub before_seq: Option<i64>,
+    pub run_id: Option<String>,
+    pub scope: Option<TranscriptQueryScope>,
     #[serde(default = "default_transcript_limit")]
     pub limit: u32,
+}
+
+/// The server owns the scope decision for durable transcript reads. A client
+/// cannot reconstruct a main conversation by filtering rows after it has
+/// already received child-agent content.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TranscriptQueryScope {
+    RootConversation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptReadScope<'a> {
+    Session,
+    Run(&'a str),
+    RootConversation,
+}
+
+fn transcript_read_scope(
+    query: &TranscriptQuery,
+) -> Result<TranscriptReadScope<'_>, (StatusCode, Json<ErrorResponse>)> {
+    match (query.scope, query.run_id.as_deref()) {
+        (Some(TranscriptQueryScope::RootConversation), Some(_)) => Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "transcript scope=root_conversation cannot be combined with run_id",
+        )),
+        (Some(TranscriptQueryScope::RootConversation), None) => {
+            Ok(TranscriptReadScope::RootConversation)
+        }
+        (None, Some(run_id)) => Ok(TranscriptReadScope::Run(run_id)),
+        (None, None) => Ok(TranscriptReadScope::Session),
+    }
 }
 
 #[derive(Serialize)]
@@ -231,39 +266,15 @@ pub(crate) struct TranscriptItemResponse {
     pub reasoning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<astra_thin_client::SessionTranscriptToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<astra_thin_client::SessionTranscriptToolResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<astra_turn_types::AgentTranscriptEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<String>,
     pub created_at: String,
-}
-
-#[derive(Clone, Debug, Default)]
-struct TranscriptReasoningProjection {
-    text: String,
-    done: bool,
-}
-
-impl TranscriptReasoningProjection {
-    fn append_delta(&mut self, delta: &str) {
-        if delta.is_empty() || self.text.ends_with(delta) {
-            return;
-        }
-        if !self.text.is_empty() && delta.starts_with(&self.text) {
-            self.text.clear();
-        }
-        self.text.push_str(delta);
-    }
-
-    fn reasoning(&self) -> Option<String> {
-        let trimmed = self.text.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    }
-
-    fn status(&self) -> Option<String> {
-        self.reasoning()
-            .map(|_| if self.done { "complete" } else { "streaming" }.to_string())
-    }
 }
 
 fn session_row_string(row: &impl RowExt, column: &str) -> Result<String, String> {
@@ -608,40 +619,72 @@ pub(crate) async fn get_session_transcript_handler(
         .shared_pool
         .as_ref()
         .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    let scope = transcript_read_scope(&query)?;
     let limit = query.limit.clamp(1, MAX_TRANSCRIPT_LIMIT);
     let before_seq = query.before_seq.unwrap_or(i64::MAX);
-    let rows = sqlx::query(
-        "SELECT session_id, item_seq, run_id, role, content,
-                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
-         FROM session_transcript_items
-         WHERE session_id = ? AND user_id = ? AND item_seq < ?
-         ORDER BY item_seq DESC
-         LIMIT ?",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(before_seq)
-    .bind(i64::from(limit))
-    .fetch_all(pool.get())
-    .await
+    let rows = match scope {
+        TranscriptReadScope::Run(run_id) => sqlx::query(
+            "SELECT session_id, item_seq, run_id, role, content, payload_json, source_event_id,
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+             FROM session_transcript_items
+             WHERE session_id = ? AND user_id = ? AND run_id = ? AND item_seq < ?
+             ORDER BY item_seq DESC
+             LIMIT ?",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(run_id)
+        .bind(before_seq)
+        .bind(i64::from(limit))
+        .fetch_all(pool.get())
+        .await,
+        TranscriptReadScope::Session => sqlx::query(
+            "SELECT session_id, item_seq, run_id, role, content, payload_json, source_event_id,
+                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+             FROM session_transcript_items
+             WHERE session_id = ? AND user_id = ? AND item_seq < ?
+             ORDER BY item_seq DESC
+             LIMIT ?",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(before_seq)
+        .bind(i64::from(limit))
+        .fetch_all(pool.get())
+        .await,
+        TranscriptReadScope::RootConversation => sqlx::query(
+            "SELECT session_transcript_items.session_id AS session_id,
+                    session_transcript_items.item_seq AS item_seq,
+                    session_transcript_items.run_id AS run_id,
+                    session_transcript_items.role AS role,
+                    session_transcript_items.content AS content,
+                    session_transcript_items.payload_json AS payload_json,
+                    session_transcript_items.source_event_id AS source_event_id,
+                    DATE_FORMAT(session_transcript_items.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
+             FROM session_transcript_items
+             LEFT JOIN agent_runs ON agent_runs.user_id = session_transcript_items.user_id
+                 AND agent_runs.session_id = session_transcript_items.session_id
+                 AND agent_runs.run_id = session_transcript_items.run_id
+             WHERE session_transcript_items.session_id = ?
+                 AND session_transcript_items.user_id = ?
+                 AND (session_transcript_items.run_id IS NULL
+                     OR (agent_runs.run_id IS NOT NULL AND agent_runs.parent_run_id IS NULL))
+                 AND session_transcript_items.item_seq < ?
+             ORDER BY session_transcript_items.item_seq DESC
+             LIMIT ?",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .bind(before_seq)
+        .bind(i64::from(limit))
+        .fetch_all(pool.get())
+        .await,
+    }
     .map_err(internal_error)?;
-
-    let run_ids = transcript_assistant_run_ids(&rows).map_err(|error| {
-        internal_error(format!(
-            "decode transcript assistant run ids failed for session {session_id}: {error}"
-        ))
-    })?;
-    let reasoning_by_run = load_transcript_reasoning_by_run(pool, &user_id, &session_id, &run_ids)
-        .await
-        .map_err(|error| {
-            internal_error(format!(
-                "load transcript reasoning failed for session {session_id}: {error}"
-            ))
-        })?;
 
     let mut items = rows
         .into_iter()
-        .map(|row| decode_transcript_item(&row, &reasoning_by_run))
+        .map(|row| decode_transcript_item(&row))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
             internal_error(format!(
@@ -649,21 +692,84 @@ pub(crate) async fn get_session_transcript_handler(
             ))
         })?;
     items.reverse();
-    let page_refs = load_transcript_page_refs(
-        pool,
-        &user_id,
-        &session_id,
-        items.first().map(|item| item.item_seq),
-        items.last().map(|item| item.item_seq),
-    )
-    .await
-    .map_err(|error| {
-        internal_error(format!(
-            "load transcript page refs failed for session {session_id}: {error}"
-        ))
-    })?;
-    let next_before_seq = items.first().map(|item| item.item_seq);
-    let has_more = items.len() == limit as usize && next_before_seq.unwrap_or(0) > 1;
+    let transcript_item_count = items.len();
+    let transcript_first_seq = items.first().map(|item| item.item_seq);
+    let transcript_last_seq = items.last().map(|item| item.item_seq);
+    let page_refs = if matches!(scope, TranscriptReadScope::RootConversation) {
+        // Physical page hashes cover the whole session stream. Returning one
+        // for a filtered root projection would incorrectly claim that it
+        // hashes only the rows in this response.
+        Vec::new()
+    } else {
+        load_transcript_page_refs(
+            pool,
+            &user_id,
+            &session_id,
+            transcript_first_seq,
+            transcript_last_seq,
+        )
+        .await
+        .map_err(|error| {
+            internal_error(format!(
+                "load transcript page refs failed for session {session_id}: {error}"
+            ))
+        })?
+    };
+    let next_before_seq = transcript_first_seq;
+    let has_more = if transcript_item_count == limit as usize {
+        match (scope, next_before_seq) {
+            (TranscriptReadScope::Run(run_id), Some(next_before_seq)) => sqlx::query(
+                "SELECT 1 AS older
+                 FROM session_transcript_items
+                 WHERE session_id = ? AND user_id = ? AND run_id = ? AND item_seq < ?
+                 LIMIT 1",
+            )
+            .bind(&session_id)
+            .bind(&user_id)
+            .bind(run_id)
+            .bind(next_before_seq)
+            .fetch_optional(pool.get())
+            .await
+            .map_err(internal_error)?
+            .is_some(),
+            (TranscriptReadScope::Session, Some(next_before_seq)) => sqlx::query(
+                "SELECT 1 AS older
+                 FROM session_transcript_items
+                 WHERE session_id = ? AND user_id = ? AND item_seq < ?
+                 LIMIT 1",
+            )
+            .bind(&session_id)
+            .bind(&user_id)
+            .bind(next_before_seq)
+            .fetch_optional(pool.get())
+            .await
+            .map_err(internal_error)?
+            .is_some(),
+            (TranscriptReadScope::RootConversation, Some(next_before_seq)) => sqlx::query(
+                "SELECT 1 AS older
+                 FROM session_transcript_items
+                 LEFT JOIN agent_runs ON agent_runs.user_id = session_transcript_items.user_id
+                     AND agent_runs.session_id = session_transcript_items.session_id
+                     AND agent_runs.run_id = session_transcript_items.run_id
+                 WHERE session_transcript_items.session_id = ?
+                     AND session_transcript_items.user_id = ?
+                     AND (session_transcript_items.run_id IS NULL
+                         OR (agent_runs.run_id IS NOT NULL AND agent_runs.parent_run_id IS NULL))
+                     AND session_transcript_items.item_seq < ?
+                 LIMIT 1",
+            )
+            .bind(&session_id)
+            .bind(&user_id)
+            .bind(next_before_seq)
+            .fetch_optional(pool.get())
+            .await
+            .map_err(internal_error)?
+            .is_some(),
+            (_, None) => false,
+        }
+    } else {
+        false
+    };
     Ok(Json(TranscriptResponse {
         session_id,
         items,
@@ -673,59 +779,28 @@ pub(crate) async fn get_session_transcript_handler(
     }))
 }
 
-fn decode_transcript_item(
-    row: &impl RowExt,
-    reasoning_by_run: &HashMap<String, TranscriptReasoningProjection>,
-) -> Result<TranscriptItemResponse, String> {
+fn decode_transcript_item(row: &impl RowExt) -> Result<TranscriptItemResponse, String> {
     let run_id = session_row_optional_string(row, "run_id")?;
     let role = session_row_string(row, "role")?;
-    let reasoning = if role == "assistant" {
-        run_id
-            .as_deref()
-            .and_then(|id| reasoning_by_run.get(id))
-            .and_then(TranscriptReasoningProjection::reasoning)
-    } else {
-        None
-    };
-    let reasoning_status = if role == "assistant" {
-        run_id
-            .as_deref()
-            .and_then(|id| reasoning_by_run.get(id))
-            .and_then(TranscriptReasoningProjection::status)
-    } else {
-        None
-    };
+    let payload = session_row_optional_string(row, "payload_json")?
+        .map(|json| serde_json::from_str::<TranscriptPersistPayload>(&json))
+        .transpose()
+        .map_err(|error| format!("decode transcript payload: {error}"))?
+        .unwrap_or_default();
     Ok(TranscriptItemResponse {
         session_id: session_row_string(row, "session_id")?,
         item_seq: session_row_i64(row, "item_seq")?,
         run_id,
         role,
         content: session_row_string(row, "content")?,
-        reasoning,
-        reasoning_status,
+        reasoning: payload.reasoning,
+        reasoning_status: payload.reasoning_status,
+        tool_calls: payload.tool_calls,
+        tool_result: payload.tool_result,
+        evidence: payload.evidence,
+        source_event_id: session_row_optional_string(row, "source_event_id")?,
         created_at: session_row_string(row, "created_at")?,
     })
-}
-
-fn transcript_assistant_run_id(row: &impl RowExt) -> Result<Option<String>, String> {
-    if session_row_string(row, "role")? != "assistant" {
-        return Ok(None);
-    }
-    session_row_optional_string(row, "run_id")
-}
-
-fn transcript_assistant_run_ids(rows: &[sqlx::mysql::MySqlRow]) -> Result<Vec<String>, String> {
-    let mut seen = HashSet::new();
-    let mut run_ids = Vec::new();
-    for row in rows {
-        let Some(run_id) = transcript_assistant_run_id(row)? else {
-            continue;
-        };
-        if seen.insert(run_id.clone()) {
-            run_ids.push(run_id);
-        }
-    }
-    Ok(run_ids)
 }
 
 async fn load_transcript_page_refs(
@@ -1012,89 +1087,6 @@ async fn fetch_latest_context_manifest(
     };
     row.map(|row| decode_context_manifest_summary(&row).map_err(internal_error))
         .transpose()
-}
-
-async fn load_transcript_reasoning_by_run(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    run_ids: &[String],
-) -> Result<HashMap<String, TranscriptReasoningProjection>, sqlx::Error> {
-    if run_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut query = QueryBuilder::<sqlx::MySql>::new(
-        "SELECT run_id, payload_json
-         FROM agent_run_events
-         WHERE session_id = ",
-    );
-    query.push_bind(session_id);
-    query.push(" AND user_id = ");
-    query.push_bind(user_id);
-    query.push(" AND run_id IN (");
-    {
-        let mut separated = query.separated(", ");
-        for run_id in run_ids {
-            separated.push_bind(run_id);
-        }
-    }
-    query.push(
-        ") AND event_type IN (
-             'reasoning_delta',
-             'reasoning_message_content',
-             'reasoning_done',
-             'thinking_delta',
-             'thinking_done'
-         )
-         ORDER BY run_id ASC, event_idx ASC",
-    );
-
-    let rows = query.build().fetch_all(pool.get()).await?;
-    let mut by_run: HashMap<String, TranscriptReasoningProjection> = HashMap::new();
-    for row in rows {
-        let run_id = row.try_get::<String, _>("run_id")?;
-        let payload_json = row.try_get::<String, _>("payload_json")?;
-        let payload = serde_json::from_str::<Value>(&payload_json).map_err(|error| {
-            sqlx::Error::Protocol(format!(
-                "invalid reasoning event payload for run {run_id}: {error}"
-            ))
-        })?;
-        let projection = by_run.entry(run_id).or_default();
-        apply_reasoning_event_payload(projection, &payload);
-    }
-    Ok(by_run)
-}
-
-fn apply_reasoning_event_payload(projection: &mut TranscriptReasoningProjection, payload: &Value) {
-    match reasoning_event_type(payload) {
-        Some("reasoning_delta" | "thinking_delta" | "reasoning_message_content") => {
-            if let Some(content) = reasoning_event_content(payload) {
-                projection.append_delta(content);
-            }
-        }
-        Some("reasoning_done" | "thinking_done") => {
-            projection.done = true;
-        }
-        _ => {}
-    }
-}
-
-fn reasoning_event_type(payload: &Value) -> Option<&str> {
-    payload
-        .get("event_type")
-        .or_else(|| payload.get("type"))
-        .and_then(Value::as_str)
-}
-
-fn reasoning_event_content(payload: &Value) -> Option<&str> {
-    payload
-        .get("content")
-        .and_then(Value::as_str)
-        .or_else(|| payload.pointer("/data/content").and_then(Value::as_str))
-        .or_else(|| payload.pointer("/data/chunk").and_then(Value::as_str))
-        .or_else(|| payload.pointer("/data/reasoning").and_then(Value::as_str))
-        .filter(|content| !content.trim().is_empty())
 }
 
 pub(crate) async fn update_session_handler(
@@ -2174,6 +2166,11 @@ mod tests {
             Ok(match column {
                 "run_id" => Some("run-1".to_string()),
                 "budget_template_id" => Some("budget-1".to_string()),
+                "source_event_id" => None,
+                "payload_json" => Some(
+                    r#"{"reasoning":"thinking","reasoning_status":"complete","tool_calls":[{"tool_use_id":"call-1","name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}]}"#
+                        .to_string(),
+                ),
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             })
         }
@@ -2201,6 +2198,14 @@ mod tests {
                 "total_estimated_tokens" => Ok(123),
                 "high_watermark" => Ok(11),
                 "last_event_idx" => Ok(10),
+                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            }
+        }
+
+        fn optional_i64_column(&self, column: &str) -> Result<Option<i64>, sqlx::Error> {
+            self.fail_if_needed(column)?;
+            match column {
+                "meta_duration_ms" => Ok(Some(12)),
                 _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
         }
@@ -2585,43 +2590,38 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_projection_collects_sse_reasoning_events() {
-        let mut projection = TranscriptReasoningProjection::default();
-        apply_reasoning_event_payload(
-            &mut projection,
-            &json!({"type": "reasoning_delta", "content": "checking "}),
+    fn transcript_scope_keeps_root_conversation_and_run_reads_disjoint() {
+        let root = TranscriptQuery {
+            scope: Some(TranscriptQueryScope::RootConversation),
+            ..TranscriptQuery::default()
+        };
+        assert_eq!(
+            transcript_read_scope(&root).unwrap(),
+            TranscriptReadScope::RootConversation
         );
-        apply_reasoning_event_payload(
-            &mut projection,
-            &json!({"type": "reasoning_delta", "content": "context"}),
-        );
-        apply_reasoning_event_payload(&mut projection, &json!({"type": "reasoning_done"}));
 
+        let run = TranscriptQuery {
+            run_id: Some("run-1".to_string()),
+            ..TranscriptQuery::default()
+        };
         assert_eq!(
-            projection.reasoning().as_deref(),
-            Some("checking context"),
-            "transcript hydration should reconstruct persisted reasoning deltas in event order"
+            transcript_read_scope(&run).unwrap(),
+            TranscriptReadScope::Run("run-1")
         );
-        assert_eq!(
-            projection.status().as_deref(),
-            Some("complete"),
-            "hydrated reasoning blocks should render as complete after persistence"
-        );
+
+        let ambiguous = TranscriptQuery {
+            run_id: Some("run-1".to_string()),
+            scope: Some(TranscriptQueryScope::RootConversation),
+            ..TranscriptQuery::default()
+        };
+        let error = transcript_read_scope(&ambiguous).unwrap_err();
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]
-    fn transcript_item_decode_preserves_values_and_reasoning() {
-        let mut reasoning = HashMap::new();
-        reasoning.insert(
-            "run-1".to_string(),
-            TranscriptReasoningProjection {
-                text: "thinking".to_string(),
-                done: true,
-            },
-        );
-
-        let item = decode_transcript_item(&FakeSessionRow::complete(), &reasoning)
-            .expect("complete row decodes");
+    fn transcript_item_decode_preserves_structured_durable_payload() {
+        let item =
+            decode_transcript_item(&FakeSessionRow::complete()).expect("complete row decodes");
 
         assert_eq!(item.session_id, "session-1");
         assert_eq!(item.item_seq, 7);
@@ -2630,32 +2630,24 @@ mod tests {
         assert_eq!(item.content, "answer");
         assert_eq!(item.reasoning.as_deref(), Some("thinking"));
         assert_eq!(item.reasoning_status.as_deref(), Some("complete"));
+        assert_eq!(item.tool_calls.len(), 1);
+        assert_eq!(item.tool_calls[0].tool_use_id, "call-1");
+        assert_eq!(item.tool_calls[0].name, "read_file");
         assert_eq!(item.created_at, "2026-06-26T12:00:00");
     }
 
     #[test]
     fn transcript_item_decode_fails_loudly_on_required_columns() {
         for column in ["session_id", "item_seq", "role", "content", "created_at"] {
-            let err =
-                match decode_transcript_item(&FakeSessionRow::fail_on(column), &HashMap::new()) {
-                    Ok(_) => panic!("missing transcript item column must fail: {column}"),
-                    Err(err) => err,
-                };
+            let err = match decode_transcript_item(&FakeSessionRow::fail_on(column)) {
+                Ok(_) => panic!("missing transcript item column must fail: {column}"),
+                Err(err) => err,
+            };
             assert!(
                 err.contains(&format!("decode column `{column}`")),
                 "error should identify missing transcript column {column}: {err}"
             );
         }
-    }
-
-    #[test]
-    fn transcript_assistant_run_id_decode_fails_loudly_on_role_column() {
-        let err = transcript_assistant_run_id(&FakeSessionRow::fail_on("role"))
-            .expect_err("role decode failure must not look like non-assistant");
-        assert!(
-            err.contains("decode column `role`"),
-            "error should identify role decode failure: {err}"
-        );
     }
 
     #[test]
@@ -2916,29 +2908,6 @@ mod tests {
                 "error should identify missing lease event column {column}: {err}"
             );
         }
-    }
-
-    #[test]
-    fn reasoning_projection_reads_event_type_and_nested_content() {
-        let mut projection = TranscriptReasoningProjection::default();
-        apply_reasoning_event_payload(
-            &mut projection,
-            &json!({"event_type": "reasoning_message_content", "data": {"content": "nested reasoning"}}),
-        );
-        apply_reasoning_event_payload(
-            &mut projection,
-            &json!({"event_type": "thinking_done", "data": {}}),
-        );
-
-        assert_eq!(
-            projection.reasoning().as_deref(),
-            Some("nested reasoning"),
-            "reasoning hydration should support persisted event_type/data.content payloads"
-        );
-        assert!(
-            projection.done,
-            "thinking_done should mark the block complete"
-        );
     }
 
     #[test]

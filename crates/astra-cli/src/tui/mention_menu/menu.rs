@@ -80,6 +80,9 @@ pub(crate) struct MentionMenu {
     /// Indices into `current_entries`, ranked by fuzzy score.
     filtered: Vec<usize>,
     selected: usize,
+    current_token: Option<MentionToken>,
+    current_dir: String,
+    provider_revision: u64,
 }
 
 impl std::fmt::Debug for MentionMenu {
@@ -99,6 +102,9 @@ impl Clone for MentionMenu {
             current_entries: self.current_entries.clone(),
             filtered: self.filtered.clone(),
             selected: self.selected,
+            current_token: self.current_token.clone(),
+            current_dir: self.current_dir.clone(),
+            provider_revision: self.provider_revision,
         }
     }
 }
@@ -111,6 +117,9 @@ impl PartialEq for MentionMenu {
             && self.current_entries == other.current_entries
             && self.filtered == other.filtered
             && self.selected == other.selected
+            && self.current_token == other.current_token
+            && self.current_dir == other.current_dir
+            && self.provider_revision == other.provider_revision
     }
 }
 impl Eq for MentionMenu {}
@@ -126,6 +135,9 @@ impl MentionMenu {
             current_entries: Vec::new(),
             filtered: Vec::new(),
             selected: 0,
+            current_token: None,
+            current_dir: String::new(),
+            provider_revision: 0,
         }
     }
 
@@ -137,6 +149,9 @@ impl MentionMenu {
     pub fn set_token(&mut self, token: &MentionToken) {
         let (dir, fragment) = split_dir_fragment(&token.partial);
 
+        self.current_token = Some(token.clone());
+        self.current_dir = dir.to_string();
+        self.provider_revision = self.provider.revision();
         self.current_entries = self.provider.list(dir);
 
         if fragment.is_empty() {
@@ -185,6 +200,28 @@ impl MentionMenu {
 
         self.filtered = scored.into_iter().map(|(_, i)| i).collect();
         self.clamp_selected();
+    }
+
+    pub(crate) fn refresh_if_provider_changed(&mut self) -> bool {
+        self.provider.poll_refresh(&self.current_dir);
+        let revision = self.provider.revision();
+        if revision == self.provider_revision {
+            return false;
+        }
+        let Some(token) = self.current_token.clone() else {
+            self.provider_revision = revision;
+            return false;
+        };
+        self.set_token(&token);
+        true
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        self.provider.is_loading(&self.current_dir)
+    }
+
+    pub(crate) fn load_error(&self) -> Option<String> {
+        self.provider.load_error(&self.current_dir)
     }
 
     pub fn matches(&self) -> Vec<&FileEntry> {

@@ -146,9 +146,12 @@ fn should_inject_run_id(event_type: &str) -> bool {
             | "run_waiting"
             | "run_paused"
             | "run_resumed"
-            | "run_input_queued"
             | "runtime.control.handoff.requested"
             | "runtime.control.handoff.rejected"
+            | "ask_user_prompted"
+            | "user_prompt_required"
+            | "user_intent"
+            | "user_intent_applied"
             | "run_finished"
     ) || event_type == "run_blocked"
 }
@@ -472,41 +475,45 @@ pub(crate) async fn resume_run_handler(
 }
 
 #[derive(serde::Deserialize)]
-pub(crate) struct RunInputRequest {
-    pub idempotency_key: String,
+pub(crate) struct RunUserIntentRequest {
+    pub intent_id: String,
+    pub delivery: astra_turn_types::UserIntentDelivery,
     #[serde(default)]
     pub input: serde_json::Value,
 }
 
 #[derive(serde::Serialize)]
-pub(crate) struct RunInputResponse {
+pub(crate) struct RunUserIntentResponse {
     pub run_id: String,
-    pub accepted: bool,
+    pub intent_id: String,
+    pub status: astra_turn_types::UserIntentStatus,
     pub duplicate: bool,
 }
 
-pub(crate) async fn submit_run_input_handler(
+pub(crate) async fn submit_run_user_intent_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<RunInputRequest>,
-) -> Result<Json<RunInputResponse>, (StatusCode, Json<ErrorResponse>)> {
+    Json(request): Json<RunUserIntentRequest>,
+) -> Result<Json<RunUserIntentResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let result = state
         .execution
         .run_lifecycle_service
-        .submit_run_input(
+        .submit_run_user_intent(
             run_id,
             user.user_id,
-            astra_services::runs::RunInputData {
-                idempotency_key: request.idempotency_key,
+            astra_services::runs::RunUserIntentData {
+                intent_id: request.intent_id,
+                delivery: request.delivery,
                 input: request.input,
             },
         )
         .await?;
-    Ok(Json(RunInputResponse {
+    Ok(Json(RunUserIntentResponse {
         run_id: result.run_id,
-        accepted: result.accepted,
+        intent_id: result.intent_id,
+        status: result.status,
         duplicate: result.duplicate,
     }))
 }
@@ -944,12 +951,16 @@ mod tests {
     }
 
     #[test]
-    fn transform_stream_run_events_for_client_emits_input_queued_with_run_id() {
+    fn transform_stream_run_events_for_client_emits_typed_intent_acceptance() {
         let transformed = transform_stream_run_events_for_client(
             "run-123",
             vec![json!({
-                "event_type": "run_input_queued",
-                "data": {"waiting_for": "user_input"},
+                "event_type": "user_intent",
+                "data": {
+                    "intent_id": "intent-5",
+                    "delivery": "guide_current_run",
+                    "input": {"content": "focus the test"}
+                },
                 "index": 5
             })],
         );
@@ -957,10 +968,42 @@ mod tests {
         assert_eq!(
             transformed,
             vec![json!({
-                "type": "run_input_queued",
+                "type": "user_intent_accepted",
                 "run_id": "run-123",
-                "waiting_for": "user_input",
+                "intent_id": "intent-5",
+                "delivery": "guide_current_run",
+                "status": "accepted_remote",
                 "index": 5
+            })]
+        );
+    }
+
+    #[test]
+    fn transform_stream_run_events_for_client_preserves_applied_intent_identity() {
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![json!({
+                "type": "user_intent_applied",
+                "intent_id": "input-7",
+                "delivery": "guide_current_run",
+                "status": "applied",
+                "event_index": 7,
+                "content": "change course",
+                "index": 8,
+            })],
+        );
+
+        assert_eq!(
+            transformed,
+            vec![json!({
+                "type": "user_intent_applied",
+                "run_id": "run-123",
+                "intent_id": "input-7",
+                "delivery": "guide_current_run",
+                "status": "applied",
+                "event_index": 7,
+                "content": "change course",
+                "index": 8,
             })]
         );
     }

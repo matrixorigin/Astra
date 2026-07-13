@@ -1,7 +1,7 @@
 //! Fanout group header computation and rendering.
 
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 
@@ -13,6 +13,7 @@ pub(crate) struct FanoutHeader {
     pub title: String,
     pub target_count: usize,
     pub running: usize,
+    pub stopping: usize,
     pub done: usize,
     pub failed: usize,
     pub stopped: usize,
@@ -32,6 +33,7 @@ pub(crate) fn compute_fanout_header(
         },
         target_count: fanout.target_count,
         running: 0,
+        stopping: 0,
         done: 0,
         failed: 0,
         stopped: 0,
@@ -43,6 +45,7 @@ pub(crate) fn compute_fanout_header(
             BackgroundTaskStatus::Pending
             | BackgroundTaskStatus::Running
             | BackgroundTaskStatus::WaitingForInput => header.running += 1,
+            BackgroundTaskStatus::Stopping => header.stopping += 1,
             BackgroundTaskStatus::Completed => header.done += 1,
             BackgroundTaskStatus::Interrupted | BackgroundTaskStatus::Failed => header.failed += 1,
             BackgroundTaskStatus::Killed => header.stopped += 1,
@@ -54,9 +57,13 @@ pub(crate) fn compute_fanout_header(
 }
 
 pub(crate) fn fanout_header_line(header: &FanoutHeader, dim: Style) -> Line<'static> {
+    let theme = crate::tui::theme::current();
     let mut parts = vec![format!("{} target", header.target_count)];
     if header.running > 0 {
         parts.push(format!("{} running", header.running));
+    }
+    if header.stopping > 0 {
+        parts.push(format!("{} stopping", header.stopping));
     }
     if header.done > 0 {
         parts.push(format!("{} done", header.done));
@@ -76,7 +83,7 @@ pub(crate) fn fanout_header_line(header: &FanoutHeader, dim: Style) -> Line<'sta
         Span::styled(
             truncate_label(&header.title, 30),
             Style::default()
-                .fg(Color::Magenta)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" · {}", parts.join(" · ")), dim),

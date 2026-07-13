@@ -10,9 +10,10 @@ use astra_runtime::{
     SessionRecord, SessionService, SessionUpdateRequestData, build_app,
 };
 use astra_services::runs::{
-    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
-    RunInputData, RunInputRecord, RunLifecycleService, RunListCursor, RunListRecord,
-    RunMutationRecord, RunStateStore, RunStatusRecord,
+    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunInteractionKind,
+    DurableRunInteractionResolveOutcome, DurableRunRecord, RunLifecycleService, RunListCursor,
+    RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord, RunUserIntentData,
+    RunUserIntentRecord,
 };
 use astra_services::session_workspace::{WorkspaceMetadata, persist_remote_workspace};
 use astra_services::{
@@ -399,6 +400,35 @@ impl RunLifecycleService for JointRunLifecycle {
         Ok(run.events.into_iter().skip(last_index as usize).collect())
     }
 
+    async fn get_run_interaction_event(
+        &self,
+        run_id: String,
+        user_id: String,
+        request_id: String,
+        event_type: String,
+    ) -> Result<Option<Value>, (StatusCode, Json<ErrorResponse>)> {
+        self.store()
+            .await
+            .load_run_interaction_event(&user_id, &run_id, &request_id, &event_type)
+            .await
+            .map_err(service_unavailable)
+    }
+
+    async fn resolve_run_interaction(
+        &self,
+        run_id: String,
+        user_id: String,
+        request_id: String,
+        kind: DurableRunInteractionKind,
+        response_data: Value,
+    ) -> Result<DurableRunInteractionResolveOutcome, (StatusCode, Json<ErrorResponse>)> {
+        self.store()
+            .await
+            .resolve_run_interaction(&user_id, &run_id, &request_id, kind, response_data)
+            .await
+            .map_err(service_unavailable)
+    }
+
     async fn cancel_run(
         &self,
         run_id: String,
@@ -429,12 +459,13 @@ impl RunLifecycleService for JointRunLifecycle {
         })
     }
 
-    async fn submit_run_input(
+    async fn submit_run_user_intent(
         &self,
         run_id: String,
         user_id: String,
-        input: RunInputData,
-    ) -> Result<RunInputRecord, (StatusCode, Json<ErrorResponse>)> {
+        input: RunUserIntentData,
+    ) -> Result<RunUserIntentRecord, (StatusCode, Json<ErrorResponse>)> {
+        let intent_id = input.intent_id.clone();
         let store = self.store().await;
         let run = store
             .load_run(&user_id, &run_id)
@@ -445,8 +476,11 @@ impl RunLifecycleService for JointRunLifecycle {
             return Err(forbidden("run belongs to another user"));
         }
         let duplicate = run.events.iter().any(|event| {
-            event.get("idempotency_key").and_then(Value::as_str)
-                == Some(input.idempotency_key.as_str())
+            event
+                .get("data")
+                .and_then(|data| data.get("intent_id"))
+                .and_then(Value::as_str)
+                == Some(input.intent_id.as_str())
         });
         if !duplicate {
             store
@@ -454,29 +488,21 @@ impl RunLifecycleService for JointRunLifecycle {
                     &user_id,
                     &run_id,
                     json!({
-                        "event_type": "user_input",
-                        "idempotency_key": input.idempotency_key,
-                        "data": {"input": input.input},
+                        "event_type": "user_intent",
+                        "data": {
+                            "intent_id": input.intent_id,
+                            "delivery": input.delivery,
+                            "input": input.input,
+                        },
                     }),
                 )
                 .await
                 .map_err(service_unavailable)?;
-            store
-                .update_run_status(&user_id, &run_id, "running", None, None)
-                .await
-                .map_err(service_unavailable)?;
-            store
-                .append_event(
-                    &user_id,
-                    &run_id,
-                    json!({"event_type": "run_resumed", "data": {"source": "approval_input"}}),
-                )
-                .await
-                .map_err(service_unavailable)?;
         }
-        Ok(RunInputRecord {
+        Ok(RunUserIntentRecord {
             run_id,
-            accepted: true,
+            intent_id,
+            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
             duplicate,
         })
     }
@@ -491,11 +517,7 @@ impl RunLifecycleService for JointRunLifecycle {
             .update_run_status(&user_id, &run_id, "waiting", Some("user"), None)
             .await
             .map_err(service_unavailable)?;
-        Ok(RunMutationRecord {
-            run_id,
-            status: "waiting".to_string(),
-            previous_status: "running".to_string(),
-        })
+        Ok(RunMutationRecord::applied(run_id, "waiting", "running"))
     }
 }
 
@@ -586,11 +608,21 @@ async fn get_stream(
     parse_sse_events(&body)
 }
 
-async fn post_run_input(client: &Client, base: SocketAddr, run_id: &str, key: &str, input: Value) {
+async fn post_user_intent(
+    client: &Client,
+    base: SocketAddr,
+    run_id: &str,
+    key: &str,
+    input: Value,
+) {
     let response = client
-        .post(format!("http://{base}/chat/runs/{run_id}/input"))
+        .post(format!("http://{base}/chat/runs/{run_id}/intents"))
         .header("authorization", HTTP_TOKEN)
-        .json(&json!({"idempotency_key": key, "input": input}))
+        .json(&json!({
+            "intent_id": key,
+            "delivery": "guide_current_run",
+            "input": input
+        }))
         .send()
         .await
         .expect("POST run input must reach axum router");
@@ -599,6 +631,46 @@ async fn post_run_input(client: &Client, base: SocketAddr, run_id: &str, key: &s
         status == StatusCode::OK,
         "POST run input expected 200, got {status}"
     );
+}
+
+async fn post_json(
+    client: &Client,
+    base: SocketAddr,
+    path: &str,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let response = client
+        .post(format!("http://{base}{path}"))
+        .header("authorization", HTTP_TOKEN)
+        .json(body)
+        .send()
+        .await
+        .expect("POST must reach joint E2E router");
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .expect("joint E2E response body must be readable");
+    let payload = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("joint E2E response must be JSON: {error}; body={text}"));
+    (status, payload)
+}
+
+async fn cleanup_joint_run(pool: &SharedPool, user_id: &str, run_id: &str) {
+    for sql in [
+        "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND run_id = ?",
+        "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
+        "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
+        "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+        "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
+    ] {
+        sqlx::query(sql)
+            .bind(user_id)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .unwrap_or_else(|error| panic!("joint E2E cleanup query failed: {sql}: {error}"));
+    }
 }
 
 fn absorb_sse_events(events: Vec<Value>, seen: &mut BTreeSet<i64>, next_index: &mut i64) {
@@ -1032,12 +1104,12 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
                 &mut seen,
                 &mut next_index,
             );
-            post_run_input(
+            post_user_intent(
                 &client,
                 addr,
                 &run_id,
-                &format!("approve-{reconnect}"),
-                json!({"decision": "approved"}),
+                &format!("intent-{reconnect}"),
+                json!({"content": "continue after the separately recorded approval"}),
             )
             .await;
         }
@@ -1113,6 +1185,392 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         "S04 final run status must be completed, got {status}"
     );
     handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_pod_retry() {
+    let pool = setup_pool().await;
+    let user_id = id("server-only-user");
+    let approval_session_id = id("server-only-approval-session");
+    let approval_run_id = id("server-only-approval-run");
+    let approval_request_id = id("server-only-approval-request");
+    let prompt_session_id = id("server-only-prompt-session");
+    let prompt_run_id = id("server-only-prompt-run");
+    let prompt_request_id = id("server-only-prompt-request");
+    let expired_session_id = id("server-only-expired-session");
+    let expired_run_id = id("server-only-expired-run");
+    let expired_request_id = id("server-only-expired-request");
+    for session_id in [
+        &approval_session_id,
+        &prompt_session_id,
+        &expired_session_id,
+    ] {
+        insert_session(&pool, &user_id, session_id).await;
+    }
+
+    let owner_store =
+        DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("server-only-owner-pod");
+    owner_store
+        .insert_run(durable_record(
+            &approval_run_id,
+            &approval_session_id,
+            &user_id,
+        ))
+        .await
+        .expect("owner pod inserts approval run");
+    owner_store
+        .append_event(
+            &user_id,
+            &approval_run_id,
+            json!({
+                "event_type": "approval_required",
+                "data": {
+                    "request_id": approval_request_id,
+                    "tool": "bash",
+                    "args": {"command": "git status"},
+                    "approval_kind": "standard",
+                }
+            }),
+        )
+        .await
+        .expect("owner pod persists approval request");
+    owner_store
+        .update_run_status(
+            &user_id,
+            &approval_run_id,
+            "waiting",
+            Some("tool_approval"),
+            None,
+        )
+        .await
+        .expect("owner pod persists approval wait");
+
+    let owner_app = build_joint_app(
+        pool.clone(),
+        user_id.clone(),
+        Arc::new(RwLock::new(owner_store.clone())),
+    );
+    let (owner_addr, owner_handle) = spawn_tcp_router(owner_app).await;
+    let client = local_client();
+    let pending = get_stream(&client, owner_addr, &approval_run_id, 0).await;
+    assert!(
+        pending
+            .iter()
+            .any(|event| event["type"] == "approval_required"),
+        "owner stream must expose the durable approval before disconnect: {pending:?}"
+    );
+    owner_handle.abort();
+    assert!(
+        owner_handle
+            .await
+            .expect_err("aborted owner router must stop")
+            .is_cancelled(),
+        "owner disconnect must cancel its router task"
+    );
+
+    let callback_b =
+        DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("server-only-callback-pod-b");
+    let callback_c =
+        DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("server-only-callback-pod-c");
+    let (callback_b_addr, callback_b_handle) = spawn_tcp_router(build_joint_app(
+        pool.clone(),
+        user_id.clone(),
+        Arc::new(RwLock::new(callback_b)),
+    ))
+    .await;
+    let (callback_c_addr, callback_c_handle) = spawn_tcp_router(build_joint_app(
+        pool.clone(),
+        user_id.clone(),
+        Arc::new(RwLock::new(callback_c.clone())),
+    ))
+    .await;
+    let approval_body = json!({
+        "request_id": approval_request_id,
+        "decision": "allow",
+        "reason": "approved after owner disconnect",
+        "session_id": approval_session_id,
+        "run_id": approval_run_id,
+        "tool_name": "bash",
+        "approval_kind": "standard",
+    });
+    let (approval_b, approval_c) = tokio::join!(
+        post_json(
+            &client,
+            callback_b_addr,
+            "/approval/respond",
+            &approval_body
+        ),
+        post_json(
+            &client,
+            callback_c_addr,
+            "/approval/respond",
+            &approval_body
+        ),
+    );
+    assert_eq!(
+        approval_b.0,
+        StatusCode::OK,
+        "first callback pod must accept the durable decision: {}",
+        approval_b.1
+    );
+    assert_eq!(
+        approval_c.0,
+        StatusCode::OK,
+        "concurrent retry on another pod must be idempotent: {}",
+        approval_c.1
+    );
+    callback_b_handle.abort();
+
+    let approval_run = callback_c
+        .load_run(&user_id, &approval_run_id)
+        .await
+        .expect("replacement pod loads approval run")
+        .expect("approval run remains durable");
+    assert_eq!(approval_run.status, "running");
+    assert_eq!(approval_run.waiting_for, None);
+    let approval_resolutions = approval_run
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "approval_resolved")
+        .count();
+    assert_eq!(
+        approval_resolutions, 1,
+        "concurrent callback retries must commit one terminal fact"
+    );
+    let replay = get_stream(&client, callback_c_addr, &approval_run_id, 0).await;
+    for expected in ["approval_required", "run_resumed"] {
+        assert!(
+            replay.iter().any(|event| event["type"] == expected),
+            "replacement pod stream must replay {expected}: {replay:?}"
+        );
+    }
+    let conflicting_approval = json!({
+        "request_id": approval_request_id,
+        "decision": "deny",
+        "reason": "conflicting late response",
+        "session_id": approval_session_id,
+        "run_id": approval_run_id,
+        "tool_name": "bash",
+        "approval_kind": "standard",
+    });
+    let (status, _) = post_json(
+        &client,
+        callback_c_addr,
+        "/approval/respond",
+        &conflicting_approval,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    owner_store
+        .insert_run(durable_record(&prompt_run_id, &prompt_session_id, &user_id))
+        .await
+        .expect("owner pod inserts ask_user run");
+    owner_store
+        .append_event(
+            &user_id,
+            &prompt_run_id,
+            json!({
+                "event_type": "ask_user_prompted",
+                "data": {
+                    "request_id": prompt_request_id,
+                    "prompt": {
+                        "context": "Server-only durable question",
+                        "questions": [{
+                            "header": "Scope",
+                            "question": "Continue?",
+                            "options": [],
+                            "multi_select": false,
+                            "allow_freeform": true
+                        }],
+                        "timeout_ms": null
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("owner pod persists ask_user prompt");
+    owner_store
+        .update_run_status(
+            &user_id,
+            &prompt_run_id,
+            "waiting",
+            Some("user_input"),
+            None,
+        )
+        .await
+        .expect("owner pod persists ask_user wait");
+    let prompt_body = json!({
+        "request_id": prompt_request_id,
+        "session_id": prompt_session_id,
+        "run_id": prompt_run_id,
+        "cancelled": false,
+        "answers": {
+            "answers": [{
+                "question": "Continue?",
+                "answers": ["yes"],
+                "multi_select": false,
+                "annotation": null
+            }]
+        }
+    });
+    let (prompt_status, prompt_payload) = post_json(
+        &client,
+        callback_c_addr,
+        "/user-prompts/respond",
+        &prompt_body,
+    )
+    .await;
+    assert_eq!(
+        prompt_status,
+        StatusCode::OK,
+        "ask_user response must commit through a non-owner pod: {prompt_payload}"
+    );
+    callback_c_handle.abort();
+
+    let callback_d =
+        DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("server-only-callback-pod-d");
+    let (callback_d_addr, callback_d_handle) = spawn_tcp_router(build_joint_app(
+        pool.clone(),
+        user_id.clone(),
+        Arc::new(RwLock::new(callback_d.clone())),
+    ))
+    .await;
+    let (retry_status, retry_payload) = post_json(
+        &client,
+        callback_d_addr,
+        "/user-prompts/respond",
+        &prompt_body,
+    )
+    .await;
+    assert_eq!(
+        retry_status,
+        StatusCode::OK,
+        "ask_user retry after callback-pod restart must be idempotent: {retry_payload}"
+    );
+    let prompt_run = callback_d
+        .load_run(&user_id, &prompt_run_id)
+        .await
+        .expect("replacement pod loads ask_user run")
+        .expect("ask_user run remains durable");
+    assert_eq!(prompt_run.status, "running");
+    assert_eq!(prompt_run.waiting_for, None);
+    assert_eq!(
+        prompt_run
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "ask_user_resolved")
+            .count(),
+        1,
+        "ask_user retry after restart must commit one terminal fact"
+    );
+    let prompt_replay = get_stream(&client, callback_d_addr, &prompt_run_id, 0).await;
+    for expected in ["user_prompt_required", "run_resumed"] {
+        assert!(
+            prompt_replay.iter().any(|event| event["type"] == expected),
+            "replacement pod stream must replay {expected}: {prompt_replay:?}"
+        );
+    }
+    let cancelled_prompt = json!({
+        "request_id": prompt_request_id,
+        "session_id": prompt_session_id,
+        "run_id": prompt_run_id,
+        "cancelled": true
+    });
+    let (cancel_status, _) = post_json(
+        &client,
+        callback_d_addr,
+        "/user-prompts/respond",
+        &cancelled_prompt,
+    )
+    .await;
+    assert_eq!(cancel_status, StatusCode::CONFLICT);
+
+    owner_store
+        .insert_run(durable_record(
+            &expired_run_id,
+            &expired_session_id,
+            &user_id,
+        ))
+        .await
+        .expect("owner pod inserts expiring approval run");
+    owner_store
+        .append_event(
+            &user_id,
+            &expired_run_id,
+            json!({
+                "event_type": "approval_required",
+                "data": {
+                    "request_id": expired_request_id,
+                    "tool": "bash",
+                    "args": {"command": "git status"},
+                    "approval_kind": "standard"
+                }
+            }),
+        )
+        .await
+        .expect("owner pod persists expiring approval request");
+    owner_store
+        .update_run_status(
+            &user_id,
+            &expired_run_id,
+            "waiting",
+            Some("tool_approval"),
+            None,
+        )
+        .await
+        .expect("owner pod persists expiring approval wait");
+    owner_store
+        .resolve_run_interaction(
+            &user_id,
+            &expired_run_id,
+            &expired_request_id,
+            DurableRunInteractionKind::Approval,
+            json!({
+                "request_id": expired_request_id,
+                "outcome": "timeout",
+                "decision": "timeout",
+                "reason": "deadline elapsed",
+                "tool": "bash",
+                "approval_kind": "standard"
+            }),
+        )
+        .await
+        .expect("timeout closes durable approval wait");
+    let late_body = json!({
+        "request_id": expired_request_id,
+        "decision": "allow",
+        "reason": "late response after expiry",
+        "session_id": expired_session_id,
+        "run_id": expired_run_id,
+        "tool_name": "bash",
+        "approval_kind": "standard"
+    });
+    let (late_status, _) =
+        post_json(&client, callback_d_addr, "/approval/respond", &late_body).await;
+    assert_eq!(
+        late_status,
+        StatusCode::CONFLICT,
+        "late approval must not overwrite the durable timeout"
+    );
+
+    callback_d_handle.abort();
+    for run_id in [&approval_run_id, &prompt_run_id, &expired_run_id] {
+        cleanup_joint_run(&pool, &user_id, run_id).await;
+    }
+    for session_id in [
+        &approval_session_id,
+        &prompt_session_id,
+        &expired_session_id,
+    ] {
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(&user_id)
+            .bind(session_id)
+            .execute(pool.get())
+            .await
+            .expect("joint E2E session cleanup must succeed");
+    }
 }
 
 #[tokio::test]
@@ -1244,12 +1702,12 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         .expect("S07 approval condition event chain must persist");
     }
 
-    post_run_input(
+    post_user_intent(
         &client,
         addr,
         &run_id,
-        "approval-final",
-        json!({"approval_id": approval_id, "decision": "approved"}),
+        "intent-final",
+        json!({"content": "continue with the approved release conditions"}),
     )
     .await;
     let final_store = shared_store.read().await.clone();

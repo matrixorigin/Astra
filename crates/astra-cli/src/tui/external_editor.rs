@@ -1,7 +1,23 @@
 use std::process::Command;
 
-pub(crate) fn edit_in_external_editor(initial: &str) -> Result<String, String> {
-    edit_in_external_editor_with_command(initial, resolve_editor_command().as_deref())
+pub(crate) async fn edit_in_external_editor_async(initial: String) -> Result<String, String> {
+    edit_in_external_editor_with_command_async(initial, None, None).await
+}
+
+async fn edit_in_external_editor_with_command_async(
+    initial: String,
+    command_override: Option<String>,
+    temp_dir: Option<std::path::PathBuf>,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        edit_in_external_editor_with_command_in(
+            &initial,
+            command_override.as_deref(),
+            temp_dir.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("external editor task failed: {error}"))?
 }
 
 fn resolve_editor_command() -> Option<String> {
@@ -59,13 +75,6 @@ fn binary_exists_in_path(binary: &str) -> bool {
         return false;
     };
     std::env::split_paths(&path).any(|dir| dir.join(binary).is_file())
-}
-
-fn edit_in_external_editor_with_command(
-    initial: &str,
-    command_override: Option<&str>,
-) -> Result<String, String> {
-    edit_in_external_editor_with_command_in(initial, command_override, None)
 }
 
 fn edit_in_external_editor_with_command_in(
@@ -192,7 +201,8 @@ fn requires_shell_evaluation(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        edit_in_external_editor_with_command_in, first_available_editor, requires_shell_evaluation,
+        edit_in_external_editor_with_command_async, edit_in_external_editor_with_command_in,
+        first_available_editor, requires_shell_evaluation,
     };
 
     #[test]
@@ -217,6 +227,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(edited, "edited from editor\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_editor_wait_does_not_block_runtime() {
+        let dir = crate::tests::test_temp_dir();
+        let script = dir.path().join("slow-editor.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nsleep 0.15\nprintf 'edited asynchronously\\n' > \"$ASTRA_EDITOR_TARGET\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let edit = edit_in_external_editor_with_command_async(
+            "before".to_string(),
+            Some(format!("sh {}", script.display())),
+            Some(dir.path().to_path_buf()),
+        );
+        tokio::pin!(edit);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut edit)
+                .await
+                .is_err(),
+            "runtime timer should fire while the editor owns a blocking thread"
+        );
+        assert_eq!(edit.await.unwrap(), "edited asynchronously\n");
     }
 
     #[test]

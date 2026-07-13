@@ -1821,7 +1821,7 @@ mod context_cache_contract_tests {
         };
         let always_load_names = HashSet::from(["bash".to_string(), "read_file".to_string()]);
         let round_zero_current = vec![
-            tool_with_parameter_insert_order("read_file", &["path", "offset"]),
+            tool_with_parameter_insert_order("read_file", &["path", "start_line"]),
             tool_with_parameter_insert_order("aaa_dynamic", &["query", "limit"]),
             tool_with_parameter_insert_order("bash", &["cmd", "timeout"]),
         ];
@@ -1838,7 +1838,7 @@ mod context_cache_contract_tests {
 
         let round_one_current = vec![
             tool_with_parameter_insert_order("bash", &["timeout", "cmd"]),
-            tool_with_parameter_insert_order("read_file", &["offset", "path"]),
+            tool_with_parameter_insert_order("read_file", &["start_line", "path"]),
             tool_with_parameter_insert_order("aaa_dynamic", &["limit", "query"]),
         ];
         let round_one_visible = round_one_current.clone();

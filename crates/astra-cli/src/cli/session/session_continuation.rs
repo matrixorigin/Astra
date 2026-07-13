@@ -1,19 +1,44 @@
-//! Session continuation helpers: load previous conversation from heavy checkpoints,
-//! strip runtime-injected scaffolding messages, and trim incomplete tool rounds.
+//! Session continuation helpers: load previous conversation from the durable
+//! conversation projection or journal, then strip runtime-injected scaffolding.
 //!
 //! Used by one-shot mode (`-m "..." --session-id <id>`) to provide multi-turn continuity.
 
-use crate::tui::turn_event::TurnEvent;
 use serde_json::{Value, json};
 
-/// Load conversation messages from a session's latest heavy checkpoint.
+/// Load prompt-facing continuation from canonical local session state.
 /// Used by one-shot mode (`-m "..." --session-id <id>`) to provide
 /// conversation history that the model needs for multi-turn continuity.
 ///
-/// Falls back to the prompt-facing transcript if the checkpoint is missing,
-/// unreadable, or sanitizes to no usable history. Returns `None` only when
-/// both stores have no prompt-facing history.
+/// CSL preserves full canonical runtime history. The primary session journal
+/// is the durable source of completed turns and provides a fresh
+/// prompt-facing fallback while a CSL projection is delayed or unavailable.
+/// A heavy checkpoint is the final recovery fallback. The TUI transcript is a
+/// display projection and is deliberately never used as model history.
 pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<Value>> {
+    match load_csl_messages_for_continuation(session_id) {
+        Ok(Some(messages)) => return Some(messages),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to read CSL continuation projection; falling back to durable journal"
+            );
+        }
+    }
+
+    match load_journal_messages_for_continuation(session_id) {
+        Ok(Some(messages)) => return Some(messages),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "failed to read journal continuation fallback; falling back to heavy checkpoint"
+            );
+        }
+    }
+
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
     match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(&user_id, session_id) {
         Ok(Some(cp)) if !cp.messages.is_empty() => {
@@ -29,7 +54,7 @@ pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option
                     session_id = %session_id,
                     "continuation checkpoint sanitized to no prompt-facing messages; falling back to transcript"
                 );
-                load_transcript_messages_for_continuation(session_id)
+                None
             } else {
                 Some(messages)
             }
@@ -39,12 +64,58 @@ pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option
                 user_id = %user_id,
                 session_id = %session_id,
                 error = %error,
-                "failed to read continuation checkpoint; falling back to transcript"
+                "failed to read continuation checkpoint"
             );
-            load_transcript_messages_for_continuation(session_id)
+            None
         }
-        _ => load_transcript_messages_for_continuation(session_id),
+        _ => None,
     }
+}
+
+/// Rebuild a prompt-facing history from completed durable journal turns.
+///
+/// The journal intentionally records only real user input and assistant
+/// output, so this fallback cannot smuggle runtime scaffolding, tool payloads
+/// or UI transcript artifacts into the next prompt.
+fn load_journal_messages_for_continuation(session_id: &str) -> Result<Option<Vec<Value>>, String> {
+    let restored = crate::cli::session::session_runtime::restored_journal_state(session_id)?;
+    if !restored.exists {
+        return Ok(None);
+    }
+
+    let messages = restored
+        .session
+        .history
+        .into_iter()
+        .flat_map(|(user, assistant)| {
+            let mut turn = Vec::with_capacity(2);
+            if !user.trim().is_empty() {
+                turn.push(json!({"role": "user", "content": user}));
+            }
+            if !assistant.trim().is_empty() {
+                turn.push(json!({"role": "assistant", "content": assistant}));
+            }
+            turn
+        })
+        .collect::<Vec<_>>();
+    Ok((!messages.is_empty()).then_some(messages))
+}
+
+fn load_csl_messages_for_continuation(session_id: &str) -> Result<Option<Vec<Value>>, String> {
+    let store = astra_turn_core::conversation_log::file_store::FileCslStore::new(
+        crate::cli::session::session_recovery::io::csl_store_base_dir(),
+    );
+    let materialized = store
+        .load_materialized_blocking(session_id)
+        .map_err(|error| error.to_string())?;
+    let Some(materialized) = materialized else {
+        return Ok(None);
+    };
+    let messages = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
+        materialized.messages,
+        &materialized.session_state,
+    );
+    Ok((!messages.is_empty()).then_some(messages))
 }
 
 fn heavy_checkpoint_prompt_state(
@@ -85,48 +156,6 @@ pub(crate) fn sanitize_continuation_messages(mut msgs: Vec<Value>) -> Vec<Value>
 /// Handles both string content and array-format content blocks.
 pub(crate) fn extract_text_content(msg: &Value) -> Option<String> {
     astra_turn_core::prompt_facing::extract_text_content(msg)
-}
-
-pub(crate) fn load_transcript_messages_for_continuation(session_id: &str) -> Option<Vec<Value>> {
-    let events = crate::tui::transcript_jsonl::load(session_id);
-    let messages = transcript_events_to_messages(&events);
-    if messages.is_empty() {
-        None
-    } else {
-        Some(sanitize_continuation_messages(messages))
-    }
-}
-
-pub(crate) fn transcript_history_pairs_for_session(session_id: &str) -> Vec<(String, String)> {
-    load_transcript_messages_for_continuation(session_id)
-        .map(|messages| history_pairs_from_messages(&messages))
-        .unwrap_or_default()
-}
-
-fn transcript_events_to_messages(events: &[TurnEvent]) -> Vec<Value> {
-    events
-        .iter()
-        .filter_map(transcript_event_to_message)
-        .collect()
-}
-
-fn transcript_event_to_message(event: &TurnEvent) -> Option<Value> {
-    match event {
-        TurnEvent::User { text, .. } => non_empty_message("user", text),
-        TurnEvent::Assistant { markdown, .. } => non_empty_message("assistant", markdown),
-        TurnEvent::System { text, .. } => non_empty_message("system", text),
-        TurnEvent::Tool { .. } => None,
-        TurnEvent::Thinking { .. } | TurnEvent::TurnSummary { .. } => None,
-    }
-}
-
-fn non_empty_message(role: &str, text: &str) -> Option<Value> {
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(json!({"role": role, "content": text}))
-    }
 }
 
 /// Reconstruct CLI `(user, assistant)` history pairs from OpenAI-style messages.
@@ -183,9 +212,44 @@ pub(crate) fn history_pairs_from_messages(msgs: &[Value]) -> Vec<(String, String
 }
 #[cfg(test)]
 mod tests {
-    use crate::tui::turn_event::{ToolStatus, TurnEvent};
     use astra_pipeline::step_protocol::{ExecutionCursor, StepCheckpoint};
+    use astra_services::session_journal;
     use serde_json::json;
+
+    #[test]
+    #[serial_test::serial]
+    fn load_session_messages_uses_durable_journal_when_csl_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let _journal_dir = session_journal::JournalDirGuard::new(temp.path());
+        let session_id = format!("journal-continuation-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&session_id).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&session_id),
+                1,
+                Some("test-model"),
+                "keep the result",
+                "the result is durable",
+                0,
+                5,
+                3,
+                10,
+            ))
+            .unwrap();
+
+        let messages = super::load_session_messages_for_continuation(&session_id)
+            .expect("journal turn should provide continuation while CSL is absent");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0],
+            json!({"role": "user", "content": "keep the result"})
+        );
+        assert_eq!(
+            messages[1],
+            json!({"role": "assistant", "content": "the result is durable"})
+        );
+    }
 
     #[test]
     fn load_session_messages_returns_checkpoint_messages() {
@@ -242,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn load_session_messages_falls_back_to_transcript_when_checkpoint_errors() {
+    fn load_session_messages_uses_csl_when_checkpoint_errors() {
         let session_id = format!("test-session-cont-corrupt-{}", uuid::Uuid::new_v4());
         let mut checkpoint = StepCheckpoint::heavy(
             "s1".to_string(),
@@ -276,34 +340,70 @@ mod tests {
         )
         .unwrap();
 
-        crate::tui::transcript_jsonl::append(
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
             &session_id,
-            &TurnEvent::User {
-                ts: None,
-                text: "transcript question".into(),
-            },
-        );
-        crate::tui::transcript_jsonl::append(
-            &session_id,
-            &TurnEvent::Assistant {
-                ts: None,
-                markdown: "transcript answer".into(),
-            },
-        );
+            9,
+            &[
+                json!({"role": "user", "content": "canonical question"}),
+                json!({"role": "assistant", "content": "canonical answer"}),
+            ],
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+        )
+        .unwrap();
 
         let messages = super::load_session_messages_for_continuation(&session_id)
-            .expect("corrupt checkpoint should fall back to transcript");
+            .expect("canonical CSL should not depend on checkpoint validity");
 
         let _ = std::fs::remove_dir_all(
             astra_pipeline::step_checkpoint::owner_session_dir_for(&user_id, &session_id).unwrap(),
         );
-        if let Some(path) = crate::tui::transcript_jsonl::transcript_path(&session_id) {
-            let _ = std::fs::remove_file(path);
-        }
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["content"], "transcript question");
-        assert_eq!(messages[1]["content"], "transcript answer");
+        assert_eq!(messages[0]["content"], "canonical question");
+        assert_eq!(messages[1]["content"], "canonical answer");
+    }
+
+    #[test]
+    fn load_session_messages_prefers_csl_over_valid_checkpoint() {
+        let session_id = format!("test-session-csl-priority-{}", uuid::Uuid::new_v4());
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        let checkpoint = StepCheckpoint::heavy(
+            "s1".to_string(),
+            "t1".to_string(),
+            "astra-cli".to_string(),
+            ExecutionCursor::default(),
+        );
+        let mut checkpoint = checkpoint;
+        let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+            unreachable!("StepCheckpoint::heavy must create a heavy checkpoint");
+        };
+        heavy.messages = vec![json!({"role": "user", "content": "older checkpoint"})];
+        astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
+            &session_id,
+            1,
+            &checkpoint,
+        )
+        .unwrap();
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            2,
+            &[
+                json!({"role": "user", "content": "canonical current"}),
+                json!({"role": "assistant", "content": "current answer"}),
+            ],
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+        )
+        .unwrap();
+
+        let messages = super::load_session_messages_for_continuation(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(
+            astra_pipeline::step_checkpoint::owner_session_dir_for(&user_id, &session_id).unwrap(),
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "canonical current");
+        assert_eq!(messages[1]["content"], "current answer");
     }
 
     #[test]
@@ -370,43 +470,6 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0]["content"], "hello");
         assert_eq!(result[1]["content"], "still here");
-    }
-
-    #[test]
-    fn transcript_events_restore_prompt_facing_stage_history() {
-        let events = vec![
-            TurnEvent::User {
-                ts: None,
-                text: "review current branch".into(),
-            },
-            TurnEvent::Tool {
-                ts: None,
-                name: "git".into(),
-                description: "diff --stat".into(),
-                status: ToolStatus::Success,
-                duration_ms: 10,
-                output_summary: Some("202 files changed".into()),
-                output: None,
-            },
-            TurnEvent::Assistant {
-                ts: None,
-                markdown: "I found a large runtime change set.".into(),
-            },
-        ];
-
-        let messages =
-            super::sanitize_continuation_messages(super::transcript_events_to_messages(&events));
-        let pairs = super::history_pairs_from_messages(&messages);
-
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].0, "review current branch");
-        assert!(!messages.iter().any(|msg| {
-            msg["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("[Runtime tool result]\ngit: diff --stat | 202 files changed")
-        }));
-        assert_eq!(pairs[0].1, "I found a large runtime change set.");
     }
 
     #[test]

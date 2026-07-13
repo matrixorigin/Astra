@@ -27,7 +27,10 @@ use astra_runtime::{
 use astra_services::coordination::AgentResult;
 use astra_turn_core::tool::schema::tool_names_from_schemas;
 
-use super::skill_subrun::{SubRunHost, persist_failed_subrun};
+use super::skill_subrun::{SubRunHost, SubRunJournalIdentity, persist_failed_subrun};
+use super::spawn_subrun::{
+    agent_live_stream_event_sink, emit_agent_terminated, emit_agent_transcript_committed,
+};
 use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::edge_tools;
 
@@ -83,6 +86,20 @@ fn resolve_worktree_path(
             }
         })
         .unwrap_or_else(|| default_root.to_path_buf())
+}
+
+/// Establish the durable boundary of one local child conversation.
+///
+/// The child task itself is captured separately at the run boundary. System
+/// instructions and inherited parent context are provider input, not
+/// child-authored transcript history.
+fn initial_delegate_transcript_identity(session_id: &str, run_id: &str) -> SubRunJournalIdentity {
+    SubRunJournalIdentity {
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        next_item_seq: 1,
+        last_assistant_source_event_id: None,
+    }
 }
 
 // ─── CliDelegateSubRunExecutor ──────────────────────────────────────────────
@@ -216,6 +233,34 @@ fn build_restricted_tools(
 impl SubRunExecutor for CliDelegateSubRunExecutor {
     async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
         let profile = &config.agent_profile;
+        let started_at = std::time::Instant::now();
+        // Profile names are not run identities: fan-out can legitimately run
+        // several reviewers at once. Keep the visible profile prefix while
+        // making the live stream key unambiguous and stable for this run.
+        let live_agent_id = format!("{}@{}", profile.agent_id, config.run_id);
+        let live_event_sink = config.live_event_sink.clone();
+        if let Some(sink) = live_event_sink.as_ref()
+            && let Err(error) = sink.send(astra_turn_core::agent_live_event::AgentLiveEvent {
+                run_id: config.run_id.clone(),
+                agent_id: live_agent_id.clone(),
+                kind: astra_turn_core::agent_live_event::AgentLiveEventKind::Signal(
+                    astra_turn_core::agent_live_event::AgentLiveSignal::RunStarted {
+                        parent_run_id: Some(config.parent_run_id.clone()),
+                        depth: u32::from(config.recursion_depth).saturating_add(1),
+                        spawn_tool_call_id: None,
+                        transcript_location:
+                            astra_turn_types::AgentTranscriptLocation::LocalJournal,
+                    },
+                ),
+            })
+        {
+            tracing::debug!(
+                agent_id = %live_agent_id,
+                run_id = %config.run_id,
+                ?error,
+                "delegated agent start was not delivered to the live workbench"
+            );
+        }
         let effective_model = profile
             .model_override
             .clone()
@@ -262,6 +307,30 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             executor.set_active_session_id(config.session_id.clone());
         }
 
+        // A delegated local run is a real child conversation, not merely a
+        // progress card. Its durable lane is keyed by the same session/run
+        // identity supplied by the delegation contract, so Ctrl+G remains a
+        // monitor and navigation surface rather than the only record of work.
+        let journal = if config.session_id.trim().is_empty() {
+            None
+        } else {
+            match astra_services::session_journal::JournalWriter::new(&config.session_id) {
+                Ok(writer) => Some(std::sync::Arc::new(writer)),
+                Err(error) => {
+                    // Losing transcript persistence must not discard useful
+                    // delegated work or force-stop an otherwise valid child.
+                    tracing::warn!(
+                        session_id = %config.session_id,
+                        run_id = %config.run_id,
+                        agent_id = %profile.agent_id,
+                        %error,
+                        "delegated local agent transcript journal is unavailable"
+                    );
+                    None
+                }
+            }
+        };
+
         let mut host = SubRunHost {
             api: self.api.clone(),
             token: self.token.clone(),
@@ -277,9 +346,13 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             cancel_token: self.cancel_token.clone(),
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: self.progress_tx.clone(),
-            agent_id: profile.agent_id.clone(),
+            agent_id: live_agent_id.clone(),
             stream_event_tx: None,
-            stream_event_sink: None,
+            stream_event_sink: agent_live_stream_event_sink(
+                config.run_id.clone(),
+                live_agent_id.clone(),
+                live_event_sink.clone(),
+            ),
             tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
@@ -293,7 +366,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             inherited_prefix: config.inherited_prefix.clone(),
             fork_cache_sink: self.fork_cache_sink.clone(),
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
-            journal: None,
+            journal,
+            journal_identity: None,
         };
 
         // Build system message from agent profile.
@@ -352,6 +426,13 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             force_reasoning_field,
         );
 
+        if host.journal.is_some() {
+            host.journal_identity = Some(initial_delegate_transcript_identity(
+                &config.session_id,
+                &config.run_id,
+            ));
+        }
+
         let restricted_tools = build_restricted_tools(&profile.skill_filter, &valid_tool_names);
 
         let task_profile = infer_task_execution_profile(&config.task);
@@ -367,6 +448,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             observation_store: None,
             observation_journal: Default::default(),
             messages,
+            run_transcript_capture: None,
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
@@ -385,6 +467,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,
+            final_output_ready_notified: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -443,13 +526,17 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             },
             messaging: MessagingState {
                 mailbox: config.mailbox,
-                progress_emitter: self
-                    .progress_broadcaster
-                    .as_ref()
-                    .map(|b| b.for_agent(profile.agent_id.clone())),
+                progress_emitter: self.progress_broadcaster.as_ref().map(|b| {
+                    b.for_agent_with_run_context(
+                        live_agent_id.clone(),
+                        config.run_id.clone(),
+                        config.parent_run_id.clone(),
+                        None,
+                    )
+                }),
                 ..Default::default()
             },
-            deferred_input: Default::default(),
+            user_intents: Default::default(),
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: config.pause_flag.clone(),
@@ -519,10 +606,19 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };
 
+        // Persist the child task before its first model boundary, then flush
+        // once more after the loop for interrupted tool rounds and partial
+        // output that did not reach a normal turn-completion callback.
+        if host.journal_identity.is_some() {
+            state.begin_run_transcript_capture(state.messages.last().cloned());
+        }
+        let _ = host.flush_agent_transcript(&state);
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+        let _ = host.flush_agent_transcript(&state);
 
         let tool_calls = state.total_tool_calls as u32;
         let agent_id = profile.agent_id.clone();
+        let terminal_run_id = config.run_id.clone();
         let run_id = config.run_id;
         let prompt_tokens = state.total_prompt;
         let completion_tokens = state.total_completion;
@@ -535,7 +631,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             }
         };
 
-        match loop_result {
+        let result = match loop_result {
             Ok(astra_runtime::turn::agentic_loop::host::AgenticLoopOutcome::Delegated) => {
                 Ok(AgentResult {
                     agent_id,
@@ -569,7 +665,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                     agent_id,
                     run_id,
                     status: "completed".to_string(),
-                    output: Some(state.final_text),
+                    output: Some(state.final_text.clone()),
                     error: None,
                     prompt_tokens,
                     completion_tokens,
@@ -602,6 +698,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             }
             Ok(astra_runtime::turn::agentic_loop::host::AgenticLoopOutcome::Error(err)) => {
                 let failure_output = persist_failed_subrun(&mut state, &err);
+                let _ = host.flush_agent_transcript(&state);
                 Ok(AgentResult {
                     agent_id,
                     run_id,
@@ -616,6 +713,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             Err(err) => {
                 let err_str = err.to_string();
                 let failure_output = persist_failed_subrun(&mut state, &err_str);
+                let _ = host.flush_agent_transcript(&state);
                 Ok(AgentResult {
                     agent_id,
                     run_id,
@@ -627,7 +725,35 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                     tool_calls,
                 })
             }
+        };
+
+        if let Ok(result) = &result {
+            if let Some(source_event_id) = host.finalize_agent_transcript(&state).await {
+                emit_agent_transcript_committed(
+                    live_event_sink.as_ref(),
+                    &terminal_run_id,
+                    &live_agent_id,
+                    source_event_id,
+                    astra_turn_types::AgentTranscriptLocation::LocalJournal,
+                );
+            }
+            let termination = match result.status.as_str() {
+                "completed" => astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
+                "delegated" => astra_turn_core::agent_live_event::AgentLiveTermination::Delegated,
+                "cancelled" => astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled,
+                "paused" => astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted,
+                _ => astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
+            };
+            emit_agent_terminated(
+                live_event_sink.as_ref(),
+                &terminal_run_id,
+                &live_agent_id,
+                started_at,
+                termination,
+                result.error.clone(),
+            );
         }
+        result
     }
 }
 
@@ -723,8 +849,8 @@ pub(crate) fn register_default_agents(
 #[cfg(test)]
 mod tests {
     use super::{
-        CliDelegateSubRunExecutor, build_restricted_tools, register_default_agents,
-        resolve_worktree_path,
+        CliDelegateSubRunExecutor, build_restricted_tools, initial_delegate_transcript_identity,
+        register_default_agents, resolve_worktree_path,
     };
     use crate::cli::permission_manager::PermissionMode;
     use std::collections::{HashMap, HashSet};
@@ -780,6 +906,15 @@ mod tests {
     }
 
     #[test]
+    fn delegated_transcript_identity_is_owned_by_the_parent_session_run() {
+        let identity = initial_delegate_transcript_identity("session-1", "run-1");
+
+        assert_eq!(identity.session_id, "session-1");
+        assert_eq!(identity.run_id, "run-1");
+        assert_eq!(identity.next_item_seq, 1);
+    }
+
+    #[test]
     fn default_agents_have_system_prompts() {
         let mut registry = astra_services::coordination::AgentProfileRegistry::new();
         register_default_agents(&mut registry);
@@ -817,6 +952,7 @@ mod tests {
 
         // Simulate a team delegation from "main" to coder/reviewer
         let request = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "Implement feature".into(),

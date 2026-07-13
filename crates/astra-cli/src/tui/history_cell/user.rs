@@ -1,4 +1,4 @@
-//! User-turn history cell — what the user typed, as they typed it.
+//! User-turn history cell — the semantic conversational input sent to the turn.
 //!
 //! Rendered as a quoted input block:
 //!
@@ -8,11 +8,12 @@
 //! › ...
 //! ```
 //!
-//! A soft tinted background spans the whole block and every content
-//! row gets the same `› ` quote prefix so the message reads as one
-//! visual unit rather than a prompt/continuation pair.
+//! A quiet slate background spans the content and one breathing row above and
+//! below it; every content row gets the same `› ` prefix. This keeps a short
+//! user turn legible as an input block without reviving the old opaque card.
 //!
-//! Persists as [`TurnEvent::User`]. Never enters a live state —
+//! Local UI/control actions use `SystemCell::action` instead, so this type is
+//! always prompt-facing. Persists as [`TurnEvent::User`]. Never enters a live state —
 //! the text is fully known at construction time.
 
 use std::any::Any;
@@ -66,18 +67,20 @@ impl UserCell {
 }
 
 impl HistoryCell for UserCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let bg = user_message_style();
         let theme = crate::tui::theme::current();
         let prefix_style = Style::default().fg(if theme.is_light {
             Color::DarkGray
         } else {
-            Color::Gray
+            theme.accent_dim()
         });
-        let pad = Line::from(Span::raw("")).style(bg);
 
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(pad.clone());
+        // The transcript separator intentionally gives UserCell no extra
+        // blank line. Keep its compact, symmetric breathing room here so the
+        // visual boundary survives both live rendering and persisted replay.
+        let blank_row = || Line::from(Span::raw(" ".repeat(usize::from(width.max(1))))).style(bg);
+        let mut lines: Vec<Line<'static>> = vec![blank_row()];
 
         if self.text.is_empty() {
             lines.push(
@@ -101,8 +104,8 @@ impl HistoryCell for UserCell {
                 );
             }
         }
-        lines.push(pad);
 
+        lines.push(blank_row());
         lines
     }
 
@@ -205,26 +208,32 @@ mod tests {
     }
 
     #[test]
-    fn slash_command_user_cell_is_tight_one_content_line() {
-        let cell = UserCell::new("/model glm-5.1");
-        let lines = cell.display_lines(60);
-        assert_eq!(
-            lines.len(),
-            3,
-            "slash UserCell should render top pad, content, bottom pad: {:?}",
-            lines
-        );
-    }
-
-    #[test]
-    fn prose_user_cell_is_tight_one_content_line() {
+    fn prose_user_cell_keeps_symmetric_breathing_room() {
         let cell = UserCell::new("just a prose question");
         let lines = cell.display_lines(60);
         assert_eq!(
             lines.len(),
             3,
-            "UserCell should emit pad + content + pad; got {:?}",
+            "UserCell should keep one content row plus two breathing rows; got {:?}",
             lines
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.content.trim().is_empty())
+        );
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("just a prose question"))
+        );
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .all(|span| span.content.trim().is_empty())
         );
     }
 
@@ -243,14 +252,30 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_single_line_40col() {
-        let cell = UserCell::new("rebuild the index");
-        crate::tui::testing::assert_tui_snapshot!("user_single_line_40", render_cell(&cell, 40, 3));
+    fn every_user_content_row_carries_the_same_quiet_surface() {
+        let cell = UserCell::new("first\nsecond");
+        let lines = cell.display_lines(60);
+        assert_eq!(lines.len(), 4);
+        let expected = crate::tui::style::user_message_style().bg;
+        assert!(lines.iter().all(|line| line.style.bg == expected));
     }
 
     #[test]
-    fn snapshot_multiline_60col() {
-        let cell = UserCell::new("first line\nsecond line with more words\nthird line");
-        crate::tui::testing::assert_tui_snapshot!("user_multiline_60", render_cell(&cell, 60, 5));
+    fn user_input_surface_spans_the_full_rendered_width_with_breathing_rows() {
+        let width = 48;
+        let cell = UserCell::new("review these changes");
+        let paragraph = ratatui::widgets::Paragraph::new(cell.display_lines(width))
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        let buffer = draw_widget(paragraph, width, 3);
+        let expected = crate::tui::style::user_message_style()
+            .bg
+            .expect("user surface always has a background");
+
+        for y in 0..3 {
+            assert!(
+                (0..width).all(|x| buffer[(x, y)].bg == expected),
+                "user surface row {y} must reach the terminal edge"
+            );
+        }
     }
 }

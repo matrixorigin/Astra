@@ -426,7 +426,43 @@ fn env_optional_f64(name: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        ffi::OsString,
+        sync::{Mutex, OnceLock},
+    };
+
     use super::*;
+
+    const LEGACY_CONTROL_POLL_INTERVAL_ENV: &str = "ASTRA_CAPACITY_CONTROL_POLL_INTERVAL_MS";
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(Default::default)
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn input() -> CapacityInput {
         CapacityInput {
@@ -523,19 +559,21 @@ mod tests {
     }
 
     #[test]
-    fn capacity_from_env_does_not_expose_control_poll_interval() {
-        let source = include_str!("capacity_model.rs");
-        let from_env_body = source
-            .split("pub(crate) fn from_env() -> Self")
-            .nth(1)
-            .and_then(|rest| rest.split("pub(crate) fn evaluate(&self)").next())
-            .expect("from_env body");
+    fn capacity_from_env_ignores_legacy_control_poll_interval_override() {
+        let _lock = env_test_lock().lock().expect("env test lock poisoned");
+        let _pods = EnvVarGuard::set(ENV_POD_COUNT, "3");
+        let _runs = EnvVarGuard::set(ENV_RUN_LIMIT, "20");
+        let _legacy_interval = EnvVarGuard::set(LEGACY_CONTROL_POLL_INTERVAL_ENV, "1");
 
-        assert!(
-            !from_env_body.contains("ASTRA_CAPACITY_CONTROL_POLL_INTERVAL_MS")
-                && !from_env_body.contains("ENV_CONTROL_POLL_INTERVAL_MS"),
-            "control poll interval is runtime policy, not a deployment capacity input"
+        let input = CapacityInput::from_env();
+        let plan = input.evaluate();
+
+        assert_eq!(
+            input.control_poll_interval_ms,
+            DEFAULT_CONTROL_POLL_INTERVAL_MS
         );
+        assert_eq!(plan.total_run_slots, 60);
+        assert_eq!(plan.estimated_control_poll_qps, 30.0);
     }
 
     #[test]

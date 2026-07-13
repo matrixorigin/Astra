@@ -6,11 +6,13 @@ pub const PROMPT_LEAK_FALLBACK: &str =
     "I can’t provide internal system instructions, but I can still help with the visible request.";
 
 /// Replacement text when an internal control protocol leaks into final output.
-pub const INTERNAL_PROTOCOL_FALLBACK: &str = "An internal control message was generated instead of a user-facing answer. Please restate the request and I will continue from the visible conversation.";
+pub const INTERNAL_PROTOCOL_FALLBACK: &str = "I can’t use an internal control message as a user-facing answer, but I can still help with your visible request.";
 
-/// Finish reason used when a guarded fallback replaces a child agent's final
-/// text. It must be a typed interruption, not a normal completion.
-pub const RESPONSE_GUARD_BLOCKED_FINISH_REASON: &str = "response_guard_blocked";
+/// Finish reason used when a safety fallback replaces a child agent's final
+/// text. The original output is withheld, but the visible fallback is a
+/// completed response: parent orchestration must not retry or abort solely
+/// because this safety boundary was applied.
+pub const RESPONSE_GUARD_REDACTED_FINISH_REASON: &str = "safety_redacted";
 
 /// Apply response guards to LLM output. Returns `Some(replacement)` if the
 /// text was blocked, `None` if it passed all guards.

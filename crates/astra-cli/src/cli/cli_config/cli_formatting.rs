@@ -6,6 +6,7 @@
 use crossterm::style::{Color, Stylize, style};
 use serde_json::Value;
 use std::borrow::Cow;
+use unicode_width::UnicodeWidthStr;
 
 use crate::diff_utils::parse_hunk_header;
 
@@ -71,9 +72,19 @@ pub fn colorize_diff_summary(diff: &str) -> String {
             new_line += 1;
             let prefix = format!("{:>4} + ", new_line);
             let body = format!("{prefix}{code}");
-            parts.push(format!(
-                "{}",
-                style(body).with(Color::Black).on(Color::DarkGreen)
+            parts.push(render_terminal_diff_change(
+                body,
+                Color::Rgb {
+                    r: 132,
+                    g: 231,
+                    b: 189,
+                },
+                Color::Rgb {
+                    r: 19,
+                    g: 49,
+                    b: 40,
+                },
+                Color::DarkGreen,
             ));
             continue;
         }
@@ -81,9 +92,19 @@ pub fn colorize_diff_summary(diff: &str) -> String {
             old_line += 1;
             let prefix = format!("{:>4} - ", old_line);
             let body = format!("{prefix}{code}");
-            parts.push(format!(
-                "{}",
-                style(body).with(Color::White).on(Color::DarkRed)
+            parts.push(render_terminal_diff_change(
+                body,
+                Color::Rgb {
+                    r: 255,
+                    g: 163,
+                    b: 166,
+                },
+                Color::Rgb {
+                    r: 59,
+                    g: 33,
+                    b: 39,
+                },
+                Color::DarkRed,
             ));
             continue;
         }
@@ -98,6 +119,95 @@ pub fn colorize_diff_summary(diff: &str) -> String {
     }
 
     parts.join("\n")
+}
+
+/// Render a compact `git diff` statistic as one neutral change surface.
+///
+/// A stat mixes additions and deletions, so colouring the whole row green or
+/// red lies about its meaning. The surface is deliberately slate; the `+` and
+/// `-` remain readable data rather than terminal escape sequences smuggled
+/// into a summary string.
+pub fn colorize_git_diff_stat_summary(summary: &str) -> String {
+    summary
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 && looks_like_git_diff_stat(line) {
+                render_terminal_diff_stat_row(format!("    {}", line.trim()))
+            } else {
+                format!("    {}", line.dim())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn looks_like_git_diff_stat(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with('+') && line.contains(" -") && line.contains(" in ")
+}
+
+/// Render a changed row as one low-saturation semantic surface. The direct
+/// streaming CLI cannot hand a typed [`ratatui::text::Line`] to the TUI, so it
+/// must apply the same visual contract itself: on a truecolor terminal, paint
+/// the entire physical row with the restrained edit surface; on weaker
+/// terminals retain a readable foreground instead of falling back to a
+/// fluorescent ANSI background.
+fn render_terminal_diff_change(
+    body: String,
+    truecolor_fg: Color,
+    truecolor_bg: Color,
+    ansi_fg: Color,
+) -> String {
+    if terminal_supports_truecolor() {
+        let padded = pad_terminal_row(body);
+        format!("{}", style(padded).with(truecolor_fg).on(truecolor_bg))
+    } else {
+        format!("{}", style(body).with(ansi_fg))
+    }
+}
+
+fn render_terminal_diff_stat_row(body: String) -> String {
+    if terminal_supports_truecolor() {
+        format!(
+            "{}",
+            style(pad_terminal_row(body))
+                .with(Color::Rgb {
+                    r: 204,
+                    g: 215,
+                    b: 229,
+                })
+                .on(Color::Rgb {
+                    r: 31,
+                    g: 42,
+                    b: 55,
+                })
+        )
+    } else {
+        format!("{}", style(body).with(Color::Cyan))
+    }
+}
+
+fn terminal_supports_truecolor() -> bool {
+    supports_color::on_cached(supports_color::Stream::Stderr).is_some_and(|level| level.has_16m)
+        || std::env::var("COLORTERM")
+            .map(|value| {
+                let value = value.to_ascii_lowercase();
+                value.contains("truecolor") || value.contains("24bit")
+            })
+            .unwrap_or(false)
+}
+
+fn pad_terminal_row(mut text: String) -> String {
+    let Ok((width, _)) = crossterm::terminal::size() else {
+        return text;
+    };
+    let width = usize::from(width);
+    let used = UnicodeWidthStr::width(text.as_str());
+    if used < width {
+        text.push_str(&" ".repeat(width - used));
+    }
+    text
 }
 
 fn is_diff_change_line(line: &str) -> bool {
@@ -401,9 +511,9 @@ fn find_comment_start(code: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        colorize_diff_summary, compact_unified_diff_preview, extract_cli_diff_block,
-        find_comment_start, format_byte_size, format_duration_suffix, highlight_code_line,
-        shorten_path, truncate_line,
+        colorize_diff_summary, colorize_git_diff_stat_summary, compact_unified_diff_preview,
+        extract_cli_diff_block, find_comment_start, format_byte_size, format_duration_suffix,
+        highlight_code_line, shorten_path, truncate_line,
     };
 
     #[test]
@@ -515,6 +625,18 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let stripped = strip_ansi(&rendered);
         assert!(stripped.contains("… +400 more changed lines"), "{stripped}");
         assert!(!stripped.contains("line-599"), "{stripped}");
+    }
+
+    #[test]
+    fn git_diff_stat_uses_a_neutral_diff_surface_not_a_success_colour() {
+        let rendered = colorize_git_diff_stat_summary(
+            "+21 -18 in 1 file(s)\n      pkg/frontend/plan_cache.go",
+        );
+        let stripped = strip_ansi(&rendered);
+        let rows = stripped.lines().collect::<Vec<_>>();
+        assert_eq!(rows[0].trim_end(), "    +21 -18 in 1 file(s)");
+        assert!(rows[0].len() > rows[0].trim_end().len(), "{rows:?}");
+        assert_eq!(rows[1], "          pkg/frontend/plan_cache.go");
     }
 
     #[test]

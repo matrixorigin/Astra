@@ -24,6 +24,13 @@ pub trait MessageStream: Send {
     /// Non-blocking: return a message if one is already buffered.
     fn try_recv(&mut self) -> Option<Arc<AgentMessage>>;
 
+    /// Confirm that a delivered message has been consumed by the runtime.
+    /// Durable transports override this; in-process delivery is already owned
+    /// by the receiver once dequeued and therefore uses the no-op default.
+    async fn acknowledge(&mut self, _message: &AgentMessage) -> Result<(), MailboxError> {
+        Ok(())
+    }
+
     /// Drain all currently buffered messages without blocking.
     fn drain(&mut self) -> Vec<Arc<AgentMessage>> {
         let mut msgs = Vec::new();

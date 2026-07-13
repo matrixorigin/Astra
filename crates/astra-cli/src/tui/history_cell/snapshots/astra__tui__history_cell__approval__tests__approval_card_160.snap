@@ -10,4 +10,4 @@ expression: "render_at(&fixture_full(), 160)"
 │ Remember · similar `npm test` commands in this workspace
 │
 │  Yes   Yes, and don't ask again   No
-╰─ ←→ move · Enter select · Esc close
+╰─ ←→ move · Enter select · Ctrl+D reject

@@ -1537,6 +1537,7 @@ mod tests {
             tool_schema_tokens: 8000,
             user_message_tokens: 500,
             total_used: 48000,
+            usage_source: Default::default(),
             budget_pressure: 0.375,
             compression_triggered: false,
         };

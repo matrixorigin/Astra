@@ -5,12 +5,14 @@
 //! - Spawn / kill lifecycle with CancellationToken
 //! - File-backed output capture (stdout/stderr → disk)
 //! - Single-channel `pending_completions` queue drained by
-//!   `poll_completions`; the TUI tick consumes lifecycle events
-//!   (Started / Completed / Failed / Killed / WaitingForInput) exactly once
+//!   `poll_completions`; the TUI tick consumes lifecycle and advisory events
+//!   (Started / Completed / Failed / Killed / NoRecentOutput) exactly once
 //!   per occurrence
-//! - Stall detection for shell tasks stuck on interactive input
+//! - Factual no-recent-output advisory without guessing process intent
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -19,9 +21,13 @@ use std::time::{Duration, Instant};
 use astra_pipeline::output_stream::OutputStream;
 use astra_services::session_workspace::BackgroundShellTaskProjection;
 use astra_text_utils::str_preview::truncate_line;
+use futures_util::FutureExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+
+use crate::background_task_error::BackgroundTaskError;
 
 // ── Public types ────────────────────────────────────────────────────
 
@@ -34,12 +40,12 @@ pub(crate) enum BgTaskStatus {
     Completed = 1,
     Failed = 2,
     Killed = 3,
-    WaitingForInput = 4,
+    Stopping = 4,
 }
 
 impl BgTaskStatus {
     fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running | Self::WaitingForInput)
+        matches!(self, Self::Completed | Self::Failed | Self::Killed)
     }
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -48,7 +54,7 @@ impl BgTaskStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Killed => "killed",
-            Self::WaitingForInput => "waiting_for_input",
+            Self::Stopping => "stopping",
         }
     }
 
@@ -58,7 +64,7 @@ impl BgTaskStatus {
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "killed" => Some(Self::Killed),
-            "waiting_for_input" => Some(Self::WaitingForInput),
+            "stopping" => Some(Self::Stopping),
             _ => None,
         }
     }
@@ -122,9 +128,10 @@ pub(crate) enum BgTaskEvent {
         id: String,
         title: String,
     },
-    WaitingForInput {
+    NoRecentOutput {
         id: String,
         title: String,
+        inactive_ms: u64,
         last_output_tail: String,
     },
 }
@@ -136,6 +143,24 @@ struct TaskCompletion {
     exit_code: Option<i32>,
     summary: String,
     error: Option<String>,
+}
+
+const BACKGROUND_TASK_PANIC_ERROR: &str = "background task crashed internally";
+
+async fn completion_from_runner<F>(task_id: String, runner: F) -> TaskCompletion
+where
+    F: Future<Output = TaskCompletion>,
+{
+    match AssertUnwindSafe(runner).catch_unwind().await {
+        Ok(completion) => completion,
+        Err(_) => TaskCompletion {
+            id: task_id,
+            status: BgTaskStatus::Failed,
+            exit_code: None,
+            summary: String::new(),
+            error: Some(BACKGROUND_TASK_PANIC_ERROR.to_string()),
+        },
+    }
 }
 
 // ── Handle (per-task metadata) ──────────────────────────────────────
@@ -154,8 +179,12 @@ pub(crate) struct BackgroundTaskHandle {
     pub exit_code: Option<i32>,
     pub terminal_reason: Option<String>,
     last_output_size: u64,
+    output_tail: Option<String>,
+    output_error: Option<BackgroundTaskError>,
+    output_sampled_at: Option<Instant>,
     last_activity: Instant,
     last_tail_probe_at: Option<Instant>,
+    no_recent_output_reported: bool,
     cancel_reason: Arc<AtomicU8>,
 }
 
@@ -165,18 +194,13 @@ impl BackgroundTaskHandle {
             1 => BgTaskStatus::Completed,
             2 => BgTaskStatus::Failed,
             3 => BgTaskStatus::Killed,
-            4 => BgTaskStatus::WaitingForInput,
+            4 => BgTaskStatus::Stopping,
             _ => BgTaskStatus::Running,
         }
     }
 
     pub fn projected_status(&self) -> &'static str {
-        let status = self.status();
-        if !self.live_control.is_available() && !status.is_terminal() {
-            "unavailable"
-        } else {
-            status.as_str()
-        }
+        self.status().as_str()
     }
 
     pub fn elapsed_ms(&self) -> u64 {
@@ -194,9 +218,6 @@ impl BackgroundTaskHandle {
     }
 
     fn set_status_if_non_terminal(&self, s: BgTaskStatus) -> bool {
-        // `WaitingForInput` is intentionally recoverable: output can stop before the
-        // child process exits, so the later real completion/failure/kill signal
-        // must still be able to replace the placeholder stalled state.
         let mut current = self.status.load(Ordering::Acquire);
         loop {
             if matches!(current, 1..=3) {
@@ -214,6 +235,17 @@ impl BackgroundTaskHandle {
         }
     }
 
+    fn request_stop(&self) -> bool {
+        self.status
+            .compare_exchange(
+                BgTaskStatus::Running as u8,
+                BgTaskStatus::Stopping as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     fn set_cancel_reason_if_empty(&self, reason: BgTaskCancelReason) {
         let _ = self.cancel_reason.compare_exchange(
             BgTaskCancelReason::None as u8,
@@ -221,6 +253,29 @@ impl BackgroundTaskHandle {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    }
+
+    pub(crate) fn observed_output_bytes(&self) -> u64 {
+        self.last_output_size
+    }
+
+    pub(crate) fn output_tail(&self) -> Option<&str> {
+        self.output_tail.as_deref()
+    }
+
+    pub(crate) fn output_error(&self) -> Option<&BackgroundTaskError> {
+        self.output_error.as_ref()
+    }
+
+    pub(crate) fn no_recent_output_ms(&self) -> Option<u64> {
+        let inactive = self.last_activity.elapsed();
+        if !self.live_control.is_available()
+            || self.status() != BgTaskStatus::Running
+            || inactive <= STALL_THRESHOLD
+        {
+            return None;
+        }
+        Some(inactive.as_millis().min(u128::from(u64::MAX)) as u64)
     }
 }
 
@@ -244,19 +299,8 @@ const MAX_RETAINED_FAILED_TASKS: usize = 128;
 const MAX_RETAINED_FAILED_TASKS: usize = 3;
 const STALL_THRESHOLD: Duration = Duration::from_secs(45);
 const STALL_TAIL_RECHECK_COOLDOWN: Duration = Duration::from_secs(2);
-const PROMPT_PATTERNS: &[&str] = &[
-    "(y/n)",
-    "[Y/n]",
-    "[y/N]",
-    "Press Enter",
-    "Continue?",
-    "Overwrite?",
-    "password:",
-    "passphrase:",
-    "Are you sure",
-    "(yes/no)",
-];
-
+const OUTPUT_PROBE_INTERVAL: Duration = Duration::from_millis(50);
+const OUTPUT_PREVIEW_INTERVAL: Duration = Duration::from_millis(500);
 fn output_cap_error() -> String {
     format!(
         "background shell output exceeded {} bytes; shell was terminated",
@@ -264,21 +308,46 @@ fn output_cap_error() -> String {
     )
 }
 
+#[derive(Debug)]
+struct ShellOutputProbeRequest {
+    id: String,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    tail_bytes: Option<usize>,
+    report_missing: bool,
+}
+
+#[derive(Debug)]
+struct ShellOutputObservation {
+    id: String,
+    total_bytes: u64,
+    tail: Option<String>,
+    output_error: Option<BackgroundTaskError>,
+}
+
 pub(crate) struct BackgroundTaskRegistry {
     tasks: HashMap<String, BackgroundTaskHandle>,
     join_set: JoinSet<TaskCompletion>,
     output_dir: PathBuf,
     pending_completions: Vec<BgTaskEvent>,
+    output_probe_tx: mpsc::UnboundedSender<Vec<ShellOutputObservation>>,
+    output_probe_rx: mpsc::UnboundedReceiver<Vec<ShellOutputObservation>>,
+    output_probe_in_flight: bool,
+    last_output_probe_started: Option<Instant>,
 }
 
 impl BackgroundTaskRegistry {
     pub fn new(output_dir: PathBuf) -> Self {
-        std::fs::create_dir_all(&output_dir).ok();
+        let (output_probe_tx, output_probe_rx) = mpsc::unbounded_channel();
         Self {
             tasks: HashMap::new(),
             join_set: JoinSet::new(),
             output_dir,
             pending_completions: Vec::new(),
+            output_probe_tx,
+            output_probe_rx,
+            output_probe_in_flight: false,
+            last_output_probe_started: None,
         }
     }
 
@@ -310,8 +379,12 @@ impl BackgroundTaskRegistry {
             exit_code: None,
             terminal_reason: None,
             last_output_size: 0,
+            output_tail: None,
+            output_error: None,
+            output_sampled_at: None,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
+            no_recent_output_reported: false,
             cancel_reason: cancel_reason.clone(),
         };
         self.tasks.insert(id.clone(), handle);
@@ -327,20 +400,22 @@ impl BackgroundTaskRegistry {
 
         let cmd = command.to_string();
         let task_id = id.clone();
+        let completion_task_id = task_id.clone();
         let task_status = status;
 
-        self.join_set.spawn(async move {
-            run_shell_task(
-                &cmd,
-                &stdout_path,
-                &stderr_path,
-                cancel,
-                &task_id,
-                &task_status,
-                cancel_reason,
-            )
-            .await
-        });
+        self.join_set
+            .spawn(completion_from_runner(completion_task_id, async move {
+                run_shell_task(
+                    &cmd,
+                    &stdout_path,
+                    &stderr_path,
+                    cancel,
+                    &task_id,
+                    &task_status,
+                    cancel_reason,
+                )
+                .await
+            }));
 
         Ok(id)
     }
@@ -387,23 +462,6 @@ impl BackgroundTaskRegistry {
         let status = Arc::new(AtomicU8::new(BgTaskStatus::Running as u8));
         let cancel_reason = Arc::new(AtomicU8::new(BgTaskCancelReason::None as u8));
 
-        // Seed output files with partial bytes the foreground runner
-        // already showed. The LLM and user must see one continuous
-        // stream, not a jump-cut at the detach point. Errors are
-        // non-fatal: the streamer will append regardless.
-        if !partial_stdout.is_empty() {
-            let _ = std::fs::write(&stdout_path, &partial_stdout);
-        } else {
-            // Touch the file so get_output() on a not-yet-flushed
-            // adopted task doesn't return ENOENT.
-            let _ = std::fs::File::create(&stdout_path);
-        }
-        if !partial_stderr.is_empty() {
-            let _ = std::fs::write(&stderr_path, &partial_stderr);
-        } else {
-            let _ = std::fs::File::create(&stderr_path);
-        }
-
         let handle = BackgroundTaskHandle {
             id: id.clone(),
             description: command_label.to_string(),
@@ -418,8 +476,12 @@ impl BackgroundTaskRegistry {
             exit_code: None,
             terminal_reason: None,
             last_output_size: partial_stdout.len() as u64 + partial_stderr.len() as u64,
+            output_tail: None,
+            output_error: None,
+            output_sampled_at: None,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
+            no_recent_output_reported: false,
             cancel_reason: cancel_reason.clone(),
         };
         self.tasks.insert(id.clone(), handle);
@@ -430,21 +492,25 @@ impl BackgroundTaskRegistry {
         });
 
         let task_id = id.clone();
+        let completion_task_id = task_id.clone();
         let command_label = command_label.to_string();
-        self.join_set.spawn(async move {
-            run_adopted_shell(AdoptedShellRun {
-                child,
-                stdout,
-                stderr,
-                stdout_path,
-                stderr_path,
-                cancel,
-                cancel_reason,
-                task_id,
-                command_label,
-            })
-            .await
-        });
+        self.join_set
+            .spawn(completion_from_runner(completion_task_id, async move {
+                run_adopted_shell(AdoptedShellRun {
+                    child,
+                    stdout,
+                    stderr,
+                    stdout_path,
+                    stderr_path,
+                    partial_stdout,
+                    partial_stderr,
+                    cancel,
+                    cancel_reason,
+                    task_id,
+                    command_label,
+                })
+                .await
+            }));
         // Status reference is kept on the handle; the runner CAS-sets
         // terminal status via the same path as spawn_shell. Discarded
         // local copy to silence dead-code lint.
@@ -469,14 +535,6 @@ impl BackgroundTaskRegistry {
         })?;
         let stdout_path = PathBuf::from(projection.stdout_path);
         let stderr_path = PathBuf::from(projection.stderr_path);
-        let last_output_size = std::fs::metadata(&stdout_path)
-            .map(|m| m.len())
-            .unwrap_or(0)
-            .saturating_add(
-                std::fs::metadata(&stderr_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0),
-            );
         let handle = BackgroundTaskHandle {
             id: id.to_string(),
             description: projection.title,
@@ -490,9 +548,13 @@ impl BackgroundTaskRegistry {
             stderr_path,
             exit_code: projection.exit_code,
             terminal_reason: projection.terminal_reason,
-            last_output_size,
+            last_output_size: 0,
+            output_tail: None,
+            output_error: None,
+            output_sampled_at: None,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
+            no_recent_output_reported: false,
             cancel_reason: Arc::new(AtomicU8::new(BgTaskCancelReason::None as u8)),
         };
         self.tasks.insert(id.to_string(), handle);
@@ -510,7 +572,7 @@ impl BackgroundTaskRegistry {
     }
 
     /// Kill a background shell by ID.
-    pub fn kill(&mut self, id: &str) -> Result<(), String> {
+    pub fn kill(&mut self, id: &str) -> Result<(), BackgroundTaskError> {
         // Drain any completed futures into pending_completions so we
         // have accurate status. Use the internal drain helper that
         // does NOT consume pending_completions, so subsequent
@@ -519,18 +581,25 @@ impl BackgroundTaskRegistry {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
         if !handle.live_control.is_available() {
-            return Err(format!("background shell '{id}' has a stale handle"));
+            return Err(BackgroundTaskError::StaleHandle {
+                task_id: id.to_string(),
+            });
         }
         if handle.status().is_terminal() {
-            return Err(format!("background shell '{id}' already terminated"));
+            return Err(BackgroundTaskError::AlreadyTerminated {
+                task_id: id.to_string(),
+            });
         }
-        // Only signal cancellation. The runner observes this via
-        // `cancel.cancelled()`, kills the child, and emits its own
-        // terminal `TaskCompletion`. `poll_completions` then translates
-        // that to a single `Killed` event. No premature status-set,
-        // no duplicate event.
+        if !handle.request_stop() {
+            return Err(BackgroundTaskError::CannotStop {
+                task_id: id.to_string(),
+            });
+        }
+        // `Stopping` records the accepted cancellation request immediately.
+        // The runner remains the source of truth for the terminal outcome and
+        // `poll_completions` replaces it with Killed or Failed exactly once.
         handle.set_cancel_reason_if_empty(BgTaskCancelReason::User);
         handle.cancel_token.cancel();
         Ok(())
@@ -562,6 +631,10 @@ impl BackgroundTaskRegistry {
                         }
                         handle.ended_at_ms = Some(unix_epoch_millis());
                         handle.exit_code = completion.exit_code;
+                        // Force one final asynchronous preview after process exit
+                        // so fast commands and trailing buffered output reach the
+                        // detail view without synchronous reads during rendering.
+                        handle.output_sampled_at = None;
                         handle.terminal_reason =
                             completion
                                 .error
@@ -595,6 +668,11 @@ impl BackgroundTaskRegistry {
                     self.pending_completions.push(event);
                 }
                 Err(e) => {
+                    // Every runner is wrapped by `completion_from_runner`, so a
+                    // panic becomes a normal Failed completion with task
+                    // identity. A remaining JoinError can only come from
+                    // registry shutdown/cancellation, when no live UI owner
+                    // remains to reconcile.
                     tracing::warn!("background shell join error: {e}");
                 }
             }
@@ -650,7 +728,7 @@ impl BackgroundTaskRegistry {
         let ids: Vec<String> = self
             .tasks
             .iter()
-            .filter(|(_, h)| h.live_control.is_available() && !h.status().is_terminal())
+            .filter(|(_, h)| h.live_control.is_available() && h.status() == BgTaskStatus::Running)
             .map(|(id, _)| id.clone())
             .collect();
         for id in &ids {
@@ -660,15 +738,23 @@ impl BackgroundTaskRegistry {
     }
 
     /// Read output from a task's stdout file. Returns (content, total_bytes).
-    pub fn get_output(&self, id: &str, tail_bytes: usize) -> Result<(String, u64), String> {
+    pub fn get_output(
+        &self,
+        id: &str,
+        tail_bytes: usize,
+    ) -> Result<(String, u64), BackgroundTaskError> {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
         if handle.status().is_terminal() && !handle.stdout_path.exists() {
-            return Err(missing_output_artifact_error(&handle.stdout_path));
+            return Err(BackgroundTaskError::output_artifact_missing(
+                id,
+                &handle.stdout_path,
+            ));
         }
         read_tail_str(&handle.stdout_path, tail_bytes)
+            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
     }
 
     /// Read output from a task's stdout file starting at `offset`.
@@ -678,15 +764,19 @@ impl BackgroundTaskRegistry {
         id: &str,
         offset: u64,
         max_bytes: usize,
-    ) -> Result<(String, u64, u64, u64), String> {
+    ) -> Result<(String, u64, u64, u64), BackgroundTaskError> {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
         if handle.status().is_terminal() && !handle.stdout_path.exists() {
-            return Err(missing_output_artifact_error(&handle.stdout_path));
+            return Err(BackgroundTaskError::output_artifact_missing(
+                id,
+                &handle.stdout_path,
+            ));
         }
         read_from_str(&handle.stdout_path, offset, max_bytes)
+            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
     }
 
     /// Read the model-facing combined stdout/stderr projection starting at
@@ -696,26 +786,71 @@ impl BackgroundTaskRegistry {
         id: &str,
         offset: u64,
         max_bytes: usize,
-    ) -> Result<(String, u64, u64, u64), String> {
+    ) -> Result<(String, u64, u64, u64), BackgroundTaskError> {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
         let stdout_missing = !handle.stdout_path.exists();
         let stderr_has_output = file_len(&handle.stderr_path) > 0;
         if handle.status().is_terminal() && stdout_missing && !stderr_has_output {
-            return Err(missing_output_artifact_error(&handle.stdout_path));
+            return Err(BackgroundTaskError::output_artifact_missing(
+                id,
+                &handle.stdout_path,
+            ));
         }
         read_combined_from_str(&handle.stdout_path, &handle.stderr_path, offset, max_bytes)
+            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
     }
 
-    /// Read stderr from a task.
-    pub fn get_stderr(&self, id: &str, tail_bytes: usize) -> Result<(String, u64), String> {
+    pub async fn get_combined_output_since_async(
+        &mut self,
+        id: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(String, u64, u64, u64), BackgroundTaskError> {
+        self.drain_join_set();
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
+        let stdout_path = handle.stdout_path.clone();
+        let stderr_path = handle.stderr_path.clone();
+        let terminal = handle.status().is_terminal();
+        let task_id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let stdout_missing = !stdout_path.exists();
+            let stderr_has_output = file_len(&stderr_path) > 0;
+            if terminal && stdout_missing && !stderr_has_output {
+                return Err(BackgroundTaskError::output_artifact_missing(
+                    &task_id,
+                    &stdout_path,
+                ));
+            }
+            read_combined_from_str(&stdout_path, &stderr_path, offset, max_bytes)
+                .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))
+        })
+        .await
+        .map_err(|error| {
+            BackgroundTaskError::output_unavailable(
+                id,
+                format!("background output read task failed: {error}"),
+            )
+        })?
+    }
+
+    /// Read stderr from a task.
+    pub fn get_stderr(
+        &self,
+        id: &str,
+        tail_bytes: usize,
+    ) -> Result<(String, u64), BackgroundTaskError> {
+        let handle = self
+            .tasks
+            .get(id)
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
         read_tail_str(&handle.stderr_path, tail_bytes)
+            .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))
     }
 
     /// Read stdout plus stderr if available. Missing stderr must not mask valid
@@ -724,11 +859,27 @@ impl BackgroundTaskRegistry {
         &self,
         id: &str,
         tail_bytes: usize,
-    ) -> Result<(String, u64), String> {
-        let (stdout, stdout_bytes) = self.get_output(id, tail_bytes)?;
-        let Ok((stderr, stderr_bytes)) = self.get_stderr(id, tail_bytes) else {
-            return Ok((stdout, stdout_bytes));
+    ) -> Result<(String, u64), BackgroundTaskError> {
+        let handle = self
+            .tasks
+            .get(id)
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
+        let stdout_missing = !handle.stdout_path.exists();
+        let stderr_has_output = file_len(&handle.stderr_path) > 0;
+        if handle.status().is_terminal() && stdout_missing && !stderr_has_output {
+            return Err(BackgroundTaskError::output_artifact_missing(
+                id,
+                &handle.stdout_path,
+            ));
         };
+        let (stdout, stdout_bytes) = if stdout_missing {
+            (String::new(), 0)
+        } else {
+            read_tail_str(&handle.stdout_path, tail_bytes)
+                .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail))?
+        };
+        let (stderr, stderr_bytes) =
+            read_tail_str(&handle.stderr_path, tail_bytes).unwrap_or_else(|_| (String::new(), 0));
         let combined = if stderr.trim().is_empty() {
             stdout
         } else if stdout.trim().is_empty() {
@@ -744,11 +895,11 @@ impl BackgroundTaskRegistry {
         &self,
         id: &str,
         tail_bytes: usize,
-    ) -> Result<(String, u64, u64), String> {
+    ) -> Result<(String, u64, u64), BackgroundTaskError> {
         let handle = self
             .tasks
             .get(id)
-            .ok_or_else(|| format!("no background shell with id '{id}'"))?;
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
         let (combined, total_bytes) = self.get_combined_output(id, tail_bytes)?;
         let stdout_lines = count_file_lines(&handle.stdout_path).unwrap_or(0);
         let stderr_lines = count_file_lines(&handle.stderr_path).unwrap_or(0);
@@ -759,111 +910,201 @@ impl BackgroundTaskRegistry {
         ))
     }
 
+    pub async fn get_combined_output_stats_async(
+        &mut self,
+        id: &str,
+        tail_bytes: usize,
+    ) -> Result<(String, u64, u64), BackgroundTaskError> {
+        self.drain_join_set();
+        let handle = self
+            .tasks
+            .get(id)
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
+        let stdout_path = handle.stdout_path.clone();
+        let stderr_path = handle.stderr_path.clone();
+        let terminal = handle.status().is_terminal();
+        let task_id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let stdout_missing = !stdout_path.exists();
+            let stderr_has_output = file_len(&stderr_path) > 0;
+            if terminal && stdout_missing && !stderr_has_output {
+                return Err(BackgroundTaskError::output_artifact_missing(
+                    &task_id,
+                    &stdout_path,
+                ));
+            }
+            let (stdout, stdout_bytes) = if stdout_missing {
+                (String::new(), 0)
+            } else {
+                read_tail_str(&stdout_path, tail_bytes)
+                    .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))?
+            };
+            let (stderr, stderr_bytes) =
+                read_tail_str(&stderr_path, tail_bytes).unwrap_or_else(|_| (String::new(), 0));
+            let combined = if stderr.trim().is_empty() {
+                stdout
+            } else if stdout.trim().is_empty() {
+                format!("<stderr>\n{stderr}\n</stderr>")
+            } else {
+                format!("{stdout}\n<stderr>\n{stderr}\n</stderr>")
+            };
+            let stdout_lines = count_file_lines(&stdout_path).unwrap_or(0);
+            let stderr_lines = count_file_lines(&stderr_path).unwrap_or(0);
+            Ok((
+                combined,
+                stdout_bytes.saturating_add(stderr_bytes),
+                stdout_lines.saturating_add(stderr_lines),
+            ))
+        })
+        .await
+        .map_err(|error| {
+            BackgroundTaskError::output_unavailable(
+                id,
+                format!("background output read task failed: {error}"),
+            )
+        })?
+    }
+
     /// Poll for completed tasks. Call from the TUI tick.
     /// Returns events for tasks that finished since last poll.
     /// Also trims old terminal handles over their retention caps.
     pub fn poll_completions(&mut self) -> Vec<BgTaskEvent> {
+        self.poll_output_observations();
         self.prune_retained_terminal_tasks();
         self.drain_join_set();
         std::mem::take(&mut self.pending_completions)
     }
 
-    /// Check all running shell tasks for stalls (no output growth for STALL_THRESHOLD).
-    pub fn stall_check(&mut self) {
-        self.drain_join_set();
-        let mut stall_events = Vec::new();
+    /// Apply completed file probes and schedule the next one without doing
+    /// filesystem I/O on the TUI event-loop task. The 50ms cadence preserves
+    /// prompt/output-cap responsiveness while a single in-flight probe bounds
+    /// work on slow or remote filesystems.
+    fn poll_output_observations(&mut self) {
+        while let Ok(observations) = self.output_probe_rx.try_recv() {
+            self.output_probe_in_flight = false;
+            self.apply_output_observations(observations);
+        }
+
+        if self.output_probe_in_flight
+            || self
+                .last_output_probe_started
+                .is_some_and(|at| at.elapsed() < OUTPUT_PROBE_INTERVAL)
+        {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut requests = Vec::new();
         for handle in self.tasks.values_mut() {
-            if !handle.live_control.is_available() {
+            let status = handle.status();
+            let monitors_lifecycle =
+                handle.live_control.is_available() && status == BgTaskStatus::Running;
+            let preview_due = if monitors_lifecycle {
+                !handle
+                    .output_sampled_at
+                    .is_some_and(|at| at.elapsed() < OUTPUT_PREVIEW_INTERVAL)
+            } else {
+                handle.output_sampled_at.is_none()
+            };
+            if !monitors_lifecycle && !preview_due {
                 continue;
             }
-            if handle.status().is_terminal() {
+            let probe_stalled_tail = monitors_lifecycle
+                && handle.last_activity.elapsed() > STALL_THRESHOLD
+                && !handle.no_recent_output_reported
+                && !handle
+                    .last_tail_probe_at
+                    .is_some_and(|at| at.elapsed() < STALL_TAIL_RECHECK_COOLDOWN);
+            if probe_stalled_tail {
+                handle.last_tail_probe_at = Some(now);
+            }
+            if preview_due {
+                handle.output_sampled_at = Some(now);
+            }
+            requests.push(ShellOutputProbeRequest {
+                id: handle.id.clone(),
+                stdout_path: handle.stdout_path.clone(),
+                stderr_path: handle.stderr_path.clone(),
+                tail_bytes: (preview_due || probe_stalled_tail).then_some(8192),
+                report_missing: !monitors_lifecycle,
+            });
+        }
+        if requests.is_empty() {
+            return;
+        }
+
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.output_probe_in_flight = true;
+        self.last_output_probe_started = Some(now);
+        let tx = self.output_probe_tx.clone();
+        runtime.spawn(async move {
+            let observations = collect_shell_output_observations(requests).await;
+            let _ = tx.send(observations);
+        });
+    }
+
+    fn apply_output_observations(&mut self, observations: Vec<ShellOutputObservation>) {
+        for observation in observations {
+            let Some(handle) = self.tasks.get_mut(&observation.id) else {
+                continue;
+            };
+            let size_changed = observation.total_bytes != handle.last_output_size;
+            handle.last_output_size = observation.total_bytes;
+            if let Some(tail) = observation.tail.as_ref() {
+                handle.output_tail = Some(tail.trim_end().to_string());
+            }
+            handle.output_error = observation.output_error;
+            if !handle.live_control.is_available() || handle.status().is_terminal() {
                 continue;
             }
-            if handle.status() == BgTaskStatus::WaitingForInput {
-                continue; // already reported
-            }
-            let stdout_size = std::fs::metadata(&handle.stdout_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let stderr_size = std::fs::metadata(&handle.stderr_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let current_size = stdout_size.saturating_add(stderr_size);
-            if current_size > MAX_OUTPUT_BYTES {
+            if observation.total_bytes > MAX_OUTPUT_BYTES {
+                if !handle.request_stop() {
+                    continue;
+                }
                 handle.set_cancel_reason_if_empty(BgTaskCancelReason::OutputCap);
                 handle.cancel_token.cancel();
                 continue;
             }
-            if current_size != handle.last_output_size {
-                handle.last_output_size = current_size;
+            if size_changed {
                 handle.last_activity = Instant::now();
                 handle.last_tail_probe_at = None;
-            } else if handle.last_activity.elapsed() > STALL_THRESHOLD {
-                if handle
-                    .last_tail_probe_at
-                    .is_some_and(|at| at.elapsed() < STALL_TAIL_RECHECK_COOLDOWN)
-                {
-                    continue;
-                }
-                handle.last_tail_probe_at = Some(Instant::now());
-                if let Ok(tail) =
-                    read_combined_tail_str(&handle.stdout_path, &handle.stderr_path, 1024)
-                {
-                    if looks_like_prompt(&tail) {
-                        handle.set_status(BgTaskStatus::WaitingForInput);
-                        let event = BgTaskEvent::WaitingForInput {
-                            id: handle.id.clone(),
-                            title: handle.description.clone(),
-                            last_output_tail: tail,
-                        };
-                        stall_events.push(event);
-                    }
-                }
-                // No reset on the non-prompt path. Resetting hides
-                // genuinely stuck no-output processes (deadlock,
-                // infinite sleep) — every later tick would see
-                // `elapsed() <= STALL_THRESHOLD` again and never look
-                // at the tail. With reset removed, subsequent ticks
-                // keep checking on every poll; if the tail eventually
-                // grows into a recognizable prompt we still catch it.
-                // The handle.status == WaitingForInput guard at the top of the
-                // loop already short-circuits once we DO fire.
+                handle.no_recent_output_reported = false;
+                continue;
             }
-        }
-        for event in stall_events {
-            self.pending_completions.push(event);
+            let Some(tail) = observation.tail else {
+                continue;
+            };
+            if handle.last_activity.elapsed() > STALL_THRESHOLD && !handle.no_recent_output_reported
+            {
+                let inactive_ms = handle
+                    .last_activity
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                handle.no_recent_output_reported = true;
+                self.pending_completions.push(BgTaskEvent::NoRecentOutput {
+                    id: handle.id.clone(),
+                    title: handle.description.clone(),
+                    inactive_ms,
+                    last_output_tail: tail.trim_end().to_string(),
+                });
+            }
         }
     }
 
-    /// Number of currently running (non-terminal, non-waiting) tasks.
-    /// WaitingForInput is excluded so the status-line "BG: N running"
-    /// represents only forward-progress tasks; waiting is reported
-    /// separately via [`waiting_count`].
+    /// Number of currently running tasks. Lack of recent output is advisory
+    /// evidence and does not change lifecycle state.
     pub fn running_count(&self) -> usize {
         self.tasks
             .values()
-            .filter(|h| {
-                let s = h.status();
-                h.live_control.is_available()
-                    && !s.is_terminal()
-                    && s != BgTaskStatus::WaitingForInput
-            })
+            .filter(|h| h.live_control.is_available() && !h.status().is_terminal())
             .count()
     }
 
     pub fn can_spawn_shell_task(&self) -> bool {
         self.running_count() < MAX_CONCURRENT_TASKS
-    }
-
-    /// Number of waiting tasks — surfaced separately on the status
-    /// line so the user notices an interactive prompt blocking work.
-    pub fn waiting_count(&self) -> usize {
-        self.tasks
-            .values()
-            .filter(|h| {
-                h.live_control.is_available() && h.status() == BgTaskStatus::WaitingForInput
-            })
-            .count()
     }
 
     /// Number of failed tasks. Failed tasks remain visible as footer
@@ -918,8 +1159,19 @@ async fn run_shell_task(
     status: &Arc<AtomicU8>,
     cancel_reason: Arc<AtomicU8>,
 ) -> TaskCompletion {
-    let stdout_file = match std::fs::File::create(stdout_path) {
-        Ok(f) => f,
+    if let Some(parent) = stdout_path.parent()
+        && let Err(error) = tokio::fs::create_dir_all(parent).await
+    {
+        return TaskCompletion {
+            id: task_id.to_string(),
+            status: BgTaskStatus::Failed,
+            exit_code: None,
+            summary: String::new(),
+            error: Some(format!("cannot create output directory: {error}")),
+        };
+    }
+    let stdout_file = match tokio::fs::File::create(stdout_path).await {
+        Ok(file) => file.into_std().await,
         Err(e) => {
             return TaskCompletion {
                 id: task_id.to_string(),
@@ -930,8 +1182,8 @@ async fn run_shell_task(
             };
         }
     };
-    let stderr_file = match std::fs::File::create(stderr_path) {
-        Ok(f) => f,
+    let stderr_file = match tokio::fs::File::create(stderr_path).await {
+        Ok(file) => file.into_std().await,
         Err(e) => {
             return TaskCompletion {
                 id: task_id.to_string(),
@@ -995,7 +1247,7 @@ async fn run_shell_task(
                                     .is_tool_error()
                             })
                             .unwrap_or(false);
-                    let summary = make_summary(stdout_path, code);
+                    let summary = make_summary(stdout_path, code).await;
                     if success {
                         TaskCompletion {
                             id: task_id.to_string(),
@@ -1005,7 +1257,8 @@ async fn run_shell_task(
                             error: None,
                         }
                     } else {
-                        let err_tail = read_tail_str(stderr_path, 512)
+                        let err_tail = read_tail_str_async(stderr_path, 512)
+                            .await
                             .map(|(s, _)| s)
                             .unwrap_or_default();
                         let error_msg = if code == Some(137) {
@@ -1063,10 +1316,9 @@ async fn run_shell_task(
 /// from a live `ChildStdout` (or stderr) into the registry's per-task
 /// file, appending after any partial-output prefix that
 /// `adopt_detached_shell` already wrote. Stops on stream EOF or
-/// channel error. Cap-handling: the file may pass `MAX_OUTPUT_BYTES`
-/// here; `stall_check` is the enforcement point for size cap because
-/// the streamer can't synchronously kill the child without racing
-/// with `wait()`.
+/// channel error. Output-cap and waiting-for-input detection are handled by
+/// the registry's asynchronous output probes, so this writer never performs
+/// synchronous filesystem checks or races the child wait path.
 async fn drain_stream_to_file<R>(mut reader: R, path: std::path::PathBuf)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -1118,6 +1370,8 @@ struct AdoptedShellRun {
     stderr: tokio::process::ChildStderr,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    partial_stdout: String,
+    partial_stderr: String,
     cancel: CancellationToken,
     cancel_reason: Arc<AtomicU8>,
     task_id: String,
@@ -1131,15 +1385,32 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
         stderr,
         stdout_path,
         stderr_path,
+        partial_stdout,
+        partial_stderr,
         cancel,
         cancel_reason,
         task_id,
         command_label,
     } = run;
 
+    let mut process_group_guard = ProcessGroupKillGuard::new(&child);
+    let seeded = tokio::try_join!(
+        seed_adopted_output(&stdout_path, partial_stdout.as_bytes()),
+        seed_adopted_output(&stderr_path, partial_stderr.as_bytes()),
+    );
+    if let Err(error) = seeded {
+        kill_child_tree(&mut child).await;
+        process_group_guard.disarm();
+        return TaskCompletion {
+            id: task_id,
+            status: BgTaskStatus::Failed,
+            exit_code: None,
+            summary: String::new(),
+            error: Some(format!("cannot seed detached shell output: {error}")),
+        };
+    }
     let stdout_drain = tokio::spawn(drain_stream_to_file(stdout, stdout_path.clone()));
     let stderr_drain = tokio::spawn(drain_stream_to_file(stderr, stderr_path.clone()));
-    let mut process_group_guard = ProcessGroupKillGuard::new(&child);
 
     let result = tokio::select! {
         exit = child.wait() => {
@@ -1157,7 +1428,7 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
                                     .is_tool_error()
                             })
                             .unwrap_or(false);
-                    let summary = make_summary(&stdout_path, code);
+                    let summary = make_summary(&stdout_path, code).await;
                     if success {
                         TaskCompletion {
                             id: task_id.clone(),
@@ -1167,7 +1438,8 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
                             error: None,
                         }
                     } else {
-                        let err_tail = read_tail_str(&stderr_path, 512)
+                        let err_tail = read_tail_str_async(&stderr_path, 512)
+                            .await
                             .map(|(s, _)| s)
                             .unwrap_or_default();
                         let error_msg = if code == Some(137) {
@@ -1220,6 +1492,13 @@ async fn run_adopted_shell(run: AdoptedShellRun) -> TaskCompletion {
     };
 
     result
+}
+
+async fn seed_adopted_output(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, content).await
 }
 
 #[cfg(unix)]
@@ -1278,9 +1557,95 @@ async fn kill_child_tree(child: &mut tokio::process::Child) {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn make_summary(stdout_path: &Path, exit_code: Option<i32>) -> String {
-    let size = std::fs::metadata(stdout_path).map(|m| m.len()).unwrap_or(0);
-    let tail = read_tail_str(stdout_path, 200)
+async fn collect_shell_output_observations(
+    requests: Vec<ShellOutputProbeRequest>,
+) -> Vec<ShellOutputObservation> {
+    futures_util::future::join_all(requests.into_iter().map(|request| async move {
+        let (stdout_metadata, stderr_metadata) = tokio::join!(
+            tokio::fs::metadata(&request.stdout_path),
+            tokio::fs::metadata(&request.stderr_path),
+        );
+        let stdout_bytes = stdout_metadata
+            .as_ref()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let stderr_bytes = stderr_metadata
+            .as_ref()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let output_error =
+            (request.report_missing && stdout_metadata.is_err() && stderr_bytes == 0).then(|| {
+                BackgroundTaskError::output_artifact_missing(&request.id, &request.stdout_path)
+            });
+        let tail = if let Some(max_bytes) = request.tail_bytes {
+            read_combined_tail_str_async(&request.stdout_path, &request.stderr_path, max_bytes)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        ShellOutputObservation {
+            id: request.id,
+            total_bytes: stdout_bytes.saturating_add(stderr_bytes),
+            tail,
+            output_error,
+        }
+    }))
+    .await
+}
+
+async fn read_tail_str_async(path: &Path, max_bytes: usize) -> Result<(String, u64), String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let len = file
+        .metadata()
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if len == 0 {
+        return Ok((String::new(), 0));
+    }
+    let offset = len.saturating_sub(max_bytes as u64);
+    file.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut buf = Vec::with_capacity(max_bytes.min(len as usize));
+    file.read_to_end(&mut buf)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((String::from_utf8_lossy(&buf).into_owned(), len))
+}
+
+async fn read_combined_tail_str_async(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let (stdout, stderr) = tokio::join!(
+        read_tail_str_async(stdout_path, max_bytes),
+        read_tail_str_async(stderr_path, max_bytes),
+    );
+    let stdout = stdout.map(|(text, _)| text).unwrap_or_default();
+    let stderr = stderr.map(|(text, _)| text).unwrap_or_default();
+    if stderr.trim().is_empty() {
+        Ok(stdout)
+    } else if stdout.trim().is_empty() {
+        Ok(stderr)
+    } else {
+        Ok(format!("{stdout}\n{stderr}"))
+    }
+}
+
+async fn make_summary(stdout_path: &Path, exit_code: Option<i32>) -> String {
+    let size = tokio::fs::metadata(stdout_path)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let tail = read_tail_str_async(stdout_path, 200)
+        .await
         .map(|(s, _)| s)
         .unwrap_or_default();
     let last_line = tail.lines().next_back().unwrap_or("").trim();
@@ -1289,10 +1654,6 @@ fn make_summary(stdout_path: &Path, exit_code: Option<i32>) -> String {
     } else {
         truncate_line(last_line, 80)
     }
-}
-
-fn missing_output_artifact_error(path: &Path) -> String {
-    format!("output artifact missing: {}", path.display())
 }
 
 fn unix_epoch_millis() -> u64 {
@@ -1546,14 +1907,6 @@ fn read_combined_tail_str(
     }
 }
 
-fn looks_like_prompt(text: &str) -> bool {
-    let last_line = text.lines().next_back().unwrap_or("");
-    let lower = last_line.to_ascii_lowercase();
-    PROMPT_PATTERNS
-        .iter()
-        .any(|p| lower.contains(&p.to_ascii_lowercase()))
-}
-
 // ── Notification XML rendering ──────────────────────────────────────
 
 pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
@@ -1599,17 +1952,20 @@ pub(crate) fn format_notification_xml(event: &BgTaskEvent) -> String {
                 xml_escape(title),
             )
         }
-        BgTaskEvent::WaitingForInput {
+        BgTaskEvent::NoRecentOutput {
             id,
             title,
+            inactive_ms,
             last_output_tail,
         } => {
             format!(
                 "<background_task_notification>\n\
                  <task_id>{id}</task_id>\n\
                  <title>{}</title>\n\
-                 <status>waiting_for_input</status>\n\
-                 <hint>Process may be waiting for interactive input. Consider killing and re-running with non-interactive flags.</hint>\n\
+                 <status>running</status>\n\
+                 <advisory>no_recent_output</advisory>\n\
+                 <inactive_ms>{inactive_ms}</inactive_ms>\n\
+                 <hint>No output was observed recently. The process may still be working; inspect its output before deciding whether to stop it.</hint>\n\
                  <last_output>{}</last_output>\n\
                  </background_task_notification>",
                 xml_escape(title),
@@ -1653,8 +2009,12 @@ mod tests {
             exit_code: None,
             terminal_reason: None,
             last_output_size: 0,
+            output_tail: None,
+            output_error: None,
+            output_sampled_at: None,
             last_activity: Instant::now(),
             last_tail_probe_at: None,
+            no_recent_output_reported: false,
             cancel_reason: Arc::new(AtomicU8::new(BgTaskCancelReason::None as u8)),
         };
         (handle, dir)
@@ -1690,19 +2050,58 @@ mod tests {
         wait_for_task_status(reg, id, BgTaskStatus::is_terminal).await
     }
 
-    #[test]
-    fn waiting_status_is_intentionally_recoverable() {
-        assert!(
-            !BgTaskStatus::WaitingForInput.is_terminal(),
-            "waiting only means output stopped; it must not freeze later completion/failure updates"
-        );
+    async fn wait_for_output_preview(reg: &mut BackgroundTaskRegistry, id: &str) {
+        wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+            let _ = reg.poll_completions();
+            !reg.output_probe_in_flight
+                && reg
+                    .get(id)
+                    .is_some_and(|handle| handle.output_sampled_at.is_some())
+        })
+        .await
+        .expect("asynchronous output preview should converge");
+    }
 
-        let (handle, _dir) = test_handle_with_status(BgTaskStatus::WaitingForInput);
+    #[test]
+    fn running_status_accepts_authoritative_terminal_completion() {
+        let (handle, _dir) = test_handle_with_status(BgTaskStatus::Running);
         assert!(
             handle.set_status_if_non_terminal(BgTaskStatus::Completed),
-            "real process exit must still replace a waiting placeholder state"
+            "real process exit must replace the running state"
         );
         assert_eq!(handle.status(), BgTaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn panicked_runner_converges_to_failed_event_and_handle() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut registry = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let (mut handle, _output_dir) = test_handle_with_status(BgTaskStatus::Running);
+        handle.id = "bg-panicked".to_string();
+        handle.description = "panicking task".to_string();
+        let task_id = handle.id.clone();
+        registry.tasks.insert(task_id.clone(), handle);
+        registry
+            .join_set
+            .spawn(completion_from_runner(task_id.clone(), async move {
+                panic!("injected runner panic")
+            }));
+
+        let events = wait_for_task_terminal(&mut registry, &task_id).await;
+
+        assert_eq!(
+            registry.get(&task_id).map(BackgroundTaskHandle::status),
+            Some(BgTaskStatus::Failed)
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                BgTaskEvent::Failed { id, title, error }
+                    if id == &task_id
+                        && title == "panicking task"
+                        && error == BACKGROUND_TASK_PANIC_ERROR
+            )
+        }));
     }
 
     #[test]
@@ -1724,46 +2123,6 @@ mod tests {
         assert!(
             error.contains("background shell task limit reached"),
             "{error}"
-        );
-    }
-
-    /// REGRESSION (review MED): stall_check must NOT reset
-    /// `last_activity` on the non-prompt path. The original code
-    /// reset unconditionally with the comment "Reset timer even if
-    /// not a prompt (just slow output)" — but if size hasn't grown
-    /// there is no output at all, slow or otherwise, so the reset
-    /// just hides truly stuck no-output processes (deadlock,
-    /// infinite sleep). With STALL_THRESHOLD = 45s this is awkward
-    /// to exercise via a real process in a unit test, so we pin the
-    /// invariant at source level: the non-prompt branch contains
-    /// no `last_activity = ...` assignment.
-    #[test]
-    fn stall_check_non_prompt_branch_does_not_reset_last_activity() {
-        let source = include_str!("background_tasks.rs");
-        // Find the body of stall_check.
-        let start = source
-            .find("pub fn stall_check(&mut self) {")
-            .expect("stall_check must exist");
-        // Body ends at the closing brace of the for-loop completion;
-        // a sentinel from the function tail keeps us from over-reading.
-        let body_end = source[start..]
-            .find("for event in stall_events {")
-            .expect("stall_check must finish with the events drain");
-        let body = &source[start..start + body_end];
-
-        // Locate the else-if that handles the elapsed-without-growth path.
-        let elapsed_branch_start = body
-            .find("} else if handle.last_activity.elapsed() > STALL_THRESHOLD {")
-            .expect("elapsed-threshold branch must exist");
-        let elapsed_branch = &body[elapsed_branch_start..];
-        // Inside that arm there is exactly one `last_activity` access we
-        // care about: the unconditional-reset bug. The fix removes that
-        // line, so the branch must contain no further `last_activity =`
-        // assignment.
-        assert!(
-            !elapsed_branch.contains("handle.last_activity = Instant::now()"),
-            "non-prompt branch must NOT reset last_activity; it hides genuinely \
-             stuck processes (review MED). Branch:\n{elapsed_branch}"
         );
     }
 
@@ -1905,6 +2264,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn combined_tail_preserves_stderr_when_stdout_artifact_is_missing() {
+        let tmp = crate::tests::test_temp_dir();
+        let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = reg.spawn_shell("printf 'stderr-line\n' >&2; exit 2", "stderr fallback");
+
+        wait_for_task_terminal(&mut reg, &id).await;
+        let stdout_path = reg.get(&id).unwrap().stdout_path.clone();
+        std::fs::remove_file(stdout_path).unwrap();
+
+        let expected = "<stderr>\nstderr-line\n\n</stderr>";
+        let sync_stats = reg
+            .get_combined_output_stats(&id, 4096)
+            .expect("sync tail should preserve stderr");
+        let async_stats = reg
+            .get_combined_output_stats_async(&id, 4096)
+            .await
+            .expect("async tail should preserve stderr");
+
+        assert_eq!(sync_stats.0, expected);
+        assert_eq!(async_stats.0, expected);
+        assert_eq!(sync_stats.1, async_stats.1);
+        assert_eq!(sync_stats.2, async_stats.2);
+    }
+
+    #[tokio::test]
     async fn get_combined_output_since_uses_offsets_over_rendered_projection() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
@@ -1946,10 +2330,12 @@ mod tests {
         let error = reg
             .get_combined_output_since(&id, 0, 1024)
             .expect_err("missing stdout with empty stderr should fail");
-        assert!(error.contains("output artifact missing"), "{error}");
-        assert!(
-            error.contains(&stdout_path.display().to_string()),
-            "{error}"
+        assert_eq!(
+            error,
+            BackgroundTaskError::OutputArtifactMissing {
+                task_id: id,
+                path: stdout_path,
+            }
         );
     }
 
@@ -1964,7 +2350,10 @@ mod tests {
         let err = reg
             .get_output_since(&id, 99, 16)
             .expect_err("offset beyond end must fail");
-        assert!(err.contains("offset 99"), "{err}");
+        assert!(matches!(
+            err,
+            BackgroundTaskError::OutputUnavailable { task_id, .. } if task_id == id
+        ));
     }
 
     #[test]
@@ -1979,10 +2368,11 @@ mod tests {
             .get_output_since("bg-shell-missing-output", 0, 1024)
             .expect_err("terminal task with missing stdout ref should be explicit");
 
-        assert!(
-            err.starts_with("output artifact missing:"),
-            "unexpected error: {err}"
-        );
+        assert!(matches!(
+            err,
+            BackgroundTaskError::OutputArtifactMissing { task_id, .. }
+                if task_id == "bg-shell-missing-output"
+        ));
     }
 
     #[tokio::test]
@@ -1993,6 +2383,15 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(reg.kill(&id).is_ok());
+        assert_eq!(reg.get(&id).unwrap().status(), BgTaskStatus::Stopping);
+        assert_eq!(reg.get(&id).unwrap().projected_status(), "stopping");
+        assert_eq!(reg.running_count(), 1, "capacity remains owned until exit");
+        assert_eq!(
+            reg.kill(&id).unwrap_err(),
+            BackgroundTaskError::CannotStop {
+                task_id: id.clone(),
+            }
+        );
 
         let events =
             wait_for_task_status(&mut reg, &id, |status| status == BgTaskStatus::Killed).await;
@@ -2043,6 +2442,7 @@ mod tests {
         let id = reg.spawn_shell("printf 'first\\nlast\\n'", "cargo test");
 
         wait_for_task_terminal(&mut reg, &id).await;
+        wait_for_output_preview(&mut reg, &id).await;
         let xml = reg.render_background_task_list_xml();
         let handle = reg.get(&id).expect("handle");
 
@@ -2055,10 +2455,12 @@ mod tests {
         );
         assert!(xml.contains("ended_at_ms=\""), "{xml}");
         assert!(xml.contains("output_ref=\"stdout:"), "{xml}");
-        assert!(xml.contains("output_offset=\"0\""), "{xml}");
         assert!(xml.contains("total_output_bytes=\"11\""), "{xml}");
-        assert!(xml.contains("total_output_lines=\"2\""), "{xml}");
         assert!(xml.contains("preview=\"last\""), "{xml}");
+        assert!(
+            !xml.contains("output_offset=") && !xml.contains("total_output_lines="),
+            "list projections must not claim exact offset/line counts from a bounded preview: {xml}"
+        );
         assert!(xml.contains("exit_code=\"0\""), "{xml}");
         assert!(xml.contains("terminal_reason=\"exit code 0\""), "{xml}");
     }
@@ -2072,6 +2474,7 @@ mod tests {
         wait_for_task_terminal(&mut reg, &id).await;
         let stdout_path = reg.get(&id).unwrap().stdout_path.clone();
         std::fs::remove_file(&stdout_path).unwrap();
+        wait_for_output_preview(&mut reg, &id).await;
         let xml = reg.render_background_task_list_xml();
 
         assert!(xml.contains(&format!("id=\"{id}\"")), "{xml}");
@@ -2083,8 +2486,8 @@ mod tests {
         assert!(!xml.contains("preview=\"done\""), "{xml}");
     }
 
-    #[test]
-    fn restored_running_projection_is_visible_stale_and_not_killable() {
+    #[tokio::test]
+    async fn restored_running_projection_is_visible_stale_and_not_killable() {
         let tmp = crate::tests::test_temp_dir();
         let stdout = tmp.path().join("restored.stdout");
         let stderr = tmp.path().join("restored.stderr");
@@ -2107,7 +2510,9 @@ mod tests {
         assert_eq!(reg.running_count(), 0);
         assert_eq!(
             reg.kill("bg-shell-restored").unwrap_err(),
-            "background shell 'bg-shell-restored' has a stale handle"
+            BackgroundTaskError::StaleHandle {
+                task_id: "bg-shell-restored".into(),
+            }
         );
         let (output, end, total, lines) = reg
             .get_output_since("bg-shell-restored", 0, 1024)
@@ -2116,9 +2521,10 @@ mod tests {
         assert_eq!(end, total);
         assert_eq!(lines, 1);
 
+        wait_for_output_preview(&mut reg, "bg-shell-restored").await;
         let xml = reg.render_background_task_list_xml();
         assert!(xml.contains("id=\"bg-shell-restored\""), "{xml}");
-        assert!(xml.contains("status=\"unavailable\""), "{xml}");
+        assert!(xml.contains("status=\"running\""), "{xml}");
         assert!(xml.contains("live_control=\"stale_handle\""), "{xml}");
         assert!(xml.contains("preview=\"still building\""), "{xml}");
 
@@ -2171,22 +2577,13 @@ mod tests {
         failed.description = "npm test".into();
         failed.started_at = Instant::now() - Duration::from_secs(10);
 
-        let (mut waiting, _waiting_dir) = test_handle_with_status(BgTaskStatus::WaitingForInput);
-        waiting.id = "bg-waiting".into();
-        waiting.description = "deploy.sh".into();
-        waiting.started_at = Instant::now() - Duration::from_secs(5);
-
         reg.tasks.insert(running.id.clone(), running);
         reg.tasks.insert(failed.id.clone(), failed);
-        reg.tasks.insert(waiting.id.clone(), waiting);
 
         let xml = reg.render_background_task_list_xml();
-        let waiting_pos = xml.find("id=\"bg-waiting\"").expect("waiting row");
         let failed_pos = xml.find("id=\"bg-failed\"").expect("failed row");
         let running_pos = xml.find("id=\"bg-running\"").expect("running row");
-        assert!(waiting_pos < running_pos, "{xml}");
         assert!(failed_pos < running_pos, "{xml}");
-        assert!(xml.contains("status=\"waiting_for_input\""), "{xml}");
     }
 
     #[test]
@@ -2195,7 +2592,6 @@ mod tests {
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         for (id, status) in [
             ("running", BgTaskStatus::Running),
-            ("waiting", BgTaskStatus::WaitingForInput),
             ("failed", BgTaskStatus::Failed),
             ("completed", BgTaskStatus::Completed),
             ("killed", BgTaskStatus::Killed),
@@ -2206,7 +2602,6 @@ mod tests {
         }
 
         assert_eq!(reg.running_count(), 1);
-        assert_eq!(reg.waiting_count(), 1);
         assert_eq!(reg.failed_count(), 1);
     }
 
@@ -2357,15 +2752,6 @@ mod tests {
     }
 
     #[test]
-    fn stall_detection_prompt_patterns() {
-        assert!(looks_like_prompt("Do you want to continue? (y/n)"));
-        assert!(looks_like_prompt("Enter password:"));
-        assert!(looks_like_prompt("Overwrite existing file? [Y/n]"));
-        assert!(!looks_like_prompt("Compiling astra-cli v0.1.0"));
-        assert!(!looks_like_prompt(""));
-    }
-
-    #[test]
     fn notification_xml_escapes_special_chars() {
         let event = BgTaskEvent::Failed {
             id: "bg-1".into(),
@@ -2382,17 +2768,23 @@ mod tests {
     }
 
     #[test]
-    fn notification_xml_uses_waiting_for_input_lifecycle_status() {
-        let event = BgTaskEvent::WaitingForInput {
+    fn notification_xml_keeps_no_output_as_advisory_not_lifecycle_state() {
+        let event = BgTaskEvent::NoRecentOutput {
             id: "bg-1".into(),
             title: "npm run dev".into(),
-            last_output_tail: "Continue? (y/n)".into(),
+            inactive_ms: 47_000,
+            last_output_tail: "server started".into(),
         };
 
         let xml = format_notification_xml(&event);
 
-        assert!(xml.contains("<status>waiting_for_input</status>"), "{xml}");
-        assert!(!xml.contains("<status>waiting</status>"), "{xml}");
+        assert!(xml.contains("<status>running</status>"), "{xml}");
+        assert!(
+            xml.contains("<advisory>no_recent_output</advisory>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<inactive_ms>47000</inactive_ms>"), "{xml}");
+        assert!(!xml.contains("waiting_for_input"), "{xml}");
     }
 
     #[tokio::test]
@@ -2407,7 +2799,7 @@ mod tests {
         let err = reg
             .kill(&id)
             .expect_err("terminal command should reject kill");
-        assert_eq!(err, format!("background shell '{id}' already terminated"));
+        assert_eq!(err, BackgroundTaskError::AlreadyTerminated { task_id: id });
     }
 
     // ── TDD: output truncation ──────────────────────────────────
@@ -2417,21 +2809,8 @@ mod tests {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg.spawn_shell("yes 'aaaaaaaaaa'", "large output");
-        wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
-            let handle = reg.tasks.get(&id).expect("background shell handle");
-            let stdout_size = std::fs::metadata(&handle.stdout_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let stderr_size = std::fs::metadata(&handle.stderr_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            stdout_size.saturating_add(stderr_size) > MAX_OUTPUT_BYTES
-        })
-        .await
-        .expect("background shell should exceed output cap");
         let mut events = Vec::new();
         wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
-            reg.stall_check();
             events.extend(reg.poll_completions());
             events.iter().any(|event| {
                 matches!(
@@ -2453,8 +2832,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stall_check_throttles_same_size_tail_rechecks() {
+    #[tokio::test]
+    async fn output_probe_emits_one_factual_no_output_advisory_without_changing_status() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let (mut handle, _dir) = test_handle_with_status(BgTaskStatus::Running);
@@ -2464,29 +2843,54 @@ mod tests {
         std::fs::write(&handle.stdout_path, "still working..\n").unwrap();
         handle.last_output_size = 16;
         handle.last_activity = Instant::now() - STALL_THRESHOLD - Duration::from_secs(1);
+        let stalled_since = handle.last_activity;
         reg.tasks.insert(handle.id.clone(), handle);
 
-        reg.stall_check();
-        assert!(
-            reg.poll_completions().is_empty(),
-            "first non-prompt tail probe should not emit a stall event"
+        reg.poll_output_observations();
+        assert!(reg.output_probe_in_flight);
+        let first_probe_started = reg.last_output_probe_started;
+        reg.poll_output_observations();
+        assert_eq!(
+            reg.last_output_probe_started, first_probe_started,
+            "a second tick must not schedule another probe while one is in flight"
         );
+        let mut first_events = Vec::new();
+        wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+            first_events.extend(reg.poll_completions());
+            !reg.output_probe_in_flight
+        })
+        .await
+        .expect("first async output probe should finish");
+        let handle = reg.tasks.get("bg-throttle").unwrap();
+        assert_eq!(handle.last_activity, stalled_since);
+        assert_eq!(handle.status(), BgTaskStatus::Running);
+        assert!(handle.no_recent_output_reported);
+        assert!(matches!(
+            first_events.as_slice(),
+            [BgTaskEvent::NoRecentOutput {
+                id,
+                inactive_ms,
+                last_output_tail,
+                ..
+            }] if id == "bg-throttle"
+                && *inactive_ms >= STALL_THRESHOLD.as_millis() as u64
+                && last_output_tail == "still working.."
+        ));
 
-        std::fs::write(tmp.path().join("stdout.log"), "Continue? [y/N]\n").unwrap();
-        reg.stall_check();
+        reg.last_output_probe_started = Some(Instant::now() - OUTPUT_PROBE_INTERVAL);
+        reg.tasks.get_mut("bg-throttle").unwrap().last_tail_probe_at =
+            Some(Instant::now() - STALL_TAIL_RECHECK_COOLDOWN);
+        let mut repeat_events = Vec::new();
+        wait_until(Duration::from_secs(1), Duration::from_millis(10), || {
+            repeat_events.extend(reg.poll_completions());
+            !reg.output_probe_in_flight
+        })
+        .await
+        .expect("repeat output probe should finish");
         assert!(
-            reg.poll_completions().is_empty(),
-            "immediate same-size reread must be throttled to avoid repeated tail I/O"
+            repeat_events.is_empty(),
+            "unchanged quiet output must not produce duplicate advisories"
         );
-
-        let handle = reg.tasks.get_mut("bg-throttle").unwrap();
-        handle.last_tail_probe_at = Some(Instant::now() - STALL_TAIL_RECHECK_COOLDOWN);
-        reg.stall_check();
-        assert!(reg.poll_completions().iter().any(|event| matches!(
-            event,
-            BgTaskEvent::WaitingForInput { id, last_output_tail, .. }
-                if id == "bg-throttle" && last_output_tail.contains("Continue? [y/N]")
-        )));
     }
 
     #[cfg(unix)]

@@ -110,7 +110,7 @@ docker run -d \
   --name matrixone \
   -p 6001:6001 \
   -v /data/matrixone:/mo-data \
-  matrixorigin/matrixone:4.0.0-rc3
+  matrixorigin/matrixone:latest
 
 # Server 2, 3 (Replicas)
 # Configure replication as needed

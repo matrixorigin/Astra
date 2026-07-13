@@ -72,20 +72,6 @@ fn timeline_hint_mentions_navigation_and_close() {
     hint_contains(&v, &["↑", "↓", "Esc"]);
 }
 
-// ─── Table ────────────────────────────────────────────────────────
-
-#[test]
-fn table_panel_hint_mentions_row_col_navigation() {
-    use super::table_view::TablePanelView;
-    use crate::tui::table_view::MysqlTable;
-    let t = MysqlTable {
-        headers: vec!["a".into()],
-        rows: vec![vec!["1".into()]],
-    };
-    let v = TablePanelView::new(t);
-    hint_contains(&v, &["↑", "↓", "←", "→", "Esc"]);
-}
-
 // ─── Worktrees ────────────────────────────────────────────────────
 
 #[test]

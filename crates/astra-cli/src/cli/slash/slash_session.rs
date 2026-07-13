@@ -1182,109 +1182,28 @@ pub(crate) async fn handle_session_command(
                     return;
                 }
             };
-            match fork_local_session(ForkSessionOptions {
-                parent_session_id: parent_id.clone(),
-                new_session_id: None,
-                label: label.clone(),
-                forked_after_turn: None,
-                data_branch: None,
-                snapshot_spec: None,
-            }) {
-                Ok(res) => {
-                    let new_sid = res.new_session_id.clone();
+            match fork_session_into_state(&parent_id, label, api, profile, state).await {
+                Ok(outcome) => {
                     eprintln!(
                         "  {} New session {} (fork of {})",
                         theme::icon_ok(),
-                        new_sid.as_str().magenta(),
+                        outcome.new_session_id.as_str().magenta(),
                         parent_id.as_str().dim()
                     );
                     eprintln!(
                         "  {}",
                         format!(
                             "{} journal events copied (excl. session end/start)",
-                            res.events_copied
+                            outcome.events_copied
                         )
                         .dim()
                     );
-                    let restored_child = match load_prepared_fork_restore(
-                        &parent_id,
-                        &new_sid,
-                        res.forked_at_turn,
-                    )
-                    .await
-                    {
-                        Ok(restored_child) => restored_child,
-                        Err(error) => {
-                            eprintln!(
-                                    "{}",
-                                    format!(
-                                        "  ✗ Forked child session could not restore local history: {error}"
-                                    )
-                                    .red()
-                                );
-                            return;
-                        }
-                    };
-
-                    let mut fork_guard = ForkStateGuard::new(state);
-                    let cloud_task_board_copy =
-                        fork_guard
-                            .state()
-                            .task_notify_tx
-                            .as_ref()
-                            .map(|_| CloudTaskBoardCopy {
-                                cloud_base: api.api_origin(),
-                                token: session_runtime::current_access_token(profile),
-                            });
-                    let task_board_restore = match apply_prepared_fork_restore(
-                        fork_guard.state(),
-                        &parent_id,
-                        &new_sid,
-                        restored_child,
-                        cloud_task_board_copy,
-                    )
-                    .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            eprintln!(
-                                "{}",
-                                format!(
-                                    "  ✗ Forked child session could not restore task board: {error}"
-                                )
-                                .red()
-                            );
-                            return;
-                        }
-                    };
-
-                    if let Err(error) =
-                        crate::cli::session::session_recovery::sync_recovery_snapshot_after_history_edit(
-                            fork_guard.state(),
-                        )
-                        .await
-                    {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                "  ✗ Forked child session could not persist resume/fork state: {error}"
-                            )
-                            .red()
-                        );
-                        return;
-                    }
-                    persist_profile_last_session_or_warn(
-                        profile,
-                        &new_sid,
-                        "slash_session:fork_new_session_id",
-                    );
-                    fork_guard.commit();
                     eprintln!(
                         "  {}",
                         "REPL context is now the forked session (same history; new cloud lineage)."
                             .dim()
                     );
-                    if task_board_restore == ForkTaskBoardRestore::PreservedExistingChild {
+                    if outcome.preserved_existing_child_task_board {
                         eprintln!(
                             "  {}",
                             "Forked child already has a task board; preserved child tasks and skipped copying the parent board."
@@ -1292,7 +1211,7 @@ pub(crate) async fn handle_session_command(
                         );
                     }
                 }
-                Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
+                Err(error) => eprintln!("{}", format!("  ✗ {error}").red()),
             }
         }
         "history" => {
@@ -2058,6 +1977,11 @@ pub(crate) async fn handle_session_command(
                                     projection.turns_completed,
                                 );
                             }
+                            // Child conversation items have a dedicated
+                            // transcript projection; printing every message in
+                            // the session event timeline would duplicate and
+                            // overwhelm lifecycle events.
+                            session_journal::JournalEventType::TranscriptItem => {}
                             session_journal::JournalEventType::VerificationCompleted => {
                                 let scope = evt
                                     .metadata
@@ -3893,31 +3817,8 @@ fn handle_session_drift(arg: &str, state: &SessionState) {
 /// - Issue detection: blocked tools, stalls, errors, latency spikes,
 ///   recording gaps, duplicate checkpoints
 fn handle_session_analyze(arg: &str, state: &SessionState) {
-    // When the TUI dispatcher handed off via `/session analyze deep
-    // <id>` it stashed the optional id in `slash_config` — recover
-    // it here so it isn't silently dropped.  A direct line-mode
-    // invocation passes the id through `arg` as usual.
-    //
-    // We *always* consume the stashed value (even when `arg` is
-    // non-empty) so a previously-stashed id from a cancelled or
-    // errored picker flow cannot leak into a later invocation and
-    // silently analyze the wrong session.  When `arg` is supplied
-    // the caller's value wins.
-    let stashed = crate::cli::slash::slash_config::take_deep_analyze_arg();
-    let arg_owned: String;
-    let effective_arg: &str = if arg.trim().is_empty() {
-        match stashed {
-            Some(v) => {
-                arg_owned = v;
-                arg_owned.as_str()
-            }
-            None => arg,
-        }
-    } else {
-        arg
-    };
     let (target_sid, resolved_prefix) = match resolve_journal_target_session(
-        effective_arg,
+        arg,
         state,
         "  No active session. Use /session analyze <session_id>.",
     ) {
@@ -3927,11 +3828,11 @@ fn handle_session_analyze(arg: &str, state: &SessionState) {
             return;
         }
     };
-    if resolved_prefix && !effective_arg.is_empty() {
+    if resolved_prefix && !arg.is_empty() {
         eprintln!(
             "  {} Resolved {} → {}",
             theme::icon_ok(),
-            effective_arg.magenta(),
+            arg.magenta(),
             target_sid.as_str().magenta()
         );
     }
@@ -5263,9 +5164,12 @@ async fn prepared_fork_restore_from_journal(
     // turn did not reach a final journal Turn event, so it is the better resume
     // source for interrupted or abandoned work.
     let mut prepared = prepared_fork_restore_from_restored_journal(restored_journal);
-    let transcript_history = session_continuation::transcript_history_pairs_for_session(session_id);
-    if transcript_history.len() > prepared.history.len() || prepared.history.is_empty() {
-        prepared.history = transcript_history;
+    let canonical_history =
+        session_continuation::load_session_messages_for_continuation(session_id)
+            .map(|messages| session_continuation::history_pairs_from_messages(&messages))
+            .unwrap_or_default();
+    if canonical_history.len() > prepared.history.len() || prepared.history.is_empty() {
+        prepared.history = canonical_history;
     }
     Ok(prepared)
 }
@@ -5427,6 +5331,75 @@ async fn apply_prepared_fork_restore(
         ForkTaskBoardRestore::Copied
     };
     Ok(task_board_restore)
+}
+
+/// Result of one transactional local-session fork. The caller owns
+/// presentation; this operation owns durable history, task-board, and runtime
+/// state restoration so TUI and line-mode commands cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForkSessionOutcome {
+    pub new_session_id: String,
+    pub events_copied: usize,
+    pub preserved_existing_child_task_board: bool,
+}
+
+/// Fork `parent_id` and atomically move the active runtime state to the child.
+/// Any error before `commit` drops the guard and restores the original state.
+pub(crate) async fn fork_session_into_state(
+    parent_id: &str,
+    label: Option<String>,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &mut SessionState,
+) -> Result<ForkSessionOutcome, String> {
+    let fork = fork_local_session(ForkSessionOptions {
+        parent_session_id: parent_id.to_string(),
+        new_session_id: None,
+        label,
+        forked_after_turn: None,
+        data_branch: None,
+        snapshot_spec: None,
+    })?;
+    let new_session_id = fork.new_session_id;
+    let restored_child =
+        load_prepared_fork_restore(parent_id, &new_session_id, fork.forked_at_turn).await?;
+
+    let mut fork_guard = ForkStateGuard::new(state);
+    let cloud_task_board_copy =
+        fork_guard
+            .state()
+            .task_notify_tx
+            .as_ref()
+            .map(|_| CloudTaskBoardCopy {
+                cloud_base: api.api_origin(),
+                token: session_runtime::current_access_token(profile),
+            });
+    let task_board_restore = apply_prepared_fork_restore(
+        fork_guard.state(),
+        parent_id,
+        &new_session_id,
+        restored_child,
+        cloud_task_board_copy,
+    )
+    .await?;
+    crate::cli::session::session_recovery::sync_recovery_snapshot_after_history_edit(
+        fork_guard.state(),
+    )
+    .await?;
+    persist_profile_last_session_or_warn(
+        profile,
+        &new_session_id,
+        "slash_session:fork_new_session_id",
+    );
+
+    let outcome = ForkSessionOutcome {
+        new_session_id,
+        events_copied: fork.events_copied,
+        preserved_existing_child_task_board: task_board_restore
+            == ForkTaskBoardRestore::PreservedExistingChild,
+    };
+    fork_guard.commit();
+    Ok(outcome)
 }
 
 async fn restore_journal_history_if_available(
@@ -5738,11 +5711,11 @@ async fn apply_restored_session(
         astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
             &restored.conversation_messages,
         )
-    } else if let Some(transcript_messages) =
-        session_continuation::load_transcript_messages_for_continuation(&restored.session_id)
+    } else if let Some(canonical_messages) =
+        session_continuation::load_session_messages_for_continuation(&restored.session_id)
     {
         astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-            &transcript_messages,
+            &canonical_messages,
         )
     } else {
         let history_messages = session_projection::history_as_messages(&state.history);

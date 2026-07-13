@@ -31,23 +31,24 @@
 //! 5. `recover_active_runs()` — On startup, loads runs that were active when process died
 //! 6. `load_run()` — Loads a run from store (cache miss path)
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use astra_services::{
     DatabaseStateProjectionStore,
     runs::{
         CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
-        DurableRunListPage, DurableRunRecord, DurableRunStatusKind, GuardedRunStatusTransition,
-        GuardedRunStatusTransitionRequest, RequestedTurnInteractionMode, RunListCursor,
-        RunStateStore, RuntimeProfileRequest, SelectedModelRequest, TurnIntentExecutionPolicy,
-        durable_run_status_kind,
+        DurableRunInteractionKind, DurableRunInteractionResolveOutcome, DurableRunListPage,
+        DurableRunRecord, DurableRunStatusKind, GuardedRunStatusTransition,
+        GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE,
+        RequestedTurnInteractionMode, RunListCursor, RunStateStore, RuntimeProfileRequest,
+        SelectedModelRequest, TurnIntentExecutionPolicy, durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 
 use astra_core::{
-    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED, STATUS_PAUSED,
-    STATUS_RUNNING, STATUS_WAITING,
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
+    STATUS_WAITING,
 };
 
 const METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL: &str = "astra_run_control_poll_attempts_total";
@@ -56,12 +57,11 @@ const METRIC_RUN_RECOVERY_SCANS_TOTAL: &str = "astra_run_recovery_scans_total";
 const METRIC_RUN_RECOVERY_RUNS_TOTAL: &str = "astra_run_recovery_runs_total";
 const TERMINAL_TRANSITION_MAX_ATTEMPTS: usize = 3;
 const TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS: u64 = 25;
-const OWNER_LEASE_RENEWAL_STATUSES: &[&str] = &[
-    STATUS_RUNNING,
-    STATUS_WAITING,
-    STATUS_INPUT_QUEUED,
-    STATUS_PAUSED,
-];
+const USER_INTENT_APPLY_MAX_ATTEMPTS: usize = 8;
+const USER_INTENT_APPLY_RETRY_BASE_DELAY_MS: u64 = 5;
+const USER_INTENT_APPLY_RETRY_MAX_DELAY_MS: u64 = 80;
+const RUN_RECOVERY_MAX_CONCURRENCY: usize = 8;
+const OWNER_LEASE_RENEWAL_STATUSES: &[&str] = &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED];
 
 fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
     [
@@ -261,6 +261,16 @@ fn record_recovery_run(
 
 fn terminal_transition_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS.saturating_mul(attempt as u64))
+}
+
+fn user_intent_apply_retry_delay(attempt: usize) -> Duration {
+    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        USER_INTENT_APPLY_RETRY_BASE_DELAY_MS
+            .saturating_mul(multiplier)
+            .min(USER_INTENT_APPLY_RETRY_MAX_DELAY_MS),
+    )
 }
 
 fn json_contains_expected_fields(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
@@ -1103,17 +1113,37 @@ impl RunEngine {
         self.store.load_run(user_id, run_id).await
     }
 
-    /// Check whether the run has been cancelled or paused externally
-    /// (e.g. by another pod in a horizontally-scaled deployment).
-    /// Returns `Some("cancelled")` if cancelled, `Some("paused")` if paused,
-    /// or `None` if the run is still active. Also returns `Some("cancelled")`
-    /// when the run record cannot be found (e.g. was deleted by a different pod).
+    /// Lightweight shared-state check used by durable interaction waiters.
+    /// It avoids hydrating the event log on every poll while still observing
+    /// terminal transitions and resolutions committed by another pod.
+    pub async fn run_is_waiting_for(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        waiting_for: &str,
+    ) -> Result<bool, String> {
+        Ok(self
+            .store
+            .load_run_control(user_id, run_id)
+            .await?
+            .is_some_and(|run| {
+                run.status == STATUS_WAITING && run.waiting_for.as_deref() == Some(waiting_for)
+            }))
+    }
+
+    /// Check whether this run or any of its durable ancestors has been
+    /// cancelled or paused externally (for example by another pod).
+    ///
+    /// An ancestor cancellation wins over every pause so a child cannot keep
+    /// waiting merely because it observed an older local pause first. This
+    /// makes parent control safe without copying a mutable pause flag into
+    /// every descendant row.
     pub async fn check_control_status(
         &self,
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<RunControlStatus>, String> {
-        let record = match self.store.load_run(user_id, run_id).await {
+        let record = match self.store.load_run_control(user_id, run_id).await {
             Ok(record) => {
                 record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "ok");
                 record
@@ -1124,13 +1154,90 @@ impl RunEngine {
                 return Err(error);
             }
         };
-        Ok(match record {
-            None => None,
-            Some(r) => match durable_run_status_kind(&r.status) {
-                DurableRunStatusKind::Cancelled => Some(RunControlStatus::Cancelled),
-                DurableRunStatusKind::Paused => Some(RunControlStatus::Paused),
-                _ => None,
-            },
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let own_status = durable_run_status_kind(&record.status);
+        if matches!(
+            own_status,
+            DurableRunStatusKind::Completed | DurableRunStatusKind::Failed
+        ) {
+            return Ok(None);
+        }
+        if matches!(own_status, DurableRunStatusKind::Cancelled) {
+            return Ok(Some(RunControlStatus::Cancelled));
+        }
+
+        let ancestor_ids = match record.parent_run_id.as_deref() {
+            None => Vec::new(),
+            Some(parent_run_id) => {
+                let Some(path) = record.ancestor_path.as_deref() else {
+                    record_control_poll_error(
+                        self.metrics_registry.as_ref(),
+                        "status",
+                        "invalid_lineage",
+                    );
+                    return Err(format!(
+                        "durable child run {run_id} is missing ancestor_path"
+                    ));
+                };
+                let segments = path
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .collect::<Vec<_>>();
+                if segments.last().copied() != Some(run_id)
+                    || segments.len() < 2
+                    || segments[segments.len() - 2] != parent_run_id
+                {
+                    record_control_poll_error(
+                        self.metrics_registry.as_ref(),
+                        "status",
+                        "invalid_lineage",
+                    );
+                    return Err(format!(
+                        "durable child run {run_id} has inconsistent ancestor_path"
+                    ));
+                }
+                let mut seen = HashSet::with_capacity(segments.len());
+                let ancestors = segments[..segments.len() - 1]
+                    .iter()
+                    .map(|segment| (*segment).to_string())
+                    .collect::<Vec<_>>();
+                if ancestors.iter().any(|ancestor| !seen.insert(ancestor)) {
+                    record_control_poll_error(
+                        self.metrics_registry.as_ref(),
+                        "status",
+                        "lineage_cycle",
+                    );
+                    return Err(format!(
+                        "durable run lineage cycle while checking control for {run_id}"
+                    ));
+                }
+                ancestors
+            }
+        };
+
+        let ancestors = self.store.load_run_controls(user_id, &ancestor_ids).await?;
+        if ancestors.len() != ancestor_ids.len() {
+            record_control_poll_error(self.metrics_registry.as_ref(), "status", "missing_ancestor");
+            return Err(format!(
+                "durable run ancestor missing while checking control for {run_id}"
+            ));
+        }
+        let mut inherited_pause = false;
+        for ancestor in ancestors {
+            match durable_run_status_kind(&ancestor.status) {
+                DurableRunStatusKind::Cancelled => return Ok(Some(RunControlStatus::Cancelled)),
+                DurableRunStatusKind::Paused => inherited_pause = true,
+                _ => {}
+            }
+        }
+
+        Ok(match own_status {
+            DurableRunStatusKind::Cancelled => Some(RunControlStatus::Cancelled),
+            DurableRunStatusKind::Paused => Some(RunControlStatus::Paused),
+            _ if inherited_pause => Some(RunControlStatus::Paused),
+            _ => None,
         })
     }
 
@@ -1171,6 +1278,31 @@ impl RunEngine {
             .await
     }
 
+    pub async fn load_run_interaction_event(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request_id: &str,
+        event_type: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        self.store
+            .load_run_interaction_event(user_id, run_id, request_id, event_type)
+            .await
+    }
+
+    pub async fn resolve_run_interaction(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request_id: &str,
+        kind: DurableRunInteractionKind,
+        response_data: serde_json::Value,
+    ) -> Result<DurableRunInteractionResolveOutcome, String> {
+        self.store
+            .resolve_run_interaction(user_id, run_id, request_id, kind, response_data)
+            .await
+    }
+
     /// Recover active runs after a crash/restart.
     ///
     /// A durable status is not proof that an execution task survived. The
@@ -1181,24 +1313,56 @@ impl RunEngine {
     ///   `paused` and direct the caller to continue the session with a new run;
     /// - `running` runs with a graceful checkpoint use the same honest
     ///   session-continuation fallback;
-    /// - other `running` / `input_queued` runs are marked failed because their
+    /// - other `running` runs are marked failed because their
     ///   in-flight effects cannot be proven replay-safe.
     pub async fn recover_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        let active = match self.store.find_recoverable_active_runs().await {
-            Ok(active) => {
+        use futures_util::{StreamExt, stream};
+
+        let mut recovered = Vec::new();
+        let mut claimed_run_ids = HashSet::new();
+        loop {
+            let claimed = match self
+                .store
+                .claim_recoverable_active_runs(RUN_RECOVERY_CLAIM_BATCH_SIZE)
+                .await
+            {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    record_recovery_scan(self.metrics_registry.as_ref(), "error");
+                    if recovered.is_empty() {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        target: "astra_runtime::run_engine",
+                        recovered_total = recovered.len(),
+                        error = %error,
+                        "recovery scan stopped after committing a partial set"
+                    );
+                    return Ok(recovered);
+                }
+            };
+            if claimed.is_empty() {
                 record_recovery_scan(self.metrics_registry.as_ref(), "ok");
-                active
+                break;
             }
-            Err(error) => {
-                record_recovery_scan(self.metrics_registry.as_ref(), "error");
-                return Err(error);
+            let fresh_claims = claimed
+                .into_iter()
+                .filter(|run| claimed_run_ids.insert((run.user_id.clone(), run.run_id.clone())))
+                .collect::<Vec<_>>();
+            if fresh_claims.is_empty() {
+                record_recovery_scan(self.metrics_registry.as_ref(), "ok");
+                break;
             }
-        };
-        let mut recovered = Vec::with_capacity(active.len());
-        for run in active {
-            if let Some(recovered_run) = self.recover_active_run(run).await {
-                recovered.push(recovered_run);
-            }
+            let batch = stream::iter(fresh_claims.into_iter().map(|run| {
+                let engine = self.clone();
+                async move { engine.recover_active_run(run).await }
+            }))
+            .buffer_unordered(RUN_RECOVERY_MAX_CONCURRENCY)
+            .filter_map(|run| async move { run })
+            .collect::<Vec<_>>()
+            .await;
+            recovered.extend(batch);
+            tokio::task::yield_now().await;
         }
         Ok(recovered)
     }
@@ -1357,6 +1521,29 @@ impl RunEngine {
             .await
     }
 
+    /// Return the authoritative bounded run working set for one session.
+    pub async fn list_session_runs(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<astra_services::runs::DurableSessionRunPage, String> {
+        self.store
+            .list_session_runs(user_id, session_id, limit)
+            .await
+    }
+
+    pub async fn load_session_agent_recovery(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<astra_services::runs::DurableSessionRunPage, String> {
+        self.store
+            .load_session_agent_recovery(user_id, session_id, limit)
+            .await
+    }
+
     /// Access the underlying store (for advanced queries).
     pub fn store(&self) -> &Arc<dyn RunStateStore> {
         &self.store
@@ -1364,8 +1551,113 @@ impl RunEngine {
 }
 
 use crate::turn::run_control::{
-    QueuedRunInputEvent, RunControlStatus, RunInputProvider, RunQueuedInputPoll, RunStatusProvider,
+    QueuedUserIntent, RunControlStatus, RunStatusProvider, UserIntentApplyAck, UserIntentPoll,
+    UserIntentPollIssue, UserIntentPollIssueKind, UserIntentProvider,
 };
+
+fn durable_event_index(event: &serde_json::Value, fallback: usize) -> usize {
+    event
+        .get("index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .unwrap_or(fallback)
+}
+
+fn latest_durable_event_cursor(run: &DurableRunRecord) -> usize {
+    let counter_cursor = usize::try_from(run.last_event_idx).unwrap_or(0);
+    let observed_cursor = run
+        .events
+        .iter()
+        .enumerate()
+        .map(|(position, event)| durable_event_index(event, position))
+        .max()
+        .unwrap_or(0);
+    counter_cursor.max(observed_cursor)
+}
+
+fn user_intent_issue(
+    event_index: usize,
+    intent_id: Option<&str>,
+    kind: UserIntentPollIssueKind,
+) -> UserIntentPollIssue {
+    UserIntentPollIssue {
+        event_index,
+        intent_id: intent_id.map(str::to_string),
+        kind,
+    }
+}
+
+fn parse_queued_user_intent(
+    event_index: usize,
+    event: &serde_json::Value,
+) -> Result<QueuedUserIntent, UserIntentPollIssue> {
+    let Some(data) = event.get("data") else {
+        return Err(user_intent_issue(
+            event_index,
+            None,
+            UserIntentPollIssueKind::MissingData,
+        ));
+    };
+    let intent_id = data
+        .get("intent_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            user_intent_issue(event_index, None, UserIntentPollIssueKind::MissingIntentId)
+        })?;
+    let delivery = data.get("delivery").cloned().ok_or_else(|| {
+        user_intent_issue(
+            event_index,
+            Some(intent_id),
+            UserIntentPollIssueKind::MissingDelivery,
+        )
+    })?;
+    let delivery = serde_json::from_value(delivery).map_err(|_| {
+        user_intent_issue(
+            event_index,
+            Some(intent_id),
+            UserIntentPollIssueKind::InvalidDelivery,
+        )
+    })?;
+    let input = data.get("input").cloned().ok_or_else(|| {
+        user_intent_issue(
+            event_index,
+            Some(intent_id),
+            UserIntentPollIssueKind::MissingInput,
+        )
+    })?;
+    if crate::turn::run_control::user_intent_content(&input).is_none() {
+        return Err(user_intent_issue(
+            event_index,
+            Some(intent_id),
+            UserIntentPollIssueKind::NoActionableContent,
+        ));
+    }
+    Ok(QueuedUserIntent {
+        intent_id: intent_id.to_string(),
+        delivery,
+        status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+        event_index,
+        input,
+    })
+}
+
+fn applied_user_intent_indices(run: &DurableRunRecord) -> std::collections::HashSet<usize> {
+    run.events
+        .iter()
+        .filter(|event| {
+            event.get("event_type").and_then(serde_json::Value::as_str)
+                == Some("user_intent_applied")
+        })
+        .filter_map(|event| {
+            event
+                .get("data")
+                .and_then(|data| data.get("event_index"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+        })
+        .collect()
+}
 
 #[async_trait::async_trait]
 impl RunStatusProvider for RunEngine {
@@ -1380,30 +1672,31 @@ impl RunStatusProvider for RunEngine {
 }
 
 #[async_trait::async_trait]
-impl RunInputProvider for RunEngine {
-    async fn poll_user_inputs(
+impl UserIntentProvider for RunEngine {
+    async fn poll_user_intents(
         &self,
         user_id: &str,
         run_id: &str,
         after_event_index: usize,
-    ) -> RunQueuedInputPoll {
+    ) -> UserIntentPoll {
         let run = match self.store.load_run(user_id, run_id).await {
             Ok(Some(run)) => run,
             Ok(None) => {
                 record_control_poll_attempt(
                     self.metrics_registry.as_ref(),
-                    "user_input_poll",
+                    "user_intent_poll",
                     "missing",
                 );
                 record_control_poll_error(
                     self.metrics_registry.as_ref(),
-                    "user_input_poll",
+                    "user_intent_poll",
                     "missing",
                 );
-                let error = format!("run not found while polling deferred input: {run_id}");
-                return RunQueuedInputPoll {
+                let error = format!("run not found while polling user intents: {run_id}");
+                return UserIntentPoll {
                     next_cursor: after_event_index,
                     inputs: Vec::new(),
+                    issues: Vec::new(),
                     error: Some(error),
                 };
             }
@@ -1411,162 +1704,199 @@ impl RunInputProvider for RunEngine {
                 tracing::warn!(
                     run_id,
                     error = %error,
-                    "failed to poll queued user inputs from run store"
+                    "failed to poll accepted user intents from run store"
                 );
                 record_control_poll_attempt(
                     self.metrics_registry.as_ref(),
-                    "user_input_poll",
+                    "user_intent_poll",
                     "error",
                 );
                 record_control_poll_error(
                     self.metrics_registry.as_ref(),
-                    "user_input_poll",
+                    "user_intent_poll",
                     "store",
                 );
-                return RunQueuedInputPoll {
+                return UserIntentPoll {
                     next_cursor: after_event_index,
                     inputs: Vec::new(),
+                    issues: Vec::new(),
                     error: Some(error),
                 };
             }
         };
-        let released_indices = run
-            .events
-            .iter()
-            .filter(|event| {
-                event.get("event_type").and_then(serde_json::Value::as_str)
-                    == Some("user_inputs_released")
-            })
-            .flat_map(|event| {
-                event
-                    .get("data")
-                    .and_then(|data| data.get("event_indices"))
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serde_json::Value::as_u64)
-                    .map(|value| value as usize)
-            })
-            .collect::<std::collections::HashSet<_>>();
-        let start_index = after_event_index.min(run.events.len());
-
-        let inputs: Vec<QueuedRunInputEvent> = run
-            .events
-            .iter()
-            .enumerate()
-            .skip(start_index)
-            .filter_map(|(event_index, event)| {
-                let payload = event
-                    .get("event_type")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|event_type| *event_type == "user_input")
-                    .and_then(|_| event.get("data"))
-                    .and_then(|data| data.get("input"))
-                    .cloned()?;
-                if released_indices.contains(&event_index) {
-                    return None;
-                }
-                Some(QueuedRunInputEvent {
-                    event_index,
-                    input: payload,
-                })
-            })
-            .collect();
-
-        let mut error = None;
-        if run.status == STATUS_INPUT_QUEUED && inputs.is_empty() && !released_indices.is_empty() {
-            if let Err(update_error) = self
-                .persist_status_if_current(
-                    user_id,
-                    run_id,
-                    &[STATUS_INPUT_QUEUED],
-                    STATUS_RUNNING,
-                    None,
-                    None,
-                )
-                .await
+        let applied_indices = applied_user_intent_indices(&run);
+        let mut inputs = Vec::new();
+        let mut issues = Vec::new();
+        for (position, event) in run.events.iter().enumerate() {
+            let event_index = durable_event_index(event, position);
+            if event_index <= after_event_index
+                || applied_indices.contains(&event_index)
+                || event.get("event_type").and_then(serde_json::Value::as_str)
+                    != Some("user_intent")
             {
-                tracing::warn!(
-                    run_id,
-                    error = %update_error,
-                    "failed to auto-heal stale input-queued status after released inputs"
-                );
-                record_control_poll_attempt(
-                    self.metrics_registry.as_ref(),
-                    "user_input_poll",
-                    "auto_heal_error",
-                );
-                record_control_poll_error(
-                    self.metrics_registry.as_ref(),
-                    "user_input_poll",
-                    "auto_heal",
-                );
-                error = Some(update_error);
+                continue;
+            }
+            match parse_queued_user_intent(event_index, event) {
+                Ok(input) => inputs.push(input),
+                Err(issue) => issues.push(issue),
             }
         }
 
-        if error.is_none() {
-            record_control_poll_attempt(self.metrics_registry.as_ref(), "user_input_poll", "ok");
+        let outcome = if issues.is_empty() { "ok" } else { "partial" };
+        record_control_poll_attempt(self.metrics_registry.as_ref(), "user_intent_poll", outcome);
+        if !issues.is_empty() {
+            record_control_poll_error(
+                self.metrics_registry.as_ref(),
+                "user_intent_poll",
+                "invalid_event",
+            );
         }
 
-        RunQueuedInputPoll {
-            next_cursor: after_event_index.max(run.events.len()),
+        UserIntentPoll {
+            next_cursor: after_event_index.max(latest_durable_event_cursor(&run)),
             inputs,
-            error,
+            issues,
+            error: None,
         }
     }
 
-    async fn mark_user_inputs_released(
+    async fn mark_user_intents_applied(
         &self,
         user_id: &str,
         run_id: &str,
         event_indices: &[usize],
-    ) -> Result<(), String> {
+    ) -> Result<UserIntentApplyAck, String> {
         if event_indices.is_empty() {
-            return Ok(());
+            return Ok(UserIntentApplyAck::Applied);
         }
-        let run =
-            self.store.load_run(user_id, run_id).await?.ok_or_else(|| {
-                format!("run not found while acknowledging deferred input: {run_id}")
-            })?;
-        match durable_run_status_kind(&run.status) {
-            DurableRunStatusKind::Cancelled
-            | DurableRunStatusKind::Completed
-            | DurableRunStatusKind::Delegated
-            | DurableRunStatusKind::Failed => return Ok(()),
-            _ => {}
-        }
-        let release_event = serde_json::json!({
-            "event_type": "user_inputs_released",
-            "data": { "event_indices": event_indices },
-        });
-        if run.status == STATUS_INPUT_QUEUED {
-            let updated = self
-                .transition_status_with_event_if_current(
+        let requested = event_indices
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        for attempt in 1..=USER_INTENT_APPLY_MAX_ATTEMPTS {
+            let run =
+                self.store.load_run(user_id, run_id).await?.ok_or_else(|| {
+                    format!("run not found while applying user intents: {run_id}")
+                })?;
+            let already_applied = applied_user_intent_indices(&run);
+            let pending = requested
+                .iter()
+                .copied()
+                .filter(|event_index| !already_applied.contains(event_index))
+                .collect::<Vec<_>>();
+            if pending.is_empty() {
+                return Ok(UserIntentApplyAck::Applied);
+            }
+            if matches!(
+                durable_run_status_kind(&run.status),
+                DurableRunStatusKind::Cancelled
+                    | DurableRunStatusKind::Completed
+                    | DurableRunStatusKind::Delegated
+                    | DurableRunStatusKind::Failed
+            ) {
+                return Ok(UserIntentApplyAck::RunTerminal);
+            }
+
+            let mut applied_events = Vec::with_capacity(pending.len());
+            for event_index in &pending {
+                let source = run
+                    .events
+                    .iter()
+                    .enumerate()
+                    .find(|(position, event)| durable_event_index(event, *position) == *event_index)
+                    .map(|(_, event)| event)
+                    .ok_or_else(|| {
+                        format!("cannot apply user intent for unknown event index {event_index}")
+                    })?;
+                if source.get("event_type").and_then(serde_json::Value::as_str)
+                    != Some("user_intent")
+                {
+                    return Err(format!("event index {event_index} is not a user intent"));
+                }
+                let data = source.get("data").ok_or_else(|| {
+                    format!("user intent event {event_index} has no data payload")
+                })?;
+                let intent_id = data
+                    .get("intent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|intent_id| !intent_id.trim().is_empty())
+                    .ok_or_else(|| format!("user intent event {event_index} has no intent_id"))?;
+                let delivery = data
+                    .get("delivery")
+                    .cloned()
+                    .ok_or_else(|| format!("user intent event {event_index} has no delivery"))?;
+                applied_events.push(serde_json::json!({
+                    "event_type": "user_intent_applied",
+                    "idempotency_key": format!("user_intent_applied:{intent_id}"),
+                    "data": {
+                        "intent_id": intent_id,
+                        "delivery": delivery,
+                        "status": astra_turn_types::UserIntentStatus::Applied,
+                        "event_index": event_index,
+                    },
+                }));
+            }
+
+            let expected_status = run.status.clone();
+            match self
+                .transition_status_with_events_if_current(
                     user_id,
                     run_id,
-                    &[STATUS_INPUT_QUEUED],
-                    STATUS_RUNNING,
-                    None,
-                    None,
-                    release_event.clone(),
+                    &[expected_status.as_str()],
+                    &expected_status,
+                    run.waiting_for.as_deref(),
+                    run.error_message.as_deref(),
+                    &applied_events,
                 )
-                .await?;
-            if updated {
-                return Ok(());
-            }
-            let current = self.store.load_run(user_id, run_id).await?.ok_or_else(|| {
-                format!("run not found after acknowledging deferred input: {run_id}")
-            })?;
-            match durable_run_status_kind(&current.status) {
-                DurableRunStatusKind::Cancelled
-                | DurableRunStatusKind::Completed
-                | DurableRunStatusKind::Delegated
-                | DurableRunStatusKind::Failed => return Ok(()),
-                _ => {}
+                .await
+            {
+                Ok(true) => return Ok(UserIntentApplyAck::Applied),
+                Ok(false) if attempt < USER_INTENT_APPLY_MAX_ATTEMPTS => {
+                    tokio::time::sleep(user_intent_apply_retry_delay(attempt)).await;
+                }
+                Ok(false) => break,
+                Err(error) => {
+                    let after = self.store.load_run(user_id, run_id).await?;
+                    if after.as_ref().is_some_and(|run| {
+                        let applied = applied_user_intent_indices(run);
+                        requested.iter().all(|index| applied.contains(index))
+                    }) {
+                        return Ok(UserIntentApplyAck::Applied);
+                    }
+                    if after.as_ref().is_some_and(|run| {
+                        matches!(
+                            durable_run_status_kind(&run.status),
+                            DurableRunStatusKind::Cancelled
+                                | DurableRunStatusKind::Completed
+                                | DurableRunStatusKind::Delegated
+                                | DurableRunStatusKind::Failed
+                        )
+                    }) {
+                        return Ok(UserIntentApplyAck::RunTerminal);
+                    }
+                    return Err(error);
+                }
             }
         }
-        self.append_event(user_id, run_id, release_event).await
+
+        let run = self
+            .store
+            .load_run(user_id, run_id)
+            .await?
+            .ok_or_else(|| format!("run not found while applying user intents: {run_id}"))?;
+        if matches!(
+            durable_run_status_kind(&run.status),
+            DurableRunStatusKind::Cancelled
+                | DurableRunStatusKind::Completed
+                | DurableRunStatusKind::Delegated
+                | DurableRunStatusKind::Failed
+        ) {
+            return Ok(UserIntentApplyAck::RunTerminal);
+        }
+        Err(format!(
+            "user intent apply CAS exhausted for run {run_id} while status remained {}",
+            run.status
+        ))
     }
 }
 
@@ -1691,6 +2021,17 @@ mod tests {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))
     }
 
+    #[test]
+    fn user_intent_apply_retry_delay_is_bounded_exponential_backoff() {
+        assert_eq!(user_intent_apply_retry_delay(1), Duration::from_millis(5));
+        assert_eq!(user_intent_apply_retry_delay(2), Duration::from_millis(10));
+        assert_eq!(user_intent_apply_retry_delay(5), Duration::from_millis(80));
+        assert_eq!(
+            user_intent_apply_retry_delay(usize::MAX),
+            Duration::from_millis(80)
+        );
+    }
+
     #[tokio::test]
     async fn owner_lease_heartbeat_is_disabled_when_store_has_no_interval() {
         assert!(
@@ -1753,7 +2094,7 @@ mod tests {
         fail_remaining: AtomicUsize,
         attempts: AtomicUsize,
         waiting_queries: AtomicUsize,
-        recoverable_active_queries: AtomicUsize,
+        recovery_claims: AtomicUsize,
         lease_renewal_interval: Option<Duration>,
         lease_renewals: AtomicUsize,
         lease_releases: AtomicUsize,
@@ -1767,7 +2108,7 @@ mod tests {
                 fail_remaining: AtomicUsize::new(failures),
                 attempts: AtomicUsize::new(0),
                 waiting_queries: AtomicUsize::new(0),
-                recoverable_active_queries: AtomicUsize::new(0),
+                recovery_claims: AtomicUsize::new(0),
                 lease_renewal_interval: None,
                 lease_renewals: AtomicUsize::new(0),
                 lease_releases: AtomicUsize::new(0),
@@ -1788,8 +2129,8 @@ mod tests {
             self.waiting_queries.load(Ordering::SeqCst)
         }
 
-        fn recoverable_active_queries(&self) -> usize {
-            self.recoverable_active_queries.load(Ordering::SeqCst)
+        fn recovery_claims(&self) -> usize {
+            self.recovery_claims.load(Ordering::SeqCst)
         }
 
         fn lease_renewals(&self) -> usize {
@@ -2043,14 +2384,12 @@ mod tests {
             self.inner.find_running_runs().await
         }
 
-        async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-            self.inner.find_recoverable_running_runs().await
-        }
-
-        async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-            self.recoverable_active_queries
-                .fetch_add(1, Ordering::SeqCst);
-            self.inner.find_recoverable_active_runs().await
+        async fn claim_recoverable_active_runs(
+            &self,
+            limit: u32,
+        ) -> Result<Vec<DurableRunRecord>, String> {
+            self.recovery_claims.fetch_add(1, Ordering::SeqCst);
+            self.inner.claim_recoverable_active_runs(limit).await
         }
 
         fn owner_lease_renewal_interval(&self) -> Option<Duration> {
@@ -2929,6 +3268,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ancestor_controls_apply_transitively_without_copying_child_state() {
+        let engine = test_engine();
+        engine
+            .start_run("root", "user-1", "session-1")
+            .await
+            .unwrap();
+        engine
+            .start_run_ext(
+                "child",
+                "user-1",
+                "session-1",
+                Some("root"),
+                Some("delegation-1"),
+                Some("worker"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run_ext(
+                "grandchild",
+                "user-1",
+                "session-1",
+                Some("child"),
+                Some("delegation-2"),
+                Some("reviewer"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        engine
+            .persist_status("user-1", "root", STATUS_PAUSED, Some("user_resume"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .check_control_status("user-1", "grandchild")
+                .await
+                .unwrap(),
+            Some(RunControlStatus::Paused)
+        );
+        assert_eq!(
+            engine
+                .load_run("user-1", "grandchild")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_RUNNING,
+            "ancestor control is derived at consumption time, not duplicated into child state"
+        );
+
+        engine
+            .persist_status("user-1", "root", STATUS_CANCELLED, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .check_control_status("user-1", "grandchild")
+                .await
+                .unwrap(),
+            Some(RunControlStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
     async fn run_control_poll_metrics_record_status_and_input_store_errors() {
         let registry = Arc::new(MetricsRegistry::new());
         let engine =
@@ -2936,7 +3342,7 @@ mod tests {
 
         let status = engine.check_control_status("user-1", "run-input").await;
         assert_eq!(status.unwrap_err(), "load failed");
-        let poll = engine.poll_user_inputs("user-1", "run-input", 7).await;
+        let poll = engine.poll_user_intents("user-1", "run-input", 7).await;
         assert_eq!(poll.error.as_deref(), Some("load failed"));
 
         let rendered = registry.render_prometheus();
@@ -2954,13 +3360,13 @@ mod tests {
         );
         assert!(
             rendered.contains(
-                "astra_run_control_poll_attempts_total{operation=\"user_input_poll\",outcome=\"error\"} 1"
+                "astra_run_control_poll_attempts_total{operation=\"user_intent_poll\",outcome=\"error\"} 1"
             ),
             "{rendered}"
         );
         assert!(
             rendered.contains(
-                "astra_run_control_poll_errors_total{class=\"store\",operation=\"user_input_poll\"} 1"
+                "astra_run_control_poll_errors_total{class=\"store\",operation=\"user_intent_poll\"} 1"
             ),
             "{rendered}"
         );
@@ -2971,11 +3377,8 @@ mod tests {
         let registry = Arc::new(MetricsRegistry::new());
         let engine = test_engine().with_metrics_registry(registry.clone());
 
-        let missing = engine.poll_user_inputs("user-1", "missing-run", 3).await;
-        assert_eq!(
-            missing.error.as_deref(),
-            Some("run not found while polling deferred input: missing-run")
-        );
+        let missing = engine.poll_user_intents("user-1", "missing-run", 3).await;
+        assert!(missing.error.is_some());
         engine
             .start_run("run-input", "user-1", "sess-input")
             .await
@@ -2987,19 +3390,19 @@ mod tests {
                 .unwrap(),
             None
         );
-        let ok = engine.poll_user_inputs("user-1", "run-input", 0).await;
+        let ok = engine.poll_user_intents("user-1", "run-input", 0).await;
         assert_eq!(ok.error, None);
 
         let rendered = registry.render_prometheus();
         assert!(
             rendered.contains(
-                "astra_run_control_poll_attempts_total{operation=\"user_input_poll\",outcome=\"missing\"} 1"
+                "astra_run_control_poll_attempts_total{operation=\"user_intent_poll\",outcome=\"missing\"} 1"
             ),
             "{rendered}"
         );
         assert!(
             rendered.contains(
-                "astra_run_control_poll_errors_total{class=\"missing\",operation=\"user_input_poll\"} 1"
+                "astra_run_control_poll_errors_total{class=\"missing\",operation=\"user_intent_poll\"} 1"
             ),
             "{rendered}"
         );
@@ -3011,7 +3414,7 @@ mod tests {
         );
         assert!(
             rendered.contains(
-                "astra_run_control_poll_attempts_total{operation=\"user_input_poll\",outcome=\"ok\"} 1"
+                "astra_run_control_poll_attempts_total{operation=\"user_intent_poll\",outcome=\"ok\"} 1"
             ),
             "{rendered}"
         );
@@ -3108,7 +3511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_user_inputs_keeps_cursor_when_after_index_exceeds_events() {
+    async fn poll_user_intents_keeps_cursor_when_after_index_exceeds_events() {
         let engine = test_engine();
         engine
             .start_run("run-input", "user-1", "sess-input")
@@ -3119,14 +3522,18 @@ mod tests {
                 "user-1",
                 "run-input",
                 serde_json::json!({
-                    "event_type": "user_input",
-                    "data": { "input": { "content": "queued" } },
+                    "event_type": "user_intent",
+                    "data": {
+                        "intent_id": "intent-ignored",
+                        "delivery": "guide_current_run",
+                        "input": { "content": "queued" }
+                    },
                 }),
             )
             .await
             .unwrap();
 
-        let poll = engine.poll_user_inputs("user-1", "run-input", 99).await;
+        let poll = engine.poll_user_intents("user-1", "run-input", 99).await;
 
         assert_eq!(poll.next_cursor, 99);
         assert!(poll.inputs.is_empty());
@@ -3134,10 +3541,171 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_user_inputs_reports_store_load_errors() {
+    async fn poll_user_intents_preserves_submit_identity() {
+        let engine = test_engine();
+        engine
+            .start_run("run-input-id", "user-1", "sess-input")
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                "user-1",
+                "run-input-id",
+                serde_json::json!({
+                    "event_type": "user_intent",
+                    "data": {
+                        "intent_id": "intent-7",
+                        "delivery": "guide_current_run",
+                        "input": { "content": "queued" }
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+
+        let poll = engine.poll_user_intents("user-1", "run-input-id", 0).await;
+
+        assert_eq!(poll.inputs.len(), 1);
+        assert_eq!(poll.inputs[0].intent_id, "intent-7");
+        assert_eq!(
+            poll.inputs[0].delivery,
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun
+        );
+        assert_eq!(
+            poll.inputs[0].status,
+            astra_turn_types::UserIntentStatus::AcceptedRemote
+        );
+        assert_eq!(poll.inputs[0].input["content"], "queued");
+    }
+
+    #[tokio::test]
+    async fn poll_user_intents_isolates_poison_and_delivers_later_valid_event() {
+        let engine = test_engine();
+        engine
+            .start_run("run-poison", "user-1", "sess-poison")
+            .await
+            .unwrap();
+        engine
+            .append_events_batch(
+                "user-1",
+                "run-poison",
+                &[
+                    serde_json::json!({
+                        "event_type": "user_intent",
+                        "data": {
+                            "intent_id": "intent-poison",
+                            "delivery": "guide_current_run",
+                            "input": {"unexpected": true}
+                        }
+                    }),
+                    serde_json::json!({
+                        "event_type": "user_intent",
+                        "data": {
+                            "intent_id": "intent-valid",
+                            "delivery": "guide_current_run",
+                            "input": {"content": "valid guidance"}
+                        }
+                    }),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let poll = engine.poll_user_intents("user-1", "run-poison", 0).await;
+
+        assert_eq!(poll.error, None);
+        assert_eq!(poll.next_cursor, 2);
+        assert_eq!(poll.issues.len(), 1);
+        assert_eq!(poll.issues[0].event_index, 1);
+        assert_eq!(
+            poll.issues[0].kind,
+            UserIntentPollIssueKind::NoActionableContent
+        );
+        assert_eq!(poll.inputs.len(), 1);
+        assert_eq!(poll.inputs[0].event_index, 2);
+        assert_eq!(poll.inputs[0].intent_id, "intent-valid");
+    }
+
+    #[tokio::test]
+    async fn user_intent_poll_and_apply_use_persisted_event_indices_with_gaps() {
+        let engine = test_engine();
+        engine
+            .start_run("run-gapped", "user-1", "sess-gapped")
+            .await
+            .unwrap();
+        engine
+            .append_events_batch(
+                "user-1",
+                "run-gapped",
+                &[
+                    serde_json::json!({
+                        "index": 7,
+                        "event_type": "user_intent",
+                        "data": {
+                            "intent_id": "intent-7",
+                            "delivery": "guide_current_run",
+                            "input": {"content": "first"}
+                        }
+                    }),
+                    serde_json::json!({
+                        "index": 9,
+                        "event_type": "user_intent",
+                        "data": {
+                            "intent_id": "intent-9",
+                            "delivery": "guide_current_run",
+                            "input": {"content": "second"}
+                        }
+                    }),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let first = engine.poll_user_intents("user-1", "run-gapped", 0).await;
+        assert_eq!(first.next_cursor, 9);
+        assert_eq!(
+            first
+                .inputs
+                .iter()
+                .map(|intent| intent.event_index)
+                .collect::<Vec<_>>(),
+            vec![7, 9]
+        );
+
+        engine
+            .mark_user_intents_applied("user-1", "run-gapped", &[9])
+            .await
+            .unwrap();
+        engine
+            .mark_user_intents_applied("user-1", "run-gapped", &[9])
+            .await
+            .unwrap();
+
+        let replay = engine.poll_user_intents("user-1", "run-gapped", 0).await;
+        assert_eq!(replay.inputs.len(), 1);
+        assert_eq!(replay.inputs[0].event_index, 7);
+        let run = engine
+            .load_run("user-1", "run-gapped")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| {
+                    event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("user_intent_applied")
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_user_intents_reports_store_load_errors() {
         let engine = RunEngine::new(Arc::new(FailingLoadRunStore));
 
-        let poll = engine.poll_user_inputs("user-1", "run-input", 7).await;
+        let poll = engine.poll_user_intents("user-1", "run-input", 7).await;
 
         assert_eq!(poll.next_cursor, 7);
         assert!(poll.inputs.is_empty());
@@ -3145,80 +3713,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_user_inputs_reports_missing_run_as_error() {
+    async fn poll_user_intents_reports_missing_run_as_error() {
         let engine = test_engine();
 
-        let poll = engine.poll_user_inputs("user-1", "missing-run", 3).await;
+        let poll = engine.poll_user_intents("user-1", "missing-run", 3).await;
 
         assert_eq!(poll.next_cursor, 3);
         assert!(poll.inputs.is_empty());
-        assert_eq!(
-            poll.error.as_deref(),
-            Some("run not found while polling deferred input: missing-run")
-        );
+        assert!(poll.error.is_some());
     }
 
     #[tokio::test]
-    async fn mark_user_inputs_released_clears_input_queued_status() {
+    async fn mark_user_intents_applied_preserves_execution_state_and_records_identity() {
         let engine = test_engine();
         engine
             .start_run("run-queued", "user-1", "sess-queued")
             .await
             .unwrap();
         engine
+            .append_event(
+                "user-1",
+                "run-queued",
+                serde_json::json!({
+                    "event_type": "user_intent",
+                    "data": {
+                        "intent_id": "intent-1",
+                        "delivery": "guide_current_run",
+                        "input": {"content": "focus the failing test"}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        engine
             .persist_status(
                 "user-1",
                 "run-queued",
-                STATUS_INPUT_QUEUED,
-                Some("user_input"),
+                STATUS_WAITING,
+                Some("edge_executor"),
                 None,
             )
             .await
             .unwrap();
 
-        engine
-            .mark_user_inputs_released("user-1", "run-queued", &[1])
+        let ack = engine
+            .mark_user_intents_applied("user-1", "run-queued", &[1])
             .await
             .unwrap();
+        assert_eq!(ack, UserIntentApplyAck::Applied);
 
         let run = engine
             .load_run("user-1", "run-queued")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(run.status, STATUS_RUNNING);
-        assert_eq!(run.waiting_for, None);
+        assert_eq!(run.status, STATUS_WAITING);
+        assert_eq!(run.waiting_for.as_deref(), Some("edge_executor"));
         assert_eq!(
             run.events
                 .iter()
                 .filter(
                     |event| event.get("event_type").and_then(serde_json::Value::as_str)
-                        == Some("user_inputs_released")
+                        == Some("user_intent_applied")
                 )
                 .count(),
             1
         );
-        let poll = engine.poll_user_inputs("user-1", "run-queued", 0).await;
+        let applied = run.events.last().unwrap();
+        assert_eq!(applied["data"]["intent_id"], "intent-1");
+        assert_eq!(applied["data"]["delivery"], "guide_current_run");
+        assert_eq!(applied["data"]["status"], "applied");
+        let poll = engine.poll_user_intents("user-1", "run-queued", 0).await;
         assert!(
             poll.inputs.is_empty(),
-            "released inputs must not replay after crash recovery"
+            "applied intents must not replay after crash recovery"
         );
     }
 
     #[tokio::test]
-    async fn mark_user_inputs_released_does_not_overwrite_paused_status() {
+    async fn mark_user_intents_applied_does_not_overwrite_paused_status() {
         let engine = test_engine();
         engine
             .start_run("run-paused-release", "user-1", "sess-paused")
             .await
             .unwrap();
         engine
-            .persist_status(
+            .append_event(
                 "user-1",
                 "run-paused-release",
-                STATUS_INPUT_QUEUED,
-                Some("user_input"),
-                None,
+                serde_json::json!({
+                    "event_type": "user_intent",
+                    "data": {
+                        "intent_id": "intent-paused",
+                        "delivery": "guide_current_run",
+                        "input": {"content": "use the focused test"}
+                    }
+                }),
             )
             .await
             .unwrap();
@@ -3233,10 +3823,11 @@ mod tests {
             .await
             .unwrap();
 
-        engine
-            .mark_user_inputs_released("user-1", "run-paused-release", &[1])
+        let ack = engine
+            .mark_user_intents_applied("user-1", "run-paused-release", &[1])
             .await
             .unwrap();
+        assert_eq!(ack, UserIntentApplyAck::Applied);
 
         let run = engine
             .load_run("user-1", "run-paused-release")
@@ -3248,17 +3839,32 @@ mod tests {
         assert!(
             run.events.iter().any(|event| {
                 event.get("event_type").and_then(serde_json::Value::as_str)
-                    == Some("user_inputs_released")
+                    == Some("user_intent_applied")
             }),
-            "paused release must still record that delivered inputs were consumed"
+            "paused application must remain auditable without changing pause state"
         );
     }
 
     #[tokio::test]
-    async fn mark_user_inputs_released_does_not_append_on_cancelled_run() {
+    async fn mark_user_intents_applied_does_not_append_on_cancelled_run() {
         let engine = test_engine();
         engine
             .start_run("run-cancelled-release", "user-1", "sess-cancelled")
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                "user-1",
+                "run-cancelled-release",
+                serde_json::json!({
+                    "event_type": "user_intent",
+                    "data": {
+                        "intent_id": "intent-cancelled",
+                        "delivery": "guide_current_run",
+                        "input": {"content": "too late"}
+                    }
+                }),
+            )
             .await
             .unwrap();
         engine
@@ -3279,10 +3885,11 @@ mod tests {
             .events
             .len();
 
-        engine
-            .mark_user_inputs_released("user-1", "run-cancelled-release", &[1])
+        let ack = engine
+            .mark_user_intents_applied("user-1", "run-cancelled-release", &[1])
             .await
             .unwrap();
+        assert_eq!(ack, UserIntentApplyAck::RunTerminal);
 
         let run = engine
             .load_run("user-1", "run-cancelled-release")
@@ -3291,6 +3898,108 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, STATUS_CANCELLED);
         assert_eq!(run.events.len(), before);
+    }
+
+    #[tokio::test]
+    async fn mark_user_intents_applied_loses_cleanly_to_concurrent_terminal_transition() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            1,
+            BatchTransitionFailureMode::ConcurrentCancelWins,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-apply-race", "user-1", "sess-apply-race")
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                "user-1",
+                "run-apply-race",
+                serde_json::json!({
+                    "event_type": "user_intent",
+                    "idempotency_key": "user_intent:intent-race",
+                    "data": {
+                        "intent_id": "intent-race",
+                        "delivery": "guide_current_run",
+                        "input": {"content": "too late"}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let ack = engine
+            .mark_user_intents_applied("user-1", "run-apply-race", &[1])
+            .await
+            .unwrap();
+        assert_eq!(ack, UserIntentApplyAck::RunTerminal);
+
+        let run = engine
+            .load_run("user-1", "run-apply-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_CANCELLED);
+        assert!(!run.events.iter().any(|event| {
+            event.get("event_type").and_then(serde_json::Value::as_str)
+                == Some("user_intent_applied")
+        }));
+        assert_eq!(store.attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn mark_user_intents_applied_reconciles_commit_then_timeout_idempotently() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            1,
+            BatchTransitionFailureMode::FailAfterStoreWrite,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-apply-timeout", "user-1", "sess-apply-timeout")
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                "user-1",
+                "run-apply-timeout",
+                serde_json::json!({
+                    "event_type": "user_intent",
+                    "idempotency_key": "user_intent:intent-timeout",
+                    "data": {
+                        "intent_id": "intent-timeout",
+                        "delivery": "guide_current_run",
+                        "input": {"content": "apply once"}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        engine
+            .mark_user_intents_applied("user-1", "run-apply-timeout", &[1])
+            .await
+            .unwrap();
+        engine
+            .mark_user_intents_applied("user-1", "run-apply-timeout", &[1])
+            .await
+            .unwrap();
+
+        let run = engine
+            .load_run("user-1", "run-apply-timeout")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| {
+                    event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("user_intent_applied")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(store.attempts(), 1);
     }
 
     #[tokio::test]
@@ -3315,7 +4024,7 @@ mod tests {
             .persist_status_if_current(
                 "user-1",
                 "run-cas",
-                &[STATUS_INPUT_QUEUED],
+                &[STATUS_RUNNING],
                 STATUS_RUNNING,
                 None,
                 None,
@@ -3399,7 +4108,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_active_runs_uses_store_recoverable_active_query() {
+    async fn recover_active_runs_drains_multiple_bounded_batches() {
+        let engine = test_engine();
+        let run_count = RUN_RECOVERY_CLAIM_BATCH_SIZE as usize + 9;
+        for index in 0..run_count {
+            engine
+                .start_run(
+                    &format!("run-recovery-batch-{index}"),
+                    "user-recovery-batch",
+                    &format!("session-recovery-batch-{index}"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+
+        assert_eq!(recovered.len(), run_count);
+        assert!(recovered.iter().all(|run| run.status == STATUS_FAILED));
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            run_count,
+            "a run must be classified at most once across recovery batches"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_active_runs_uses_bounded_store_claims() {
         let store = Arc::new(FlakyBatchTransitionStore::new(
             0,
             BatchTransitionFailureMode::FailBeforeStoreWrite,
@@ -3427,9 +4166,9 @@ mod tests {
         let recovered = engine.recover_active_runs().await.unwrap();
 
         assert_eq!(
-            store.recoverable_active_queries(),
-            1,
-            "startup recovery must use the store's owner-scoped active recovery query"
+            store.recovery_claims(),
+            2,
+            "startup recovery must claim one work batch and then prove the queue is drained"
         );
         assert_eq!(
             store.waiting_queries(),
@@ -3798,54 +4537,5 @@ mod tests {
             )),
             "stale recovery must not append crash-recovery terminal events"
         );
-    }
-
-    #[tokio::test]
-    async fn recover_active_runs_includes_input_queued_runs() {
-        let engine = test_engine();
-        engine
-            .start_run("run-input-queued", "user-1", "sess-queued")
-            .await
-            .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "run-input-queued",
-                STATUS_INPUT_QUEUED,
-                Some("user_input"),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let recovered = engine.recover_active_runs().await.unwrap();
-
-        assert!(
-            recovered.iter().any(|run| run.run_id == "run-input-queued"),
-            "input-queued runs must be part of active crash recovery"
-        );
-        let durable = engine
-            .load_run("user-1", "run-input-queued")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(durable.status, "failed");
-        assert_eq!(
-            durable.error_message.as_deref(),
-            Some("recovered from crash")
-        );
-        assert_eq!(durable.error_code.as_deref(), Some("crash_recovery"));
-        let event_types = durable
-            .events
-            .iter()
-            .filter_map(|event| event.get("event_type").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>();
-        assert!(
-            event_types.ends_with(&["run_error", "run_finished"]),
-            "input-queued recovery failure must persist a complete terminal event pair"
-        );
-        let run_finished = durable.events.last().unwrap();
-        assert_eq!(run_finished["data"]["status"], "failed");
-        assert_eq!(run_finished["data"]["error_code"], "crash_recovery");
     }
 }

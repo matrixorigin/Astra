@@ -15,10 +15,12 @@
 //!       └─ on_stream_complete  → cleanup
 //! ```
 
+use crate::agent_live_event::{AgentLiveEvent, AgentLiveEventKind, AgentLiveGap, AgentLiveSignal};
 use crate::chat_turn_sse_dispatch::{
     ChatTurnEdgePending, ChatTurnSseAccum, ChatTurnSseFramer, EdgeApprovalRequest, SseRenderEffect,
     dispatch_chat_turn_sse_event_block,
 };
+use crate::sse::data_lines::json_events_from_sse_event_block;
 pub use crate::tool::policy::is_tool_concurrency_safe;
 use crate::tool::policy::tool_batch_coalesce_duration;
 use astra_thin_client::ApprovalKind;
@@ -161,7 +163,7 @@ pub trait SseStreamHost: Send {
     /// Called for each batch of render effects parsed from an SSE event block.
     /// CLI: prints text deltas, starts/stops thinking spinner.
     /// Headless: no-op.
-    fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>);
+    async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>);
 
     /// Called when a complete tool_call entry has been accumulated from the
     /// SSE stream. Default: no-op.
@@ -201,6 +203,22 @@ pub trait SseStreamHost: Send {
     /// Hosts can use this to mirror session metadata, streamed assistant text,
     /// and usage counters into their own incremental recovery state.
     fn on_accum_update(&mut self, _accum: &ChatTurnSseAccum) {}
+
+    /// Called when the server emits bounded, typed inter-agent communication
+    /// evidence. This observation lane is intentionally separate from prompt
+    /// messages and from rendering effects.
+    fn on_agent_communication(&mut self, _event: astra_turn_types::AgentCommunicationEvent) {}
+
+    /// Called when a delegated agent emits its typed live transcript event.
+    /// This lane carries the exact agent identity and content boundaries across
+    /// CLI, Server Only, and Edge+Server execution; hosts must not reconstruct
+    /// it from parent tool-card text.
+    fn on_agent_live_event(&mut self, _event: AgentLiveEvent) {}
+
+    /// Called when the transport had to drop coalescible agent live activity.
+    /// Hosts must treat the corresponding transcript/projection as incomplete
+    /// until it has been reconciled from durable state.
+    fn on_agent_live_gap(&mut self, _gap: AgentLiveGap) {}
 
     /// Execute a tool request that arrived via `tool_request` SSE event.
     /// Returns the execution result (output, status, duration).
@@ -523,7 +541,8 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             _ => "Unknown abort".to_string(),
         };
         accum.error_message = Some(msg);
-        host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner]);
+        host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner])
+            .await;
     }
 
     let tail = match framer.take_trailing_dispatch_blob() {
@@ -536,7 +555,8 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             accum.error_message = Some(format!(
                 "Error: invalid UTF-8 in model SSE response: {error}"
             ));
-            host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner]);
+            host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner])
+                .await;
             String::new()
         }
     };
@@ -610,6 +630,37 @@ async fn process_sse_event_block<H: SseStreamHost>(
     }
     let tc_len_before = accum.tool_calls.len();
     let pending_len_before = pending.len();
+    for event in json_events_from_sse_event_block(event_str).events {
+        match event.get("type").and_then(Value::as_str) {
+            Some("agent_communication") => {
+                match serde_json::from_value::<astra_turn_types::AgentCommunicationEvent>(event) {
+                    Ok(event) => host.on_agent_communication(event),
+                    Err(error) => tracing::warn!(
+                        target: "astra_turn_core::sse",
+                        %error,
+                        "ignored malformed agent communication SSE evidence"
+                    ),
+                }
+            }
+            Some("agent_live_event") => match agent_live_event_from_sse(&event) {
+                Ok(event) => host.on_agent_live_event(event),
+                Err(error) => tracing::warn!(
+                    target: "astra_turn_core::sse",
+                    %error,
+                    "ignored malformed agent live SSE evidence"
+                ),
+            },
+            Some("agent_live_gap") => match agent_live_gap_from_sse(&event) {
+                Ok(gap) => host.on_agent_live_gap(gap),
+                Err(error) => tracing::warn!(
+                    target: "astra_turn_core::sse",
+                    %error,
+                    "ignored malformed agent live gap SSE evidence"
+                ),
+            },
+            _ => {}
+        }
+    }
     let effects = dispatch_chat_turn_sse_event_block(event_str, accum, pending);
     let extends_coalescible_batch = {
         let appended = &pending[pending_len_before..];
@@ -628,7 +679,7 @@ async fn process_sse_event_block<H: SseStreamHost>(
         *reported_session_id = Some(session_id.to_string());
     }
     host.on_accum_update(accum);
-    host.on_render_effects(effects);
+    host.on_render_effects(effects).await;
     if accum.tool_calls.len() > tc_len_before {
         let new_calls: Vec<(usize, Value)> = accum.tool_calls[tc_len_before..]
             .iter()
@@ -640,6 +691,95 @@ async fn process_sse_event_block<H: SseStreamHost>(
         }
     }
     extends_coalescible_batch
+}
+
+fn agent_live_event_from_sse(event: &Value) -> Result<AgentLiveEvent, String> {
+    let run_id = required_sse_string(event, "run_id")?;
+    let agent_id = required_sse_string(event, "agent_id")?;
+    let kind = match required_sse_string(event, "event_kind")?.as_str() {
+        "output_delta" => AgentLiveEventKind::OutputDelta(required_sse_string(event, "content")?),
+        "thinking_delta" => {
+            AgentLiveEventKind::ThinkingDelta(required_sse_string(event, "content")?)
+        }
+        "status" => AgentLiveEventKind::Status(required_sse_string(event, "content")?),
+        "signal" => AgentLiveEventKind::Signal(
+            serde_json::from_value::<AgentLiveSignal>(
+                event
+                    .get("signal")
+                    .cloned()
+                    .ok_or_else(|| "agent_live_event missing signal".to_string())?,
+            )
+            .map_err(|error| format!("invalid agent live signal: {error}"))?,
+        ),
+        "tool_started" => AgentLiveEventKind::ToolStarted {
+            name: required_sse_string(event, "name")?,
+            description: required_sse_string(event, "description")?,
+            tool_use_id: required_sse_string(event, "tool_use_id")?,
+        },
+        "tool_completed" => AgentLiveEventKind::ToolCompleted {
+            name: required_sse_string(event, "name")?,
+            description: required_sse_string(event, "description")?,
+            status: required_sse_string(event, "status")?,
+            duration_ms: required_sse_u64(event, "duration_ms")?,
+            output_summary: optional_sse_string(event, "output_summary"),
+            output: optional_sse_string(event, "output"),
+            tool_use_id: required_sse_string(event, "tool_use_id")?,
+        },
+        "agent_terminated" => AgentLiveEventKind::AgentTerminated {
+            termination: serde_json::from_value(
+                event
+                    .get("termination")
+                    .cloned()
+                    .ok_or_else(|| "agent_live_event missing termination".to_string())?,
+            )
+            .map_err(|error| format!("invalid agent terminal status: {error}"))?,
+            duration_ms: required_sse_u64(event, "duration_ms")?,
+            reason: optional_sse_string(event, "reason"),
+        },
+        other => return Err(format!("unknown agent live event kind: {other}")),
+    };
+    Ok(AgentLiveEvent {
+        run_id,
+        agent_id,
+        kind,
+    })
+}
+
+fn agent_live_gap_from_sse(event: &Value) -> Result<AgentLiveGap, String> {
+    let dropped_event_count = event
+        .get("dropped_event_count")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+        .ok_or_else(|| "agent live gap requires a positive dropped_event_count".to_string())?;
+    Ok(AgentLiveGap {
+        run_id: required_sse_string(event, "run_id")?,
+        agent_id: required_sse_string(event, "agent_id")?,
+        dropped_event_count,
+    })
+}
+
+fn required_sse_string(event: &Value, field: &str) -> Result<String, String> {
+    event
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| format!("agent_live_event missing {field}"))
+}
+
+fn optional_sse_string(event: &Value, field: &str) -> Option<String> {
+    event
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+fn required_sse_u64(event: &Value, field: &str) -> Result<u64, String> {
+    event
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("agent_live_event missing {field}"))
 }
 
 /// Reorder so that skill tool requests come before all non-skill requests.
@@ -779,7 +919,7 @@ pub struct NoopSseStreamHost;
 
 #[async_trait]
 impl SseStreamHost for NoopSseStreamHost {
-    fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+    async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
 
     fn on_stream_complete(&mut self) {}
 
@@ -827,6 +967,9 @@ struct RecordingSseStreamHost {
     tool_outputs: std::collections::HashMap<String, String>,
     approval_kinds: Vec<ApprovalKind>,
     approval_run_ids: Vec<Option<String>>,
+    agent_communications: Vec<astra_turn_types::AgentCommunicationEvent>,
+    agent_live_events: Vec<AgentLiveEvent>,
+    agent_live_gaps: Vec<AgentLiveGap>,
     stream_completed: bool,
 }
 
@@ -838,6 +981,9 @@ impl RecordingSseStreamHost {
             tool_outputs: std::collections::HashMap::new(),
             approval_kinds: Vec::new(),
             approval_run_ids: Vec::new(),
+            agent_communications: Vec::new(),
+            agent_live_events: Vec::new(),
+            agent_live_gaps: Vec::new(),
             stream_completed: false,
         }
     }
@@ -852,12 +998,24 @@ impl RecordingSseStreamHost {
 #[cfg(test)]
 #[async_trait]
 impl SseStreamHost for RecordingSseStreamHost {
-    fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
+    async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
         self.render_effects.extend(effects);
     }
 
     fn on_stream_complete(&mut self) {
         self.stream_completed = true;
+    }
+
+    fn on_agent_communication(&mut self, event: astra_turn_types::AgentCommunicationEvent) {
+        self.agent_communications.push(event);
+    }
+
+    fn on_agent_live_event(&mut self, event: AgentLiveEvent) {
+        self.agent_live_events.push(event);
+    }
+
+    fn on_agent_live_gap(&mut self, gap: AgentLiveGap) {
+        self.agent_live_gaps.push(gap);
     }
 
     async fn execute_tool(
@@ -999,6 +1157,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recording_host_receives_typed_agent_communication() {
+        let events = sse_event(
+            "agent_communication",
+            ",\"schema_version\":\"astra.agent_communication.v1\",\"observed_by\":{\"run_id\":\"run-review\",\"agent_id\":\"reviewer\"},\"direction\":\"received\",\"message_id\":\"msg-1\",\"from\":{\"run_id\":\"run-code\",\"agent_id\":\"coder\"},\"to\":{\"kind\":\"direct\",\"address\":{\"run_id\":\"run-review\",\"agent_id\":\"reviewer\"}},\"payload_kind\":\"text\",\"summary\":\"review this\",\"timestamp_ms\":42,\"requires_ack\":false",
+        );
+        let mut stream = stream::iter(chunks_from_sse(&events));
+        let mut host = RecordingSseStreamHost::new();
+
+        let (_result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert_eq!(host.agent_communications.len(), 1);
+        assert_eq!(
+            host.agent_communications[0].observed_by.run_id,
+            "run-review"
+        );
+        assert_eq!(host.agent_communications[0].from.agent_id, "coder");
+    }
+
+    #[tokio::test]
+    async fn recording_host_receives_typed_agent_live_gap() {
+        let events = sse_event(
+            "agent_live_gap",
+            ",\"run_id\":\"run-reviewer-1\",\"agent_id\":\"reviewer\",\"dropped_event_count\":3,\"repair\":\"refresh_run_snapshot\"",
+        );
+        let mut stream = stream::iter(chunks_from_sse(&events));
+        let mut host = RecordingSseStreamHost::new();
+
+        let (_result, abort) = consume_sse_stream_cancellable(
+            &mut stream,
+            &mut host,
+            stream_idle_timeout(),
+            None,
+            Some(stream_idle_timeout_after_progress()),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert_eq!(
+            host.agent_live_gaps,
+            vec![AgentLiveGap {
+                run_id: "run-reviewer-1".into(),
+                agent_id: "reviewer".into(),
+                dropped_event_count: 3,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_host_receives_typed_agent_live_events() {
+        let events = format!(
+            "{}{}{}",
+            sse_event(
+                "agent_live_event",
+                ",\"run_id\":\"run-reviewer-1\",\"agent_id\":\"reviewer\",\"event_kind\":\"thinking_delta\",\"content\":\"inspect ownership\"",
+            ),
+            sse_event(
+                "agent_live_event",
+                ",\"run_id\":\"run-reviewer-1\",\"agent_id\":\"reviewer\",\"event_kind\":\"tool_completed\",\"name\":\"bash\",\"description\":\"cargo test\",\"status\":\"success\",\"duration_ms\":12,\"output_summary\":\"ok\",\"output\":\"all passed\",\"tool_use_id\":\"call-1\"",
+            ),
+            sse_event(
+                "agent_live_event",
+                ",\"run_id\":\"run-reviewer-1\",\"agent_id\":\"reviewer\",\"event_kind\":\"signal\",\"signal\":{\"signal\":\"approval_required\",\"request_id\":\"approval-1\",\"tool\":\"bash\",\"approval_kind\":\"explicit\",\"path\":null,\"detail\":\"git status\",\"display_label\":\"$ git status\"}",
+            ),
+        );
+        let mut stream = stream::iter(chunks_from_sse(&events));
+        let mut host = RecordingSseStreamHost::new();
+
+        let (_result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert!(matches!(
+            host.agent_live_events.as_slice(),
+            [
+                AgentLiveEvent {
+                    run_id,
+                    agent_id,
+                    kind: AgentLiveEventKind::ThinkingDelta(text),
+                },
+                AgentLiveEvent {
+                    run_id: tool_run_id,
+                    kind: AgentLiveEventKind::ToolCompleted {
+                        tool_use_id,
+                        output: Some(output),
+                        ..
+                    },
+                    ..
+                },
+                AgentLiveEvent {
+                    run_id: approval_run_id,
+                    kind: AgentLiveEventKind::Signal(AgentLiveSignal::ApprovalRequired {
+                        request_id,
+                        ..
+                    }),
+                    ..
+                },
+            ] if run_id == "run-reviewer-1"
+                && agent_id == "reviewer"
+                && text == "inspect ownership"
+                && tool_run_id == "run-reviewer-1"
+                && tool_use_id == "call-1"
+                && output == "all passed"
+                && approval_run_id == "run-reviewer-1"
+                && request_id == "approval-1"
+        ));
+    }
+
+    #[tokio::test]
     async fn recording_host_tool_request_executed() {
         let events = sse_event(
             "tool_request",
@@ -1119,7 +1395,7 @@ mod tests {
         struct SessionAwareHost(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
         #[async_trait]
         impl SseStreamHost for SessionAwareHost {
-            fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+            async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
 
             fn on_stream_complete(&mut self) {}
 
@@ -1211,7 +1487,7 @@ mod tests {
 
         #[async_trait]
         impl SseStreamHost for LiveHookHost {
-            fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+            async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
 
             fn on_stream_complete(&mut self) {}
 
@@ -1862,7 +2138,7 @@ mod tests {
         struct BatchHost(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
         #[async_trait]
         impl SseStreamHost for BatchHost {
-            fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
+            async fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
             async fn execute_tool(
                 &mut self,
@@ -1976,7 +2252,7 @@ mod tests {
         struct OrderTrackingHost(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
         #[async_trait]
         impl SseStreamHost for OrderTrackingHost {
-            fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
+            async fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
             async fn execute_tool(
                 &mut self,
@@ -2181,7 +2457,7 @@ mod tests {
         struct TrackingHost(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
         #[async_trait]
         impl SseStreamHost for TrackingHost {
-            fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
+            async fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
             async fn execute_tool(
                 &mut self,
@@ -2327,7 +2603,7 @@ mod tests {
         struct OrderHost(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
         #[async_trait]
         impl SseStreamHost for OrderHost {
-            fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
+            async fn on_render_effects(&mut self, _: Vec<SseRenderEffect>) {}
             fn on_stream_complete(&mut self) {}
             async fn execute_tool(
                 &mut self,

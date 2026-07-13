@@ -538,8 +538,10 @@ Set permission mode for tool execution.
 /allow rules     # Show rules
 ```
 
-Bare `/allow` and Shift+Tab cycle `prompt → accept_edits → plan → auto → prompt`.
-Use `/allow bypass` explicitly when you want to skip approval prompts.
+Bare `/allow` and Shift+Tab open the same explicit mode picker in the TUI.
+In line-mode CLI, bare `/allow` shows the current mode and the available explicit choices.
+Selecting `bypass` in the TUI requires a separate confirmation. Use `/allow bypass`
+explicitly in line-mode CLI when you want to skip approval prompts.
 
 ### `/instructions [subcommand]`
 

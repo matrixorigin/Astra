@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
+use astra_turn_types::ContextWindowUsageSource;
+
 use crate::section_types::estimate_text_tokens;
 
 /// Product-level lower bound for memories that may become prompt-visible.
@@ -200,6 +202,12 @@ pub struct HistorySelectionTrace {
     pub turns_compressed: Vec<TurnCompression>,
     /// Turns that were completely dropped.
     pub turns_dropped: Vec<u32>,
+    /// Pipeline-level compaction work that cannot truthfully be attributed to
+    /// one exact conversation turn. This is deliberately distinct from
+    /// `turns_compressed`: a layer such as duplicate-read elimination may
+    /// free tokens without compressing a whole turn.
+    #[serde(default)]
+    pub compression_stages: Vec<CompressionStage>,
     /// Overall compression ratio achieved.
     pub compression_ratio: f64,
     /// Tokens before compression.
@@ -216,6 +224,12 @@ pub struct TurnRetention {
     pub tokens: u32,
     /// Whether this turn contains tool calls (often preserved).
     pub has_tool_calls: bool,
+    /// Bounded, normalized summary of the exact prompt-history group this
+    /// record describes. It is produced alongside token accounting, so an
+    /// observability surface never has to guess a correspondence from a
+    /// separate UI transcript.
+    #[serde(default)]
+    pub content_preview: String,
 }
 
 /// A turn that was compressed.
@@ -228,6 +242,14 @@ pub struct TurnCompression {
     pub compression_method: CompressionMethod,
     /// What information was lost (for explainability).
     pub information_lost: Vec<String>,
+}
+
+/// An observed context-compaction stage with no fabricated turn identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionStage {
+    pub stage: String,
+    pub method: CompressionMethod,
+    pub tokens_freed: u32,
 }
 
 /// Method used to compress a turn.
@@ -361,6 +383,10 @@ pub struct TokenBudgetTrace {
     pub user_message_tokens: u32,
     /// Total tokens used.
     pub total_used: u32,
+    /// Whether `total_used` is a request-assembly estimate or a provider
+    /// measurement for this specific LLM request.
+    #[serde(default)]
+    pub usage_source: ContextWindowUsageSource,
     /// Budget pressure (0.0 = relaxed, 1.0 = at limit, >1.0 = over).
     pub budget_pressure: f64,
     /// Whether compression was triggered.
@@ -558,17 +584,14 @@ pub fn build_history_trace_from_compression(
     final_tokens: u32,
     layer_results: &[(String, CompressionMethod, u32)], // (layer_name, method, tokens_freed)
 ) -> HistorySelectionTrace {
-    let mut turns_compressed = Vec::new();
+    let mut compression_stages = Vec::new();
 
-    for (idx, (layer_name, method, tokens_freed)) in layer_results.iter().enumerate() {
+    for (layer_name, method, tokens_freed) in layer_results {
         if *tokens_freed > 0 {
-            turns_compressed.push(TurnCompression {
-                turn_index: idx as u32,
-                role: layer_name.clone(),
-                original_tokens: *tokens_freed, // Approximate - actual is unknown
-                compressed_tokens: 0,
-                compression_method: method.clone(),
-                information_lost: vec![format!("~{} tokens freed by {}", tokens_freed, layer_name)],
+            compression_stages.push(CompressionStage {
+                stage: layer_name.clone(),
+                method: method.clone(),
+                tokens_freed: *tokens_freed,
             });
         }
     }
@@ -581,9 +604,12 @@ pub fn build_history_trace_from_compression(
 
     HistorySelectionTrace {
         total_turns_available: initial_messages as u32,
-        turns_retained: Vec::new(), // Would need message-level tracking
-        turns_compressed,
-        turns_dropped: Vec::new(), // Would need message-level tracking
+        // This input only knows pipeline aggregate counts. Do not invent
+        // per-turn retention, compression, or dropping identities from it.
+        turns_retained: Vec::new(),
+        turns_compressed: Vec::new(),
+        turns_dropped: Vec::new(),
+        compression_stages,
         compression_ratio,
         tokens_before: initial_tokens,
         tokens_after: final_tokens,
@@ -839,6 +865,39 @@ mod tests {
         assert_eq!(trace.deferred_available, 4);
         assert_eq!(trace.deferred_omitted_tools, vec!["github".to_string()]);
         assert_eq!(trace.visible_tools[1].tokens, 250);
+    }
+
+    #[test]
+    fn aggregate_compression_records_stages_without_inventing_turn_identity() {
+        let trace = build_history_trace_from_compression(
+            12,
+            7,
+            20_000,
+            12_000,
+            &[
+                (
+                    "duplicate read elimination".to_string(),
+                    CompressionMethod::DuplicateReadElimination,
+                    3_000,
+                ),
+                (
+                    "no-op layer".to_string(),
+                    CompressionMethod::ToolResultTruncation,
+                    0,
+                ),
+            ],
+        );
+
+        assert_eq!(trace.total_turns_available, 12);
+        assert!(trace.turns_retained.is_empty());
+        assert!(trace.turns_compressed.is_empty());
+        assert!(trace.turns_dropped.is_empty());
+        assert_eq!(trace.compression_stages.len(), 1);
+        assert_eq!(
+            trace.compression_stages[0].stage,
+            "duplicate read elimination"
+        );
+        assert_eq!(trace.compression_stages[0].tokens_freed, 3_000);
     }
 
     #[test]

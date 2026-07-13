@@ -615,7 +615,7 @@ async fn execute_headless_task_body(
     let spawner_handle_for_drain = spawner.clone();
 
     let (stream_event_tx, stream_event_writer) = if options.stream_events {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = crate::cli::chat_stream::stream_event_channel();
         let handle = crate::cli::stream::stream_events_writer::spawn_stderr_writer(rx);
         (Some(tx), Some(handle))
     } else {
@@ -1187,13 +1187,16 @@ mod permission_mode_display_tests {
             permission_mode_display_label(PermissionMode::AcceptEdits),
             "Edits"
         );
-        assert_eq!(permission_mode_display_label(PermissionMode::Plan), "Plan");
+        assert_eq!(
+            permission_mode_display_label(PermissionMode::Plan),
+            "Read-only"
+        );
         assert_eq!(permission_mode_display_label(PermissionMode::Deny), "Deny");
     }
 
     #[test]
     fn removed_permission_aliases_do_not_change_mode() {
-        for alias in ["all", "default", "ask", "accept-edits"] {
+        for alias in ["all", "default", "ask", "accept-edits", "plan"] {
             let mut state = SessionState::default();
             state.perm_manager.set_mode(PermissionMode::Deny);
 
@@ -1935,7 +1938,7 @@ async fn execute_cli_command_impl(
             // emitted on their first response.
             let spawner_handle_for_drain = one_shot_spawner.clone();
             let (stream_event_tx, _stream_event_writer) = if args.stream_events {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (tx, rx) = crate::cli::chat_stream::stream_event_channel();
                 let handle = crate::cli::stream::stream_events_writer::spawn_stderr_writer(rx);
                 (Some(tx), Some(handle))
             } else {
@@ -3583,7 +3586,8 @@ mod one_shot_persistence_tests {
             final_state: "completed".into(),
             interruption_kind: None,
             final_messages: Vec::new(),
-            deferred_user_inputs: Vec::new(),
+            run_transcript_messages: Vec::new(),
+            applied_user_intents: Vec::new(),
             background_agent_results: Vec::new(),
         };
 
@@ -3697,7 +3701,8 @@ mod one_shot_persistence_tests {
             final_state: "completed".into(),
             interruption_kind: None,
             final_messages: Vec::new(),
-            deferred_user_inputs: Vec::new(),
+            run_transcript_messages: Vec::new(),
+            applied_user_intents: Vec::new(),
             background_agent_results: Vec::new(),
         };
 

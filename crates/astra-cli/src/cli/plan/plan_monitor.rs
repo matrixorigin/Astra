@@ -103,7 +103,7 @@ pub(crate) fn format_duration_short(d: std::time::Duration) -> String {
 /// Takes individual field refs instead of `&SessionState` so callers inside
 /// `while let Some(update) = handle.try_recv()` (which holds a mutable
 /// borrow on `state.plan_handle`) can still call this without conflicting.
-fn emit_plan_lifecycle_event(
+pub(crate) fn emit_plan_lifecycle_event(
     journal: Option<&astra_services::session_journal::JournalWriter>,
     session_id: Option<&str>,
     executing_plan: Option<&astra_services::task_orchestrator::TaskPlan>,
@@ -311,6 +311,10 @@ fn display_plan_updates_live(
                 state.durable_task_state = Some(*durable);
                 continue;
             }
+            PlanUpdate::Advisory { title, detail } => (
+                format!("  {} {title} · {detail}", theme::icon_warn()),
+                PostSpinner::None,
+            ),
             PlanUpdate::PlanProgress {
                 done,
                 total,
@@ -332,6 +336,7 @@ fn display_plan_updates_live(
                     s.stop_clear();
                 }
                 state.plan_execution_last_error = None;
+                state.plan_execution_paused = false;
                 if let Some(mut h) = state.plan_handle.take() {
                     while let Some(trailing) = h.try_recv() {
                         apply_trailing_update(trailing, state);
@@ -422,6 +427,7 @@ fn display_plan_updates_live(
             }
             PlanUpdate::PlanError { error } => {
                 state.plan_execution_last_error = Some(error.clone());
+                state.plan_execution_paused = false;
                 if let Some(s) = plan_spinner.take() {
                     s.stop_clear();
                 }
@@ -478,6 +484,7 @@ fn display_plan_updates_live(
                 blocked_ids,
             } => {
                 outcome = PlanMonitorOutcome::Paused;
+                state.plan_execution_paused = true;
                 // Surface blocked ids when the executor supplies them so the
                 // user can see *which* subtasks are gating progress instead
                 // of just a count. Empty blocked_ids means a Ctrl+C / normal
@@ -687,6 +694,21 @@ fn display_plan_updates_live(
                             )));
                         continue;
                     }
+                    StreamEvent::AssistantOutputSettled => {
+                        // The child agent has finished model-visible work.
+                        // Flush the final markdown now; persistence and plan
+                        // bookkeeping may still be settling independently.
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        continue;
+                    }
                     StreamEvent::Thinking(true) => {
                         if state.plan_thinking_pane.is_none() {
                             finalize_plan_stream(
@@ -760,6 +782,25 @@ fn display_plan_updates_live(
                         eprintln!("    {line}");
                         continue;
                     }
+                    StreamEvent::UserIntentApplied {
+                        intent_id, content, ..
+                    } => {
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        let mut preview = content.chars().take(120).collect::<String>();
+                        if content.chars().count() > 120 {
+                            preview.push('…');
+                        }
+                        eprintln!("    Guidance applied ({intent_id}): {preview}");
+                        continue;
+                    }
                     StreamEvent::PermissionAutoApproved { tool, reason } => {
                         finalize_plan_stream(
                             &mut state.plan_in_token_stream,
@@ -778,10 +819,40 @@ fn display_plan_updates_live(
                         );
                         continue;
                     }
+                    StreamEvent::AgentLiveGap(gap) => {
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        eprintln!(
+                            "    {} Agent activity for {} is incomplete ({} update{} skipped); durable run state remains authoritative",
+                            theme::icon_warn(),
+                            gap.agent_id,
+                            gap.dropped_event_count,
+                            if gap.dropped_event_count == 1 {
+                                ""
+                            } else {
+                                "s"
+                            },
+                        );
+                        *plan_spinner = Some(PlanSpinner::Activity(
+                            effects::PlanActivitySpinner::start(current_subtask_tag, "Continuing"),
+                        ));
+                        continue;
+                    }
                     // Plan monitor runs headless (no TUI cells) — the
                     // progress ticks have no visual home here. Drop.
-                    StreamEvent::ToolOutput { .. }
+                    StreamEvent::ContextWindowEstimated(_)
+                    | StreamEvent::ContextSystemPromptTokens(_)
+                    | StreamEvent::ContextWindowMeasured(_)
+                    | StreamEvent::ToolOutput { .. }
                     | StreamEvent::AgentLive(_)
+                    | StreamEvent::AgentCommunication(_)
                     | StreamEvent::ExplainReport(_)
                     | StreamEvent::ExplainText(_)
                     | StreamEvent::VerdictReport(_)
@@ -933,6 +1004,7 @@ fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Opt
 
     state.executing_plan = None;
     state.current_plan_subtask_id = None;
+    state.plan_execution_paused = false;
     if let Some(tx) = state.pending_approval.take() {
         let _ = tx.send(crate::cli::chat_stream::ApprovalResponse::Deny);
     }
@@ -955,8 +1027,6 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
 
     loop {
         let outcome = display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
-
-        sync_task_board_from_executing_plan(state).await;
 
         match outcome {
             PlanMonitorOutcome::Finished => {
@@ -1053,7 +1123,7 @@ pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
 
 /// Apply a single trailing update from the plan executor channel.
 /// Called when draining remaining messages after PlanFinished/PlanError.
-fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut SessionState) {
+pub(crate) fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut SessionState) {
     use crate::cli::plan::plan_executor::PlanUpdate;
     match update {
         PlanUpdate::HistoryEntry {
@@ -1098,13 +1168,16 @@ fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut SessionS
         PlanUpdate::DurableStateReturn(durable) => {
             state.durable_task_state = Some(*durable);
         }
+        PlanUpdate::Advisory { title, detail } => {
+            tracing::warn!(%title, %detail, "plan executor advisory arrived after monitor shutdown");
+        }
         _ => {}
     }
 }
 
 /// Update all in-memory plan copies so background execution stays observable
 /// after plan mode exits.
-fn sync_subtask_status(
+pub(crate) fn sync_subtask_status(
     state: &mut SessionState,
     subtask_id: &str,
     status: astra_services::task_orchestrator::TaskStatus,
@@ -1121,91 +1194,9 @@ fn sync_subtask_status(
     }
 }
 
-async fn sync_task_board_subtask_status(
-    state: &SessionState,
-    goal: &str,
-    plan_fingerprint: &str,
-    subtask_id: &str,
-    status: astra_services::task_orchestrator::TaskStatus,
-) -> Result<(), String> {
-    let tasks = state.task_manager.snapshot().await.unwrap_or_default();
-    let task = tasks.into_iter().find(|task| {
-        astra_tools::plan_task_mirror::approved_plan_task_identity(
-            task,
-            goal, // plan_id == goal in CLI context
-            plan_fingerprint,
-            Some(subtask_id),
-            true,
-        )
-    });
-
-    let Some(task) = task else {
-        return Ok(());
-    };
-
-    let output = state
-        .task_manager
-        .update(&serde_json::json!({
-            "task_id": task.id,
-            "new_status": status.as_str(),
-        }))
-        .await;
-    if output.starts_with("Error:") {
-        return Err(output);
-    }
-    Ok(())
-}
-
-async fn sync_task_board_from_executing_plan(state: &SessionState) {
-    let Some(plan) = state.executing_plan.as_ref() else {
-        return;
-    };
-    let Some(goal) = state.executing_plan_goal.as_deref() else {
-        return;
-    };
-    if let Err(error) = astra_tools::plan_task_mirror::mirror_approved_plan_to_task_board(
-        &state.task_manager,
-        "cli",
-        state.session_id.as_deref().unwrap_or(""),
-        goal,
-        goal,
-        plan,
-    )
-    .await
-    {
-        tracing::warn!(
-            goal = %goal,
-            error = %error,
-            "failed to ensure executing plan is mirrored into task board"
-        );
-    }
-    let plan_fingerprint = astra_tools::plan_task_mirror::plan_task_board_fingerprint(plan);
-    for subtask in &plan.subtasks {
-        if let Err(error) = sync_task_board_subtask_status(
-            state,
-            goal,
-            &plan_fingerprint,
-            &subtask.id,
-            subtask.status,
-        )
-        .await
-        {
-            tracing::warn!(
-                subtask_id = %subtask.id,
-                status = subtask.status.as_str(),
-                error = %error,
-                "failed to sync plan subtask status into task board"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        flush_plan_updates_between_prompts, sync_task_board_from_executing_plan,
-        sync_task_board_subtask_status,
-    };
+    use super::flush_plan_updates_between_prompts;
     use crate::cli::plan::plan_executor;
     use crate::cli::session::session_state::SessionState;
     use astra_services::task_orchestrator::{SubtaskPlan, TaskOutcome, TaskPlan, TaskStatus};
@@ -1240,177 +1231,6 @@ mod tests {
                 .subtasks[0]
                 .status,
             TaskStatus::InProgress
-        );
-    }
-
-    #[tokio::test]
-    async fn task_board_subtask_status_sync_updates_visible_plan_step() {
-        let state = SessionState::default();
-        let plan = TaskPlan {
-            subtasks: vec![
-                SubtaskPlan {
-                    id: "s1".into(),
-                    title: "Design state model".into(),
-                    ..Default::default()
-                },
-                SubtaskPlan {
-                    id: "s2".into(),
-                    title: "Handle unhappy paths".into(),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let plan_fingerprint = astra_tools::plan_task_mirror::plan_task_board_fingerprint(&plan);
-        let create = state
-            .task_manager
-            .create(&serde_json::json!({
-                "title": "Handle unhappy paths",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_id": "Ship plan UX",
-                    "plan_goal": "Ship plan UX",
-                    "plan_fingerprint": plan_fingerprint,
-                    "plan_subtask_id": "s2"
-                }
-            }))
-            .await;
-        assert!(create.contains("created"), "{create}");
-
-        sync_task_board_subtask_status(
-            &state,
-            "Ship plan UX",
-            &plan_fingerprint,
-            "s2",
-            TaskStatus::InProgress,
-        )
-        .await
-        .unwrap();
-
-        let task = state
-            .task_manager
-            .snapshot()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|task| task.title == "Handle unhappy paths")
-            .expect("plan step task should exist");
-        assert_eq!(
-            task.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
-        );
-        assert!(
-            task.subtasks.is_empty(),
-            "plan step should be top-level: {task:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn executing_plan_sync_does_not_update_stale_plan_with_same_subtask_id() {
-        let mut state = SessionState::default();
-        let stale = TaskPlan {
-            subtasks: vec![SubtaskPlan {
-                id: "s1".into(),
-                title: "old step".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        crate::cli::plan::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &stale)
-            .await
-            .unwrap();
-
-        let current = TaskPlan {
-            subtasks: vec![SubtaskPlan {
-                id: "s1".into(),
-                title: "new step".into(),
-                status: TaskStatus::InProgress,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        crate::cli::plan::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &current)
-            .await
-            .unwrap();
-        state.executing_plan = Some(current);
-        state.executing_plan_goal = Some("same goal".into());
-
-        sync_task_board_from_executing_plan(&state).await;
-
-        let tasks = state.task_manager.snapshot().await.unwrap();
-        let stale_task = tasks
-            .iter()
-            .find(|task| task.title == "old step")
-            .expect("stale task exists");
-        assert_eq!(
-            stale_task.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::Paused
-        );
-
-        let current_task = tasks
-            .iter()
-            .find(|task| task.title == "new step")
-            .expect("current task exists");
-        assert_eq!(
-            current_task.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
-        );
-    }
-
-    #[tokio::test]
-    async fn executing_plan_sync_does_not_update_different_goal_with_same_steps() {
-        let mut state = SessionState::default();
-        let plan = TaskPlan {
-            subtasks: vec![SubtaskPlan {
-                id: "s1".into(),
-                title: "shared step".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        crate::cli::plan::plan_task_board::mirror_plan_to_task_board(&state, "old goal", &plan)
-            .await
-            .unwrap();
-
-        let current = TaskPlan {
-            subtasks: vec![SubtaskPlan {
-                id: "s1".into(),
-                title: "shared step".into(),
-                status: TaskStatus::InProgress,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        state.executing_plan = Some(current);
-        state.executing_plan_goal = Some("new goal".into());
-
-        sync_task_board_from_executing_plan(&state).await;
-
-        let tasks = state.task_manager.snapshot().await.unwrap();
-        let old_task = tasks
-            .iter()
-            .find(|task| task.title == "shared step")
-            .expect("old goal task exists");
-        assert_eq!(
-            old_task.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::Paused,
-            "old goal must not receive current plan progress"
-        );
-
-        let new_task = tasks
-            .iter()
-            .find(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_goal"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("new goal")
-            })
-            .expect("new goal task exists");
-        assert_eq!(
-            new_task.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
-            "new goal should receive current plan progress"
         );
     }
 

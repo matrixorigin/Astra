@@ -32,7 +32,10 @@ use serde_json::Value;
 use crate::{
     ExplainMode,
     cli::permission_manager::{PermissionManager, PermissionMode},
-    cli::stream::stream_render::RenderPolicy,
+    cli::stream::stream_render::{
+        RenderPolicy, agent_control_action, agent_control_label, agent_id_from_args,
+        agent_id_from_output, tool_output_event_text,
+    },
     edge_tools::ToolExecutor,
 };
 
@@ -124,17 +127,6 @@ fn cli_skill_auto_route_service_context(
     }
 }
 
-fn control_tool_recovery_fields(outcome: &str) -> serde_json::Map<String, Value> {
-    serde_json::Map::from_iter([(
-        "recovery".to_string(),
-        serde_json::json!({
-            "attempted": true,
-            "source": "host_state",
-            "outcome": outcome,
-        }),
-    )])
-}
-
 fn render_control_tool_recovery_error(message: &str) -> String {
     let mut value: Value = serde_json::from_str(&render_agent_tool_error(None, message))
         .unwrap_or_else(|_| serde_json::json!({"status": "failed", "error": message}));
@@ -175,23 +167,6 @@ fn bridge_session_turn_stale_expected_turn(
         Some(expected)
     } else {
         None
-    }
-}
-
-fn failed_control_tool_recovery_result(
-    tool_call_id: &str,
-    tool_name: &str,
-    args: &Value,
-    message: &str,
-) -> EdgeToolExecResult {
-    EdgeToolExecResult {
-        request_id: tool_call_id.to_string(),
-        tool: tool_name.to_string(),
-        args: args.clone(),
-        output: render_control_tool_recovery_error(message),
-        tool_result_fields: Some(control_tool_recovery_fields("failed")),
-        status: "failed".to_string(),
-        duration_ms: 0,
     }
 }
 
@@ -270,6 +245,10 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
     /// Optional channel for forwarding fine-grained stream events.
     pub stream_event_tx: Option<crate::cli::chat_stream::StreamEventTx>,
+    /// Request-scoped live lane for every child run, including `delegate`
+    /// coordination. This is distinct from parent stream events so
+    /// child activity cannot delay parent completion.
+    pub agent_live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     /// Optional channel for async tool approval requests during plan execution.
     pub approval_request_tx: Option<crate::cli::chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
@@ -394,30 +373,43 @@ impl CliAgenticLoopHost<'_> {
             std::io::stdin().is_terminal(),
         )
     }
+
+    /// Synchronous host callbacks cannot await UI backpressure. Stream events
+    /// are observational (durable state lives elsewhere), so preserve bounded
+    /// memory and make saturation visible instead of blocking a Tokio worker.
+    fn try_emit_stream_event(&self, event: crate::cli::chat_stream::StreamEvent) {
+        let Some(tx) = &self.stream_event_tx else {
+            return;
+        };
+        if let Err(error) = tx.try_send(event) {
+            tracing::warn!(%error, "stream event queue unavailable");
+        }
+    }
 }
 
-fn deferred_input_status_line(input: &Value) -> Option<String> {
-    let text = input
-        .get("content")
-        .and_then(Value::as_str)
-        .or_else(|| input.get("text").and_then(Value::as_str))
-        .or_else(|| input.as_str())
-        .map(str::trim)
-        .filter(|text| !text.is_empty())?;
-    let mut preview: String = text
-        .replace('\n', crate::DEFERRED_INPUT_FINGERPRINT_SEP)
-        .chars()
-        .take(80)
-        .collect();
-    if text
-        .replace('\n', crate::DEFERRED_INPUT_FINGERPRINT_SEP)
-        .chars()
-        .count()
-        > 80
+fn user_intent_stream_event(
+    event: &astra_runtime::turn::run_control::QueuedUserIntent,
+) -> Option<crate::cli::chat_stream::StreamEvent> {
+    let content = astra_runtime::turn::run_control::user_intent_content(&event.input)?;
+    Some(crate::cli::chat_stream::StreamEvent::UserIntentApplied {
+        intent_id: event.intent_id.clone(),
+        delivery: event.delivery,
+        status: astra_turn_types::UserIntentStatus::Applied,
+        event_index: event.event_index,
+        content,
+    })
+}
+
+async fn emit_final_output_ready(stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>) {
+    let Some(tx) = stream_event_tx else {
+        return;
+    };
+    if let Err(error) = tx
+        .send(crate::cli::chat_stream::StreamEvent::AssistantOutputSettled)
+        .await
     {
-        preview.push_str("...");
+        tracing::debug!(%error, "output-settled stream receiver closed");
     }
-    Some(format!("__deferred_input_applied__:{preview}"))
 }
 
 fn permission_mode_change_audit_event(
@@ -481,6 +473,12 @@ fn append_permission_mode_change_audit(
 
 #[async_trait]
 impl AgenticLoopHost for CliAgenticLoopHost<'_> {
+    fn agent_live_event_sink(
+        &self,
+    ) -> Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink> {
+        self.agent_live_event_sink.clone()
+    }
+
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
@@ -525,32 +523,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 astra_runtime::turn::agentic_loop::host::VolatileKind::PlanModeMarker,
                 format!(
                     "[mode={new_mode}] User approved the plan; you are now executing in `{new_mode}` permission mode. Mutating tools are available — proceed to implement the plan."
-                ),
-            );
-        }
-
-        // Pull mid-turn UI-staged mode pivots into `self.mode`. The
-        // user can press Shift+Tab while a turn is running; the TUI
-        // cannot borrow `perm_manager` then, so it writes the new
-        // mode through the lock-free mirror. Reading it here makes
-        // the new mode authoritative for this turn's schema and
-        // gating decisions. No-op when nothing was staged.
-        let mode_before = self.perm_manager.mode();
-        self.perm_manager.pull_mode_from_mirror();
-        let mode_after = self.perm_manager.mode();
-        if mode_before != mode_after {
-            refresh_root_permission_context(&mut state.permission_context, self.perm_manager).await;
-            append_permission_mode_change_audit(
-                state.current_session_id.as_deref(),
-                self.chat_turn_index,
-                mode_before,
-                mode_after,
-                "mid_turn_ui",
-            );
-            state.push_volatile(
-                astra_runtime::turn::agentic_loop::host::VolatileKind::PlanModeMarker,
-                format!(
-                    "[mode={mode_after}] User pressed Shift+Tab; permission mode is now `{mode_after}`. Adjust your tool surface accordingly."
                 ),
             );
         }
@@ -898,16 +870,14 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         let permission_event =
             astra_turn_core::permission::notice::parse_auto_approved_permission(&line);
         if self.render_policy.suppress_headless() {
-            if let Some(tx) = &self.stream_event_tx {
-                let stream_event = permission_event.map_or_else(
-                    || crate::cli::chat_stream::StreamEvent::StatusLine(line),
-                    |(tool, reason)| crate::cli::chat_stream::StreamEvent::PermissionAutoApproved {
-                        tool,
-                        reason,
-                    },
-                );
-                let _ = tx.send(stream_event);
-            }
+            let stream_event = permission_event.map_or_else(
+                || crate::cli::chat_stream::StreamEvent::StatusLine(line),
+                |(tool, reason)| crate::cli::chat_stream::StreamEvent::PermissionAutoApproved {
+                    tool,
+                    reason,
+                },
+            );
+            self.try_emit_stream_event(stream_event);
             return;
         }
         let line_ref = line.as_str();
@@ -940,25 +910,27 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             HeadlessStderrStyle::Normal => eprintln!("{}", line_ref),
         }
         self.pending_clear_lines += 1;
-        if let Some(tx) = &self.stream_event_tx {
-            let stream_event = permission_event.map_or_else(
-                || crate::cli::chat_stream::StreamEvent::StatusLine(line),
-                |(tool, reason)| crate::cli::chat_stream::StreamEvent::PermissionAutoApproved {
-                    tool,
-                    reason,
-                },
-            );
-            let _ = tx.send(stream_event);
-        }
+        let stream_event = permission_event.map_or_else(
+            || crate::cli::chat_stream::StreamEvent::StatusLine(line),
+            |(tool, reason)| crate::cli::chat_stream::StreamEvent::PermissionAutoApproved {
+                tool,
+                reason,
+            },
+        );
+        self.try_emit_stream_event(stream_event);
     }
 
     fn on_compaction(&mut self, event: CompactionEvent) {
         // Stderr fallback (always visible).
         self.emit_headless_line(HeadlessStderrStyle::Dim, event.summary.clone());
         // Structured event for TUI / stream consumers.
-        if let Some(tx) = &self.stream_event_tx {
-            let _ = tx.send(crate::cli::chat_stream::StreamEvent::Compaction(event));
-        }
+        self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::Compaction(event));
+    }
+
+    fn on_agent_communication(&mut self, event: astra_messaging::AgentCommunicationEvent) {
+        self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::AgentCommunication(
+            event,
+        ));
     }
 
     fn is_quiet(&self) -> bool {
@@ -984,12 +956,12 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.executor.current_activatable_tool_names_snapshot()
     }
 
-    fn on_deferred_user_input(&mut self, input: &Value) {
-        let Some(tx) = &self.stream_event_tx else {
-            return;
-        };
-        if let Some(line) = deferred_input_status_line(input) {
-            let _ = tx.send(crate::cli::chat_stream::StreamEvent::StatusLine(line));
+    fn on_user_intent_applied(
+        &mut self,
+        event: &astra_runtime::turn::run_control::QueuedUserIntent,
+    ) {
+        if let Some(event) = user_intent_stream_event(event) {
+            self.try_emit_stream_event(event);
         }
     }
 
@@ -1013,12 +985,12 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
 
     async fn recover_missing_control_tool_result(
         &mut self,
-        parent_run_id: Option<&str>,
+        _parent_run_id: Option<&str>,
         tool_call_id: &str,
         tool_name: &str,
         args: &Value,
     ) -> ControlToolRecovery {
-        if tool_name != "agent_fanout" {
+        if !matches!(tool_name, "agent" | "agent_fanout") {
             return ControlToolRecovery::Unsupported;
         }
         let Some(spawn_context) = self.executor.spawn_context.as_ref() else {
@@ -1029,34 +1001,88 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             );
             return ControlToolRecovery::Missing;
         };
-        let Some(parent_run_id) = parent_run_id else {
-            tracing::warn!(
-                target: "astra_cli::agentic_loop_host",
-                spawn_context_run_id = %spawn_context.run_id,
-                tool_call_id,
-                "agent_fanout recovery failed: missing parent run id"
-            );
-            return ControlToolRecovery::Recovered(failed_control_tool_recovery_result(
-                tool_call_id,
-                tool_name,
-                args,
-                "Cannot recover missing agent_fanout edge result: parent_run_id is missing, so the host cannot prove which parent turn owns the fanout group.",
-            ));
-        };
-        if parent_run_id != spawn_context.run_id {
-            tracing::warn!(
-                target: "astra_cli::agentic_loop_host",
-                parent_run_id,
-                spawn_context_run_id = %spawn_context.run_id,
-                tool_call_id,
-                "agent_fanout recovery failed: parent run id does not match spawn context"
-            );
-            return ControlToolRecovery::Recovered(failed_control_tool_recovery_result(
-                tool_call_id,
-                tool_name,
-                args,
-                "Cannot recover missing agent_fanout edge result: parent_run_id does not match the active spawn context.",
-            ));
+
+        // The server run id and the local spawn-context id are issued by
+        // different runtimes and are not a comparable identity namespace.
+        // This host/executor instance is already bound to exactly one spawn
+        // context, which is the authority for the control operation.
+
+        if tool_name == "agent" {
+            let started_at = std::time::Instant::now();
+            let mut execution_args = args.clone();
+            if let Some(object) = execution_args.as_object_mut() {
+                object.insert(
+                    "_tool_call_id".to_string(),
+                    Value::String(tool_call_id.to_string()),
+                );
+            }
+            let action = agent_control_action(args).map(str::to_string);
+            let label = action
+                .as_deref()
+                .map(|action| agent_control_label(args, format!("Agent {action}")));
+            if let (Some(action), Some(label)) = (action.as_deref(), label.as_deref()) {
+                self.try_emit_stream_event(
+                    crate::cli::chat_stream::StreamEvent::AgentControlStarted {
+                        action: action.to_string(),
+                        label: label.to_string(),
+                        tool_use_id: tool_call_id.to_string(),
+                        agent_id: agent_id_from_args(args),
+                        fanout_slot: None,
+                        fanout_title: None,
+                    },
+                );
+                self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::ToolStarted {
+                    name: tool_name.to_string(),
+                    description: label.to_string(),
+                    tool_use_id: tool_call_id.to_string(),
+                    parent_tool_use_id: None,
+                });
+            }
+            let outcome = self
+                .executor
+                .execute_with_metadata(tool_name, &execution_args)
+                .await;
+            let duration_ms = started_at.elapsed().as_millis() as u64;
+            let status = if outcome.is_error {
+                "failed"
+            } else {
+                cloud_tool_result_status_label(&outcome.output)
+            }
+            .to_string();
+            let event_output = tool_output_event_text(tool_name, &outcome.output);
+            if let (Some(action), Some(label)) = (action.as_deref(), label.as_deref()) {
+                self.try_emit_stream_event(
+                    crate::cli::chat_stream::StreamEvent::AgentControlCompleted {
+                        action: action.to_string(),
+                        label: label.to_string(),
+                        status: status.clone(),
+                        duration_ms,
+                        output: Some(event_output.clone()),
+                        tool_use_id: tool_call_id.to_string(),
+                        agent_id: agent_id_from_output(&outcome.output)
+                            .or_else(|| agent_id_from_args(args)),
+                    },
+                );
+                self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::ToolCompleted {
+                    name: tool_name.to_string(),
+                    description: label.to_string(),
+                    status: status.clone(),
+                    duration_ms,
+                    output_summary: None,
+                    output: Some(event_output),
+                    tool_use_id: tool_call_id.to_string(),
+                    parent_tool_use_id: None,
+                });
+            }
+            return ControlToolRecovery::Recovered(EdgeToolExecResult {
+                request_id: tool_call_id.to_string(),
+                tool: tool_name.to_string(),
+                args: args.clone(),
+                output: outcome.output,
+                tool_result_fields: None,
+                status,
+                duration_ms,
+            });
         }
 
         let output = match tokio::time::timeout(
@@ -1075,17 +1101,12 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             ),
         };
         let status = cloud_tool_result_status_label(&output).to_string();
-        let recovery_outcome = if status == "completed" {
-            "recovered"
-        } else {
-            "failed"
-        };
         ControlToolRecovery::Recovered(EdgeToolExecResult {
             request_id: tool_call_id.to_string(),
             tool: tool_name.to_string(),
             args: args.clone(),
             output,
-            tool_result_fields: Some(control_tool_recovery_fields(recovery_outcome)),
+            tool_result_fields: None,
             status,
             duration_ms: 0,
         })
@@ -1134,6 +1155,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             }
             let _ = std::io::stdout().flush();
         }
+    }
+
+    async fn on_final_output_ready(&mut self, _state: &AgenticLoopState) {
+        emit_final_output_ready(self.stream_event_tx.as_ref()).await;
     }
 
     fn on_turn_completed(
@@ -1288,16 +1313,27 @@ fn request_allowlist_restriction_names(
 #[cfg(test)]
 mod tests {
     use super::{
-        CliSummaryClientSkillAutoRouteJudge, deferred_input_status_line,
-        derive_turn_interaction_mode, failed_control_tool_recovery_result,
+        CliSummaryClientSkillAutoRouteJudge, derive_turn_interaction_mode, emit_final_output_ready,
         permission_mode_change_audit_event, plan_mode_restriction_names,
-        request_allowlist_restriction_names,
+        request_allowlist_restriction_names, user_intent_stream_event,
     };
     use crate::cli::permission_manager::PermissionMode;
     use astra_runtime::turn::agentic_loop::host::TurnInteractionMode;
     use astra_services::session_journal::JournalEventType;
     use serde_json::json;
     use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn final_output_ready_reaches_the_typed_stream_lane() {
+        let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
+
+        emit_final_output_ready(Some(&tx)).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(crate::cli::chat_stream::StreamEvent::AssistantOutputSettled)
+        ));
+    }
 
     struct ScriptedSummaryClient {
         text: String,
@@ -1338,28 +1374,6 @@ mod tests {
             .expect("judge response should parse");
 
         assert_eq!(selected, Some("review-changes".to_string()));
-    }
-
-    #[test]
-    fn failed_control_tool_recovery_result_is_explicitly_marked_as_recovery_failure() {
-        let result = failed_control_tool_recovery_result(
-            "call-fanout",
-            "agent_fanout",
-            &json!({"action": "start"}),
-            "Cannot recover missing agent_fanout edge result",
-        );
-
-        assert_eq!(result.status, "failed");
-        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(output["status"], "failed");
-        assert_eq!(output["recovery"]["attempted"], true);
-        assert_eq!(output["recovery"]["source"], "host_state");
-        assert_eq!(output["recovery"]["outcome"], "failed");
-
-        let fields = result.tool_result_fields.expect("recovery metadata");
-        assert_eq!(fields["recovery"]["attempted"], true);
-        assert_eq!(fields["recovery"]["source"], "host_state");
-        assert_eq!(fields["recovery"]["outcome"], "failed");
     }
 
     #[test]
@@ -1427,13 +1441,24 @@ mod tests {
     }
 
     #[test]
-    fn deferred_input_status_line_renders_feedback_prefix_and_preview() {
-        let line = deferred_input_status_line(&json!({
-            "content": "先停啊！"
-        }))
-        .expect("deferred input feedback should be rendered");
-        assert!(line.starts_with("__deferred_input_applied__:"));
-        assert!(line.contains("先停啊"));
+    fn user_intent_stream_event_preserves_identity_and_content() {
+        let event = user_intent_stream_event(&astra_runtime::turn::run_control::QueuedUserIntent {
+            intent_id: "input-7".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::AcceptedLocal,
+            event_index: 7,
+            input: json!({"content": "先停啊！"}),
+        })
+        .expect("user intent feedback should be emitted");
+        assert!(matches!(
+            event,
+            crate::cli::chat_stream::StreamEvent::UserIntentApplied {
+                intent_id,
+                event_index: 7,
+                content,
+                ..
+            } if intent_id == "input-7" && content == "先停啊！"
+        ));
     }
 
     #[test]
@@ -1679,9 +1704,7 @@ mod tests {
         // arrive with correct kind and summary.
         use crate::cli::chat_stream::StreamEvent;
         use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind};
-        use tokio::sync::mpsc;
-
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
         let event = CompactionEvent {
             kind: CompactionKind::ReactiveBudget,
             pressure: 0.85,
@@ -1696,7 +1719,7 @@ mod tests {
         };
 
         // Same pattern used by CliAgenticLoopHost::on_compaction:
-        let _ = tx.send(StreamEvent::Compaction(event));
+        tx.try_send(StreamEvent::Compaction(event)).unwrap();
 
         let received = rx.try_recv().expect("must receive compaction event");
         match received {

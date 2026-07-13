@@ -889,13 +889,15 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
         ProgressEventType::AgentSpawned {
             agent_type,
             description,
-            parent_run_id,
             ..
         } => {
-            let parent_label = if parent_run_id.is_empty() {
+            let parent_label = if event.parent_run_id.is_empty() {
                 String::new()
             } else {
-                format!(" ← {}", &parent_run_id[..8.min(parent_run_id.len())])
+                format!(
+                    " ← {}",
+                    &event.parent_run_id[..8.min(event.parent_run_id.len())]
+                )
             };
             format!(
                 "▶ 🌲 {} spawned: {}{}",
@@ -1982,6 +1984,7 @@ mod tests {
     }
 
     fn make_agent(agent_id: &str, run_id: &str, status: AgentStatus) -> SpawnedAgentInfo {
+        let ended_at = status.is_terminal().then(SystemTime::now);
         SpawnedAgentInfo {
             agent_id: agent_id.to_string(),
             run_id: run_id.to_string(),
@@ -1990,9 +1993,11 @@ mod tests {
             description: "test agent".to_string(),
             status,
             started_at: SystemTime::now(),
+            ended_at,
             metrics: SpawnedAgentMetrics::default(),
             has_permission_issues: false,
             run_in_background: false,
+            spawn_tool_call_id: None,
             fanout_slot: None,
         }
     }

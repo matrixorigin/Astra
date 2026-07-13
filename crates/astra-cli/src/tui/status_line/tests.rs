@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use super::{BackgroundTaskCounts, BackgroundTaskFanoutSummary, StatusContext, StatusLine};
 use crate::tui::status_line::line::PermissionMode;
+use crate::tui::theme::current as current_theme;
 
 fn ctx() -> StatusContext {
     StatusContext::default()
@@ -173,7 +174,7 @@ fn ask_mode_renders_default_chip() {
         .iter()
         .find(|seg| seg.text == "Ask")
         .expect("ask chip segment");
-    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Gray));
+    assert_eq!(chip.style.fg, Some(current_theme().dim));
     assert!(
         chip.style
             .add_modifier
@@ -182,20 +183,20 @@ fn ask_mode_renders_default_chip() {
 }
 
 #[test]
-fn auto_mode_renders_yellow_chip() {
+fn auto_mode_uses_the_semantic_attention_colour() {
     let c = StatusContext {
         permission_mode: PermissionMode::Auto,
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
     assert!(s.plain().contains("Auto"));
-    // The chip should carry a yellow style to draw the eye.
+    // Auto mode is attention-worthy, but the exact palette is theme-owned.
     let chip = s
         .left
         .iter()
         .find(|seg| seg.text == "Auto")
         .expect("auto chip segment");
-    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
+    assert_eq!(chip.style.fg, Some(current_theme().warn));
     assert!(
         chip.style
             .add_modifier
@@ -204,7 +205,7 @@ fn auto_mode_renders_yellow_chip() {
 }
 
 #[test]
-fn accept_edits_mode_renders_cyan_chip() {
+fn accept_edits_mode_uses_the_semantic_link_colour() {
     let c = StatusContext {
         permission_mode: PermissionMode::AcceptEdits,
         ..ctx()
@@ -215,7 +216,7 @@ fn accept_edits_mode_renders_cyan_chip() {
         .iter()
         .find(|seg| seg.text == "Edits")
         .expect("accept_edits chip segment");
-    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Cyan));
+    assert_eq!(chip.style.fg, Some(current_theme().link));
     assert!(
         chip.style
             .add_modifier
@@ -224,7 +225,7 @@ fn accept_edits_mode_renders_cyan_chip() {
 }
 
 #[test]
-fn plan_mode_renders_blue_chip() {
+fn read_only_policy_uses_the_semantic_command_colour() {
     let c = StatusContext {
         permission_mode: PermissionMode::Plan,
         ..ctx()
@@ -233,9 +234,9 @@ fn plan_mode_renders_blue_chip() {
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text == "Plan")
-        .expect("plan chip segment");
-    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Blue));
+        .find(|seg| seg.text == "Read-only")
+        .expect("read-only chip segment");
+    assert_eq!(chip.style.fg, Some(current_theme().command));
     assert!(
         chip.style
             .add_modifier
@@ -244,7 +245,7 @@ fn plan_mode_renders_blue_chip() {
 }
 
 #[test]
-fn deny_mode_renders_red_chip() {
+fn deny_mode_uses_the_semantic_error_colour() {
     let c = StatusContext {
         permission_mode: PermissionMode::Deny,
         ..ctx()
@@ -255,7 +256,7 @@ fn deny_mode_renders_red_chip() {
         .iter()
         .find(|seg| seg.text == "Deny")
         .expect("deny chip");
-    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
+    assert_eq!(chip.style.fg, Some(current_theme().error));
     assert!(
         chip.style
             .add_modifier
@@ -338,7 +339,9 @@ fn dense_footer_preserves_mode_before_budget_and_branch() {
     let c = StatusContext {
         model: Some("deepseek-v4-pro-official(thinking:high)".into()),
         cwd: Some("~/github/astra".into()),
-        token_budget: Some((138_000, 200_000)),
+        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
+            138_000, 200_000,
+        )),
         git_branch: Some("enqueue_new_after_next_call".into()),
         permission_mode: PermissionMode::Auto,
         ..ctx()
@@ -365,7 +368,9 @@ fn dense_footer_preserves_mode_before_budget_and_branch() {
 fn token_budget_renders_as_percent_and_absolute() {
     let c = StatusContext {
         turn_active: true,
-        token_budget: Some((25_000, 100_000)),
+        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
+            25_000, 100_000,
+        )),
         ..ctx()
     };
     let plain = StatusLine::from_context(&c).plain();
@@ -384,9 +389,26 @@ fn token_budget_renders_as_percent_and_absolute() {
 }
 
 #[test]
+fn previous_request_context_is_visible_and_explicitly_scoped() {
+    let c = StatusContext {
+        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
+            25_000, 100_000,
+        )),
+        context_window_is_previous: true,
+        turn_active: true,
+        ..ctx()
+    };
+
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(plain.contains("Ctx last 25%"), "{plain:?}");
+}
+
+#[test]
 fn idle_turn_hides_remaining_budget_suffix() {
     let c = StatusContext {
-        token_budget: Some((25_000, 100_000)),
+        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
+            25_000, 100_000,
+        )),
         ..ctx()
     };
     let plain = StatusLine::from_context(&c).plain();
@@ -403,7 +425,9 @@ fn idle_turn_hides_remaining_budget_suffix() {
 #[test]
 fn high_token_usage_uses_warning_color() {
     let c = StatusContext {
-        token_budget: Some((90_000, 100_000)),
+        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
+            90_000, 100_000,
+        )),
         ..ctx()
     };
     let s = StatusLine::from_context(&c);
@@ -413,13 +437,34 @@ fn high_token_usage_uses_warning_color() {
         .find(|seg| seg.text.contains('%'))
         .expect("budget segment");
     assert!(
-        matches!(
-            budget_seg.style.fg,
-            Some(ratatui::style::Color::Yellow) | Some(ratatui::style::Color::Red)
-        ),
+        matches!(budget_seg.style.fg, Some(color) if color == current_theme().warn || color == current_theme().error),
         "high-usage budget should highlight; style={:?}",
         budget_seg.style.fg
     );
+}
+
+#[test]
+fn narrow_footer_keeps_context_and_drops_cwd_first() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let c = StatusContext {
+        model: Some("astra-model".into()),
+        cwd: Some("~/very/long/project/path".into()),
+        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
+            25_000, 100_000,
+        )),
+        ..ctx()
+    };
+    let status = StatusLine::from_context(&c);
+    let area = Rect::new(0, 0, 44, 1);
+    let mut buf = Buffer::empty(area);
+    status.render(area, &mut buf);
+    let rendered: String = (0..area.width)
+        .map(|x| buf[(x, 0)].symbol().to_string())
+        .collect();
+    assert!(rendered.contains("Ctx 25%"), "{rendered:?}");
+    assert!(!rendered.contains("very/long"), "{rendered:?}");
 }
 
 #[test]
@@ -517,7 +562,7 @@ fn multi_pending_uses_numeric_count() {
 }
 
 #[test]
-fn pending_chip_is_yellow_without_extra_bold() {
+fn pending_chip_uses_attention_colour_without_extra_bold() {
     let c = StatusContext {
         pending_approvals: 2,
         ..ctx()
@@ -528,7 +573,7 @@ fn pending_chip_is_yellow_without_extra_bold() {
         .iter()
         .find(|seg| seg.text.contains("pending"))
         .expect("pending chip");
-    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Yellow));
+    assert_eq!(chip.style.fg, Some(current_theme().warn));
     assert!(
         !chip
             .style
@@ -602,6 +647,23 @@ fn bg_running_and_stalled_appends_stalled_segment() {
 }
 
 #[test]
+fn bg_stopping_and_stale_snapshot_are_explicit() {
+    let c = StatusContext {
+        bg_task_counts: Some(BackgroundTaskCounts {
+            stopping: 1,
+            stale_snapshots: 2,
+            ..BackgroundTaskCounts::default()
+        }),
+        ..ctx()
+    };
+
+    let plain = StatusLine::from_context(&c).plain();
+    assert!(plain.contains("1 stopping"), "{plain}");
+    assert!(plain.contains("2 stale snapshots"), "{plain}");
+    assert!(!plain.contains("unavailable"), "{plain}");
+}
+
+#[test]
 fn bg_zero_running_zero_waiting_zero_failed_hides_chip() {
     // Empty registry counts — registry exists but no live/attention
     // tasks. Hide the chip
@@ -640,13 +702,13 @@ fn bg_stalled_only_chip_uses_yellow_for_attention() {
     );
     assert_eq!(
         chip.style.fg,
-        Some(ratatui::style::Color::Yellow),
-        "stalled-only state must surface in yellow so the user notices"
+        Some(current_theme().warn),
+        "stalled-only state must use the theme attention colour so the user notices"
     );
 }
 
 #[test]
-fn bg_failed_only_chip_uses_red_attention() {
+fn bg_failed_only_chip_uses_error_attention() {
     let c = StatusContext {
         bg_task_counts: Some(BackgroundTaskCounts {
             running: 0,
@@ -663,7 +725,7 @@ fn bg_failed_only_chip_uses_red_attention() {
         .find(|seg| seg.text.contains("failed"))
         .expect("failed bg shell must stay visible as an attention state");
     assert_eq!(chip.text, "1 shell failed");
-    assert_eq!(chip.style.fg, Some(ratatui::style::Color::Red));
+    assert_eq!(chip.style.fg, Some(current_theme().error));
 }
 
 #[test]
@@ -782,6 +844,7 @@ fn bg_footer_calls_out_active_fanout_group_accounting() {
             title: "review fanout".into(),
             target_count: 3,
             running: 2,
+            stopping: 0,
             done: 0,
             failed: 0,
             stopped: 1,

@@ -302,7 +302,7 @@ dev-deps-wait:
 .PHONY: dev-db-connect
 dev-db-connect:
 	@set -a; [ -f .env ] && . ./.env; set +a; \
-	mysql --protocol=TCP -h$${MATRIXONE_HOST:-127.0.0.1} -P$${MATRIXONE_PORT:-6001} -u$${MATRIXONE_USER:-root} -p$${MATRIXONE_PASSWORD:-111}
+	scripts/dev/mysql-client.sh
 
 # ============================================================================
 # API Server (Source Code Mode)
@@ -752,23 +752,9 @@ dev-seed:
 	@printf "Are you sure? [y/N] "; read REPLY; \
 	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
 	@set -a; [ -f .env ] && . ./.env; set +a; \
-	DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
-	DB_PORT=$${MATRIXONE_PORT:-6001}; \
-	DB_USER=$${MATRIXONE_USER:-root}; \
-	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
-	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
-	mysql_ssl_disable_arg() { \
-		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
-		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
-		elif mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl-mode=DISABLED --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl-mode=DISABLED"; \
-		fi; \
-	}; \
-	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
-	run_mysql_ddl 2>/dev/null || { \
-		if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
-	}
+	scripts/dev/mysql-client.sh -e "$$SQL"
 	@$(MAKE) dev-api-restart-debug build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
@@ -1113,24 +1099,10 @@ test-online:
 		integration) DB_NAMES="$$INTEGRATION_DB" ;; \
 		*) echo "❌ invalid ASTRA_ONLINE_LANE=$$ONLINE_LANE (expected all, core, or integration)"; exit 2 ;; \
 	esac; \
-	DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
-	DB_PORT=$${MATRIXONE_PORT:-6001}; \
-	DB_USER=$${MATRIXONE_USER:-root}; \
-	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
 	echo "Running online lane=$$ONLINE_LANE; recreating test databases: $$DB_NAMES ..."; \
-	run_mysql_ddl() { _sql=$$1; shift; mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$_sql"; }; \
-	mysql_ssl_disable_arg() { \
-		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
-		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
-		elif mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl-mode=DISABLED --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl-mode=DISABLED"; \
-		fi; \
-	}; \
-	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
 	for DB_NAME in $$DB_NAMES; do \
 		SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
-		run_mysql_ddl "$$SQL" 2>/dev/null || { \
-			if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$SQL" "$$MYSQL_SSL_ARG"; else run_mysql_ddl "$$SQL"; fi; \
-		} 2>/dev/null || true; \
+		scripts/dev/mysql-client.sh -e "$$SQL" 2>/dev/null || true; \
 	done; \
 	FAILED=""; \
 	if [ "$$ONLINE_LANE" != "integration" ]; then \
@@ -1504,23 +1476,13 @@ db-reset:
 		else \
 			DB_NAME=dev_agent; \
 		fi; \
-		DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
-		DB_PORT=$${MATRIXONE_PORT:-6001}; \
-		DB_USER=$${MATRIXONE_USER:-root}; \
-		DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
 		SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
-		run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
-		mysql_ssl_disable_arg() { \
-			if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
-			elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
-			elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
-			fi; \
-		}; \
-		MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
-		run_mysql_ddl 2>/dev/null || { \
-			if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
-		}; \
+		scripts/dev/mysql-client.sh -e "$$SQL"; \
 		echo "✅ Database reset complete"; \
 	else \
 		echo "Cancelled"; \
 	fi
+
+.PHONY: test-mysql-client
+test-mysql-client:
+	@bash scripts/dev/test-mysql-client.sh

@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -185,6 +186,7 @@ fn build_retained_history_turns(
             .to_string();
         let tokens = prompts::estimate_str_tokens(&msg_content(message)) as u32;
         let has_tool_calls = message_has_tool_calls(message);
+        let preview = retained_history_preview(&role, &msg_content(message));
 
         if turns.is_empty() || role == "user" {
             turns.push(astra_turn_core::context_assembly_trace::TurnRetention {
@@ -192,6 +194,7 @@ fn build_retained_history_turns(
                 role,
                 tokens,
                 has_tool_calls,
+                content_preview: preview,
             });
             continue;
         }
@@ -202,10 +205,34 @@ fn build_retained_history_turns(
             if retained_turn_role_priority(&role) > retained_turn_role_priority(&turn.role) {
                 turn.role = role;
             }
+            if !preview.is_empty() {
+                const MAX_GROUP_PREVIEW_CHARS: usize = 320;
+                let joined = if turn.content_preview.is_empty() {
+                    preview
+                } else {
+                    format!("{} · {preview}", turn.content_preview)
+                };
+                turn.content_preview = astra_turn_core::context_assembly_trace::preview_snippet(
+                    &joined,
+                    MAX_GROUP_PREVIEW_CHARS,
+                );
+            }
         }
     }
 
     turns
+}
+
+/// Bounded human evidence for the exact message group accounted for by the
+/// context trace. This is observability data, not prompt input and not a UI
+/// transcript join key.
+fn retained_history_preview(role: &str, content: &str) -> String {
+    let snippet = astra_turn_core::context_assembly_trace::preview_snippet(content, 180);
+    if snippet.is_empty() {
+        String::new()
+    } else {
+        format!("{role}: {snippet}")
+    }
 }
 
 fn retained_turn_role_priority(role: &str) -> u8 {
@@ -408,7 +435,26 @@ fn chat_turn_budget_pressure(
     )
 }
 
-async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
+struct PreparedChatTurnPayload {
+    payload: Value,
+    context_window_estimate: astra_turn_types::ContextWindowUsage,
+}
+
+impl std::fmt::Display for PreparedChatTurnPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.payload.fmt(f)
+    }
+}
+
+impl Deref for PreparedChatTurnPayload {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.payload
+    }
+}
+
+async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedChatTurnPayload {
     let timing = ctx.timing_phases;
     let mut mark = Instant::now();
     let prep_wall = mark;
@@ -1059,52 +1105,35 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // `ChatTurnSseAccum.bridge_injection_fingerprints`) with the CLI-owned
     // `lessons` snapshot.
 
-    // ─── Record token budget estimate to trace collector (M1 observability) ───
+    // ─── Context-window estimate / trace collection ───────────────────────
+    // The runtime owns the final system prompt, so this starts without it and
+    // is amended by the `context_meta` SSE event before the model responds.
+    let schema_tokens = trace_token_count_u32(visible_tool_tokens_total_u64, "tool_schema_tokens");
+    let max_tokens = trace_token_count_u32(ctx.effective_input_budget_tokens, "max_tokens");
+    let history_messages = retained_history_messages(&prompt_messages);
+    let history_tokens_u64: u64 = history_messages
+        .iter()
+        .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u64)
+        .sum();
+    let history_tokens = trace_token_count_u32(history_tokens_u64, "history_tokens");
+    let turns_retained = build_retained_history_turns(history_messages);
+    let user_message_tokens_u64 = prompts::estimate_str_tokens(ctx.message) as u64;
+    let user_message_tokens = trace_token_count_u32(user_message_tokens_u64, "user_message_tokens");
+    let memory_tokens_u64 = 0u64;
+    let memory_tokens = trace_token_count_u32(memory_tokens_u64, "memory_tokens");
+    let estimated_total = trace_token_count_u32(
+        history_tokens_u64
+            + memory_tokens_u64
+            + visible_tool_tokens_total_u64
+            + user_message_tokens_u64,
+        "estimated_total",
+    );
+
     if let Some(collector) = ctx.telem.trace_collector {
-        let schema_tokens =
-            trace_token_count_u32(visible_tool_tokens_total_u64, "tool_schema_tokens");
-        let max_tokens = trace_token_count_u32(ctx.effective_input_budget_tokens, "max_tokens");
-        let history_messages = retained_history_messages(&prompt_messages);
-
-        // Estimate retained history tokens from prior messages only.
-        let history_tokens_u64: u64 = history_messages
-            .iter()
-            .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u64)
-            .sum();
-        let history_tokens = trace_token_count_u32(history_tokens_u64, "history_tokens");
-
-        // Record per-turn history breakdown
-        let turns_retained = build_retained_history_turns(history_messages);
         collector.set_history_retained(&turns_retained);
 
-        // Estimate user message tokens
-        let user_message_tokens_u64 = prompts::estimate_str_tokens(ctx.message) as u64;
-        let user_message_tokens =
-            trace_token_count_u32(user_message_tokens_u64, "user_message_tokens");
-
-        // System prompt tokens: the system prompt is assembled by the runtime
-        // (`bridge/inprocess.rs`) and sent back via `context_meta` SSE event.
-        // Use 0 here as placeholder — runtime will overwrite via record_token_budget.
-        let system_prompt_tokens_u64 = 0u64;
-        let system_prompt_tokens =
-            trace_token_count_u32(system_prompt_tokens_u64, "system_prompt_tokens");
-
-        // Memory tokens are tracked in memory retrieval trace, use 0 here
-        // (would need to be passed from memory boost search results)
-        let memory_tokens_u64 = 0u64;
-        let memory_tokens = trace_token_count_u32(memory_tokens_u64, "memory_tokens");
-
-        let estimated_total = trace_token_count_u32(
-            system_prompt_tokens_u64
-                + history_tokens_u64
-                + memory_tokens_u64
-                + visible_tool_tokens_total_u64
-                + user_message_tokens_u64,
-            "estimated_total",
-        );
-
         collector.record_token_budget_estimate(
-            system_prompt_tokens,
+            0,
             history_tokens,
             memory_tokens,
             schema_tokens,
@@ -1127,7 +1156,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         );
     }
 
-    payload
+    PreparedChatTurnPayload {
+        payload,
+        context_window_estimate: astra_turn_types::ContextWindowUsage::estimated(
+            u64::from(estimated_total),
+            u64::from(max_tokens),
+        ),
+    }
 }
 
 fn inject_runtime_turn_overrides(
@@ -1329,15 +1364,24 @@ async fn chat_turn_post_payload_after_prepare(
     token: &str,
     quiet: bool,
     ui: &ChatTurnSseFetchUi,
+    stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>,
     prepare: PrepareChatTurnRequest<'_>,
 ) -> Result<(astra_thin_client::HttpResponse, ChatTurnPrepLineGuard), String> {
     let prep_line = ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
     let payload = prepare_chat_turn_payload(prepare).await;
 
+    if let Some(tx) = stream_event_tx {
+        let _ = tx.try_send(
+            crate::cli::chat_stream::StreamEvent::ContextWindowEstimated(
+                payload.context_window_estimate,
+            ),
+        );
+    }
+
     touch_prep_ui_phase(&ui.prep_ui_phase, "Sending…");
     let http_mark = Instant::now();
     let resp = api
-        .post_chat_turn_retry_429(token, &payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
+        .post_chat_turn_retry_429(token, &payload.payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
         .await
         .map_err(|e| e.to_string())?;
     if ui.timing {
@@ -1447,6 +1491,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         token,
         render_policy.is_silent(),
         &ui,
+        stream_event_tx.as_ref(),
         PrepareChatTurnRequest {
             messages,
             runtime_required_texts,
@@ -1721,6 +1766,7 @@ mod tests {
             lessons_text: None,
         })
         .await
+        .payload
     }
 
     #[tokio::test]
@@ -2014,9 +2060,17 @@ mod tests {
         assert_eq!(turns[0].turn_index, 0);
         assert_eq!(turns[0].role, "assistant");
         assert!(!turns[0].has_tool_calls);
+        assert_eq!(
+            turns[0].content_preview,
+            "user: first · assistant: reply one"
+        );
         assert_eq!(turns[1].turn_index, 1);
         assert_eq!(turns[1].role, "assistant");
         assert!(turns[1].has_tool_calls);
+        assert_eq!(
+            turns[1].content_preview,
+            "user: second · assistant: calling tool · tool: tool output · assistant: final answer"
+        );
     }
 
     #[test]

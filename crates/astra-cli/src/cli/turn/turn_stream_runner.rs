@@ -4,14 +4,14 @@ use super::turn_cancellation::drain_after_cancel;
 use crate::cli::chat_stream::{ChatTurnParams, stream_chat_sse};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
-use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
+use crate::cli::turn::local_run_control::LocalRunControl;
 use crossterm::style::Stylize;
 use std::sync::Arc;
 
 struct PreparedTurnStreamState {
     cancel_token: Arc<tokio_util::sync::CancellationToken>,
     incremental_state: Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
-    run_control: Arc<LocalDeferredInputRunControl>,
+    run_control: Arc<LocalRunControl>,
     tui_cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     observability_session: Option<
@@ -56,6 +56,10 @@ pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> Tu
     let params = build_turn_stream_params(state, input, &prepared);
     let (result, was_user_cancel) =
         await_stream_with_interrupts(params, &prepared, input.api, input.token).await;
+    // Release the TUI's sender at transport close, before post-stream
+    // persistence. A completed answer must not keep its live typing marker
+    // while journal/CSL/workspace work is still settling.
+    state.tui_stream_event_tx = None;
     *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) = None;
 
     if was_user_cancel {
@@ -71,7 +75,7 @@ async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamSt
     let run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control)
             .clone()
-            .unwrap_or_else(LocalDeferredInputRunControl::shared);
+            .unwrap_or_else(LocalRunControl::shared);
 
     PreparedTurnStreamState {
         cancel_token: Arc::new(tokio_util::sync::CancellationToken::new()),
@@ -275,7 +279,7 @@ mod tests {
         prepare_turn_stream_state,
     };
     use crate::cli::session::session_state::SessionState;
-    use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
+    use crate::cli::turn::local_run_control::LocalRunControl;
     use std::sync::Arc;
 
     /// Source-level guard: cancellation paths in `await_stream_with_interrupts`
@@ -308,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_turn_stream_state_reuses_preinstalled_tui_run_control() {
         let state = SessionState::default();
-        let preinstalled = LocalDeferredInputRunControl::shared();
+        let preinstalled = LocalRunControl::shared();
         *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
             Some(preinstalled.clone());
 
@@ -359,7 +363,7 @@ mod tests {
             incremental_state: Arc::new(
                 astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
             ),
-            run_control: LocalDeferredInputRunControl::shared(),
+            run_control: LocalRunControl::shared(),
             tui_cancel_token: None,
             observability_hub: None,
             observability_session: None,

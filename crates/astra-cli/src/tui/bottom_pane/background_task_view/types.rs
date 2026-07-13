@@ -2,28 +2,8 @@
 
 use ratatui::style::Color;
 
-pub(crate) const BACKGROUND_TASK_STOP_SENTINEL: &str = "__background_task_stop__\n";
-pub(crate) const BACKGROUND_TASK_OUTPUT_SENTINEL: &str = "__background_task_output__\n";
 pub(crate) const PAGE_STEP: usize = 8;
 pub(crate) const DETAIL_TAIL_LINES: usize = 8;
-
-pub(crate) fn parse_stop_sentinel(s: &str) -> Option<&str> {
-    s.strip_prefix(BACKGROUND_TASK_STOP_SENTINEL)
-        .map(|rest| {
-            let rest = rest.trim_start_matches('\n');
-            rest.split_once('\n').map(|(id, _)| id).unwrap_or(rest)
-        })
-        .filter(|id| !id.is_empty())
-}
-
-pub(crate) fn parse_output_sentinel(s: &str) -> Option<&str> {
-    s.strip_prefix(BACKGROUND_TASK_OUTPUT_SENTINEL)
-        .map(|rest| {
-            let rest = rest.trim_start_matches('\n');
-            rest.split_once('\n').map(|(id, _)| id).unwrap_or(rest)
-        })
-        .filter(|id| !id.is_empty())
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackgroundTaskKind {
@@ -44,10 +24,6 @@ impl BackgroundTaskKind {
             Self::Monitor => "monitor",
         }
     }
-
-    pub(crate) fn supports_output_action(self) -> bool {
-        matches!(self, Self::Shell | Self::LocalAgent)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +33,7 @@ pub(crate) enum BackgroundTaskStatus {
     Interrupted,
     Failed,
     Running,
+    Stopping,
     Killed,
     Completed,
     Unavailable,
@@ -70,6 +47,7 @@ impl BackgroundTaskStatus {
             "interrupted" => Self::Interrupted,
             "failed" => Self::Failed,
             "running" => Self::Running,
+            "stopping" => Self::Stopping,
             "killed" => Self::Killed,
             "completed" => Self::Completed,
             "unavailable" => Self::Unavailable,
@@ -84,6 +62,7 @@ impl BackgroundTaskStatus {
             Self::Interrupted => "interrupted",
             Self::Failed => "failed",
             Self::Running => "running",
+            Self::Stopping => "stopping",
             Self::Killed => "killed",
             Self::Completed => "completed",
             Self::Unavailable => "unavailable",
@@ -97,6 +76,7 @@ impl BackgroundTaskStatus {
             Self::Interrupted => "interrupted",
             Self::Failed => "failed",
             Self::Running => "running",
+            Self::Stopping => "stopping",
             Self::Killed => "stopped",
             Self::Completed => "completed",
             Self::Unavailable => "unavailable",
@@ -104,14 +84,16 @@ impl BackgroundTaskStatus {
     }
 
     pub(crate) fn color(self) -> Color {
+        let theme = crate::tui::theme::current();
         match self {
-            Self::Pending => Color::Blue,
-            Self::WaitingForInput => Color::Yellow,
-            Self::Interrupted => Color::Yellow,
-            Self::Failed => Color::Red,
-            Self::Running => Color::Cyan,
-            Self::Completed => Color::Green,
-            Self::Killed | Self::Unavailable => Color::DarkGray,
+            Self::Pending => theme.accent,
+            Self::WaitingForInput => theme.warn,
+            Self::Interrupted => theme.warn,
+            Self::Failed => theme.error,
+            Self::Running => theme.gutter,
+            Self::Stopping => theme.accent,
+            Self::Completed => theme.success,
+            Self::Killed | Self::Unavailable => theme.dim,
         }
     }
 
@@ -123,7 +105,7 @@ impl BackgroundTaskStatus {
         match self {
             Self::WaitingForInput | Self::Interrupted | Self::Failed => 0,
             Self::Running | Self::Pending => 1,
-            Self::Killed => 2,
+            Self::Stopping | Self::Killed => 2,
             Self::Completed => 3,
             Self::Unavailable => 4,
         }
@@ -135,6 +117,7 @@ impl BackgroundTaskStatus {
             Self::WaitingForInput => "Waiting for input · no output yet",
             Self::Interrupted => "Interrupted with no output",
             Self::Running => "No output yet · still running",
+            Self::Stopping => "Stopping · no output captured yet",
             Self::Completed => "Completed with no output",
             Self::Failed => "Failed with no output",
             Self::Killed => "Stopped with no output",
@@ -154,13 +137,21 @@ impl LiveControlState {
     pub(crate) fn label(self) -> Option<&'static str> {
         match self {
             Self::Available => None,
-            Self::StaleHandle => Some("stale handle"),
-            Self::UnsupportedInMode => Some("control unavailable"),
+            Self::StaleHandle => Some("restored snapshot · no live control"),
+            Self::UnsupportedInMode => Some("control unavailable in this mode"),
         }
     }
 
     pub(crate) fn can_stop(self) -> bool {
         matches!(self, Self::Available)
+    }
+
+    pub(crate) fn list_label(self) -> Option<&'static str> {
+        match self {
+            Self::Available => None,
+            Self::StaleHandle => Some("stale snapshot"),
+            Self::UnsupportedInMode => Some("no control"),
+        }
     }
 }
 
@@ -180,6 +171,7 @@ pub(crate) struct BackgroundTaskRow {
     pub status: BackgroundTaskStatus,
     pub live_control: LiveControlState,
     pub elapsed_ms: u64,
+    pub no_recent_output_ms: Option<u64>,
     pub started_at_ms: Option<u64>,
     pub ended_at_ms: Option<u64>,
     pub title: String,
@@ -246,6 +238,7 @@ impl BackgroundTaskRow {
             status: init.status,
             live_control: LiveControlState::Available,
             elapsed_ms: init.elapsed_ms,
+            no_recent_output_ms: None,
             started_at_ms: None,
             ended_at_ms: None,
             title: init.title,
@@ -277,16 +270,6 @@ impl BackgroundTaskRow {
 
     pub(crate) fn with_live_control(mut self, live_control: LiveControlState) -> Self {
         self.live_control = live_control;
-        if !live_control.can_stop()
-            && matches!(
-                self.status,
-                BackgroundTaskStatus::Pending
-                    | BackgroundTaskStatus::Running
-                    | BackgroundTaskStatus::WaitingForInput
-            )
-        {
-            self.status = BackgroundTaskStatus::Unavailable;
-        }
         self
     }
 
@@ -317,6 +300,11 @@ impl BackgroundTaskRow {
     ) -> Self {
         self.started_at_ms = started_at_ms;
         self.ended_at_ms = ended_at_ms;
+        self
+    }
+
+    pub(crate) fn with_no_recent_output(mut self, inactive_ms: Option<u64>) -> Self {
+        self.no_recent_output_ms = inactive_ms;
         self
     }
 
@@ -366,15 +354,10 @@ pub(crate) fn pluralize_with_count(count: usize, singular: &str, plural: &str) -
     }
 }
 
-pub(crate) fn detail_actions_label(can_output: bool, can_stop: bool, width: usize) -> &'static str {
-    match (can_output, can_stop, width) {
-        (true, true, 34..) => "  actions: output · stop · return",
-        (true, true, 24..) => "  actions: output · stop",
-        (true, true, _) => "  actions: output",
-        (true, false, 26..) => "  actions: output · return",
-        (true, false, _) => "  actions: output",
-        (false, true, 26..) => "  actions: stop · return",
-        (false, true, _) => "  actions: stop",
-        (false, false, _) => "  actions: return",
+pub(crate) fn detail_actions_label(can_stop: bool, width: usize) -> &'static str {
+    match (can_stop, width) {
+        (true, 26..) => "  actions: stop · return",
+        (true, _) => "  actions: stop",
+        (false, _) => "  actions: return",
     }
 }

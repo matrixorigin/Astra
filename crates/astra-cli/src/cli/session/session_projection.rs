@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use astra_text_utils::str_preview::truncate_str;
 use astra_tools::task_mgmt::SessionTask;
 
@@ -5,6 +7,11 @@ use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
 use crate::cli::stream::streaming_types::StreamResult;
 use crate::cli::surface::session_task_surface::session_task_active_priority;
 use astra_services::session_journal;
+
+/// The task board is useful continuation context, not part of the turn's
+/// durable commit. In Edge+Server it is an HTTP projection and must never
+/// leave the user waiting for the request timeout after model output arrived.
+const ACTIVE_TASK_ANCHOR_REFRESH_BUDGET: Duration = Duration::from_millis(250);
 
 fn summarize_assistant_for_anchor(full_text: &str) -> Option<String> {
     let mut lines = Vec::new();
@@ -379,20 +386,36 @@ fn anchor_worthy_user_input(user_line: &str) -> bool {
 }
 
 pub(crate) async fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
-    match load_active_tasks_for_anchor(state).await {
-        Ok(active_tasks) => {
+    let preserved_task_board = state
+        .continuation_anchor
+        .as_ref()
+        .map(|anchor| anchor.active_task_board.clone())
+        .unwrap_or_default();
+    match tokio::time::timeout(
+        ACTIVE_TASK_ANCHOR_REFRESH_BUDGET,
+        load_active_tasks_for_anchor(state),
+    )
+    .await
+    {
+        Ok(Ok(active_tasks)) => {
             rebuild_continuation_anchor_from_state_with_active_tasks(state, &active_tasks);
         }
-        Err(error) => {
-            let preserved_task_board = state
-                .continuation_anchor
-                .as_ref()
-                .map(|anchor| anchor.active_task_board.clone())
-                .unwrap_or_default();
+        Ok(Err(error)) => {
             tracing::warn!(
                 session_id = %state.task_manager.session_id(),
                 error = %error,
                 "failed to refresh active task board for continuation anchor; preserving previous anchor task board"
+            );
+            rebuild_continuation_anchor_from_state_with_active_task_items(
+                state,
+                preserved_task_board,
+            );
+        }
+        Err(_) => {
+            tracing::debug!(
+                session_id = %state.task_manager.session_id(),
+                budget_ms = ACTIVE_TASK_ANCHOR_REFRESH_BUDGET.as_millis() as u64,
+                "active task board refresh exceeded post-output budget; preserving previous anchor task board"
             );
             rebuild_continuation_anchor_from_state_with_active_task_items(
                 state,
@@ -694,6 +717,73 @@ mod tests {
             anchor.active_task_board,
             vec!["[in_progress] task-1: Preserve me".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn rebuild_continuation_anchor_does_not_wait_for_a_stalled_remote_task_board() {
+        struct StalledTaskStore;
+
+        #[async_trait::async_trait]
+        impl astra_tools::task_mgmt::TaskStore for StalledTaskStore {
+            async fn load(
+                &self,
+                _session_id: &str,
+            ) -> Result<Vec<astra_tools::task_mgmt::SessionTask>, String> {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok(Vec::new())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<astra_tools::task_mgmt::SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let mut state = SessionState {
+            task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::new(
+                "sess-anchor-stalled",
+                std::sync::Arc::new(StalledTaskStore),
+            )),
+            continuation_anchor: Some(ContinuationAnchor::from_parts(
+                "Latest user task: finish durable transcript loading\nActive task board:\n- [in_progress] task-1: Preserve live work",
+                Some("finish durable transcript loading".into()),
+                None,
+                vec!["[in_progress] task-1: Preserve live work".into()],
+            )),
+            ..SessionState::default()
+        };
+        state.history.push((
+            "继续".into(),
+            "The durable transcript remains available while the task service recovers.".into(),
+        ));
+
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            rebuild_continuation_anchor_from_live_state(&mut state),
+        )
+        .await;
+        assert!(
+            completed.is_ok(),
+            "continuation context must not wait for the remote task-store timeout"
+        );
+
+        let anchor = state.continuation_anchor.expect("anchor");
+        assert_eq!(
+            anchor.active_task_board,
+            vec!["[in_progress] task-1: Preserve live work".to_string()]
+        );
+        assert!(anchor.contains("task-1: Preserve live work"), "{anchor}");
     }
 
     #[test]

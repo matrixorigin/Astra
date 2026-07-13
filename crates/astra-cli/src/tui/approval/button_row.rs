@@ -145,18 +145,6 @@ impl ButtonRow {
         self.focus = (self.focus + 1) % self.buttons.len();
     }
 
-    /// Jump focus to the `No` button so Esc-as-default-reject can
-    /// still reuse the same activation path when we prefer to.
-    pub fn focus_reject(&mut self) {
-        if let Some(pos) = self
-            .buttons
-            .iter()
-            .position(|b| matches!(&b.action, ButtonAction::Respond(ApprovalResponse::Deny)))
-        {
-            self.focus = pos;
-        }
-    }
-
     /// What the currently focused button produces on activation.
     pub fn activate(&self) -> Option<ButtonAction> {
         self.buttons.get(self.focus).map(|b| b.action.clone())

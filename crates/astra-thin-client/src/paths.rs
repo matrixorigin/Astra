@@ -12,6 +12,9 @@ pub const TOOLS_RESULT: &str = "/tools/result";
 /// `POST` — design doc: user approval for gated tools.
 pub const APPROVAL_RESPOND: &str = "/approval/respond";
 
+/// `POST` — answer or cancel a durable `ask_user` interaction.
+pub const USER_PROMPT_RESPOND: &str = "/user-prompts/respond";
+
 /// `GET` — list durable runs.
 pub const RUNS: &str = "/runs";
 
@@ -52,6 +55,11 @@ pub fn session_resume(id: &str) -> String {
 #[inline]
 pub fn session_state(id: &str) -> String {
     format!("/sessions/{id}/state")
+}
+
+#[inline]
+pub fn session_runs(id: &str) -> String {
+    format!("/sessions/{id}/runs")
 }
 
 #[inline]
@@ -136,8 +144,8 @@ pub fn chat_run_stream(run_id: &str) -> String {
 }
 
 #[inline]
-pub fn chat_run_input(run_id: &str) -> String {
-    format!("/chat/runs/{run_id}/input")
+pub fn chat_run_user_intents(run_id: &str) -> String {
+    format!("/chat/runs/{run_id}/intents")
 }
 
 #[inline]
@@ -441,6 +449,11 @@ mod tests {
     }
 
     #[test]
+    fn session_runs_path() {
+        assert_eq!(session_runs("s1"), "/sessions/s1/runs");
+    }
+
+    #[test]
     fn session_transcript_path() {
         assert_eq!(session_transcript("s1"), "/sessions/s1/transcript");
     }
@@ -526,8 +539,8 @@ mod tests {
     }
 
     #[test]
-    fn chat_run_input_path() {
-        assert_eq!(chat_run_input("r1"), "/chat/runs/r1/input");
+    fn chat_run_user_intents_path() {
+        assert_eq!(chat_run_user_intents("r1"), "/chat/runs/r1/intents");
     }
 
     #[test]

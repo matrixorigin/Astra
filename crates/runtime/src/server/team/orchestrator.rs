@@ -172,7 +172,13 @@ impl TeamExecutionOrchestrator {
 
         // Resolve members → profiles using the new resolve_team with registry lookup
         let registry = self.profile_registry.read().await;
-        let (request, profiles) = match resolve_team(&team, task, &parent_run_id, Some(&registry)) {
+        let (request, profiles) = match resolve_team(
+            &team,
+            task,
+            &parent_run_id,
+            &self.config.session_id,
+            Some(&registry),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 drop(registry);
@@ -239,12 +245,6 @@ impl TeamExecutionOrchestrator {
         let agent_ids: Vec<String> = profiles.iter().map(|p| p.agent_id.clone()).collect();
 
         let mut effective_request = request;
-
-        // Inject session_id so sub-runs can find the parent session.
-        effective_request.context.insert(
-            "session_id".to_string(),
-            serde_json::Value::String(self.config.session_id.clone()),
-        );
 
         // Inject budget and max_parallel into request context for downstream consumers.
         // `max_duration_secs` is enforced via tokio::time::timeout + CancellationToken.

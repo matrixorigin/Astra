@@ -145,7 +145,6 @@ pub use cloud::session_memory_extract as cloud_session_memory_extract;
 pub use cloud::summary as cloud_summary;
 pub use cloud::tool_delivery as cloud_tool_delivery;
 pub use tool::args::hints as tool_argument_hints;
-pub use tool::args::repair as tool_args_repair;
 pub use tool::args::shape as tool_call_shape;
 pub use tool::categories as tool_categories;
 pub use tool::categories::surface as tool_surface;

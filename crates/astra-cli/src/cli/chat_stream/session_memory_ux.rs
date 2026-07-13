@@ -88,7 +88,7 @@ impl SessionMemoryUxBridge {
                                 &mut showed_started,
                                 &mut started_deadline,
                                 &mut errored_extractions,
-                            ),
+                            ).await,
                             // Dropped events due to slow consumer. Keep
                             // the bridge alive — subsequent events still
                             // reach us. Only `Closed` means the sender
@@ -121,7 +121,7 @@ impl SessionMemoryUxBridge {
                         if !showed_started {
                             let _ = tx.send(StreamEvent::StatusLine(
                                 "💭 Updating session memory…".to_string(),
-                            ));
+                            )).await;
                             showed_started = true;
                         }
                         started_deadline = None;
@@ -143,7 +143,7 @@ impl Drop for SessionMemoryUxBridge {
     }
 }
 
-fn handle_event(
+async fn handle_event(
     event: BackgroundActivity,
     tx: &StreamEventTx,
     showed_started: &mut bool,
@@ -168,10 +168,12 @@ fn handle_event(
             let key = (session_id, turn);
             match source {
                 SessionMemoryExtractionSource::Llm if duration_ms >= FINISHED_MIN_DURATION_MS => {
-                    let _ = tx.send(StreamEvent::StatusLine(format!(
-                        "💭 Session memory updated ({}ms)",
-                        duration_ms
-                    )));
+                    let _ = tx
+                        .send(StreamEvent::StatusLine(format!(
+                            "💭 Session memory updated ({}ms)",
+                            duration_ms
+                        )))
+                        .await;
                 }
                 SessionMemoryExtractionSource::Llm => {
                     // LLM finished faster than the debounce — we never
@@ -179,10 +181,12 @@ fn handle_event(
                 }
                 SessionMemoryExtractionSource::RuleFallback => {
                     if errored_extractions.remove(&key) {
-                        let _ = tx.send(StreamEvent::StatusLine(format!(
-                            "💭 Session memory recovered after extraction failure ({}ms)",
-                            duration_ms
-                        )));
+                        let _ = tx
+                            .send(StreamEvent::StatusLine(format!(
+                                "💭 Session memory recovered after extraction failure ({}ms)",
+                                duration_ms
+                            )))
+                            .await;
                     }
                 }
             }
@@ -204,7 +208,7 @@ fn handle_event(
                 ),
                 _ => format!("⚠ session memory extraction failed ({reason:?}, {duration_ms}ms)"),
             };
-            let _ = tx.send(StreamEvent::StatusLine(line));
+            let _ = tx.send(StreamEvent::StatusLine(line)).await;
             *showed_started = false;
             errored_extractions.insert((session_id, turn));
         }
@@ -214,6 +218,7 @@ fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::SessionMemoryUxBridge;
+    use crate::cli::chat_stream::params::{StreamEvent, StreamEventRx, stream_event_channel};
     use astra_runtime::session_memory::{
         BackgroundActivity, BackgroundActivityBroker, ConstSelectorResolver,
         MemoryExtractionService,
@@ -225,9 +230,6 @@ mod tests {
     };
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::mpsc;
-
-    use crate::cli::chat_stream::params::StreamEvent;
 
     /// Minimal no-op Memoria client for UX-level tests: never stores,
     /// never retrieves — the UX bridge doesn't observe Memoria anyway.
@@ -273,7 +275,7 @@ mod tests {
         (svc, broker)
     }
 
-    async fn drain_status_lines(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) -> Vec<String> {
+    async fn drain_status_lines(rx: &mut StreamEventRx) -> Vec<String> {
         let mut out = Vec::new();
         // Give the bridge a moment to process emitted events.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -288,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn fast_rule_based_is_silent() {
         let (svc, broker) = build_service();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let _bridge = SessionMemoryUxBridge::spawn(Some(&svc), Some(tx));
 
         broker.emit(BackgroundActivity::Finished {
@@ -307,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn llm_error_followed_by_fallback_surfaces_recovery() {
         let (svc, broker) = build_service();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let _bridge = SessionMemoryUxBridge::spawn(Some(&svc), Some(tx));
 
         broker.emit(BackgroundActivity::Errored {
@@ -340,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn fallback_recovery_state_is_isolated_per_session_and_turn() {
         let (svc, broker) = build_service();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let _bridge = SessionMemoryUxBridge::spawn(Some(&svc), Some(tx));
 
         broker.emit(BackgroundActivity::Errored {
@@ -382,7 +384,7 @@ mod tests {
     #[tokio::test]
     async fn slow_llm_surfaces_completion() {
         let (svc, broker) = build_service();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let _bridge = SessionMemoryUxBridge::spawn(Some(&svc), Some(tx));
 
         broker.emit(BackgroundActivity::Finished {
@@ -403,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn errored_always_surfaces() {
         let (svc, broker) = build_service();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let _bridge = SessionMemoryUxBridge::spawn(Some(&svc), Some(tx));
 
         broker.emit(BackgroundActivity::Errored {
@@ -425,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn started_debounce_suppresses_fast_extraction() {
         let (svc, broker) = build_service();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let _bridge = SessionMemoryUxBridge::spawn(Some(&svc), Some(tx));
 
         broker.emit(BackgroundActivity::Started {
@@ -465,7 +467,7 @@ mod tests {
             "lagged-test",
             Arc::clone(&broker),
         ));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = stream_event_channel();
         let _bridge = SessionMemoryUxBridge::spawn(Some(&svc), Some(tx));
 
         // Flood the broker faster than the bridge can drain — the
@@ -506,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn bridge_survives_stream_tx_drop_before_event() {
         let (svc, broker) = build_service();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = stream_event_channel();
         let bridge = SessionMemoryUxBridge::spawn(Some(&svc), Some(tx));
 
         // Close the receiver side → all subsequent sends on `tx`
@@ -546,7 +548,7 @@ mod tests {
         drop(bridge);
 
         // Sink but no service.
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = stream_event_channel();
         let bridge = SessionMemoryUxBridge::spawn(None, Some(tx));
         drop(bridge);
         // assertion: no panic, no hang — all three combinations

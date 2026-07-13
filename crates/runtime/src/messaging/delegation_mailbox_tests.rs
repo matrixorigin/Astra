@@ -125,6 +125,7 @@ mod tests {
 
     fn fan_out_request(agents: Vec<&str>) -> DelegationRequest {
         DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-mailbox-test".into(),
             parent_run_id: "parent-run".into(),
             task: "test task with mailbox".into(),

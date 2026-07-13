@@ -113,7 +113,11 @@ pub(crate) async fn handle_plan_command(
         plan_request.to_string(),
         Some(&token),
         state,
-        crate::cli::turn::turn_entry::TurnContext { api, profile },
+        crate::cli::turn::turn_entry::TurnContext {
+            api,
+            profile,
+            post_commit_tx: None,
+        },
     )
     .await?;
     Ok(())

@@ -9,13 +9,13 @@ use axum::extract::Extension;
 
 use super::*;
 
-use astra_services::session_journal::{
-    ApprovalDecisionAppendOutcome, append_approval_decision_for_run_if_absent, validate_session_id,
-};
+use astra_services::session_journal::validate_session_id;
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
+use astra_tools::{AskUserAnswers, AskUserPrompt, normalize_ask_user_answers};
 use serde::Deserialize;
+use serde_json::Value;
 
-use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, approval_callback_key, tool_callback_key};
+use astra_turn_core::edge_ledger::{LEDGER_MAX_ENTRIES, tool_callback_key};
 
 /// Server-enforced cap on `last_seen_request_ids` entries per heartbeat.
 /// Excess entries beyond this limit are silently dropped — the edge will
@@ -91,34 +91,6 @@ pub(crate) fn insert_ledger_entry(
         return Err(LedgerInsertError::DuplicateKey);
     }
     if ledger.len() >= LEDGER_MAX_ENTRIES {
-        return Err(LedgerInsertError::CapacityExceeded);
-    }
-    ledger.insert(key.clone(), value);
-    astra_turn_core::edge_ledger::on_ledger_insert(&key);
-    Ok(true)
-}
-
-/// Insert an approval-callback ledger entry. Same idempotency contract
-/// as [`insert_ledger_entry`], plus: when the ledger is full AND
-/// `durable_fallback_ready` is true (session journal persisted the
-/// decision), return `Ok(false)` so the handler still responds 200 —
-/// the durable store is the source of truth for the approval decision.
-pub(crate) fn insert_approval_ledger_entry(
-    ledger: &mut std::collections::HashMap<String, serde_json::Value>,
-    key: String,
-    value: serde_json::Value,
-    durable_fallback_ready: bool,
-) -> Result<bool, LedgerInsertError> {
-    if let Some(existing) = ledger.get(&key) {
-        if existing == &value {
-            return Ok(false);
-        }
-        return Err(LedgerInsertError::DuplicateKey);
-    }
-    if ledger.len() >= LEDGER_MAX_ENTRIES {
-        if durable_fallback_ready {
-            return Ok(false);
-        }
         return Err(LedgerInsertError::CapacityExceeded);
     }
     ledger.insert(key.clone(), value);
@@ -287,7 +259,7 @@ pub(crate) async fn post_approval_respond_handler(
     let registry = state.metrics_registry();
     let run_id = body.run_id.trim();
     if run_id.is_empty() {
-        crate::server::interaction_metrics::record_approval_journal_write(
+        crate::server::interaction_metrics::record_approval_interaction_resolution(
             registry.as_ref(),
             "invalid_run",
         );
@@ -295,45 +267,68 @@ pub(crate) async fn post_approval_respond_handler(
     }
     let session_id = body.session_id.trim();
     if let Err(error) = validate_session_id(session_id) {
-        crate::server::interaction_metrics::record_approval_journal_write(
+        crate::server::interaction_metrics::record_approval_interaction_resolution(
             registry.as_ref(),
             "invalid_session",
         );
         return Err(error_response(StatusCode::BAD_REQUEST, error));
     }
-    let key = approval_callback_key(&user.user_id, session_id, run_id, &body.request_id);
+    // The bearer token proves the caller's identity, not that an arbitrary
+    // session/run pair in its body belongs to that identity.  Resolve the
+    // durable run through the lifecycle service before resolving shared state
+    // so a callback cannot cross session boundaries.
+    let target = state
+        .execution
+        .run_lifecycle_service
+        .get_run_status(run_id.to_string(), user.user_id.clone())
+        .await?;
+    if target.session_id != session_id {
+        crate::server::interaction_metrics::record_approval_interaction_resolution(
+            registry.as_ref(),
+            "session_mismatch",
+        );
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Approval request not found in this session",
+        ));
+    }
     let decision = match &body.decision {
         astra_thin_client::ApprovalDecision::Allow => "allow",
         astra_thin_client::ApprovalDecision::Deny => "deny",
         astra_thin_client::ApprovalDecision::AllowSession => "allow_session",
     };
-    let approval_kind = body.approval_kind.as_ref().map(|kind| match kind {
-        astra_thin_client::ApprovalKind::Standard => "standard",
-        astra_thin_client::ApprovalKind::Explicit => "explicit",
-    });
-    let approval_turn = match astra_services::session_journal::find_latest_approval_required_for_run(
-        session_id,
-        &body.request_id,
-        run_id,
-    ) {
+    let required = match state
+        .execution
+        .run_lifecycle_service
+        .get_run_interaction_event(
+            run_id.to_string(),
+            user.user_id.clone(),
+            body.request_id.clone(),
+            "approval_required".to_string(),
+        )
+        .await
+    {
         Ok(Some(request)) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
+            crate::server::interaction_metrics::record_approval_interaction_lookup(
                 registry.as_ref(),
                 "required",
                 "hit",
             );
-            request.turn
+            request
         }
         Ok(None) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
+            crate::server::interaction_metrics::record_approval_interaction_lookup(
                 registry.as_ref(),
                 "required",
                 "miss",
             );
-            None
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "Approval request not found for this run",
+            ));
         }
-        Err(e) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
+        Err((_, error)) => {
+            crate::server::interaction_metrics::record_approval_interaction_lookup(
                 registry.as_ref(),
                 "required",
                 "error",
@@ -343,51 +338,119 @@ pub(crate) async fn post_approval_respond_handler(
                 session_id = %session_id,
                 run_id = %run_id,
                 request_id = %body.request_id,
-                error = %e,
-                "approval journal lookup failed, treating as no prior request"
+                error = %error.0.detail,
+                "approval durable interaction lookup failed"
             );
-            None
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Approval request lookup failed",
+            ));
         }
     };
-    match append_approval_decision_for_run_if_absent(
-        session_id,
-        approval_turn,
-        &body.request_id,
-        run_id,
-        body.tool_name.as_deref(),
-        approval_kind,
-        decision,
-        body.reason.as_deref(),
-    ) {
-        Ok(ApprovalDecisionAppendOutcome::Appended) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
+    let required_data = required.get("data").unwrap_or(&required);
+    let required_tool = required_data
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            crate::server::interaction_metrics::record_approval_interaction_resolution(
+                registry.as_ref(),
+                "invalid_required_request",
+            );
+            error_response(
+                StatusCode::CONFLICT,
+                "Approval request is missing canonical tool identity",
+            )
+        })?;
+    let required_kind = required_data
+        .get("approval_kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            crate::server::interaction_metrics::record_approval_interaction_resolution(
+                registry.as_ref(),
+                "invalid_required_request",
+            );
+            error_response(
+                StatusCode::CONFLICT,
+                "Approval request is missing canonical approval kind",
+            )
+        })?;
+    if body
+        .tool_name
+        .as_deref()
+        .is_some_and(|tool| tool != required_tool)
+    {
+        crate::server::interaction_metrics::record_approval_interaction_resolution(
+            registry.as_ref(),
+            "tool_mismatch",
+        );
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Approval response does not match the requested tool",
+        ));
+    }
+    let body_kind = body.approval_kind.as_ref().map(|kind| match kind {
+        astra_thin_client::ApprovalKind::Standard => "standard",
+        astra_thin_client::ApprovalKind::Explicit => "explicit",
+    });
+    if body_kind.is_some_and(|kind| kind != required_kind) {
+        crate::server::interaction_metrics::record_approval_interaction_resolution(
+            registry.as_ref(),
+            "kind_mismatch",
+        );
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Approval response does not match the requested approval kind",
+        ));
+    }
+    let response_data = serde_json::json!({
+        "request_id": body.request_id,
+        "outcome": match decision { "allow" | "allow_session" => "approved", _ => "denied" },
+        "decision": decision,
+        "reason": body.reason,
+        "tool": required_tool,
+        "approval_kind": required_kind,
+    });
+    match state
+        .execution
+        .run_lifecycle_service
+        .resolve_run_interaction(
+            run_id.to_string(),
+            user.user_id.clone(),
+            body.request_id.clone(),
+            astra_services::runs::DurableRunInteractionKind::Approval,
+            response_data,
+        )
+        .await
+    {
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_)) => {
+            crate::server::interaction_metrics::record_approval_interaction_lookup(
                 registry.as_ref(),
                 "decision",
                 "miss",
             );
-            crate::server::interaction_metrics::record_approval_journal_write(
+            crate::server::interaction_metrics::record_approval_interaction_resolution(
                 registry.as_ref(),
                 "ok",
             );
         }
-        Ok(ApprovalDecisionAppendOutcome::Idempotent) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => {
+            crate::server::interaction_metrics::record_approval_interaction_lookup(
                 registry.as_ref(),
                 "decision",
                 "hit",
             );
-            crate::server::interaction_metrics::record_approval_journal_write(
+            crate::server::interaction_metrics::record_approval_interaction_resolution(
                 registry.as_ref(),
                 "idempotent",
             );
         }
-        Ok(ApprovalDecisionAppendOutcome::Conflict(existing)) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(existing)) => {
+            crate::server::interaction_metrics::record_approval_interaction_lookup(
                 registry.as_ref(),
                 "decision",
                 "hit",
             );
-            crate::server::interaction_metrics::record_approval_journal_write(
+            crate::server::interaction_metrics::record_approval_interaction_resolution(
                 registry.as_ref(),
                 "conflict",
             );
@@ -395,72 +458,43 @@ pub(crate) async fn post_approval_respond_handler(
                 StatusCode::CONFLICT,
                 format!(
                     "approval decision already recorded for request {} run {} as {}",
-                    existing.request_id, run_id, existing.decision
+                    body.request_id,
+                    run_id,
+                    existing
+                        .pointer("/data/decision")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
                 ),
             ));
         }
-        Err(error) => {
-            crate::server::interaction_metrics::record_approval_journal_lookup(
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::MissingRequest) => {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "Approval request not found for this run",
+            ));
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting) => {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Approval request is no longer waiting for a response",
+            ));
+        }
+        Err((_, error)) => {
+            crate::server::interaction_metrics::record_approval_interaction_lookup(
                 registry.as_ref(),
                 "decision",
                 "error",
             );
-            crate::server::interaction_metrics::record_approval_journal_write(
+            crate::server::interaction_metrics::record_approval_interaction_resolution(
                 registry.as_ref(),
                 "error",
             );
             return Err(error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("approval journal append failed: {error}"),
+                format!("approval durable resolution failed: {}", error.0.detail),
             ));
         }
     }
-    let ledger_value = serde_json::json!({
-        "kind": "approval_respond",
-        "user_id": user.user_id,
-        "edge_id": edge_id,
-        "body": serde_json::to_value(&body).map_err(|e| {
-            error_response(
-                StatusCode::BAD_REQUEST,
-                format!("failed to serialize approval_respond body for ledger: {e}"),
-            )
-        })?,
-    });
-    let ledger_result = {
-        let mut lock = state.edge_callback_ledger.lock().await;
-        let new_key = !lock.contains_key(&key);
-        let ledger_full = lock.len() >= LEDGER_MAX_ENTRIES;
-        match insert_approval_ledger_entry(&mut lock, key.clone(), ledger_value, true) {
-            Ok(enqueued) => {
-                let outcome = if enqueued {
-                    "inserted"
-                } else if new_key && ledger_full {
-                    "durable_fallback"
-                } else {
-                    "idempotent_replay"
-                };
-                Ok((enqueued, outcome))
-            }
-            Err(err) => Err(err),
-        }
-    };
-    let (ledger_enqueued, ledger_outcome) = match ledger_result {
-        Ok(result) => result,
-        Err(err) => {
-            crate::server::interaction_metrics::record_approval_ledger_insert(
-                registry.as_ref(),
-                match err {
-                    LedgerInsertError::CapacityExceeded => "capacity_exceeded",
-                    LedgerInsertError::DuplicateKey => "duplicate_key",
-                },
-            );
-            return Err(ledger_insert_error_response(&key, err));
-        }
-    };
-    crate::server::interaction_metrics::record_approval_ledger_insert(
-        registry.as_ref(),
-        ledger_outcome,
-    );
     tracing::info!(
         target: "astra_runtime::edge_callback",
         request_id = %trace.request_id,
@@ -468,13 +502,202 @@ pub(crate) async fn post_approval_respond_handler(
         edge_id = %edge_id,
         callback_request_id = %body.request_id,
         kind = "approval_respond",
-        ledger_enqueued,
-        "edge approval callback recorded"
+        "durable approval callback committed"
     );
     Ok(Json(serde_json::json!({
         "ok": true,
         "request_id": body.request_id,
-        "ledger_enqueued": ledger_enqueued,
+        "durable": true,
+    })))
+}
+
+/// Resolve a durable `ask_user` interaction.
+///
+/// This endpoint intentionally validates the authenticated run/session and
+/// the canonical prompted questionnaire before resolving shared run state. A
+/// response is an immutable terminal fact: identical
+/// retries are accepted, while late or divergent answers conflict instead of
+/// poisoning recovery state.
+pub(crate) async fn post_user_prompt_respond_handler(
+    Extension(trace): Extension<RequestTrace>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<astra_thin_client::UserPromptRespondRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let edge_id = edge_id_from_headers(&headers);
+    let run_id = body.run_id.trim();
+    let session_id = body.session_id.trim();
+    let request_id = body.request_id.trim();
+    if run_id.is_empty() || request_id.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "run_id and request_id are required",
+        ));
+    }
+    if let Err(error) = validate_session_id(session_id) {
+        return Err(error_response(StatusCode::BAD_REQUEST, error));
+    }
+    if body.cancelled == body.answers.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "exactly one of cancelled=true or answers is required",
+        ));
+    }
+
+    let target = state
+        .execution
+        .run_lifecycle_service
+        .get_run_status(run_id.to_string(), user.user_id.clone())
+        .await?;
+    if target.session_id != session_id {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "User prompt request not found in this session",
+        ));
+    }
+
+    let required = match state
+        .execution
+        .run_lifecycle_service
+        .get_run_interaction_event(
+            run_id.to_string(),
+            user.user_id.clone(),
+            request_id.to_string(),
+            "ask_user_prompted".to_string(),
+        )
+        .await
+    {
+        Ok(Some(required)) => required,
+        Ok(None) => {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "User prompt request not found for this run",
+            ));
+        }
+        Err((_, error)) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_callback",
+                user_id = %user.user_id,
+                session_id,
+                run_id,
+                request_id,
+                error = %error.0.detail,
+                "ask_user durable interaction lookup failed"
+            );
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "User prompt request lookup failed",
+            ));
+        }
+    };
+    let prompt: AskUserPrompt = serde_json::from_value(
+        required
+            .pointer("/data/prompt")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|error| {
+        error_response(
+            StatusCode::CONFLICT,
+            format!("User prompt request has invalid canonical questionnaire: {error}"),
+        )
+    })?;
+    let normalized_answers = if body.cancelled {
+        None
+    } else {
+        let raw_answers = body.answers.clone().ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "answers are required when cancelled is false",
+            )
+        })?;
+        let submitted: AskUserAnswers = serde_json::from_value(raw_answers).map_err(|error| {
+            error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("Invalid user prompt answers: {error}"),
+            )
+        })?;
+        let normalized = normalize_ask_user_answers(&prompt, &submitted)
+            .map_err(|error| error_response(StatusCode::UNPROCESSABLE_ENTITY, error))?;
+        Some(serde_json::to_value(normalized).map_err(|error| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to serialize normalized user prompt answers: {error}"),
+            )
+        })?)
+    };
+    let status = if body.cancelled {
+        "cancelled"
+    } else {
+        "submitted"
+    };
+    let response_data = serde_json::json!({
+        "request_id": request_id,
+        "outcome": status,
+        "answers": normalized_answers.clone(),
+    });
+    match state
+        .execution
+        .run_lifecycle_service
+        .resolve_run_interaction(
+            run_id.to_string(),
+            user.user_id.clone(),
+            request_id.to_string(),
+            astra_services::runs::DurableRunInteractionKind::AskUser,
+            response_data,
+        )
+        .await
+    {
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_))
+        | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => {}
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(existing)) => {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "user prompt response already recorded for request {} run {} as {}",
+                    request_id,
+                    run_id,
+                    existing
+                        .pointer("/data/outcome")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+            ));
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::MissingRequest) => {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "User prompt request not found for this run",
+            ));
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting) => {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "User prompt request is no longer waiting for a response",
+            ));
+        }
+        Err((_, error)) => {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("user prompt durable resolution failed: {}", error.0.detail),
+            ));
+        }
+    }
+
+    tracing::info!(
+        target: "astra_runtime::edge_callback",
+        request_id = %trace.request_id,
+        user_id = %user.user_id,
+        edge_id = %edge_id,
+        callback_request_id = %request_id,
+        kind = "user_prompt_respond",
+        "durable user prompt callback committed"
+    );
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "request_id": request_id,
+        "durable": true,
     })))
 }
 
@@ -625,17 +848,19 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
 #[cfg(test)]
 mod edge_callback_insert_tests {
     //! Phase-R adversarial regression tests for the edge callback ledger
-    //! insert helpers. These directly exercise [`insert_ledger_entry`] /
-    //! [`insert_approval_ledger_entry`] without the full HTTP stack: the
-    //! point is to lock in the "at-most-once" contract broken by the
-    //! previous `contains_key` short-circuit.
+    //! insert helpers. These directly exercise [`insert_ledger_entry`] without
+    //! the full HTTP stack and lock in tool-result callback idempotency.
 
     use super::{
-        EdgeRegisterRequest, LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry,
-        post_approval_respond_handler, post_tool_result_handler,
+        EdgeRegisterRequest, LedgerInsertError, insert_ledger_entry, post_approval_respond_handler,
+        post_tool_result_handler, post_user_prompt_respond_handler,
     };
     use crate::server::RequestTrace;
     use crate::{AppState, HealthChecker, ServiceInfo};
+    use astra_services::runs::{
+        CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
+        RunListCursor, RunListRecord, RunStatusRecord,
+    };
     use astra_services::{
         AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
         AuthTokenRecord, AuthUserRecord, EdgeDispatchIdentity, EdgeDispatchRow,
@@ -706,6 +931,197 @@ mod edge_callback_insert_tests {
                 display_name: None,
             })
         }
+    }
+
+    #[derive(Clone)]
+    struct ApprovalTargetRunLifecycle {
+        run_id: String,
+        session_id: String,
+        required: Arc<Mutex<HashMap<(String, String), serde_json::Value>>>,
+        resolved: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    }
+
+    impl ApprovalTargetRunLifecycle {
+        fn new(run_id: impl Into<String>, session_id: impl Into<String>) -> Self {
+            Self {
+                run_id: run_id.into(),
+                session_id: session_id.into(),
+                required: Arc::new(Mutex::new(HashMap::new())),
+                resolved: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+
+        fn with_required(
+            self,
+            request_id: &str,
+            event_type: &str,
+            data: serde_json::Value,
+        ) -> Self {
+            self.required.lock().unwrap().insert(
+                (request_id.to_string(), event_type.to_string()),
+                json!({"event_type": event_type, "data": data}),
+            );
+            self
+        }
+    }
+
+    #[async_trait]
+    impl RunLifecycleService for ApprovalTargetRunLifecycle {
+        async fn create_run(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unreachable!("approval callback only resolves an existing run")
+        }
+
+        async fn stream_chat(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unreachable!("approval callback only resolves an existing run")
+        }
+
+        async fn get_run_status(
+            &self,
+            run_id: String,
+            user_id: String,
+        ) -> Result<RunStatusRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            if run_id != self.run_id || user_id != "u-approval" {
+                return Err(astra_core::error_response(
+                    StatusCode::NOT_FOUND,
+                    "Run not found",
+                ));
+            }
+            Ok(RunStatusRecord {
+                run_id,
+                session_id: self.session_id.clone(),
+                status: "waiting".into(),
+                waiting_for: Some("tool_approval".into()),
+                events_count: 1,
+                workspace: None,
+                executor: None,
+                transport: None,
+            })
+        }
+
+        async fn get_run_interaction_event(
+            &self,
+            run_id: String,
+            user_id: String,
+            request_id: String,
+            event_type: String,
+        ) -> Result<Option<serde_json::Value>, (StatusCode, Json<crate::ErrorResponse>)> {
+            if run_id != self.run_id || user_id != "u-approval" {
+                return Err(astra_core::error_response(
+                    StatusCode::NOT_FOUND,
+                    "Run not found",
+                ));
+            }
+            Ok(self
+                .required
+                .lock()
+                .unwrap()
+                .get(&(request_id, event_type))
+                .cloned())
+        }
+
+        async fn resolve_run_interaction(
+            &self,
+            run_id: String,
+            user_id: String,
+            request_id: String,
+            kind: astra_services::runs::DurableRunInteractionKind,
+            response_data: serde_json::Value,
+        ) -> Result<
+            astra_services::runs::DurableRunInteractionResolveOutcome,
+            (StatusCode, Json<crate::ErrorResponse>),
+        > {
+            if run_id != self.run_id || user_id != "u-approval" {
+                return Err(astra_core::error_response(
+                    StatusCode::NOT_FOUND,
+                    "Run not found",
+                ));
+            }
+            if !self
+                .required
+                .lock()
+                .unwrap()
+                .contains_key(&(request_id.clone(), kind.required_event_type().to_string()))
+            {
+                return Ok(
+                    astra_services::runs::DurableRunInteractionResolveOutcome::MissingRequest,
+                );
+            }
+            let mut resolved = self.resolved.lock().unwrap();
+            if let Some(existing) = resolved.get(&request_id) {
+                return Ok(if existing.get("data") == Some(&response_data) {
+                    astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(
+                        existing.clone(),
+                    )
+                } else {
+                    astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(
+                        existing.clone(),
+                    )
+                });
+            }
+            let event = json!({
+                "event_type": kind.resolved_event_type(),
+                "data": response_data,
+            });
+            resolved.insert(request_id, event.clone());
+            Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(event))
+        }
+
+        async fn stream_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+            _last_index: u32,
+        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<crate::ErrorResponse>)> {
+            unreachable!("approval callback does not stream runs")
+        }
+
+        async fn cancel_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<CancelRunRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unreachable!("approval callback does not cancel runs")
+        }
+
+        async fn list_runs_cursor(
+            &self,
+            _user_id: String,
+            _limit: u32,
+            _cursor: Option<RunListCursor>,
+        ) -> Result<RunListRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unreachable!("approval callback does not list runs")
+        }
+    }
+
+    fn approval_callback_state(run_id: &str, session_id: &str) -> AppState {
+        AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(Arc::new(ApprovalTargetRunLifecycle::new(
+                run_id, session_id,
+            )))
+    }
+
+    fn approval_callback_state_with_required(
+        run_id: &str,
+        session_id: &str,
+        request_id: &str,
+        event_type: &str,
+        data: serde_json::Value,
+    ) -> AppState {
+        AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_run_lifecycle_service(Arc::new(
+                ApprovalTargetRunLifecycle::new(run_id, session_id)
+                    .with_required(request_id, event_type, data),
+            ))
     }
 
     #[derive(Default)]
@@ -847,60 +1263,6 @@ mod edge_callback_insert_tests {
     }
 
     #[test]
-    fn duplicate_approval_insert_different_payload_is_conflict() {
-        let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
-        let key = "u1:approval:a1".to_string();
-        let first = json!({"body": {"decision": "allow"}});
-        let second = json!({"body": {"decision": "deny"}});
-
-        assert_eq!(
-            insert_approval_ledger_entry(&mut ledger, key.clone(), first.clone(), false),
-            Ok(true)
-        );
-        let err = insert_approval_ledger_entry(&mut ledger, key.clone(), second, false)
-            .expect_err("different approval decision for same key must conflict");
-        assert_eq!(err, LedgerInsertError::DuplicateKey);
-
-        let stored = ledger.get(&key).expect("first approval still present");
-        assert_eq!(stored, &first);
-    }
-
-    #[test]
-    fn duplicate_approval_insert_identical_payload_is_idempotent_replay() {
-        let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
-        let key = "u1:approval:a1".to_string();
-        let value = json!({"body": {"decision": "allow"}});
-
-        assert_eq!(
-            insert_approval_ledger_entry(&mut ledger, key.clone(), value.clone(), false),
-            Ok(true)
-        );
-        assert_eq!(
-            insert_approval_ledger_entry(&mut ledger, key.clone(), value.clone(), false),
-            Ok(false),
-            "identical approval payload replay must be idempotent"
-        );
-    }
-
-    #[test]
-    fn duplicate_approval_insert_rejected_even_with_durable_fallback_ready() {
-        // Durable fallback only relaxes the capacity path; a true conflict
-        // (different payload for same key) must still be rejected so
-        // replayed callbacks never overwrite.
-        let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
-        let key = "u1:approval:a1".to_string();
-        let first = json!({"body": {"decision": "allow"}});
-        let second = json!({"body": {"decision": "deny"}});
-
-        insert_approval_ledger_entry(&mut ledger, key.clone(), first.clone(), true).unwrap();
-        let err = insert_approval_ledger_entry(&mut ledger, key.clone(), second, true).expect_err(
-            "differing-payload duplicate must still be rejected under durable fallback",
-        );
-        assert_eq!(err, LedgerInsertError::DuplicateKey);
-        assert_eq!(ledger.get(&key), Some(&first));
-    }
-
-    #[test]
     fn distinct_keys_still_insert_normally() {
         let mut ledger: HashMap<String, serde_json::Value> = HashMap::new();
         for i in 0..10 {
@@ -921,34 +1283,21 @@ mod edge_callback_insert_tests {
         let err = insert_ledger_entry(&mut ledger, "u:tool:new".into(), json!("nope"))
             .expect_err("full ledger should reject new key");
         assert_eq!(err, LedgerInsertError::CapacityExceeded);
-
-        // Approval variant without durable fallback → same CapacityExceeded.
-        let err = insert_approval_ledger_entry(
-            &mut ledger,
-            "u:approval:new".into(),
-            json!("nope"),
-            false,
-        )
-        .expect_err("full ledger + no fallback should reject");
-        assert_eq!(err, LedgerInsertError::CapacityExceeded);
-
-        // Approval variant WITH durable fallback → returns Ok(false), not error.
-        let out = insert_approval_ledger_entry(
-            &mut ledger,
-            "u:approval:new2".into(),
-            json!("nope"),
-            true,
-        )
-        .expect("durable fallback path returns Ok(false)");
-        assert!(!out, "durable fallback path signals not-enqueued");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn approval_handler_persists_journal_when_ledger_is_full() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
-            .with_auth_service(Arc::new(StaticAuthService));
+    async fn approval_handler_resolves_shared_state_without_local_ledger_capacity() {
+        let state = approval_callback_state_with_required(
+            "run-approval",
+            "sess-approval",
+            "req-approval",
+            "approval_required",
+            json!({
+                "request_id": "req-approval",
+                "tool": "write_file",
+                "approval_kind": "explicit",
+            }),
+        );
         {
             let mut ledger = state.edge_callback_ledger.lock().await;
             for i in 0..LEDGER_MAX_ENTRIES {
@@ -963,11 +1312,11 @@ mod edge_callback_insert_tests {
             State(state.clone()),
             HeaderMap::new(),
             Json(astra_thin_client::ApprovalRespondRequest {
-                request_id: "req-approval-journal".into(),
+                request_id: "req-approval".into(),
                 decision: astra_thin_client::ApprovalDecision::Allow,
                 reason: Some("approved in another pod".into()),
-                session_id: "sess-approval-journal".into(),
-                run_id: "run-approval-journal".into(),
+                session_id: "sess-approval".into(),
+                run_id: "run-approval".into(),
                 tool_name: Some("write_file".into()),
                 approval_kind: Some(astra_thin_client::ApprovalKind::Explicit),
             }),
@@ -976,51 +1325,91 @@ mod edge_callback_insert_tests {
         .expect("durable approval response should not fail when local ledger is full");
 
         assert_eq!(response.0["ok"], true);
-        assert_eq!(response.0["ledger_enqueued"], false);
-
-        let decision = astra_services::session_journal::find_latest_approval_decision_for_run(
-            "sess-approval-journal",
-            "req-approval-journal",
-            "run-approval-journal",
-        )
-        .unwrap()
-        .expect("approval decision should be durable for no-sticky replay");
-        assert_eq!(decision.run_id.as_deref(), Some("run-approval-journal"));
-        assert_eq!(decision.decision, "allow");
-        assert_eq!(decision.reason.as_deref(), Some("approved in another pod"));
-        assert_eq!(decision.tool_name.as_deref(), Some("write_file"));
-        assert_eq!(decision.approval_kind.as_deref(), Some("explicit"));
+        assert_eq!(response.0["durable"], true);
 
         let ledger = state.edge_callback_ledger.lock().await;
         assert_eq!(ledger.len(), LEDGER_MAX_ENTRIES);
         assert!(
-            !ledger.contains_key(&astra_turn_core::edge_ledger::approval_callback_key(
-                "u-approval",
-                "sess-approval-journal",
-                "run-approval-journal",
-                "req-approval-journal"
-            )),
-            "full local ledger should not be required after durable approval persistence"
+            ledger.keys().all(|key| !key.contains("req-approval")),
+            "durable interactions must not depend on the process-local tool-result ledger"
         );
-        drop(ledger);
+    }
 
-        let metrics = state.metrics_registry().render_prometheus();
-        assert!(
-            metrics.contains(
-                "astra_interaction_approval_journal_lookup_total{event=\"decision\",outcome=\"miss\"} 1"
-            ),
-            "{metrics}"
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_prompt_handler_validates_canonical_request_and_survives_full_ledger() {
+        let state = approval_callback_state_with_required(
+            "run-user-prompt",
+            "sess-user-prompt",
+            "req-user-prompt",
+            "ask_user_prompted",
+            json!({
+                "request_id": "req-user-prompt",
+                "prompt": {
+                    "context": null,
+                    "questions": [{
+                        "header": "Scope",
+                        "question": "Continue?",
+                        "options": [
+                            {"label": "yes", "description": null, "preview": null},
+                            {"label": "no", "description": null, "preview": null}
+                        ],
+                        "multi_select": false,
+                        "allow_freeform": false
+                    }],
+                    "timeout_ms": null
+                }
+            }),
         );
-        assert!(
-            metrics.contains("astra_interaction_approval_journal_write_total{outcome=\"ok\"} 1"),
-            "{metrics}"
-        );
-        assert!(
-            metrics.contains(
-                "astra_interaction_approval_ledger_insert_total{outcome=\"durable_fallback\"} 1"
-            ),
-            "{metrics}"
-        );
+        {
+            let mut ledger = state.edge_callback_ledger.lock().await;
+            for i in 0..LEDGER_MAX_ENTRIES {
+                ledger.insert(format!("u-approval:tool:filled-{i}"), json!({"i": i}));
+            }
+        }
+
+        let response = post_user_prompt_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-user-prompt".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::UserPromptRespondRequest {
+                request_id: "req-user-prompt".into(),
+                session_id: "sess-user-prompt".into(),
+                run_id: "run-user-prompt".into(),
+                cancelled: false,
+                answers: Some(json!({
+                    "answers": [{
+                        "question": "Continue?",
+                        "answers": [" yes "],
+                        "multi_select": false,
+                        "annotation": null
+                    }]
+                })),
+            }),
+        )
+        .await
+        .expect("durable user prompt callback should not require local ledger capacity");
+        assert_eq!(response.0["ok"], true);
+        assert_eq!(response.0["durable"], true);
+
+        let conflict = post_user_prompt_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-user-prompt-late".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::UserPromptRespondRequest {
+                request_id: "req-user-prompt".into(),
+                session_id: "sess-user-prompt".into(),
+                run_id: "run-user-prompt".into(),
+                cancelled: true,
+                answers: None,
+            }),
+        )
+        .await
+        .expect_err("late conflicting answer must not overwrite the durable response");
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1119,6 +1508,100 @@ mod edge_callback_insert_tests {
             state.edge_callback_ledger.lock().await.is_empty(),
             "invalid approval response must not populate same-pod ledger"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_handler_rejects_run_from_another_session_without_side_effects() {
+        let state = approval_callback_state("run-owned", "session-owned");
+
+        let err = post_approval_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-approval-mismatch".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ApprovalRespondRequest {
+                request_id: "request-mismatch".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: None,
+                session_id: "session-not-owned-by-run".into(),
+                run_id: "run-owned".into(),
+                tool_name: Some("write_file".into()),
+                approval_kind: Some(astra_thin_client::ApprovalKind::Standard),
+            }),
+        )
+        .await
+        .expect_err("run/session mismatch must be rejected before recording a decision");
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(
+            state.edge_callback_ledger.lock().await.is_empty(),
+            "mismatched approval target must not enter the local callback ledger"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_handler_rejects_unknown_request_without_recording_a_decision() {
+        let state = approval_callback_state("run-known", "session-known");
+
+        let err = post_approval_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-approval-unknown".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ApprovalRespondRequest {
+                request_id: "unknown-request".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: None,
+                session_id: "session-known".into(),
+                run_id: "run-known".into(),
+                tool_name: Some("write_file".into()),
+                approval_kind: Some(astra_thin_client::ApprovalKind::Standard),
+            }),
+        )
+        .await
+        .expect_err("an approval response must name an existing durable request");
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(state.edge_callback_ledger.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_handler_rejects_tool_mismatch_without_overwriting_request_identity() {
+        let state = approval_callback_state_with_required(
+            "run-tool-match",
+            "session-tool-match",
+            "request-tool-match",
+            "approval_required",
+            json!({
+                "request_id": "request-tool-match",
+                "tool": "bash",
+                "approval_kind": "standard",
+            }),
+        );
+
+        let err = post_approval_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-approval-tool-mismatch".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ApprovalRespondRequest {
+                request_id: "request-tool-match".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: None,
+                session_id: "session-tool-match".into(),
+                run_id: "run-tool-match".into(),
+                tool_name: Some("write_file".into()),
+                approval_kind: Some(astra_thin_client::ApprovalKind::Standard),
+            }),
+        )
+        .await
+        .expect_err("approval response must retain the request's canonical tool identity");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(state.edge_callback_ledger.lock().await.is_empty());
     }
 
     #[test]

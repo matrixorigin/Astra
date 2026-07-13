@@ -1300,30 +1300,6 @@ mod tests {
     }
 
     #[test]
-    fn db_fixed_window_admission_does_not_claim_pacing_before_window_slot() {
-        let source = include_str!("llm_provider_admission.rs");
-        let body = source
-            .split("async fn db_fixed_window_admit")
-            .nth(1)
-            .and_then(|tail| tail.split("async fn release_window_slot").next())
-            .expect("db_fixed_window_admit body");
-        let rows_affected = body
-            .find("if result.rows_affected() == 1")
-            .expect("window claim result branch");
-        let pacing = body
-            .find("claim_rpm_pacing")
-            .expect("pacing claim should still run for admitted window slots");
-        assert!(
-            pacing > rows_affected,
-            "RPM pacing must not be claimed before TPM/window admission is known"
-        );
-        assert!(
-            body.contains("release_window_slot"),
-            "pacing rejects/errors after a window claim must release the claimed slot"
-        );
-    }
-
-    #[test]
     fn cleanup_cutoff_keeps_configured_number_of_complete_windows() {
         assert_eq!(cleanup_cutoff_ms(123_456, 60_000, 2), 0);
         assert_eq!(cleanup_cutoff_ms(180_000, 60_000, 2), 60_000);

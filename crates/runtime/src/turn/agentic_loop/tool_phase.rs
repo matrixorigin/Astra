@@ -155,13 +155,49 @@ fn agent_fanout_reason_from_edge_result(result: &EdgeToolExecResult) -> Option<S
 }
 
 fn tool_allows_host_owned_control_recovery(tool_name: &str) -> bool {
-    matches!(tool_name, "agent_fanout")
+    matches!(tool_name, "agent" | "agent_fanout")
+}
+
+/// A fanout start is complete only when the model receives the group identity
+/// and terminal/active status it needs to observe the launched children.
+///
+/// Transport failures can contain arbitrary non-empty text. Treating any text
+/// as a result strands already-created children outside the model's and UI's
+/// authoritative fanout registry, so validity is determined from the typed
+/// receipt shape instead of error wording or edge status.
+fn agent_fanout_start_receipt_is_usable(args: &Value, output: &str) -> bool {
+    if args.get("action").and_then(Value::as_str) != Some("start") {
+        return !output.trim().is_empty();
+    }
+    let Ok(receipt) = serde_json::from_str::<Value>(output) else {
+        return false;
+    };
+    receipt
+        .get("group_id")
+        .and_then(Value::as_str)
+        .is_some_and(|group_id| !group_id.trim().is_empty())
+        && receipt
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| !status.trim().is_empty())
+}
+
+fn control_tool_edge_result_is_usable(
+    tool_name: &str,
+    args: &Value,
+    edge_result: &EdgeToolExecResult,
+) -> bool {
+    match tool_name {
+        "agent_fanout" => agent_fanout_start_receipt_is_usable(args, &edge_result.output),
+        _ => !edge_result.output.trim().is_empty(),
+    }
 }
 
 async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
     host: &mut H,
     parent_run_id: Option<&str>,
     tool_calls: &[Value],
+    pre_resolved_results: &mut Vec<(String, String)>,
     edge_tool_round: &mut Vec<EdgeToolExecResult>,
 ) {
     for tool_call in tool_calls {
@@ -180,10 +216,20 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
             continue;
         };
         let args = tool_call_arguments_value(tool_call);
-        if edge_tool_round
+        // `agent_fanout.start` always returns a structured launch receipt. An
+        // edge row with an empty output is therefore just as unusable as a
+        // missing row: the child agents may already be running, but neither
+        // the model nor the UI can learn their group identity from it.
+        //
+        // Keep this narrowly scoped to host-owned control tools. The host can
+        // query the authoritative fanout registry without replaying the start
+        // operation; arbitrary tools must never be retried from this path.
+        let existing_row = edge_tool_round
             .iter()
-            .any(|edge| edge.request_id == tool_call_id)
-        {
+            .position(|edge| edge.request_id == tool_call_id);
+        if existing_row.is_some_and(|index| {
+            control_tool_edge_result_is_usable(tool_name, &args, &edge_tool_round[index])
+        }) {
             continue;
         }
         let recovered = match host
@@ -202,14 +248,29 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
             }
             ControlToolRecovery::Recovered(recovered) => recovered,
         };
+        // Host-owned control tools are resolved by the host, not by an edge
+        // executor. Routing the recovered value back through `edge_tool_round`
+        // would subject it to edge capability validation and can reject a
+        // successful control operation after it has already taken effect.
+        // Remove any unusable transport artifact and mark this call resolved
+        // in the same lane used by other upstream interception layers.
+        if let Some(index) = existing_row {
+            edge_tool_round.remove(index);
+        }
+        pre_resolved_results.retain(|(call_id, _)| call_id != tool_call_id);
+        pre_resolved_results.push((tool_call_id.to_string(), recovered.output));
+        let recovery_kind = if existing_row.is_some() {
+            "replaced unusable control-tool transport output with host-resolved result"
+        } else {
+            "recovered missing control-tool result from host state"
+        };
         tracing::warn!(
             target: "astra_runtime::agentic_loop_tool_phase",
             tool_name,
             tool_call_id,
-            status = %recovered.status,
-            "recovered missing control-tool edge row from host state"
+            recovery_kind,
+            "{recovery_kind}"
         );
-        edge_tool_round.push(recovered);
     }
 }
 
@@ -1200,8 +1261,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     let PreparedToolRound {
         tool_calls,
-        pre_resolved_results,
+        mut pre_resolved_results,
         mut edge_tool_round,
+        communication_events,
     } = prepare_intercepted_tool_round(
         state,
         &turn_result,
@@ -1210,10 +1272,14 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &valid_tool_names,
     )
     .await;
+    for event in communication_events {
+        host.on_agent_communication(event);
+    }
     recover_missing_control_tool_results(
         host,
         state.current_run_id.as_deref(),
         &tool_calls,
+        &mut pre_resolved_results,
         &mut edge_tool_round,
     )
     .await;
@@ -1257,6 +1323,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .as_ref()
         .map(|b| b.current_round())
         .unwrap_or(0);
+    let transcript_append_start = state.messages.len();
     {
         let mut term_adapter = HostTerminalAdapter(host);
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
@@ -1300,6 +1367,8 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         })
         .await;
     }
+    let transcript_appended = state.messages[transcript_append_start..].to_vec();
+    state.record_prompt_history_messages(transcript_appended);
 
     // Record LLM round in the turn event buffer and advance the round counter.
     // Also post-process new ToolCallRecords to set batch_id and parallel flags.
@@ -2155,7 +2224,7 @@ mod tests {
         record_recent_read_file_path(
             &mut reads,
             "read_file",
-            &json!({"path": "src/lib.rs", "offset": 10, "limit": 11}),
+            &json!({"path": "src/lib.rs", "start_line": 10, "end_line": 20}),
             2,
         );
 
@@ -2270,33 +2339,115 @@ mod tests {
                 "arguments": serde_json::to_string(&args).unwrap(),
             }
         })];
+        let mut pre_resolved_results = Vec::new();
         let mut edge_tool_round = Vec::new();
 
         recover_missing_control_tool_results(
             &mut host,
             Some("run-parent"),
             &tool_calls,
+            &mut pre_resolved_results,
             &mut edge_tool_round,
         )
         .await;
 
-        assert_eq!(edge_tool_round.len(), 1);
-        assert_eq!(edge_tool_round[0].args, args);
-        assert_eq!(host.recovered_control_requests.len(), 1);
-        let mut consumed = vec![false; edge_tool_round.len()];
-        let matched =
-            astra_turn_core::headless_tool_assembly::take_edge_output_for_tool_call_with_duration(
-                "agent_fanout",
-                &edge_tool_round[0].args,
-                &edge_tool_round,
-                &mut consumed,
-                &HashMap::new(),
-            );
-        assert_eq!(matched.output, recovered_output);
-        assert!(
-            !matched.output.contains("Error: headless edge protocol"),
-            "{matched:?}"
+        assert!(edge_tool_round.is_empty());
+        assert_eq!(
+            pre_resolved_results,
+            vec![("call-fanout".to_string(), recovered_output)]
         );
+        assert_eq!(host.recovered_control_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unstructured_agent_fanout_edge_output_is_replaced_with_registry_receipt() {
+        let args = json!({
+            "action": "start",
+            "group_id": "review-42",
+            "target_count": 1,
+            "slots": [
+                {"description": "Review storage", "prompt": "Review storage changes"}
+            ]
+        });
+        let recovered_output = json!({
+            "status": "started",
+            "group_id": "review-42",
+            "target_count": 1,
+            "agents": [{"slot_index": 0, "status": "launched"}]
+        })
+        .to_string();
+        let recovered = EdgeToolExecResult {
+            request_id: "call-fanout".to_string(),
+            tool: "agent_fanout".to_string(),
+            args: args.clone(),
+            output: recovered_output.clone(),
+            tool_result_fields: None,
+            status: "completed".to_string(),
+            duration_ms: 3,
+        };
+        let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
+            .with_recovered_control_tool_result(
+                "call-fanout",
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered),
+            );
+        let tool_calls = vec![json!({
+            "id": "call-fanout",
+            "type": "function",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": serde_json::to_string(&args).unwrap(),
+            }
+        })];
+        let mut edge_tool_round = vec![EdgeToolExecResult {
+            request_id: "call-fanout".to_string(),
+            tool: "agent_fanout".to_string(),
+            args: args.clone(),
+            output: "transport completed without a structured result".to_string(),
+            tool_result_fields: None,
+            status: "failed".to_string(),
+            duration_ms: 4,
+        }];
+        let mut pre_resolved_results = Vec::new();
+
+        recover_missing_control_tool_results(
+            &mut host,
+            Some("run-parent"),
+            &tool_calls,
+            &mut pre_resolved_results,
+            &mut edge_tool_round,
+        )
+        .await;
+
+        assert!(
+            edge_tool_round.is_empty(),
+            "the unusable transport row is removed"
+        );
+        assert_eq!(
+            pre_resolved_results,
+            vec![("call-fanout".to_string(), recovered_output.clone())]
+        );
+        assert_eq!(host.recovered_control_requests.len(), 1);
+        let receipt: Value = serde_json::from_str(&pre_resolved_results[0].1).unwrap();
+        assert_eq!(receipt["status"], "started");
+        assert_eq!(receipt["group_id"], "review-42");
+    }
+
+    #[test]
+    fn agent_fanout_start_requires_a_typed_launch_receipt() {
+        let args = json!({"action": "start", "target_count": 1, "slots": []});
+
+        assert!(!agent_fanout_start_receipt_is_usable(
+            &args,
+            "transport completed without a structured result"
+        ));
+        assert!(!agent_fanout_start_receipt_is_usable(
+            &args,
+            r#"{"status":"started"}"#
+        ));
+        assert!(agent_fanout_start_receipt_is_usable(
+            &args,
+            r#"{"status":"started","group_id":"review-42"}"#
+        ));
     }
 
     #[tokio::test]
@@ -2346,12 +2497,14 @@ mod tests {
                 "arguments": serde_json::to_string(&args).unwrap(),
             }
         })];
+        let mut pre_resolved_results = Vec::new();
         let mut edge_tool_round = vec![first_existing];
 
         recover_missing_control_tool_results(
             &mut host,
             Some("run-parent"),
             &tool_calls,
+            &mut pre_resolved_results,
             &mut edge_tool_round,
         )
         .await;
@@ -2361,7 +2514,13 @@ mod tests {
                 .iter()
                 .map(|edge| edge.request_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["call-fanout-a", "call-fanout-b"]
+            vec!["call-fanout-a"]
+        );
+        assert_eq!(pre_resolved_results.len(), 1);
+        assert_eq!(pre_resolved_results[0].0, "call-fanout-b");
+        assert_eq!(
+            serde_json::from_str::<Value>(&pre_resolved_results[0].1).unwrap()["marker"],
+            "b"
         );
         assert_eq!(
             host.recovered_control_requests
@@ -2396,17 +2555,20 @@ mod tests {
                 "arguments": serde_json::to_string(&json!({"cmd": "echo hi"})).unwrap(),
             }
         })];
+        let mut pre_resolved_results = Vec::new();
         let mut edge_tool_round = Vec::new();
 
         recover_missing_control_tool_results(
             &mut host,
             Some("run-parent"),
             &tool_calls,
+            &mut pre_resolved_results,
             &mut edge_tool_round,
         )
         .await;
 
         assert!(edge_tool_round.is_empty());
+        assert!(pre_resolved_results.is_empty());
         assert!(
             host.recovered_control_requests.is_empty(),
             "ordinary missing tool rows must not consume host-owned control recovery state"

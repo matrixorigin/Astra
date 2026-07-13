@@ -7,7 +7,7 @@ services:
   # ─── Infrastructure ─────────────────────────────────────────
 
   matrixone:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:4.0.0-rc3}
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
     hostname: matrixone
     entrypoint: /entrypoint.sh
     command: []

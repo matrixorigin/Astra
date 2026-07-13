@@ -17,7 +17,7 @@ use astra_turn_core::tool_registry_report::ToolSelectionReport;
 use crossterm::style::Stylize;
 use serde_json::Value;
 
-use crate::cli::stream::streaming_types::DeferredStreamUserInput;
+use crate::cli::stream::streaming_types::AppliedStreamUserIntent;
 use crate::explain_dag::ExplainTurnMeta;
 use crate::{ExplainMode, StreamResult, VerdictEvent};
 
@@ -173,7 +173,8 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) llm_rounds: Option<u32>,
     pub(crate) interruption: Option<serde_json::Value>,
     pub(crate) final_messages: Vec<serde_json::Value>,
-    pub(crate) deferred_user_inputs: Vec<DeferredStreamUserInput>,
+    pub(crate) run_transcript_messages: Vec<serde_json::Value>,
+    pub(crate) applied_user_intents: Vec<AppliedStreamUserIntent>,
 }
 
 pub(crate) fn resolved_tool_metrics<I>(
@@ -271,7 +272,8 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         llm_rounds,
         interruption,
         final_messages,
-        deferred_user_inputs,
+        run_transcript_messages,
+        applied_user_intents,
     } = ctx;
     let (tool_calls_count, tools_used) =
         resolved_tool_metrics(tool_calls_count, tools_used, &tool_call_records);
@@ -357,7 +359,8 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         final_state,
         interruption_kind,
         final_messages,
-        deferred_user_inputs,
+        run_transcript_messages,
+        applied_user_intents,
         background_agent_results: Vec::new(),
     }
 }
@@ -413,7 +416,8 @@ mod tests {
             llm_rounds: None,
             interruption: None,
             final_messages: Vec::new(),
-            deferred_user_inputs: Vec::new(),
+            run_transcript_messages: Vec::new(),
+            applied_user_intents: Vec::new(),
         }
     }
 
@@ -496,9 +500,9 @@ mod tests {
         let mut ctx = make_build_ctx(&sr, &tg);
         ctx.full_text = "  ".into();
         ctx.interruption = Some(serde_json::json!({
-            "kind": "guard_abort",
+            "kind": "harness_blocked",
             "resumable": false,
-            "error_detail": "guard pipeline abort"
+            "error_detail": "required harness capability is unavailable"
         }));
 
         let result = build_stream_result(ctx);
@@ -507,12 +511,12 @@ mod tests {
         assert!(
             result
                 .full_text
-                .starts_with("[guard_abort] Turn interrupted.")
+                .starts_with("[harness_blocked] Turn interrupted.")
         );
         assert!(
             result
                 .full_text
-                .contains("Stop reason: guard pipeline abort")
+                .contains("Stop reason: required harness capability is unavailable")
         );
     }
 

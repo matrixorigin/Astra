@@ -32,8 +32,16 @@
 
 ## Core model
 
-Everything on screen is a **HistoryCell**. One trait, one source of truth
-(`ChatWidget.history: Vec<Arc<dyn HistoryCell>>`), one rendering pipeline.
+The compact chat canvas is a **HistoryCell** projection, but it is not the
+authoritative history for every workbench surface. The TUI has two explicit
+read paths:
+
+- `ChatWidget` owns the local live conversation projection and terminal
+  scrollback.
+- Root and delegated transcript workspaces read the canonical ordered run
+  transcript. While a root page is catching up, the current local cell is
+  shown as a labelled local suffix; it is never merged into durable history by
+  matching text.
 
 - **Committed cells** live in `history` and are immutable. They flush to
   terminal scrollback exactly once (via `drain_new_committed`) and persist
@@ -44,6 +52,9 @@ Everything on screen is a **HistoryCell**. One trait, one source of truth
 - **Events** arrive as `AppEvent` (translated from the on-the-wire
   `TuiAppEvent` by `chat_widget::bridge::translate`). `ChatWidget::handle_event`
   is a single `match` that mutates `history` / `active_cell`.
+- **Agent runs** use the same transcript item browser as the root run. The
+  run navigator only selects a conversation; it never substitutes a task
+  summary for that run's working record.
 
 ### Screen regions
 
@@ -63,7 +74,7 @@ Everything on screen is a **HistoryCell**. One trait, one source of truth
 | **Footer** | Shortcuts hint (left) + model · dir · tokens · cost (right) | When no popup/overlay is active |
 | **Slash Popup** | Command list under composer, filters as user types `/…` | Composer text starts with `/` |
 | **Skill Popup** | Skill mention list, triggered by `$` | Composer text starts with `$` |
-| **Overlay Panel** | Full bottom-pane replacement (HelpView, ListSelectionView, TranscriptView, …). Esc closes. | When a view is pushed onto view_stack |
+| **Workspace / Overlay Panel** | A primary workspace (root/agent transcript or task board) replaces compact chat; forms and pickers remain bounded overlays. | When a view is pushed onto `view_stack` |
 | **Approval Cell** | `⏸ bash wants to run …` with focused button, rendered above composer. | When an approval is pending. Now a `HistoryCell` (not scrollback-committed; `to_persist` is `None`). |
 
 ### Overlay panels (BottomPaneView implementations)
@@ -73,8 +84,8 @@ Everything on screen is a **HistoryCell**. One trait, one source of truth
 | **ListSelectionView** | `/model`, `/skill`, `/stats` menu | Numbered list with `›` selection |
 | **HelpView** | `/help` | Tabbed command browser |
 | **InfoView** | `/stats` detail, `/whoami`, `/instructions show` | Scrollable key-value display |
-| **HistoryView** | `/history` | Conversation history with search bar |
-| **TranscriptView** | `Ctrl+O` | Scrollable committed-history overlay; scales to 80% of terminal height |
+| **RootTranscriptView** | `Ctrl+O`, root row in `Ctrl+G` | Canonical root conversation with pagination and labelled local live suffix |
+| **AgentTranscriptView** | `Ctrl+G` → selected run | The same browser for a child/grandchild run, with typed live suffix and pagination |
 | **SessionPickerView** | `/resume` (no args) | Two-pane recent sessions picker |
 | **LoginView / RegisterView** | `/login`, `/register` | Inline auth form (no drop to bare terminal) |
 
@@ -148,13 +159,13 @@ slash_dispatch::dispatch("/model", ctx)
     │       /copy  → clipboard
     │       /exit  → exit
     │
-    └── SlashResult::Fallback ──► guard.with_restored(|| slash_router::handle_slash_command())
-            │  (briefly leaves TUI, runs in line mode, restores)
+    └── unavailable in TUI ──► show a structured local explanation
+            │  (unavailable commands are excluded from discovery; the TUI
+            │   never drops into a second line-mode UI to complete one)
             ▼
-        If state.session_id changed (resume/new-session),
-        rebuild ChatWidget via `replay_session_into_widget`:
-          — load JSONL transcript, rebuild cells, paint banner,
-            then mark_all_flushed so they don't re-flush.
+        Typed session/model/config completions apply their shared transaction,
+        then the compact projection is rebound or replayed only when the
+        canonical session identity genuinely changes.
 ```
 
 ## Resume flow (startup or `/resume`)
@@ -184,7 +195,7 @@ slash_dispatch::dispatch("/model", ctx)
 | `transcript_jsonl.rs` | Append / load JSONL at `~/.astra/transcripts/<sid>.jsonl` |
 | `status_indicator.rs` | Viewport status line (Thinking ✶ / Tool / WaitingModel / Idle) |
 | `bottom_pane/` | Composer, popups, overlay views, approval queue |
-| `slash_dispatch.rs` | TUI-native slash command handling (with Fallback for complex async) |
+| `slash_dispatch.rs` | TUI-native slash command handling and typed workbench actions |
 | `terminal.rs` | `TerminalGuard` lifecycle, inline viewport, `with_restored` |
 | `custom_terminal.rs` | Dual-buffer diff terminal (inline-viewport with scroll) |
 | `wrapping.rs` | URL-aware span-preserving word wrap |
@@ -203,7 +214,10 @@ slash_dispatch::dispatch("/model", ctx)
 | `Ctrl+C` | Idle | Quit |
 | `Ctrl+D` | Composer empty | Quit |
 | `Ctrl+L` | Any | Force full redraw |
-| `Ctrl+O` | Idle | Open transcript overlay (scales to terminal height) |
+| `Ctrl+O` | Global, including active turns | Toggle the root conversation workspace; it remains live while the run streams |
+| `Ctrl+G` | Compact chat or conversation workspace | Open the run navigator; Enter/Right switches to the selected root or agent transcript, Left/Esc returns |
+| `Ctrl+E` | Transcript / activity | Toggle all expandable reasoning and tool details; in composer it remains line-end |
+| `Alt+E` | Composer | Open the external editor |
 | `Ctrl+R` | Idle, composer empty | Pull last user message back into composer for editing / retry |
 | `Ctrl+U` | Composer | Kill to start of line |
 | `Esc` | Overlay/Popup | Close and return |
@@ -219,5 +233,5 @@ slash_dispatch::dispatch("/model", ctx)
 
 ## Design doc
 
-The full rationale and phase-by-phase migration plan live in
-`docs/design/tui-refactor.md`.
+The current product contract and phased implementation plan live in
+`plans/astra-tui-agent-workbench-productization-2026-07-11.md`.

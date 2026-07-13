@@ -98,6 +98,28 @@ impl AgentMailbox {
         }
     }
 
+    /// Confirm durable consumption after the caller has converted the messages
+    /// into runtime state. A failed confirmation leaves the transport claim
+    /// recoverable for redelivery instead of silently losing the message.
+    pub async fn acknowledge_received(
+        &self,
+        messages: &[Arc<AgentMessage>],
+    ) -> Result<(), MailboxError> {
+        let mut stream = self.stream.lock().await;
+        let mut first_error = None;
+        for message in messages {
+            if let Err(error) = stream.acknowledge(message).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Send a message through the router (handles target resolution).
     pub async fn send(&self, msg: AgentMessage) -> Result<(), MailboxError> {
         self.router.send(msg).await
@@ -193,6 +215,7 @@ impl AgentMailbox {
                     // Check if this is our response
                     if msg.correlation_id.as_deref() == Some(&request_id) {
                         self.buffered.get_mut().extend(skipped.drain(..));
+                        self.stream.lock().await.acknowledge(&msg).await?;
                         if let MessagePayload::Response { data, accepted, .. } = &msg.payload {
                             return Ok(PermissionOutcome {
                                 accepted: *accepted,
@@ -512,6 +535,29 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::RwLock;
 
+    struct AckRecordingStream {
+        acknowledged: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl MessageStream for AckRecordingStream {
+        async fn recv(&mut self) -> Option<Arc<AgentMessage>> {
+            None
+        }
+
+        fn try_recv(&mut self) -> Option<Arc<AgentMessage>> {
+            None
+        }
+
+        async fn acknowledge(&mut self, message: &AgentMessage) -> Result<(), MailboxError> {
+            self.acknowledged
+                .lock()
+                .expect("ack recorder lock")
+                .push(message.id.clone());
+            Ok(())
+        }
+    }
+
     /// Simple in-memory mock for DelegationLookup (no runtime dependency).
     struct MockDelegation {
         parents: RwLock<HashMap<String, String>>,
@@ -628,6 +674,44 @@ mod tests {
             MessagePayload::Text { content, .. } => assert_eq!(content, "check this"),
             _ => panic!("expected text"),
         }
+    }
+
+    #[tokio::test]
+    async fn mailbox_confirms_consumption_only_when_caller_acknowledges() {
+        let acknowledged = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let mailbox = AgentMailbox {
+            address: addr("run-review", "reviewer"),
+            delegation_id: None,
+            stream: tokio::sync::Mutex::new(Box::new(AckRecordingStream {
+                acknowledged: Arc::clone(&acknowledged),
+            })),
+            buffered: tokio::sync::Mutex::new(VecDeque::new()),
+            router,
+        };
+        let message = Arc::new(AgentMessage::new(
+            addr("run-code", "coder"),
+            MessageTarget::Direct {
+                address: addr("run-review", "reviewer"),
+            },
+            MessagePayload::Text {
+                content: "review this".into(),
+                summary: None,
+            },
+        ));
+
+        assert!(acknowledged.lock().expect("ack recorder lock").is_empty());
+        mailbox
+            .acknowledge_received(std::slice::from_ref(&message))
+            .await
+            .unwrap();
+        assert_eq!(
+            acknowledged.lock().expect("ack recorder lock").as_slice(),
+            [message.id.as_str()]
+        );
     }
 
     #[tokio::test]

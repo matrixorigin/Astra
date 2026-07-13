@@ -246,13 +246,11 @@ fn build_skill_listing_section_with_budget_and_caps(
              route through `agent_fanout` instead of skill execution or an \
              `agents:[...]` payload. If `agent_fanout` is not present in \
              `tools[]`, first call `tool_search(query=\"select:agent_fanout\")` \
-             to fetch its full schema. Then call \
-             `agent_fanout(action='start', target_count=N, \
-             slots=[{id:'api', description:'Short UI label', prompt:'Full child task prompt'}], \
-             defaults={agent_type:'code-review'})`. \
+             to fetch its full schema. Then submit one complete JSON argument \
+             object, for example \
+             `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"API review\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"UI review\",\"prompt\":\"Review the UI and report findings.\"}]}`. \
              Put each child's full brief in that slot's `prompt`, then collect \
-             with `agent_fanout(action='get_results', \
-             group_id=...)`. Skills usually run sequentially inside the \
+             with `{\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}`. Skills usually run sequentially inside the \
              parent turn, which contradicts the user's explicit fan-out intent.",
         );
     } else {
@@ -3228,7 +3226,7 @@ mod tests {
         assert!(section.text.contains("&lt;skill&gt;metadata&lt;/skill&gt;"));
         assert!(!section.text.contains("<skill>metadata</skill>"));
         assert!(section.text.contains("does not provide sub-agent fan-out"));
-        assert!(!section.text.contains("agent_fanout(action='start'"));
+        assert!(!section.text.contains("\"action\":\"start\""));
     }
 
     #[test]
@@ -3246,8 +3244,8 @@ mod tests {
             build_skill_listing_section_with_context_window_and_caps(&skills, Some(200_000), false)
                 .expect("skill listing should render when fanout is unavailable");
 
-        assert!(with_fanout.text.contains("agent_fanout(action='start'"));
-        assert!(!without_fanout.text.contains("agent_fanout(action='start'"));
+        assert!(with_fanout.text.contains("\"action\":\"start\""));
+        assert!(!without_fanout.text.contains("\"action\":\"start\""));
         assert!(
             without_fanout
                 .text

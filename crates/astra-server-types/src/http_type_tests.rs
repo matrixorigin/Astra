@@ -1092,15 +1092,36 @@ fn cancel_run_record_to_response() {
 
 #[test]
 fn run_mutation_record_to_response() {
-    let record = RunMutationRecord {
-        run_id: "r1".into(),
-        status: "paused".into(),
-        previous_status: "running".into(),
-    };
+    let record = RunMutationRecord::applied("r1", "paused", "running");
     let resp: RunMutationResponse = record.into();
     assert_eq!(resp.run_id, "r1");
     assert_eq!(resp.status, "paused");
     assert_eq!(resp.previous_status, "running");
+    assert_eq!(resp.disposition, RunMutationDisposition::Applied);
+    assert!(resp.continuation.is_none());
+}
+
+#[test]
+fn run_mutation_continuation_to_response() {
+    let record = RunMutationRecord {
+        run_id: "child-run".into(),
+        status: "paused".into(),
+        previous_status: "paused".into(),
+        disposition: RunMutationDisposition::SessionContinuationRequired,
+        continuation: Some(RunContinuationRecord {
+            strategy: "session_continuation".into(),
+            session_id: "session-1".into(),
+            source_run_id: "child-run".into(),
+        }),
+    };
+    let response: RunMutationResponse = record.into();
+    assert_eq!(
+        response.disposition,
+        RunMutationDisposition::SessionContinuationRequired
+    );
+    let continuation = response.continuation.expect("continuation response");
+    assert_eq!(continuation.session_id, "session-1");
+    assert_eq!(continuation.source_run_id, "child-run");
 }
 
 #[test]

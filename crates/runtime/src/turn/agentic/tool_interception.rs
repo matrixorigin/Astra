@@ -23,6 +23,7 @@ pub(crate) struct PreparedToolRound {
     pub(crate) tool_calls: Vec<Value>,
     pub(crate) pre_resolved_results: Vec<(String, String)>,
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
+    pub(crate) communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
 }
 
 pub(crate) fn request_allowlist_permits_tool(state: &AgenticLoopState, tool_name: &str) -> bool {
@@ -206,7 +207,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
             .into_owned();
     let (blocked_tool_results, allowed_tool_calls) =
         intercept_disallowed_tool_calls(state, &tool_calls);
-    let (mut pre_resolved_results, post_send_tool_calls) =
+    let (mut pre_resolved_results, post_send_tool_calls, communication_events) =
         intercept_send_message_calls(state, &allowed_tool_calls, valid_tool_names).await;
     let SkillInterceptionResult {
         results: skill_results,
@@ -386,6 +387,7 @@ pub(crate) async fn prepare_intercepted_tool_round(
         tool_calls,
         pre_resolved_results,
         edge_tool_round,
+        communication_events,
     }
 }
 
@@ -393,13 +395,18 @@ async fn intercept_send_message_calls(
     state: &mut AgenticLoopState,
     tool_calls: &[Value],
     valid_tool_names: &HashSet<String>,
-) -> (Vec<(String, String)>, Vec<Value>) {
+) -> (
+    Vec<(String, String)>,
+    Vec<Value>,
+    Vec<astra_messaging::AgentCommunicationEvent>,
+) {
     let Some(mailbox) = state.messaging.mailbox.as_ref() else {
-        return (Vec::new(), tool_calls.to_vec());
+        return (Vec::new(), tool_calls.to_vec(), Vec::new());
     };
 
     let mut msg_results = Vec::new();
     let mut remaining = Vec::new();
+    let mut communication_events = Vec::new();
     for tc in tool_calls {
         if astra_messaging::send_tool::is_send_message_call(tc)
             && valid_tool_names.contains(astra_messaging::send_tool::SEND_MESSAGE_TOOL_NAME)
@@ -407,9 +414,12 @@ async fn intercept_send_message_calls(
             if let Some((call_id, args)) = astra_messaging::send_tool::parse_send_message_call(tc) {
                 let send_result =
                     astra_messaging::send_tool::execute_send_message(mailbox, &args).await;
-                if send_result.tracked_message.is_some()
-                    || !send_result.display.starts_with("Error:")
-                {
+                if let Some(message) = send_result.sent_message.as_ref() {
+                    communication_events.push(astra_messaging::agent_communication_event(
+                        &mailbox.address,
+                        astra_messaging::AgentCommunicationDirection::Sent,
+                        message,
+                    ));
                     if let Some(ref metrics) = state.messaging.metrics {
                         metrics
                             .messages_sent
@@ -444,7 +454,7 @@ async fn intercept_send_message_calls(
         }
     }
 
-    (msg_results, remaining)
+    (msg_results, remaining, communication_events)
 }
 
 /// Result of skill interception. `results` are pre-resolved tool results to
@@ -1126,7 +1136,7 @@ mod tests {
             }
         })];
 
-        let (results, remaining) =
+        let (results, remaining, communication_events) =
             intercept_send_message_calls(&mut state, &tool_calls, &HashSet::new()).await;
 
         assert!(
@@ -1137,6 +1147,7 @@ mod tests {
             remaining, tool_calls,
             "tool call should remain for unknown-tool handling"
         );
+        assert!(communication_events.is_empty());
         assert!(
             parent.try_recv().is_none(),
             "no message should be delivered when send_message is disallowed"

@@ -370,6 +370,9 @@ pub enum AggregationStrategy {
 pub struct DelegationRequest {
     /// Unique delegation ID.
     pub delegation_id: String,
+    /// Canonical parent session identity. This scopes child run persistence,
+    /// transcript recovery, and runtime tools; it is not task prompt context.
+    pub session_id: String,
     /// Parent run ID (for hierarchy tracking).
     pub parent_run_id: String,
     /// Task description/prompt for the delegated agents.
@@ -958,6 +961,7 @@ mod tests {
         reg.register(system_agent("s2")).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "analyze code".into(),
@@ -983,6 +987,7 @@ mod tests {
         reg.register(system_agent("s1")).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "deep".into(),
@@ -1009,6 +1014,7 @@ mod tests {
         reg.register(orchestrator()).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "upward".into(),
@@ -1035,6 +1041,7 @@ mod tests {
         reg.register(user_agent("u2")).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "help".into(),
@@ -1058,6 +1065,7 @@ mod tests {
     fn validate_delegation_unknown_source() {
         let reg = AgentProfileRegistry::new();
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "test".into(),
@@ -1083,6 +1091,7 @@ mod tests {
         reg.register(orchestrator()).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "test".into(),
@@ -1112,6 +1121,7 @@ mod tests {
         reg.register(system_agent("reviewer")).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "write and review".into(),
@@ -1146,6 +1156,7 @@ mod tests {
         reg.register(system_agent("critic")).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "write with review".into(),
@@ -1476,6 +1487,7 @@ mod tests {
     #[test]
     fn delegation_request_round_trip() {
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "test".into(),

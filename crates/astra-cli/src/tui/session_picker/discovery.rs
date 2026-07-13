@@ -6,8 +6,6 @@ use std::sync::Arc;
 
 use nucleo_matcher::{Config, Matcher, Utf32Str, pattern::Atom};
 
-use crate::tui::{transcript_jsonl, turn_event::TurnEvent};
-
 /// A single resumable session surfaced to the picker.
 ///
 /// `updated_at_age_secs` is precomputed age-in-seconds at enumeration
@@ -76,7 +74,6 @@ impl SessionSource for FsSessionSource {
                             (None, "(workspace metadata unreadable)")
                         }
                     };
-                let cost_usd = transcript_cost_usd(&sid);
                 workspace
                     .map(|ws| SessionEntry {
                         id: sid.clone(),
@@ -86,7 +83,7 @@ impl SessionSource for FsSessionSource {
                         turn_count: ws.turn_count,
                         tokens_in: ws.total_tokens_in,
                         tokens_out: ws.total_tokens_out,
-                        cost_usd,
+                        cost_usd: None,
                         summary: decorate_picker_summary(
                             ws.summary,
                             ws.last_persistence_error.as_deref(),
@@ -106,7 +103,7 @@ impl SessionSource for FsSessionSource {
                             turn_count: session_journal::count_turns(&sid),
                             tokens_in: 0,
                             tokens_out: 0,
-                            cost_usd,
+                            cost_usd: None,
                             summary: peek.first_prompt,
                             status: "journal_only".to_string(),
                             model: peek.model.unwrap_or_else(|| "default".to_string()),
@@ -150,19 +147,6 @@ fn summarize_picker_error(error: &str) -> String {
     } else {
         preview
     }
-}
-
-fn transcript_cost_usd(session_id: &str) -> Option<f64> {
-    transcript_jsonl::load(session_id)
-        .into_iter()
-        .rev()
-        .find_map(|event| match event {
-            TurnEvent::TurnSummary {
-                cumulative_cost_usd,
-                ..
-            } => cumulative_cost_usd,
-            _ => None,
-        })
 }
 
 // ── Static source for tests ───────────────────────────────────────
@@ -383,79 +367,18 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn fs_source_reads_cost_from_latest_transcript_turn_summary() {
+    fn fs_source_leaves_cost_unavailable_without_a_canonical_cost_projection() {
         with_tmp_sessions_dir(|sessions_dir| {
             let _guard = JournalDirGuard::new(sessions_dir);
             let sid = "sessmeta123";
             let _ws = write_picker_session(&sessions_dir, sid);
 
-            transcript_jsonl::append(
-                sid,
-                &TurnEvent::TurnSummary {
-                    ts: None,
-                    elapsed_ms: Some(1200),
-                    ttft_ms: None,
-                    tokens_in: Some(300),
-                    tokens_out: Some(120),
-                    cache_read_tokens: None,
-                    tools: 1,
-                    cumulative_tokens: Some(420),
-                    cumulative_cost_usd: Some(1.23),
-                },
-            );
-
             let entries = FsSessionSource::new().list(10);
             let entry = entries
                 .iter()
                 .find(|entry| entry.id == sid)
                 .expect("session listed");
-            assert_eq!(entry.cost_usd, Some(1.23));
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn fs_source_uses_last_non_empty_transcript_cost() {
-        with_tmp_sessions_dir(|sessions_dir| {
-            let _guard = JournalDirGuard::new(sessions_dir);
-            let sid = "sessmeta456";
-            let _ws = write_picker_session(&sessions_dir, sid);
-
-            transcript_jsonl::append(
-                sid,
-                &TurnEvent::TurnSummary {
-                    ts: None,
-                    elapsed_ms: Some(1000),
-                    ttft_ms: None,
-                    tokens_in: Some(200),
-                    tokens_out: Some(100),
-                    cache_read_tokens: None,
-                    tools: 0,
-                    cumulative_tokens: Some(300),
-                    cumulative_cost_usd: Some(0.42),
-                },
-            );
-            transcript_jsonl::append(
-                sid,
-                &TurnEvent::TurnSummary {
-                    ts: None,
-                    elapsed_ms: Some(1200),
-                    ttft_ms: None,
-                    tokens_in: Some(250),
-                    tokens_out: Some(120),
-                    cache_read_tokens: None,
-                    tools: 1,
-                    cumulative_tokens: Some(670),
-                    cumulative_cost_usd: None,
-                },
-            );
-
-            let entries = FsSessionSource::new().list(10);
-            let entry = entries
-                .iter()
-                .find(|entry| entry.id == sid)
-                .expect("session listed");
-            assert_eq!(entry.cost_usd, Some(0.42));
+            assert_eq!(entry.cost_usd, None);
         });
     }
 

@@ -25,13 +25,7 @@ use crate::plan::{PlanLoadError, PlanModeState};
 use astra_plan::PlanPhase;
 use astra_plan::{PlanListFilter, PlanStepRun};
 use astra_services::task_orchestrator::{TaskPlan, TaskStatus};
-use astra_tools::task_mgmt::{
-    MAX_CREATE_SUBTASKS, SessionTask, SessionTaskStatusKind, TaskManager, TaskManagerSnapshot,
-    TaskStore,
-};
-use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
-use std::collections::HashMap;
-use std::sync::Arc;
+use astra_tools::task_mgmt::MAX_CREATE_SUBTASKS;
 
 const MAX_GOAL_LENGTH: usize = 10_000;
 const MAX_INSTRUCTION_LENGTH: usize = 10_000;
@@ -302,7 +296,10 @@ pub(super) struct PlanListResponse {
 #[derive(Serialize)]
 pub(super) struct PlanSummary {
     pub plan_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub goal: String,
+    pub version: u64,
     pub progress_pct: u32,
     pub subtask_count: usize,
     pub status: String,
@@ -374,7 +371,9 @@ fn check_version(
 fn plan_summary_from_state(plan_id: String, plan_state: &PlanModeState) -> PlanSummary {
     PlanSummary {
         plan_id,
+        session_id: plan_state.session_hint.clone(),
         goal: plan_state.goal.clone(),
+        version: plan_state.version,
         progress_pct: plan_state.plan.progress_pct(),
         subtask_count: plan_state.plan.subtasks.len(),
         status: plan_state.infer_phase().to_string(),
@@ -496,201 +495,28 @@ fn status_counts(plan: &TaskPlan) -> (usize, usize) {
     (completed, failed)
 }
 
-use astra_tools::plan_task_mirror;
-
-async fn mirror_approved_plan_to_task_board_if_configured(
-    state: &AppState,
-    user_id: &str,
-    session_id: &str,
-    plan_id: &str,
-    plan_state: &PlanModeState,
-) -> Result<(), String> {
-    let Some(pool) = state.shared_pool.as_ref() else {
-        return Ok(());
-    };
-    let store: Arc<dyn TaskStore> =
-        Arc::new(MatrixOneTaskStore::from_shared_for_user(pool, user_id)?);
-    let manager = TaskManager::new(session_id.to_string(), store);
-    plan_task_mirror::mirror_approved_plan_to_task_board(
-        &manager,
-        user_id,
-        session_id,
-        plan_id,
-        &plan_state.goal,
-        &plan_state.plan,
-    )
-    .await
-}
-
-async fn sync_plan_task_board_subtask_status(
-    manager: &TaskManager,
-    plan_id: &str,
-    plan: &TaskPlan,
+/// Apply a durable execution fact to the plan's canonical step projection.
+/// The caller persists this updated plan in the same repository transaction as
+/// its `plan_step_runs` mutation; this function itself deliberately performs
+/// no I/O and leaves no second writable task representation behind.
+fn set_plan_step_status(
+    plan: &mut TaskPlan,
     subtask_id: &str,
     status: TaskStatus,
 ) -> Result<(), String> {
-    let plan_fingerprint = plan_task_mirror::plan_task_board_fingerprint(plan);
-    let task = manager
-        .load_tasks()
-        .await
-        .map_err(|error| format!("load task board before plan subtask sync: {error}"))?
-        .into_iter()
-        .find(|task| {
-            plan_task_mirror::approved_plan_task_identity(
-                task,
-                plan_id,
-                &plan_fingerprint,
-                Some(subtask_id),
-                false,
-            )
-        });
-
-    let Some(task) = task else {
-        return Ok(());
+    let Some(subtask) = plan
+        .subtasks
+        .iter_mut()
+        .find(|subtask| subtask.id == subtask_id)
+    else {
+        return Err(format!("subtask {subtask_id} not found in plan"));
     };
-    let task_id = task.id.clone();
-
-    if status.is_terminal() {
-        return manager
-            .sync_approved_plan_mirror_terminal_status(
-                &task_id,
-                plan_task_mirror::task_status_to_session_status(status),
-            )
-            .await;
+    if subtask.status.is_terminal() && status != subtask.status {
+        return Err(format!(
+            "subtask {subtask_id} is terminal and cannot change state; redo it first"
+        ));
     }
-
-    let output = manager
-        .update(&serde_json::json!({
-            "task_id": task_id,
-            "new_status": status.as_str(),
-        }))
-        .await;
-    if output.starts_with("Error:") {
-        return Err(output);
-    }
-    Ok(())
-}
-
-async fn sync_plan_task_board_subtask_status_if_configured(
-    state: &AppState,
-    user_id: &str,
-    session_id: &str,
-    plan_id: &str,
-    plan: &TaskPlan,
-    subtask_id: &str,
-    status: TaskStatus,
-) -> Result<(), String> {
-    let Some(pool) = state.shared_pool.as_ref() else {
-        return Ok(());
-    };
-    let store: Arc<dyn TaskStore> =
-        Arc::new(MatrixOneTaskStore::from_shared_for_user(pool, user_id)?);
-    let manager = TaskManager::new(session_id.to_string(), store);
-    if let Err(error) =
-        sync_plan_task_board_subtask_status(&manager, plan_id, plan, subtask_id, status).await
-    {
-        tracing::error!(
-            plan_id = %plan_id,
-            session_id = %session_id,
-            subtask_id = %subtask_id,
-            status = status.as_str(),
-            error = %error,
-            "plan handler: failed to sync subtask status into task board — plan and task board may drift"
-        );
-        return Err(error);
-    }
-    Ok(())
-}
-
-struct TaskBoardRollback {
-    manager: TaskManager,
-    snapshot: TaskManagerSnapshot,
-}
-
-impl TaskBoardRollback {
-    async fn seal(&mut self) -> Result<(), String> {
-        self.manager
-            .seal_snapshot_for_restore(&mut self.snapshot)
-            .await
-    }
-
-    async fn restore(self) -> Result<(), String> {
-        self.manager.restore_snapshot(&self.snapshot).await
-    }
-}
-
-async fn seal_task_board_rollback_or_restore(
-    rollback: &mut Option<TaskBoardRollback>,
-    context: &str,
-    not_saved_message: &str,
-) -> Result<(), String> {
-    let Some(active) = rollback.as_mut() else {
-        return Ok(());
-    };
-    if let Err(error) = active.seal().await {
-        // We failed to read/seal the post-mutation version guard, so the
-        // normal CAS restore path would reject the snapshot as stale and
-        // leave the task board diverged from the plan state. On this path we
-        // prefer a best-effort restore of the pre-mutation board snapshot.
-        active.snapshot.restore_version = Some(0);
-        let restore_result = rollback
-            .take()
-            .expect("rollback option should still be populated after failed seal")
-            .restore()
-            .await;
-        return match restore_result {
-            Ok(()) => Err(format!(
-                "{context}: failed to seal task-board rollback — {not_saved_message}. \
-                 Task board was rolled back. Error: {error}"
-            )),
-            Err(restore_error) => Err(format!(
-                "{context}: failed to seal task-board rollback — {not_saved_message}. \
-                 Additionally failed to roll back task board: {restore_error}"
-            )),
-        };
-    }
-    Ok(())
-}
-
-async fn capture_task_board_rollback_if_configured(
-    state: &AppState,
-    user_id: &str,
-    session_id: Option<&str>,
-) -> Result<Option<TaskBoardRollback>, String> {
-    let Some(session_id) = session_id.filter(|sid| !sid.trim().is_empty()) else {
-        return Ok(None);
-    };
-    let Some(pool) = state.shared_pool.as_ref() else {
-        return Ok(None);
-    };
-    let store: Arc<dyn TaskStore> =
-        Arc::new(MatrixOneTaskStore::from_shared_for_user(pool, user_id)?);
-    let manager = TaskManager::new(session_id.to_string(), store);
-    let snapshot = manager
-        .try_snapshot_state()
-        .await
-        .map_err(|error| format!("snapshot task board before plan mutation: {error}"))?;
-    Ok(Some(TaskBoardRollback { manager, snapshot }))
-}
-
-async fn sync_plan_task_board_subtasks_status_if_configured(
-    state: &AppState,
-    user_id: &str,
-    session_id: Option<&str>,
-    plan_id: &str,
-    plan: &TaskPlan,
-    subtask_ids: &[String],
-    status: TaskStatus,
-) -> Result<(), String> {
-    let Some(session_id) = session_id.filter(|sid| !sid.trim().is_empty()) else {
-        return Ok(());
-    };
-    for subtask_id in subtask_ids {
-        sync_plan_task_board_subtask_status_if_configured(
-            state, user_id, session_id, plan_id, plan, subtask_id, status,
-        )
-        .await?;
-    }
+    subtask.status = status;
     Ok(())
 }
 
@@ -833,7 +659,9 @@ pub(super) async fn list_plans_handler(
         .into_iter()
         .map(|p| PlanSummary {
             plan_id: p.name,
+            session_id: p.session_id,
             goal: p.goal,
+            version: p.version,
             progress_pct: p.progress_pct,
             subtask_count: p.subtask_count,
             status: p.status,
@@ -953,11 +781,9 @@ pub(super) async fn execute_plan_handler(
 
     // Flip the first pending subtask to in-progress so the CLI/executor has a
     // clear "current subtask" anchor on pickup.
-    let mut started_subtask_id = None;
     for subtask in &mut plan_state.plan.subtasks {
         if subtask.status == TaskStatus::Pending {
             subtask.status = TaskStatus::InProgress;
-            started_subtask_id = Some(subtask.id.clone());
             break;
         }
     }
@@ -968,74 +794,18 @@ pub(super) async fn execute_plan_handler(
 
     let goal = plan_state.goal.clone();
 
-    let mut task_board_rollback =
-        capture_task_board_rollback_if_configured(&state, &user.user_id, Some(&req.session_id))
-            .await
-            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
-    // ── Sync to task board FIRST ──────────────────────────────────
-    // If the task-board sync fails, we bail out before persisting
-    // the plan mutation so the repo never records an InProgress state
-    // that the task board doesn't reflect.
-    if let Some(subtask_id) = started_subtask_id.as_deref() {
-        sync_plan_task_board_subtask_status_if_configured(
-            &state,
-            &user.user_id,
-            &req.session_id,
-            &plan_id,
-            &plan_state.plan,
-            subtask_id,
-            TaskStatus::InProgress,
-        )
-        .await
-        .map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "execute_plan: failed to sync started subtask into task board — \
-                     plan was NOT saved. Error: {error}"
-                ),
-            )
-        })?;
-    }
-    seal_task_board_rollback_or_restore(
-        &mut task_board_rollback,
-        "execute_plan",
-        "plan was NOT saved",
-    )
-    .await
-    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
     let expected = resolve_expected_version(&plan_state, req.expected_version);
-    if let Err(error) = state
+    state
         .plan_repo
         .save(&user.user_id, &plan_id, &mut plan_state, expected)
         .await
-    {
-        if let Some(rollback) = task_board_rollback.take() {
-            rollback.restore().await.map_err(|restore_error| {
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "execute_plan: plan save failed ({error}) and task-board rollback failed: {restore_error}"
-                    ),
-                )
-            })?;
-        }
-        return Err(map_plan_load_err(error));
-    }
+        .map_err(map_plan_load_err)?;
 
     if let Err(error) = state
         .plan_repo
         .set_active_plan(&user.user_id, &req.session_id, Some(&plan_id))
         .await
     {
-        let mut restore_errors = Vec::new();
-        if let Some(rollback) = task_board_rollback.take() {
-            if let Err(restore_error) = rollback.restore().await {
-                restore_errors.push(format!("task-board rollback failed: {restore_error}"));
-            }
-        }
         let mut rollback_plan = original_plan_state;
         if let Err(restore_error) = state
             .plan_repo
@@ -1047,14 +817,10 @@ pub(super) async fn execute_plan_handler(
             )
             .await
         {
-            restore_errors.push(format!("plan rollback failed: {restore_error}"));
-        }
-        if !restore_errors.is_empty() {
             return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
-                    "execute_plan: active-plan link failed ({error}); {}",
-                    restore_errors.join("; ")
+                    "execute_plan: active-plan link failed ({error}); plan rollback failed: {restore_error}"
                 ),
             ));
         }
@@ -1132,32 +898,9 @@ pub(super) async fn exit_plan_mode_handler(
     let session_hint = plan_state.session_hint.clone();
     let expected = resolve_expected_version(&plan_state, req.expected_version);
 
-    // On approval, mirror the plan to the task board BEFORE persisting it.
-    // If mirror fails, we haven't committed the plan yet, avoiding the
-    // three-way inconsistency (plan persisted, task board empty, session locked).
-    // The active_plan_id is cleared AFTER both mirror and save succeed.
-    if req.approved {
-        if let Some(sid) = session_hint.as_deref() {
-            mirror_approved_plan_to_task_board_if_configured(
-                &state,
-                &user.user_id,
-                sid,
-                &plan_id,
-                &plan_state,
-            )
-            .await
-            .map_err(|error| {
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to mirror approved plan into task board: {error}"),
-                )
-            })?;
-        }
-    }
-
     // Persist the rendered markdown alongside plan_json so web, sync, and CLI
-    // consumers can read the same artifact without reviving the removed
-    // turn-history compatibility layer.
+    // consumers can read the same artifact. Taskboard clients project the
+    // durable plan directly; approval never writes a duplicate todo tree.
     if let Some(md) = req.plan_md {
         plan_state.plan_md = Some(md);
     }
@@ -1168,8 +911,8 @@ pub(super) async fn exit_plan_mode_handler(
         .await
         .map_err(map_plan_load_err)?;
 
-    // Clear active plan AFTER both mirror and save succeed. This releases
-    // the write-tool guard so execution can proceed.
+    // Clear the authoring overlay after the durable plan save succeeds. This
+    // releases the write-tool guard without introducing a todo side effect.
     if req.approved {
         if let Some(sid) = session_hint.as_deref() {
             state
@@ -1273,37 +1016,6 @@ pub(super) async fn rewind_plan_handler(
 
     let session_hint = plan_state.session_hint.clone();
     let expected = resolve_expected_version(&plan_state, req.expected_version);
-    let mut task_board_rollback =
-        capture_task_board_rollback_if_configured(&state, &user.user_id, session_hint.as_deref())
-            .await
-            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
-    sync_plan_task_board_subtasks_status_if_configured(
-        &state,
-        &user.user_id,
-        session_hint.as_deref(),
-        &plan_id,
-        &plan_state.plan,
-        &affected_subtask_ids,
-        TaskStatus::Pending,
-    )
-    .await
-    .map_err(|error| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "rewind_plan: failed to sync affected subtasks into task board — plan state was NOT saved. Error: {error}"
-            ),
-        )
-    })?;
-    seal_task_board_rollback_or_restore(
-        &mut task_board_rollback,
-        "rewind_plan",
-        "plan state was NOT saved",
-    )
-    .await
-    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
     let expected_version = expected.unwrap_or(plan_state.version);
     let aborted_runs = match state
         .plan_repo
@@ -1317,19 +1029,7 @@ pub(super) async fn rewind_plan_handler(
         .await
     {
         Ok(count) => count,
-        Err(error) => {
-            if let Some(rollback) = task_board_rollback.take() {
-                rollback.restore().await.map_err(|restore_error| {
-                    error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "rewind_plan: atomic plan/run update failed ({error}) and task-board rollback failed: {restore_error}"
-                        ),
-                    )
-                })?;
-            }
-            return Err(map_plan_load_err(error));
-        }
+        Err(error) => return Err(map_plan_load_err(error)),
     };
 
     emit_plan_journal(
@@ -1392,37 +1092,6 @@ pub(super) async fn redo_step_handler(
     let resolved_subtask_id = plan_state.plan.subtasks[idx].id.clone();
     let session_hint = plan_state.session_hint.clone();
 
-    let mut task_board_rollback =
-        capture_task_board_rollback_if_configured(&state, &user.user_id, session_hint.as_deref())
-            .await
-            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
-    sync_plan_task_board_subtasks_status_if_configured(
-        &state,
-        &user.user_id,
-        session_hint.as_deref(),
-        &plan_id,
-        &plan_state.plan,
-        std::slice::from_ref(&resolved_subtask_id),
-        TaskStatus::Pending,
-    )
-    .await
-    .map_err(|error| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "redo_step: failed to sync subtask status back to Pending in task board — plan state was NOT saved. Error: {error}"
-            ),
-        )
-    })?;
-    seal_task_board_rollback_or_restore(
-        &mut task_board_rollback,
-        "redo_step",
-        "plan state was NOT saved",
-    )
-    .await
-    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
     // Compute the next attempt number by counting prior runs for this subtask.
     // In-memory/test repos start empty too, so the first attempt is 1 there.
     let prior_runs = match state
@@ -1436,19 +1105,7 @@ pub(super) async fn redo_step_handler(
         .await
     {
         Ok(runs) => runs,
-        Err(error) => {
-            if let Some(rollback) = task_board_rollback.take() {
-                rollback.restore().await.map_err(|restore_error| {
-                    error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "redo_step: list prior step-runs failed ({error}) and task-board rollback failed: {restore_error}"
-                        ),
-                    )
-                })?;
-            }
-            return Err(map_plan_load_err(error));
-        }
+        Err(error) => return Err(map_plan_load_err(error)),
     };
     let next_attempt: i32 = prior_runs.iter().map(|r| r.attempt).max().unwrap_or(0) + 1;
 
@@ -1474,19 +1131,7 @@ pub(super) async fn redo_step_handler(
         .await
     {
         Ok(count) => count,
-        Err(error) => {
-            if let Some(rollback) = task_board_rollback.take() {
-                rollback.restore().await.map_err(|restore_error| {
-                    error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "redo_step: atomic plan/run update failed ({error}) and task-board rollback failed: {restore_error}"
-                        ),
-                    )
-                })?;
-            }
-            return Err(map_plan_load_err(error));
-        }
+        Err(error) => return Err(map_plan_load_err(error)),
     };
 
     emit_plan_journal(
@@ -1527,7 +1172,7 @@ pub(super) async fn start_step_run_handler(
     // fails fast and cannot corrupt state.
     validate_attempt(req.attempt)?;
 
-    let plan_state = state
+    let mut plan_state = state
         .plan_repo
         .load(&user.user_id, &plan_id)
         .await
@@ -1540,52 +1185,32 @@ pub(super) async fn start_step_run_handler(
         ));
     }
 
-    let subtask = plan_state
+    let subtask_title = plan_state
         .plan
         .subtasks
         .iter()
         .find(|s| s.id == req.subtask_id)
+        .map(|subtask| subtask.title.clone())
         .ok_or_else(|| {
             error_response(
                 StatusCode::BAD_REQUEST,
                 format!("subtask {} not found in plan {}", req.subtask_id, plan_id),
             )
         })?;
-
-    let mut task_board_rollback =
-        capture_task_board_rollback_if_configured(&state, &user.user_id, Some(&req.session_id))
-            .await
-            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    sync_plan_task_board_subtask_status_if_configured(
-        &state,
-        &user.user_id,
-        &req.session_id,
-        &plan_id,
-        &plan_state.plan,
+    set_plan_step_status(
+        &mut plan_state.plan,
         &req.subtask_id,
         TaskStatus::InProgress,
     )
-    .await
-    .map_err(|error| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "start_step_run: failed to sync task board — step run was NOT recorded. Error: {error}"
-            ),
-        )
-    })?;
-    seal_task_board_rollback_or_restore(
-        &mut task_board_rollback,
-        "start_step_run",
-        "step run was NOT recorded",
-    )
-    .await
-    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
+    .map_err(|error| error_response(StatusCode::CONFLICT, error))?;
+    let expected_version = plan_state.version;
     let run_id = match state
         .plan_repo
-        .record_step_run(
+        .save_existing_and_start_step_run(
             &user.user_id,
+            &plan_id,
+            &mut plan_state,
+            expected_version,
             astra_plan::NewStepRun {
                 plan_id: &plan_id,
                 subtask_id: &req.subtask_id,
@@ -1598,19 +1223,7 @@ pub(super) async fn start_step_run_handler(
         .await
     {
         Ok(run_id) => run_id,
-        Err(error) => {
-            if let Some(rollback) = task_board_rollback.take() {
-                rollback.restore().await.map_err(|restore_error| {
-                    error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "start_step_run: record step-run failed ({error}) and task-board rollback failed: {restore_error}"
-                        ),
-                    )
-                })?;
-            }
-            return Err(map_plan_load_err(error));
-        }
+        Err(error) => return Err(map_plan_load_err(error)),
     };
 
     let (completed, _) = status_counts(&plan_state.plan);
@@ -1620,7 +1233,7 @@ pub(super) async fn start_step_run_handler(
             Some(&req.session_id),
             0,
             &req.subtask_id,
-            &subtask.title,
+            &subtask_title,
             "started",
             plan_state.plan.progress_pct(),
             plan_state.plan.subtasks.len(),
@@ -1660,7 +1273,6 @@ pub(super) async fn post_completed_step_run_handler(
         MAX_ARTIFACT_REF_LENGTH,
         "artifact_ref",
     )?;
-
     if req.session_id.trim().is_empty() || req.request_id.trim().is_empty() {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
@@ -1678,59 +1290,34 @@ pub(super) async fn post_completed_step_run_handler(
         ));
     }
 
-    let plan_state = state
+    let mut plan_state = state
         .plan_repo
         .load(&user.user_id, &plan_id)
         .await
         .map_err(map_plan_load_err)?;
 
-    let subtask = plan_state
+    let subtask_title = plan_state
         .plan
         .subtasks
         .iter()
         .find(|s| s.id == req.subtask_id)
+        .map(|subtask| subtask.title.clone())
         .ok_or_else(|| {
             error_response(
                 StatusCode::BAD_REQUEST,
                 format!("subtask {} not found in plan {}", req.subtask_id, plan_id),
             )
         })?;
-
-    let mut task_board_rollback =
-        capture_task_board_rollback_if_configured(&state, &user.user_id, Some(&req.session_id))
-            .await
-            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
-    sync_plan_task_board_subtask_status_if_configured(
-        &state,
-        &user.user_id,
-        &req.session_id,
-        &plan_id,
-        &plan_state.plan,
-        &req.subtask_id,
-        req.status,
-    )
-    .await
-    .map_err(|error| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "post_completed_step_run: failed to sync task board — step run was NOT recorded. Error: {error}"
-            ),
-        )
-    })?;
-    seal_task_board_rollback_or_restore(
-        &mut task_board_rollback,
-        "post_completed_step_run",
-        "step run was NOT recorded",
-    )
-    .await
-    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
+    set_plan_step_status(&mut plan_state.plan, &req.subtask_id, req.status)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+    let expected_version = plan_state.version;
     let run_id = match state
         .plan_repo
-        .record_completed_step_run(
+        .save_existing_and_record_completed_step_run(
             &user.user_id,
+            &plan_id,
+            &mut plan_state,
+            expected_version,
             astra_plan::NewStepRun {
                 plan_id: &plan_id,
                 subtask_id: &req.subtask_id,
@@ -1745,19 +1332,7 @@ pub(super) async fn post_completed_step_run_handler(
         .await
     {
         Ok(run_id) => run_id,
-        Err(error) => {
-            if let Some(rollback) = task_board_rollback.take() {
-                rollback.restore().await.map_err(|restore_error| {
-                    error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!(
-                            "post_completed_step_run: record completed step-run failed ({error}) and task-board rollback failed: {restore_error}"
-                        ),
-                    )
-                })?;
-            }
-            return Err(map_plan_load_err(error));
-        }
+        Err(error) => return Err(map_plan_load_err(error)),
     };
 
     let (completed, _) = status_counts(&plan_state.plan);
@@ -1773,7 +1348,7 @@ pub(super) async fn post_completed_step_run_handler(
             Some(&req.session_id),
             0,
             &req.subtask_id,
-            &subtask.title,
+            &subtask_title,
             action,
             plan_state.plan.progress_pct(),
             plan_state.plan.subtasks.len(),
@@ -1808,9 +1383,15 @@ pub(super) async fn finish_step_run_handler(
         MAX_ARTIFACT_REF_LENGTH,
         "artifact_ref",
     )?;
+    if !req.status.is_terminal() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "step-run finish requires a terminal status",
+        ));
+    }
 
     // Ownership check so unrelated users can't finalize someone else's runs.
-    let plan_state = state
+    let mut plan_state = state
         .plan_repo
         .load(&user.user_id, &plan_id)
         .await
@@ -1821,46 +1402,16 @@ pub(super) async fn finish_step_run_handler(
         .get_step_run(&user.user_id, &plan_id, &run_id)
         .await
         .map_err(map_plan_load_err)?;
-
-    let mut task_board_rollback = capture_task_board_rollback_if_configured(
-        &state,
-        &user.user_id,
-        Some(&existing.session_id),
-    )
-    .await
-    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
-    sync_plan_task_board_subtask_status_if_configured(
-        &state,
-        &user.user_id,
-        &existing.session_id,
-        &plan_id,
-        &plan_state.plan,
-        &existing.subtask_id,
-        req.status,
-    )
-    .await
-    .map_err(|error| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "finalize_step_run: failed to sync task board — step run was NOT finalized. Error: {error}"
-            ),
-        )
-    })?;
-    seal_task_board_rollback_or_restore(
-        &mut task_board_rollback,
-        "finalize_step_run",
-        "step run was NOT finalized",
-    )
-    .await
-    .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-
+    set_plan_step_status(&mut plan_state.plan, &existing.subtask_id, req.status)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+    let expected_version = plan_state.version;
     if let Err(error) = state
         .plan_repo
-        .finalize_step_run(
+        .save_existing_and_finalize_step_run(
             &user.user_id,
             &plan_id,
+            &mut plan_state,
+            expected_version,
             &run_id,
             req.status,
             req.error.as_deref(),
@@ -1868,16 +1419,6 @@ pub(super) async fn finish_step_run_handler(
         )
         .await
     {
-        if let Some(rollback) = task_board_rollback.take() {
-            rollback.restore().await.map_err(|restore_error| {
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "finalize_step_run: finalize failed ({error}) and task-board rollback failed: {restore_error}"
-                    ),
-                )
-            })?;
-        }
         return Err(map_plan_load_err(error));
     }
 
@@ -2019,90 +1560,6 @@ pub(super) async fn delete_plan_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_core::{MatrixOneSettings, SharedPool};
-    use astra_services::storage::ensure_core_schema;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct FailingLoadTaskStore;
-
-    #[async_trait::async_trait]
-    impl TaskStore for FailingLoadTaskStore {
-        async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
-            Err(format!("forced task-board load failure for {session_id}"))
-        }
-
-        async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn mutate(
-            &self,
-            session_id: &str,
-            _mutation: astra_tools::task_mgmt::TaskMutation,
-        ) -> Result<String, String> {
-            Err(format!("forced task-board mutate failure for {session_id}"))
-        }
-
-        async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
-            Err(format!("forced task id failure for {session_id}"))
-        }
-
-        async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-            Ok(1)
-        }
-    }
-
-    struct FailingSealRollbackStore {
-        inner: Arc<astra_tools::task_mgmt::InMemoryTaskStore>,
-        version_reads: AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl TaskStore for FailingSealRollbackStore {
-        async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
-            self.inner.load(session_id).await
-        }
-
-        async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String> {
-            self.inner.save(session_id, tasks).await
-        }
-
-        async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
-            self.inner.next_task_id(session_id).await
-        }
-
-        async fn set_next_task_id(&self, session_id: &str, next: u32) -> Result<(), String> {
-            self.inner.set_next_task_id(session_id, next).await
-        }
-
-        async fn restore_snapshot_state(
-            &self,
-            session_id: &str,
-            tasks: Vec<SessionTask>,
-            next_task_id: u32,
-            expected_version: u64,
-        ) -> Result<(), String> {
-            self.inner
-                .restore_snapshot_state(session_id, tasks, next_task_id, expected_version)
-                .await
-        }
-
-        async fn peek_next_task_id(&self, session_id: &str) -> Result<u32, String> {
-            self.inner.peek_next_task_id(session_id).await
-        }
-
-        async fn get_session_version(&self, session_id: &str) -> Result<u64, String> {
-            match self.version_reads.fetch_add(1, Ordering::Relaxed) {
-                0 => self.inner.get_session_version(session_id).await,
-                1 => Err("forced seal failure".to_string()),
-                _ => self.inner.get_session_version(session_id).await,
-            }
-        }
-
-        async fn bump_version(&self, session_id: &str) {
-            self.inner.bump_version(session_id).await;
-        }
-    }
 
     fn task_plan(subtasks: Vec<astra_services::task_orchestrator::SubtaskPlan>) -> TaskPlan {
         TaskPlan {
@@ -2122,65 +1579,6 @@ mod tests {
             status,
             ..Default::default()
         }
-    }
-
-    async fn bootstrap_shared_pool() -> SharedPool {
-        assert_eq!(
-            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
-            Ok("1"),
-            "set ASTRA_TEST_DB_IT=1 to run this ignored test"
-        );
-        let mut settings = MatrixOneSettings::from_env();
-        settings.db_pool_max_connections = settings.db_pool_max_connections.min(4);
-        settings.db_pool_min_connections = settings.db_pool_min_connections.min(1);
-        let catalog =
-            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-        ensure_core_schema(&settings, &catalog)
-            .await
-            .expect("ensure_core_schema");
-        SharedPool::new(&settings).await.expect("connect matrixone")
-    }
-
-    async fn cleanup_session_todos(
-        pool: &sqlx::Pool<sqlx::MySql>,
-        session_id: &str,
-        user_id: &str,
-    ) {
-        sqlx::query("DELETE FROM session_todos WHERE session_id = ? AND user_id = ?")
-            .bind(session_id)
-            .bind(user_id)
-            .execute(pool)
-            .await
-            .expect("cleanup plan handler fixture session_todos");
-        sqlx::query("DELETE FROM session_todo_counters WHERE session_id = ? AND user_id = ?")
-            .bind(session_id)
-            .bind(user_id)
-            .execute(pool)
-            .await
-            .expect("cleanup plan handler fixture session_todo_counters");
-        sqlx::query("DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(session_id)
-            .bind(user_id)
-            .execute(pool)
-            .await
-            .expect("cleanup plan handler fixture agent_sessions");
-    }
-
-    async fn prepare_session_todo_owner(
-        pool: &sqlx::Pool<sqlx::MySql>,
-        session_id: &str,
-        user_id: &str,
-    ) {
-        cleanup_session_todos(pool, session_id, user_id).await;
-        sqlx::query(
-            "INSERT INTO agent_sessions (session_id, user_id, agent_id, title, status, metadata)
-             VALUES (?, ?, 'plan-handler-test', 'plan handler test', 'active', '{}')",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .expect("insert agent_sessions owner root");
     }
 
     // ── infer_phase tests ─────────────────────────────────────────────
@@ -2260,11 +1658,15 @@ mod tests {
     #[test]
     fn plan_summary_from_state_tracks_completion_progress() {
         let mut state = PlanModeState::new("done".into());
+        state.session_hint = Some("session-done".into());
+        state.version = 9;
         state.plan = task_plan(vec![subtask("s1", "Step 1", TaskStatus::Completed)]);
 
         let summary = plan_summary_from_state("plan-done".into(), &state);
         assert_eq!(summary.progress_pct, 100);
         assert_eq!(summary.status, "completed");
+        assert_eq!(summary.session_id.as_deref(), Some("session-done"));
+        assert_eq!(summary.version, 9);
     }
 
     #[test]
@@ -2279,1005 +1681,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn http_approved_plan_mirror_creates_user_visible_step_tasks() {
-        let manager = TaskManager::in_memory();
-        let mut state = PlanModeState::new_with_owner("ship cloud plan".into(), "alice".into());
-        state.plan = task_plan(vec![
-            subtask("step-1", "Design API", TaskStatus::Pending),
-            subtask("step-2", "Verify unhappy path", TaskStatus::Pending),
-        ]);
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            "alice",
-            "session-cloud",
-            "plan-cloud-visible",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(tasks.len(), 2, "{tasks:?}");
-        let first = tasks
-            .iter()
-            .find(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_subtask_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("step-1")
-            })
-            .expect("step-1 should be a top-level task");
-        assert_eq!(first.title, "Design API");
-        assert_eq!(
-            first.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
-        );
-        assert_eq!(first.owner.as_deref(), Some("alice"));
-        assert!(first.subtasks.is_empty(), "{first:?}");
-        assert_eq!(
-            first
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("source"))
-                .and_then(serde_json::Value::as_str),
-            Some("approved_plan")
-        );
-        assert_eq!(
-            first
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("plan_id"))
-                .and_then(serde_json::Value::as_str),
-            Some("plan-cloud-visible")
-        );
-        let second = tasks
-            .iter()
-            .find(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_subtask_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("step-2")
-            })
-            .expect("step-2 should be a top-level task");
-        assert_eq!(second.title, "Verify unhappy path");
-        assert_eq!(
-            second.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::Pending
-        );
-        assert!(second.subtasks.is_empty(), "{second:?}");
-        assert_eq!(
-            second
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("plan_id"))
-                .and_then(serde_json::Value::as_str),
-            Some("plan-cloud-visible")
-        );
-    }
-
-    #[tokio::test]
-    async fn http_approved_plan_mirror_rejects_oversized_plan() {
-        let manager = TaskManager::in_memory();
-        let mut state =
-            PlanModeState::new_with_owner("oversized cloud plan".into(), "alice".into());
-        state.plan = task_plan(
-            (0..=MAX_CREATE_SUBTASKS)
-                .map(|index| {
-                    subtask(
-                        &format!("step-{index}"),
-                        &format!("step {index}"),
-                        TaskStatus::Pending,
-                    )
-                })
-                .collect(),
-        );
-
-        let err = plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            "alice",
-            "session-cloud",
-            "plan-cloud-oversized",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .expect_err("oversized approved plans should not create one huge batch of step tasks");
-        assert!(
-            err.contains("subtasks") && err.contains("maximum"),
-            "oversized approved plan should surface the task fan-out limit: {err}"
-        );
-        assert!(
-            manager.snapshot().await.unwrap().is_empty(),
-            "rejected oversized plan should not leave partial task-board work"
-        );
-    }
-
-    #[tokio::test]
-    async fn http_approved_plan_mirror_fails_closed_when_task_board_load_fails() {
-        let manager = TaskManager::new(
-            "plan-load-fails",
-            Arc::new(FailingLoadTaskStore) as Arc<dyn TaskStore>,
-        );
-        let mut state = PlanModeState::new_with_owner("load-failing plan".into(), "alice".into());
-        state.plan = task_plan(vec![subtask(
-            "step-1",
-            "Do not duplicate automatically",
-            TaskStatus::Pending,
-        )]);
-
-        let error = plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            "alice",
-            "session-load-fails",
-            "plan-load-fails",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .expect_err("task-board load failure should abort approved-plan mirror");
-
-        assert!(
-            error.contains("snapshot task board before approved-plan mirror")
-                && error.contains("forced task-board load failure"),
-            "approved-plan mirror must not treat task-board load failure as an empty board: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn http_approved_plan_mirror_rolls_back_partial_step_create_failure() {
-        let manager = TaskManager::in_memory();
-        let existing = manager
-            .create(&serde_json::json!({
-                "title": "Existing cloud task",
-            }))
-            .await;
-        assert!(!existing.starts_with("Error:"), "{existing}");
-        let mut state = PlanModeState::new_with_owner("rollback cloud plan".into(), "alice".into());
-        state.plan = task_plan(vec![
-            subtask("step-1", "Create first cloud step", TaskStatus::Pending),
-            subtask(
-                "step-2",
-                &"x".repeat(astra_tools::task_mgmt::MAX_TASK_TITLE_CHARS + 1),
-                TaskStatus::Pending,
-            ),
-        ]);
-
-        let err = plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            "alice",
-            "session-cloud-rollback",
-            "plan-cloud-rollback",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .expect_err("invalid later step should abort approved-plan mirror");
-
-        assert!(
-            err.contains("title") && err.contains("exceeds"),
-            "original create validation error should be surfaced: {err}"
-        );
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(
-            tasks.len(),
-            1,
-            "failed HTTP approved-plan mirror must roll back the task board to its pre-approval state: {tasks:?}"
-        );
-        assert!(
-            tasks.iter().any(|t| t.title == "Existing cloud task"),
-            "existing cloud task must survive mirror failure: {tasks:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn seal_task_board_rollback_failure_restores_task_board() {
-        let inner = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new());
-        let store: Arc<dyn TaskStore> = Arc::new(FailingSealRollbackStore {
-            inner: inner.clone(),
-            version_reads: AtomicUsize::new(0),
-        });
-        let manager = TaskManager::new("rollback-seal-fails", store);
-
-        let first = manager
-            .create(&serde_json::json!({"title": "keep me"}))
-            .await;
-        assert!(!first.starts_with("Error:"), "{first}");
-        let snapshot = manager.try_snapshot_state().await.expect("snapshot");
-
-        let second = manager
-            .create(&serde_json::json!({"title": "must roll back"}))
-            .await;
-        assert!(!second.starts_with("Error:"), "{second}");
-
-        let mut rollback = Some(TaskBoardRollback { manager, snapshot });
-        let err = seal_task_board_rollback_or_restore(
-            &mut rollback,
-            "test_plan_op",
-            "plan state was NOT saved",
-        )
-        .await
-        .expect_err("seal failure should be surfaced");
-
-        assert!(err.contains("forced seal failure"), "{err}");
-        assert!(err.contains("Task board was rolled back"), "{err}");
-        assert!(
-            rollback.is_none(),
-            "failed seal should consume the rollback handle"
-        );
-
-        let tasks = inner
-            .load("rollback-seal-fails")
-            .await
-            .expect("task board after rollback");
-        assert_eq!(tasks.len(), 1, "{tasks:?}");
-        assert_eq!(tasks[0].title, "keep me");
-    }
-
-    #[tokio::test]
-    async fn http_approved_plan_mirror_uses_bounded_retry_on_title_collision() {
-        let manager = TaskManager::in_memory();
-        let unrelated = manager
-            .create(&serde_json::json!({
-                "title": "Design API",
-                "metadata": { "source": "manual" }
-            }))
-            .await;
-        assert!(unrelated.contains("created"), "{unrelated}");
-
-        let mut state = PlanModeState::new_with_owner("ship cloud plan".into(), "alice".into());
-        state.plan = task_plan(vec![subtask("step-1", "Design API", TaskStatus::Pending)]);
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            "alice",
-            "session-cloud",
-            "plan-collision",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(tasks.len(), 2, "{tasks:?}");
-        assert!(
-            tasks.iter().any(|task| {
-                task.title == "Design API"
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("source"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("manual")
-            }),
-            "pre-existing task should remain untouched: {tasks:?}"
-        );
-        assert!(
-            tasks.iter().any(|task| {
-                task.title == "Design API (step-1)"
-                    && task
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("source"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("approved_plan")
-            }),
-            "approved plan should use one disambiguated retry: {tasks:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn http_approved_plan_mirror_does_not_reuse_legacy_cli_style_tree() {
-        let manager = TaskManager::in_memory();
-        let mut state = PlanModeState::new_with_owner("ship hybrid plan".into(), "alice".into());
-        state.plan = task_plan(vec![subtask(
-            "step-1",
-            "Sync the visible task board",
-            TaskStatus::Pending,
-        )]);
-        let fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-
-        let cli_style = manager
-            .create(&serde_json::json!({
-                "title": "ship hybrid plan",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_goal": "ship hybrid plan",
-                    "plan_fingerprint": fingerprint,
-                },
-                "subtasks": [
-                    { "id": "step-1", "title": "Sync the visible task board" }
-                ]
-            }))
-            .await;
-        assert!(cli_style.contains("created"), "{cli_style}");
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            "alice",
-            "session-hybrid",
-            "plan-http-reuses-cli-tree",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(
-            tasks.len(),
-            2,
-            "HTTP approval should leave legacy tree-shaped task history alone and create a clean step task: {tasks:?}"
-        );
-        let task = tasks
-            .iter()
-            .find(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_subtask_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("step-1")
-            })
-            .expect("approved plan step task");
-        assert_eq!(
-            task.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
-        );
-        assert_eq!(
-            task.metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("plan_id"))
-                .and_then(serde_json::Value::as_str),
-            Some("plan-http-reuses-cli-tree")
-        );
-        assert!(task.subtasks.is_empty(), "{task:?}");
-    }
-
-    #[tokio::test]
-    async fn http_approved_plan_mirror_does_not_reopen_completed_plan_history() {
-        let manager = TaskManager::in_memory();
-        let mut state = PlanModeState::new_with_owner("repeat cloud plan".into(), "alice".into());
-        state.plan = task_plan(vec![subtask(
-            "step-1",
-            "Repeatable step",
-            TaskStatus::Pending,
-        )]);
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            "alice",
-            "session-repeat",
-            "plan-repeat",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-        let completed = manager
-            .update(&serde_json::json!({
-                "task_id": "task-1",
-                "new_status": "completed",
-            }))
-            .await;
-        assert!(!completed.starts_with("Error:"), "{completed}");
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            "alice",
-            "session-repeat",
-            "plan-repeat",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(
-            tasks.len(),
-            2,
-            "completed approved-plan history must remain terminal, not be reused: {tasks:?}"
-        );
-        assert!(
-            tasks.iter().any(|task| task.status.is_completed()),
-            "completed history should remain completed: {tasks:?}"
-        );
-        assert!(
-            tasks.iter().any(|task| task.status.is_in_progress()),
-            "repeat approval should create a fresh in-progress task: {tasks:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn sync_plan_task_board_subtask_status_updates_existing_step_task() {
-        let manager = TaskManager::in_memory();
-        let mut state = PlanModeState::new_with_owner("execute cloud plan".into(), "alice".into());
-        state.plan = task_plan(vec![
-            subtask("step-1", "Start work", TaskStatus::Pending),
-            subtask("step-2", "Finish work", TaskStatus::Pending),
-        ]);
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            "alice",
-            "session-cloud",
-            "plan-sync-visible",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-
-        sync_plan_task_board_subtask_status(
-            &manager,
-            "plan-sync-visible",
-            &state.plan,
-            "step-2",
-            TaskStatus::Completed,
-        )
-        .await
-        .unwrap();
-
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(tasks.len(), 2, "{tasks:?}");
-        let task = tasks
-            .iter()
-            .find(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_subtask_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("step-2")
-            })
-            .expect("step-2 task");
-        assert_eq!(
-            task.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::Completed
-        );
-        assert!(task.subtasks.is_empty(), "{task:?}");
-    }
-
-    #[tokio::test]
-    async fn sync_plan_task_board_subtask_status_does_not_reopen_completed_step_history() {
-        let manager = TaskManager::in_memory();
-        let mut state = PlanModeState::new_with_owner("redo cloud plan".into(), "alice".into());
-        state.plan = task_plan(vec![
-            subtask("step-1", "Build it", TaskStatus::Pending),
-            subtask("step-2", "Verify it", TaskStatus::Pending),
-        ]);
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            "alice",
-            "session-cloud",
-            "plan-redo-visible",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-        sync_plan_task_board_subtask_status(
-            &manager,
-            "plan-redo-visible",
-            &state.plan,
-            "step-1",
-            TaskStatus::Completed,
-        )
-        .await
-        .unwrap();
-        sync_plan_task_board_subtask_status(
-            &manager,
-            "plan-redo-visible",
-            &state.plan,
-            "step-2",
-            TaskStatus::Completed,
-        )
-        .await
-        .unwrap();
-
-        let completed = manager.snapshot().await.unwrap();
-        assert_eq!(
-            completed
-                .iter()
-                .filter(|task| task.status.is_completed())
-                .count(),
-            2,
-            "completed plan steps should be terminal task history: {completed:?}"
-        );
-
-        let error = sync_plan_task_board_subtask_status(
-            &manager,
-            "plan-redo-visible",
-            &state.plan,
-            "step-2",
-            TaskStatus::Pending,
-        )
-        .await
-        .expect_err("sync should not reopen completed task-board history");
-        assert!(
-            error.contains("already terminal"),
-            "redo of completed task-board history should fail closed: {error}"
-        );
-
-        let after_redo = manager.snapshot().await.unwrap();
-        assert_eq!(
-            after_redo
-                .iter()
-                .filter(|task| task.status.is_completed())
-                .count(),
-            2,
-            "completed task-board history should remain terminal: {after_redo:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn sync_plan_task_board_subtask_status_is_noop_without_existing_tree() {
-        let manager = TaskManager::in_memory();
-        let plan = task_plan(vec![subtask("step-1", "Start work", TaskStatus::Pending)]);
-
-        sync_plan_task_board_subtask_status(
-            &manager,
-            "plan-without-task-board",
-            &plan,
-            "step-1",
-            TaskStatus::InProgress,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            manager.snapshot().await.unwrap().is_empty(),
-            "status sync should not auto-create task-board work"
-        );
-    }
-
-    #[tokio::test]
-    async fn sync_plan_task_board_subtask_status_fails_closed_when_task_board_load_fails() {
-        let manager = TaskManager::new(
-            "plan-sync-load-fails",
-            Arc::new(FailingLoadTaskStore) as Arc<dyn TaskStore>,
-        );
-        let plan = task_plan(vec![subtask("step-1", "Start work", TaskStatus::Pending)]);
-
-        let error = sync_plan_task_board_subtask_status(
-            &manager,
-            "plan-sync-load-fails",
-            &plan,
-            "step-1",
-            TaskStatus::InProgress,
-        )
-        .await
-        .expect_err("task-board load failure should abort plan subtask sync");
-
-        assert!(
-            error.contains("load task board before plan subtask sync")
-                && error.contains("forced task-board load failure"),
-            "plan subtask sync must not treat task-board load failure as a missing tree: {error}"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-    async fn http_approved_plan_mirror_persists_to_matrixone_task_board() {
-        let shared = bootstrap_shared_pool().await;
-        let pool = shared.get().clone();
-        let user_id = format!("u-plan-mirror-{}", uuid::Uuid::new_v4());
-        let session_id = format!("s-plan-mirror-{}", uuid::Uuid::new_v4());
-        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
-
-        let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
-        let manager = TaskManager::new(session_id.clone(), store);
-        let mut state =
-            PlanModeState::new_with_owner("ship MatrixOne visible plan".into(), user_id.clone());
-        state.plan = task_plan(vec![
-            subtask("step-1", "Persist step task", TaskStatus::Pending),
-            subtask("step-2", "Verify step task", TaskStatus::Pending),
-        ]);
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            &user_id,
-            &session_id,
-            "plan-matrixone-visible",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(tasks.len(), 2, "{tasks:?}");
-        let first = tasks
-            .iter()
-            .find(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_subtask_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("step-1")
-            })
-            .expect("step-1 task");
-        assert_eq!(first.title, "Persist step task");
-        assert_eq!(
-            first.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
-        );
-        assert!(first.subtasks.is_empty(), "{first:?}");
-        assert!(tasks.iter().all(|task| {
-            task.metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("plan_id"))
-                .and_then(serde_json::Value::as_str)
-                == Some("plan-matrixone-visible")
-        }));
-
-        cleanup_session_todos(&pool, &session_id, &user_id).await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-    async fn http_approved_plan_mirror_rolls_back_partial_failure_in_matrixone() {
-        let shared = bootstrap_shared_pool().await;
-        let pool = shared.get().clone();
-        let user_id = format!("u-plan-rollback-{}", uuid::Uuid::new_v4());
-        let session_id = format!("s-plan-rollback-{}", uuid::Uuid::new_v4());
-        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
-
-        let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
-        let manager = TaskManager::new(session_id.clone(), store);
-        let existing = manager
-            .create(&serde_json::json!({
-                "title": "Existing MatrixOne task",
-            }))
-            .await;
-        assert!(existing.contains("\"success\":true"), "{existing}");
-        let mut state =
-            PlanModeState::new_with_owner("rollback MatrixOne plan".into(), user_id.clone());
-        state.plan = task_plan(vec![
-            subtask("step-1", "Create first MatrixOne step", TaskStatus::Pending),
-            subtask(
-                "step-2",
-                &"x".repeat(astra_tools::task_mgmt::MAX_TASK_TITLE_CHARS + 1),
-                TaskStatus::Pending,
-            ),
-        ]);
-
-        let err = plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            &user_id,
-            &session_id,
-            "plan-http-matrixone-rollback",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .expect_err("invalid later step should abort MatrixOne approved-plan mirror");
-
-        assert!(
-            err.contains("title") && err.contains("exceeds"),
-            "original create validation error should be surfaced: {err}"
-        );
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(
-            tasks.len(),
-            1,
-            "failed MatrixOne approved-plan mirror must roll back the task board to its pre-approval state: {tasks:?}"
-        );
-        assert!(
-            tasks.iter().any(|t| t.title == "Existing MatrixOne task"),
-            "existing MatrixOne task must survive mirror failure: {tasks:?}"
-        );
-
-        cleanup_session_todos(&pool, &session_id, &user_id).await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-    async fn http_approved_plan_mirror_does_not_reuse_legacy_cli_style_tree_in_matrixone() {
-        let shared = bootstrap_shared_pool().await;
-        let pool = shared.get().clone();
-        let user_id = format!("u-plan-reuse-cli-{}", uuid::Uuid::new_v4());
-        let session_id = format!("s-plan-reuse-cli-{}", uuid::Uuid::new_v4());
-        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
-
-        let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
-        let manager = TaskManager::new(session_id.clone(), store);
-        let mut state =
-            PlanModeState::new_with_owner("ship hybrid MatrixOne plan".into(), user_id.clone());
-        state.plan = task_plan(vec![subtask(
-            "step-1",
-            "Mirror MatrixOne step task",
-            TaskStatus::Pending,
-        )]);
-        let fingerprint = plan_task_mirror::plan_task_board_fingerprint(&state.plan);
-
-        let cli_style = manager
-            .create(&serde_json::json!({
-                "title": "ship hybrid MatrixOne plan",
-                "metadata": {
-                    "source": "approved_plan",
-                    "plan_goal": "ship hybrid MatrixOne plan",
-                    "plan_fingerprint": fingerprint,
-                },
-                "subtasks": [
-                    { "id": "step-1", "title": "Mirror MatrixOne step task" }
-                ]
-            }))
-            .await;
-        assert!(cli_style.contains("\"success\":true"), "{cli_style}");
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            &user_id,
-            &session_id,
-            "plan-http-matrixone-reuses-cli-tree",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(
-            tasks.len(),
-            2,
-            "HTTP MatrixOne approval should leave legacy tree-shaped history alone and create a clean step task: {tasks:?}"
-        );
-        let task = tasks
-            .iter()
-            .find(|task| {
-                task.metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("plan_subtask_id"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("step-1")
-            })
-            .expect("approved plan step task");
-        assert_eq!(
-            task.status,
-            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
-        );
-        assert_eq!(
-            task.metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("plan_id"))
-                .and_then(serde_json::Value::as_str),
-            Some("plan-http-matrixone-reuses-cli-tree")
-        );
-        assert!(task.subtasks.is_empty(), "{task:?}");
-
-        cleanup_session_todos(&pool, &session_id, &user_id).await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-    async fn http_approved_plan_mirror_does_not_reopen_completed_history_in_matrixone() {
-        let shared = bootstrap_shared_pool().await;
-        let pool = shared.get().clone();
-        let user_id = format!("u-plan-repeat-{}", uuid::Uuid::new_v4());
-        let session_id = format!("s-plan-repeat-{}", uuid::Uuid::new_v4());
-        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
-
-        let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
-        let manager = TaskManager::new(session_id.clone(), store);
-        let mut state =
-            PlanModeState::new_with_owner("repeat MatrixOne plan".into(), user_id.clone());
-        state.plan = task_plan(vec![subtask(
-            "step-1",
-            "Repeat MatrixOne step task",
-            TaskStatus::Pending,
-        )]);
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            &user_id,
-            &session_id,
-            "plan-http-matrixone-repeat",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-        let completed = manager
-            .update(&serde_json::json!({
-                "task_id": "task-1",
-                "new_status": "completed",
-            }))
-            .await;
-        assert!(
-            completed.contains("\"success\":true"),
-            "first plan task should be completed before repeat mirror: {completed}"
-        );
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            &user_id,
-            &session_id,
-            "plan-http-matrixone-repeat",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(
-            tasks.len(),
-            2,
-            "completed MatrixOne plan history must not be reopened: {tasks:?}"
-        );
-        assert!(
-            tasks.iter().any(|task| task.status.is_completed()),
-            "completed history should remain completed: {tasks:?}"
-        );
-        assert!(
-            tasks.iter().any(|task| task.status.is_in_progress()),
-            "repeat approval should create a fresh in-progress task: {tasks:?}"
-        );
-
-        cleanup_session_todos(&pool, &session_id, &user_id).await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-    async fn http_approved_plan_mirror_pauses_previous_in_progress_plan_in_matrixone() {
-        let shared = bootstrap_shared_pool().await;
-        let pool = shared.get().clone();
-        let user_id = format!("u-plan-handoff-{}", uuid::Uuid::new_v4());
-        let session_id = format!("s-plan-handoff-{}", uuid::Uuid::new_v4());
-        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
-
-        let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
-        let manager = TaskManager::new(session_id.clone(), store);
-        let mut first_state =
-            PlanModeState::new_with_owner("handoff MatrixOne plan".into(), user_id.clone());
-        first_state.plan = task_plan(vec![subtask(
-            "step-1",
-            "First MatrixOne step task",
-            TaskStatus::Pending,
-        )]);
-        let mut second_state =
-            PlanModeState::new_with_owner("handoff MatrixOne plan".into(), user_id.clone());
-        second_state.plan = task_plan(vec![subtask(
-            "step-2",
-            "Second MatrixOne step task",
-            TaskStatus::Pending,
-        )]);
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            &user_id,
-            &session_id,
-            "plan-http-matrixone-handoff-1",
-            &first_state.goal,
-            &first_state.plan,
-        )
-        .await
-        .unwrap();
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            &user_id,
-            &session_id,
-            "plan-http-matrixone-handoff-2",
-            &second_state.goal,
-            &second_state.plan,
-        )
-        .await
-        .unwrap();
-
-        let tasks = manager.snapshot().await.unwrap();
-        assert_eq!(tasks.len(), 2, "{tasks:?}");
-        assert_eq!(
-            tasks
-                .iter()
-                .filter(|task| task.status.is_in_progress())
-                .count(),
-            1,
-            "MatrixOne plan handoff must leave exactly one running plan: {tasks:?}"
-        );
-        let paused = tasks
-            .iter()
-            .find(|task| task.status == astra_tools::task_mgmt::SessionTaskStatusKind::Paused)
-            .expect("previous plan should be paused");
-        assert_eq!(
-            paused
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("auto_paused_reason"))
-                .and_then(serde_json::Value::as_str),
-            Some("approved_plan_handoff"),
-            "paused plan should explain automatic handoff: {paused:?}"
-        );
-
-        cleanup_session_todos(&pool, &session_id, &user_id).await;
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live infrastructure: run with ASTRA_TEST_DB_IT=1"]
-    async fn plan_task_board_redo_does_not_reopen_completed_step_history_in_matrixone() {
-        let shared = bootstrap_shared_pool().await;
-        let pool = shared.get().clone();
-        let user_id = format!("u-plan-redo-{}", uuid::Uuid::new_v4());
-        let session_id = format!("s-plan-redo-{}", uuid::Uuid::new_v4());
-        prepare_session_todo_owner(&pool, &session_id, &user_id).await;
-
-        let store: Arc<dyn TaskStore> =
-            Arc::new(MatrixOneTaskStore::from_shared_for_user(&shared, &user_id).unwrap());
-        let manager = TaskManager::new(session_id.clone(), store);
-        let mut state =
-            PlanModeState::new_with_owner("redo MatrixOne plan".into(), user_id.clone());
-        state.plan = task_plan(vec![
-            subtask("step-1", "Build MatrixOne task", TaskStatus::Pending),
-            subtask("step-2", "Redo MatrixOne task", TaskStatus::Pending),
-        ]);
-
-        plan_task_mirror::mirror_approved_plan_to_task_board(
-            &manager,
-            &user_id,
-            &session_id,
-            "plan-http-matrixone-redo",
-            &state.goal,
-            &state.plan,
-        )
-        .await
-        .unwrap();
-        for subtask_id in ["step-1", "step-2"] {
-            sync_plan_task_board_subtask_status(
-                &manager,
-                "plan-http-matrixone-redo",
-                &state.plan,
-                subtask_id,
-                TaskStatus::Completed,
-            )
-            .await
-            .unwrap();
-        }
-
-        let completed = manager.snapshot().await.unwrap();
-        assert_eq!(
-            completed
-                .iter()
-                .filter(|task| task.status.is_completed())
-                .count(),
-            2,
-            "MatrixOne completed plan steps should be terminal task history: {completed:?}"
-        );
-
-        let error = sync_plan_task_board_subtask_status(
-            &manager,
-            "plan-http-matrixone-redo",
-            &state.plan,
-            "step-2",
-            TaskStatus::Pending,
-        )
-        .await
-        .expect_err("MatrixOne sync should not reopen completed task-board history");
-        assert!(
-            error.contains("already terminal"),
-            "MatrixOne redo of completed task-board history should fail closed: {error}"
-        );
-
-        let after_redo = manager.snapshot().await.unwrap();
-        assert_eq!(
-            after_redo
-                .iter()
-                .filter(|task| task.status.is_completed())
-                .count(),
-            2,
-            "MatrixOne completed task-board history should remain terminal: {after_redo:?}"
-        );
-
-        cleanup_session_todos(&pool, &session_id, &user_id).await;
+    #[test]
+    fn canonical_step_status_updates_require_redo_before_reopening_terminal_work() {
+        let mut plan = task_plan(vec![subtask("step", "Step", TaskStatus::Completed)]);
+        let _ = set_plan_step_status(&mut plan, "step", TaskStatus::InProgress)
+            .expect_err("terminal work must not be silently reopened by a new attempt");
+        assert_eq!(plan.subtasks[0].status, TaskStatus::Completed);
+
+        plan.subtasks[0].reset_for_redo();
+        set_plan_step_status(&mut plan, "step", TaskStatus::InProgress)
+            .expect("redo returns the canonical step to an executable state");
+        assert_eq!(plan.subtasks[0].status, TaskStatus::InProgress);
     }
 
     // ── error mapping tests ──────────────────────────────────────────────

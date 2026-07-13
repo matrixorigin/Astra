@@ -167,7 +167,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "session_device_lease_events",
             "session_state_items",
             "session_delegations",
-            "session_plan_todos",
             "session_todos",
             "session_todo_counters",
             "session_todo_idempotency",
@@ -221,11 +220,7 @@ class SchemaInventoryTest(unittest.TestCase):
             self.tables["session_delegations"]["merge_guidance"],
         )
         self.assertIn(
-            "incompatible schema and consumers",
-            self.tables["session_plan_todos"]["merge_guidance"],
-        )
-        self.assertIn(
-            "live task scratchpad",
+            "plan mirror",
             self.tables["session_todos"]["merge_guidance"],
         )
         self.assertIn(

@@ -39,7 +39,6 @@ pub mod internal_artifacts;
 pub mod memory_tool_contract;
 pub mod passive_cargo_check;
 pub mod passive_tsc_check;
-pub mod plan_task_mirror;
 pub mod relevance_score;
 #[cfg(unix)]
 pub mod rpc_bridge;

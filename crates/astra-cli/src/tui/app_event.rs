@@ -3,6 +3,9 @@
 #[derive(Debug, Clone)]
 pub(crate) enum TuiAppEvent {
     // ── Mapped from StreamEvent (one-layer bridge) ──────────────────────
+    ContextWindowEstimated(astra_turn_types::ContextWindowUsage),
+    ContextSystemPromptTokens(u32),
+    ContextWindowMeasured(u64),
     Token(String),
     ThinkingStarted,
     ThinkingStopped,
@@ -48,14 +51,30 @@ pub(crate) enum TuiAppEvent {
     WaitingForModel,
     ModelResponding,
     StatusLine(String),
+    UserIntentApplied {
+        intent_id: String,
+        delivery: astra_turn_types::UserIntentDelivery,
+        status: astra_turn_types::UserIntentStatus,
+        event_index: usize,
+        content: String,
+    },
     AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),
     AgentLiveBatch(Vec<astra_turn_core::agent_live_event::AgentLiveEvent>),
+    AgentLiveGap(astra_turn_core::agent_live_event::AgentLiveGap),
+    AgentCommunication(astra_turn_types::AgentCommunicationEvent),
     PermissionAutoApproved {
         tool: String,
         reason: String,
     },
 
     // ── Turn lifecycle ──────────────────────────────────────────────────
+    /// The agentic loop has settled its last model-visible output. Durable
+    /// turn settlement may still be running, but the reply can no longer grow.
+    AssistantOutputSettled,
+    /// The response event stream is closed. This freezes the mutable reply
+    /// projection, but does not claim that durable turn settlement has
+    /// completed yet.
+    TurnStreamClosed,
     TurnComplete,
     TurnError(String),
     SystemWarning(String),

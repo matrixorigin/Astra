@@ -37,13 +37,13 @@ use std::time::Instant;
 const AGENT_TOOL_OUTPUT_EVENT_LIMIT: usize = 50_000;
 const DEFAULT_TOOL_OUTPUT_EVENT_LIMIT: usize = 5_000;
 
-fn agent_control_action(args: &Value) -> Option<&str> {
+pub(crate) fn agent_control_action(args: &Value) -> Option<&str> {
     args.get("action")
         .and_then(Value::as_str)
         .and_then(|action| matches!(action, "spawn" | "get_result").then_some(action))
 }
 
-fn agent_control_label(args: &Value, fallback: String) -> String {
+pub(crate) fn agent_control_label(args: &Value, fallback: String) -> String {
     args.get("name")
         .and_then(Value::as_str)
         .or_else(|| args.get("agent_id").and_then(Value::as_str))
@@ -53,7 +53,7 @@ fn agent_control_label(args: &Value, fallback: String) -> String {
         .unwrap_or(fallback)
 }
 
-fn agent_id_from_args(args: &Value) -> Option<String> {
+pub(crate) fn agent_id_from_args(args: &Value) -> Option<String> {
     args.get("agent_id")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -78,7 +78,7 @@ fn agent_fanout_title_from_args(args: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn agent_id_from_output(output: &str) -> Option<String> {
+pub(crate) fn agent_id_from_output(output: &str) -> Option<String> {
     serde_json::from_str::<Value>(output)
         .ok()
         .and_then(|value| {
@@ -89,7 +89,7 @@ fn agent_id_from_output(output: &str) -> Option<String> {
         })
 }
 
-fn tool_output_event_text(tool: &str, output: &str) -> String {
+pub(crate) fn tool_output_event_text(tool: &str, output: &str) -> String {
     let limit = if tool == "agent" {
         AGENT_TOOL_OUTPUT_EVENT_LIMIT
     } else {
@@ -100,8 +100,8 @@ fn tool_output_event_text(tool: &str, output: &str) -> String {
 
 // CLI formatting utilities
 use crate::cli::cli_config::cli_formatting::{
-    colorize_diff_summary, compact_unified_diff_preview, extract_cli_diff_block, format_byte_size,
-    format_duration_suffix, shorten_path, truncate_line,
+    colorize_diff_summary, colorize_git_diff_stat_summary, compact_unified_diff_preview,
+    extract_cli_diff_block, format_byte_size, format_duration_suffix, shorten_path, truncate_line,
 };
 
 // Effects module types
@@ -322,10 +322,22 @@ fn persist_scoped_allow_rule(
             "Don't ask again for {remember_preview} is session-only; failed to save rule {rule} to {target_label}: {err}"
         );
         if let Some(tx) = save_warning_tx {
-            let _ = tx.send(chat_stream::StreamEvent::StatusLine(format!(
-                "Failed to save don't-ask-again rule for {remember_preview} to {target_label}: {err}"
-            )));
+            try_send_stream_event(
+                tx,
+                chat_stream::StreamEvent::StatusLine(format!(
+                    "Failed to save don't-ask-again rule for {remember_preview} to {target_label}: {err}"
+                )),
+            );
         }
+    }
+}
+
+/// Synchronous callers are limited to lifecycle edges and destructor-time
+/// snapshots. They must never block a Tokio worker; bounded-queue saturation
+/// is observable and durable state remains authoritative.
+fn try_send_stream_event(tx: &chat_stream::StreamEventTx, event: chat_stream::StreamEvent) {
+    if let Err(error) = tx.try_send(event) {
+        tracing::warn!(%error, "stream event queue unavailable");
     }
 }
 
@@ -637,6 +649,11 @@ struct CliSseStreamHost<'a> {
     cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
     stream_event_tx: Option<chat_stream::StreamEventTx>,
+    /// Last context-meta value forwarded to observers. The SSE accumulator is
+    /// replayed on each frame, so deduplicate rather than flooding the TUI.
+    last_context_system_prompt_tokens: Option<u32>,
+    /// Last provider-confirmed input occupancy forwarded to observers.
+    last_context_window_measured: Option<u64>,
     /// Optional direct stream sink for bounded/live paths.
     stream_event_sink: Option<chat_stream::SharedStreamEventSink>,
     /// Optional channel for async tool approval requests during plan execution.
@@ -815,6 +832,7 @@ impl BashProgressGuard {
                             lines,
                             bytes,
                         })
+                        .await
                         .is_err()
                     {
                         break;
@@ -849,7 +867,7 @@ impl Drop for BashProgressGuard {
             self.final_event_tx.as_ref(),
         ) {
             let (lines, bytes) = sink.snapshot();
-            let _ = tx.send(chat_stream::StreamEvent::ToolOutput {
+            let _ = tx.try_send(chat_stream::StreamEvent::ToolOutput {
                 name: self.tool_name.clone(),
                 lines,
                 bytes,
@@ -931,6 +949,8 @@ impl<'a> CliSseStreamHost<'a> {
             xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
             stream_event_tx: ctx.stream_event_tx,
+            last_context_system_prompt_tokens: None,
+            last_context_window_measured: None,
             stream_event_sink: ctx.stream_event_sink,
             approval_request_tx: ctx.approval_request_tx,
             ask_user_request_tx: ctx.ask_user_request_tx,
@@ -1278,7 +1298,8 @@ impl<'a> CliSseStreamHost<'a> {
                     output: Some(tool_output_event_text(tool, &output)),
                     tool_use_id: request_id.to_string(),
                     agent_id: agent_id_from_output(&output).or_else(|| agent_id_from_args(args)),
-                });
+                })
+                .await;
             }
             self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
                 name: tool.to_string(),
@@ -1293,7 +1314,8 @@ impl<'a> CliSseStreamHost<'a> {
                 output: Some(tool_output_event_text(tool, &output)),
                 tool_use_id: request_id.to_string(),
                 parent_tool_use_id: None,
-            });
+            })
+            .await;
         }
 
         let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
@@ -1342,6 +1364,18 @@ impl<'a> CliSseStreamHost<'a> {
         Ok(expanded)
     }
 
+    fn sandbox_expansion_scope(
+        &self,
+        args: &serde_json::Value,
+        sandbox_msg: &str,
+    ) -> Option<PathBuf> {
+        crate::sandbox_retry::sandbox_expand_dir_from_denial_or_workspace(
+            args,
+            sandbox_msg,
+            &self.executor.effective_project_root(),
+        )
+    }
+
     async fn preflight_explicit_path_sandbox_expansion_target(
         &mut self,
         target: &crate::sandbox_retry::ExplicitPathPreflightTarget,
@@ -1356,9 +1390,7 @@ impl<'a> CliSseStreamHost<'a> {
         else {
             return Ok(false);
         };
-        let Some(expand_dir) =
-            crate::sandbox_retry::sandbox_expand_dir_from_denial(args, &sandbox_msg)
-        else {
+        let Some(expand_dir) = self.sandbox_expansion_scope(args, &sandbox_msg) else {
             return Err(crate::sandbox_retry::sandbox_retry_no_expand_dir_output(
                 tool,
                 &sandbox_msg,
@@ -1381,7 +1413,10 @@ impl<'a> CliSseStreamHost<'a> {
         expand_dir: &Path,
     ) -> Result<(), String> {
         let sandbox_tool_key = format!("sandbox_expand:{tool}");
-        let guard_args = serde_json::json!({"reason": sandbox_msg});
+        let guard_args = serde_json::json!({
+            "reason": sandbox_msg,
+            "directory": expand_dir.to_string_lossy(),
+        });
         let decision = {
             let Some(pm) = self.perm_manager.as_mut() else {
                 return Err(format!(
@@ -1427,14 +1462,24 @@ impl<'a> CliSseStreamHost<'a> {
                 };
 
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                let _ = tx.send(chat_stream::ApprovalRequest::bare(
-                    approval_tool.clone(),
-                    format!("🔒 {header}"),
-                    detail,
-                    reason,
-                    guard_args.clone(),
-                    resp_tx,
-                ));
+                if let Err(error) = chat_stream::enqueue_interactive_request(
+                    tx,
+                    chat_stream::ApprovalRequest::bare(
+                        approval_tool.clone(),
+                        format!("🔒 {header}"),
+                        detail,
+                        reason,
+                        guard_args.clone(),
+                        resp_tx,
+                    ),
+                ) {
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        pm.record_approval(&approval_tool, Some(&guard_args), false);
+                    }
+                    return Err(format!(
+                        "Error: {sandbox_msg} (sandbox expansion for {tool} requires approval, but {error})"
+                    ));
+                }
                 let response = if let Some(token) = self.cancel_token {
                     tokio::select! {
                         biased;
@@ -2023,7 +2068,8 @@ impl<'a> CliSseStreamHost<'a> {
                     tool_use_id: req.request_id.clone(),
                     agent_id: agent_id_from_output(&output)
                         .or_else(|| agent_id_from_args(&req.args)),
-                });
+                })
+                .await;
             }
             self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
                 name: req.tool.clone(),
@@ -2038,7 +2084,8 @@ impl<'a> CliSseStreamHost<'a> {
                 output: Some(tool_output_event_text(&req.tool, &output)),
                 tool_use_id: req.request_id.clone(),
                 parent_tool_use_id: None,
-            });
+            })
+            .await;
         }
 
         let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
@@ -2391,9 +2438,20 @@ pub(crate) fn reusable_speculative_output(r: Option<(String, bool)>) -> Option<S
 }
 
 impl CliSseStreamHost<'_> {
-    fn emit_stream_event(&self, event: chat_stream::StreamEvent) {
+    async fn emit_stream_event(&self, event: chat_stream::StreamEvent) {
         if let Some(tx) = &self.stream_event_tx {
-            let _ = tx.send(event.clone());
+            if tx.send(event.clone()).await.is_err() {
+                tracing::debug!("stream event receiver closed");
+            }
+        }
+        if let Some(sink) = &self.stream_event_sink {
+            sink.send(event);
+        }
+    }
+
+    fn try_emit_stream_event(&self, event: chat_stream::StreamEvent) {
+        if let Some(tx) = &self.stream_event_tx {
+            try_send_stream_event(tx, event.clone());
         }
         if let Some(sink) = &self.stream_event_sink {
             sink.send(event);
@@ -2543,10 +2601,10 @@ impl CliSseStreamHost<'_> {
             resp_tx,
         );
         request.metadata = Some(Box::new(metadata));
-        if tx.send(request).is_err() {
+        if let Err(error) = chat_stream::enqueue_interactive_request(tx, request) {
             astra_core::agent_warn!(
                 "permission",
-                "Auto-denied cloud approval for {tool}: TUI approval sink is closed"
+                "Auto-denied cloud approval for {tool}: {error}"
             );
             return ApprovalDecision::Deny;
         }
@@ -2603,14 +2661,14 @@ impl CliSseStreamHost<'_> {
 
         let request_id = format!("ask_{}", uuid::Uuid::now_v7().simple());
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        if tx
-            .send(AskUserRequest {
+        if let Err(error) = chat_stream::enqueue_interactive_request(
+            tx,
+            AskUserRequest {
                 prompt: prompt.clone(),
                 response_tx,
-            })
-            .is_err()
-        {
-            return "Error: ask_user prompt sink is closed".to_string();
+            },
+        ) {
+            return format!("Error: ask_user cannot open a prompt because {error}");
         }
         self.emit_stream_event(chat_stream::StreamEvent::AskUserPrompted {
             request_id: request_id.clone(),
@@ -2618,7 +2676,8 @@ impl CliSseStreamHost<'_> {
                 "source": "tui",
                 "prompt": astra_tools::build_ask_user_prompt_telemetry(&prompt),
             }),
-        });
+        })
+        .await;
 
         let response = if let Some(token) = self.cancel_token {
             tokio::select! {
@@ -2643,7 +2702,8 @@ impl CliSseStreamHost<'_> {
                             None,
                         ),
                     }),
-                });
+                })
+                .await;
                 answers.to_tool_result_value().to_string()
             }
             AskUserResponse::Cancelled => {
@@ -2659,7 +2719,8 @@ impl CliSseStreamHost<'_> {
                             Some(error),
                         ),
                     }),
-                });
+                })
+                .await;
                 error.to_string()
             }
         }
@@ -2729,7 +2790,7 @@ fn sync_incremental_tool_result_state(
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
     fn on_before_sse_read_loop(&mut self) {
-        self.emit_stream_event(chat_stream::StreamEvent::WaitingForModel);
+        self.try_emit_stream_event(chat_stream::StreamEvent::WaitingForModel);
         if self.render_policy.is_silent() {
             return;
         }
@@ -2737,7 +2798,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_first_sse_frame(&mut self) {
-        self.emit_stream_event(chat_stream::StreamEvent::ModelResponding);
+        self.try_emit_stream_event(chat_stream::StreamEvent::ModelResponding);
         // Don't stop the TTFT spinner here — the first SSE frame is often
         // metadata (session_info, usage) not visible content.  Let the
         // spinner run until actual thinking/text arrives, which will
@@ -2762,9 +2823,45 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
     fn on_accum_update(&mut self, accum: &ChatTurnSseAccum) {
         self.sync_incremental_accum(accum);
+        if accum.system_prompt_tokens != self.last_context_system_prompt_tokens {
+            if let Some(tokens) = accum.system_prompt_tokens {
+                self.try_emit_stream_event(chat_stream::StreamEvent::ContextSystemPromptTokens(
+                    tokens,
+                ));
+            }
+            self.last_context_system_prompt_tokens = accum.system_prompt_tokens;
+        }
+
+        let measured = accum
+            .has_usage
+            .then(|| {
+                accum
+                    .prompt_tokens
+                    .saturating_add(accum.cache_read_tokens)
+                    .saturating_add(accum.cache_creation_tokens)
+            })
+            .filter(|tokens| *tokens > 0);
+        if measured != self.last_context_window_measured {
+            if let Some(tokens) = measured {
+                self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowMeasured(tokens));
+            }
+            self.last_context_window_measured = measured;
+        }
     }
 
-    fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
+    fn on_agent_communication(&mut self, event: astra_turn_types::AgentCommunicationEvent) {
+        self.try_emit_stream_event(chat_stream::StreamEvent::AgentCommunication(event));
+    }
+
+    fn on_agent_live_event(&mut self, event: astra_turn_core::agent_live_event::AgentLiveEvent) {
+        self.try_emit_stream_event(chat_stream::StreamEvent::AgentLive(event));
+    }
+
+    fn on_agent_live_gap(&mut self, gap: astra_turn_core::agent_live_event::AgentLiveGap) {
+        self.try_emit_stream_event(chat_stream::StreamEvent::AgentLiveGap(gap));
+    }
+
+    async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
         // Forward to stream event channel (even when quiet/suppress are on)
         if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
             use crate::cli::chat_stream::StreamEvent;
@@ -2781,7 +2878,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     _ => None,
                 };
                 if let Some(ev) = ev {
-                    self.emit_stream_event(ev);
+                    self.emit_stream_event(ev).await;
                 }
             }
         }
@@ -2886,14 +2983,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     agent_id: agent_id_from_args(args),
                     fanout_slot: agent_fanout_slot_from_args(args),
                     fanout_title: agent_fanout_title_from_args(args),
-                });
+                })
+                .await;
             }
             self.emit_stream_event(chat_stream::StreamEvent::ToolStarted {
                 name: tool.to_string(),
                 description: tool_description.clone(),
                 tool_use_id: request_id.to_string(),
                 parent_tool_use_id: None,
-            });
+            })
+            .await;
         }
 
         // Install a bash progress sink + 200ms ticker for the TUI's
@@ -3216,23 +3315,34 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     }
                     let stale_revalidation = approval_stale_revalidation_target(&t, args)
                         .map(|path| (path, metadata.base_digest.clone()));
-                    let _ = tx.send(chat_stream::ApprovalRequest {
-                        tool: t.clone(),
-                        header,
-                        detail,
-                        reason,
-                        args: args.clone(),
-                        response_tx: resp_tx,
-                        metadata: Some(Box::new(metadata)),
-                    });
-                    let response = if let Some(token) = self.cancel_token {
-                        tokio::select! {
-                            biased;
-                            _ = token.cancelled() => ApprovalResponse::Deny,
-                            r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                    let response = match chat_stream::enqueue_interactive_request(
+                        tx,
+                        chat_stream::ApprovalRequest {
+                            tool: t.clone(),
+                            header,
+                            detail,
+                            reason,
+                            args: args.clone(),
+                            response_tx: resp_tx,
+                            metadata: Some(Box::new(metadata)),
+                        },
+                    ) {
+                        Ok(()) => {
+                            if let Some(token) = self.cancel_token {
+                                tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => ApprovalResponse::Deny,
+                                    r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                                }
+                            } else {
+                                resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                            }
                         }
-                    } else {
-                        resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                        Err(error) => {
+                            denied_output =
+                                Some(format!("Error: {t} requires approval, but {error}"));
+                            ApprovalResponse::Deny
+                        }
                     };
                     let mut stale_revalidation_passed = true;
                     if response.is_approved() {
@@ -3442,12 +3552,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // authorization. On approval, temporarily expand the sandbox
                 // boundary and retry the tool.
                 if let Some(sandbox_msg) = normalize_sandbox_denied_outcome(&mut outcome) {
-                    if let Some(expand_dir) =
-                        crate::sandbox_retry::sandbox_expand_dir_from_denial(args, &sandbox_msg)
-                    {
+                    if let Some(expand_dir) = self.sandbox_expansion_scope(args, &sandbox_msg) {
                         if let Some(pm) = &mut self.perm_manager {
                             let sandbox_tool_key = format!("sandbox_expand:{tool}");
-                            let guard_args = serde_json::json!({"reason": sandbox_msg.clone()});
+                            let guard_args = serde_json::json!({
+                                "reason": sandbox_msg.clone(),
+                                "directory": expand_dir.to_string_lossy(),
+                            });
                             let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
                                 Some(&mut **pm),
                                 &sandbox_tool_key,
@@ -3469,23 +3580,39 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         // prompts; header/detail/reason otherwise
                                         // come straight from the permission manager
                                         // so we don't echo the same text thrice.
-                                        let _ = tx.send(chat_stream::ApprovalRequest::bare(
-                                            sandbox_tool_key.clone(),
-                                            format!("🔒 {header}"),
-                                            detail,
-                                            reason,
-                                            args.clone(),
-                                            resp_tx,
-                                        ));
-                                        let response = if let Some(token) = self.cancel_token {
-                                            tokio::select! {
-                                                biased;
-                                                _ = token.cancelled() => ApprovalResponse::Deny,
-                                                r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
-                                            }
-                                        } else {
-                                            resp_rx.await.unwrap_or(ApprovalResponse::Deny)
-                                        };
+                                        let response =
+                                            match chat_stream::enqueue_interactive_request(
+                                                tx,
+                                                chat_stream::ApprovalRequest::bare(
+                                                    sandbox_tool_key.clone(),
+                                                    format!("🔒 {header}"),
+                                                    detail,
+                                                    reason,
+                                                    guard_args.clone(),
+                                                    resp_tx,
+                                                ),
+                                            ) {
+                                                Ok(()) => {
+                                                    if let Some(token) = self.cancel_token {
+                                                        tokio::select! {
+                                                            biased;
+                                                            _ = token.cancelled() => ApprovalResponse::Deny,
+                                                            r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                                                        }
+                                                    } else {
+                                                        resp_rx
+                                                            .await
+                                                            .unwrap_or(ApprovalResponse::Deny)
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    astra_core::agent_warn!(
+                                                        "permission",
+                                                        "Auto-denied sandbox expansion {sandbox_tool_key}: {error}"
+                                                    );
+                                                    ApprovalResponse::Deny
+                                                }
+                                            };
                                         let selected_scope = response.always_scope(
                                             astra_turn_core::permission::scope::AllowScope::Project,
                                         );
@@ -3507,19 +3634,19 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                         "Don't ask again for {remember_preview} is session-only; failed to save rule {rule}: {err}"
                                                     );
                                                     if let Some(tx) = &self.stream_event_tx {
-                                                        let _ = tx.send(chat_stream::StreamEvent::StatusLine(
+                                                        try_send_stream_event(tx, chat_stream::StreamEvent::StatusLine(
                                                             format!(
                                                                 "Failed to save don't-ask-again rule for {remember_preview}: {err}"
                                                             ),
                                                         ));
                                                     }
                                                 }
-                                                pm.trust_sandbox_root_from_reason(&sandbox_msg);
+                                                pm.trust_sandbox_root(expand_dir.clone());
                                             }
                                             Some(
                                                 astra_turn_core::permission::scope::AllowScope::RestOfSession,
                                             ) => {
-                                                pm.trust_sandbox_root_from_reason(&sandbox_msg);
+                                                pm.trust_sandbox_root(expand_dir.clone());
                                             }
                                             Some(
                                                 astra_turn_core::permission::scope::AllowScope::User,
@@ -3538,14 +3665,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                         "Don't ask again for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
                                                     );
                                                     if let Some(tx) = &self.stream_event_tx {
-                                                        let _ = tx.send(chat_stream::StreamEvent::StatusLine(
+                                                        try_send_stream_event(tx, chat_stream::StreamEvent::StatusLine(
                                                             format!(
                                                                 "Failed to save don't-ask-again rule for {remember_preview}: {err}"
                                                             ),
                                                         ));
                                                     }
                                                 }
-                                                pm.trust_sandbox_root_from_reason(&sandbox_msg);
+                                                pm.trust_sandbox_root(expand_dir.clone());
                                             }
                                             Some(
                                                 astra_turn_core::permission::scope::AllowScope::OnceThisCall
@@ -3713,7 +3840,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     output: Some(tool_output_event_text(tool, &output)),
                     tool_use_id: request_id.to_string(),
                     agent_id: agent_id_from_output(&output).or_else(|| agent_id_from_args(args)),
-                });
+                })
+                .await;
             }
             self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
                 name: tool.to_string(),
@@ -3728,7 +3856,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 output: Some(tool_output_event_text(tool, &output)),
                 tool_use_id: request_id.to_string(),
                 parent_tool_use_id: None,
-            });
+            })
+            .await;
         }
 
         // Update tool line to show completion.
@@ -4113,14 +4242,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         agent_id: agent_id_from_args(&req.args),
                         fanout_slot: agent_fanout_slot_from_args(&req.args),
                         fanout_title: agent_fanout_title_from_args(&req.args),
-                    });
+                    })
+                    .await;
                 }
                 self.emit_stream_event(chat_stream::StreamEvent::ToolStarted {
                     name: req.tool.clone(),
                     description: desc,
                     tool_use_id: req.request_id.clone(),
                     parent_tool_use_id: None,
-                });
+                })
+                .await;
             }
             // First-tool clearing (once per turn).
             if !self.tool_work_detected {
@@ -4358,15 +4489,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let tool = req.tool.clone();
             let args = req.args.clone();
             let sandbox_tool_key = format!("sandbox_expand:{tool}");
-            let Some(expand_dir) =
-                crate::sandbox_retry::sandbox_expand_dir_from_denial(&args, &sandbox_msg)
-            else {
+            let Some(expand_dir) = self.sandbox_expansion_scope(&args, &sandbox_msg) else {
                 outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
                     crate::sandbox_retry::sandbox_retry_no_expand_dir_output(&tool, &sandbox_msg),
                 );
                 continue;
             };
-            let guard_args = serde_json::json!({"reason": sandbox_msg.clone()});
+            let guard_args = serde_json::json!({
+                "reason": sandbox_msg.clone(),
+                "directory": expand_dir.to_string_lossy(),
+            });
             let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
                 self.perm_manager.as_deref_mut(),
                 &sandbox_tool_key,
@@ -4394,22 +4526,35 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     use crate::cli::chat_stream::ApprovalResponse;
                     if let Some(tx) = &self.approval_request_tx {
                         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                        let _ = tx.send(chat_stream::ApprovalRequest::bare(
-                            approval_tool.clone(),
-                            header,
-                            detail,
-                            reason,
-                            args.clone(),
-                            resp_tx,
-                        ));
-                        let response = if let Some(token) = self.cancel_token {
-                            tokio::select! {
-                                biased;
-                                _ = token.cancelled() => ApprovalResponse::Deny,
-                                r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                        let response = match chat_stream::enqueue_interactive_request(
+                            tx,
+                            chat_stream::ApprovalRequest::bare(
+                                approval_tool.clone(),
+                                header,
+                                detail,
+                                reason,
+                                guard_args.clone(),
+                                resp_tx,
+                            ),
+                        ) {
+                            Ok(()) => {
+                                if let Some(token) = self.cancel_token {
+                                    tokio::select! {
+                                        biased;
+                                        _ = token.cancelled() => ApprovalResponse::Deny,
+                                        r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                                    }
+                                } else {
+                                    resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                                }
                             }
-                        } else {
-                            resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                            Err(error) => {
+                                outputs[pos].0.output = format!(
+                                    "Error: {sandbox_msg} (sandbox expansion for {tool} requires approval, but {error})"
+                                );
+                                outputs[pos].0.is_error = true;
+                                ApprovalResponse::Deny
+                            }
                         };
                         if let Some(pm) = self.perm_manager.as_mut() {
                             if response.is_approved() {
@@ -4501,7 +4646,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         tool_use_id: req.request_id.clone(),
                         agent_id: agent_id_from_output(&output)
                             .or_else(|| agent_id_from_args(&req.args)),
-                    });
+                    })
+                    .await;
                 }
                 self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
                     name: req.tool.clone(),
@@ -4516,7 +4662,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     output: Some(tool_output_event_text(&req.tool, &output)),
                     tool_use_id: req.request_id.clone(),
                     parent_tool_use_id: None,
-                });
+                })
+                .await;
             }
 
             // Tool-done UI.
@@ -4777,10 +4924,13 @@ struct ToolOutputSummary {
 }
 
 fn format_terminal_tool_summary(tool: &str, summary: &ToolOutputSummary, warning: bool) -> String {
-    let rendered = if matches!(summary.kind, ToolOutputSummaryKind::Diff)
-        && matches!(tool, "write_file" | "str_replace" | "multi_edit")
-    {
+    let is_edit_diff = matches!(summary.kind, ToolOutputSummaryKind::Diff)
+        && matches!(tool, "write_file" | "str_replace" | "multi_edit");
+    let is_git_diff_stat = matches!(summary.kind, ToolOutputSummaryKind::Diff) && tool == "git";
+    let rendered = if is_edit_diff {
         colorize_diff_summary(&summary.text)
+    } else if is_git_diff_stat {
+        colorize_git_diff_stat_summary(&summary.text)
     } else {
         match summary.kind {
             ToolOutputSummaryKind::Diff => summary.text.clone(),
@@ -4797,7 +4947,17 @@ fn format_terminal_tool_summary(tool: &str, summary: &ToolOutputSummary, warning
 
     rendered
         .lines()
-        .map(|line| format!("    {line}"))
+        // `colorize_diff_summary` owns the complete changed-row geometry so
+        // its muted surface reaches the terminal edge. Adding this generic
+        // preview indent would start the background after four blank columns
+        // and break that contract.
+        .map(|line| {
+            if is_edit_diff || is_git_diff_stat {
+                line.to_string()
+            } else {
+                format!("    {line}")
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -5423,16 +5583,12 @@ impl StreamRenderState {
                     .filter(|l| l.starts_with("+++ b/") && !l.contains("/dev/null"))
                     .count();
                 let stat = if additions > 0 || deletions > 0 {
-                    format!(
-                        "{} {}",
-                        format!("+{additions}").green(),
-                        format!("-{deletions}").red()
-                    )
+                    format!("+{additions} -{deletions}")
                 } else {
                     format!("{line_count} lines")
                 };
                 if files.is_empty() {
-                    Some(structural(stat))
+                    Some(diff_summary(stat))
                 } else {
                     let mut summary = format!("{stat} in {total_files} file(s)");
                     for f in &files {
@@ -5442,7 +5598,7 @@ impl StreamRenderState {
                     if remaining > 0 {
                         summary.push_str(&format!("\n      … +{remaining} more"));
                     }
-                    Some(structural(summary))
+                    Some(diff_summary(summary))
                 }
             }
             "grep" | "search" => {
@@ -6591,16 +6747,17 @@ mod tests {
         ApprovalMemoryAction, ChatTurnEdgePending, ChatTurnSseAccum, CliSseStreamHost,
         EdgeSseContext, EdgeToolCache, EdgeToolCacheEntry, EdgeToolCacheValidation,
         EdgeToolExecResult, PostToolResultError, RenderPolicy, StreamRenderState, ToolBatchRequest,
-        ToolOutputSummaryKind, TurnResult, append_skill_loaded_marker,
+        ToolOutputSummary, ToolOutputSummaryKind, TurnResult, append_skill_loaded_marker,
         apply_edge_auth_failure_result, approval_batch_group_key, approval_default_always_scope,
         approval_memory_action, approval_memory_preview, approval_scope_context_for_tool,
         approval_stale_revalidation_error, catch_tool_execution_panic, dispatch_turn_event_block,
         edge_tool_is_cacheable_read, edge_tool_outcome_status, execute_with_metadata_responsive,
-        extract_cli_diff_block, format_tool_display_from_preview, is_edge_auth_failure,
-        merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
-        reusable_speculative_output, sanitize_final_stream_text, style_tool_description,
-        sync_incremental_accum_state, sync_incremental_tool_result_state, task_preview_from_args,
-        theme, tool_completion_icon, tool_dedup_signature, turn_has_tool_work,
+        extract_cli_diff_block, format_terminal_tool_summary, format_tool_display_from_preview,
+        is_edge_auth_failure, merge_edge_tool_rounds, normalize_sandbox_denied_outcome,
+        path_mtime_ms, reusable_speculative_output, sanitize_final_stream_text,
+        style_tool_description, sync_incremental_accum_state, sync_incremental_tool_result_state,
+        task_preview_from_args, theme, tool_completion_icon, tool_dedup_signature,
+        turn_has_tool_work,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -7117,7 +7274,9 @@ mod tests {
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
-            tokio::sync::mpsc::unbounded_channel::<chat_stream::ApprovalRequest>();
+            tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
+                chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+            );
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -7207,6 +7366,16 @@ mod tests {
             },
             80,
             false,
+        );
+
+        assert_eq!(
+            host.sandbox_expansion_scope(
+                &serde_json::json!({
+                    "command": "find crates -name '*.rs' -exec sed -i 's/old/new/g' {} +"
+                }),
+                "sandbox policy denied this workspace command",
+            ),
+            Some(project.clone())
         );
 
         let expanded = host
@@ -7454,7 +7623,9 @@ mod tests {
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
-            tokio::sync::mpsc::unbounded_channel::<chat_stream::ApprovalRequest>();
+            tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
+                chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+            );
 
         let decision = {
             let mut host = CliSseStreamHost::from_edge_ctx(
@@ -7524,7 +7695,9 @@ mod tests {
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
-            tokio::sync::mpsc::unbounded_channel::<chat_stream::ApprovalRequest>();
+            tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
+                chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+            );
 
         let decision = {
             let mut host = CliSseStreamHost::from_edge_ctx(
@@ -7605,7 +7778,9 @@ mod tests {
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
-            tokio::sync::mpsc::unbounded_channel::<chat_stream::ApprovalRequest>();
+            tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
+                chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+            );
         let command = "git restore --staged --worktree crates/foo/src/lib.rs";
 
         let decision = {
@@ -8604,6 +8779,46 @@ mod tests {
     // ── Skill/MCP output summary tests ──
 
     #[test]
+    fn terminal_edit_diff_owns_its_row_geometry_without_generic_preview_indent() {
+        let summary = ToolOutputSummary {
+            kind: ToolOutputSummaryKind::Diff,
+            text: "@@ -1 +1 @@\n-old\n+new".into(),
+        };
+
+        let rendered = format_terminal_tool_summary("str_replace", &summary, false);
+        let plain = crate::cli::theme::strip_ansi(&rendered);
+        let rows = plain.lines().collect::<Vec<_>>();
+
+        assert_eq!(rows[1].trim(), "1 - old");
+        assert_eq!(rows[2].trim(), "1 + new");
+        assert!(
+            rows[1].len() > rows[1].trim_end().len(),
+            "edit diff rows own the full terminal width: {:?}",
+            rows[1]
+        );
+        assert!(
+            !rows[1].starts_with("       1 -"),
+            "edit rows must not receive the generic four-column preview indent: {:?}",
+            rows[1]
+        );
+    }
+
+    #[test]
+    fn terminal_git_diff_stat_has_its_own_neutral_row_geometry() {
+        let summary = ToolOutputSummary {
+            kind: ToolOutputSummaryKind::Diff,
+            text: "+21 -18 in 1 file(s)\n      pkg/frontend/plan_cache.go".into(),
+        };
+
+        let rendered = format_terminal_tool_summary("git", &summary, false);
+        let plain = crate::cli::theme::strip_ansi(&rendered);
+        let rows = plain.lines().collect::<Vec<_>>();
+        assert_eq!(rows[0].trim_end(), "    +21 -18 in 1 file(s)");
+        assert!(rows[0].len() > rows[0].trim_end().len(), "{rows:?}");
+        assert_eq!(rows[1], "          pkg/frontend/plan_cache.go");
+    }
+
+    #[test]
     fn output_summary_basics() {
         let r = StreamRenderState::new();
         // skill: collapses preview lines
@@ -8658,7 +8873,7 @@ mod tests {
             .format_output_summary("bash", "", "failed")
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Error);
-        assert_eq!(s.text, "bash failed before returning output");
+        assert_eq!(s.text, "bash ended without a result payload");
         let s = r
             .format_output_summary(
                 "str_replace",
@@ -8700,10 +8915,11 @@ mod tests {
                 "completed",
             )
             .expect("summary");
-        assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
+        assert_eq!(s.kind, ToolOutputSummaryKind::Diff);
         assert!(s.text.contains("+1"));
         assert!(s.text.contains("-1"));
         assert!(s.text.contains("src/a.rs"));
+        assert!(!s.text.contains('\x1b'));
 
         // str_replace
         let s = r.format_output_summary("str_replace", "<<<ASTRA_UNIFIED_DIFF>>>\n--- a/src/hello.py\n+++ b/src/hello.py\n@@ -1,2 +1,3 @@\n-print(\"old\")\n+print(\"new\")\n+print(\"more\")\n<<<END_ASTRA_UNIFIED_DIFF>>>", "completed").expect("summary");
@@ -10127,7 +10343,7 @@ mod tests {
             },
         );
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = chat_stream::stream_event_channel();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,

@@ -14,6 +14,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
+
 use crate::cli::session::session_state::ContinuationAnchor;
 use astra_turn_core::context_assembly_trace::{
     ContextAssemblyTrace, DecisionExplanation, DecisionType, MemoryInjection, MemoryRejection,
@@ -61,8 +63,12 @@ pub(crate) struct CompactionSummary {
     /// All turns in the session that fired compaction.  Includes
     /// older events beyond just this turn.
     pub compressed_turns: Vec<u32>,
-    /// Per-event detail (from the latest trace's turns_compressed).
+    /// Exact per-turn compaction detail, only when a producer recorded a
+    /// real turn identity.
     pub events: Vec<CompactionEventItem>,
+    /// Pipeline-level work that freed context without a meaningful individual
+    /// turn identity (for example duplicate-read elimination).
+    pub stages: Vec<CompactionStageItem>,
     /// Aggregate token shape (last turn only).
     pub tokens_before: u32,
     pub tokens_after: u32,
@@ -70,7 +76,10 @@ pub(crate) struct CompactionSummary {
 
 impl CompactionSummary {
     pub fn is_empty(&self) -> bool {
-        !self.triggered_this_turn && self.compressed_turns.is_empty() && self.events.is_empty()
+        !self.triggered_this_turn
+            && self.compressed_turns.is_empty()
+            && self.events.is_empty()
+            && self.stages.is_empty()
     }
 
     pub fn tokens_saved(&self) -> u32 {
@@ -87,6 +96,13 @@ pub(crate) struct CompactionEventItem {
     pub compressed_tokens: u32,
     /// Human-readable bullets describing what was lost.
     pub information_lost: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CompactionStageItem {
+    pub stage: String,
+    pub method: String,
+    pub tokens_freed: u32,
 }
 
 /// Extra detail for the Memory section.  Populated directly from
@@ -177,9 +193,180 @@ pub(crate) struct SessionSummary {
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// One request's actual context-window occupancy. This is deliberately
+    /// separate from cumulative session/billing totals above.
+    pub request_context: Option<RequestContextEvidence>,
     pub continuation_anchor: Option<ContinuationAnchor>,
     pub queued_message: Option<String>,
     pub diagnostics_context: Option<String>,
+    /// Session-wide `read_file` evidence from the canonical journal. This is
+    /// intentionally separate from the latest prompt trace: a prompt can be
+    /// small while the session has accumulated substantial tool activity.
+    pub read_activity: ReadActivity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RequestContextEvidence {
+    pub usage: astra_turn_types::ContextWindowUsage,
+    pub scope: RequestContextScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestContextScope {
+    CurrentRequest,
+    PreviousRequestWhileAssembling,
+    LastCompletedRequest,
+}
+
+impl RequestContextScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CurrentRequest => "current request",
+            Self::PreviousRequestWhileAssembling => "previous request · assembling next",
+            Self::LastCompletedRequest => "last completed request",
+        }
+    }
+}
+
+/// Availability and provenance of the session-level file-read evidence.
+///
+/// A prompt trace only describes one assembled prompt. Journal evidence is
+/// useful for a longer lived question ("are we repeatedly reading the same
+/// files?"), but it is not guaranteed to exist on every topology. In
+/// particular a Server-only client must not be shown invented local facts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum ReadActivity {
+    /// The workbench has scheduled the local durable read, but it has not
+    /// completed yet. This state is only presentation progress; it is never
+    /// interpreted as an absence of activity.
+    #[default]
+    Loading,
+    /// Evidence was computed from append-ordered local journal events.
+    Available(SessionReadActivity),
+    /// No local durable source was available. The reason is deliberately
+    /// surfaced rather than silently rendering zero reads.
+    Unavailable(String),
+}
+
+/// Auditable summary of `read_file` activity across a durable session.
+///
+/// `exact_repeat_requests` only counts calls whose full structured arguments
+/// were recorded. `repeats_after_recorded_compaction` is a temporal
+/// correlation, not a causal conclusion: compaction may be one reason for a
+/// reread, but source changes and a different task are also possible.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SessionReadActivity {
+    pub requested: u32,
+    pub executed: u32,
+    pub reused_or_suppressed: u32,
+    pub other_not_executed: u32,
+    pub distinct_files: u32,
+    pub requests_with_exact_identity: u32,
+    pub exact_repeat_requests: u32,
+    pub repeats_after_recorded_compaction: u32,
+}
+
+impl SessionReadActivity {
+    pub fn has_activity(&self) -> bool {
+        self.requested > 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReadRequestIdentity {
+    path: String,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+    outline: bool,
+}
+
+impl ReadRequestIdentity {
+    fn from_record(record: &astra_services::session_journal::ToolCallRecord) -> Option<Self> {
+        let args = record.args_full.as_deref()?;
+        let args: serde_json::Value = serde_json::from_str(args).ok()?;
+        let path = args.get("path")?.as_str()?.trim();
+        if path.is_empty() {
+            return None;
+        }
+        Some(Self {
+            path: path.to_string(),
+            start_line: args.get("start_line").and_then(serde_json::Value::as_u64),
+            end_line: args.get("end_line").and_then(serde_json::Value::as_u64),
+            outline: args
+                .get("outline")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
+
+/// Summarize canonical, append-ordered journal evidence without inspecting
+/// rendered tool text. The result distinguishes executions from reused or
+/// suppressed calls, so a high request count is never misreported as disk I/O.
+pub(crate) fn summarize_session_read_activity(
+    events: &[astra_services::session_journal::JournalEvent],
+) -> SessionReadActivity {
+    use astra_services::session_journal::ToolCallDisposition;
+
+    let mut summary = SessionReadActivity::default();
+    let mut paths = HashSet::new();
+    let mut seen_requests = HashSet::new();
+    let mut compaction_recorded = false;
+
+    for event in events {
+        if event
+            .context_assembly_trace
+            .as_ref()
+            .and_then(|trace| trace.get("token_budget"))
+            .and_then(|budget| budget.get("compression_triggered"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            compaction_recorded = true;
+        }
+
+        let Some(records) = event.tool_calls.as_ref() else {
+            continue;
+        };
+        for record in records.iter().filter(|record| record.name == "read_file") {
+            summary.requested = summary.requested.saturating_add(1);
+            match record.effective_disposition() {
+                ToolCallDisposition::Executed => {
+                    summary.executed = summary.executed.saturating_add(1)
+                }
+                ToolCallDisposition::Reused | ToolCallDisposition::Suppressed => {
+                    summary.reused_or_suppressed = summary.reused_or_suppressed.saturating_add(1)
+                }
+                ToolCallDisposition::Rejected | ToolCallDisposition::Deferred => {
+                    summary.other_not_executed = summary.other_not_executed.saturating_add(1)
+                }
+            }
+
+            if let Some(path) = record
+                .file_path
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+            {
+                paths.insert(path.to_string());
+            }
+            let Some(identity) = ReadRequestIdentity::from_record(record) else {
+                continue;
+            };
+            paths.insert(identity.path.clone());
+            summary.requests_with_exact_identity =
+                summary.requests_with_exact_identity.saturating_add(1);
+            if !seen_requests.insert(identity) {
+                summary.exact_repeat_requests = summary.exact_repeat_requests.saturating_add(1);
+                if compaction_recorded {
+                    summary.repeats_after_recorded_compaction =
+                        summary.repeats_after_recorded_compaction.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    summary.distinct_files = paths.len().try_into().unwrap_or(u32::MAX);
+    summary
 }
 
 /// One decision lifted from `ContextAssemblyTrace::explanations`.
@@ -214,6 +401,17 @@ pub(crate) struct HistorySummary {
     pub compression_ratio: f64,
     pub turns: Vec<TurnDetail>,
     pub dropped_indices: Vec<u32>,
+    /// Whether item text came from the exact prompt-history trace or is a
+    /// local visible-conversation fallback. The UI must never present the
+    /// latter as proof of what entered the model prompt.
+    pub evidence_source: HistoryEvidenceSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum HistoryEvidenceSource {
+    #[default]
+    PromptTrace,
+    LocalVisibleConversation,
 }
 
 impl HistorySummary {
@@ -249,12 +447,13 @@ impl CategoryKind {
     }
 
     pub fn color(self) -> Color {
+        let theme = crate::tui::theme::current();
         match self {
-            Self::System => Color::Cyan,
-            Self::Tools => Color::Magenta,
-            Self::Memory => Color::Blue,
-            Self::History => Color::Yellow,
-            Self::UserMessage => Color::Green,
+            Self::System => theme.accent,
+            Self::Tools => theme.command,
+            Self::Memory => theme.quote,
+            Self::History => theme.warn,
+            Self::UserMessage => theme.success,
         }
     }
 }
@@ -420,10 +619,11 @@ pub(crate) enum PressureBand {
 
 impl PressureBand {
     pub fn color(self) -> Color {
+        let theme = crate::tui::theme::current();
         match self {
-            Self::Low => Color::Green,
-            Self::Warning => Color::Yellow,
-            Self::Critical => Color::Red,
+            Self::Low => theme.success,
+            Self::Warning => theme.warn,
+            Self::Critical => theme.error,
         }
     }
 
@@ -437,20 +637,16 @@ impl PressureBand {
 }
 
 /// Auxiliary data the caller supplies alongside a trace. The
-/// trace itself captures token counts only; this snapshot carries
-/// the human-readable previews the expanded view renders under
-/// each item (first line of each history turn's text, cwd + git
-/// branch for Environment, etc). All fields are optional so
-/// callers can opt in incrementally.
+/// trace carries its own exact prompt-history previews; this snapshot carries
+/// local evidence that the trace cannot own (visible conversation when no
+/// trace exists, cwd + git branch for Environment, etc). All fields are
+/// optional so callers can opt in incrementally.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ContextSnapshot<'a> {
-    /// Per-history-turn plain-text preview (first non-blank line).
-    /// Key matches [`TurnRetention::turn_index`] / [`TurnCompression::turn_index`].
-    pub history_previews: std::collections::HashMap<u32, String>,
-    /// Per-history-turn full body. Used when the user drills into
-    /// a turn. Same key as `history_previews`. Missing entries
-    /// fall back to the preview in the drill view.
-    pub history_bodies: std::collections::HashMap<u32, String>,
+    /// Local conversation visible in the current TUI session. This is a
+    /// fallback when an exact prompt-composition trace is unavailable; its
+    /// ordinal intentionally is not treated as a trace turn identity.
+    pub visible_conversation: Vec<VisibleConversationItem>,
     /// Current model identifier (for the System-prompt Persona row).
     pub model: Option<&'a str>,
     /// cwd rendered as a display string, e.g. `~/github/astra`.
@@ -481,6 +677,16 @@ pub(crate) struct ContextSnapshot<'a> {
     /// so this list is what makes the Compaction section show a
     /// session-level timeline.
     pub compressed_turns: Vec<u32>,
+}
+
+/// One local, user-visible conversation item. Stored independently from the
+/// prompt trace so callers cannot accidentally pair two unrelated sequences
+/// by ordinal position.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VisibleConversationItem {
+    pub role: String,
+    pub preview: String,
+    pub body: String,
 }
 
 /// One loaded system skill surfaced by the snapshot.  Decoupled
@@ -515,6 +721,88 @@ impl ContextBreakdown {
         }
     }
 
+    /// Build an honest partial view when the exact prompt-composition trace
+    /// has not arrived yet. `/context` must still show session, visible
+    /// conversation, loaded skills and compaction facts that the client
+    /// already owns; it must not fabricate per-category token counts.
+    pub fn from_snapshot_without_trace(snap: &ContextSnapshot<'_>) -> Self {
+        let turns = snap
+            .visible_conversation
+            .iter()
+            .enumerate()
+            .map(|(index, item)| TurnDetail {
+                index: index as u32,
+                role: item.role.clone(),
+                tokens: 0,
+                has_tool_calls: false,
+                compressed_from: None,
+                preview: item.preview.clone(),
+                body: item.body.clone(),
+            })
+            .collect::<Vec<_>>();
+        let retained = turns.len() as u32;
+        let skills = if !snap.selected_skills.is_empty() {
+            snap.selected_skills
+                .iter()
+                .map(|name| SkillItem {
+                    name: name.clone(),
+                    tokens: 0,
+                    description: None,
+                    source: Some("selected".to_string()),
+                })
+                .collect()
+        } else {
+            snap.active_skills
+                .iter()
+                .map(|skill| SkillItem {
+                    name: skill.name.clone(),
+                    tokens: 0,
+                    description: (!skill.description.is_empty()).then(|| skill.description.clone()),
+                    source: Some("loaded".to_string()),
+                })
+                .collect()
+        };
+
+        Self {
+            total_used: 0,
+            limit: 0,
+            pressure: 0.0,
+            categories: Vec::new(),
+            free_space_tokens: 0,
+            compression_triggered: false,
+            tools: Vec::new(),
+            memories: Vec::new(),
+            skills,
+            system_sections: Vec::new(),
+            history: HistorySummary {
+                total_turns: retained,
+                retained,
+                compressed: 0,
+                dropped: 0,
+                tokens_before: 0,
+                tokens_after: 0,
+                compression_ratio: 0.0,
+                turns,
+                dropped_indices: Vec::new(),
+                evidence_source: HistoryEvidenceSource::LocalVisibleConversation,
+            },
+            memory_focus: MemoryFocus::default(),
+            prompt_signals: Vec::new(),
+            session_summary: snap.session.clone(),
+            decisions: Vec::new(),
+            compaction: CompactionSummary {
+                compressed_turns: snap.compressed_turns.clone(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Whether this panel has any state worth rendering. Exact token layout
+    /// and locally-known session evidence are distinct, both useful states.
+    pub fn has_observable_data(&self) -> bool {
+        self.limit > 0 || !self.categories.is_empty() || self.first_focusable_section().is_some()
+    }
+
     /// Build from the most recent full [`ContextAssemblyTrace`].
     /// Equivalent to [`from_trace_with`] with an empty snapshot —
     /// no content previews, just the counts the trace carries.
@@ -522,10 +810,10 @@ impl ContextBreakdown {
         Self::from_trace_with(trace, &ContextSnapshot::default())
     }
 
-    /// Build from a trace plus an auxiliary [`ContextSnapshot`] of
-    /// human-readable previews.  The caller passes what it knows
-    /// (history text, cwd, git branch, user-rules path) and the
-    /// expanded view renders them alongside the raw token counts.
+    /// Build from a trace plus auxiliary local evidence. The trace's history
+    /// preview remains authoritative for prompt contents; the snapshot adds
+    /// environment, skill and session facts without attempting an ordinal
+    /// join to local transcript cells.
     pub fn from_trace_with(trace: &ContextAssemblyTrace, snap: &ContextSnapshot<'_>) -> Self {
         let budget = &trace.token_budget;
         let limit = budget.max_tokens;
@@ -656,10 +944,6 @@ impl ContextBreakdown {
         let h = &trace.history;
         let mut turns: Vec<TurnDetail> =
             Vec::with_capacity(h.turns_retained.len() + h.turns_compressed.len());
-        let preview_of =
-            |idx: u32| -> String { snap.history_previews.get(&idx).cloned().unwrap_or_default() };
-        let body_of =
-            |idx: u32| -> String { snap.history_bodies.get(&idx).cloned().unwrap_or_default() };
         for r in &h.turns_retained {
             turns.push(TurnDetail {
                 index: r.turn_index,
@@ -667,8 +951,8 @@ impl ContextBreakdown {
                 tokens: r.tokens,
                 has_tool_calls: r.has_tool_calls,
                 compressed_from: None,
-                preview: preview_of(r.turn_index),
-                body: body_of(r.turn_index),
+                preview: r.content_preview.clone(),
+                body: String::new(),
             });
         }
         for c in &h.turns_compressed {
@@ -678,8 +962,8 @@ impl ContextBreakdown {
                 tokens: c.compressed_tokens,
                 has_tool_calls: false,
                 compressed_from: Some((c.original_tokens, format!("{:?}", c.compression_method))),
-                preview: preview_of(c.turn_index),
-                body: body_of(c.turn_index),
+                preview: String::new(),
+                body: String::new(),
             });
         }
         // Sort ascending by turn index so the expanded view reads
@@ -696,6 +980,7 @@ impl ContextBreakdown {
             compression_ratio: h.compression_ratio,
             turns,
             dropped_indices: h.turns_dropped.clone(),
+            evidence_source: HistoryEvidenceSource::PromptTrace,
         };
 
         let memory_focus = build_memory_focus(trace);
@@ -742,6 +1027,12 @@ impl ContextBreakdown {
             self.total_used as f64 / self.limit as f64 * 100.0
         }
     }
+
+    pub(crate) fn set_read_activity(&mut self, read_activity: ReadActivity) {
+        if let Some(session) = self.session_summary.as_mut() {
+            session.read_activity = read_activity;
+        }
+    }
 }
 
 fn build_compaction_summary(
@@ -761,10 +1052,20 @@ fn build_compaction_summary(
             information_lost: c.information_lost.clone(),
         })
         .collect();
+    let stages = h
+        .compression_stages
+        .iter()
+        .map(|stage| CompactionStageItem {
+            stage: stage.stage.clone(),
+            method: format!("{:?}", stage.method),
+            tokens_freed: stage.tokens_freed,
+        })
+        .collect();
     CompactionSummary {
         triggered_this_turn: trace.token_budget.compression_triggered,
         compressed_turns: snap.compressed_turns.clone(),
         events,
+        stages,
         tokens_before: h.tokens_before,
         tokens_after: h.tokens_after,
     }

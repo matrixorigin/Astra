@@ -2,16 +2,24 @@ use std::sync::{Arc, Mutex};
 
 use astra_core::sync_poison::recover_mutex_lock;
 use astra_runtime::turn::run_control::{
-    QueuedRunInputEvent, RunControlStatus, RunInputProvider, RunQueuedInputPoll, RunStatusProvider,
+    QueuedUserIntent, RunControlStatus, RunStatusProvider, UserIntentPoll, UserIntentProvider,
 };
+use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
 use serde_json::Value;
 
-const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
+const MAX_USER_INTENT_CHARS: usize = 20_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalUserIntentReceipt {
+    pub(crate) intent_id: String,
+    pub(crate) delivery: UserIntentDelivery,
+    pub(crate) status: UserIntentStatus,
+}
 
 #[derive(Default)]
 struct LocalRunControlState {
     next_event_index: usize,
-    inputs: Vec<QueuedRunInputEvent>,
+    intents: Vec<QueuedUserIntent>,
     status: Option<RunControlStatus>,
 }
 
@@ -19,17 +27,17 @@ struct LocalRunControlState {
 ///
 /// Server-backed runs use the durable run engine for this contract. CLI local
 /// runs use this turn-scoped provider so the same runtime polling paths can
-/// observe user cancellation and deferred input without requiring a server-side
+/// observe user cancellation and active-run guidance without requiring a server-side
 /// workspace executor.
 #[derive(Default)]
-pub(crate) struct LocalDeferredInputRunControl {
+pub(crate) struct LocalRunControl {
     // This lock is only held for short in-memory queue mutations and never
     // across an `.await`, so a std::sync::Mutex keeps the local TUI hot path
     // simple without introducing async lock wakeups.
     state: Mutex<LocalRunControlState>,
 }
 
-impl LocalDeferredInputRunControl {
+impl LocalRunControl {
     pub(crate) fn shared() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -53,31 +61,43 @@ impl LocalDeferredInputRunControl {
         }
     }
 
-    pub(crate) fn enqueue_text(&self, text: &str) -> Result<(), String> {
+    pub(crate) fn accept_guidance(&self, text: &str) -> Result<LocalUserIntentReceipt, String> {
         if text.trim().is_empty() {
-            return Err("Deferred input cannot be empty.".to_string());
+            return Err("Guidance cannot be empty.".to_string());
         }
-        if text.chars().count() > MAX_DEFERRED_INPUT_CHARS {
+        if text.chars().count() > MAX_USER_INTENT_CHARS {
             return Err(format!(
-                "Deferred input is too large. Limit it to {MAX_DEFERRED_INPUT_CHARS} characters."
+                "Guidance is too large. Limit it to {MAX_USER_INTENT_CHARS} characters."
             ));
         }
-        self.enqueue_input(serde_json::json!({ "content": text }));
-        Ok(())
+        Ok(self.accept_intent(
+            UserIntentDelivery::GuideCurrentRun,
+            serde_json::json!({ "content": text }),
+        ))
     }
 
-    pub(crate) fn enqueue_input(&self, input: Value) {
+    fn accept_intent(&self, delivery: UserIntentDelivery, input: Value) -> LocalUserIntentReceipt {
         let mut guard = recover_mutex_lock(&self.state);
         guard.next_event_index += 1;
         let event_index = guard.next_event_index;
-        guard
-            .inputs
-            .push(QueuedRunInputEvent { event_index, input });
+        let intent_id = format!("intent_{}", uuid::Uuid::now_v7().simple());
+        guard.intents.push(QueuedUserIntent {
+            intent_id: intent_id.clone(),
+            delivery,
+            status: UserIntentStatus::AcceptedLocal,
+            event_index,
+            input,
+        });
+        LocalUserIntentReceipt {
+            intent_id,
+            delivery,
+            status: UserIntentStatus::AcceptedLocal,
+        }
     }
 }
 
 #[async_trait::async_trait]
-impl RunStatusProvider for LocalDeferredInputRunControl {
+impl RunStatusProvider for LocalRunControl {
     async fn control_status(
         &self,
         _user_id: &str,
@@ -88,35 +108,36 @@ impl RunStatusProvider for LocalDeferredInputRunControl {
 }
 
 #[async_trait::async_trait]
-impl RunInputProvider for LocalDeferredInputRunControl {
-    async fn poll_user_inputs(
+impl UserIntentProvider for LocalRunControl {
+    async fn poll_user_intents(
         &self,
         _user_id: &str,
         _run_id: &str,
         after_event_index: usize,
-    ) -> RunQueuedInputPoll {
+    ) -> UserIntentPoll {
         let guard = recover_mutex_lock(&self.state);
         let inputs = guard
-            .inputs
+            .intents
             .iter()
             .filter(|event| event.event_index > after_event_index)
             .cloned()
             .collect::<Vec<_>>();
-        RunQueuedInputPoll {
+        UserIntentPoll {
             next_cursor: guard.next_event_index.max(after_event_index),
             inputs,
+            issues: Vec::new(),
             error: None,
         }
     }
 
-    async fn mark_user_inputs_released(
+    async fn mark_user_intents_applied(
         &self,
         _user_id: &str,
         _run_id: &str,
         event_indices: &[usize],
-    ) -> Result<(), String> {
+    ) -> Result<astra_runtime::turn::run_control::UserIntentApplyAck, String> {
         if event_indices.is_empty() {
-            return Ok(());
+            return Ok(astra_runtime::turn::run_control::UserIntentApplyAck::Applied);
         }
         let released = event_indices
             .iter()
@@ -124,9 +145,9 @@ impl RunInputProvider for LocalDeferredInputRunControl {
             .collect::<std::collections::HashSet<_>>();
         let mut guard = recover_mutex_lock(&self.state);
         guard
-            .inputs
+            .intents
             .retain(|event| !released.contains(&event.event_index));
-        Ok(())
+        Ok(astra_runtime::turn::run_control::UserIntentApplyAck::Applied)
     }
 }
 
@@ -136,20 +157,23 @@ mod tests {
 
     #[tokio::test]
     async fn local_run_control_polls_inputs_after_cursor() {
-        let provider = LocalDeferredInputRunControl::default();
-        provider.enqueue_text("first").expect("enqueue first");
-        provider.enqueue_text("second").expect("enqueue second");
+        let provider = LocalRunControl::default();
+        let first_receipt = provider.accept_guidance("first").expect("enqueue first");
+        let second_receipt = provider.accept_guidance("second").expect("enqueue second");
 
         let first = provider
-            .poll_user_inputs("local-user", "run-local", 0)
+            .poll_user_intents("local-user", "run-local", 0)
             .await;
         assert_eq!(first.next_cursor, 2);
         assert_eq!(first.inputs.len(), 2);
+        assert_eq!(first.inputs[0].intent_id, first_receipt.intent_id);
+        assert_eq!(first.inputs[1].intent_id, second_receipt.intent_id);
+        assert_ne!(first.inputs[0].intent_id, first.inputs[1].intent_id);
         assert_eq!(first.inputs[0].input["content"], "first");
         assert_eq!(first.inputs[1].input["content"], "second");
 
         let second = provider
-            .poll_user_inputs("local-user", "run-local", 1)
+            .poll_user_intents("local-user", "run-local", 1)
             .await;
         assert_eq!(second.next_cursor, 2);
         assert_eq!(second.inputs.len(), 1);
@@ -158,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_run_control_reports_cancel_status_through_shared_contract() {
-        let provider = LocalDeferredInputRunControl::default();
+        let provider = LocalRunControl::default();
         assert_eq!(
             provider
                 .control_status("local-user", "run-local")
@@ -180,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_run_control_pause_can_resume_but_not_override_cancel() {
-        let provider = LocalDeferredInputRunControl::default();
+        let provider = LocalRunControl::default();
         provider.request_pause();
         assert_eq!(
             provider
@@ -214,36 +238,36 @@ mod tests {
 
     #[test]
     fn local_run_control_rejects_blank_input() {
-        let provider = LocalDeferredInputRunControl::default();
+        let provider = LocalRunControl::default();
         let error = provider
-            .enqueue_text("   ")
-            .expect_err("blank deferred input should be rejected");
+            .accept_guidance("   ")
+            .expect_err("blank user intent should be rejected");
         assert!(error.contains("cannot be empty"));
     }
 
     #[test]
     fn local_run_control_rejects_oversized_input() {
-        let provider = LocalDeferredInputRunControl::default();
-        let text = "x".repeat(MAX_DEFERRED_INPUT_CHARS + 1);
+        let provider = LocalRunControl::default();
+        let text = "x".repeat(MAX_USER_INTENT_CHARS + 1);
         let error = provider
-            .enqueue_text(&text)
-            .expect_err("oversized deferred input should be rejected");
+            .accept_guidance(&text)
+            .expect_err("oversized user intent should be rejected");
         assert!(error.contains("too large"));
     }
 
     #[tokio::test]
     async fn local_run_control_evicts_released_inputs() {
-        let provider = LocalDeferredInputRunControl::default();
-        provider.enqueue_text("first").expect("enqueue first");
-        provider.enqueue_text("second").expect("enqueue second");
+        let provider = LocalRunControl::default();
+        provider.accept_guidance("first").expect("enqueue first");
+        provider.accept_guidance("second").expect("enqueue second");
 
         provider
-            .mark_user_inputs_released("local-user", "run-local", &[1])
+            .mark_user_intents_applied("local-user", "run-local", &[1])
             .await
             .expect("release should succeed");
 
         let remaining = provider
-            .poll_user_inputs("local-user", "run-local", 0)
+            .poll_user_intents("local-user", "run-local", 0)
             .await;
         assert_eq!(remaining.next_cursor, 2);
         assert_eq!(remaining.inputs.len(), 1);

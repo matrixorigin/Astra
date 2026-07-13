@@ -69,7 +69,9 @@ fn snapshot_deny_mode() {
 #[test]
 fn snapshot_high_token_usage_with_cost() {
     let ctx = StatusContext {
-        token_budget: Some((92_000, 100_000)),
+        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
+            92_000, 100_000,
+        )),
         cost_usd: Some(3.47),
         ..base_ctx()
     };
@@ -93,7 +95,9 @@ fn snapshot_full_context_80() {
     let ctx = StatusContext {
         model: Some("sonnet-4.6".into()),
         cwd: Some("~/projects/astra".into()),
-        token_budget: Some((40_000, 200_000)),
+        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
+            40_000, 200_000,
+        )),
         permission_mode: PermissionMode::Auto,
         turn_active: false,
         cost_usd: Some(0.42),
@@ -108,7 +112,9 @@ fn snapshot_narrow_drops_right_segments() {
     let ctx = StatusContext {
         model: Some("sonnet-4.6".into()),
         cwd: Some("~/projects/astra".into()),
-        token_budget: Some((40_000, 200_000)),
+        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
+            40_000, 200_000,
+        )),
         git_branch: Some("enhance_tui".into()),
         ..StatusContext::default()
     };

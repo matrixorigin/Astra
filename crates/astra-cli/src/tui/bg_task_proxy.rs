@@ -12,6 +12,8 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
+use crate::background_task_error::BackgroundTaskError;
+
 pub(crate) fn background_task_rejected_fanout_slot_id(group_id: &str, slot_index: usize) -> String {
     format!("fanout:{group_id}:slot:{slot_index}:spawn_rejected")
 }
@@ -145,14 +147,20 @@ pub(crate) fn background_local_agent_projection_from_info(
         .ok()
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
+    let ended_at_ms = agent
+        .ended_at
+        .and_then(|ended_at| ended_at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64);
 
     Some(
         astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
             id: agent.agent_id.clone(),
+            run_id: agent.run_id.clone(),
+            parent_run_id: agent.parent_run_id.clone(),
             status: status.to_string(),
             title: agent.description.clone(),
             started_at_ms,
-            ended_at_ms: None,
+            ended_at_ms,
             output_tail: local_agent_output_tail(output),
             terminal_reason,
             fanout: agent.fanout_slot.as_ref().map(|slot| {
@@ -166,6 +174,14 @@ pub(crate) async fn export_background_local_agent_task_projections(
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
 ) -> Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection> {
+    let snapshot = super::local_agent_snapshot::LocalAgentSnapshot::capture(agent_spawner).await;
+    export_background_local_agent_task_projections_from_snapshot(&snapshot, restored)
+}
+
+pub(crate) fn export_background_local_agent_task_projections_from_snapshot(
+    snapshot: &super::local_agent_snapshot::LocalAgentSnapshot,
+    restored: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+) -> Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection> {
     let mut by_id: BTreeMap<
         String,
         astra_services::session_workspace::BackgroundLocalAgentTaskProjection,
@@ -175,21 +191,23 @@ pub(crate) async fn export_background_local_agent_task_projections(
         .map(|projection| (projection.id.clone(), projection))
         .collect();
 
-    if let Some(spawner) = agent_spawner {
-        let fanout_titles = spawner
-            .list_fanout_groups()
-            .await
-            .into_iter()
-            .map(|group| (group.group_id, group.title))
-            .collect::<BTreeMap<_, _>>();
-        for agent in spawner.get_agent_history(None).await {
+    if snapshot.available {
+        let fanout_titles = snapshot.fanout_titles();
+        for agent in &snapshot.agents {
             let fanout_title = agent
                 .fanout_slot
                 .as_ref()
                 .and_then(|slot| fanout_titles.get(&slot.group_id).map(String::as_str));
-            if let Some(projection) =
-                background_local_agent_projection_from_info(&agent, fanout_title)
+            if let Some(mut projection) =
+                background_local_agent_projection_from_info(agent, fanout_title)
             {
+                if projection.ended_at_ms.is_some()
+                    && let Some(existing_ended_at_ms) = by_id
+                        .get(&projection.id)
+                        .and_then(|existing| existing.ended_at_ms)
+                {
+                    projection.ended_at_ms = Some(existing_ended_at_ms);
+                }
                 by_id.insert(projection.id.clone(), projection);
             }
         }
@@ -208,14 +226,30 @@ pub(crate) fn background_task_output_dir(session_id: Option<&str>) -> std::path:
     )
 }
 
-pub(crate) fn restore_background_task_projections(
+pub(crate) async fn restore_background_task_projections(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     session_id: Option<&str>,
 ) -> Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection> {
     let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
         return Vec::new();
     };
-    let workspace = match astra_services::session_workspace::read_workspace_optional(session_id) {
+    let session_id_owned = session_id.to_string();
+    let workspace_result = match tokio::task::spawn_blocking(move || {
+        astra_services::session_workspace::read_workspace_optional(&session_id_owned)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "workspace background projection read task failed"
+            );
+            return Vec::new();
+        }
+    };
+    let workspace = match workspace_result {
         Ok(Some(workspace)) => workspace,
         Ok(None) => return Vec::new(),
         Err(error) => {
@@ -240,7 +274,7 @@ pub(crate) fn restore_background_task_projections(
     local_agent_projections
 }
 
-pub(crate) fn persist_background_task_projections_if_changed(
+pub(crate) async fn persist_background_task_projections_if_changed(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     session_id: Option<&str>,
     model: Option<&str>,
@@ -254,33 +288,37 @@ pub(crate) fn persist_background_task_projections_if_changed(
         return;
     }
 
-    let mut workspace = match astra_services::session_workspace::read_workspace_optional(session_id)
-    {
-        Ok(Some(workspace)) => workspace,
-        Ok(None) => astra_services::session_workspace::WorkspaceMetadata::new(
-            session_id,
-            model.unwrap_or("default"),
-        ),
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to read workspace before persisting background shell projections"
-            );
-            return;
-        }
-    };
-    workspace.background_shell_tasks = projections.clone();
-    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-    match astra_services::session_workspace::write_workspace(&workspace) {
-        Ok(()) => *last_persisted = projections,
-        Err(error) => {
+    let session_id_owned = session_id.to_string();
+    let model = model.unwrap_or("default").to_string();
+    let projections_for_write = projections.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        let mut workspace =
+            match astra_services::session_workspace::read_workspace_optional(&session_id_owned)? {
+                Some(workspace) => workspace,
+                None => astra_services::session_workspace::WorkspaceMetadata::new(
+                    &session_id_owned,
+                    &model,
+                ),
+            };
+        workspace.background_shell_tasks = projections_for_write;
+        workspace.updated_at = chrono::Utc::now().to_rfc3339();
+        astra_services::session_workspace::write_workspace(&workspace)
+    })
+    .await;
+    match persisted {
+        Ok(Ok(())) => *last_persisted = projections,
+        Ok(Err(error)) => {
             tracing::warn!(
                 session_id = %session_id,
                 error = %error,
                 "failed to persist background shell projections"
             );
         }
+        Err(error) => tracing::warn!(
+            session_id = %session_id,
+            error = %error,
+            "background shell projection write task failed"
+        ),
     }
 }
 
@@ -291,8 +329,28 @@ pub(crate) async fn persist_background_local_agent_task_projections_if_changed(
     model: Option<&str>,
     last_persisted: &mut Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection>,
 ) -> Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection> {
-    let projections =
-        export_background_local_agent_task_projections(agent_spawner, restored_local_agents).await;
+    let snapshot = super::local_agent_snapshot::LocalAgentSnapshot::capture(agent_spawner).await;
+    persist_background_local_agent_task_projections_from_snapshot_if_changed(
+        &snapshot,
+        restored_local_agents,
+        session_id,
+        model,
+        last_persisted,
+    )
+    .await
+}
+
+pub(crate) async fn persist_background_local_agent_task_projections_from_snapshot_if_changed(
+    snapshot: &super::local_agent_snapshot::LocalAgentSnapshot,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    session_id: Option<&str>,
+    model: Option<&str>,
+    last_persisted: &mut Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection>,
+) -> Vec<astra_services::session_workspace::BackgroundLocalAgentTaskProjection> {
+    let projections = export_background_local_agent_task_projections_from_snapshot(
+        snapshot,
+        restored_local_agents,
+    );
     let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
         return projections;
     };
@@ -300,93 +358,110 @@ pub(crate) async fn persist_background_local_agent_task_projections_if_changed(
         return projections;
     }
 
-    let mut workspace = match astra_services::session_workspace::read_workspace_optional(session_id)
-    {
-        Ok(Some(workspace)) => workspace,
-        Ok(None) => astra_services::session_workspace::WorkspaceMetadata::new(
-            session_id,
-            model.unwrap_or("default"),
-        ),
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to read workspace before persisting background local agent projections"
-            );
-            return projections;
-        }
-    };
-    workspace.background_local_agent_tasks = projections.clone();
-    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-    match astra_services::session_workspace::write_workspace(&workspace) {
-        Ok(()) => *last_persisted = projections.clone(),
-        Err(error) => {
+    let session_id_owned = session_id.to_string();
+    let model = model.unwrap_or("default").to_string();
+    let projections_for_write = projections.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        let mut workspace =
+            match astra_services::session_workspace::read_workspace_optional(&session_id_owned)? {
+                Some(workspace) => workspace,
+                None => astra_services::session_workspace::WorkspaceMetadata::new(
+                    &session_id_owned,
+                    &model,
+                ),
+            };
+        workspace.background_local_agent_tasks = projections_for_write;
+        workspace.updated_at = chrono::Utc::now().to_rfc3339();
+        astra_services::session_workspace::write_workspace(&workspace)
+    })
+    .await;
+    match persisted {
+        Ok(Ok(())) => *last_persisted = projections.clone(),
+        Ok(Err(error)) => {
             tracing::warn!(
                 session_id = %session_id,
                 error = %error,
                 "failed to persist background local agent projections"
             );
         }
+        Err(error) => tracing::warn!(
+            session_id = %session_id,
+            error = %error,
+            "background local-agent projection write task failed"
+        ),
     }
     projections
 }
 
-pub(crate) fn format_background_task_output_read_error(task_id: &str, error: &str) -> String {
-    if error.contains("no background shell with id") || error.contains("no background task with id")
-    {
-        format!("Background task not found: {task_id}")
-    } else if let Some(detail) = error.strip_prefix("output artifact missing:") {
-        format!("Output artifact missing ·{}", detail)
-    } else {
-        format!("Output unavailable · {error}")
+pub(crate) fn format_background_task_output_read_error(error: &BackgroundTaskError) -> String {
+    match error {
+        BackgroundTaskError::NotFound { task_id } => {
+            format!("Background task not found: {task_id}")
+        }
+        BackgroundTaskError::OutputArtifactMissing { path, .. } => {
+            format!("Output artifact missing · {}", path.display())
+        }
+        BackgroundTaskError::OutputUnavailable { detail, .. } => {
+            format!("Output unavailable · {detail}")
+        }
+        BackgroundTaskError::AlreadyTerminated { .. }
+        | BackgroundTaskError::StaleHandle { .. }
+        | BackgroundTaskError::CannotStop { .. } => format!("Output unavailable · {error}"),
     }
-}
-
-pub(crate) fn is_background_task_terminal_race_error(error: &str) -> bool {
-    error.contains("already terminated")
 }
 
 pub(crate) fn format_background_task_stop_error_system_message(
-    task_id: &str,
-    error: &str,
+    error: &BackgroundTaskError,
 ) -> String {
-    if error.contains("no background shell with id") || error.contains("no background task with id")
-    {
-        format!("Background task not found: {task_id}")
-    } else if is_background_task_terminal_race_error(error) {
-        format!("Background task {task_id} already finished.")
-    } else if error.contains("stale handle") {
-        format!(
+    match error {
+        BackgroundTaskError::NotFound { task_id } => {
+            format!("Background task not found: {task_id}")
+        }
+        BackgroundTaskError::AlreadyTerminated { task_id } => {
+            format!("Background task {task_id} already finished.")
+        }
+        BackgroundTaskError::StaleHandle { task_id } => format!(
             "Background task {task_id} cannot be stopped because it was restored from a previous session and no live process handle is available."
-        )
-    } else {
-        format!("Failed to stop background task {task_id}: {error}")
+        ),
+        BackgroundTaskError::CannotStop { task_id } => {
+            format!("Background task {task_id} cannot be stopped in its current state.")
+        }
+        BackgroundTaskError::OutputArtifactMissing { task_id, .. }
+        | BackgroundTaskError::OutputUnavailable { task_id, .. } => {
+            format!("Failed to stop background task {task_id}: {error}")
+        }
     }
 }
 
-pub(crate) fn background_task_output_snapshot(
+pub(crate) async fn background_task_output_snapshot(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     task_id: &str,
     offset: u64,
     max_bytes: usize,
-) -> Result<crate::edge_tools::BgTaskOutputSnapshot, String> {
+) -> Result<crate::edge_tools::BgTaskOutputSnapshot, BackgroundTaskError> {
     background_registry.drain_join_set();
-    let handle = background_registry
-        .get(task_id)
-        .ok_or_else(|| format!("no background shell with id '{task_id}'"))?;
-    let status = handle.projected_status().to_string();
+    let (status, title, output_ref) = {
+        let handle = background_registry
+            .get(task_id)
+            .ok_or_else(|| BackgroundTaskError::not_found(task_id))?;
+        (
+            handle.projected_status().to_string(),
+            handle.description.clone(),
+            format!(
+                "stdout: {} · stderr: {}",
+                handle.stdout_path.display(),
+                handle.stderr_path.display()
+            ),
+        )
+    };
     let terminal = background_task_status_is_terminal(&status);
-    let output_ref = format!(
-        "stdout: {} · stderr: {}",
-        handle.stdout_path.display(),
-        handle.stderr_path.display()
-    );
-    let (output, end_offset, total_bytes, total_lines) =
-        background_registry.get_combined_output_since(task_id, offset, max_bytes)?;
+    let (output, end_offset, total_bytes, total_lines) = background_registry
+        .get_combined_output_since_async(task_id, offset, max_bytes)
+        .await?;
 
     Ok(crate::edge_tools::BgTaskOutputSnapshot {
         kind: "shell".to_string(),
-        title: Some(handle.description.clone()),
+        title: Some(title),
         output,
         end_offset,
         total_bytes,
@@ -446,14 +521,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
     let start = offset.min(total_bytes) as usize;
     let end = start.saturating_add(max_bytes).min(full_output.len());
     let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();
-    let status = if matches!(
-        projection.status.as_str(),
-        "pending" | "running" | "waiting_for_input"
-    ) {
-        "unavailable"
-    } else {
-        projection.status.as_str()
-    };
+    let status = projection.status.as_str();
 
     crate::edge_tools::BgTaskOutputSnapshot {
         kind: "local agent".to_string(),
@@ -469,7 +537,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
 }
 
 pub(crate) fn background_task_status_is_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "killed" | "unavailable")
+    matches!(status, "completed" | "failed" | "interrupted" | "killed")
 }
 
 pub(crate) fn format_background_task_output_system_message(
@@ -547,7 +615,9 @@ pub(crate) fn background_task_empty_output_state(status: &str) -> &'static str {
     match status {
         "pending" => "Pending · no output yet",
         "running" => "No output yet · still running",
+        "stopping" => "Stopping · no new output",
         "waiting_for_input" => "Waiting for input · no new output",
+        "interrupted" => "Interrupted with no output",
         "completed" => "Completed with no output",
         "failed" => "Failed with no output",
         "killed" => "Stopped with no output",
@@ -560,7 +630,9 @@ pub(crate) fn background_task_status_label(status: &str) -> &'static str {
     match status {
         "pending" => "pending",
         "running" => "still running",
+        "stopping" => "stopping",
         "waiting_for_input" => "needs input",
+        "interrupted" => "interrupted",
         "completed" => "completed",
         "failed" => "failed",
         "killed" => "stopped",
@@ -595,10 +667,10 @@ pub(crate) fn background_task_event_system_message(
             "Background shell {} failed: {error}",
             background_shell_notification_label(id, title)
         )),
-        super::background_tasks::BgTaskEvent::WaitingForInput { id, title, .. } => Some(format!(
-            "Background shell {} appears to be waiting for input",
-            background_shell_notification_label(id, title)
-        )),
+        // This is advisory activity evidence, not a lifecycle transition or
+        // a chat message. The workbench row projects it without interrupting
+        // the conversation.
+        super::background_tasks::BgTaskEvent::NoRecentOutput { .. } => None,
         super::background_tasks::BgTaskEvent::Killed { id, title } => Some(format!(
             "Background shell {} was stopped",
             background_shell_notification_label(id, title)
@@ -657,4 +729,25 @@ pub(crate) fn background_task_event_system_messages(
     }
 
     messages
+}
+
+#[cfg(test)]
+mod tests {
+    use super::background_task_status_is_terminal;
+
+    #[test]
+    fn terminal_status_is_a_lifecycle_fact_not_an_availability_guess() {
+        for status in ["completed", "failed", "interrupted", "killed"] {
+            assert!(background_task_status_is_terminal(status), "{status}");
+        }
+        for status in [
+            "pending",
+            "running",
+            "stopping",
+            "waiting_for_input",
+            "unavailable",
+        ] {
+            assert!(!background_task_status_is_terminal(status), "{status}");
+        }
+    }
 }

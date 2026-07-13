@@ -1,8 +1,9 @@
 use astra_core::{
     ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
-    STATUS_INPUT_QUEUED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState,
-    error_response, error_response_coded,
+    STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
+    error_response_coded,
 };
+use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
@@ -117,6 +118,21 @@ pub trait RunLifecycleService: Send + Sync {
         cursor: Option<RunListCursor>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Return a bounded authoritative snapshot of one session's durable runs.
+    /// Active work is retained ahead of terminal history when the snapshot is
+    /// truncated. The route layer is responsible for projecting wire types.
+    async fn list_session_runs(
+        &self,
+        _user_id: String,
+        _session_id: String,
+        _limit: u32,
+    ) -> Result<DurableSessionRunPage, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Session run tree not supported",
+        ))
+    }
+
     /// Pause an active run. Default: NOT_IMPLEMENTED.
     async fn pause_run(
         &self,
@@ -141,15 +157,15 @@ pub trait RunLifecycleService: Send + Sync {
         ))
     }
 
-    async fn submit_run_input(
+    async fn submit_run_user_intent(
         &self,
         _run_id: String,
         _user_id: String,
-        _input: RunInputData,
-    ) -> Result<RunInputRecord, (StatusCode, Json<ErrorResponse>)> {
+        _input: RunUserIntentData,
+    ) -> Result<RunUserIntentRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
-            "Run input not supported",
+            "Active-run user intents are not supported",
         ))
     }
 
@@ -173,6 +189,33 @@ pub trait RunLifecycleService: Send + Sync {
     /// Default: no-op (returns empty vec).
     async fn drain_user_prompt_requests(&self, _run_id: &str) -> Vec<serde_json::Value> {
         vec![]
+    }
+
+    async fn get_run_interaction_event(
+        &self,
+        _run_id: String,
+        _user_id: String,
+        _request_id: String,
+        _event_type: String,
+    ) -> Result<Option<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Durable run interactions are not supported",
+        ))
+    }
+
+    async fn resolve_run_interaction(
+        &self,
+        _run_id: String,
+        _user_id: String,
+        _request_id: String,
+        _kind: DurableRunInteractionKind,
+        _response_data: serde_json::Value,
+    ) -> Result<DurableRunInteractionResolveOutcome, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Durable run interactions are not supported",
+        ))
     }
 
     /// Drain pending tool progress events for a run.
@@ -667,23 +710,57 @@ pub struct CancelRunRecord {
 }
 
 /// Generic record for run mutations (pause, resume, etc.).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMutationDisposition {
+    Applied,
+    SessionContinuationRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunContinuationRecord {
+    pub strategy: String,
+    pub session_id: String,
+    pub source_run_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunMutationRecord {
     pub run_id: String,
     pub status: String,
     pub previous_status: String,
+    pub disposition: RunMutationDisposition,
+    pub continuation: Option<RunContinuationRecord>,
+}
+
+impl RunMutationRecord {
+    pub fn applied(
+        run_id: impl Into<String>,
+        status: impl Into<String>,
+        previous_status: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            status: status.into(),
+            previous_status: previous_status.into(),
+            disposition: RunMutationDisposition::Applied,
+            continuation: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RunInputData {
-    pub idempotency_key: String,
+pub struct RunUserIntentData {
+    pub intent_id: String,
+    pub delivery: UserIntentDelivery,
     pub input: serde_json::Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunInputRecord {
+pub struct RunUserIntentRecord {
     pub run_id: String,
-    pub accepted: bool,
+    pub intent_id: String,
+    pub status: UserIntentStatus,
     pub duplicate: bool,
 }
 
@@ -712,6 +789,13 @@ pub struct DurableRunListPage {
     pub next_cursor: Option<RunListCursor>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DurableSessionRunPage {
+    pub runs: Vec<DurableRunRecord>,
+    pub limit: u32,
+    pub truncated: bool,
+}
+
 #[must_use]
 pub fn validate_run_list_limit(limit: u32) -> u32 {
     limit.clamp(1, MAX_API_LIST_LIMIT)
@@ -720,6 +804,30 @@ pub fn validate_run_list_limit(limit: u32) -> u32 {
 #[must_use]
 fn run_list_query_limit(limit: u32) -> i64 {
     i64::from(validate_run_list_limit(limit)) + 1
+}
+
+#[must_use]
+fn session_run_query_limit(limit: u32) -> i64 {
+    i64::from(validate_run_list_limit(limit)) + 1
+}
+
+fn sort_session_run_candidates(runs: &mut [DurableRunRecord]) {
+    runs.sort_by(|a, b| {
+        durable_run_status_is_terminal(&a.status)
+            .cmp(&durable_run_status_is_terminal(&b.status))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| b.run_id.cmp(&a.run_id))
+    });
+}
+
+fn sort_session_run_tree(runs: &mut [DurableRunRecord]) {
+    runs.sort_by(|a, b| {
+        a.depth
+            .cmp(&b.depth)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+            .then_with(|| a.run_id.cmp(&b.run_id))
+    });
 }
 
 pub fn run_list_cursor_db_updated_at(cursor: &RunListCursor) -> Result<String, String> {
@@ -810,9 +918,77 @@ pub struct DurableRunRecord {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableRunInteractionKind {
+    Approval,
+    AskUser,
+}
+
+impl DurableRunInteractionKind {
+    pub fn required_event_type(self) -> &'static str {
+        match self {
+            Self::Approval => "approval_required",
+            Self::AskUser => "ask_user_prompted",
+        }
+    }
+
+    pub fn resolved_event_type(self) -> &'static str {
+        match self {
+            Self::Approval => "approval_resolved",
+            Self::AskUser => "ask_user_resolved",
+        }
+    }
+
+    pub fn waiting_for(self) -> &'static str {
+        match self {
+            Self::Approval => "tool_approval",
+            Self::AskUser => "user_input",
+        }
+    }
+
+    fn idempotency_namespace(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::AskUser => "ask_user",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DurableRunInteractionResolveOutcome {
+    Resolved(serde_json::Value),
+    Idempotent(serde_json::Value),
+    Conflict(serde_json::Value),
+    MissingRequest,
+    NoLongerWaiting,
+}
+
+/// Narrow control-plane projection. Frequent cross-pod pause/cancel polling
+/// must not hydrate event payloads, checkpoints, model bindings, or transcript
+/// metadata from the full durable run record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableRunControlRecord {
+    pub run_id: String,
+    pub status: String,
+    pub waiting_for: Option<String>,
+    pub parent_run_id: Option<String>,
+    pub ancestor_path: Option<String>,
+}
+
+impl From<&DurableRunRecord> for DurableRunControlRecord {
+    fn from(run: &DurableRunRecord) -> Self {
+        Self {
+            run_id: run.run_id.clone(),
+            status: run.status.clone(),
+            waiting_for: run.waiting_for.clone(),
+            parent_run_id: run.parent_run_id.clone(),
+            ancestor_path: run.ancestor_path.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DurableRunStatusKind {
     Running,
-    InputQueued,
     Waiting,
     Paused,
     Completed,
@@ -825,7 +1001,6 @@ pub enum DurableRunStatusKind {
 pub fn durable_run_status_kind(status: &str) -> DurableRunStatusKind {
     match status {
         STATUS_RUNNING => DurableRunStatusKind::Running,
-        STATUS_INPUT_QUEUED => DurableRunStatusKind::InputQueued,
         STATUS_WAITING => DurableRunStatusKind::Waiting,
         STATUS_PAUSED => DurableRunStatusKind::Paused,
         STATUS_COMPLETED => DurableRunStatusKind::Completed,
@@ -857,15 +1032,13 @@ pub fn durable_run_status_is_terminal(status: &str) -> bool {
 pub fn durable_run_status_blocks_session(status: &str, waiting_for: Option<&str>) -> bool {
     matches!(
         durable_run_status_kind(status),
-        DurableRunStatusKind::Running
-            | DurableRunStatusKind::InputQueued
-            | DurableRunStatusKind::Waiting
+        DurableRunStatusKind::Running | DurableRunStatusKind::Waiting
     ) || (durable_run_status_kind(status) == DurableRunStatusKind::Paused && waiting_for.is_some())
 }
 
 pub fn durable_run_status_to_subrun_state(status: &str) -> SubRunState {
     match durable_run_status_kind(status) {
-        DurableRunStatusKind::Running | DurableRunStatusKind::InputQueued => SubRunState::Running,
+        DurableRunStatusKind::Running => SubRunState::Running,
         DurableRunStatusKind::Waiting | DurableRunStatusKind::Paused => SubRunState::Paused,
         DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated => SubRunState::Completed,
         DurableRunStatusKind::Failed | DurableRunStatusKind::Other => SubRunState::Failed,
@@ -914,6 +1087,9 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, selected_model_json, selected_model_name, \
      selected_model_gateway, capability_server_refs_json, runtime_profile, created_at, updated_at";
+pub const RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 64;
+const MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 256;
+const RUN_RECOVERY_CLAIM_COLLISION_RETRIES: usize = 4;
 const RUN_LIST_CURSOR_SELECT_SQL: &str =
     "DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%f') AS cursor_updated_at";
 const RUN_LIST_CURSOR_FILTER_SQL: &str = " AND (updated_at < ";
@@ -960,6 +1136,32 @@ pub trait RunStateStore: Send + Sync {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String>;
+
+    async fn load_run_control(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunControlRecord>, String> {
+        Ok(self
+            .load_run(user_id, run_id)
+            .await?
+            .as_ref()
+            .map(DurableRunControlRecord::from))
+    }
+
+    async fn load_run_controls(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+    ) -> Result<Vec<DurableRunControlRecord>, String> {
+        let mut controls = Vec::with_capacity(run_ids.len());
+        for run_id in run_ids {
+            if let Some(run) = self.load_run_control(user_id, run_id).await? {
+                controls.push(run);
+            }
+        }
+        Ok(controls)
+    }
 
     /// Update run status and optional fields.
     async fn update_run_status(
@@ -1089,6 +1291,37 @@ pub trait RunStateStore: Send + Sync {
         events: &[serde_json::Value],
     ) -> Result<(), String>;
 
+    /// Load one canonical interaction fact without hydrating the run's full
+    /// event history. Shared stores must use the normalized request identity.
+    async fn load_run_interaction_event(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request_id: &str,
+        event_type: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let run = self.load_run(user_id, run_id).await?;
+        Ok(run.and_then(|run| {
+            run.events.into_iter().rev().find(|event| {
+                extract_event_type(event) == event_type
+                    && extract_interaction_request_id(event).as_deref() == Some(request_id)
+            })
+        }))
+    }
+
+    /// Resolve a durable interaction and release its run wait in one atomic
+    /// transition. The response and `run_resumed` facts commit together.
+    async fn resolve_run_interaction(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+        _request_id: &str,
+        _kind: DurableRunInteractionKind,
+        _response_data: serde_json::Value,
+    ) -> Result<DurableRunInteractionResolveOutcome, String> {
+        Err("durable run interaction resolution is not supported by this store".to_string())
+    }
+
     /// Append a single event. Default implementation delegates to
     /// `append_events_batch`.
     async fn append_event(
@@ -1112,39 +1345,75 @@ pub trait RunStateStore: Send + Sync {
         Err("run list cursor pagination is not supported by this store".to_string())
     }
 
+    /// List a bounded working set for one session. Unknown lifecycle values
+    /// intentionally rank with active work so the API projection can surface
+    /// the invalid durable value instead of silently hiding it in old history.
+    async fn list_session_runs(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<DurableSessionRunPage, String> {
+        let _ = (user_id, session_id, limit);
+        Err("session run listing is not supported by this store".to_string())
+    }
+
+    /// Load the same bounded session working set plus only the lifecycle
+    /// events required to reconstruct read-only agent/fanout results. The
+    /// database implementation overrides this with two batch queries; this
+    /// fallback is for deterministic test stores.
+    async fn load_session_agent_recovery(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<DurableSessionRunPage, String> {
+        let mut page = self.list_session_runs(user_id, session_id, limit).await?;
+        for run in &mut page.runs {
+            if let Some(full) = self.load_run(user_id, &run.run_id).await? {
+                run.events = full.events;
+            }
+        }
+        Ok(page)
+    }
+
     /// Find runs in WAITING status (for resume engine).
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
 
     /// Find runs in RUNNING status.
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
 
-    /// Find paused runs that still claim an execution wait and therefore need
-    /// startup recovery to release their session slot when no live owner
-    /// remains. Stores without durable owner tracking may return every paused
-    /// run with `waiting_for` set.
-    async fn find_recoverable_paused_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+    /// Find paused runs that still hold a blocking execution wait.
+    async fn find_blocking_paused_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         Ok(Vec::new())
     }
 
-    /// Find active runs this store owner may recover after startup.
+    /// Atomically claim a bounded batch of active runs for restart recovery.
     ///
-    /// Implementations backed by shared durable storage must not return rows
-    /// owned by a different live pod with an unexpired lease. Otherwise one
-    /// app instance can falsely mark another instance's live run as crashed.
-    async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        self.find_running_runs().await
-    }
-
-    /// Find all active runs this store owner may recover after startup.
-    ///
-    /// This includes waiting, running/input-queued, and blocking paused runs
-    /// that need recovery classification. Shared durable stores must apply the
-    /// same owner-lease boundary to every returned status so a restarting pod
-    /// cannot resume or interrupt work still leased by another live pod.
-    async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+    /// This includes waiting, running, and blocking paused runs
+    /// that need recovery classification. Shared durable stores must override
+    /// this operation so concurrent pods claim disjoint work and never return
+    /// rows protected by another live owner's lease. The fallback is intended
+    /// for process-local deterministic stores.
+    async fn claim_recoverable_active_runs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<DurableRunRecord>, String> {
+        let limit = limit.clamp(1, MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE) as usize;
         let mut active = self.find_waiting_runs().await?;
-        active.extend(self.find_recoverable_running_runs().await?);
-        active.extend(self.find_recoverable_paused_runs().await?);
+        active.extend(self.find_running_runs().await?);
+        active.extend(self.find_blocking_paused_runs().await?);
+        active.retain(|run| {
+            matches!(run.status.as_str(), STATUS_WAITING | STATUS_RUNNING)
+                || (run.status == STATUS_PAUSED && run.waiting_for.is_some())
+        });
+        active.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.user_id.cmp(&right.user_id))
+                .then_with(|| left.run_id.cmp(&right.run_id))
+        });
+        active.truncate(limit);
         Ok(active)
     }
 
@@ -1368,6 +1637,35 @@ fn apply_in_memory_status_transition(
     Ok(())
 }
 
+fn new_idempotent_events(
+    existing: &[serde_json::Value],
+    incoming: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut idempotency_keys = existing
+        .iter()
+        .filter_map(|event| extract_optional_string(event, "idempotency_key"))
+        .collect::<std::collections::HashSet<_>>();
+    incoming
+        .iter()
+        .filter(|event| {
+            extract_optional_string(event, "idempotency_key")
+                .is_none_or(|key| idempotency_keys.insert(key))
+        })
+        .cloned()
+        .collect()
+}
+
+fn in_memory_transition_changes_state(
+    run: &DurableRunRecord,
+    status: &str,
+    waiting_for: Option<&str>,
+    error_message: Option<&str>,
+) -> bool {
+    run.status != status
+        || run.waiting_for.as_deref() != waiting_for
+        || error_message.is_some_and(|message| run.error_message.as_deref() != Some(message))
+}
+
 fn session_execution_slot_owner_reclaimable(
     status: &str,
     waiting_for: Option<&str>,
@@ -1380,9 +1678,7 @@ fn session_execution_slot_owner_reclaimable(
     }
     matches!(
         durable_run_status_kind(status),
-        DurableRunStatusKind::Running
-            | DurableRunStatusKind::InputQueued
-            | DurableRunStatusKind::Waiting
+        DurableRunStatusKind::Running | DurableRunStatusKind::Waiting
     ) && owner_lease_expired
         && slot_is_stale
 }
@@ -1751,7 +2047,6 @@ impl RunStateStore for InMemoryRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
-        let latest_event_type = extract_event_type(&event);
         let terminal_error_code = terminal_error_code_from_transition(
             status,
             error_message,
@@ -1775,6 +2070,19 @@ impl RunStateStore for InMemoryRunStateStore {
                 if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
                     None
                 } else {
+                    let new_events =
+                        new_idempotent_events(&run.events, std::slice::from_ref(&event));
+                    if new_events.is_empty()
+                        && !in_memory_transition_changes_state(
+                            run,
+                            status,
+                            waiting_for,
+                            error_message,
+                        )
+                    {
+                        return Ok(false);
+                    }
+                    let latest_event_type = new_events.last().map(extract_event_type);
                     apply_in_memory_status_transition(
                         &mut slots,
                         run,
@@ -1783,17 +2091,18 @@ impl RunStateStore for InMemoryRunStateStore {
                         error_message,
                         terminal_error_code.as_deref(),
                     )?;
-                    run.events.push(event);
-                    run.last_event_idx = run.events.len() as i64 - 1;
-                    Some(run.clone())
+                    if !new_events.is_empty() {
+                        run.events.extend(new_events);
+                        run.last_event_idx = run.events.len() as i64 - 1;
+                    }
+                    Some((run.clone(), latest_event_type))
                 }
             } else {
                 None
             }
         };
-        if let Some(run) = updated {
-            self.sync_projection(&run, Some(latest_event_type), None)
-                .await;
+        if let Some((run, latest_event_type)) = updated {
+            self.sync_projection(&run, latest_event_type, None).await;
             Ok(true)
         } else {
             Ok(false)
@@ -1885,7 +2194,6 @@ impl RunStateStore for InMemoryRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
-        let latest_event_type = events.last().map(extract_event_type);
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
         let updated = {
@@ -1906,6 +2214,19 @@ impl RunStateStore for InMemoryRunStateStore {
                 if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
                     None
                 } else {
+                    let new_events = new_idempotent_events(&run.events, events);
+                    if !events.is_empty()
+                        && new_events.is_empty()
+                        && !in_memory_transition_changes_state(
+                            run,
+                            status,
+                            waiting_for,
+                            error_message,
+                        )
+                    {
+                        return Ok(false);
+                    }
+                    let latest_event_type = new_events.last().map(extract_event_type);
                     apply_in_memory_status_transition(
                         &mut slots,
                         run,
@@ -1914,17 +2235,17 @@ impl RunStateStore for InMemoryRunStateStore {
                         error_message,
                         terminal_error_code.as_deref(),
                     )?;
-                    if !events.is_empty() {
-                        run.events.extend(events.iter().cloned());
+                    if !new_events.is_empty() {
+                        run.events.extend(new_events);
                         run.last_event_idx = run.events.len() as i64 - 1;
                     }
-                    Some(run.clone())
+                    Some((run.clone(), latest_event_type))
                 }
             } else {
                 None
             }
         };
-        if let Some(run) = updated {
+        if let Some((run, latest_event_type)) = updated {
             self.sync_projection(&run, latest_event_type, None).await;
             Ok(true)
         } else {
@@ -2090,7 +2411,6 @@ impl RunStateStore for InMemoryRunStateStore {
         if events.is_empty() {
             return Ok(());
         }
-        let latest_event_type = extract_event_type(events.last().unwrap());
         let updated = {
             let mut runs = self.runs.write().await;
             let Some(run) = runs.get_mut(run_id) else {
@@ -2099,17 +2419,76 @@ impl RunStateStore for InMemoryRunStateStore {
             if run.user_id != user_id {
                 return Err(format!("run not found while appending events: {run_id}"));
             }
+            let events = new_idempotent_events(&run.events, events);
+            if events.is_empty() {
+                return Ok(());
+            }
+            let latest_event_type = extract_event_type(events.last().unwrap());
             let start_idx = run.events.len() as i64;
-            run.events.extend(events.iter().cloned());
-            run.last_event_idx = start_idx + events.len() as i64 - 1;
+            let event_count = events.len() as i64;
+            run.events.extend(events);
+            run.last_event_idx = start_idx + event_count - 1;
             run.updated_at = chrono::Utc::now().to_rfc3339();
-            Some(run.clone())
+            Some((run.clone(), latest_event_type))
         };
-        if let Some(run) = updated {
+        if let Some((run, latest_event_type)) = updated {
             self.sync_projection(&run, Some(latest_event_type), None)
                 .await;
         }
         Ok(())
+    }
+
+    async fn resolve_run_interaction(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request_id: &str,
+        kind: DurableRunInteractionKind,
+        response_data: serde_json::Value,
+    ) -> Result<DurableRunInteractionResolveOutcome, String> {
+        let events = interaction_resolution_events(kind, request_id, response_data.clone());
+        let updated = {
+            let mut slots = self.execution_slots.write().await;
+            let mut runs = self.runs.write().await;
+            let Some(run) = runs.get_mut(run_id).filter(|run| run.user_id == user_id) else {
+                return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
+            };
+            let required = run.events.iter().any(|event| {
+                extract_event_type(event) == kind.required_event_type()
+                    && extract_interaction_request_id(event).as_deref() == Some(request_id)
+            });
+            if !required {
+                return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
+            }
+            if let Some(existing) = run.events.iter().rev().find(|event| {
+                extract_event_type(event) == kind.resolved_event_type()
+                    && extract_interaction_request_id(event).as_deref() == Some(request_id)
+            }) {
+                return Ok(if interaction_response_matches(existing, &response_data) {
+                    DurableRunInteractionResolveOutcome::Idempotent(existing.clone())
+                } else {
+                    DurableRunInteractionResolveOutcome::Conflict(existing.clone())
+                });
+            }
+            if run.status != STATUS_WAITING
+                || run.waiting_for.as_deref() != Some(kind.waiting_for())
+            {
+                return Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting);
+            }
+            apply_in_memory_status_transition(&mut slots, run, STATUS_RUNNING, None, None, None)?;
+            let first_event_idx = run.last_event_idx + 1;
+            run.events.extend(events.clone());
+            run.last_event_idx = first_event_idx + events.len() as i64 - 1;
+            Some(run.clone())
+        };
+        let Some(run) = updated else {
+            return Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting);
+        };
+        self.sync_projection(&run, Some("run_resumed".to_string()), None)
+            .await;
+        Ok(DurableRunInteractionResolveOutcome::Resolved(
+            events[0].clone(),
+        ))
     }
 
     async fn list_user_runs_cursor(
@@ -2153,6 +2532,30 @@ impl RunStateStore for InMemoryRunStateStore {
         })
     }
 
+    async fn list_session_runs(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<DurableSessionRunPage, String> {
+        let limit = validate_run_list_limit(limit);
+        let runs = self.runs.read().await;
+        let mut session_runs = runs
+            .values()
+            .filter(|run| run.user_id == user_id && run.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_session_run_candidates(&mut session_runs);
+        let truncated = session_runs.len() > limit as usize;
+        session_runs.truncate(limit as usize);
+        sort_session_run_tree(&mut session_runs);
+        Ok(DurableSessionRunPage {
+            runs: session_runs,
+            limit,
+            truncated,
+        })
+    }
+
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let runs = self.runs.read().await;
         Ok(runs
@@ -2166,17 +2569,12 @@ impl RunStateStore for InMemoryRunStateStore {
         let runs = self.runs.read().await;
         Ok(runs
             .values()
-            .filter(|r| {
-                matches!(
-                    durable_run_status_kind(&r.status),
-                    DurableRunStatusKind::Running | DurableRunStatusKind::InputQueued
-                )
-            })
+            .filter(|r| durable_run_status_kind(&r.status) == DurableRunStatusKind::Running)
             .cloned()
             .collect())
     }
 
-    async fn find_recoverable_paused_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+    async fn find_blocking_paused_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let runs = self.runs.read().await;
         Ok(runs
             .values()
@@ -3300,7 +3698,7 @@ impl DatabaseRunStateStore {
         let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "INSERT IGNORE INTO agent_run_events \
              (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id, \
-              idempotency_key, event_hash, producer_pod_id, payload_json, created_at) ",
+              subject_run_id, interaction_request_id, idempotency_key, event_hash, producer_pod_id, payload_json, created_at) ",
         );
         builder.push_values(rows.iter(), |mut row, event| {
             row.push_bind(&event.id)
@@ -3311,6 +3709,8 @@ impl DatabaseRunStateStore {
                 .push_bind(&event.event_type)
                 .push_bind(&event.event_id)
                 .push_bind(&event.agent_id)
+                .push_bind(&event.subject_run_id)
+                .push_bind(&event.interaction_request_id)
                 .push_bind(&event.idempotency_key)
                 .push_bind(&event.event_hash)
                 .push_bind(&event.producer_pod_id)
@@ -3574,6 +3974,54 @@ impl RunStateStore for DatabaseRunStateStore {
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|e| e.to_string())?;
         Ok(Some(run))
+    }
+
+    async fn load_run_control(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunControlRecord>, String> {
+        let row = sqlx::query(
+            "SELECT run_id, status, waiting_for, parent_run_id, ancestor_path
+             FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_run_control", run_id, source).to_string())?;
+        row.map(|row| decode_run_control_row(&row, run_id))
+            .transpose()
+    }
+
+    async fn load_run_controls(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+    ) -> Result<Vec<DurableRunControlRecord>, String> {
+        if run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "SELECT run_id, status, waiting_for, parent_run_id, ancestor_path
+             FROM agent_runs WHERE user_id = ",
+        );
+        query.push_bind(user_id).push(" AND run_id IN (");
+        {
+            let mut ids = query.separated(",");
+            for run_id in run_ids {
+                ids.push_bind(run_id);
+            }
+        }
+        query.push(")");
+        query
+            .build()
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| db_error("load_run_controls", "lineage", source).to_string())?
+            .into_iter()
+            .map(|row| decode_run_control_row(&row, "lineage"))
+            .collect()
     }
 
     async fn update_run_status(
@@ -3886,8 +4334,8 @@ impl RunStateStore for DatabaseRunStateStore {
         let insert_result = sqlx::query(
             "INSERT INTO agent_run_events
              (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
-              idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+              subject_run_id, interaction_request_id, idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&event_row.id)
         .bind(&event_row.run_id)
@@ -3897,6 +4345,8 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(&event_row.event_type)
         .bind(&event_row.event_id)
         .bind(&event_row.agent_id)
+        .bind(&event_row.subject_run_id)
+        .bind(&event_row.interaction_request_id)
         .bind(&event_row.idempotency_key)
         .bind(&event_row.event_hash)
         .bind(&event_row.producer_pod_id)
@@ -4103,8 +4553,8 @@ impl RunStateStore for DatabaseRunStateStore {
         let insert_result = sqlx::query(
             "INSERT INTO agent_run_events
              (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
-              idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+              subject_run_id, interaction_request_id, idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&event_row.id)
         .bind(&event_row.run_id)
@@ -4114,6 +4564,8 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(&event_row.event_type)
         .bind(&event_row.event_id)
         .bind(&event_row.agent_id)
+        .bind(&event_row.subject_run_id)
+        .bind(&event_row.interaction_request_id)
         .bind(&event_row.idempotency_key)
         .bind(&event_row.event_hash)
         .bind(&event_row.producer_pod_id)
@@ -4285,7 +4737,7 @@ impl RunStateStore for DatabaseRunStateStore {
             let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
                 "INSERT INTO agent_run_events
                  (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
-                  idempotency_key, event_hash, producer_pod_id, payload_json, created_at) ",
+                  subject_run_id, interaction_request_id, idempotency_key, event_hash, producer_pod_id, payload_json, created_at) ",
             );
             insert.push_values(&event_rows, |mut row, event| {
                 row.push_bind(&event.id)
@@ -4296,6 +4748,8 @@ impl RunStateStore for DatabaseRunStateStore {
                     .push_bind(&event.event_type)
                     .push_bind(&event.event_id)
                     .push_bind(&event.agent_id)
+                    .push_bind(&event.subject_run_id)
+                    .push_bind(&event.interaction_request_id)
                     .push_bind(&event.idempotency_key)
                     .push_bind(&event.event_hash)
                     .push_bind(&event.producer_pod_id)
@@ -4582,6 +5036,234 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|e| e.to_string())
     }
 
+    async fn load_run_interaction_event(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request_id: &str,
+        event_type: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let row = sqlx::query(
+            "SELECT event_idx, payload_json
+             FROM agent_run_events
+             WHERE user_id = ? AND run_id = ?
+               AND interaction_request_id = ? AND event_type = ?
+             ORDER BY event_idx DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .bind(request_id)
+        .bind(event_type)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_run_interaction_event", run_id, source).to_string())?;
+        row.map(|row| decode_run_event_payload(&row, run_id))
+            .transpose()
+            .map_err(|error| error.to_string())
+    }
+
+    async fn resolve_run_interaction(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        request_id: &str,
+        kind: DurableRunInteractionKind,
+        response_data: serde_json::Value,
+    ) -> Result<DurableRunInteractionResolveOutcome, String> {
+        let events = interaction_resolution_events(kind, request_id, response_data.clone());
+        for _ in 0..3 {
+            let mut tx = self.pool.get().begin().await.map_err(|source| {
+                db_error("resolve_run_interaction_begin", run_id, source).to_string()
+            })?;
+            let Some(run) = self
+                .load_run_metadata_for_user_tx(&mut tx, user_id, run_id)
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                tx.rollback().await.map_err(|source| {
+                    db_error("resolve_run_interaction_rollback_missing", run_id, source).to_string()
+                })?;
+                return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
+            };
+            let rows = sqlx::query(
+                "SELECT event_idx, event_type, payload_json
+                 FROM agent_run_events
+                 WHERE user_id = ? AND run_id = ? AND interaction_request_id = ?
+                   AND event_type IN (?, ?)
+                 ORDER BY event_idx ASC",
+            )
+            .bind(user_id)
+            .bind(run_id)
+            .bind(request_id)
+            .bind(kind.required_event_type())
+            .bind(kind.resolved_event_type())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|source| {
+                db_error("resolve_run_interaction_load_facts", run_id, source).to_string()
+            })?;
+            let mut required_found = false;
+            let mut existing_response = None;
+            for row in rows {
+                let event_type: String = row.try_get("event_type").map_err(|source| {
+                    db_error("decode_run_interaction_event_type", run_id, source).to_string()
+                })?;
+                let event =
+                    decode_run_event_payload(&row, run_id).map_err(|error| error.to_string())?;
+                if event_type == kind.required_event_type() {
+                    required_found = true;
+                } else if event_type == kind.resolved_event_type() {
+                    existing_response = Some(event);
+                }
+            }
+            if let Some(existing) = existing_response {
+                tx.rollback().await.map_err(|source| {
+                    db_error("resolve_run_interaction_rollback_existing", run_id, source)
+                        .to_string()
+                })?;
+                return Ok(if interaction_response_matches(&existing, &response_data) {
+                    DurableRunInteractionResolveOutcome::Idempotent(existing)
+                } else {
+                    DurableRunInteractionResolveOutcome::Conflict(existing)
+                });
+            }
+            if !required_found {
+                tx.rollback().await.map_err(|source| {
+                    db_error(
+                        "resolve_run_interaction_rollback_missing_request",
+                        run_id,
+                        source,
+                    )
+                    .to_string()
+                })?;
+                return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
+            }
+            if run.status != STATUS_WAITING
+                || run.waiting_for.as_deref() != Some(kind.waiting_for())
+            {
+                tx.rollback().await.map_err(|source| {
+                    db_error(
+                        "resolve_run_interaction_rollback_not_waiting",
+                        run_id,
+                        source,
+                    )
+                    .to_string()
+                })?;
+                return Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting);
+            }
+
+            let first_event_idx = run.last_event_idx + 1;
+            let event_rows = events
+                .iter()
+                .enumerate()
+                .map(|(offset, event)| {
+                    build_run_event_insert_row(
+                        user_id,
+                        run_id,
+                        &run.session_id,
+                        run.agent_id.as_deref(),
+                        first_event_idx + offset as i64,
+                        &self.owner_pod_id,
+                        event,
+                    )
+                })
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?;
+            let last_event_idx = first_event_idx + event_rows.len() as i64 - 1;
+            let updated = sqlx::query(
+                "UPDATE agent_runs
+                 SET status = ?, waiting_for = NULL, last_event_idx = ?, updated_at = NOW(6)
+                 WHERE user_id = ? AND run_id = ? AND status = ? AND waiting_for = ?
+                   AND last_event_idx = ?",
+            )
+            .bind(STATUS_RUNNING)
+            .bind(last_event_idx)
+            .bind(user_id)
+            .bind(run_id)
+            .bind(STATUS_WAITING)
+            .bind(kind.waiting_for())
+            .bind(run.last_event_idx)
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| {
+                db_error("resolve_run_interaction_update", run_id, source).to_string()
+            })?;
+            if updated.rows_affected() == 0 {
+                tx.rollback().await.map_err(|source| {
+                    db_error("resolve_run_interaction_rollback_conflict", run_id, source)
+                        .to_string()
+                })?;
+                tokio::task::yield_now().await;
+                continue;
+            }
+            if !self
+                .sync_session_execution_slot_after_status_tx(&mut tx, &run, STATUS_RUNNING, None)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                tx.rollback().await.map_err(|source| {
+                    db_error("resolve_run_interaction_rollback_slot", run_id, source).to_string()
+                })?;
+                return Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting);
+            }
+            let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "INSERT INTO agent_run_events
+                 (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
+                  subject_run_id, interaction_request_id, idempotency_key, event_hash,
+                  producer_pod_id, payload_json, created_at) ",
+            );
+            insert.push_values(&event_rows, |mut row, event| {
+                row.push_bind(&event.id)
+                    .push_bind(&event.run_id)
+                    .push_bind(event.event_idx)
+                    .push_bind(&event.user_id)
+                    .push_bind(&event.session_id)
+                    .push_bind(&event.event_type)
+                    .push_bind(&event.event_id)
+                    .push_bind(&event.agent_id)
+                    .push_bind(&event.subject_run_id)
+                    .push_bind(&event.interaction_request_id)
+                    .push_bind(&event.idempotency_key)
+                    .push_bind(&event.event_hash)
+                    .push_bind(&event.producer_pod_id)
+                    .push_bind(&event.payload_json)
+                    .push("NOW(6)");
+            });
+            insert.build().execute(&mut *tx).await.map_err(|source| {
+                db_error("resolve_run_interaction_insert_events", run_id, source).to_string()
+            })?;
+            tx.commit().await.map_err(|source| {
+                db_error("resolve_run_interaction_commit", run_id, source).to_string()
+            })?;
+            if let Err(error) = self
+                .sync_projection_for_user(user_id, run_id, Some("run_resumed"), None)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    error = %error,
+                    "interaction resolved but display projection refresh failed"
+                );
+            }
+            return Ok(DurableRunInteractionResolveOutcome::Resolved(
+                events[0].clone(),
+            ));
+        }
+
+        if let Some(existing) = self
+            .load_run_interaction_event(user_id, run_id, request_id, kind.resolved_event_type())
+            .await?
+        {
+            return Ok(if interaction_response_matches(&existing, &response_data) {
+                DurableRunInteractionResolveOutcome::Idempotent(existing)
+            } else {
+                DurableRunInteractionResolveOutcome::Conflict(existing)
+            });
+        }
+        Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting)
+    }
+
     async fn list_user_runs_cursor(
         &self,
         user_id: &str,
@@ -4642,6 +5324,145 @@ impl RunStateStore for DatabaseRunStateStore {
         })
     }
 
+    async fn list_session_runs(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<DurableSessionRunPage, String> {
+        let limit = validate_run_list_limit(limit);
+        let sql = format!(
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
+             WHERE user_id = ? AND session_id = ? \
+             ORDER BY CASE WHEN status IN (?, ?, ?) THEN 1 ELSE 0 END ASC, \
+                      updated_at DESC, created_at DESC, run_id DESC \
+             LIMIT ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(STATUS_COMPLETED)
+            .bind(STATUS_FAILED)
+            .bind(STATUS_CANCELLED)
+            .bind(session_run_query_limit(limit))
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| db_error("list_session_runs", session_id, source).to_string())?;
+        let mut runs = rows
+            .into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        let truncated = runs.len() > limit as usize;
+        runs.truncate(limit as usize);
+        sort_session_run_tree(&mut runs);
+        Ok(DurableSessionRunPage {
+            runs,
+            limit,
+            truncated,
+        })
+    }
+
+    async fn load_session_agent_recovery(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<DurableSessionRunPage, String> {
+        let mut page = self.list_session_runs(user_id, session_id, limit).await?;
+        if page.runs.is_empty() {
+            return Ok(page);
+        }
+        // Recovery needs one exact spawn envelope per selected child plus the
+        // latest terminal facts per selected run. `event_idx` is run-local, so
+        // a global ORDER BY/LIMIT lets one noisy run starve every other run.
+        // Keep this as one bounded DB round trip, with the child identity
+        // normalized in `subject_run_id` rather than parsed from JSON here.
+        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "SELECT run_id, event_idx, payload_json FROM (
+               SELECT run_id, event_idx, payload_json FROM (
+                 SELECT run_id, event_idx, payload_json,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY subject_run_id ORDER BY event_idx DESC
+                        ) AS recovery_rank
+                 FROM agent_run_events
+                 WHERE user_id = ",
+        );
+        builder
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND event_type = 'agent_spawned' AND subject_run_id IN (");
+        {
+            let mut ids = builder.separated(",");
+            for run in &page.runs {
+                ids.push_bind(run.run_id.as_str());
+            }
+        }
+        builder
+            .push(
+                ")
+               ) ranked_spawns WHERE recovery_rank = 1
+               UNION ALL
+               SELECT run_id, event_idx, payload_json FROM (
+                 SELECT run_id, event_idx, payload_json,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY run_id, event_type ORDER BY event_idx DESC
+                        ) AS recovery_rank
+                 FROM agent_run_events
+                 WHERE user_id = ",
+            )
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND event_type IN ('text_done','run_error','run_finished') AND run_id IN (");
+        {
+            let mut ids = builder.separated(",");
+            for run in &page.runs {
+                ids.push_bind(run.run_id.as_str());
+            }
+        }
+        builder.push(
+            ")
+               ) ranked_terminal WHERE recovery_rank = 1
+             ) recovery_events
+             ORDER BY run_id, event_idx",
+        );
+        let rows = builder
+            .build()
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("load_session_agent_recovery", session_id, source).to_string()
+            })?;
+        let mut events_by_run = HashMap::<String, Vec<(i64, serde_json::Value)>>::new();
+        for row in rows {
+            let run_id: String = row.try_get("run_id").map_err(|source| {
+                db_error("decode_session_agent_recovery_run_id", session_id, source).to_string()
+            })?;
+            let event_idx: i64 = row.try_get("event_idx").map_err(|source| {
+                db_error("decode_session_agent_recovery_event_idx", &run_id, source).to_string()
+            })?;
+            let payload: String = row.try_get("payload_json").map_err(|source| {
+                db_error("decode_session_agent_recovery_payload", &run_id, source).to_string()
+            })?;
+            let payload = serde_json::from_str(&payload).map_err(|source| {
+                format!("invalid durable recovery event for run {run_id}: {source}")
+            })?;
+            events_by_run
+                .entry(run_id)
+                .or_default()
+                .push((event_idx, payload));
+        }
+        for run in &mut page.runs {
+            if let Some(mut events) = events_by_run.remove(&run.run_id) {
+                events.sort_by_key(|(event_idx, _)| *event_idx);
+                run.events = events.into_iter().map(|(_, event)| event).collect();
+            }
+        }
+        Ok(page)
+    }
+
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         self.find_runs_by_status(STATUS_WAITING).await
     }
@@ -4649,11 +5470,10 @@ impl RunStateStore for DatabaseRunStateStore {
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         let sql = format!(
             "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
-             WHERE status IN (?, ?) ORDER BY updated_at ASC"
+             WHERE status = ? ORDER BY updated_at ASC"
         );
         let rows = sqlx::query(&sql)
             .bind(STATUS_RUNNING)
-            .bind(STATUS_INPUT_QUEUED)
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| db_error("find_running_runs", "active", source).to_string())?;
@@ -4663,60 +5483,136 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|e| e.to_string())
     }
 
-    async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
-             WHERE status IN (?, ?)
-               AND (
-                   owner_pod_id IS NULL
-                   OR owner_pod_id = ?
-                   OR owner_lease_expires_at IS NULL
-                   OR owner_lease_expires_at < NOW(6)
-               )
-             ORDER BY updated_at ASC",
-        );
-        let rows = sqlx::query(&sql)
-            .bind(STATUS_RUNNING)
-            .bind(STATUS_INPUT_QUEUED)
-            .bind(&self.owner_pod_id)
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error("find_recoverable_running_runs", "active", source).to_string()
-            })?;
-        rows.into_iter()
-            .map(run_record_from_row)
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|e| e.to_string())
-    }
+    async fn claim_recoverable_active_runs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<DurableRunRecord>, String> {
+        let limit = limit.clamp(1, MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE);
+        for _ in 0..RUN_RECOVERY_CLAIM_COLLISION_RETRIES {
+            let candidate_sql = format!(
+                "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+                 WHERE (status IN (?, ?) OR (status = ? AND waiting_for IS NOT NULL))
+                   AND (
+                       owner_pod_id IS NULL
+                       OR owner_pod_id = ?
+                       OR owner_lease_expires_at IS NULL
+                       OR owner_lease_expires_at < NOW(6)
+                   )
+                 ORDER BY updated_at ASC, user_id ASC, run_id ASC
+                 LIMIT ?",
+            );
+            let candidates = sqlx::query(&candidate_sql)
+                .bind(STATUS_WAITING)
+                .bind(STATUS_RUNNING)
+                .bind(STATUS_PAUSED)
+                .bind(&self.owner_pod_id)
+                .bind(i64::from(limit))
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("select_run_recovery_claim_candidates", "active", source).to_string()
+                })?
+                .into_iter()
+                .map(run_record_from_row)
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?;
+            if candidates.is_empty() {
+                return Ok(Vec::new());
+            }
 
-    async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
-             WHERE (status IN (?, ?, ?) OR (status = ? AND waiting_for IS NOT NULL))
-               AND (
-                   owner_pod_id IS NULL
-                   OR owner_pod_id = ?
-                   OR owner_lease_expires_at IS NULL
-                   OR owner_lease_expires_at < NOW(6)
-               )
-             ORDER BY updated_at ASC",
-        );
-        let rows = sqlx::query(&sql)
-            .bind(STATUS_WAITING)
-            .bind(STATUS_RUNNING)
-            .bind(STATUS_INPUT_QUEUED)
-            .bind(STATUS_PAUSED)
-            .bind(&self.owner_pod_id)
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|source| {
-                db_error("find_recoverable_active_runs", "active", source).to_string()
-            })?;
-        rows.into_iter()
-            .map(run_record_from_row)
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|e| e.to_string())
+            let claim_expires_at = self.lease_expires_at();
+            let mut claim = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "UPDATE agent_runs
+                 SET owner_pod_id = ",
+            );
+            claim.push_bind(&self.owner_pod_id);
+            claim.push(", owner_lease_expires_at = ");
+            claim.push_bind(claim_expires_at);
+            claim.push(
+                ", run_generation = run_generation + 1, updated_at = NOW(6)
+                 WHERE (status IN (",
+            );
+            claim.push_bind(STATUS_WAITING);
+            claim.push(", ");
+            claim.push_bind(STATUS_RUNNING);
+            claim.push(") OR (status = ");
+            claim.push_bind(STATUS_PAUSED);
+            claim.push(
+                " AND waiting_for IS NOT NULL))
+                   AND (
+                       owner_pod_id IS NULL
+                       OR owner_pod_id = ",
+            );
+            claim.push_bind(&self.owner_pod_id);
+            claim.push(
+                " OR owner_lease_expires_at IS NULL
+                       OR owner_lease_expires_at < NOW(6)
+                   ) AND (",
+            );
+            for (index, candidate) in candidates.iter().enumerate() {
+                if index > 0 {
+                    claim.push(" OR ");
+                }
+                claim.push("(user_id = ");
+                claim.push_bind(&candidate.user_id);
+                claim.push(" AND run_id = ");
+                claim.push_bind(&candidate.run_id);
+                claim.push(" AND run_generation = ");
+                claim.push_bind(candidate.run_generation as i64);
+                claim.push(")");
+            }
+            claim.push(")");
+            let claimed_count = claim
+                .build()
+                .execute(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("claim_recoverable_active_runs", "active", source).to_string()
+                })?
+                .rows_affected();
+            if claimed_count == 0 {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            let mut claimed = sqlx::QueryBuilder::<sqlx::MySql>::new("SELECT ");
+            claimed.push(AGENT_RUN_COLUMNS);
+            claimed.push(" FROM agent_runs WHERE owner_pod_id = ");
+            claimed.push_bind(&self.owner_pod_id);
+            claimed.push(" AND owner_lease_expires_at = ");
+            claimed.push_bind(claim_expires_at);
+            claimed.push(" AND (");
+            for (index, candidate) in candidates.iter().enumerate() {
+                if index > 0 {
+                    claimed.push(" OR ");
+                }
+                claimed.push("(user_id = ");
+                claimed.push_bind(&candidate.user_id);
+                claimed.push(" AND run_id = ");
+                claimed.push_bind(&candidate.run_id);
+                claimed.push(" AND run_generation = ");
+                claimed.push_bind(candidate.run_generation.saturating_add(1) as i64);
+                claimed.push(")");
+            }
+            claimed.push(") ORDER BY updated_at ASC, user_id ASC, run_id ASC");
+            let rows = claimed
+                .build()
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_claimed_recoverable_active_runs", "active", source).to_string()
+                })?;
+            let records = rows
+                .into_iter()
+                .map(run_record_from_row)
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?;
+            if !records.is_empty() {
+                return Ok(records);
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(Vec::new())
     }
 
     fn owner_lease_renewal_interval(&self) -> Option<Duration> {
@@ -4782,7 +5678,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let sql = format!(
             "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
              WHERE user_id = ? AND session_id = ? \
-               AND (status IN (?, ?, ?) OR (status = ? AND waiting_for IS NOT NULL)) \
+               AND (status IN (?, ?) OR (status = ? AND waiting_for IS NOT NULL)) \
              ORDER BY updated_at DESC \
              LIMIT 1",
         );
@@ -4790,7 +5686,6 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(user_id)
             .bind(session_id)
             .bind(STATUS_RUNNING)
-            .bind(STATUS_INPUT_QUEUED)
             .bind(STATUS_WAITING)
             .bind(STATUS_PAUSED)
             .fetch_optional(self.pool.get())
@@ -5130,6 +6025,29 @@ fn run_record_from_row(row: sqlx::mysql::MySqlRow) -> DbStoreResult<DurableRunRe
     decode_run_record_from_row(&row)
 }
 
+fn decode_run_control_row(
+    row: &sqlx::mysql::MySqlRow,
+    entity: &str,
+) -> Result<DurableRunControlRecord, String> {
+    Ok(DurableRunControlRecord {
+        run_id: row
+            .try_get("run_id")
+            .map_err(|source| db_error("decode_run_control_run_id", entity, source).to_string())?,
+        status: row
+            .try_get("status")
+            .map_err(|source| db_error("decode_run_control_status", entity, source).to_string())?,
+        waiting_for: row.try_get("waiting_for").map_err(|source| {
+            db_error("decode_run_control_waiting_for", entity, source).to_string()
+        })?,
+        parent_run_id: row
+            .try_get("parent_run_id")
+            .map_err(|source| db_error("decode_run_control_parent", entity, source).to_string())?,
+        ancestor_path: row.try_get("ancestor_path").map_err(|source| {
+            db_error("decode_run_control_ancestor_path", entity, source).to_string()
+        })?,
+    })
+}
+
 fn run_list_cursor_from_row(row: &impl RunStateDbRow) -> DbStoreResult<RunListCursor> {
     let operation = "list_user_runs_cursor";
     let table = "agent_runs";
@@ -5305,9 +6223,9 @@ fn decode_run_event_payload(
             source,
         }
     })?;
-    if let Some(obj) = value.as_object_mut()
-        && !obj.contains_key("index")
-    {
+    if let Some(obj) = value.as_object_mut() {
+        // The row key is authoritative. Payload-provided indices are stream
+        // metadata and must never override durable cursor/ack identity.
         obj.insert("index".to_string(), serde_json::json!(event_idx));
     }
     Ok(value)
@@ -5327,6 +6245,60 @@ fn extract_optional_string(event: &serde_json::Value, key: &str) -> Option<Strin
         .map(ToOwned::to_owned)
 }
 
+fn extract_interaction_request_id(event: &serde_json::Value) -> Option<String> {
+    extract_optional_string(event, "request_id").or_else(|| {
+        event
+            .get("data")
+            .and_then(|data| extract_optional_string(data, "request_id"))
+    })
+}
+
+fn interaction_idempotency_key(
+    kind: DurableRunInteractionKind,
+    request_id: &str,
+    suffix: &str,
+) -> String {
+    let identity = sha256_hex(request_id.as_bytes());
+    format!(
+        "interaction:{}:{identity}:{suffix}",
+        kind.idempotency_namespace()
+    )
+}
+
+fn interaction_resolution_events(
+    kind: DurableRunInteractionKind,
+    request_id: &str,
+    response_data: serde_json::Value,
+) -> [serde_json::Value; 2] {
+    let outcome = response_data
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("resolved");
+    [
+        serde_json::json!({
+            "event_type": kind.resolved_event_type(),
+            "idempotency_key": interaction_idempotency_key(kind, request_id, "terminal"),
+            "data": response_data,
+        }),
+        serde_json::json!({
+            "event_type": "run_resumed",
+            "idempotency_key": interaction_idempotency_key(kind, request_id, "resume"),
+            "data": {
+                "reason": kind.waiting_for(),
+                "request_id": request_id,
+                "interaction_outcome": outcome,
+            }
+        }),
+    ]
+}
+
+fn interaction_response_matches(
+    existing: &serde_json::Value,
+    response_data: &serde_json::Value,
+) -> bool {
+    existing.get("data") == Some(response_data)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")
@@ -5342,6 +6314,8 @@ struct RunEventInsertRow {
     event_type: String,
     event_id: String,
     agent_id: String,
+    subject_run_id: Option<String>,
+    interaction_request_id: Option<String>,
     idempotency_key: Option<String>,
     event_hash: String,
     producer_pod_id: String,
@@ -5364,6 +6338,10 @@ fn build_run_event_insert_row(
             source,
         })?;
     let event_type = extract_event_type(event);
+    let subject_run_id = (event_type == "agent_spawned")
+        .then(|| extract_optional_string(event, "run_id"))
+        .flatten();
+    let interaction_request_id = extract_interaction_request_id(event);
     let event_id = extract_optional_string(event, "event_id")
         .or_else(|| extract_optional_string(event, "id"))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -5379,6 +6357,8 @@ fn build_run_event_insert_row(
         event_type,
         event_id,
         agent_id: agent_id.unwrap_or_default().to_string(),
+        subject_run_id,
+        interaction_request_id,
         idempotency_key,
         event_hash,
         producer_pod_id: owner_pod_id.to_string(),
@@ -5421,6 +6401,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "tool_request",
     "approval_required",
     "approval_batch_required",
+    "user_prompt_required",
     // Run lifecycle + framing.
     "run_started",
     "run_error",
@@ -5430,9 +6411,10 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "run_blocked",
     "run_paused",
     "run_resumed",
-    "run_input_queued",
     "runtime.control.handoff.requested",
     "runtime.control.handoff.rejected",
+    "user_intent_accepted",
+    "user_intent_applied",
     "context_meta",
     "session_info",
     "turn_complete",
@@ -5456,6 +6438,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "plan_step_done",
     "plan_revised",
     "agent_delegated",
+    "agent_communication",
     "agent_spawned",
     "agent_live_event",
     "agent_progress",
@@ -5802,6 +6785,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             }
             out
         }
+        "ask_user_prompted" | "user_prompt_required" => {
+            let mut out = serde_json::json!({ "type": "user_prompt_required" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
         "user_input" => {
             let mut out = serde_json::json!({ "type": "user_input" });
             if let Some(obj) = out.as_object_mut() {
@@ -5865,11 +6857,23 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             }
             out
         }
-        "run_input_queued" => {
-            let mut out = serde_json::json!({ "type": "run_input_queued" });
+        "user_intent" => {
+            let mut out = serde_json::json!({
+                "type": "user_intent_accepted",
+                "status": UserIntentStatus::AcceptedRemote,
+            });
             if let Some(obj) = out.as_object_mut() {
-                for (k, v) in &data {
-                    obj.insert(k.clone(), v.clone());
+                for key in ["intent_id", "delivery"] {
+                    insert_if_present(obj, &data, key);
+                }
+            }
+            out
+        }
+        "user_intent_applied" => {
+            let mut out = serde_json::json!({ "type": "user_intent_applied" });
+            if let Some(obj) = out.as_object_mut() {
+                for key in ["intent_id", "delivery", "status", "event_index"] {
+                    insert_if_present(obj, &data, key);
                 }
             }
             out
@@ -5905,8 +6909,14 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "agent_id": data.get("agent_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
             "task": data.get("task").cloned().unwrap_or(serde_json::Value::String(String::new())),
         }),
-        "agent_spawned" | "agent_progress" | "agent_completed" | "agent_failed"
-        | "agent_waiting" | "agent_cancelled" | "agent_interrupted" => {
+        "agent_communication"
+        | "agent_spawned"
+        | "agent_progress"
+        | "agent_completed"
+        | "agent_failed"
+        | "agent_waiting"
+        | "agent_cancelled"
+        | "agent_interrupted" => {
             let mut out = serde_json::json!({ "type": event_type });
             if let Some(obj) = out.as_object_mut() {
                 for (k, v) in &data {
@@ -6054,6 +7064,37 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+
+    #[test]
+    fn run_event_rows_normalize_spawn_subject_without_inventing_terminal_subjects() {
+        let spawned = build_run_event_insert_row(
+            "user-1",
+            "parent-run",
+            "session-1",
+            Some("root"),
+            4,
+            "pod-a",
+            &json!({
+                "type": "agent_spawned",
+                "run_id": "child-run",
+                "agent_id": "reviewer"
+            }),
+        )
+        .unwrap();
+        assert_eq!(spawned.subject_run_id.as_deref(), Some("child-run"));
+
+        let terminal = build_run_event_insert_row(
+            "user-1",
+            "child-run",
+            "session-1",
+            Some("reviewer"),
+            9,
+            "pod-a",
+            &json!({"event_type": "run_finished", "data": {"status": "completed"}}),
+        )
+        .unwrap();
+        assert_eq!(terminal.subject_run_id, None);
     }
 
     #[derive(Clone)]
@@ -6314,10 +7355,6 @@ mod tests {
             DurableRunStatusKind::Running
         );
         assert_eq!(
-            durable_run_status_kind(STATUS_INPUT_QUEUED),
-            DurableRunStatusKind::InputQueued
-        );
-        assert_eq!(
             durable_run_status_kind(STATUS_WAITING),
             DurableRunStatusKind::Waiting
         );
@@ -6351,12 +7388,10 @@ mod tests {
         assert!(durable_run_status_is_terminal(STATUS_FAILED));
         assert!(durable_run_status_is_terminal(STATUS_CANCELLED));
         assert!(!durable_run_status_is_terminal(STATUS_RUNNING));
-        assert!(!durable_run_status_is_terminal(STATUS_INPUT_QUEUED));
         assert!(!durable_run_status_is_terminal(STATUS_WAITING));
         assert!(!durable_run_status_is_terminal(STATUS_PAUSED));
 
         assert!(durable_run_status_blocks_session(STATUS_RUNNING, None));
-        assert!(durable_run_status_blocks_session(STATUS_INPUT_QUEUED, None));
         assert!(durable_run_status_blocks_session(STATUS_WAITING, None));
         assert!(durable_run_status_blocks_session(
             STATUS_PAUSED,
@@ -6407,10 +7442,6 @@ mod tests {
         );
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_RUNNING),
-            SubRunState::Running
-        );
-        assert_eq!(
-            durable_run_status_to_subrun_state(STATUS_INPUT_QUEUED),
             SubRunState::Running
         );
         assert_eq!(
@@ -7303,6 +8334,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_session_run_snapshot_is_scoped_bounded_and_keeps_active_work() {
+        let store = InMemoryRunStateStore::new();
+
+        let mut root = durable_run_record("root");
+        root.status = STATUS_COMPLETED.into();
+        root.created_at = "2026-07-11T00:00:00Z".into();
+        root.updated_at = "2026-07-11T00:01:00Z".into();
+        store.insert_run(root).await.unwrap();
+
+        let mut old_terminal = durable_run_record("old-terminal");
+        old_terminal.status = STATUS_FAILED.into();
+        old_terminal.parent_run_id = Some("root".into());
+        old_terminal.root_run_id = Some("root".into());
+        old_terminal.depth = 1;
+        old_terminal.created_at = "2026-07-11T00:02:00Z".into();
+        old_terminal.updated_at = "2026-07-11T00:03:00Z".into();
+        store.insert_run(old_terminal).await.unwrap();
+
+        let mut active = durable_run_record("active-child");
+        active.status = STATUS_WAITING.into();
+        active.parent_run_id = Some("root".into());
+        active.root_run_id = Some("root".into());
+        active.depth = 1;
+        active.created_at = "2026-07-11T00:04:00Z".into();
+        active.updated_at = "2026-07-11T00:05:00Z".into();
+        store.insert_run(active).await.unwrap();
+
+        let mut other_session = durable_run_record("other-session");
+        other_session.session_id = "s2".into();
+        store.insert_run(other_session).await.unwrap();
+
+        let mut other_user = durable_run_record("other-user");
+        other_user.user_id = "u2".into();
+        store.insert_run(other_user).await.unwrap();
+
+        let page = store.list_session_runs("u1", "s1", 2).await.unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.limit, 2);
+        assert_eq!(
+            page.runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-terminal", "active-child"]
+        );
+        assert!(page.runs.iter().any(|run| run.run_id == "active-child"));
+        assert!(page.runs.iter().all(|run| run.user_id == "u1"));
+        assert!(page.runs.iter().all(|run| run.session_id == "s1"));
+    }
+
+    #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn database_list_user_runs_cursor_seek_paginates_tied_updated_at_on_matrixone() {
         let (store, pool) = setup_database_run_state_store_it().await;
@@ -7378,6 +8460,486 @@ mod tests {
         assert!(third.next_cursor.is_none());
 
         for run_id in &run_ids {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_session_run_snapshot_keeps_active_work_ahead_of_terminal_history() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-tree-user-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-tree-session-{}", Uuid::new_v4());
+        let active_id = format!("runs-it-tree-active-{}", Uuid::new_v4());
+        let newest_terminal_id = format!("runs-it-tree-terminal-new-{}", Uuid::new_v4());
+        let older_terminal_id = format!("runs-it-tree-terminal-old-{}", Uuid::new_v4());
+        let run_ids = [&active_id, &newest_terminal_id, &older_terminal_id];
+
+        for run_id in run_ids {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+        let fixtures = [
+            (&active_id, STATUS_WAITING, "2026-07-11 00:00:01.000000"),
+            (
+                &newest_terminal_id,
+                STATUS_COMPLETED,
+                "2026-07-11 00:00:05.000000",
+            ),
+            (
+                &older_terminal_id,
+                STATUS_FAILED,
+                "2026-07-11 00:00:04.000000",
+            ),
+        ];
+        for (run_id, status, updated_at) in fixtures {
+            let mut run = durable_run_record(run_id);
+            run.user_id = user_id.clone();
+            run.session_id = session_id.clone();
+            run.status = status.into();
+            store.insert_run(run).await.unwrap();
+            sqlx::query("UPDATE agent_runs SET updated_at = ? WHERE user_id = ? AND run_id = ?")
+                .bind(updated_at)
+                .bind(&user_id)
+                .bind(run_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+
+        let page = store
+            .list_session_runs(&user_id, &session_id, 2)
+            .await
+            .unwrap();
+        assert!(page.truncated);
+        assert!(page.runs.iter().any(|run| run.run_id == active_id));
+        assert!(page.runs.iter().any(|run| run.run_id == newest_terminal_id));
+        assert!(!page.runs.iter().any(|run| run.run_id == older_terminal_id));
+
+        for run_id in run_ids {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_agent_recovery_batches_selected_events_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-recovery-user-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-recovery-session-{}", Uuid::new_v4());
+        let root_id = format!("runs-it-recovery-root-{}", Uuid::new_v4());
+        let child_id = format!("runs-it-recovery-child-{}", Uuid::new_v4());
+        for run_id in [&root_id, &child_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+        let mut root = durable_run_record(&root_id);
+        root.user_id = user_id.clone();
+        root.session_id = session_id.clone();
+        store.insert_run(root).await.unwrap();
+        let mut child = durable_run_record(&child_id);
+        child.user_id = user_id.clone();
+        child.session_id = session_id.clone();
+        child.parent_run_id = Some(root_id.clone());
+        child.root_run_id = Some(root_id.clone());
+        child.depth = 1;
+        child.agent_id = Some("reviewer".into());
+        store.insert_run(child).await.unwrap();
+        store
+            .append_events_batch(
+                &user_id,
+                &root_id,
+                &[
+                    serde_json::json!({
+                        "type": "agent_spawned",
+                        "run_id": child_id,
+                        "agent_id": "reviewer",
+                        "agent_type": "code-review",
+                        "description": "review storage",
+                        "fanout_slot": {"group_id":"review","target_count":1,"slot_index":0,"slot_id":"correctness"}
+                    }),
+                    serde_json::json!({"type":"agent_progress","status":"noise"}),
+                ],
+            )
+            .await
+            .unwrap();
+        let noisy_terminal_events = (0..40)
+            .map(|attempt| {
+                serde_json::json!({
+                    "event_type": "run_finished",
+                    "data": {"attempt": attempt, "status": "still-reconciling"}
+                })
+            })
+            .collect::<Vec<_>>();
+        store
+            .append_events_batch(&user_id, &child_id, &noisy_terminal_events)
+            .await
+            .unwrap();
+        let active_page = store
+            .load_session_agent_recovery(&user_id, &session_id, 2)
+            .await
+            .expect("MatrixOne recovery batch query");
+        let root = active_page
+            .runs
+            .iter()
+            .find(|run| run.run_id == root_id)
+            .unwrap();
+        let child = active_page
+            .runs
+            .iter()
+            .find(|run| run.run_id == child_id)
+            .unwrap();
+        assert_eq!(
+            root.events.len(),
+            1,
+            "unneeded progress events stay out of recovery"
+        );
+        assert_eq!(root.events[0]["type"], "agent_spawned");
+        assert_eq!(child.status, STATUS_RUNNING);
+        assert_eq!(
+            child.events.len(),
+            1,
+            "recovery keeps only the latest fact for each terminal event type"
+        );
+        assert_eq!(child.events[0]["data"]["attempt"], 39);
+
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &child_id,
+                    &[STATUS_RUNNING],
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[
+                        serde_json::json!({"event_type":"text_done","data":{"full_text":"durable finding"}}),
+                        serde_json::json!({"event_type":"run_finished","data":{"tool_call_count":3}}),
+                    ],
+                )
+                .await
+                .unwrap()
+        );
+        let completed_page = store
+            .load_session_agent_recovery(&user_id, &session_id, 200)
+            .await
+            .expect("MatrixOne recovery refresh query");
+        let child = completed_page
+            .runs
+            .iter()
+            .find(|run| run.run_id == child_id)
+            .unwrap();
+        assert_eq!(child.status, STATUS_COMPLETED);
+        assert_eq!(child.events.len(), 2);
+        assert_eq!(child.events[0]["event_type"], "text_done");
+        assert_eq!(child.events[1]["event_type"], "run_finished");
+
+        for run_id in [&root_id, &child_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_recovery_claims_are_bounded_disjoint_and_lease_safe_on_matrixone() {
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("rcu-{}", Uuid::new_v4());
+        let prefix = format!("rc-{}", Uuid::new_v4());
+        let recoverable_ids = (0..8)
+            .map(|index| format!("{prefix}-r{index}"))
+            .collect::<Vec<_>>();
+        let live_id = format!("{prefix}-live");
+        let all_ids = recoverable_ids
+            .iter()
+            .chain(std::iter::once(&live_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let fixture_store =
+            DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("runs-it-claim-fixture");
+        for (index, run_id) in all_ids.iter().enumerate() {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+            let mut run = durable_run_record(run_id);
+            run.user_id = user_id.clone();
+            run.session_id = format!("{prefix}-s{index}");
+            fixture_store
+                .insert_run(run)
+                .await
+                .expect("insert claim run");
+        }
+        for (index, run_id) in recoverable_ids.iter().enumerate() {
+            sqlx::query(
+                "UPDATE agent_runs
+                 SET owner_pod_id = 'expired-owner',
+                     owner_lease_expires_at = NOW(6) - INTERVAL 1 SECOND,
+                     updated_at = NOW(6) - INTERVAL ? SECOND
+                 WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(100_i64 - index as i64)
+            .bind(&user_id)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .expect("expire recovery fixture lease");
+        }
+        sqlx::query(
+            "UPDATE agent_runs
+             SET owner_pod_id = 'live-owner',
+                 owner_lease_expires_at = NOW(6) + INTERVAL 60 SECOND
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&live_id)
+        .execute(pool.get())
+        .await
+        .expect("protect live fixture lease");
+
+        let owner_a = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("claim-pod-a");
+        let owner_b = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("claim-pod-b");
+        let (claimed_a, claimed_b) = tokio::join!(
+            owner_a.claim_recoverable_active_runs(4),
+            owner_b.claim_recoverable_active_runs(4)
+        );
+        let claimed_a = claimed_a.expect("pod A recovery claim");
+        let claimed_b = claimed_b.expect("pod B recovery claim");
+        assert!(claimed_a.len() <= 4);
+        assert!(claimed_b.len() <= 4);
+        let ids_a = claimed_a
+            .iter()
+            .map(|run| run.run_id.as_str())
+            .collect::<HashSet<_>>();
+        let ids_b = claimed_b
+            .iter()
+            .map(|run| run.run_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(ids_a.is_disjoint(&ids_b), "pods must claim disjoint runs");
+        assert_eq!(
+            ids_a.len() + ids_b.len(),
+            recoverable_ids.len(),
+            "claim collision retries should distribute the complete bounded working set"
+        );
+        assert!(!ids_a.contains(live_id.as_str()));
+        assert!(!ids_b.contains(live_id.as_str()));
+        assert!(claimed_a.iter().all(|run| {
+            run.owner_pod_id.as_deref() == Some("claim-pod-a") && run.run_generation == 1
+        }));
+        assert!(claimed_b.iter().all(|run| {
+            run.owner_pod_id.as_deref() == Some("claim-pod-b") && run.run_generation == 1
+        }));
+
+        for run_id in &all_ids {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup recovery claim slots");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_interaction_resolution_converges_across_pods_on_matrixone() {
+        let (_, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("riu-{}", Uuid::new_v4());
+        let run_id = format!("rir-{}", Uuid::new_v4());
+        let session_id = format!("ris-{}", Uuid::new_v4());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+
+        let fixture =
+            DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("interaction-owner");
+        let mut run = durable_run_record(&run_id);
+        run.user_id = user_id.clone();
+        run.session_id = session_id;
+        fixture
+            .insert_run(run)
+            .await
+            .expect("insert interaction run");
+        assert!(
+            fixture
+                .update_run_status_with_event_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    STATUS_WAITING,
+                    Some("tool_approval"),
+                    None,
+                    json!({
+                        "event_type": "approval_required",
+                        "data": {
+                            "request_id": "cross-pod-approval",
+                            "tool": "bash",
+                            "approval_kind": "standard"
+                        }
+                    }),
+                )
+                .await
+                .expect("persist approval wait")
+        );
+
+        let pod_a = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("interaction-pod-a");
+        let pod_b = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("interaction-pod-b");
+        let allow = json!({
+            "request_id": "cross-pod-approval",
+            "outcome": "approved",
+            "decision": "allow",
+            "tool": "bash",
+            "approval_kind": "standard"
+        });
+        let deny = json!({
+            "request_id": "cross-pod-approval",
+            "outcome": "denied",
+            "decision": "deny",
+            "reason": "review rejected",
+            "tool": "bash",
+            "approval_kind": "standard"
+        });
+        let (outcome_a, outcome_b) = tokio::join!(
+            pod_a.resolve_run_interaction(
+                &user_id,
+                &run_id,
+                "cross-pod-approval",
+                DurableRunInteractionKind::Approval,
+                allow,
+            ),
+            pod_b.resolve_run_interaction(
+                &user_id,
+                &run_id,
+                "cross-pod-approval",
+                DurableRunInteractionKind::Approval,
+                deny,
+            )
+        );
+        let outcomes = [outcome_a.unwrap(), outcome_b.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    DurableRunInteractionResolveOutcome::Resolved(_)
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    DurableRunInteractionResolveOutcome::Conflict(_)
+                ))
+                .count(),
+            1
+        );
+        let durable = fixture.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        assert_eq!(durable.status, STATUS_RUNNING);
+        assert_eq!(durable.waiting_for, None);
+        assert_eq!(
+            durable
+                .events
+                .iter()
+                .filter(|event| extract_event_type(event) == "approval_resolved")
+                .count(),
+            1
+        );
+        assert!(
+            fixture
+                .load_run_interaction_event(
+                    &user_id,
+                    &run_id,
+                    "cross-pod-approval",
+                    "approval_resolved",
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "a fresh pod must find the canonical terminal interaction by normalized identity"
+        );
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+        sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup interaction slot");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_run_control_projection_batches_deep_lineage_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-control-user-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-control-session-{}", Uuid::new_v4());
+        let root_id = format!("runs-it-control-root-{}", Uuid::new_v4());
+        let child_id = format!("runs-it-control-child-{}", Uuid::new_v4());
+        let grandchild_id = format!("runs-it-control-grandchild-{}", Uuid::new_v4());
+        for run_id in [&root_id, &child_id, &grandchild_id] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+
+        let mut root = durable_run_record(&root_id);
+        root.user_id = user_id.clone();
+        root.session_id = session_id.clone();
+        store.insert_run(root).await.unwrap();
+        let mut child = durable_run_record(&child_id);
+        child.user_id = user_id.clone();
+        child.session_id = session_id.clone();
+        child.parent_run_id = Some(root_id.clone());
+        child.root_run_id = Some(root_id.clone());
+        child.ancestor_path = Some(format!("{root_id}/{child_id}"));
+        child.depth = 1;
+        store.insert_run(child).await.unwrap();
+        let mut grandchild = durable_run_record(&grandchild_id);
+        grandchild.user_id = user_id.clone();
+        grandchild.session_id = session_id;
+        grandchild.parent_run_id = Some(child_id.clone());
+        grandchild.root_run_id = Some(root_id.clone());
+        grandchild.ancestor_path = Some(format!("{root_id}/{child_id}/{grandchild_id}"));
+        grandchild.depth = 2;
+        store.insert_run(grandchild).await.unwrap();
+        store
+            .append_events_batch(
+                &user_id,
+                &grandchild_id,
+                &(0..32)
+                    .map(
+                        |idx| serde_json::json!({"event_type":"agent_progress","data":{"idx":idx}}),
+                    )
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+
+        store
+            .update_run_status(&user_id, &root_id, STATUS_PAUSED, Some("user_resume"), None)
+            .await
+            .unwrap();
+        let target = store
+            .load_run_control(&user_id, &grandchild_id)
+            .await
+            .unwrap()
+            .expect("grandchild control projection");
+        assert_eq!(target.parent_run_id.as_deref(), Some(child_id.as_str()));
+        let expected_path = format!("{root_id}/{child_id}/{grandchild_id}");
+        assert_eq!(
+            target.ancestor_path.as_deref(),
+            Some(expected_path.as_str())
+        );
+        let ancestors = store
+            .load_run_controls(&user_id, &[root_id.clone(), child_id.clone()])
+            .await
+            .unwrap();
+        assert_eq!(ancestors.len(), 2);
+        assert!(
+            ancestors
+                .iter()
+                .any(|run| { run.run_id == root_id && run.status == STATUS_PAUSED })
+        );
+        assert!(
+            ancestors
+                .iter()
+                .any(|run| { run.run_id == child_id && run.status == STATUS_RUNNING })
+        );
+
+        for run_id in [&root_id, &child_id, &grandchild_id] {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
         }
     }
@@ -7714,6 +9276,30 @@ mod tests {
                 },
             ),
             (
+                "agent_communication",
+                make_event(
+                    "agent_communication",
+                    json!({
+                        "schema_version": "astra.agent_communication.v1",
+                        "observed_by": {"run_id": "run-review", "agent_id": "reviewer"},
+                        "direction": "received",
+                        "message_id": "msg-1",
+                        "from": {"run_id": "run-code", "agent_id": "coder"},
+                        "to": {"kind": "direct", "address": {"run_id": "run-review", "agent_id": "reviewer"}},
+                        "payload_kind": "text",
+                        "summary": "review this",
+                        "timestamp_ms": 42,
+                        "requires_ack": false
+                    }),
+                ),
+                &|o| {
+                    assert_eq!(o["type"], "agent_communication");
+                    assert_eq!(o["observed_by"]["run_id"], "run-review");
+                    assert_eq!(o["from"]["agent_id"], "coder");
+                    assert_eq!(o["summary"], "review this");
+                },
+            ),
+            (
                 "agent_waiting",
                 make_event(
                     "agent_waiting",
@@ -7796,6 +9382,25 @@ mod tests {
                 &|o| {
                     assert_eq!(o["type"], "text_delta");
                     assert_eq!(o["content"], "hello");
+                },
+            ),
+            (
+                "shaped user_intent_applied pass-through",
+                json!({
+                    "type": "user_intent_applied",
+                    "intent_id": "input-7",
+                    "delivery": "guide_current_run",
+                    "status": "applied",
+                    "event_index": 7,
+                    "content": "change course",
+                }),
+                &|o| {
+                    assert_eq!(o["type"], "user_intent_applied");
+                    assert_eq!(o["intent_id"], "input-7");
+                    assert_eq!(o["delivery"], "guide_current_run");
+                    assert_eq!(o["status"], "applied");
+                    assert_eq!(o["event_index"], 7);
+                    assert_eq!(o["content"], "change course");
                 },
             ),
             (
@@ -8279,6 +9884,103 @@ mod tests {
         assert_eq!(loaded.events[1]["event_type"], "tool_result");
         assert_eq!(loaded.events[2]["event_type"], "text_delta");
         assert_eq!(loaded.last_event_idx, 2);
+    }
+
+    #[tokio::test]
+    async fn run_interaction_resolution_is_atomic_idempotent_and_conflict_safe() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("interaction-resolution"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .update_run_status_with_event_if_current(
+                    "u1",
+                    "interaction-resolution",
+                    &[STATUS_RUNNING],
+                    STATUS_WAITING,
+                    Some("tool_approval"),
+                    None,
+                    json!({
+                        "event_type": "approval_required",
+                        "data": {
+                            "request_id": "approval-1",
+                            "tool": "bash",
+                            "approval_kind": "standard"
+                        }
+                    }),
+                )
+                .await
+                .unwrap()
+        );
+        let approved = json!({
+            "request_id": "approval-1",
+            "outcome": "approved",
+            "decision": "allow",
+            "tool": "bash",
+            "approval_kind": "standard"
+        });
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    "u1",
+                    "interaction-resolution",
+                    "approval-1",
+                    DurableRunInteractionKind::Approval,
+                    approved.clone(),
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Resolved(_)
+        ));
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    "u1",
+                    "interaction-resolution",
+                    "approval-1",
+                    DurableRunInteractionKind::Approval,
+                    approved,
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Idempotent(_)
+        ));
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    "u1",
+                    "interaction-resolution",
+                    "approval-1",
+                    DurableRunInteractionKind::Approval,
+                    json!({
+                        "request_id": "approval-1",
+                        "outcome": "denied",
+                        "decision": "deny",
+                        "tool": "bash",
+                        "approval_kind": "standard"
+                    }),
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Conflict(_)
+        ));
+        let run = store
+            .load_run("u1", "interaction-resolution")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_RUNNING);
+        assert_eq!(run.waiting_for, None);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| extract_event_type(event) == "approval_resolved")
+                .count(),
+            1
+        );
+        assert_eq!(run.events.last().unwrap()["event_type"], "run_resumed");
     }
 
     #[tokio::test]
@@ -9072,6 +10774,80 @@ mod tests {
         for (i, (be, se)) in batch.events.iter().zip(seq.events.iter()).enumerate() {
             assert_eq!(be, se, "event {i} differs between batch and sequential");
         }
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_append_enforces_idempotency_keys() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("idempotent-append"))
+            .await
+            .unwrap();
+        let event = json!({
+            "event_type": "user_intent_applied",
+            "idempotency_key": "user_intent_applied:intent-1",
+            "data": {"intent_id": "intent-1", "event_index": 1}
+        });
+
+        let (first, second) = tokio::join!(
+            store.append_event("u1", "idempotent-append", event.clone()),
+            store.append_event("u1", "idempotent-append", event),
+        );
+        first.unwrap();
+        second.unwrap();
+
+        let run = store
+            .load_run("u1", "idempotent-append")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.events.len(), 1);
+        assert_eq!(run.last_event_idx, 0);
+    }
+
+    #[tokio::test]
+    async fn in_memory_same_state_transition_reports_duplicate_event_conflict() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("idempotent-transition"))
+            .await
+            .unwrap();
+        let event = json!({
+            "event_type": "user_intent",
+            "idempotency_key": "user_intent:intent-1",
+            "data": {"intent_id": "intent-1"}
+        });
+
+        let (first, second) = tokio::join!(
+            store.update_run_status_with_events_if_current(
+                "u1",
+                "idempotent-transition",
+                &["running"],
+                "running",
+                None,
+                None,
+                std::slice::from_ref(&event),
+            ),
+            store.update_run_status_with_events_if_current(
+                "u1",
+                "idempotent-transition",
+                &["running"],
+                "running",
+                None,
+                None,
+                std::slice::from_ref(&event),
+            ),
+        );
+        let mut outcomes = [first.unwrap(), second.unwrap()];
+        outcomes.sort_unstable();
+        assert_eq!(outcomes, [false, true]);
+
+        let run = store
+            .load_run("u1", "idempotent-transition")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.events.len(), 1);
     }
 }
 

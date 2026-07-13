@@ -106,28 +106,13 @@ pub(crate) fn parse_mcp_command(arg: &str) -> ParsedMcpCommand<'_> {
 ///   `("inspect github:list_prs",  "github · list_prs")`
 ///   `("tools github",             "Tools on github")`
 ///   `("ping github",              "Ping github")`
-///   `("remove github",            "Remove github server")`
+///
+/// This feeds the interactive workbench, so it only lists operations that
+/// the TUI can actually carry out. Headless-only configuration mutations are
+/// intentionally absent instead of leading users into an unavailable action.
 pub(crate) fn build_mcp_extra_subcommands(manager: &McpClientManager) -> Vec<(String, String)> {
-    let mut items: Vec<(String, String)> = Vec::new();
-
     let servers: Vec<&str> = manager.connected_servers();
-    if servers.is_empty() {
-        return items;
-    }
-
-    // Per-server: tools <server>, ping <server>, remove <server>
-    for server in &servers {
-        items.push((format!("tools {server}"), format!("Tools on {server}")));
-        items.push((format!("ping {server}"), format!("Ping {server}")));
-        items.push((
-            format!("remove {server}"),
-            format!("Remove {server} server"),
-        ));
-        items.push((
-            format!("log-level {server}"),
-            format!("Set log level for {server}"),
-        ));
-    }
+    let mut items = workbench_server_completions(servers);
 
     // Per tool: inspect <server>:<tool>
     for (server, tool) in manager.all_tools() {
@@ -137,6 +122,17 @@ pub(crate) fn build_mcp_extra_subcommands(manager: &McpClientManager) -> Vec<(St
         ));
     }
 
+    items
+}
+
+fn workbench_server_completions<'a>(
+    servers: impl IntoIterator<Item = &'a str>,
+) -> Vec<(String, String)> {
+    let mut items = Vec::new();
+    for server in servers {
+        items.push((format!("tools {server}"), format!("Tools on {server}")));
+        items.push((format!("ping {server}"), format!("Ping {server}")));
+    }
     items
 }
 
@@ -1720,7 +1716,10 @@ async fn handle_mcp_ping(server: Option<&str>, state: &SessionState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedMcpCommand, extract_prompt_message_text, format_state, parse_mcp_command};
+    use super::{
+        ParsedMcpCommand, extract_prompt_message_text, format_state, parse_mcp_command,
+        workbench_server_completions,
+    };
     use crate::cli::slash::slash_agent::format_duration;
     use crate::mcp_client::ConnectionState;
 
@@ -1754,6 +1753,21 @@ mod tests {
         assert_eq!(
             parse_mcp_command("resource github:file:///README.md"),
             ParsedMcpCommand::Read(Some("github:file:///README.md"))
+        );
+    }
+
+    #[test]
+    fn workbench_completions_only_offer_supported_server_actions() {
+        let entries = workbench_server_completions(["github"]);
+        let names = entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["tools github", "ping github"]);
+        assert!(
+            !names
+                .iter()
+                .any(|name| matches!(*name, "remove github" | "log-level github"))
         );
     }
 

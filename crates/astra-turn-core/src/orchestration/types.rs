@@ -190,9 +190,14 @@ pub struct SpawnedAgentInfo {
     pub description: String,
     pub status: AgentStatus,
     pub started_at: SystemTime,
+    pub ended_at: Option<SystemTime>,
     pub metrics: SpawnedAgentMetrics,
     pub has_permission_issues: bool,
     pub run_in_background: bool,
+    /// Parent tool-call identity that launched this run. This is the typed
+    /// reconciliation key between a provisional control row and the child
+    /// runtime identity published after admission.
+    pub spawn_tool_call_id: Option<String>,
     pub fanout_slot: Option<AgentFanoutSlotIdentity>,
 }
 
@@ -216,8 +221,8 @@ mod tests {
         assert!(agent_completion_is_interrupted(Some("empty_completion")));
         assert!(agent_completion_is_interrupted(Some("stream_transport")));
         assert!(agent_completion_is_interrupted(Some("executor_dropped")));
-        assert!(agent_completion_is_interrupted(Some(
-            crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON
+        assert!(!agent_completion_is_interrupted(Some(
+            crate::response_guard::RESPONSE_GUARD_REDACTED_FINISH_REASON
         )));
         assert!(
             !agent_completion_is_interrupted(Some("completed_with_warnings")),
@@ -258,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn fanout_projection_treats_known_interrupted_completion_as_failed() {
+    fn fanout_projection_only_fails_known_interrupted_completions() {
         let completed = AgentStatus::Completed {
             result: "done".to_string(),
             finish_reason: Some("normal".to_string()),
@@ -290,18 +295,15 @@ mod tests {
         );
         assert!(projection.terminal_reason.is_none());
 
-        let guarded = AgentStatus::Completed {
+        let safety_redacted = AgentStatus::Completed {
             result: "guarded fallback text is data, not protocol".to_string(),
             finish_reason: Some(
-                crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON.to_string(),
+                crate::response_guard::RESPONSE_GUARD_REDACTED_FINISH_REASON.to_string(),
             ),
         };
-        let projection = project_agent_status_to_fanout_slot(&guarded);
-        assert_eq!(projection.status, AgentFanoutSlotStatus::Failed);
-        assert_eq!(
-            projection.terminal_reason.as_deref(),
-            Some(crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON)
-        );
+        let projection = project_agent_status_to_fanout_slot(&safety_redacted);
+        assert_eq!(projection.status, AgentFanoutSlotStatus::Completed);
+        assert!(projection.terminal_reason.is_none());
     }
 
     #[test]

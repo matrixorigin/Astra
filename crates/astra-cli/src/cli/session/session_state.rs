@@ -360,6 +360,10 @@ pub(crate) struct SessionState {
     pub last_delivery_report: Option<astra_services::durable_task::TaskDeliveryReport>,
     /// Last terminal error from the plan executor, used for prompt/TUI recovery messaging.
     pub plan_execution_last_error: Option<String>,
+    /// The current plan attempt reached an explicit resumable pause boundary.
+    /// This distinguishes a normal pause from an executor that vanished
+    /// without a terminal lifecycle event.
+    pub plan_execution_paused: bool,
     /// Stacked operator notes while plan execution is paused (`correct` / `note` at ⏸>).
     pub plan_execution_corrections: Vec<String>,
     /// Delegation engine for multi-agent coordination.
@@ -510,9 +514,7 @@ pub(crate) struct SessionState {
     /// release user input after the next tool-call boundary.
     pub active_turn_local_run_control: std::sync::Arc<
         std::sync::Mutex<
-            Option<
-                std::sync::Arc<crate::cli::turn::local_run_control::LocalDeferredInputRunControl>,
-            >,
+            Option<std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>>,
         >,
     >,
     /// When set, tool approval requests are sent through this channel
@@ -660,6 +662,7 @@ impl Default for SessionState {
             durable_task_state: None,
             last_delivery_report: None,
             plan_execution_last_error: None,
+            plan_execution_paused: false,
             plan_execution_corrections: Vec::new(),
             delegation_engine: None,
             team_registry: slash_team::TeamRegistry::new(),
@@ -821,6 +824,7 @@ impl SessionState {
         self.durable_task_state = None;
         self.last_delivery_report = None;
         self.plan_execution_last_error = None;
+        self.plan_execution_paused = false;
         self.plan_execution_corrections.clear();
         self.plan_handle = None;
         self.pending_approval = None;

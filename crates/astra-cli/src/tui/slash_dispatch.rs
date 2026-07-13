@@ -1,28 +1,110 @@
 //! TUI-native slash command dispatch.
 //!
-//! Each command is handled inline without leaving the TUI. Commands that
-//! need complex interactive UI push a BottomPaneView. Commands that only
-//! produce output render to scrollback. Unrecognized or complex commands
-//! fall back to `with_restored()` which temporarily exits the TUI.
+//! Each command is handled inline without leaving the TUI. Commands that need
+//! complex interactive UI push a `BottomPaneView`; commands that only produce
+//! output render to scrollback. The dispatcher never swaps to a second
+//! terminal UI to complete an action.
 
 use crate::cli::command_registry;
-use crate::cli::command_registry::TuiHandler;
 use crate::cli::session::session_state::ExplainMode;
 use crate::cli::session::session_state::SessionState;
 use crate::tui::bottom_pane::BottomPane;
 use crate::tui::bottom_pane::list_selection_view::{ListSelectionView, SelectionItem};
-use crate::tui::bottom_pane::view::BottomPaneView;
+use crate::tui::bottom_pane::view::{
+    BottomPaneView, ProjectInstructionsAction, StatsPanel, ViewResult,
+};
 use crate::tui::history_cell::system::SystemCell;
 use crate::tui::terminal::TerminalGuard;
 
 pub(crate) enum SlashResult {
     Handled,
     Deferred,
+    /// Open the canonical root transcript workspace. The event loop owns the
+    /// durable/local source selection because it also owns session binding,
+    /// live suffix refresh and asynchronous page loading.
+    OpenRootTranscript {
+        session_id: Option<String>,
+    },
+    OpenBackgroundTasks,
+    BackgroundRead(Box<SlashBackgroundRead>),
     Exit,
-    Fallback,
-    /// Forward the raw slash command text to the chat composer for the user
-    /// to review and send as a normal message (ChatForward handler).
-    Forward(String),
+}
+
+impl SlashResult {
+    fn background_read(action: SlashBackgroundRead) -> Self {
+        Self::BackgroundRead(Box::new(action))
+    }
+}
+
+/// A read-only workbench action whose I/O is owned by the event loop rather
+/// than the slash dispatcher. These actions have no mutable session effect,
+/// so they can complete after the user keeps composing without borrowing UI
+/// state across a filesystem or process wait.
+pub(crate) enum SlashBackgroundRead {
+    Worktrees,
+    Timeline {
+        session_id: String,
+    },
+    ResumePicker,
+    ForkPicker,
+    SessionHub {
+        snapshot: Box<SessionHubSnapshot>,
+    },
+    SessionAnalysis {
+        session_id: String,
+    },
+    Reflection {
+        session_id: String,
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        token: Option<String>,
+        args: String,
+    },
+    Memory(MemoryReadRequest),
+    Mcp {
+        manager: McpManagerHandle,
+        action: McpReadAction,
+    },
+    Context {
+        breakdown: Box<crate::tui::context_panel::ContextBreakdown>,
+        session_id: Option<String>,
+        journal_dir_override: Option<std::path::PathBuf>,
+    },
+}
+
+/// Immutable request captured when a read-only memory surface is submitted.
+/// Authentication, local artifact reads and remote retrieval happen in the
+/// background worker; the event loop only projects a typed completion.
+pub(crate) enum MemoryReadRequest {
+    Health,
+    Session {
+        session_id: String,
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+    },
+    Search {
+        api: astra_thin_client::ThinClient,
+        profile: Option<String>,
+        query: String,
+        top_k: usize,
+        stats_view: bool,
+    },
+}
+
+/// Read-only MCP surface requested from the workbench. Parsing happens while
+/// the user submits the command; the manager lock and any provider I/O belong
+/// to the background worker.
+pub(crate) enum McpReadAction {
+    Help,
+    Overview,
+    Servers,
+    Tools(Option<String>),
+    Prompts,
+    Resources,
+    Read(String),
+    History,
+    Inspect(String),
+    Ping(Option<String>),
 }
 
 /// Context needed by slash dispatch — avoids passing 8+ loose arguments.
@@ -42,10 +124,9 @@ impl<'a> DispatchContext<'a> {
     /// NOT for command acknowledgements — those should visually pair
     /// with the `› /cmd` prompt above them; see `show_response`.
     ///
-    /// Routed through `ChatWidget::commit_system` so the line lands
-    /// in both the on-screen scrollback AND the JSONL transcript —
-    /// resume will surface it, Ctrl+O will include it, the model's
-    /// next turn will see it in history.
+    /// Routed through `ChatWidget::commit_system` so the line lands in
+    /// scrollback and the durable workbench transcript. Prompt continuation
+    /// deliberately excludes these local UI/control events.
     fn show_info(&mut self, msg: String) {
         self.chat_widget.commit_system(SystemCell::info(msg));
     }
@@ -85,14 +166,14 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 // the top-3 closest known commands as a "did you mean?" hint.
                 // Keeps the suggestion UX aligned with the slash popup.
                 let needle = cmd.trim_start_matches('/');
-                let mut scored: Vec<(u32, &'static str)> = crate::cli::command_registry::COMMANDS
-                    .iter()
-                    .filter(|m| !m.is_alias && !m.name.contains(' '))
-                    .filter_map(|m| {
-                        let name = m.name.trim_start_matches('/');
-                        crate::tui::score_slash_token(needle, name).map(|s| (s, m.name))
-                    })
-                    .collect();
+                let mut scored: Vec<(u32, &'static str)> =
+                    crate::cli::command_registry::tui_commands()
+                        .filter(|m| !m.name.contains(' '))
+                        .filter_map(|m| {
+                            let name = m.name.trim_start_matches('/');
+                            crate::tui::score_slash_token(needle, name).map(|s| (s, m.name))
+                        })
+                        .collect();
                 scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
                 let hints: Vec<&'static str> = scored.into_iter().take(3).map(|(_, n)| n).collect();
                 if hints.is_empty() {
@@ -115,16 +196,42 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
     };
 
+    if let Some(meta) = command_registry::resolve_command_meta(resolved)
+        && !meta.is_available_in_tui()
+    {
+        ctx.show_error(format!(
+            "`{resolved}` is not available in the workbench. Type `/` to browse actions that preserve this session."
+        ));
+        return SlashResult::Handled;
+    }
+
     match resolved {
         // ── Exit ────────────────────────────────────────────────────
-        "/exit" | "/quit" => SlashResult::Exit,
+        "/exit" => SlashResult::Exit,
 
         // ── Help ────────────────────────────────────────────────────
-        "/help" | "/commands" => {
-            use crate::tui::bottom_pane::help_view::HelpView;
-            ctx.open_view("Opened command help", Box::new(HelpView::new()));
-            SlashResult::Handled
-        }
+        "/help" => match help_command_route(args) {
+            HelpCommandRoute::Commands => {
+                use crate::tui::bottom_pane::help_view::HelpView;
+                ctx.open_view("Opened command help", Box::new(HelpView::new()));
+                SlashResult::Handled
+            }
+            HelpCommandRoute::Keys => {
+                use crate::tui::bottom_pane::info_view::InfoView;
+                ctx.open_view(
+                    "Opened keyboard shortcuts",
+                    Box::new(InfoView::from_key_value(
+                        "Keyboard shortcuts",
+                        keyboard_shortcut_pairs(),
+                    )),
+                );
+                SlashResult::Handled
+            }
+            HelpCommandRoute::Unsupported => {
+                ctx.show_error("Usage: /help [keys]".into());
+                SlashResult::Handled
+            }
+        },
 
         // ── Auth forms (inline TUI card instead of dropping out to
         //    bare-terminal prompts that looked disjoint and stole keys) ─
@@ -172,12 +279,45 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             }
         }
 
-        "/mcp" => handle_mcp_dispatch(args, ctx).await,
+        "/mcp" => handle_mcp_dispatch(args, ctx),
+
+        "/task" if matches!(args.trim(), "" | "list") => {
+            ctx.show_response("Opened background work".to_string());
+            SlashResult::OpenBackgroundTasks
+        }
+
+        "/task" => {
+            ctx.show_error("Usage: /task — opens background work".to_string());
+            SlashResult::Handled
+        }
+
+        "/agent" if matches!(args.trim(), "" | "list") => {
+            if crate::tui::agent_view::open_agents_view(ctx.chat_widget, ctx.bottom_pane) {
+                ctx.show_response("Opened agent monitor".to_string());
+            } else {
+                ctx.show_info(
+                    "No agent runs yet. Active and recent delegated work will appear here."
+                        .to_string(),
+                );
+            }
+            SlashResult::Handled
+        }
+
+        "/agent" => {
+            ctx.show_error(
+                "Usage: /agent [list] — select an agent in the workbench to inspect, guide, pause, resume, or stop it."
+                    .to_string(),
+            );
+            SlashResult::Handled
+        }
 
         "/plan" => {
             let trimmed = args.trim();
             if !trimmed.is_empty() {
-                return SlashResult::Fallback;
+                ctx.show_error(
+                    "Usage: /plan — then describe the plan in the composer.".to_string(),
+                );
+                return SlashResult::Handled;
             }
 
             crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(ctx.state);
@@ -251,36 +391,41 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     is_current: false,
                 },
             ];
-            let view = ListSelectionView::new(items, Some("Stats — choose a view:".into()));
+            let view = ListSelectionView::new(items, Some("Stats — choose a view:".into()))
+                .with_results(vec![
+                    ViewResult::Stats(StatsPanel::Overview),
+                    ViewResult::Stats(StatsPanel::History),
+                    ViewResult::Stats(StatsPanel::Tools),
+                    ViewResult::Stats(StatsPanel::Cost),
+                    ViewResult::Stats(StatsPanel::Health),
+                    ViewResult::Stats(StatsPanel::Learn),
+                ]);
             ctx.open_view("Opened stats picker", Box::new(view));
             SlashResult::Handled
         }
 
         // ── Skills ──────────────────────────────────────────────────
-        "/skill" | "/skills" => {
-            let skill_count = ctx
-                .state
-                .unified_skill_registry
-                .all_manifests()
-                .iter()
-                .filter(|m| m.user_invocable)
-                .count();
-            let items = vec![
-                SelectionItem {
-                    name: "List skills".into(),
-                    description: Some(format!(
-                        "Tip: press $ to open this list directly. ({skill_count} skills)"
-                    )),
-                    is_current: false,
-                },
-                SelectionItem {
-                    name: "Skill info".into(),
-                    description: Some("Show details of a specific skill".into()),
-                    is_current: false,
-                },
-            ];
-            let view = ListSelectionView::new(items, Some("Skills — choose an action:".into()));
-            ctx.open_view("Opened skills picker", Box::new(view));
+        "/skill" => {
+            match skill_command_route(args) {
+                SkillCommandRoute::Browse => {
+                    let skill_count = ctx
+                        .state
+                        .unified_skill_registry
+                        .all_manifests()
+                        .iter()
+                        .filter(|manifest| manifest.user_invocable)
+                        .count();
+                    ctx.bottom_pane.composer.set_text("$");
+                    ctx.bottom_pane.sync_popups();
+                    ctx.show_response(format!(
+                        "Opened skills · {skill_count} available · type to filter"
+                    ));
+                }
+                SkillCommandRoute::Unsupported => ctx.show_error(
+                    "This skill action has no workbench flow. Available here: `/skill` or `$` to browse and activate a skill."
+                        .to_string(),
+                ),
+            }
             SlashResult::Handled
         }
 
@@ -291,7 +436,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             };
 
             match parse_permission_command(args) {
-                PermissionCommandAction::Cycle => {
+                PermissionCommandAction::ChooseMode => {
                     ctx.open_view(
                         "Opened permission mode picker",
                         Box::new(build_permission_mode_picker(ctx.state.perm_manager.mode())),
@@ -299,11 +444,18 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     SlashResult::Handled
                 }
                 PermissionCommandAction::SetMode(mode) => {
-                    ctx.state.perm_manager.set_mode(mode);
-                    crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(
-                        ctx.state,
-                    );
-                    ctx.show_response(permission_mode_feedback(mode));
+                    if permission_mode_requires_confirmation(mode) {
+                        ctx.open_view(
+                            "Confirm Bypass permission mode",
+                            Box::new(build_permission_mode_confirmation(mode)),
+                        );
+                    } else {
+                        ctx.state.perm_manager.set_mode(mode);
+                        crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(
+                            ctx.state,
+                        );
+                        ctx.show_response(permission_mode_feedback(mode));
+                    }
                     SlashResult::Handled
                 }
                 PermissionCommandAction::ShowRules => {
@@ -352,7 +504,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     } else {
                         format!("{}\n", lines.join("\n"))
                     };
-                    match std::fs::write(path, body) {
+                    match tokio::fs::write(path, body).await {
                         Ok(()) => ctx.show_response(format!("Permission trace exported to {path}")),
                         Err(err) => {
                             ctx.show_error(format!("Failed to export permission trace: {err}"));
@@ -374,7 +526,36 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
 
         // ── State commands → with_restored (share full logic with non-TUI) ──
-        "/clear" | "/undo" | "/redo" | "/compact" | "/reflect" => SlashResult::Fallback,
+        "/clear" => {
+            if !args.trim().is_empty() {
+                ctx.show_error("Usage: /clear".into());
+                return SlashResult::Handled;
+            }
+            let Some(token) =
+                crate::cli::session::session_runtime::fresh_access_token(ctx.api, ctx.profile)
+                    .await
+            else {
+                ctx.show_error("Not logged in. Use /login.".into());
+                return SlashResult::Handled;
+            };
+            match crate::cli::slash::slash_state::start_fresh_session(
+                ctx.api,
+                ctx.profile,
+                &token,
+                ctx.state,
+            )
+            .await
+            {
+                Ok(session_id) => {
+                    ctx.show_response(format!("Started new session {session_id}"));
+                    SlashResult::Handled
+                }
+                Err(error) => {
+                    ctx.show_error(format!("Could not start a new session: {error}"));
+                    SlashResult::Handled
+                }
+            }
+        }
 
         // ── Explain ─────────────────────────────────────────────────
         "/explain" => {
@@ -392,23 +573,19 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
+        // ── Reflect (TUI-native) ───────────────────────────────────
+        //
+        // Reflection is a read-only evidence surface. It shares the exact
+        // local-first/server-fallback operation with line mode, then presents
+        // its provenance and proposals in a scrollable workbench panel.
+        "/reflect" => handle_reflect_dispatch(args, ctx),
+
         // ── Inspect (TUI-native) ────────────────────────────────────
         //
-        // Routes to the harness snapshot for session introspection.
-        //   `/inspect`                → subcommand picker
-        //   `/inspect budget`         → token budget breakdown
-        //   `/inspect tools`          → tool call dashboard
-        //   `/inspect context`        → context window snapshot
-        //   `/inspect cache`          → per-round cache diagnosis
-        //   `/inspect json`           → raw snapshot as JSON
-        //   `/inspect diff`           → state diff vs start-of-session
-        //   `/inspect history [N]`    → recent turn history
-        //   `/inspect trace`          → permission trace
-        //   `/inspect forensics`      → forensics dump
-        //   `/inspect export [path]`  → export to file
-        "/inspect" => {
-            return handle_inspect_dispatch(args, ctx).await;
-        }
+        // `/inspect` opens the current runtime snapshot in the same panel
+        // system as the rest of the workbench. Focused facets belong in that
+        // inspector rather than being a second, text-only command surface.
+        "/inspect" => handle_inspect_dispatch(args, ctx),
 
         // ── Context panel (TUI-native) ──────────────────────────────
         //
@@ -430,22 +607,18 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Handled;
             }
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
-            use crate::tui::context_panel::model::{ActiveSkill, SessionSummary};
-            use crate::tui::context_panel::{ContextBreakdown, ContextSnapshot};
+            use crate::tui::context_panel::ContextSnapshot;
+            use crate::tui::context_panel::model::{
+                ActiveSkill, RequestContextEvidence, RequestContextScope, SessionSummary,
+            };
 
-            // Collect human-readable previews the trace doesn't
-            // carry: per-turn transcript snippets (from the chat
-            // widget's history) and process-state bits for the
-            // System-prompt sub-rows (model id, cwd, git branch,
-            // user-rules path).  The panel renders these under the
-            // count rows when the user expands a section.
+            // Collect human-readable previews the trace doesn't carry:
+            // per-turn transcript snippets and already-observed process
+            // state. Slash dispatch runs on the UI event path, so it must
+            // not probe the filesystem or walk a git repository here.
             let mut snap = ContextSnapshot::default();
             snap.model = ctx.state.model.as_deref();
-            if let Ok(cwd) = std::env::current_dir() {
-                snap.cwd = Some(display_path(&cwd));
-            }
-            snap.git_branch = detect_git_branch();
-            snap.user_rules_path = find_user_rules_path();
+            (snap.cwd, snap.git_branch) = context_environment_from_footer(&ctx.bottom_pane.footer);
 
             // Loaded system skills.  Surfaced as a Skills-section
             // fallback when the trace is silent (common for CLI
@@ -478,50 +651,53 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 completion_tokens: ctx.state.total_completion_tokens,
                 cache_read_tokens: ctx.state.total_cache_read_tokens,
                 cache_creation_tokens: ctx.state.total_cache_creation_tokens,
+                request_context: ctx.bottom_pane.footer.context_window.map(|usage| {
+                    let scope = if ctx.bottom_pane.footer.context_window_is_previous() {
+                        RequestContextScope::PreviousRequestWhileAssembling
+                    } else if ctx.bottom_pane.footer.is_turn_active {
+                        RequestContextScope::CurrentRequest
+                    } else {
+                        RequestContextScope::LastCompletedRequest
+                    };
+                    RequestContextEvidence { usage, scope }
+                }),
                 continuation_anchor: ctx.state.continuation_anchor.clone(),
                 queued_message: ctx.state.queued_message.clone(),
                 diagnostics_context: ctx.state.diagnostics_context.clone(),
+                read_activity: Default::default(),
             });
 
-            // Walk the committed history cells and pair them with
-            // the trace's turn indices.  We use the cell ordering
-            // (user/assistant pairs) as a rough proxy — the trace
-            // doesn't emit a stable cell→turn_index mapping today,
-            // so we populate by position.  Each turn contributes a
-            // one-line preview for the collapsed view plus the
-            // full body text for the drill-in view.
-            let (previews, bodies) = collect_history_text(ctx.chat_widget);
-            snap.history_previews = previews;
-            snap.history_bodies = bodies;
+            // Local transcript cells and prompt-history trace records have
+            // distinct identities. Keep the local list as an explicitly
+            // labelled fallback for trace-less sessions; never pair the two
+            // merely because their ordinal positions happen to match.
+            snap.visible_conversation = collect_visible_conversation(ctx.chat_widget);
 
-            let breakdown = match ctx.state.observability_session.as_ref() {
-                Some(session) => {
-                    let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-                    // Pull session-level compaction history into the
-                    // snapshot so the Compaction section can show all
-                    // past events, not just the last-turn trace.
-                    snap.compressed_turns = guard.compressed_turns.clone();
-                    match guard.context_traces.last() {
-                        // Use the full assembly trace so the panel
-                        // can render the nested tool / memory /
-                        // skill / section rows under the top-level
-                        // category bar. Old code only passed the
-                        // scalar TokenBudgetTrace which lost that
-                        // detail.
-                        Some(trace) => ContextBreakdown::from_trace_with(trace, &snap),
-                        None => ContextBreakdown::empty(),
-                    }
-                }
-                None => ContextBreakdown::empty(),
-            };
-            ctx.open_view(
-                "Opened context panel",
-                Box::new(ContextPanelView::new(breakdown)),
-            );
-            SlashResult::Handled
+            let breakdown = context_breakdown_for_panel(ctx.state, &mut snap);
+            let session_id = ctx
+                .state
+                .session_id
+                .as_deref()
+                .filter(|session_id| !session_id.is_empty())
+                .map(str::to_owned);
+            if session_id.is_some() {
+                ctx.show_response("Loading context diagnostics".to_string());
+                SlashResult::background_read(SlashBackgroundRead::Context {
+                    breakdown: Box::new(breakdown),
+                    session_id,
+                    journal_dir_override:
+                        astra_services::session_journal::current_journal_dir_override(),
+                })
+            } else {
+                ctx.open_view(
+                    "Opened context panel",
+                    Box::new(ContextPanelView::new(breakdown)),
+                );
+                SlashResult::Handled
+            }
         }
 
-        // ── /config (panel for edit, text fallback for read-only forms) ──
+        // ── /config (the workbench editor) ────────────────────────────
         "/config" => match config_command_route(args) {
             Ok(ConfigCommandRoute::Panel) => {
                 use crate::tui::bottom_pane::config_edit_view::ConfigEditView;
@@ -529,207 +705,58 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ctx.open_view("Opened config editor", Box::new(ConfigEditView::new(cfg)));
                 SlashResult::Handled
             }
-            Ok(ConfigCommandRoute::Fallback) => SlashResult::Fallback,
+            Ok(ConfigCommandRoute::Unsupported) => {
+                ctx.show_error(
+                    "This config form has no workbench action. Use `/config` to edit runtime configuration."
+                        .to_string(),
+                );
+                SlashResult::Handled
+            }
             Err(usage) => {
                 ctx.show_error(usage.to_string());
                 SlashResult::Handled
             }
         },
 
-        // ── SQL table view (TUI-native, astra-unique) ───────────────
-        //
-        // Runs a SQL query against MatrixOne via the existing `mo_query`
-        // tool, parses the mysql-client ASCII output, and renders it as
-        // a navigable ratatui table. Read-only-by-default: the safety
-        // guard in mo_query blocks DROP/DELETE/TRUNCATE/ALTER without
-        // an explicit flag, and we don't expose that flag here.
-        "/table" => {
-            if args.trim().is_empty() {
-                ctx.show_info(
-                    "Usage: /table <sql>\nExample: /table SELECT * FROM users LIMIT 20".into(),
-                );
-                return SlashResult::Handled;
-            }
-            // Paint a BusyView over the bottom pane so the user sees
-            // *something* while the SQL runs. We force an immediate
-            // draw because nothing else will redraw until the
-            // spawn_blocking future resolves.
-            use crate::tui::bottom_pane::busy_view::BusyView;
-            ctx.bottom_pane.push_view(Box::new(
-                BusyView::new("Running SQL query…").with_title(" /table "),
-            ));
-            let _ = crate::tui::do_draw(
-                ctx.guard,
-                crate::tui::ActiveView::Empty,
-                None,
-                ctx.bottom_pane,
-                None,
-                None,
-            );
-
-            // `mo_query` shells out to the mysql client (blocking IO) —
-            // park it on a blocking thread so we don't freeze the async
-            // event loop while the query runs.
-            let sql_text = args.to_string();
-            let output = tokio::task::spawn_blocking(move || {
-                let executor = crate::edge_tools::ToolExecutor::new(
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                );
-                executor.mo_query(&serde_json::json!({ "sql": sql_text }))
-            })
-            .await
-            .unwrap_or_else(|e| format!("Error: SQL execution task failed: {e}"));
-
-            // Remove the BusyView — a real panel (or info message)
-            // takes its place below.
-            let _ = ctx.bottom_pane.pop_view();
-            use crate::tui::bottom_pane::table_view::TablePanelView;
-            use crate::tui::table_view::parse;
-            match parse(&output) {
-                Some(table) => {
-                    ctx.open_view("Opened table results", Box::new(TablePanelView::new(table)));
-                }
-                None => {
-                    // Parser rejected — show raw output to scrollback so
-                    // the user can see the error or "OK (no results)".
-                    ctx.show_info(output);
-                }
-            }
-            SlashResult::Handled
-        }
-
-        // ── Panels cheat sheet ──────────────────────────────────────
-        "/panels" => {
-            use crate::tui::bottom_pane::info_view::InfoView;
-            let body = build_panels_cheat_sheet_lines();
-            ctx.open_view(
-                "Opened panels cheat sheet",
-                Box::new(InfoView::from_plain("TUI panels", body).with_reopen("/panels")),
-            );
-            SlashResult::Handled
-        }
-
         // ── Worktrees (TUI-native) ──────────────────────────────────
         "/worktrees" => {
-            use crate::tui::bottom_pane::worktrees_view::WorktreesView;
-            use crate::tui::worktrees::{WorktreeList, parse};
-
-            // Both the `git worktree list --porcelain` invocation AND the
-            // per-entry session-count enrichment do blocking filesystem IO
-            // (process exec, journal scans, workspace YAML reads). Run the
-            // whole bundle on a blocking thread — keeping any portion of
-            // it on the runtime thread freezes the TUI on filesystems
-            // with tens of sessions per worktree.
-            let entries = tokio::task::spawn_blocking(|| {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                let out = std::process::Command::new("git")
-                    .args(["worktree", "list", "--porcelain"])
-                    .current_dir(&cwd)
-                    .output();
-                let porcelain = match out {
-                    Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-                    _ => String::new(),
-                };
-                let mut entries = parse(&porcelain);
-                for e in entries.iter_mut() {
-                    let sessions = astra_services::session_workspace::list_sessions_by_git_root(
-                        &e.path, None, 50,
-                    );
-                    e.session_count = sessions.len();
-                    e.last_session_at = sessions.first().map(|s| s.updated_at.clone());
-                }
-                entries
-            })
-            .await
-            .unwrap_or_default();
-
-            if entries.is_empty() {
-                ctx.show_info("No worktrees found (or `git worktree list` failed).".into());
-                return SlashResult::Handled;
-            }
-            let list = WorktreeList::new(entries);
-            ctx.open_view("Opened worktrees", Box::new(WorktreesView::new(list)));
-            SlashResult::Handled
+            ctx.show_response("Loading worktrees…".into());
+            SlashResult::background_read(SlashBackgroundRead::Worktrees)
         }
 
         // ── Session timeline (TUI-native) ───────────────────────────
         "/timeline" => {
-            use crate::tui::bottom_pane::timeline_view::TimelineView;
-            use crate::tui::timeline::{JournalTurnSource, Timeline};
             let Some(sid) = ctx.state.session_id.clone() else {
                 ctx.show_info("No active session — /timeline needs a session id.".into());
                 return SlashResult::Handled;
             };
-            // Timeline construction synchronously reads the entire JSONL
-            // session journal from disk; on long sessions this freezes
-            // the TUI for hundreds of ms. Run on a blocking thread.
-            let sid_owned = sid.clone();
-            let timeline = match tokio::task::spawn_blocking(move || {
-                Timeline::new(JournalTurnSource::new(), &sid_owned)
-            })
-            .await
-            {
-                Ok(t) => t,
-                Err(error) => {
-                    ctx.show_info(format!("/timeline failed: {error}"));
-                    return SlashResult::Handled;
-                }
-            };
-            if let Some(error) = timeline.load_error() {
-                ctx.show_info(error.to_string());
-                return SlashResult::Handled;
-            }
-            if timeline.is_empty() {
-                ctx.show_info(format!("No turns recorded yet for session {sid}."));
-                return SlashResult::Handled;
-            }
-            ctx.open_view("Opened timeline", Box::new(TimelineView::new(timeline)));
-            SlashResult::Handled
-        }
-
-        // Deprecated commands — graceful hints
-        "/turn" => {
-            ctx.show_info("Use /timeline (Enter to drill into a turn).".into());
-            SlashResult::Handled
-        }
-        "/verbose" | "/experiment" => {
-            ctx.show_info("Removed. Use /stats for metrics, /timeline for turn traces.".into());
-            SlashResult::Handled
+            ctx.show_response("Loading session timeline…".into());
+            SlashResult::background_read(SlashBackgroundRead::Timeline { session_id: sid })
         }
 
         // ── Resume picker (TUI-native) ──────────────────────────────
         "/resume" => {
             if !args.is_empty() {
-                // `/resume <id>` — direct path takes the rustyline-compatible
-                // fallback so we go through the full restore pipeline.
-                return SlashResult::Fallback;
-            }
-            use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
-            use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
-            // SessionDiscovery::new walks the on-disk journal index and
-            // reads up to `limit` workspace YAML files (~3 fs ops per
-            // session). On a runtime thread that's a TUI freeze; do it
-            // on a blocking thread instead.
-            let disco = match tokio::task::spawn_blocking(|| {
-                SessionDiscovery::new(FsSessionSource::new(), 50)
-            })
-            .await
-            {
-                Ok(d) => d,
-                Err(error) => {
-                    ctx.show_info(format!("session discovery failed: {error}"));
+                let session_id = args.trim();
+                if !looks_like_session_id(session_id) {
+                    ctx.show_error("Usage: /resume [session_id]".to_string());
                     return SlashResult::Handled;
                 }
-            };
-            if disco.total() == 0 {
-                ctx.show_info("No previous sessions found.".into());
+                match crate::cli::slash::slash_session::restore_session_into_state(
+                    session_id,
+                    ctx.profile,
+                    ctx.api,
+                    ctx.state,
+                )
+                .await
+                {
+                    Ok(()) => ctx.show_response(format!("Resumed session {session_id}")),
+                    Err(error) => ctx.show_error(format!("Could not resume session: {error}")),
+                }
                 return SlashResult::Handled;
             }
-            ctx.open_view(
-                "Opened session picker",
-                Box::new(SessionPickerView::new(disco)),
-            );
-            SlashResult::Handled
+            ctx.show_response("Loading previous sessions…".into());
+            SlashResult::background_read(SlashBackgroundRead::ResumePicker)
         }
 
         // ── Session ─────────────────────────────────────────────────
@@ -748,20 +775,62 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //   /session fork            → interactive fork flow
         //   /session analyze [id]    → counter-only diagnostics
         //   /session export [id]     → write markdown, echo path
-        //   everything else          → line-mode fallback
+        //   everything else          → explain the available workbench action
         "/session" => {
             let trimmed = args.trim();
             if trimmed.is_empty() {
-                return handle_session_hub(ctx);
+                let snapshot = session_hub_snapshot(ctx.state);
+                ctx.show_response("Loading session overview…".into());
+                return SlashResult::background_read(SlashBackgroundRead::SessionHub {
+                    snapshot: Box::new(snapshot),
+                });
             }
             let (sub, rest) = split_sub(trimmed);
             match sub {
-                "list" => handle_session_list_view(ctx).await,
-                "history" => handle_session_history_view(ctx, rest),
-                "fork" => handle_session_fork_view(ctx).await,
-                "analyze" | "diag" => handle_session_analyze_view(ctx, rest),
-                "export" => handle_session_export_view(ctx, rest),
-                _ => SlashResult::Fallback,
+                "list" => {
+                    ctx.show_response("Loading previous sessions…".into());
+                    SlashResult::background_read(SlashBackgroundRead::ResumePicker)
+                }
+                "history" => match resolve_session_arg(ctx, rest) {
+                    Some(session_id) => SlashResult::OpenRootTranscript {
+                        session_id: Some(session_id),
+                    },
+                    None => SlashResult::Handled,
+                },
+                "fork" => {
+                    ctx.show_response("Loading sessions to fork…".into());
+                    SlashResult::background_read(SlashBackgroundRead::ForkPicker)
+                }
+                "analyze" | "diag" => {
+                    // TUI-side analysis is a concise session summary. A deep
+                    // text-only analyzer is not a separate workbench action.
+                    let (flag, _) = split_sub(rest);
+                    if flag == "deep" {
+                        ctx.show_error(
+                            "`/session analyze deep` has no workbench action. Use `/session analyze` for the available summary."
+                                .to_string(),
+                        );
+                        SlashResult::Handled
+                    } else {
+                        match resolve_session_arg(ctx, rest) {
+                            Some(session_id) => {
+                                ctx.show_response("Loading session analysis…".into());
+                                SlashResult::background_read(SlashBackgroundRead::SessionAnalysis {
+                                    session_id,
+                                })
+                            }
+                            None => SlashResult::Handled,
+                        }
+                    }
+                }
+                "export" => handle_session_export_view(ctx, rest).await,
+                _ => {
+                    ctx.show_error(
+                        "This session action is not available in the workbench. Use `/session` for the available session views."
+                            .to_string(),
+                    );
+                    SlashResult::Handled
+                }
             }
         }
 
@@ -783,13 +852,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // ── Version ─────────────────────────────────────────────────
-        "/version" => {
-            ctx.show_response(format!("astra v{}", env!("CARGO_PKG_VERSION")));
-            SlashResult::Handled
-        }
-
-        "/whoami" | "/info" => {
+        "/info" => {
             use crate::tui::bottom_pane::info_view::InfoView;
 
             let model = ctx.state.model.as_deref().unwrap_or("<unset>");
@@ -835,24 +898,21 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             SlashResult::Handled
         }
 
-        // ── History — interactive search view ────────────────────────
-        "/history" => {
-            use crate::tui::bottom_pane::history_view::HistoryView;
-            if ctx.state.history.is_empty() {
-                ctx.show_info("No history yet".into());
-                return SlashResult::Handled;
+        // ── History — canonical transcript workspace ─────────────────
+        // `/history` used to open a second, in-memory `(user, assistant)`
+        // list. That view silently omitted tools, reasoning, compacted turns,
+        // delegated runs and server history. One conversation must have one
+        // browser and one source-selection contract, so this command is now a
+        // discoverable alias for the same workspace as Ctrl+O.
+        "/history" => match history_command_route(args) {
+            HistoryCommandRoute::Transcript => SlashResult::OpenRootTranscript { session_id: None },
+            HistoryCommandRoute::Unsupported => {
+                ctx.show_error(
+                    "Usage: /history — open the transcript, then press / to search.".into(),
+                );
+                SlashResult::Handled
             }
-            let initial_query = if args.starts_with("grep ") {
-                args.strip_prefix("grep ").unwrap_or("").trim()
-            } else {
-                ""
-            };
-            ctx.open_view(
-                "Opened history search",
-                Box::new(HistoryView::new(&ctx.state.history, initial_query)),
-            );
-            SlashResult::Handled
-        }
+        },
 
         // ── Instructions — subcommand menu or direct action ─────────
         "/instructions" => {
@@ -862,7 +922,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let inst_path = cwd.join(".astra").join("instructions.md");
 
-                    let file_info = if let Ok(meta) = std::fs::metadata(&inst_path) {
+                    let file_info = if let Ok(meta) = tokio::fs::metadata(&inst_path).await {
                         let size = meta.len();
                         let age = meta
                             .modified()
@@ -911,10 +971,14 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     ];
                     ctx.open_view(
                         "Opened project instructions",
-                        Box::new(ListSelectionView::new(
-                            items,
-                            Some("Project Instructions:".into()),
-                        )),
+                        Box::new(
+                            ListSelectionView::new(items, Some("Project Instructions:".into()))
+                                .with_results(vec![
+                                    ViewResult::Instructions(ProjectInstructionsAction::Show),
+                                    ViewResult::Instructions(ProjectInstructionsAction::Reload),
+                                    ViewResult::Instructions(ProjectInstructionsAction::Disable),
+                                ]),
+                        ),
                     );
                     SlashResult::Handled
                 }
@@ -971,225 +1035,119 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     return SlashResult::Handled;
                 }
             };
-            let token =
-                crate::cli::session::session_runtime::fresh_access_token(ctx.api, ctx.profile)
-                    .await;
-            let Some(token) = token else {
-                ctx.show_error("Not logged in. Use /login.".into());
-                return SlashResult::Handled;
-            };
 
-            if args.trim() == "session" {
-                let Some(session_id) = ctx.state.session_id.as_deref() else {
-                    ctx.show_error("No active session yet.".into());
-                    return SlashResult::Handled;
-                };
-                match crate::cli::slash::slash_memory::load_current_session_memory(
-                    ctx.api, &token, session_id,
-                )
-                .await
-                {
-                    Ok(record) => {
-                        let body = record
-                            .as_ref()
-                            .map(|memory| memory.body.as_str())
-                            .unwrap_or_default();
-                        let hint = if body.trim().is_empty() {
-                            crate::cli::slash::slash_memory::latest_session_memory_status_hint(
-                                session_id,
-                            )
-                        } else {
-                            None
-                        };
-                        let summary = record.as_ref().and_then(|memory| memory.summary.as_deref());
-                        let status = crate::cli::slash::slash_memory::session_memory_surface_status(
-                            session_id,
-                            record.as_ref(),
-                        );
-                        ctx.show_response(
-                            crate::cli::slash::slash_memory::format_session_memory_response(
-                                summary,
-                                body,
-                                Some(session_id),
-                                hint.as_ref().map(|hint| hint.summary.as_str()),
-                                Some(&status),
-                            ),
-                        );
-                    }
-                    Err(e) => ctx.show_error(format!("Session memory failed: {e}")),
-                }
+            if route == MemoryCommandRoute::Unsupported {
+                ctx.show_error(
+                    "This memory action has no workbench UI. Available: `/memory`, `/memory search <query>`, `/memory stats`, `/memory health`, `/memory session`."
+                        .to_string(),
+                );
                 return SlashResult::Handled;
             }
 
             if route == MemoryCommandRoute::Health {
-                use crate::tui::bottom_pane::info_view::InfoView;
+                ctx.show_response("Loading memory health…".into());
+                return SlashResult::background_read(SlashBackgroundRead::Memory(
+                    MemoryReadRequest::Health,
+                ));
+            };
 
-                match crate::edge_tools::memoria::memoria_health().await {
-                    Ok(body) => {
-                        let lines = crate::cli::slash::slash_memory::memory_health_lines(&body);
-                        ctx.open_view(
-                            "Opened memory health",
-                            Box::new(
-                                InfoView::from_plain("Memory Health", lines)
-                                    .with_reopen("/memory health"),
-                            ),
-                        );
-                    }
-                    Err(e) => ctx.show_error(format!("Memory health failed: {e}")),
-                }
-                return SlashResult::Handled;
+            if route == MemoryCommandRoute::Session {
+                let Some(session_id) = ctx.state.session_id.clone() else {
+                    ctx.show_error("No active session yet.".into());
+                    return SlashResult::Handled;
+                };
+                ctx.show_response("Loading session memory…".into());
+                return SlashResult::background_read(SlashBackgroundRead::Memory(
+                    MemoryReadRequest::Session {
+                        session_id,
+                        api: ctx.api.clone(),
+                        profile: ctx.profile.map(str::to_owned),
+                    },
+                ));
             }
 
-            let (query, top_k, stats_view) = match route {
-                MemoryCommandRoute::Search(query) => (query, 20, false),
+            let (query, top_k, stats_view, list_view) = match route {
+                MemoryCommandRoute::Search(query) => (query, 20, false, false),
                 MemoryCommandRoute::List => (
                     crate::cli::slash::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
                     crate::cli::slash::slash_memory::MEMORY_BROWSE_TOP_K,
                     false,
+                    true,
                 ),
                 MemoryCommandRoute::Stats => (
                     crate::cli::slash::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
                     crate::cli::slash::slash_memory::MEMORY_STATS_TOP_K,
                     true,
+                    false,
                 ),
-                MemoryCommandRoute::Fallback => return SlashResult::Fallback,
+                MemoryCommandRoute::Session => unreachable!("handled above"),
+                MemoryCommandRoute::Unsupported => unreachable!("handled above"),
                 MemoryCommandRoute::Health => unreachable!("handled above"),
             };
 
-            let payload = serde_json::json!({
-                "query": query,
-                "top_k": top_k,
-            });
-            match ctx.api.post_memory_search_json(&token, &payload).await {
-                Ok(r) if r.status().is_success() => {
-                    let body = r.text().await.unwrap_or_default();
-                    match serde_json::from_str::<Vec<serde_json::Value>>(&body) {
-                        Ok(arr) if !arr.is_empty() => {
-                            if stats_view {
-                                use crate::tui::bottom_pane::info_view::InfoView;
-
-                                let lines =
-                                    crate::cli::slash::slash_memory::memory_stats_lines(&arr);
-                                ctx.open_view(
-                                    "Opened memory stats",
-                                    Box::new(
-                                        InfoView::from_plain("Memory Stats", lines)
-                                            .with_reopen("/memory stats"),
-                                    ),
-                                );
-                                return SlashResult::Handled;
-                            }
-                            let mut hidden_session_entries = 0usize;
-                            let items: Vec<SelectionItem> = arr
-                                .iter()
-                                .filter_map(|m| {
-                                    let content =
-                                        m.get("content").and_then(|v| v.as_str()).unwrap_or("?");
-                                    if crate::cli::slash::slash_memory::is_session_proto(content) {
-                                        hidden_session_entries += 1;
-                                        return None;
-                                    }
-                                    let id = m
-                                        .get("memory_id")
-                                        .or(m.get("id"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    let short_id = &id[..std::cmp::min(8, id.len())];
-                                    Some(SelectionItem {
-                                        name: crate::cli::slash::slash_memory::format_memory_entry_line(m),
-                                        description: Some(format!("id:{short_id}")),
-                                        is_current: false,
-                                    })
-                                })
-                                .collect();
-                            if items.is_empty() {
-                                let mut message = "No non-session memories found.".to_string();
-                                if hidden_session_entries > 0 {
-                                    message.push_str(" Use /memory session to view session state.");
-                                }
-                                ctx.show_info(message);
-                                return SlashResult::Handled;
-                            }
-                            let header = format!(
-                                "Memory — {} result{} for: {}{}",
-                                items.len(),
-                                if items.len() == 1 { "" } else { "s" },
-                                query,
-                                if hidden_session_entries > 0 {
-                                    format!(
-                                        " ({hidden_session_entries} session entr{} hidden)",
-                                        if hidden_session_entries == 1 {
-                                            "y"
-                                        } else {
-                                            "ies"
-                                        }
-                                    )
-                                } else {
-                                    String::new()
-                                }
-                            );
-                            ctx.open_view(
-                                "Opened memory browser",
-                                Box::new(
-                                    ListSelectionView::new(items, Some(header))
-                                        .with_footer_hint("↑↓ navigate · q / Esc close"),
-                                ),
-                            );
-                            SlashResult::Handled
-                        }
-                        Ok(_) => {
-                            ctx.show_info("No memories found.".into());
-                            SlashResult::Handled
-                        }
-                        Err(_) => {
-                            ctx.show_error("Failed to parse memory results.".into());
-                            SlashResult::Handled
-                        }
-                    }
-                }
-                Ok(r) => {
-                    ctx.show_error(format!("Memory search failed (HTTP {})", r.status()));
-                    SlashResult::Handled
-                }
-                Err(e) => {
-                    ctx.show_error(format!("Memory unreachable: {e}"));
-                    SlashResult::Handled
-                }
-            }
+            let progress = if stats_view {
+                "Loading memory stats…"
+            } else if list_view {
+                "Loading memories…"
+            } else {
+                "Searching memories…"
+            };
+            ctx.show_response(progress.into());
+            SlashResult::background_read(SlashBackgroundRead::Memory(MemoryReadRequest::Search {
+                api: ctx.api.clone(),
+                profile: ctx.profile.map(str::to_owned),
+                query,
+                top_k,
+                stats_view,
+            }))
         }
 
-        // ── Everything else → route via TuiHandler metadata ────────
-        _ => match command_registry::resolve_command_meta(cmd).map(|m| m.tui_handler) {
-            // ChatForward (default, no tui_handler set) → forward to chat composer
-            None | Some(TuiHandler::ChatForward) => SlashResult::Forward(text.to_string()),
-            // Fallback → tear down TUI, run REPL handler, restore
-            Some(TuiHandler::Fallback) => SlashResult::Fallback,
-            // Panel → open native TUI panel (portals built in later phases)
-            Some(TuiHandler::Panel) => {
-                ctx.show_info(format!(
-                    "`{}` panel is not yet implemented in TUI — forwarding to chat",
-                    resolved
-                ));
-                SlashResult::Forward(text.to_string())
-            }
-            // Selector → open picker/selector (built in later phases)
-            Some(TuiHandler::Selector) => {
-                ctx.show_info(format!(
-                    "`{}` selector is not yet implemented in TUI — forwarding to chat",
-                    resolved
-                ));
-                SlashResult::Forward(text.to_string())
-            }
-            // Inline → should have been matched explicitly above
-            Some(TuiHandler::Inline) => {
-                ctx.show_error(format!("Command `{resolved}` not handled inline"));
-                SlashResult::Handled
-            }
-        },
+        // A native registry entry without a dispatcher is a product bug. It
+        // must never fall through into a user prompt or a terminal handoff.
+        _ => {
+            ctx.show_error(format!(
+                "Command `{resolved}` is registered but has no workbench action."
+            ));
+            SlashResult::Handled
+        }
     }
 }
 
-fn build_permission_mode_picker(
+/// Build `/context` from the same committed trace that session recovery and
+/// `/inspect` use. Streaming/server paths may commit a trace into
+/// `SessionState` without mirroring it into the local observability ring, so
+/// treating that ring as the only source makes a completed turn appear to
+/// have no context. The ring remains a fallback for older local traces and
+/// retains cross-turn compaction history.
+fn context_breakdown_for_panel(
+    state: &SessionState,
+    snapshot: &mut crate::tui::context_panel::ContextSnapshot<'_>,
+) -> crate::tui::context_panel::ContextBreakdown {
+    use crate::tui::context_panel::ContextBreakdown;
+
+    if let Some(session) = state.observability_session.as_ref() {
+        let guard = astra_core::sync_poison::recover_rwlock_read(session);
+        // Pull session-level compaction history into the snapshot so the
+        // Compaction section shows all past events, not just the latest turn.
+        snapshot.compressed_turns = guard.compressed_turns.clone();
+    }
+
+    if let Some(trace) = state.latest_context_assembly_trace.as_ref() {
+        return ContextBreakdown::from_trace_with(trace, snapshot);
+    }
+
+    let Some(session) = state.observability_session.as_ref() else {
+        return ContextBreakdown::from_snapshot_without_trace(snapshot);
+    };
+    let guard = astra_core::sync_poison::recover_rwlock_read(session);
+    guard
+        .context_traces
+        .last()
+        .map(|trace| ContextBreakdown::from_trace_with(trace, snapshot))
+        .unwrap_or_else(|| ContextBreakdown::from_snapshot_without_trace(snapshot))
+}
+
+pub(crate) fn build_permission_mode_picker(
     current: crate::cli::permission_manager::PermissionMode,
 ) -> ListSelectionView {
     let items = vec![
@@ -1206,9 +1164,10 @@ fn build_permission_mode_picker(
             is_current: current == crate::cli::permission_manager::PermissionMode::AcceptEdits,
         },
         SelectionItem {
-            name: "Plan".into(),
+            name: "Read-only".into(),
             description: Some(
-                "Read-only investigation mode; writes and shell mutations are denied".into(),
+                "Read-only tool capability; /plan uses this policy while authoring a workflow"
+                    .into(),
             ),
             is_current: current == crate::cli::permission_manager::PermissionMode::Plan,
         },
@@ -1232,15 +1191,61 @@ fn build_permission_mode_picker(
             is_current: current == crate::cli::permission_manager::PermissionMode::Deny,
         },
     ];
-    ListSelectionView::new(items, Some("Modes".into())).with_footer_hint(
-        "Shift+Tab cycles ask → edits → plan → auto · bypass is explicit · /allow rules · /allow trust · /allow trace",
+    ListSelectionView::new(
+        items,
+        Some("Tool policy · enter planning workflow with /plan".into()),
+    )
+    .with_results(vec![
+        ViewResult::Permission(crate::cli::permission_manager::PermissionMode::Prompt),
+        ViewResult::Permission(crate::cli::permission_manager::PermissionMode::AcceptEdits),
+        ViewResult::Permission(crate::cli::permission_manager::PermissionMode::Plan),
+        ViewResult::Permission(crate::cli::permission_manager::PermissionMode::Auto),
+        ViewResult::Permission(crate::cli::permission_manager::PermissionMode::Bypass),
+        ViewResult::Permission(crate::cli::permission_manager::PermissionMode::Deny),
+    ])
+    .with_footer_hint(
+        "↑↓ select · Enter apply · Esc keep current · /allow rules · /allow trust · /allow trace",
     )
 }
 
-pub(crate) fn next_permission_mode_for_cycle(
-    current: crate::cli::permission_manager::PermissionMode,
-) -> crate::cli::permission_manager::PermissionMode {
-    crate::cli::permission_command::next_permission_mode_for_cycle(current)
+pub(crate) fn build_permission_mode_confirmation(
+    mode: crate::cli::permission_manager::PermissionMode,
+) -> ListSelectionView {
+    debug_assert!(permission_mode_requires_confirmation(mode));
+    ListSelectionView::new(
+        vec![
+            SelectionItem {
+                name: "Keep current permissions".into(),
+                description: Some("No policy change".into()),
+                is_current: true,
+            },
+            SelectionItem {
+                name: "Use Bypass".into(),
+                description: Some(
+                    "Skip approval prompts; real safety and policy boundaries still apply".into(),
+                ),
+                is_current: false,
+            },
+        ],
+        Some("Confirm Bypass permission mode".into()),
+    )
+    .with_results(vec![
+        ViewResult::PermissionConfirmation {
+            mode,
+            confirmed: false,
+        },
+        ViewResult::PermissionConfirmation {
+            mode,
+            confirmed: true,
+        },
+    ])
+    .with_footer_hint("Enter confirm · Esc keep current permissions")
+}
+
+pub(crate) fn permission_mode_requires_confirmation(
+    mode: crate::cli::permission_manager::PermissionMode,
+) -> bool {
+    matches!(mode, crate::cli::permission_manager::PermissionMode::Bypass)
 }
 
 pub(crate) fn permission_mode_feedback(
@@ -1249,104 +1254,34 @@ pub(crate) fn permission_mode_feedback(
     crate::cli::permission_command::permission_mode_feedback(mode)
 }
 
-fn apply_permission_mode_selection(
+pub(crate) fn apply_permission_mode_selection(
     state: &mut SessionState,
+    bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
     mode: crate::cli::permission_manager::PermissionMode,
 ) {
     state.perm_manager.set_mode(mode);
     crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(state);
+    let released = bottom_pane.reevaluate_approvals_for_mode(mode);
     chat_widget.commit_system(SystemCell::response(permission_mode_feedback(mode)));
+    if released > 0 {
+        chat_widget.commit_system(SystemCell::response(format!(
+            "{released} pending approval(s) resolved by the selected permission mode"
+        )));
+    }
 }
 
-/// Cheat sheet content for `/panels`. Pure — separate from the
-/// dispatch wiring so it can be snapshot-tested.
-pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
-    // (command, one-line purpose, key hint)
-    const PANELS: &[(&str, &str, &str)] = &[
-        (
-            "/resume",
-            "pick and restore a recent session",
-            "↑↓ navigate · type to filter · Enter resume · Esc close",
-        ),
-        (
-            "/context",
-            "visualise the current turn's token budget",
-            "Enter / q / Esc close",
-        ),
-        (
-            "/timeline",
-            "browse this session's turn-by-turn journal",
-            "↑↓ navigate · PgUp/PgDn page · q / Esc close",
-        ),
-        (
-            "/table <sql>",
-            "run a SQL query and render a navigable table",
-            "↑↓ rows · ←→ cols · Home/End jump · q / Esc close",
-        ),
-        (
-            "/worktrees",
-            "list git worktrees with per-worktree session counts",
-            "↑↓ navigate · q / Esc close",
-        ),
-        (
-            "/config [edit|show|paths|sources|diff|export]",
-            "edit opens the panel; show/paths/sources/diff/export stay text-first",
-            "panel: ↑↓ navigate · Enter edit/set · type to search · Esc save/close",
-        ),
-        (
-            "/model",
-            "fuzzy-search model picker; switch or inspect current model",
-            "type to filter · Enter select · Esc close",
-        ),
-        (
-            "/skill",
-            "browse, search, install, and manage skills",
-            "type to filter · Enter select · Esc close",
-        ),
-        (
-            "/memory [list|search <q>|show <id>|session|help]",
-            "browse/search/stats in-panel; other subcommands stay text-first",
-            "↑↓ navigate · Enter select · Esc close",
-        ),
-        (
-            "/session",
-            "list, fork, history, analyze, or export sessions",
-            "↑↓ navigate · Enter select · Esc close",
-        ),
-        (
-            "/stats",
-            "view token cost, tool usage, and session statistics",
-            "Enter / q / Esc close",
-        ),
-        (
-            "/inspect",
-            "session introspection: budget, tools, history, traces",
-            "type subcommand · Esc close",
-        ),
-        (
-            "/info",
-            "system info at a glance — version, model, session, skills",
-            "↑↓ scroll · Esc close",
-        ),
-        (
-            "/help",
-            "list every slash command grouped by category",
-            "↑↓ browse · Esc close",
-        ),
-    ];
-    let mut out = Vec::with_capacity(PANELS.len() * 3);
-    for (cmd, desc, hint) in PANELS {
-        out.push(format!("  {cmd}"));
-        out.push(format!("      {desc}"));
-        out.push(format!("      {hint}"));
-        out.push(String::new());
+fn apply_or_confirm_permission_mode_selection(
+    state: &mut SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+    mode: crate::cli::permission_manager::PermissionMode,
+) {
+    if permission_mode_requires_confirmation(mode) {
+        bottom_pane.push_view(Box::new(build_permission_mode_confirmation(mode)));
+    } else {
+        apply_permission_mode_selection(state, bottom_pane, chat_widget, mode);
     }
-    // Trim trailing blank so InfoView scrolls cleanly.
-    while out.last().is_some_and(|s| s.trim().is_empty()) {
-        out.pop();
-    }
-    out
 }
 
 /// Detect the conventional "sess_<…>" / uuid-like session id shape.
@@ -1360,59 +1295,31 @@ pub(crate) fn looks_like_session_id(s: &str) -> bool {
 
 /// Handle a ViewCompleted result from a BottomPaneView.
 pub(crate) fn handle_view_result(
-    name: &str,
+    result: ViewResult,
     state: &mut SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
 ) {
-    // Session picker result is handled by the outer event loop (it
-    // needs to run the async resume pipeline); this sync fn just
-    // lets it pass through — see `is_session_id` below.
-    if looks_like_session_id(name) {
-        return;
-    }
-
-    // Skill menu actions
-    if name == "List skills" {
-        bottom_pane.composer.set_text("$");
-        return;
-    }
-    if name == "Skill info" {
-        chat_widget.commit_system(SystemCell::info("Use /skill info <name> for details"));
-        return;
-    }
-
-    // Skill name → insert $name into composer
-    if state.unified_skill_registry.get_manifest(name).is_some() {
-        bottom_pane.composer.set_text(&format!("${name} "));
-        return;
-    }
-
-    // Stats menu → show inline view
-    let stats_sub = match name {
-        "Session overview" => Some(""),
-        "History" => Some("history"),
-        "Tools" => Some("tools"),
-        "Cost" => Some("cost"),
-        "Health" => Some("health"),
-        "Learn" => Some("learn"),
-        _ => None,
-    };
-    if let Some(sub) = stats_sub {
-        show_stats_view(sub, state, bottom_pane);
-        return;
-    }
-
-    // Instructions menu → dispatch subcommands
-    match name {
-        "Show" => {
+    match result {
+        ViewResult::Stats(panel) => {
+            let sub = match panel {
+                StatsPanel::Overview => "",
+                StatsPanel::History => "history",
+                StatsPanel::Tools => "tools",
+                StatsPanel::Cost => "cost",
+                StatsPanel::Health => "health",
+                StatsPanel::Learn => "learn",
+            };
+            show_stats_view(sub, state, bottom_pane);
+        }
+        ViewResult::Instructions(ProjectInstructionsAction::Show) => {
             use crate::tui::bottom_pane::info_view::InfoView;
             if let Some(ref pi) = state.project_instructions {
                 let lc = pi.lines().count();
                 bottom_pane.push_view(Box::new(
                     InfoView::from_plain(
                         &format!("Project Instructions ({lc} lines)"),
-                        pi.lines().map(|l| format!("  {l}")).collect(),
+                        pi.lines().map(|line| format!("  {line}")).collect(),
                     )
                     .with_reopen("/instructions"),
                 ));
@@ -1421,132 +1328,63 @@ pub(crate) fn handle_view_result(
                     "No project instructions loaded. Create .astra/instructions.md",
                 ));
             }
-            return;
         }
-        "Reload" => {
+        ViewResult::Instructions(ProjectInstructionsAction::Reload) => {
             if let Some(instructions) =
                 crate::cli::project_instructions::discover_project_instructions()
             {
-                let lc = instructions.lines().count();
+                let lines = instructions.lines().count();
                 state.project_instructions = Some(instructions);
                 chat_widget.commit_system(SystemCell::response(format!(
-                    "Reloaded project instructions ({lc} lines)"
+                    "Reloaded project instructions ({lines} lines)"
                 )));
             } else {
                 state.project_instructions = None;
                 chat_widget.commit_system(SystemCell::info("No .astra/instructions.md found"));
             }
-            return;
         }
-        "Off" => {
+        ViewResult::Instructions(ProjectInstructionsAction::Disable) => {
             state.project_instructions = None;
             chat_widget.commit_system(SystemCell::response("Project instructions disabled"));
-            return;
         }
-        _ => {}
-    }
-
-    // Permission menu
-    match name {
-        "Auto" => {
-            apply_permission_mode_selection(
-                state,
-                chat_widget,
-                crate::cli::permission_manager::PermissionMode::Auto,
-            );
-            return;
+        ViewResult::Permission(mode) => {
+            apply_or_confirm_permission_mode_selection(state, bottom_pane, chat_widget, mode)
         }
-        "Bypass" | "Skip" => {
-            apply_permission_mode_selection(
-                state,
-                chat_widget,
-                crate::cli::permission_manager::PermissionMode::Bypass,
-            );
-            return;
-        }
-        "Edits" => {
-            apply_permission_mode_selection(
-                state,
-                chat_widget,
-                crate::cli::permission_manager::PermissionMode::AcceptEdits,
-            );
-            return;
-        }
-        "Ask" | "Default" => {
-            apply_permission_mode_selection(
-                state,
-                chat_widget,
-                crate::cli::permission_manager::PermissionMode::Prompt,
-            );
-            return;
-        }
-        "Plan" => {
-            apply_permission_mode_selection(
-                state,
-                chat_widget,
-                crate::cli::permission_manager::PermissionMode::Plan,
-            );
-            return;
-        }
-        "Deny" => {
-            apply_permission_mode_selection(
-                state,
-                chat_widget,
-                crate::cli::permission_manager::PermissionMode::Deny,
-            );
-            return;
-        }
-        "Rules" => {
+        ViewResult::PermissionConfirmation {
+            mode,
+            confirmed: true,
+        } => apply_permission_mode_selection(state, bottom_pane, chat_widget, mode),
+        ViewResult::PermissionConfirmation {
+            confirmed: false, ..
+        } => {}
+        ViewResult::Memory(memory) => {
             use crate::tui::bottom_pane::info_view::InfoView;
-            let summary = state.perm_manager.rules_summary();
             bottom_pane.push_view(Box::new(
                 InfoView::from_plain(
-                    "Permission Rules",
-                    summary.lines().map(|l| l.to_string()).collect(),
+                    "Memory detail",
+                    vec![
+                        format!("id: {}", memory.memory_id),
+                        String::new(),
+                        memory.content,
+                    ],
                 )
-                .with_reopen("/allow"),
+                .with_reopen("/memory"),
             ));
-            return;
         }
-        "Trust Workspace" => {
-            match state.perm_manager.trust_workspace() {
-                Ok(message) => chat_widget.commit_system(SystemCell::response(message)),
-                Err(err) => chat_widget.commit_system(SystemCell::error(format!(
-                    "Failed to trust workspace: {err}"
-                ))),
-            }
-            return;
+        ViewResult::InsertCommand(command) => {
+            bottom_pane.composer.set_text(&format!("{command} "));
         }
-        "Untrust Workspace" => {
-            match state.perm_manager.untrust_workspace() {
-                Ok(message) => chat_widget.commit_system(SystemCell::response(message)),
-                Err(err) => chat_widget.commit_system(SystemCell::error(format!(
-                    "Failed to mark workspace untrusted: {err}"
-                ))),
-            }
-            return;
-        }
-        "Trace" => {
-            use crate::tui::bottom_pane::info_view::InfoView;
-            let lines = astra_turn_core::permission::audit::format_snapshot_lines(50);
-            bottom_pane.push_view(Box::new(
-                InfoView::from_plain("Permission Trace", lines).with_reopen("/allow trace"),
-            ));
-            return;
-        }
-        _ => {}
+        // These results have async or state-transition handling in the event
+        // loop. Keeping them explicit prevents a future picker from silently
+        // falling through based on its rendered label.
+        ViewResult::Login { .. }
+        | ViewResult::Register { .. }
+        | ViewResult::ConfigEdit { .. }
+        | ViewResult::Model { .. }
+        | ViewResult::ModelThinking { .. }
+        | ViewResult::Session { .. }
+        | ViewResult::WorkspaceTrust(_) => {}
     }
-
-    // Slash command selected from help → insert into composer
-    if name.starts_with('/') {
-        bottom_pane.composer.set_text(&format!("{name} "));
-    }
-
-    // Unknown picker results must stay inert here. Model picks are
-    // routed asynchronously by the outer event loop via
-    // `MODEL_PICK_SENTINEL`; treating arbitrary selection text as a
-    // model lets unrelated pickers (notably `/memory` results) poison
-    // `state.model`.
 }
 
 fn show_stats_view(sub: &str, state: &SessionState, bottom_pane: &mut BottomPane) {
@@ -1908,117 +1746,69 @@ fn split_sub(text: &str) -> (&str, &str) {
     }
 }
 
-async fn handle_mcp_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+fn handle_mcp_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
     use crate::cli::slash::slash_mcp::ParsedMcpCommand as Cmd;
 
-    match crate::cli::slash::slash_mcp::parse_mcp_command(args) {
-        Cmd::Help => {
-            ctx.show_response(mcp_help_text(ctx.state).await);
-            SlashResult::Handled
-        }
-        Cmd::Overview => {
-            ctx.show_response(mcp_overview_text(ctx.state).await);
-            SlashResult::Handled
-        }
-        Cmd::Servers => {
-            ctx.show_response(mcp_servers_text(ctx.state).await);
-            SlashResult::Handled
-        }
-        Cmd::Tools(server) => {
-            ctx.show_response(mcp_tools_text(ctx.state, server).await);
-            SlashResult::Handled
-        }
-        Cmd::Prompts => {
-            ctx.show_response(mcp_prompts_text(ctx.state).await);
-            SlashResult::Handled
-        }
-        Cmd::Resources => {
-            ctx.show_response(mcp_resources_text(ctx.state).await);
-            SlashResult::Handled
-        }
-        Cmd::Read(Some(spec)) => {
-            ctx.show_response(mcp_read_text(ctx.state, spec).await);
-            SlashResult::Handled
-        }
+    let action = match crate::cli::slash::slash_mcp::parse_mcp_command(args) {
+        Cmd::Help => McpReadAction::Help,
+        Cmd::Overview => McpReadAction::Overview,
+        Cmd::Servers => McpReadAction::Servers,
+        Cmd::Tools(server) => McpReadAction::Tools(server.map(str::to_owned)),
+        Cmd::Prompts => McpReadAction::Prompts,
+        Cmd::Resources => McpReadAction::Resources,
+        Cmd::Read(Some(spec)) => McpReadAction::Read(spec.to_owned()),
         Cmd::Read(None) => {
             ctx.show_error("Usage: /mcp read <server>:<uri>".into());
-            SlashResult::Handled
+            return SlashResult::Handled;
         }
-        Cmd::History => {
-            ctx.show_response(mcp_history_text(ctx.state).await);
-            SlashResult::Handled
-        }
-        Cmd::Inspect(Some(query)) => {
-            ctx.show_response(mcp_inspect_text(ctx.state, query).await);
-            SlashResult::Handled
-        }
+        Cmd::History => McpReadAction::History,
+        Cmd::Inspect(Some(query)) => McpReadAction::Inspect(query.to_owned()),
         Cmd::Inspect(None) => {
             ctx.show_error(
                 "Usage: /mcp inspect <server>:<tool>  ·  try `/mcp tools` first.".into(),
             );
-            SlashResult::Handled
+            return SlashResult::Handled;
         }
-        Cmd::Ping(server) => {
-            ctx.show_response(mcp_ping_text(ctx.state, server).await);
-            SlashResult::Handled
-        }
-        Cmd::Add(Some(_)) => mcp_fallback_notice(ctx, "add"),
-        Cmd::Add(None) => {
-            ctx.show_error("Usage: /mcp add <name> <command> [args…]".into());
-            SlashResult::Handled
-        }
-        Cmd::Remove(Some(_)) => mcp_fallback_notice(ctx, "remove"),
-        Cmd::Remove(None) => {
-            ctx.show_error("Usage: /mcp remove <name>".into());
-            SlashResult::Handled
-        }
-        Cmd::Subscribe(Some(_)) => mcp_fallback_notice(ctx, "subscribe"),
-        Cmd::Subscribe(None) => {
-            ctx.show_error("Usage: /mcp subscribe <server>:<uri>".into());
-            SlashResult::Handled
-        }
-        Cmd::Unsubscribe(Some(_)) => mcp_fallback_notice(ctx, "unsubscribe"),
-        Cmd::Unsubscribe(None) => {
-            ctx.show_error("Usage: /mcp unsubscribe <server>:<uri>".into());
-            SlashResult::Handled
-        }
-        Cmd::LogLevel(Some(_)) => mcp_fallback_notice(ctx, "log-level"),
-        Cmd::LogLevel(None) => {
-            ctx.show_error("Usage: /mcp log-level <server> <level>".into());
-            SlashResult::Handled
-        }
-        Cmd::Prompt(Some(_)) => mcp_fallback_notice(ctx, "prompt"),
-        Cmd::Prompt(None) => {
-            ctx.show_error("Usage: /mcp prompt <server>:<name> [args…]".into());
-            SlashResult::Handled
-        }
-        Cmd::Complete(Some(_)) => mcp_fallback_notice(ctx, "complete"),
-        Cmd::Complete(None) => {
-            ctx.show_error("Usage: /mcp complete <server>:<prompt|resource> <arg> [value]".into());
-            SlashResult::Handled
-        }
+        Cmd::Ping(server) => McpReadAction::Ping(server.map(str::to_owned)),
+        Cmd::Add(_) => return mcp_unavailable_notice(ctx, "add"),
+        Cmd::Remove(_) => return mcp_unavailable_notice(ctx, "remove"),
+        Cmd::Subscribe(_) => return mcp_unavailable_notice(ctx, "subscribe"),
+        Cmd::Unsubscribe(_) => return mcp_unavailable_notice(ctx, "unsubscribe"),
+        Cmd::LogLevel(_) => return mcp_unavailable_notice(ctx, "log-level"),
+        Cmd::Prompt(_) => return mcp_unavailable_notice(ctx, "prompt"),
+        Cmd::Complete(_) => return mcp_unavailable_notice(ctx, "complete"),
         Cmd::Unknown(sub) => {
             ctx.show_error(format!(
                 "Unknown `/mcp` subcommand: `{sub}`. Try `/mcp help`."
             ));
-            SlashResult::Handled
+            return SlashResult::Handled;
         }
-    }
+    };
+
+    ctx.show_response("Loading MCP information…".into());
+    SlashResult::background_read(SlashBackgroundRead::Mcp {
+        manager: ctx.state.mcp_manager.clone(),
+        action,
+    })
 }
 
-fn mcp_fallback_notice(ctx: &mut DispatchContext<'_>, subcommand: &str) -> SlashResult {
-    ctx.show_info(format!(
-        "`/mcp {subcommand}` still uses terminal fallback. Core discovery commands (`/mcp list`, `/mcp tools`, `/mcp prompts`, `/mcp resources`, `/mcp read`, `/mcp inspect`, `/mcp ping`) are native in TUI."
+fn mcp_unavailable_notice(ctx: &mut DispatchContext<'_>, subcommand: &str) -> SlashResult {
+    ctx.show_error(format!(
+        "`/mcp {subcommand}` has no workbench action. Available here: list, servers, tools, inspect, prompts, resources, read, ping, history."
     ));
-    SlashResult::Fallback
+    SlashResult::Handled
 }
 
-async fn mcp_help_text(state: &SessionState) -> String {
-    let count = state.mcp_manager.read().await.connection_count();
+pub(crate) type McpManagerHandle =
+    std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>;
+
+async fn mcp_help_text(manager: &McpManagerHandle) -> String {
+    let count = manager.read().await.connection_count();
     let mut lines = vec!["MCP commands".to_string()];
     if count == 0 {
         lines.push("No MCP servers connected yet.".into());
-        lines.push("Add one with: /mcp add <name> <command> [args…]".into());
+        lines
+            .push("Configure a server before starting the workbench, then use `/mcp list`.".into());
     } else {
         lines.push(format!(
             "{count} server(s) connected. Start with `/mcp list`."
@@ -2031,15 +1821,12 @@ async fn mcp_help_text(state: &SessionState) -> String {
     lines.push("/mcp resources            list readable resources".into());
     lines.push("/mcp read <server>:<uri>  read one resource".into());
     lines.push("/mcp ping [server]        connectivity check".into());
-    lines.push(
-        "Advanced: /mcp add, remove, prompt, complete, log-level, subscribe, unsubscribe, history"
-            .into(),
-    );
+    lines.push("/mcp history              recent MCP tool-call history".into());
     lines.join("\n")
 }
 
 fn mcp_no_servers_text() -> String {
-    "No MCP servers connected.\nAdd one with: /mcp add <name> <command> [args…]\nThen use `/mcp list` or `/mcp tools`.".into()
+    "No MCP servers connected. Configure a server before starting the workbench, then use `/mcp list` or `/mcp tools`.".into()
 }
 
 fn mcp_format_duration(d: std::time::Duration) -> String {
@@ -2089,8 +1876,8 @@ fn mcp_truncate_block(text: &str, max_lines: usize, max_chars_per_line: usize) -
     out.join("\n")
 }
 
-async fn mcp_overview_text(state: &SessionState) -> String {
-    let manager = state.mcp_manager.read().await;
+async fn mcp_overview_text(manager: &McpManagerHandle) -> String {
+    let manager = manager.read().await;
     let count = manager.connection_count();
     if count == 0 {
         return mcp_no_servers_text();
@@ -2144,8 +1931,8 @@ async fn mcp_overview_text(state: &SessionState) -> String {
     lines.join("\n")
 }
 
-async fn mcp_servers_text(state: &SessionState) -> String {
-    let manager = state.mcp_manager.read().await;
+async fn mcp_servers_text(manager: &McpManagerHandle) -> String {
+    let manager = manager.read().await;
     if manager.connection_count() == 0 {
         return mcp_no_servers_text();
     }
@@ -2190,8 +1977,8 @@ async fn mcp_servers_text(state: &SessionState) -> String {
     lines.join("\n")
 }
 
-async fn mcp_tools_text(state: &SessionState, server: Option<&str>) -> String {
-    let manager = state.mcp_manager.read().await;
+async fn mcp_tools_text(manager: &McpManagerHandle, server: Option<&str>) -> String {
+    let manager = manager.read().await;
     if manager.connection_count() == 0 {
         return mcp_no_servers_text();
     }
@@ -2242,8 +2029,8 @@ async fn mcp_tools_text(state: &SessionState, server: Option<&str>) -> String {
     lines.join("\n")
 }
 
-async fn mcp_prompts_text(state: &SessionState) -> String {
-    let manager = state.mcp_manager.read().await;
+async fn mcp_prompts_text(manager: &McpManagerHandle) -> String {
+    let manager = manager.read().await;
     if manager.connection_count() == 0 {
         return mcp_no_servers_text();
     }
@@ -2288,8 +2075,8 @@ async fn mcp_prompts_text(state: &SessionState) -> String {
     lines.join("\n")
 }
 
-async fn mcp_resources_text(state: &SessionState) -> String {
-    let manager = state.mcp_manager.read().await;
+async fn mcp_resources_text(manager: &McpManagerHandle) -> String {
+    let manager = manager.read().await;
     if manager.connection_count() == 0 {
         return mcp_no_servers_text();
     }
@@ -2322,7 +2109,7 @@ async fn mcp_resources_text(state: &SessionState) -> String {
     lines.join("\n")
 }
 
-async fn mcp_read_text(state: &SessionState, spec: &str) -> String {
+async fn mcp_read_text(manager: &McpManagerHandle, spec: &str) -> String {
     let spec = spec.trim();
     let (server_name, uri) = match spec.split_once(':') {
         Some((server_name, uri)) if !server_name.is_empty() && !uri.is_empty() => {
@@ -2332,7 +2119,7 @@ async fn mcp_read_text(state: &SessionState, spec: &str) -> String {
     };
 
     let conn = {
-        let manager = state.mcp_manager.read().await;
+        let manager = manager.read().await;
         if manager.connection_count() == 0 {
             return mcp_no_servers_text();
         }
@@ -2358,9 +2145,9 @@ async fn mcp_read_text(state: &SessionState, spec: &str) -> String {
     }
 }
 
-async fn mcp_history_text(state: &SessionState) -> String {
+async fn mcp_history_text(manager: &McpManagerHandle) -> String {
     let connections = {
-        let manager = state.mcp_manager.read().await;
+        let manager = manager.read().await;
         if manager.connection_count() == 0 {
             return mcp_no_servers_text();
         }
@@ -2461,8 +2248,8 @@ fn mcp_builtin_tool_text(meta: &astra_turn_core::tool::registry::meta::ToolMeta)
     .join("\n")
 }
 
-async fn mcp_inspect_text(state: &SessionState, query: &str) -> String {
-    let manager = state.mcp_manager.read().await;
+async fn mcp_inspect_text(manager: &McpManagerHandle, query: &str) -> String {
+    let manager = manager.read().await;
     match crate::cli::slash::slash_mcp::resolve_protocol_tool_query(&manager, query) {
         Ok((server, tool)) => mcp_protocol_tool_text(server, tool),
         Err(protocol_error) => {
@@ -2476,39 +2263,70 @@ async fn mcp_inspect_text(state: &SessionState, query: &str) -> String {
     }
 }
 
-async fn mcp_ping_text(state: &SessionState, server: Option<&str>) -> String {
-    let manager = state.mcp_manager.read().await;
-    if manager.connection_count() == 0 {
-        return mcp_no_servers_text();
-    }
-
-    match server.map(str::trim).filter(|name| !name.is_empty()) {
-        Some(name) => match manager.ping(name).await {
-            Ok(duration) => format!("✓ {name}: {:.1}ms", duration.as_secs_f64() * 1000.0),
-            Err(error) => format!("✗ {name}: {error}"),
-        },
-        None => {
-            let mut results = manager.ping_all().await;
-            if results.is_empty() {
-                return "No MCP servers connected.".into();
-            }
-            results.sort_by(|a, b| a.0.cmp(&b.0));
-            results
-                .into_iter()
-                .map(|(name, result)| match result {
-                    Ok(duration) => format!("✓ {name}: {:.1}ms", duration.as_secs_f64() * 1000.0),
-                    Err(error) => format!("✗ {name}: {error}"),
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+async fn mcp_ping_text(manager: &McpManagerHandle, server: Option<&str>) -> String {
+    let requested = server.map(str::trim).filter(|name| !name.is_empty());
+    let connections = {
+        let manager = manager.read().await;
+        if manager.connection_count() == 0 {
+            return mcp_no_servers_text();
         }
+        match requested {
+            Some(name) => match manager.get(name) {
+                Some(connection) => vec![(name.to_string(), connection)],
+                None => {
+                    return format!(
+                        "Server '{name}' not found. Try `/mcp list` or `/mcp servers`."
+                    );
+                }
+            },
+            None => manager
+                .connected_servers()
+                .into_iter()
+                .filter_map(|name| {
+                    manager
+                        .get(name)
+                        .map(|connection| (name.to_string(), connection))
+                })
+                .collect::<Vec<_>>(),
+        }
+    };
+
+    let mut lines = Vec::with_capacity(connections.len());
+    for (name, connection) in connections {
+        let started = std::time::Instant::now();
+        match connection.ping().await {
+            Ok(()) => lines.push(format!(
+                "✓ {name}: {:.1}ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            )),
+            Err(error) => lines.push(format!("✗ {name}: {error}")),
+        }
+    }
+    lines.join("\n")
+}
+
+/// Execute one already-parsed MCP workbench read. This owns all manager
+/// contention and provider waits, and is deliberately invoked only by the
+/// event loop's background-read worker.
+pub(crate) async fn execute_mcp_read(manager: McpManagerHandle, action: McpReadAction) -> String {
+    match action {
+        McpReadAction::Help => mcp_help_text(&manager).await,
+        McpReadAction::Overview => mcp_overview_text(&manager).await,
+        McpReadAction::Servers => mcp_servers_text(&manager).await,
+        McpReadAction::Tools(server) => mcp_tools_text(&manager, server.as_deref()).await,
+        McpReadAction::Prompts => mcp_prompts_text(&manager).await,
+        McpReadAction::Resources => mcp_resources_text(&manager).await,
+        McpReadAction::Read(spec) => mcp_read_text(&manager, &spec).await,
+        McpReadAction::History => mcp_history_text(&manager).await,
+        McpReadAction::Inspect(query) => mcp_inspect_text(&manager, &query).await,
+        McpReadAction::Ping(server) => mcp_ping_text(&manager, server.as_deref()).await,
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigCommandRoute {
     Panel,
-    Fallback,
+    Unsupported,
 }
 
 fn config_command_route(args: &str) -> Result<ConfigCommandRoute, &'static str> {
@@ -2521,7 +2339,7 @@ fn config_command_route(args: &str) -> Result<ConfigCommandRoute, &'static str> 
     match sub {
         "edit" => Ok(ConfigCommandRoute::Panel),
         "show" | "paths" | "sources" | "diff" | "export" | "help" | "-h" | "--help" => {
-            Ok(ConfigCommandRoute::Fallback)
+            Ok(ConfigCommandRoute::Unsupported)
         }
         _ => Err("Usage: /config [edit|show|paths|sources|diff|export [path]]"),
     }
@@ -2533,7 +2351,21 @@ enum MemoryCommandRoute {
     Search(String),
     Stats,
     Health,
-    Fallback,
+    Session,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillCommandRoute {
+    Browse,
+    Unsupported,
+}
+
+fn skill_command_route(args: &str) -> SkillCommandRoute {
+    match args.trim() {
+        "" | "browse" | "list" => SkillCommandRoute::Browse,
+        _ => SkillCommandRoute::Unsupported,
+    }
 }
 
 fn memory_command_route(args: &str) -> Result<MemoryCommandRoute, &'static str> {
@@ -2548,51 +2380,106 @@ fn memory_command_route(args: &str) -> Result<MemoryCommandRoute, &'static str> 
         "search" if !rest.is_empty() => Ok(MemoryCommandRoute::Search(rest.to_string())),
         "stats" | "count" if rest.is_empty() => Ok(MemoryCommandRoute::Stats),
         "health" if rest.is_empty() => Ok(MemoryCommandRoute::Health),
-        _ => Ok(MemoryCommandRoute::Fallback),
+        "session" if rest.is_empty() => Ok(MemoryCommandRoute::Session),
+        _ => Ok(MemoryCommandRoute::Unsupported),
     }
 }
 
-fn inspect_command_supported(args: &str) -> Result<(), String> {
-    let sub = args.trim();
-    match sub {
-        "" => Ok(()),
-        "budget" | "tools" | "context" | "cache" | "json" | "diff" | "history" | "trace"
-        | "forensics" | "export" => Ok(()),
-        _ => Err(format!("Unknown `/inspect` subcommand: `{sub}`.")),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpCommandRoute {
+    Commands,
+    Keys,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryCommandRoute {
+    Transcript,
+    Unsupported,
+}
+
+fn history_command_route(args: &str) -> HistoryCommandRoute {
+    if args.trim().is_empty() {
+        HistoryCommandRoute::Transcript
+    } else {
+        HistoryCommandRoute::Unsupported
     }
+}
+
+fn help_command_route(args: &str) -> HelpCommandRoute {
+    match args.trim() {
+        "" => HelpCommandRoute::Commands,
+        "keys" => HelpCommandRoute::Keys,
+        _ => HelpCommandRoute::Unsupported,
+    }
+}
+
+/// Key bindings that are meaningful in the current workbench.  This is an
+/// action-oriented panel, not a dump of every editor binding: it answers the
+/// user's high-frequency questions about recovery, transcript navigation,
+/// agent work, and input control.
+fn keyboard_shortcut_pairs() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "Enter",
+            "send a message or run the selected slash action".into(),
+        ),
+        ("Shift+Enter", "insert a newline in the composer".into()),
+        (
+            "Ctrl+C",
+            "clear draft, interrupt a run, or quit when idle".into(),
+        ),
+        (
+            "Ctrl+O",
+            "open the live root transcript; close returns to the prior workspace".into(),
+        ),
+        (
+            "Ctrl+G",
+            "open the run navigator; Enter/Right opens the selected conversation".into(),
+        ),
+        (
+            "Shift+Left/Right",
+            "switch among open root and agent conversation workspaces".into(),
+        ),
+        (
+            "Ctrl+E",
+            "toggle transcript thinking/tool details; composer keeps line-end behavior".into(),
+        ),
+        (
+            "Alt+E",
+            "open the current composer draft in the external editor".into(),
+        ),
+        (
+            "Ctrl+R",
+            "when idle with an empty composer, restore the last user draft".into(),
+        ),
+        (
+            "Ctrl+B",
+            format!(
+                "{} promotes eligible foreground work to a background task",
+                crate::tui::background_shortcut::ctrl_b_background_shortcut()
+            ),
+        ),
+        (
+            "/ then Tab",
+            "browse and complete native workbench actions".into(),
+        ),
+        ("$", "browse available skills".into()),
+    ]
 }
 
 const CONTEXT_USAGE_MESSAGE: &str = "Usage: /context — open the context panel\n       /context dump [path] — write a JSON snapshot.";
 
 // ── /model subcommand helpers ───────────────────────────────────
 
-/// Sentinel prefix used by the `/session fork` picker to hand the
-/// chosen parent session id back to the main input loop.  The
-/// outer loop strips this prefix and runs `fork_local_session`
-/// with the remainder.  Lives here (co-located with the dispatcher
-/// that emits it) so `tui/mod.rs` can import it instead of
-/// duplicating the literal and silently drifting.
-pub(crate) const FORK_PICK_SENTINEL: &str = "__fork__\n";
-
-/// Sentinel prefix emitted by the model-name picker.  The outer
-/// loop (in `tui/mod.rs`) strips the prefix and decides whether to
-/// commit immediately or push a second picker for the model's
-/// thinking modes.  Kept public(crate) so the mod.rs arm can
-/// strip it symmetrically with the other sentinels.
-pub(crate) const MODEL_PICK_SENTINEL: &str = "__model_pick__\n";
 pub(crate) const MODEL_PICKER_FOOTER_HINT: &str =
     "Type to filter | Enter to choose | Some models then ask for thinking mode | Esc to go back";
-/// Sentinel prefix for the thinking-mode picker. Payload format is
-/// `__model_thinking__\n<base_model>\n<thinking_label>`.  The
-/// handler composes `base + thinking_suffix_for(label)` and sets
-/// `state.model`.
-pub(crate) const MODEL_THINKING_SENTINEL: &str = "__model_thinking__\n";
 pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
     "Type to filter | Enter to finish model selection | Esc to go back";
 
 /// `/model` with no args (or `list`) — fetch the catalog and push
-/// the picker.  The picker emits `MODEL_PICK_SENTINEL + <name>`; the
-/// outer loop then checks the model's `thinking_capability` and
+/// the picker. The typed result lets the outer loop check the model's
+/// `thinking_capability` and
 /// either commits or pushes a thinking-mode picker.
 /// True when an error string represents an Astra session auth failure.
 /// Matches both session-specific error patterns (via `is_astra_session_auth_error`)
@@ -2603,94 +2490,131 @@ fn is_astra_auth_error(msg: &str) -> bool {
         || msg.contains("request failed (401)")
 }
 
+/// Whether a slash submission asks to browse the model catalog. Kept separate
+/// from direct model selection so the event loop can fetch the catalog without
+/// borrowing its UI state across a network wait.
+pub(crate) fn is_model_picker_request(text: &str) -> bool {
+    let (command, args) = parse_slash(text);
+    matches!(command_registry::resolve_command(command), Ok("/model"))
+        && matches!(args.trim(), "" | "list")
+}
+
 /// Build the model picker view from a fetched model list and push it.
-fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) -> bool {
+///
+/// This is deliberately a synchronous UI projection: networking belongs to
+/// [`load_model_catalog`], so callers never have to hold the TUI loop while
+/// waiting for a remote catalog.
+pub(crate) fn push_model_picker(
+    state: &SessionState,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut crate::tui::chat_widget::ChatWidget,
+    models: Vec<String>,
+) -> bool {
     // Strip any `-thinking:*` suffix from the cached model when
     // highlighting the current row — the picker shows base names only,
     // and the suffix is re-applied by the thinking stage.
-    let current_raw = ctx.state.model.clone().unwrap_or_default();
+    let current_raw = state.model.clone().unwrap_or_default();
     let current_base = current_raw
         .split_once("-thinking:")
         .map(|(b, _)| b.to_string())
         .unwrap_or(current_raw);
     let items: Vec<SelectionItem> = models
-        .into_iter()
+        .iter()
         .map(|m| {
-            let is_current = m == current_base;
+            let is_current = *m == current_base;
             SelectionItem {
-                name: m,
+                name: m.clone(),
                 description: None,
                 is_current,
             }
         })
         .collect();
     if items.is_empty() {
-        ctx.show_info("No models available".into());
+        chat_widget.commit_system(SystemCell::info("No models available"));
         false
     } else {
         let view = ListSelectionView::new(items, Some("Select model:".into()))
             .with_footer_hint(MODEL_PICKER_FOOTER_HINT)
-            .with_result_prefix(MODEL_PICK_SENTINEL);
-        ctx.open_deferred_view("Opened model picker", Box::new(view));
+            .with_results(
+                models
+                    .into_iter()
+                    .map(|name| ViewResult::Model { name })
+                    .collect(),
+            );
+        chat_widget.commit_system(SystemCell::response("Opened model picker"));
+        bottom_pane.push_view(Box::new(view));
         true
     }
 }
 
-async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
+fn model_catalog_error_message(message: &str) -> String {
+    if is_astra_auth_error(message) {
+        "Not authorized — try /login first".into()
+    } else if message.contains("connect") || message.contains("timeout") {
+        "Cannot reach server — check connection".into()
+    } else {
+        format!(
+            "Failed to fetch models: {}",
+            message.lines().next().unwrap_or(message)
+        )
+    }
+}
+
+/// Fetch the full active model catalog, including provider and thinking
+/// metadata. The caller owns scheduling; this function is free of TUI
+/// references so it can run outside the input event loop.
+pub(crate) async fn load_model_catalog(
+    api: astra_thin_client::ThinClient,
+    profile: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
     let token =
-        crate::cli::session::session_runtime::fresh_access_token(ctx.api, ctx.profile).await;
-    match crate::cli::slash::slash_router::fetch_model_list(ctx.api, token.as_deref()).await {
-        Ok(models) => {
-            if push_model_picker(ctx, models) {
-                return SlashResult::Deferred;
+        crate::cli::session::session_runtime::fresh_access_token(&api, profile.as_deref()).await;
+    match crate::cli::slash::slash_router::fetch_model_list_raw(&api, token.as_deref()).await {
+        Ok(models) => Ok(models),
+        Err(error) => {
+            let message = error.to_string();
+            if !is_astra_auth_error(&message) {
+                return Err(model_catalog_error_message(&message));
             }
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if is_astra_auth_error(&msg) {
-                // Attempt silent token refresh + retry once. If the retry
-                // itself fails with a non-auth error (e.g. 5xx after refresh),
-                // surface that real error instead of the generic /login hint.
-                if crate::cli::session::session_runtime::attempt_token_refresh(ctx.api, ctx.profile)
-                    .await
+
+            if crate::cli::session::session_runtime::attempt_token_refresh(&api, profile.as_deref())
+                .await
+            {
+                let refreshed =
+                    crate::cli::session::session_runtime::current_access_token(profile.as_deref());
+                match crate::cli::slash::slash_router::fetch_model_list_raw(
+                    &api,
+                    refreshed.as_deref(),
+                )
+                .await
                 {
-                    let fresh =
-                        crate::cli::session::session_runtime::current_access_token(ctx.profile);
-                    match crate::cli::slash::slash_router::fetch_model_list(
-                        ctx.api,
-                        fresh.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(models) => {
-                            if push_model_picker(ctx, models) {
-                                return SlashResult::Deferred;
-                            }
-                            return SlashResult::Handled;
-                        }
-                        Err(retry_err) => {
-                            let retry_msg = retry_err.to_string();
-                            if !is_astra_auth_error(&retry_msg) {
-                                ctx.show_error(format!(
-                                    "Failed to fetch models: {}",
-                                    retry_msg.lines().next().unwrap_or(&retry_msg)
-                                ));
-                                return SlashResult::Handled;
-                            }
-                            // Still 401 after refresh — fall through to /login hint.
+                    Ok(models) => return Ok(models),
+                    Err(retry_error) => {
+                        let retry_message = retry_error.to_string();
+                        if !is_astra_auth_error(&retry_message) {
+                            return Err(model_catalog_error_message(&retry_message));
                         }
                     }
                 }
-                ctx.show_error("Not authorized — try /login first".into());
-            } else if msg.contains("connect") || msg.contains("timeout") {
-                ctx.show_error("Cannot reach server — check connection".into());
-            } else {
-                ctx.show_error(format!(
-                    "Failed to fetch models: {}",
-                    msg.lines().next().unwrap_or(&msg)
-                ));
+            }
+            Err("Not authorized — try /login first".into())
+        }
+    }
+}
+
+async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    match load_model_catalog(ctx.api.clone(), ctx.profile.map(str::to_string)).await {
+        Ok(models) => {
+            let names = models
+                .iter()
+                .filter_map(crate::cli::slash::slash_router::entry_model_name)
+                .map(ToOwned::to_owned)
+                .collect();
+            if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, names) {
+                return SlashResult::Deferred;
             }
         }
+        Err(error) => ctx.show_error(error),
     }
     SlashResult::Handled
 }
@@ -2838,49 +2762,101 @@ fn fmt_tokens(n: u64) -> String {
 
 // ── /session subcommand helpers ─────────────────────────────────
 
-/// `/session` with no args — push the session hub with a
-/// snapshot of the current session's vital stats and shortcut
-/// hints for the common flows (list / history / context /
-/// fork / export).
-fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
+/// Immutable input captured when `/session` is submitted. The background
+/// workspace read must never inspect a later re-bound `SessionState`.
+pub(crate) struct SessionHubSnapshot {
+    pub(crate) session_id: String,
+    turn: u32,
+    model: String,
+    total_cost: f64,
+    max_budget: f64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cache_read_tokens: u64,
+    permission: String,
+    explain: String,
+    skills: usize,
+    recent_tools: Option<String>,
+    run_id: Option<String>,
+    compactions: usize,
+    journal_path: Option<String>,
+    persistence_error: Option<String>,
+    cwd_fallback: String,
+}
+
+pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
+    let compactions = state
+        .observability_session
+        .as_ref()
+        .and_then(|observation| observation.try_read().ok())
+        .map(|observation| observation.compressed_turns.len())
+        .unwrap_or_default();
+    let cwd_fallback = std::env::current_dir()
+        .map(|path| tilde_session_path(&path.to_string_lossy()))
+        .unwrap_or_else(|_| "?".into());
+    SessionHubSnapshot {
+        session_id: state.session_id.clone().unwrap_or_default(),
+        turn: state.turn,
+        model: state.model.clone().unwrap_or_else(|| "—".into()),
+        total_cost: state.total_session_cost,
+        max_budget: state.max_budget_limit,
+        prompt_tokens: state.total_prompt_tokens,
+        completion_tokens: state.total_completion_tokens,
+        cache_read_tokens: state.total_cache_read_tokens,
+        permission: state.perm_manager.mode().to_string(),
+        explain: state.explain.to_string(),
+        skills: state.unified_skill_registry.len(),
+        recent_tools: (!state.recent_tools.is_empty()).then(|| {
+            state
+                .recent_tools
+                .iter()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        }),
+        run_id: state.run_id.clone(),
+        compactions,
+        journal_path: state
+            .journal
+            .as_ref()
+            .map(|journal| tilde_session_path(&journal.path().display().to_string())),
+        persistence_error: state.session_persistence_error.clone(),
+        cwd_fallback,
+    }
+}
+
+/// Build the session hub after its workspace read finishes. All live state was
+/// captured in [`SessionHubSnapshot`] at submit time, keeping a late result
+/// attributable to the session the user actually asked to inspect.
+pub(crate) fn session_hub_view(
+    snapshot: SessionHubSnapshot,
+    workspace: Result<Option<astra_services::session_workspace::WorkspaceMetadata>, String>,
+) -> crate::tui::bottom_pane::info_view::InfoView {
     use crate::tui::bottom_pane::info_view::InfoView;
-    use astra_services::session_workspace;
 
-    let sid = ctx.state.session_id.clone().unwrap_or_default();
-    let sid_short = if sid.len() > 8 {
-        &sid[..8]
-    } else {
-        sid.as_str()
-    };
-    let model = ctx.state.model.clone().unwrap_or_else(|| "—".into());
-    let cumulative_tokens = ctx
-        .state
-        .total_prompt_tokens
-        .saturating_add(ctx.state.total_completion_tokens);
-
+    let sid_short = &snapshot.session_id[..snapshot.session_id.len().min(8)];
+    let cumulative_tokens = snapshot
+        .prompt_tokens
+        .saturating_add(snapshot.completion_tokens);
     let mut pairs: Vec<(&str, String)> = vec![
         (
             "session id",
-            if sid.is_empty() {
+            if snapshot.session_id.is_empty() {
                 "— (no active session)".into()
             } else {
-                sid.clone()
+                snapshot.session_id.clone()
             },
         ),
-        ("turn", ctx.state.turn.to_string()),
-        ("model", model),
+        ("turn", snapshot.turn.to_string()),
+        ("model", snapshot.model.clone()),
     ];
 
-    // Workspace info (cwd, git, timestamps)
-    let (ws, workspace_error) = if sid.is_empty() {
-        (None, None)
-    } else {
-        match session_workspace::read_workspace_optional(&sid) {
-            Ok(workspace) => (workspace, None),
-            Err(error) => (None, Some(error)),
-        }
+    let (workspace, workspace_error) = match workspace {
+        Ok(workspace) => (workspace, None),
+        Err(error) => (None, Some(error)),
     };
-    if let Some(ref ws) = ws {
+    if let Some(ref ws) = workspace {
         pairs.push(("cwd", tilde_session_path(&ws.cwd)));
         let git_line = match (&ws.git_branch, &ws.git_head) {
             (Some(b), Some(h)) => format!("{b} @ {}", &h[..h.len().min(8)]),
@@ -2902,62 +2878,41 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
             "metadata unreadable; using live/journal state".into(),
         ));
     } else {
-        let cwd = std::env::current_dir()
-            .map(|p| tilde_session_path(&p.to_string_lossy()))
-            .unwrap_or_else(|_| "?".into());
-        pairs.push(("cwd", cwd));
+        pairs.push(("cwd", snapshot.cwd_fallback.clone()));
     }
-    if let Some(error) = session_hub_persistence_error(ctx.state, ws.as_ref()) {
+    if let Some(error) =
+        session_hub_persistence_error(snapshot.persistence_error.as_deref(), workspace.as_ref())
+    {
         pairs.push(("persistence", error));
     }
 
     // Live state
-    pairs.push(("cost", format!("${:.4}", ctx.state.total_session_cost)));
-    if ctx.state.max_budget_limit > 0.0 {
-        pairs.push(("budget", format!("${:.2}", ctx.state.max_budget_limit)));
+    pairs.push(("cost", format!("${:.4}", snapshot.total_cost)));
+    if snapshot.max_budget > 0.0 {
+        pairs.push(("budget", format!("${:.2}", snapshot.max_budget)));
     }
-    pairs.push(("prompt tokens", fmt_tokens(ctx.state.total_prompt_tokens)));
-    pairs.push((
-        "completion tokens",
-        fmt_tokens(ctx.state.total_completion_tokens),
-    ));
-    pairs.push((
-        "cache-read tokens",
-        fmt_tokens(ctx.state.total_cache_read_tokens),
-    ));
+    pairs.push(("prompt tokens", fmt_tokens(snapshot.prompt_tokens)));
+    pairs.push(("completion tokens", fmt_tokens(snapshot.completion_tokens)));
+    pairs.push(("cache-read tokens", fmt_tokens(snapshot.cache_read_tokens)));
     pairs.push(("total tokens", fmt_tokens(cumulative_tokens)));
 
     // Agent identity (from former /whoami)
-    pairs.push(("permission", format!("{}", ctx.state.perm_manager.mode())));
-    pairs.push(("explain", format!("{}", ctx.state.explain)));
-    pairs.push(("skills", ctx.state.unified_skill_registry.len().to_string()));
-    if !ctx.state.recent_tools.is_empty() {
-        let tools: String = ctx
-            .state
-            .recent_tools
-            .iter()
-            .take(6)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
+    pairs.push(("permission", snapshot.permission));
+    pairs.push(("explain", snapshot.explain));
+    pairs.push(("skills", snapshot.skills.to_string()));
+    if let Some(tools) = snapshot.recent_tools {
         pairs.push(("recent tools", tools));
     }
-    if let Some(ref rid) = ctx.state.run_id {
-        pairs.push(("run_id", rid.clone()));
+    if let Some(run_id) = snapshot.run_id {
+        pairs.push(("run_id", run_id));
     }
 
-    // Compaction + drift counters
-    if let Some(obs) = ctx.state.observability_session.as_ref() {
-        let guard = astra_core::sync_poison::recover_rwlock_read(&obs);
-        if !guard.compressed_turns.is_empty() {
-            pairs.push(("compactions", guard.compressed_turns.len().to_string()));
-        }
+    if snapshot.compactions > 0 {
+        pairs.push(("compactions", snapshot.compactions.to_string()));
     }
 
-    // Journal path
-    if let Some(ref j) = ctx.state.journal {
-        let jp = j.path().display().to_string();
-        pairs.push(("journal", tilde_session_path(&jp)));
+    if let Some(journal_path) = snapshot.journal_path {
+        pairs.push(("journal", journal_path));
     }
 
     // Action cheatsheet
@@ -2969,25 +2924,19 @@ fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {
     pairs.push(("/session fork", "branch a parallel session".into()));
     pairs.push(("/session export", "write markdown transcript".into()));
 
-    let title = if sid.is_empty() {
+    let title = if snapshot.session_id.is_empty() {
         "Session · no active session".to_string()
     } else {
         format!("Session · {sid_short}")
     };
-    ctx.open_view(
-        format!("Opened {title}"),
-        Box::new(InfoView::from_key_value(&title, pairs)),
-    );
-    SlashResult::Handled
+    InfoView::from_key_value(&title, pairs)
 }
 
 fn session_hub_persistence_error(
-    state: &crate::cli::session::session_state::SessionState,
+    state_error: Option<&str>,
     workspace: Option<&astra_services::session_workspace::WorkspaceMetadata>,
 ) -> Option<String> {
-    state
-        .session_persistence_error
-        .as_deref()
+    state_error
         .or_else(|| workspace.and_then(|ws| ws.last_persistence_error.as_deref()))
         .map(str::trim)
         .filter(|error| !error.is_empty())
@@ -3014,132 +2963,16 @@ fn tilde_session_path(abs: &str) -> String {
     abs.to_string()
 }
 
-/// `/session list` — same picker as `/resume`, but reached via
-/// the session namespace so the registry reads naturally.  Empty
-/// store → info message instead of a blank picker.
-async fn handle_session_list_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
-    use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
-    use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
-    let disco =
-        match tokio::task::spawn_blocking(|| SessionDiscovery::new(FsSessionSource::new(), 50))
-            .await
-        {
-            Ok(d) => d,
-            Err(error) => {
-                ctx.show_info(format!("session discovery failed: {error}"));
-                return SlashResult::Handled;
-            }
-        };
-    if disco.total() == 0 {
-        ctx.show_info("No previous sessions found.".into());
-        return SlashResult::Handled;
-    }
-    ctx.open_view(
-        "Opened session list",
-        Box::new(SessionPickerView::new(disco)),
-    );
-    SlashResult::Handled
-}
-
-fn handle_session_history_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
-    let sid = resolve_session_arg(ctx, arg);
-    let Some(sid) = sid else {
-        return SlashResult::Handled;
-    };
-    let events = match astra_services::session_journal::read_journal(&sid) {
-        Ok(events) => events,
-        Err(error) => {
-            ctx.show_error(format!("Failed to read journal: {error}"));
-            return SlashResult::Handled;
-        }
-    };
-    if events.is_empty() {
-        ctx.show_info(format!("No journal events for session {sid}."));
-        return SlashResult::Handled;
-    }
-    let sid_short = if sid.len() > 8 { &sid[..8] } else { &sid };
-    ctx.show_response(format!("Opened session history · {sid_short}"));
-    push_history_info(ctx, &sid, &events);
-    SlashResult::Handled
-}
-
-/// `/session fork` — interactive parent picker.  On Enter the
-/// picker emits `"__fork__\n<sid>"`; the outer loop recognises the
-/// sentinel and runs `fork_local_session`.  No args short-circuits
-/// through the picker; `/session fork <sid>` falls back to the
-/// line-mode handler (covers scripted use).
-async fn handle_session_fork_view(ctx: &mut DispatchContext<'_>) -> SlashResult {
-    use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
-    use crate::tui::session_picker::{FsSessionSource, SessionDiscovery};
-    let disco =
-        match tokio::task::spawn_blocking(|| SessionDiscovery::new(FsSessionSource::new(), 50))
-            .await
-        {
-            Ok(d) => d,
-            Err(error) => {
-                ctx.show_info(format!("session discovery failed: {error}"));
-                return SlashResult::Handled;
-            }
-        };
-    if disco.total() == 0 {
-        ctx.show_info("No previous sessions to fork from.".into());
-        return SlashResult::Handled;
-    }
-    ctx.open_view(
-        "Opened session fork picker",
-        Box::new(SessionPickerView::new(disco).with_result_prefix(FORK_PICK_SENTINEL)),
-    );
-    SlashResult::Handled
-}
-
-fn handle_session_analyze_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
-    // TUI-side analyze is a *summary* — counters only.  The full
-    // textual diagnostic (latency spikes, per-turn token shape,
-    // issue detection bullets) still lives in the line-mode
-    // printer.  Users who want the full thing get it via
-    // `/session analyze deep [id]` falling back through
-    // `SlashResult::Fallback`; we propagate the optional session
-    // id (`rest`) so the downstream handler can see
-    // `/session analyze deep <id>` verbatim.
-    let (flag, rest) = split_sub(arg);
-    if flag == "deep" {
-        // Expose the trailing id (if any) through a thread-local so
-        // the line-mode analyzer can recover the user's original
-        // intent without re-parsing the slash string.
-        let rest = rest.trim();
-        if !rest.is_empty() {
-            crate::cli::slash::slash_config::set_deep_analyze_arg(Some(rest.to_string()));
-        } else {
-            crate::cli::slash::slash_config::set_deep_analyze_arg(None);
-        }
-        return SlashResult::Fallback;
-    }
-    let Some(sid) = resolve_session_arg(ctx, arg) else {
-        return SlashResult::Handled;
-    };
-    push_analyze_summary(ctx, &sid);
-    SlashResult::Handled
-}
-
 /// Counter-only summary of a session journal — fast to compute
 /// (no workspace reads, no per-event allocation) so the InfoView
 /// renders instantly.  Users who want the deep report still get
 /// it via `/session analyze deep [id]`.
-fn push_analyze_summary(ctx: &mut DispatchContext<'_>, sid: &str) {
+pub(crate) fn session_analysis_view(
+    sid: &str,
+    events: &[astra_services::session_journal::JournalEvent],
+) -> crate::tui::bottom_pane::info_view::InfoView {
     use crate::tui::bottom_pane::info_view::InfoView;
     use astra_services::session_journal::JournalEventType;
-
-    let events = match astra_services::session_journal::read_journal(sid) {
-        Ok(e) => e,
-        Err(e) => {
-            ctx.show_error(format!("Failed to read journal: {e}"));
-            return;
-        }
-    };
-    if events.is_empty() {
-        ctx.show_info(format!("Session {sid} has no journal events."));
-        return;
-    }
 
     let mut turns = 0u32;
     let mut errors = 0u32;
@@ -3152,7 +2985,7 @@ fn push_analyze_summary(ctx: &mut DispatchContext<'_>, sid: &str) {
     let mut cache_creation_tokens = 0u64;
     let mut first_ts: Option<String> = None;
     let mut last_ts: Option<String> = None;
-    for ev in &events {
+    for ev in events {
         if first_ts.is_none() {
             first_ts = Some(ev.ts.clone());
         }
@@ -3207,48 +3040,58 @@ fn push_analyze_summary(ctx: &mut DispatchContext<'_>, sid: &str) {
     ));
 
     let sid_short = if sid.len() > 8 { &sid[..8] } else { sid };
-    ctx.open_view(
-        format!("Opened session analysis · {sid_short}"),
-        Box::new(InfoView::from_key_value(
-            &format!("Session analyze · {sid_short}"),
-            pairs,
-        )),
-    );
+    InfoView::from_key_value(&format!("Session analyze · {sid_short}"), pairs)
 }
 
-fn handle_session_export_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+async fn handle_session_export_view(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
     let Some(sid) = resolve_session_arg(ctx, arg) else {
         return SlashResult::Handled;
     };
-    let events = match astra_services::session_journal::read_journal(&sid) {
-        Ok(events) => events,
-        Err(e) => {
-            ctx.show_error(format!("Failed to read journal: {e}"));
-            return SlashResult::Handled;
+    let sid_for_export = sid.clone();
+    let export = tokio::task::spawn_blocking(move || {
+        let events = astra_services::session_journal::read_journal(&sid_for_export)
+            .map_err(|error| format!("Failed to read journal: {error}"))?;
+        if events.is_empty() {
+            return Ok(None);
         }
-    };
-    if events.is_empty() {
-        ctx.show_info(format!("Session {sid} has no journal events to export."));
-        return SlashResult::Handled;
-    }
-    let workspace = match astra_services::session_workspace::read_workspace_optional(&sid) {
-        Ok(workspace) => workspace,
-        Err(error) => {
-            ctx.show_info(format!(
-                "workspace.yaml is invalid; export omits workspace health metadata: {error}"
-            ));
-            None
+        let (workspace, workspace_warning) =
+            match astra_services::session_workspace::read_workspace_optional(&sid_for_export) {
+                Ok(workspace) => (workspace, None),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "workspace.yaml is invalid; export omits workspace health metadata: {error}"
+                    )),
+                ),
+            };
+        let markdown = crate::cli::slash::slash_session::build_export_markdown(
+            &sid_for_export,
+            workspace.as_ref(),
+            &events,
+        );
+        // Default path mirrors the line-mode exporter so scripts see the same
+        // artifact shape regardless of surface.
+        let path = format!(
+            "astra-session-{}.md",
+            chrono::Local::now().format("%Y%m%d-%H%M")
+        );
+        std::fs::write(&path, markdown)
+            .map_err(|error| format!("Failed to write {path}: {error}"))?;
+        Ok(Some((path, workspace_warning)))
+    })
+    .await;
+    match export {
+        Ok(Ok(Some((path, workspace_warning)))) => {
+            if let Some(warning) = workspace_warning {
+                ctx.show_info(warning);
+            }
+            ctx.show_response(format!("Exported {sid} → {path}"));
         }
-    };
-    let md =
-        crate::cli::slash::slash_session::build_export_markdown(&sid, workspace.as_ref(), &events);
-    let now = chrono::Local::now();
-    // Default path mirrors the legacy line-mode exporter so users
-    // with scripts expecting that filename shape keep working.
-    let path = format!("astra-session-{}.md", now.format("%Y%m%d-%H%M"));
-    match std::fs::write(&path, &md) {
-        Ok(_) => ctx.show_response(format!("Exported {sid} → {path}")),
-        Err(e) => ctx.show_error(format!("Failed to write {path}: {e}")),
+        Ok(Ok(None)) => {
+            ctx.show_info(format!("Session {sid} has no journal events to export."));
+        }
+        Ok(Err(error)) => ctx.show_error(error),
+        Err(error) => ctx.show_error(format!("Session export task failed: {error}")),
     }
     SlashResult::Handled
 }
@@ -3269,106 +3112,6 @@ fn resolve_session_arg(ctx: &mut DispatchContext<'_>, arg: &str) -> Option<Strin
     }
 }
 
-/// Render a session's conversation history into an InfoView.
-/// Keeps the logic tight: titles, user → assistant pairing,
-/// truncated previews.  Heavier browsing (drill, scroll) can be
-/// added later with a dedicated view.
-fn push_history_info(
-    ctx: &mut DispatchContext<'_>,
-    sid: &str,
-    events: &[astra_services::session_journal::JournalEvent],
-) {
-    use crate::tui::bottom_pane::info_view::InfoView;
-    use astra_services::session_journal::JournalEventType;
-    use ratatui::style::{Color, Modifier, Style};
-    use ratatui::text::{Line, Span};
-
-    let dim = Style::default().fg(Color::DarkGray);
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let role_user = Style::default().fg(crate::tui::theme::current().accent);
-    let role_assistant = Style::default().fg(Color::Green);
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for ev in events {
-        match ev.event_type {
-            JournalEventType::Turn => {
-                if let Some(user) = &ev.user_input {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  #{turn} ", turn = ev.turn.unwrap_or(0)), dim),
-                        Span::styled("user", role_user),
-                    ]));
-                    for row in truncate_rows(user, 3) {
-                        lines.push(Line::from(Span::styled(format!("    {row}"), bold)));
-                    }
-                }
-                if let Some(out) = &ev.assistant_output {
-                    lines.push(Line::from(Span::styled("       assistant", role_assistant)));
-                    for row in truncate_rows(out, 3) {
-                        lines.push(Line::from(Span::raw(format!("    {row}"))));
-                    }
-                }
-                lines.push(Line::default());
-            }
-            JournalEventType::Compact => {
-                lines.push(Line::from(Span::styled(
-                    format!("  ⚠ compaction at turn {}", ev.turn.unwrap_or(0)),
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-            _ => {}
-        }
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no user/assistant turns recorded in this journal)",
-            dim,
-        )));
-    }
-    let sid_short = if sid.len() > 8 { &sid[..8] } else { sid };
-    ctx.bottom_pane.push_view(Box::new(InfoView::new(
-        format!("Session history · {sid_short}"),
-        lines,
-    )));
-}
-
-/// Split `text` into `max` short rows. Trims whitespace, drops
-/// empty lines, caps each row at 76 chars.  Keeps the InfoView
-/// dense without wrapping surprises.
-fn truncate_rows(text: &str, max: usize) -> Vec<String> {
-    let mut rows: Vec<String> = Vec::new();
-    if max == 0 {
-        return rows;
-    }
-    let total_non_blank = text.lines().filter(|l| !l.trim().is_empty()).count();
-    let mut seen = 0usize;
-    for logical in text.lines() {
-        let trimmed = logical.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        seen += 1;
-        // Reserve the last slot for an overflow marker only when
-        // there is still *further* non-blank content after the
-        // current line.  `seen` counts lines already processed
-        // (including this one) so `total_non_blank - seen` is the
-        // true remainder.  This keeps the final allowed row when
-        // the source has exactly `max` non-blank lines instead of
-        // prematurely ellipsing it.
-        let remaining_after = total_non_blank.saturating_sub(seen);
-        if rows.len() + 1 >= max && remaining_after > 0 {
-            rows.push("…".into());
-            break;
-        }
-        if trimmed.chars().count() > 76 {
-            let short: String = trimmed.chars().take(75).collect();
-            rows.push(format!("{short}…"));
-        } else {
-            rows.push(trimmed.to_string());
-        }
-    }
-    rows
-}
-
 fn parse_slash(text: &str) -> (&str, &str) {
     let text = text.trim();
     match text.find(' ') {
@@ -3379,100 +3122,62 @@ fn parse_slash(text: &str) -> (&str, &str) {
 
 /// Render a filesystem path for the `/context` Environment row.
 /// Replaces `$HOME` with `~` so absolute paths stay short.
-fn display_path(path: &std::path::Path) -> String {
-    let s = path.display().to_string();
-    if let Ok(home) = std::env::var("HOME") {
-        if let Some(rest) = s.strip_prefix(&home) {
-            return format!("~{rest}");
-        }
-    }
-    s
+/// Context inspection consumes the footer's last confirmed environment
+/// observation. Refreshing it belongs to the regular environment refresh
+/// path, not a user-input dispatch branch.
+fn context_environment_from_footer(
+    footer: &crate::tui::bottom_pane::footer::Footer,
+) -> (Option<String>, Option<String>) {
+    (footer.cwd.clone(), footer.git_branch.clone())
 }
 
-/// Detect current git branch via `gix`. Returns `None` when the cwd
-/// isn't a git repo, in detached HEAD, or on any I/O error — in any
-/// of those cases the Environment row falls back to just the cwd.
-///
-/// Cached process-wide so a flurry of slash commands doesn't spawn
-/// repeat `gix::discover` walks. See `crate::git_branch_cache`.
-fn detect_git_branch() -> Option<String> {
-    crate::git_branch_cache::detect_git_branch_cached()
-}
-
-/// Locate the user-rules directory under `~/.astra/rules/`, if
-/// present.  Returns the home-shortened path via `display_path`
-/// so the snapshot already reads like `~/.astra/rules`.  `None`
-/// when the directory doesn't exist.
-fn find_user_rules_path() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let p = std::path::PathBuf::from(&home).join(".astra/rules");
-    if p.exists() {
-        return Some(display_path(&p));
-    }
-    None
-}
-
-/// Build a `turn_index → one-line preview` map from the chat
-/// widget's committed scrollback.  Turn indices come from the
-/// trace side of the API, but the trace doesn't store text — we
-/// use the cell position within each user-turn as the index.
-///
-/// The mapping is heuristic (cells don't carry a turn id) but
-/// matches the common case: each user/assistant pair is one turn.
-fn collect_history_text(
+/// Collect user-visible conversation cells as local evidence. This vector is
+/// intentionally not keyed by `ContextAssemblyTrace::turn_index`: the trace
+/// represents exact prompt groups, while the TUI transcript represents
+/// rendered cells and may have a different shape after resume, tool activity,
+/// or server-side compaction.
+fn collect_visible_conversation(
     chat: &crate::tui::chat_widget::ChatWidget,
-) -> (
-    std::collections::HashMap<u32, String>,
-    std::collections::HashMap<u32, String>,
-) {
+) -> Vec<crate::tui::context_panel::model::VisibleConversationItem> {
     use crate::tui::history_cell::{
         assistant::AssistantCell, reasoning::ReasoningCell, user::UserCell,
     };
-    let mut previews: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
-    let mut bodies: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
-    // Walk history cells; each user cell advances the turn index.
-    // For both preview (one-line) and body (full text) we follow
-    // the same priority: user message wins; otherwise assistant
-    // reply for that turn; otherwise reasoning text as last resort.
-    let mut turn_idx: u32 = 0;
-    let record = |idx: u32,
-                  text: &str,
-                  previews: &mut std::collections::HashMap<u32, String>,
-                  bodies: &mut std::collections::HashMap<u32, String>,
-                  force: bool| {
-        if text.trim().is_empty() {
-            return;
-        }
-        if force || !previews.contains_key(&idx) {
-            let p = one_line_preview(text);
-            if !p.is_empty() {
-                previews.insert(idx, p);
-            }
-        }
-        if force || !bodies.contains_key(&idx) {
-            bodies.insert(idx, text.to_string());
-        }
-    };
+    let mut visible = Vec::new();
     for cell in chat.history() {
         let any = cell.as_any_ref();
         if let Some(u) = any.downcast_ref::<UserCell>() {
-            record(turn_idx, u.text(), &mut previews, &mut bodies, true);
-            turn_idx = turn_idx.saturating_add(1);
+            let body = u.text();
+            let preview = one_line_preview(body);
+            if !preview.is_empty() {
+                visible.push(crate::tui::context_panel::model::VisibleConversationItem {
+                    role: "user".into(),
+                    preview,
+                    body: body.to_string(),
+                });
+            }
         } else if let Some(a) = any.downcast_ref::<AssistantCell>() {
-            if turn_idx == 0 {
-                continue;
+            let body = a.source();
+            let preview = one_line_preview(body);
+            if !preview.is_empty() {
+                visible.push(crate::tui::context_panel::model::VisibleConversationItem {
+                    role: "assistant".into(),
+                    preview,
+                    body: body.to_string(),
+                });
             }
-            let slot = turn_idx.saturating_sub(1);
-            record(slot, a.source(), &mut previews, &mut bodies, false);
         } else if let Some(r) = any.downcast_ref::<ReasoningCell>() {
-            if turn_idx == 0 {
-                continue;
+            let body = r.text();
+            let preview = one_line_preview(body);
+            if !preview.is_empty() {
+                visible.push(crate::tui::context_panel::model::VisibleConversationItem {
+                    role: "reasoning".into(),
+                    preview,
+                    body: body.to_string(),
+                });
             }
-            let slot = turn_idx.saturating_sub(1);
-            record(slot, r.text(), &mut previews, &mut bodies, false);
         }
     }
-    (previews, bodies)
+    visible
 }
 
 fn one_line_preview(text: &str) -> String {
@@ -3516,272 +3221,81 @@ fn handle_context_dump(arg: &str, ctx: &mut DispatchContext<'_>) -> SlashResult 
 }
 
 // ── /inspect dispatch ────────────────────────────────────────────────
-//
-// Routes `/inspect` subcommands. Until the dedicated TUI panel ships,
-// all supported forms fall back to the text renderer immediately so the
-// command still executes instead of being bounced back into the composer.
-async fn handle_inspect_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
-    match inspect_command_supported(args) {
-        Ok(()) => SlashResult::Fallback,
-        Err(message) => {
-            ctx.show_error(message);
-            SlashResult::Handled
-        }
+fn handle_inspect_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+    if !args.trim().is_empty() {
+        ctx.show_error("Usage: /inspect".to_string());
+        return SlashResult::Handled;
     }
+
+    use crate::tui::bottom_pane::info_view::InfoView;
+    let inspection = crate::cli::slash::slash_inspect::inspect_workbench(ctx.state);
+    ctx.open_view(
+        "Opened runtime inspector",
+        Box::new(
+            InfoView::from_inspection("Runtime Inspector", inspection)
+                .with_primary_workspace()
+                .with_reopen("/inspect"),
+        ),
+    );
+    SlashResult::Handled
 }
 
-#[cfg(test)]
-mod blocking_io_guard_tests {
-    /// Source-level guard: every slash command that loads from disk must do
-    /// it on a blocking thread. Specifically, the three known offenders —
-    /// `/timeline`, `/worktrees`, the SessionDiscovery used by `/resume`
-    /// and `/session list|fork` — must each appear in a `spawn_blocking`
-    /// closure. This test catches accidental regressions where someone
-    /// inlines a sync filesystem call back onto the runtime thread (which
-    /// freezes the TUI for hundreds of ms on long sessions).
-    #[test]
-    fn known_blocking_paths_are_wrapped_in_spawn_blocking() {
-        let source = include_str!("slash_dispatch.rs");
+// ── /reflect dispatch ───────────────────────────────────────────────
+fn handle_reflect_dispatch(args: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::cli::session::session_runtime::current_access_token;
+    use crate::cli::slash::slash_state::{is_reflect_diff_request, render_reflect_diff};
+    use crate::tui::bottom_pane::info_view::InfoView;
 
-        // /worktrees: the parse(porcelain) + list_sessions_by_git_root
-        // bundle must happen on a blocking thread. Look for the
-        // distinctive `list_sessions_by_git_root` call appearing inside
-        // a `spawn_blocking` block.
-        let worktrees_idx = source
-            .find("\"/worktrees\"")
-            .expect("/worktrees handler must exist");
-        let worktrees_block_end = worktrees_idx
-            + source[worktrees_idx..]
-                .find("\n        }")
-                .expect("/worktrees handler must close");
-        let worktrees_block = &source[worktrees_idx..worktrees_block_end];
-        assert!(
-            worktrees_block.contains("spawn_blocking"),
-            "/worktrees handler must wrap fs IO in spawn_blocking"
-        );
-        assert!(
-            worktrees_block.contains("list_sessions_by_git_root"),
-            "/worktrees handler should still enrich entries with session count"
-        );
-
-        // /timeline must build Timeline on a blocking thread.
-        let timeline_idx = source
-            .find("\"/timeline\"")
-            .expect("/timeline handler must exist");
-        let timeline_block_end = timeline_idx
-            + source[timeline_idx..]
-                .find("\n        }")
-                .expect("/timeline handler must close");
-        let timeline_block = &source[timeline_idx..timeline_block_end];
-        assert!(
-            timeline_block.contains("spawn_blocking"),
-            "/timeline handler must wrap Timeline::new in spawn_blocking"
-        );
-
-        // SessionDiscovery::new must always be called inside spawn_blocking.
-        // Allow the test snapshot blocks themselves to call it directly.
-        for (idx, _) in source.match_indices("SessionDiscovery::new(") {
-            let preceding = &source[..idx];
-            let last_512 = if preceding.len() > 512 {
-                &preceding[preceding.len() - 512..]
-            } else {
-                preceding
-            };
-            assert!(
-                last_512.contains("spawn_blocking"),
-                "SessionDiscovery::new at byte {idx} must be inside a spawn_blocking closure"
-            );
-        }
-    }
-
-    #[test]
-    fn allow_dispatch_uses_shared_permission_parser() {
-        let source = include_str!("slash_dispatch.rs");
-        let start = source
-            .find("\"/allow\" => {")
-            .expect("/allow handler must exist");
-        let end = start
-            + source[start..]
-                .find("\n        \"/instructions\"")
-                .expect("/allow handler must close before /instructions");
-        let allow_block = &source[start..end];
-
-        assert!(allow_block.contains("parse_permission_command(args)"));
-        for legacy in [
-            "\"all\"",
-            "\"default\"",
-            "\"ask\"",
-            "\"status\"",
-            "\"accept-edits\"",
-        ] {
-            assert!(
-                !allow_block.contains(legacy),
-                "/allow dispatch must not reintroduce legacy token branch {legacy}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod panels_tests {
-    use super::build_panels_cheat_sheet_lines;
-
-    #[test]
-    fn cheat_sheet_lists_every_tui_native_panel() {
-        let text = build_panels_cheat_sheet_lines().join("\n");
-        for cmd in ["/resume", "/context", "/timeline", "/table", "/worktrees"] {
-            assert!(text.contains(cmd), "cheat sheet missing {cmd}; got: {text}");
-        }
-    }
-
-    #[test]
-    fn cheat_sheet_shows_key_hints() {
-        let text = build_panels_cheat_sheet_lines().join("\n");
-        assert!(text.contains("↑"));
-        assert!(text.contains("Esc"));
-    }
-
-    #[test]
-    fn cheat_sheet_has_stable_snapshot() {
-        crate::tui::testing::assert_tui_snapshot!(
-            "panels_cheat_sheet",
-            build_panels_cheat_sheet_lines().join("\n")
-        );
-    }
-
-    #[test]
-    fn config_entry_lists_all_subcommands() {
-        let text = build_panels_cheat_sheet_lines().join("\n");
-        // The /config entry MUST mention each subcommand so users
-        // discover show / paths / sources / diff / export.
-        for sub in &["show", "paths", "sources", "diff", "export"] {
-            assert!(
-                text.contains(sub),
-                "cheat sheet /config entry missing subcommand: {sub}"
-            );
-        }
-    }
-
-    #[test]
-    fn memory_entry_lists_all_subcommands() {
-        let text = build_panels_cheat_sheet_lines().join("\n");
-        // The /memory entry MUST mention list / search / inspect
-        // so users discover they can search and inspect memories.
-        for sub in &["list", "search", "inspect"] {
-            assert!(
-                text.contains(sub),
-                "cheat sheet /memory entry missing subcommand: {sub}"
-            );
-        }
-    }
-
-    #[test]
-    fn info_entry_shows_system_info() {
-        let text = build_panels_cheat_sheet_lines().join("\n");
-        assert!(text.contains("/info"), "cheat sheet missing /info");
-        // The /info entry should mention key system details.
-        for kw in &["version", "model", "session", "skills"] {
-            assert!(
-                text.contains(kw),
-                "cheat sheet /info entry missing keyword: {kw}"
-            );
-        }
-    }
-
-    #[test]
-    fn session_hub_view_emits_transcript_response() {
-        let source = include_str!("slash_dispatch.rs");
-        let start = source
-            .find("fn handle_session_hub(ctx: &mut DispatchContext<'_>) -> SlashResult {")
-            .expect("handle_session_hub must exist");
-        let end = source[start..]
-            .find("fn session_hub_persistence_error(")
-            .map(|offset| start + offset)
-            .expect("session hub helper should end before session_hub_persistence_error");
-        let body = &source[start..end];
-        assert!(
-            body.contains("ctx.open_view("),
-            "/session should emit a transcript response before opening the hub"
-        );
-    }
-
-    #[test]
-    fn session_views_emit_transcript_responses() {
-        let source = include_str!("slash_dispatch.rs");
-
-        fn body_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-            let start_idx = source.find(start).expect(start);
-            let end_idx = source[start_idx..]
-                .find(end)
-                .map(|offset| start_idx + offset)
-                .expect(end);
-            &source[start_idx..end_idx]
-        }
-
-        for (name, body, needles) in [
-            (
-                "session list",
-                body_between(
-                    source,
-                    "async fn handle_session_list_view",
-                    "fn handle_session_history_view",
-                ),
-                &["ctx.open_view(", "Opened session list"][..],
+    if is_reflect_diff_request(args) {
+        let body = render_reflect_diff(ctx.state);
+        let lines = body.lines().map(str::to_owned).collect();
+        ctx.open_view(
+            "Opened session reflection delta",
+            Box::new(
+                InfoView::from_plain("Reflection · Session Delta", lines).with_primary_workspace(),
             ),
-            (
-                "session history",
-                body_between(
-                    source,
-                    "fn handle_session_history_view",
-                    "async fn handle_session_fork_view",
-                ),
-                &["ctx.show_response(", "Opened session history"][..],
-            ),
-            (
-                "session fork",
-                body_between(
-                    source,
-                    "async fn handle_session_fork_view",
-                    "fn handle_session_analyze_view",
-                ),
-                &["ctx.open_view(", "Opened session fork picker"][..],
-            ),
-            (
-                "session analysis",
-                body_between(
-                    source,
-                    "fn push_analyze_summary",
-                    "fn handle_session_export_view",
-                ),
-                &["ctx.open_view(", "Opened session analysis"][..],
-            ),
-        ] {
-            for needle in needles {
-                assert!(
-                    body.contains(needle),
-                    "{name} slash command must emit a transcript response: missing {needle}"
-                );
-            }
-        }
-        for needle in ["ctx.open_view(", "ctx.show_response("] {
-            assert!(
-                source.contains(needle),
-                "session view slash commands must emit transcript responses: missing {needle}"
-            );
-        }
+        );
+        return SlashResult::Handled;
     }
+
+    let Some(session_id) = ctx
+        .state
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.trim().is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        ctx.show_error("Reflect needs an active session.".into());
+        return SlashResult::Handled;
+    };
+    ctx.show_response("Loading session reflection…".into());
+    SlashResult::background_read(SlashBackgroundRead::Reflection {
+        session_id,
+        api: ctx.api.clone(),
+        profile: ctx.profile.map(str::to_owned),
+        token: current_access_token(ctx.profile),
+        args: args.to_owned(),
+    })
 }
 
 #[cfg(test)]
 mod routing_tests {
     use super::{
-        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, MODEL_PICKER_FOOTER_HINT,
-        MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute, config_command_route,
-        inspect_command_supported, memory_command_route,
+        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, HelpCommandRoute, HistoryCommandRoute,
+        MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute,
+        SkillCommandRoute, config_command_route, context_breakdown_for_panel, help_command_route,
+        history_command_route, is_model_picker_request, keyboard_shortcut_pairs,
+        memory_command_route, skill_command_route,
     };
+    use crate::cli::session::session_state::SessionState;
+    use crate::tui::context_panel::{
+        ContextSnapshot,
+        model::{SessionSummary, VisibleConversationItem},
+    };
+    use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 
     #[test]
-    fn config_route_keeps_read_only_forms_on_text_path() {
+    fn config_route_marks_non_editor_forms_unavailable_in_tui() {
         for form in [
             "show",
             "paths",
@@ -3792,8 +3306,8 @@ mod routing_tests {
         ] {
             assert_eq!(
                 config_command_route(form),
-                Ok(ConfigCommandRoute::Fallback),
-                "{form} should keep the text fallback behavior"
+                Ok(ConfigCommandRoute::Unsupported),
+                "{form} has no native editor action"
             );
         }
     }
@@ -3805,13 +3319,46 @@ mod routing_tests {
     }
 
     #[test]
+    fn help_keys_is_a_native_keyboard_shortcut_surface() {
+        assert_eq!(help_command_route(""), HelpCommandRoute::Commands);
+        assert_eq!(help_command_route(" keys "), HelpCommandRoute::Keys);
+        assert_eq!(
+            help_command_route("commands"),
+            HelpCommandRoute::Unsupported
+        );
+
+        let bindings = keyboard_shortcut_pairs();
+        assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+O"));
+        assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+G"));
+        assert!(bindings.iter().any(|(key, _)| *key == "Ctrl+E"));
+    }
+
+    #[test]
+    fn history_routes_only_to_the_canonical_transcript_workspace() {
+        assert_eq!(history_command_route(""), HistoryCommandRoute::Transcript);
+        assert_eq!(
+            history_command_route(" grep old text "),
+            HistoryCommandRoute::Unsupported
+        );
+    }
+
+    #[test]
     fn model_picker_footer_warns_about_thinking_follow_up() {
         assert!(MODEL_PICKER_FOOTER_HINT.contains("thinking mode"));
         assert!(MODEL_THINKING_PICKER_FOOTER_HINT.contains("finish model selection"));
     }
 
     #[test]
-    fn memory_route_uses_panel_for_list_search_and_fallback_for_full_domain_commands() {
+    fn model_catalog_request_matches_only_picker_forms() {
+        assert!(is_model_picker_request("/model"));
+        assert!(is_model_picker_request("/model list"));
+        assert!(!is_model_picker_request("/model info"));
+        assert!(!is_model_picker_request("/model gpt-5"));
+        assert!(!is_model_picker_request("/context"));
+    }
+
+    #[test]
+    fn memory_route_keeps_discovery_actions_native_and_marks_the_rest_unsupported() {
         assert_eq!(memory_command_route(""), Ok(MemoryCommandRoute::List));
         assert_eq!(memory_command_route("list"), Ok(MemoryCommandRoute::List));
         assert_eq!(memory_command_route("ls"), Ok(MemoryCommandRoute::List));
@@ -3821,15 +3368,15 @@ mod routing_tests {
         );
         assert_eq!(
             memory_command_route("show mem_123"),
-            Ok(MemoryCommandRoute::Fallback)
+            Ok(MemoryCommandRoute::Unsupported)
         );
         assert_eq!(
             memory_command_route("inspect mem_123"),
-            Ok(MemoryCommandRoute::Fallback)
+            Ok(MemoryCommandRoute::Unsupported)
         );
         assert_eq!(
             memory_command_route("search"),
-            Ok(MemoryCommandRoute::Fallback)
+            Ok(MemoryCommandRoute::Unsupported)
         );
         assert_eq!(memory_command_route("stats"), Ok(MemoryCommandRoute::Stats));
         assert_eq!(
@@ -3838,27 +3385,26 @@ mod routing_tests {
         );
         assert_eq!(
             memory_command_route("session"),
-            Ok(MemoryCommandRoute::Fallback)
+            Ok(MemoryCommandRoute::Session)
         );
         assert_eq!(
             memory_command_route("help"),
-            Ok(MemoryCommandRoute::Fallback)
+            Ok(MemoryCommandRoute::Unsupported)
         );
     }
 
     #[test]
-    fn inspect_route_accepts_known_subcommands_and_rejects_unknown_ones() {
-        for form in [
-            "", "budget", "tools", "context", "cache", "json", "diff", "history", "trace",
-        ] {
-            assert!(
-                inspect_command_supported(form).is_ok(),
-                "{form} should be accepted"
-            );
-        }
+    fn skill_route_only_advertises_the_native_browser() {
+        assert_eq!(skill_command_route(""), SkillCommandRoute::Browse);
+        assert_eq!(skill_command_route("browse"), SkillCommandRoute::Browse);
+        assert_eq!(skill_command_route("list"), SkillCommandRoute::Browse);
         assert_eq!(
-            inspect_command_supported("mystery"),
-            Err("Unknown `/inspect` subcommand: `mystery`.".into())
+            skill_command_route("install demo"),
+            SkillCommandRoute::Unsupported
+        );
+        assert_eq!(
+            skill_command_route("info demo"),
+            SkillCommandRoute::Unsupported
         );
     }
 
@@ -3869,36 +3415,97 @@ mod routing_tests {
             "Usage: /context — open the context panel\n       /context dump [path] — write a JSON snapshot."
         );
     }
-}
 
-#[cfg(test)]
-mod mcp_ux_tests {
-    use super::{mcp_help_text, mcp_no_servers_text};
+    #[test]
+    fn context_panel_uses_committed_trace_when_observability_ring_is_empty() {
+        let mut state = SessionState::default();
+        state.latest_context_assembly_trace = Some(ContextAssemblyTrace {
+            turn_id: "turn-7".into(),
+            token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
+                max_tokens: 100_000,
+                system_prompt_tokens: 5_000,
+                history_tokens: 12_000,
+                tool_schema_tokens: 3_000,
+                user_message_tokens: 200,
+                total_used: 20_200,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut snapshot = ContextSnapshot::default();
 
-    #[tokio::test]
-    async fn mcp_help_mentions_core_commands() {
-        let state = crate::cli::session::session_state::SessionState::default();
-        let text = mcp_help_text(&state).await;
-        assert!(text.contains("/mcp list"), "missing list help: {text}");
-        assert!(text.contains("/mcp tools"), "missing tools help: {text}");
-        assert!(text.contains("/mcp read"), "missing read help: {text}");
+        let breakdown = context_breakdown_for_panel(&state, &mut snapshot);
+
+        assert_eq!(breakdown.limit, 100_000);
+        assert_eq!(breakdown.total_used, 20_200);
         assert!(
-            text.contains("/mcp inspect"),
-            "missing inspect help: {text}"
+            breakdown
+                .categories
+                .iter()
+                .any(|category| category.tokens == 12_000)
         );
     }
 
     #[test]
-    fn mcp_no_servers_text_guides_user_to_add_then_list() {
-        let text = mcp_no_servers_text();
-        assert!(text.contains("/mcp add"), "missing add guidance: {text}");
-        assert!(text.contains("/mcp list"), "missing list guidance: {text}");
+    fn context_panel_keeps_session_and_history_visible_without_a_trace() {
+        let mut state = SessionState::default();
+        state.session_id = Some("session-context".into());
+        state.turn = 3;
+        state.model = Some("model-x".into());
+        state.total_prompt_tokens = 1_200;
+        state.total_completion_tokens = 600;
+        let mut snapshot = ContextSnapshot::default();
+        snapshot.session = Some(SessionSummary {
+            session_id: "session-context".into(),
+            turn: 3,
+            model: Some("model-x".into()),
+            total_cost: 0.01,
+            max_budget: 1.0,
+            prompt_tokens: 1_200,
+            completion_tokens: 600,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            request_context: None,
+            continuation_anchor: None,
+            queued_message: None,
+            diagnostics_context: None,
+            read_activity: Default::default(),
+        });
+        snapshot.visible_conversation.push(VisibleConversationItem {
+            role: "user".into(),
+            preview: "first request".into(),
+            body: "first request\nfull body".into(),
+        });
+
+        let breakdown = context_breakdown_for_panel(&state, &mut snapshot);
+
+        assert_eq!(breakdown.limit, 0, "do not fabricate a prompt budget");
+        assert!(breakdown.categories.is_empty());
+        assert!(breakdown.session_summary.is_some());
+        assert_eq!(breakdown.history.retained, 1);
+        assert_eq!(breakdown.history.turns[0].preview, "first request");
+        assert!(breakdown.has_observable_data());
+    }
+
+    #[test]
+    fn context_environment_uses_the_latest_footer_observation() {
+        let mut footer = crate::tui::bottom_pane::footer::Footer::new();
+        footer.cwd = Some("~/work/astra".into());
+        footer.git_branch = Some("feature/workbench".into());
+
+        assert_eq!(
+            super::context_environment_from_footer(&footer),
+            (
+                Some("~/work/astra".into()),
+                Some("feature/workbench".into())
+            )
+        );
     }
 }
 
 #[cfg(test)]
 mod context_history_tests {
-    use super::{collect_history_text, one_line_preview};
+    use super::{collect_visible_conversation, one_line_preview};
     use crate::tui::chat_widget::ChatWidget;
     use crate::tui::turn_event::{SystemLevel, TurnEvent};
 
@@ -3914,7 +3521,7 @@ mod context_history_tests {
     }
 
     #[test]
-    fn collect_history_text_ignores_assistant_without_user_anchor() {
+    fn visible_conversation_keeps_unpaired_rendered_cells_without_faking_turn_identity() {
         let mut chat = ChatWidget::new("");
         chat.replay(vec![
             TurnEvent::Assistant {
@@ -3928,16 +3535,15 @@ mod context_history_tests {
             },
         ]);
 
-        let (previews, bodies) = collect_history_text(&chat);
+        let visible = collect_visible_conversation(&chat);
 
-        assert!(
-            previews.is_empty() && bodies.is_empty(),
-            "assistant/reasoning cells before the first user turn must not create a fake turn 0"
-        );
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].role, "assistant");
+        assert_eq!(visible[1].role, "reasoning");
     }
 
     #[test]
-    fn collect_history_text_skips_system_cells_and_keeps_turn_indices_aligned() {
+    fn visible_conversation_keeps_real_roles_and_excludes_system_cells() {
         let mut chat = ChatWidget::new("");
         chat.replay(vec![
             TurnEvent::User {
@@ -3959,31 +3565,35 @@ mod context_history_tests {
             },
         ]);
 
-        let (previews, bodies) = collect_history_text(&chat);
+        let visible = collect_visible_conversation(&chat);
 
-        assert_eq!(previews.get(&0).map(String::as_str), Some("first user"));
-        assert_eq!(bodies.get(&0).map(String::as_str), Some("first user"));
-        assert_eq!(previews.get(&1).map(String::as_str), Some("second user"));
-        assert_eq!(bodies.get(&1).map(String::as_str), Some("second user"));
+        assert_eq!(visible.len(), 3);
+        assert_eq!(visible[0].role, "user");
+        assert_eq!(visible[0].body, "first user");
+        assert_eq!(visible[1].role, "assistant");
+        assert_eq!(visible[1].body, "assistant answer");
+        assert_eq!(visible[2].role, "user");
+        assert_eq!(visible[2].body, "second user");
         assert!(
-            previews
-                .values()
-                .chain(bodies.values())
-                .all(|text| !text.contains("system note")),
-            "system cells should not pollute turn previews or bodies"
+            visible
+                .iter()
+                .all(|item| item.body != "system note should not appear in context history"),
+            "system cells should not pollute visible conversation evidence"
         );
     }
 }
 
 #[cfg(test)]
 mod view_result_tests {
-    use super::{handle_view_result, next_permission_mode_for_cycle};
+    use super::handle_view_result;
     use crate::cli::permission_manager::PermissionMode;
     use crate::cli::session::session_state::SessionState;
     use crate::tui::bottom_pane::BottomPane;
+    use crate::tui::bottom_pane::view::{BottomPaneView, SessionSelectionIntent, ViewResult};
     use crate::tui::chat_widget::ChatWidget;
     use crate::tui::history_cell::system::SystemCell;
     use astra_runtime::plan;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn last_system_message(widget: &ChatWidget) -> Option<String> {
         widget
@@ -3994,13 +3604,102 @@ mod view_result_tests {
     }
 
     #[test]
+    fn permission_picker_returns_a_typed_selected_mode() {
+        let mut picker = super::build_permission_mode_picker(PermissionMode::Prompt);
+        picker.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            picker.completion().and_then(|completion| completion.result),
+            Some(ViewResult::Permission(PermissionMode::AcceptEdits))
+        );
+    }
+
+    #[test]
+    fn bypass_selection_requires_a_separate_typed_confirmation() {
+        let mut state = SessionState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result(
+            ViewResult::Permission(PermissionMode::Bypass),
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
+
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Prompt);
+        assert!(bottom_pane.has_active_view());
+    }
+
+    #[test]
+    fn bypass_confirmation_has_typed_keep_and_apply_outcomes() {
+        let mut confirmation = super::build_permission_mode_confirmation(PermissionMode::Bypass);
+        confirmation.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            confirmation
+                .completion()
+                .and_then(|completion| completion.result),
+            Some(ViewResult::PermissionConfirmation {
+                mode: PermissionMode::Bypass,
+                confirmed: false,
+            })
+        );
+
+        let mut confirmation = super::build_permission_mode_confirmation(PermissionMode::Bypass);
+        confirmation.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        confirmation.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            confirmation
+                .completion()
+                .and_then(|completion| completion.result),
+            Some(ViewResult::PermissionConfirmation {
+                mode: PermissionMode::Bypass,
+                confirmed: true,
+            })
+        );
+    }
+
+    #[test]
+    fn confirmed_bypass_changes_policy_but_cancel_keeps_it_unchanged() {
+        let mut state = SessionState::default();
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = ChatWidget::new("");
+
+        handle_view_result(
+            ViewResult::PermissionConfirmation {
+                mode: PermissionMode::Bypass,
+                confirmed: false,
+            },
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Prompt);
+
+        handle_view_result(
+            ViewResult::PermissionConfirmation {
+                mode: PermissionMode::Bypass,
+                confirmed: true,
+            },
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Bypass);
+    }
+
+    #[test]
     fn session_picker_result_is_reserved_for_outer_resume_pipeline() {
         let mut state = SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
         handle_view_result(
-            "sess_1234567890",
+            ViewResult::Session {
+                session_id: "sess_1234567890".into(),
+                intent: SessionSelectionIntent::Resume,
+            },
             &mut state,
             &mut bottom_pane,
             &mut chat_widget,
@@ -4017,27 +3716,17 @@ mod view_result_tests {
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result("Auto", &mut state, &mut bottom_pane, &mut chat_widget);
+        handle_view_result(
+            ViewResult::Permission(PermissionMode::Auto),
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
             Some("Mode → Auto")
-        );
-    }
-
-    #[test]
-    fn bypass_selection_updates_state_and_commits_feedback() {
-        let mut state = SessionState::default();
-        let mut bottom_pane = BottomPane::new();
-        let mut chat_widget = ChatWidget::new("");
-
-        handle_view_result("Bypass", &mut state, &mut bottom_pane, &mut chat_widget);
-
-        assert_eq!(state.perm_manager.mode(), PermissionMode::Bypass);
-        assert_eq!(
-            last_system_message(&chat_widget).as_deref(),
-            Some("Mode → Bypass")
         );
     }
 
@@ -4049,7 +3738,12 @@ mod view_result_tests {
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result("Auto", &mut state, &mut bottom_pane, &mut chat_widget);
+        handle_view_result(
+            ViewResult::Permission(PermissionMode::Auto),
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
         assert!(
@@ -4064,7 +3758,12 @@ mod view_result_tests {
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result("Edits", &mut state, &mut bottom_pane, &mut chat_widget);
+        handle_view_result(
+            ViewResult::Permission(PermissionMode::AcceptEdits),
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::AcceptEdits);
         assert_eq!(
@@ -4074,17 +3773,22 @@ mod view_result_tests {
     }
 
     #[test]
-    fn plan_selection_updates_state_and_commits_feedback() {
+    fn read_only_policy_result_updates_state_and_commits_feedback() {
         let mut state = SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result("Plan", &mut state, &mut bottom_pane, &mut chat_widget);
+        handle_view_result(
+            ViewResult::Permission(PermissionMode::Plan),
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::Plan);
         assert_eq!(
             last_system_message(&chat_widget).as_deref(),
-            Some("Mode → Plan")
+            Some("Mode → Read-only")
         );
     }
 
@@ -4095,7 +3799,12 @@ mod view_result_tests {
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result("Ask", &mut state, &mut bottom_pane, &mut chat_widget);
+        handle_view_result(
+            ViewResult::Permission(PermissionMode::Prompt),
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
 
         assert_eq!(state.perm_manager.mode(), PermissionMode::Prompt);
         assert_eq!(
@@ -4105,42 +3814,17 @@ mod view_result_tests {
     }
 
     #[test]
-    fn permission_mode_cycle_skips_deny_and_wraps() {
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Prompt),
-            PermissionMode::AcceptEdits
-        );
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::AcceptEdits),
-            PermissionMode::Plan
-        );
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Plan),
-            PermissionMode::Auto
-        );
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Auto),
-            PermissionMode::Prompt
-        );
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Bypass),
-            PermissionMode::Prompt
-        );
-        // `Bypass` is explicit-only, and `Deny` is sticky under the cycle:
-        // neither can be reached by a bare `/allow`.
-        assert_eq!(
-            next_permission_mode_for_cycle(PermissionMode::Deny),
-            PermissionMode::Deny
-        );
-    }
-
-    #[test]
     fn slash_command_selection_returns_command_to_composer() {
         let mut state = SessionState::default();
         let mut bottom_pane = BottomPane::new();
         let mut chat_widget = ChatWidget::new("");
 
-        handle_view_result("/resume", &mut state, &mut bottom_pane, &mut chat_widget);
+        handle_view_result(
+            ViewResult::InsertCommand("/resume".into()),
+            &mut state,
+            &mut bottom_pane,
+            &mut chat_widget,
+        );
 
         assert_eq!(bottom_pane.composer.text(), "/resume ");
         assert!(
@@ -4150,7 +3834,7 @@ mod view_result_tests {
     }
 
     #[test]
-    fn arbitrary_selection_does_not_mutate_model() {
+    fn memory_selection_opens_the_observed_record_without_mutating_model() {
         let mut state = SessionState::default();
         state.model = Some("deepseek-v4-pro".to_string());
         let mut bottom_pane = BottomPane::new();
@@ -4158,7 +3842,10 @@ mod view_result_tests {
         let mut chat_widget = ChatWidget::new("");
 
         handle_view_result(
-            "[working] [@session/active] foo",
+            ViewResult::Memory(crate::tui::bottom_pane::view::MemorySelection {
+                memory_id: "mem-1".into(),
+                content: "remembered fact".into(),
+            }),
             &mut state,
             &mut bottom_pane,
             &mut chat_widget,
@@ -4167,6 +3854,10 @@ mod view_result_tests {
         assert_eq!(state.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(bottom_pane.footer.model.as_deref(), Some("deepseek-v4-pro"));
         assert!(chat_widget.history().is_empty());
+        assert!(
+            bottom_pane.has_active_view(),
+            "memory selection must open detail"
+        );
     }
 }
 
@@ -4320,20 +4011,15 @@ mod fmt_tokens_tests {
 #[cfg(test)]
 mod session_hub_tests {
     use super::session_hub_persistence_error;
-    use crate::cli::session::session_state::SessionState;
     use astra_services::session_workspace::WorkspaceMetadata;
 
     #[test]
     fn session_hub_persistence_error_prefers_live_state() {
-        let state = SessionState {
-            session_persistence_error: Some("live commit failed".into()),
-            ..SessionState::default()
-        };
         let mut ws = WorkspaceMetadata::new("sess-hub", "gpt-5");
         ws.last_persistence_error = Some("stale workspace error".into());
 
         assert_eq!(
-            session_hub_persistence_error(&state, Some(&ws)).as_deref(),
+            session_hub_persistence_error(Some("live commit failed"), Some(&ws)).as_deref(),
             Some(
                 "degraded: live commit failed · live session can continue; resume/fork metadata may be stale until the next successful save"
             )
@@ -4342,51 +4028,15 @@ mod session_hub_tests {
 
     #[test]
     fn session_hub_persistence_error_falls_back_to_workspace_state() {
-        let state = SessionState::default();
         let mut ws = WorkspaceMetadata::new("sess-hub", "gpt-5");
         ws.last_persistence_error = Some("workspace write failed".into());
 
         assert_eq!(
-            session_hub_persistence_error(&state, Some(&ws)).as_deref(),
+            session_hub_persistence_error(None, Some(&ws)).as_deref(),
             Some(
                 "degraded: workspace write failed · live session can continue; resume/fork metadata may be stale until the next successful save"
             )
         );
-    }
-}
-
-#[cfg(test)]
-mod truncate_rows_tests {
-    use super::truncate_rows;
-
-    #[test]
-    fn truncate_rows_drops_blank_lines() {
-        let rows = truncate_rows("\n\nfirst\n\nsecond\n", 3);
-        assert_eq!(rows, vec!["first".to_string(), "second".to_string()]);
-    }
-
-    #[test]
-    fn truncate_rows_adds_ellipsis_when_truncating() {
-        let input = "a\nb\nc\nd\ne";
-        let rows = truncate_rows(input, 3);
-        assert_eq!(
-            rows,
-            vec!["a".to_string(), "b".to_string(), "…".to_string()]
-        );
-    }
-
-    #[test]
-    fn truncate_rows_caps_long_single_line_at_76() {
-        let long = "x".repeat(100);
-        let rows = truncate_rows(&long, 2);
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].ends_with('…'));
-        assert_eq!(rows[0].chars().count(), 76);
-    }
-
-    #[test]
-    fn truncate_rows_empty_input_produces_empty_output() {
-        assert!(truncate_rows("", 5).is_empty());
     }
 }
 

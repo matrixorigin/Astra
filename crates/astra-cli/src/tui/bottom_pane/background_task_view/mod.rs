@@ -13,22 +13,24 @@ pub(crate) mod list_render;
 pub(crate) mod types;
 
 pub(crate) use types::{
-    BACKGROUND_TASK_OUTPUT_SENTINEL, BACKGROUND_TASK_STOP_SENTINEL, BackgroundTaskFanoutMembership,
-    BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskRowInit, BackgroundTaskStatus,
-    LiveControlState, Mode, parse_output_sentinel, parse_stop_sentinel,
+    BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskRowInit,
+    BackgroundTaskStatus, LiveControlState, Mode,
 };
 
 use list_render::background_task_list_entries;
 use types::{PAGE_STEP, sort_rows};
 
-use super::view::{BottomPaneView, CancellationEvent};
+use super::view::{
+    BottomPaneView, BottomPaneViewAction, CancellationEvent, ViewActionDisposition,
+    ViewActionRequest,
+};
 
 pub(crate) struct BackgroundTaskView {
     rows: Vec<BackgroundTaskRow>,
     selected: usize,
     completed: bool,
     mode: Mode,
-    pending_action: Option<String>,
+    pending_action: Option<ViewActionRequest>,
 }
 
 impl BackgroundTaskView {
@@ -163,15 +165,12 @@ impl BackgroundTaskView {
             && row.status.is_killable()
             && row.live_control.can_stop()
         {
-            self.pending_action = Some(format!("{BACKGROUND_TASK_STOP_SENTINEL}{}", row.id));
-        }
-    }
-
-    fn request_output(&mut self) {
-        if let Some(row) = self.selected_row()
-            && row.kind.supports_output_action()
-        {
-            self.pending_action = Some(format!("{BACKGROUND_TASK_OUTPUT_SENTINEL}{}", row.id));
+            self.pending_action = Some(ViewActionRequest {
+                action: BottomPaneViewAction::StopBackgroundTask {
+                    task_id: row.id.clone(),
+                },
+                disposition: ViewActionDisposition::KeepOpen,
+            });
         }
     }
 }
@@ -232,9 +231,6 @@ impl BottomPaneView for BackgroundTaskView {
                 _ => {}
             },
             Mode::Detail => match key.code {
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('o') | KeyCode::Char('O') => {
-                    self.request_output();
-                }
                 KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('x') | KeyCode::Delete => {
                     self.request_stop();
                 }
@@ -253,7 +249,7 @@ impl BottomPaneView for BackgroundTaskView {
         self.completed
     }
 
-    fn take_pending_action(&mut self) -> Option<String> {
+    fn take_action_request(&mut self) -> Option<ViewActionRequest> {
         self.pending_action.take()
     }
 
@@ -547,7 +543,7 @@ mod tests {
         view.handle_key(key(KeyCode::Enter));
 
         let text = render(&view, 24, 14);
-        assert!(text.contains("actions: output"), "{text}");
+        assert!(text.contains("actions: stop"), "{text}");
         assert!(text.contains("stop"), "{text}");
         assert!(!text.contains("retu"), "{text}");
     }
@@ -568,7 +564,8 @@ mod tests {
         assert!(text.contains("second command"));
         assert!(text.contains("/tmp/second.stdout"));
         assert!(text.contains("line one"));
-        assert!(text.contains("actions: output"));
+        assert!(text.contains("Latest output"));
+        assert!(text.contains("actions: stop · return"));
     }
 
     #[test]
@@ -611,6 +608,25 @@ mod tests {
     }
 
     #[test]
+    fn quiet_shell_remains_running_and_surfaces_factual_activity_advisory() {
+        let mut view = BackgroundTaskView::new(vec![
+            row("quiet", "running", "cargo test --workspace").with_no_recent_output(Some(47_000)),
+        ]);
+
+        let list = render(&view, 100, 5);
+        assert!(list.contains("running"), "{list}");
+        assert!(list.contains("quiet 47.0s"), "{list}");
+        assert!(!list.contains("needs input"), "{list}");
+
+        view.handle_key(key(KeyCode::Enter));
+        let detail = render(&view, 100, 14);
+        assert!(
+            detail.contains("no output observed for 47.0s · advisory only"),
+            "{detail}"
+        );
+    }
+
+    #[test]
     fn waiting_for_input_renders_as_needs_input_not_internal_state() {
         let mut view =
             BackgroundTaskView::new(vec![row("wait", "waiting_for_input", "prompting command")]);
@@ -642,33 +658,59 @@ mod tests {
     }
 
     #[test]
-    fn stale_live_handle_renders_unavailable_and_disables_stop() {
+    fn stale_snapshot_preserves_last_observed_status_and_disables_stop() {
         let mut view = BackgroundTaskView::new(vec![
             row_without_output("stale", "running", "restored long command")
                 .with_live_control(LiveControlState::StaleHandle),
         ]);
 
         let list = render(&view, 100, 5);
-        assert!(list.contains("unavailable"), "{list}");
+        assert!(list.contains("running"), "{list}");
+        assert!(list.contains("stale snapshot"), "{list}");
         assert!(list.contains("restored long command"), "{list}");
 
         view.handle_key(key(KeyCode::Enter));
         let detail = render(&view, 100, 12);
-        assert!(detail.contains("stale · unavailable"), "{detail}");
-        assert!(detail.contains("control stale handle"), "{detail}");
+        assert!(detail.contains("stale · running"), "{detail}");
         assert!(
-            detail.contains("Unavailable · stale handle or unsupported runner"),
+            detail.contains("control restored snapshot · no live control"),
             "{detail}"
         );
+        assert!(detail.contains("No output yet · still running"), "{detail}");
         assert!(!detail.contains("No output captured yet"), "{detail}");
-        assert!(detail.contains("actions: output · return"), "{detail}");
+        assert!(detail.contains("actions: return"), "{detail}");
         assert!(!detail.contains("stop"), "{detail}");
 
         view.handle_key(key(KeyCode::Char('s')));
         assert!(
-            view.take_pending_action().is_none(),
+            view.take_action_request().is_none(),
             "stale handles must not emit stop actions"
         );
+    }
+
+    #[test]
+    fn accepted_stop_is_visible_and_cannot_be_requested_twice() {
+        let mut view = BackgroundTaskView::new(vec![row_without_output(
+            "stopping",
+            "stopping",
+            "long command",
+        )]);
+
+        let list = render(&view, 100, 5);
+        assert!(list.contains("1 stopping"), "{list}");
+        assert!(list.contains("shell  stopping"), "{list}");
+
+        view.handle_key(key(KeyCode::Enter));
+        let detail = render(&view, 100, 10);
+        assert!(detail.contains("stopping · stopping"), "{detail}");
+        assert!(
+            detail.contains("Stopping · no output captured yet"),
+            "{detail}"
+        );
+        assert!(!detail.contains("stop · return"), "{detail}");
+
+        view.handle_key(key(KeyCode::Char('s')));
+        assert!(view.take_action_request().is_none());
     }
 
     #[test]
@@ -681,10 +723,15 @@ mod tests {
         view.handle_key(key(KeyCode::Char('s')));
 
         assert_eq!(
-            view.take_pending_action().as_deref(),
-            Some("__background_task_stop__\nsecond")
+            view.take_action_request(),
+            Some(ViewActionRequest {
+                action: BottomPaneViewAction::StopBackgroundTask {
+                    task_id: "second".into(),
+                },
+                disposition: ViewActionDisposition::KeepOpen,
+            })
         );
-        assert!(view.take_pending_action().is_none());
+        assert!(view.take_action_request().is_none());
         assert!(!view.is_complete());
     }
 
@@ -693,7 +740,7 @@ mod tests {
         let mut view = BackgroundTaskView::new(vec![row("done", "completed", "done task")]);
         view.handle_key(key(KeyCode::Char('s')));
 
-        assert!(view.take_pending_action().is_none());
+        assert!(view.take_action_request().is_none());
         assert!(!view.is_complete());
     }
 
@@ -749,17 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_stop_sentinel_extracts_id() {
-        assert_eq!(
-            parse_stop_sentinel("__background_task_stop__\nbg-shell-1"),
-            Some("bg-shell-1")
-        );
-        assert_eq!(parse_stop_sentinel("not it"), None);
-        assert_eq!(parse_stop_sentinel(BACKGROUND_TASK_STOP_SENTINEL), None);
-    }
-
-    #[test]
-    fn detail_output_action_emits_selected_task_id_and_keeps_view_open() {
+    fn detail_is_the_live_output_surface_without_a_transcript_action() {
         let mut view = BackgroundTaskView::new(vec![
             row("first", "running", "first command"),
             row("second", "running", "second command"),
@@ -768,26 +805,12 @@ mod tests {
         view.handle_key(key(KeyCode::Enter));
         view.handle_key(key(KeyCode::Char('o')));
 
-        assert_eq!(
-            view.take_pending_action().as_deref(),
-            Some("__background_task_output__\nsecond")
-        );
-        assert!(view.take_pending_action().is_none());
+        assert!(view.take_action_request().is_none());
         assert!(!view.is_complete());
     }
 
     #[test]
-    fn parse_output_sentinel_extracts_id() {
-        assert_eq!(
-            parse_output_sentinel("__background_task_output__\nbg-shell-1"),
-            Some("bg-shell-1")
-        );
-        assert_eq!(parse_output_sentinel("not it"), None);
-        assert_eq!(parse_output_sentinel(BACKGROUND_TASK_OUTPUT_SENTINEL), None);
-    }
-
-    #[test]
-    fn local_agent_detail_offers_typed_output_action() {
+    fn local_agent_detail_keeps_output_in_panel_and_offers_stop() {
         let mut view = BackgroundTaskView::new(vec![typed_row(
             "agent-1",
             BackgroundTaskKind::LocalAgent,
@@ -797,25 +820,44 @@ mod tests {
         view.handle_key(key(KeyCode::Enter));
 
         let detail = render(&view, 80, 12);
-        assert!(
-            detail.contains("actions: output · stop · return"),
-            "{detail}"
-        );
+        assert!(detail.contains("actions: stop · return"), "{detail}");
+        assert!(detail.contains("Latest output"), "{detail}");
         assert!(detail.contains("task review auth flow"), "{detail}");
 
         view.handle_key(key(KeyCode::Char('o')));
-        assert!(
-            matches!(
-                view.take_pending_action().as_deref(),
-                Some("__background_task_output__\nagent-1")
-            ),
-            "local agent output should emit typed task_output sentinel"
-        );
+        assert!(view.take_action_request().is_none());
 
         view.handle_key(key(KeyCode::Char('s')));
-        assert_eq!(
-            view.take_pending_action().as_deref(),
-            Some("__background_task_stop__\nagent-1")
-        );
+        assert!(matches!(
+            view.take_action_request(),
+            Some(ViewActionRequest {
+                action: BottomPaneViewAction::StopBackgroundTask { task_id },
+                disposition: ViewActionDisposition::KeepOpen,
+            }) if task_id == "agent-1"
+        ));
+    }
+
+    #[test]
+    fn detail_prioritizes_the_newest_output_lines() {
+        let output = (0..12)
+            .map(|index| format!("line-{index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut view = BackgroundTaskView::new(vec![BackgroundTaskRow::shell(
+            "tail",
+            "running",
+            1_500,
+            "streaming command",
+            Some("/tmp/tail.stdout".into()),
+            Some(output),
+            Some(95),
+        )]);
+        view.handle_key(key(KeyCode::Enter));
+
+        let detail = render(&view, 80, 14);
+        assert!(detail.contains("line-11"), "{detail}");
+        assert!(detail.contains("line-10"), "{detail}");
+        assert!(!detail.contains("line-00"), "{detail}");
+        assert!(detail.contains("actions: stop · return"), "{detail}");
     }
 }

@@ -11,6 +11,13 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentProgressEvent {
     pub agent_id: String,
+    /// Immutable execution identity for every agent event. The event kind may
+    /// add descriptive hierarchy data, but consumers must not have to wait
+    /// for a separate `AgentSpawned` event before routing progress, controls,
+    /// or transcript updates to the correct run.
+    pub run_id: String,
+    /// Parent execution identity paired with `run_id` when known.
+    pub parent_run_id: String,
     pub event_type: ProgressEventType,
     pub timestamp_epoch_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,8 +87,6 @@ pub enum ProgressEventType {
     },
     /// Agent spawned with hierarchy information (enables real-time tree updates).
     AgentSpawned {
-        run_id: String,
-        parent_run_id: String,
         agent_type: String,
         description: String,
         fanout_slot: Option<AgentFanoutSlotIdentity>,
@@ -145,23 +150,19 @@ impl ProgressBroadcaster {
         self.tx.subscribe()
     }
 
-    /// Create a scoped emitter for a specific agent.
-    pub fn for_agent(self: &Arc<Self>, agent_id: String) -> AgentProgressEmitter {
-        AgentProgressEmitter {
-            broadcaster: Arc::clone(self),
-            agent_id,
-            metadata: None,
-        }
-    }
-
-    pub fn for_agent_with_metadata(
+    /// Create a scoped emitter for a specific agent execution.
+    pub fn for_agent_with_run_context(
         self: &Arc<Self>,
         agent_id: String,
+        run_id: String,
+        parent_run_id: String,
         metadata: Option<Value>,
     ) -> AgentProgressEmitter {
         AgentProgressEmitter {
             broadcaster: Arc::clone(self),
             agent_id,
+            run_id,
+            parent_run_id,
             metadata,
         }
     }
@@ -172,6 +173,8 @@ impl ProgressBroadcaster {
 pub struct AgentProgressEmitter {
     broadcaster: Arc<ProgressBroadcaster>,
     agent_id: String,
+    run_id: String,
+    parent_run_id: String,
     metadata: Option<Value>,
 }
 
@@ -294,28 +297,18 @@ impl AgentProgressEmitter {
     }
 
     /// Emit agent spawned event with hierarchy info for tree visualization.
-    pub fn agent_spawned(
-        &self,
-        run_id: impl Into<String>,
-        parent_run_id: impl Into<String>,
-        agent_type: impl Into<String>,
-        description: impl Into<String>,
-    ) {
-        self.agent_spawned_with_fanout(run_id, parent_run_id, agent_type, description, None);
+    pub fn agent_spawned(&self, agent_type: impl Into<String>, description: impl Into<String>) {
+        self.agent_spawned_with_fanout(agent_type, description, None);
     }
 
     /// Emit agent spawned event with fanout slot identity.
     pub fn agent_spawned_with_fanout(
         &self,
-        run_id: impl Into<String>,
-        parent_run_id: impl Into<String>,
         agent_type: impl Into<String>,
         description: impl Into<String>,
         fanout_slot: Option<AgentFanoutSlotIdentity>,
     ) {
         self.emit(ProgressEventType::AgentSpawned {
-            run_id: run_id.into(),
-            parent_run_id: parent_run_id.into(),
             agent_type: agent_type.into(),
             description: description.into(),
             fanout_slot,
@@ -329,6 +322,8 @@ impl AgentProgressEmitter {
             .unwrap_or(0);
         self.broadcaster.emit(AgentProgressEvent {
             agent_id: self.agent_id.clone(),
+            run_id: self.run_id.clone(),
+            parent_run_id: self.parent_run_id.clone(),
             event_type,
             timestamp_epoch_ms,
             metadata: self.metadata.clone(),
@@ -345,7 +340,12 @@ mod tests {
         let broadcaster = Arc::new(ProgressBroadcaster::default());
         let mut rx = broadcaster.subscribe();
 
-        let emitter = broadcaster.for_agent("test-agent".to_string());
+        let emitter = broadcaster.for_agent_with_run_context(
+            "test-agent".to_string(),
+            "run-test".to_string(),
+            "run-root".to_string(),
+            None,
+        );
         emitter.started("Testing");
 
         let event = rx.recv().await.unwrap();
@@ -357,11 +357,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_emitter_attaches_run_identity_before_the_spawn_event() {
+        let broadcaster = Arc::new(ProgressBroadcaster::default());
+        let mut rx = broadcaster.subscribe();
+        let emitter = broadcaster.for_agent_with_run_context(
+            "reviewer@child".to_string(),
+            "run-child".to_string(),
+            "run-root".to_string(),
+            None,
+        );
+
+        emitter.started("review the storage layer");
+        let event = rx.recv().await.expect("started event");
+
+        assert_eq!(event.run_id, "run-child");
+        assert_eq!(event.parent_run_id, "run-root");
+        assert!(matches!(
+            event.event_type,
+            ProgressEventType::Started { description } if description == "review the storage layer"
+        ));
+    }
+
+    #[tokio::test]
     async fn test_all_event_types() {
         let broadcaster = Arc::new(ProgressBroadcaster::default());
         let mut rx = broadcaster.subscribe();
 
-        let emitter = broadcaster.for_agent("agent-1".to_string());
+        let emitter = broadcaster.for_agent_with_run_context(
+            "agent-1".to_string(),
+            "run-1".to_string(),
+            "run-root".to_string(),
+            None,
+        );
 
         // Emit all event types
         emitter.started("task description");
@@ -434,7 +461,12 @@ mod tests {
         let broadcaster = Arc::new(ProgressBroadcaster::default());
         let mut rx = broadcaster.subscribe();
 
-        let emitter = broadcaster.for_agent("agent-2".to_string());
+        let emitter = broadcaster.for_agent_with_run_context(
+            "agent-2".to_string(),
+            "run-2".to_string(),
+            "run-root".to_string(),
+            None,
+        );
 
         emitter.failed("connection timeout");
         let e1 = rx.recv().await.unwrap();
@@ -442,7 +474,12 @@ mod tests {
             matches!(e1.event_type, ProgressEventType::Failed { error } if error == "connection timeout")
         );
 
-        let emitter2 = broadcaster.for_agent("agent-3".to_string());
+        let emitter2 = broadcaster.for_agent_with_run_context(
+            "agent-3".to_string(),
+            "run-3".to_string(),
+            "run-root".to_string(),
+            None,
+        );
         emitter2.cancelled("user request");
         let e2 = rx.recv().await.unwrap();
         assert_eq!(e2.agent_id, "agent-3");
@@ -450,7 +487,12 @@ mod tests {
             matches!(e2.event_type, ProgressEventType::Cancelled { reason } if reason == "user request")
         );
 
-        let emitter3 = broadcaster.for_agent("agent-4".to_string());
+        let emitter3 = broadcaster.for_agent_with_run_context(
+            "agent-4".to_string(),
+            "run-4".to_string(),
+            "run-root".to_string(),
+            None,
+        );
         emitter3.interrupted("budget_exhausted", "partial output", 4, (10, 11), 1200);
         let e3 = rx.recv().await.unwrap();
         assert_eq!(e3.agent_id, "agent-4");
@@ -472,7 +514,12 @@ mod tests {
         let mut rx1 = broadcaster.subscribe();
         let mut rx2 = broadcaster.subscribe();
 
-        let emitter = broadcaster.for_agent("shared-agent".to_string());
+        let emitter = broadcaster.for_agent_with_run_context(
+            "shared-agent".to_string(),
+            "run-shared".to_string(),
+            "run-root".to_string(),
+            None,
+        );
         emitter.started("shared task");
 
         // Both subscribers receive the event
@@ -486,7 +533,12 @@ mod tests {
     #[test]
     fn test_no_panic_when_no_subscribers() {
         let broadcaster = Arc::new(ProgressBroadcaster::default());
-        let emitter = broadcaster.for_agent("orphan-agent".to_string());
+        let emitter = broadcaster.for_agent_with_run_context(
+            "orphan-agent".to_string(),
+            "run-orphan".to_string(),
+            "run-root".to_string(),
+            None,
+        );
 
         // Should not panic even without subscribers
         emitter.started("no one listening");

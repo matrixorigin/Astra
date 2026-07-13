@@ -915,6 +915,13 @@ async fn phase1_run_durability_schema_contract() {
         ["user_id", "id"],
         "agent_run_events primary key must carry the owner boundary"
     );
+    assert!(
+        column_names(&pool, &schema, "agent_run_events")
+            .await
+            .iter()
+            .any(|column| column == "interaction_request_id"),
+        "agent_run_events must normalize durable interaction identity"
+    );
     assert_eq!(
         unique_key_columns(&pool, &schema, "agent_run_events", "uq_run_event_idx").await,
         ["user_id", "run_id", "event_idx"],
@@ -1071,6 +1078,23 @@ async fn phase1_run_durability_schema_contract() {
         "retry lineage lookups must be owner-bound"
     );
     assert_eq!(
+        index_columns(&pool, &schema, "agent_runs", "idx_agent_runs_recovery_scan").await,
+        [
+            "status",
+            "owner_lease_expires_at",
+            "updated_at",
+            "user_id",
+            "run_id"
+        ],
+        "restart recovery must use a bounded lease-aware ordered scan"
+    );
+    assert!(
+        index_columns(&pool, &schema, "agent_runs", "idx_agent_runs_status_lease")
+            .await
+            .is_empty(),
+        "the shorter recovery index must not duplicate the covering scan index"
+    );
+    assert_eq!(
         index_columns(&pool, &schema, "agent_session_execution_slots", "PRIMARY").await,
         ["user_id", "session_id"],
         "session execution slot must be a first-class unique owner/session resource"
@@ -1152,6 +1176,40 @@ async fn phase1_run_durability_schema_contract() {
         .await,
         ["user_id", "session_id", "run_id", "event_idx"],
         "reasoning event replay must use owner/session/run/event ordering"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_run_events",
+            "idx_agent_run_events_owner_session_subject"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "event_type",
+            "subject_run_id",
+            "event_idx"
+        ],
+        "agent recovery must resolve selected child identities without scanning event JSON"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_run_events",
+            "idx_agent_run_events_interaction"
+        )
+        .await,
+        [
+            "user_id",
+            "run_id",
+            "interaction_request_id",
+            "event_type",
+            "event_idx"
+        ],
+        "durable interaction polling must use normalized run-scoped identity"
     );
     for removed_index in [
         "idx_agent_run_events_run_created",
@@ -2012,47 +2070,6 @@ async fn phase4_state_projection_schema_contract() {
             .is_empty(),
         "plan_step_runs must not keep an ownerless session scan index"
     );
-
-    let plan_todos = column_names(&pool, &schema, "session_plan_todos").await;
-    for expected in ["user_id", "session_id", "plan_id", "parent_todo_id"] {
-        assert!(
-            plan_todos.iter().any(|column| column == expected),
-            "session_plan_todos missing {expected}"
-        );
-    }
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_plan_todos",
-            "idx_session_plan_todos_owner_active"
-        )
-        .await,
-        ["user_id", "session_id", "status", "priority", "updated_at"],
-        "active plan todo scans must stay owner-bound"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_plan_todos",
-            "idx_session_plan_todos_owner_tree"
-        )
-        .await,
-        ["user_id", "session_id", "parent_todo_id", "priority"],
-        "plan todo tree scans must stay owner-bound"
-    );
-    for removed_index in [
-        "idx_session_plan_todos_active",
-        "idx_session_plan_todos_tree",
-    ] {
-        assert!(
-            index_columns(&pool, &schema, "session_plan_todos", removed_index)
-                .await
-                .is_empty(),
-            "session_plan_todos must not keep ownerless plan index {removed_index}"
-        );
-    }
 
     let history_chunks = column_names(&pool, &schema, "session_history_chunks").await;
     for expected in [

@@ -186,21 +186,7 @@ fn read_file_semantic_key(args: &Value) -> Option<String> {
 }
 
 fn read_file_effective_line_bounds(args: &Value) -> (Option<u64>, Option<u64>) {
-    let mut start = arg_u64(args, "start_line");
-    let mut end = arg_u64(args, "end_line");
-
-    // Mirror astra_tools::fs_ops::convert_read_file_args for the LLM-facing
-    // contract. The schema exposes offset+limit; start_line/end_line are
-    // internal compatibility fields. Dedup must key on the effective range or
-    // offset reads of different sections collapse into the same cache entry.
-    if let Some(offset) = arg_u64(args, "offset") {
-        start = Some(offset);
-        if let Some(limit) = arg_u64(args, "limit") {
-            end = Some(offset.saturating_add(limit.saturating_sub(1)));
-        }
-    }
-
-    (start, end)
+    (arg_u64(args, "start_line"), arg_u64(args, "end_line"))
 }
 
 fn read_file_path_from_semantic_key(key: &str) -> Option<&str> {
@@ -903,32 +889,27 @@ mod tests {
     fn read_file_different_line_ranges_differ() {
         let k1 = semantic_call_key(
             "read_file",
-            &json!({"path": "foo.rs", "offset": 1, "limit": 120}),
+            &json!({"path": "foo.rs", "start_line": 1, "end_line": 120}),
         );
         let k2 = semantic_call_key(
             "read_file",
-            &json!({"path": "foo.rs", "offset": 200, "limit": 151}),
+            &json!({"path": "foo.rs", "start_line": 200, "end_line": 350}),
         );
         assert_ne!(
             k1, k2,
-            "different offset/limit ranges must produce distinct keys — otherwise agent can't read different regions of the same file"
+            "different line ranges must produce distinct keys — otherwise agent can't read different regions of the same file"
         );
     }
 
     #[test]
-    fn read_file_offset_limit_matches_internal_line_range_key() {
-        let visible = semantic_call_key(
-            "read_file",
-            &json!({"path": "foo.rs", "offset": 20, "limit": 30}),
-        );
-        let internal = semantic_call_key(
+    fn read_file_omitted_end_is_distinct_from_bounded_range() {
+        let unbounded =
+            semantic_call_key("read_file", &json!({"path": "foo.rs", "start_line": 20}));
+        let bounded = semantic_call_key(
             "read_file",
             &json!({"path": "foo.rs", "start_line": 20, "end_line": 49}),
         );
-        assert_eq!(
-            visible, internal,
-            "LLM-facing offset/limit and internal start/end args must dedup identically"
-        );
+        assert_ne!(unbounded, bounded);
     }
 
     #[test]
@@ -1373,7 +1354,7 @@ mod tests {
     #[test]
     fn tracker_detects_token_cosine_only_with_same_semantic_key() {
         let mut tracker = SemanticDedup::new(0.7);
-        let args = json!({"path": "src/main.rs", "offset": 1, "limit": 80});
+        let args = json!({"path": "src/main.rs", "start_line": 1, "end_line": 80});
         let sem_key = semantic_call_key("read_file", &args).expect("read_file key");
         let output1 =
             "fn parse_user() {}\nfn parse_team() {}\nfn parse_token() {}\nfn parse_config() {}";
@@ -1400,8 +1381,8 @@ mod tests {
     #[test]
     fn read_file_different_ranges_do_not_trigger_output_similarity_hint() {
         let mut tracker = SemanticDedup::new(0.7);
-        let range1 = json!({"path": "src/lib.rs", "offset": 1, "limit": 500});
-        let range2 = json!({"path": "src/lib.rs", "offset": 501, "limit": 500});
+        let range1 = json!({"path": "src/lib.rs", "start_line": 1, "end_line": 500});
+        let range2 = json!({"path": "src/lib.rs", "start_line": 501, "end_line": 1000});
         let output1 = "pub fn handler_a() {}\npub fn handler_b() {}\npub fn handler_c() {}\npub fn handler_d() {}\n";
         let output2 = "pub fn handler_e() {}\npub fn handler_f() {}\npub fn handler_g() {}\npub fn handler_h() {}\n";
         assert!(
@@ -1424,14 +1405,14 @@ mod tests {
         let mut tracker = SemanticDedup::new(0.75);
         tracker.check_and_record(
             "read_file",
-            &json!({"path": "src/lib.rs", "offset": 1, "limit": 500}),
+            &json!({"path": "src/lib.rs", "start_line": 1, "end_line": 500}),
             "first range content that is long enough to be a useful cached output",
             1,
         );
 
         let block = tracker.pre_check_block(
             "read_file",
-            &json!({"path": "src/lib.rs", "offset": 501, "limit": 500}),
+            &json!({"path": "src/lib.rs", "start_line": 501, "end_line": 1000}),
             2,
         );
         assert!(

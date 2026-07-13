@@ -1,10 +1,10 @@
 ---
 source: crates/astra-cli/src/tui/context_panel/view.rs
-assertion_line: 2038
+assertion_line: 2267
 expression: "render_panel(&b, 80, 14)"
 ---
 ┌ Context window (22% · low) ──────────────────────────────────────────────────┐
-│  21.7k / 100.0k tokens  (21.7%)                                              │
+│  21.7k / 100.0k tokens  current prompt (21.7%)                               │
 │  Tab focus · Enter close · j/k scroll · Esc close                            │
 │                                                                              │
 │  ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁ ⛁   ⛁ System prompt     2.0k  ( 2.0%)                     │

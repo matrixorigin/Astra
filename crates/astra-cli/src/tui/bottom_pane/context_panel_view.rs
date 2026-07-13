@@ -1,4 +1,4 @@
-//! BottomPaneView wrapper for the context-window breakdown.
+//! Primary-workspace wrapper for the context-window breakdown.
 //!
 //! Holds the scroll offset locally so the rich breakdown (grid +
 //! legend + nested tool/memory/skill sections) can exceed the
@@ -198,78 +198,25 @@ impl ContextPanelView {
         self.scroll = self.pre_drill_scroll;
     }
 
-    /// Adjust the scroll window so the whole selected-item block
-    /// stays in view — the ▸ header row AND its wrapped preview
-    /// body. Previous implementation only tracked the marker row,
-    /// so selecting an item with a 3-line preview left the last
-    /// lines of that preview clipped off the bottom.
-    ///
-    /// Algorithm:
-    ///   • Find the marker row (top of block) and the last row
-    ///     belonging to that block (next ▸ / next section
-    ///     heading / end of list).
-    ///   • If the block height fits the viewport: park it within
-    ///     the visible window (scroll up if block_top is above,
-    ///     scroll down if block_bottom is below).
-    ///   • If the block is taller than the viewport: keep
-    ///     block_top at the top so the user can scroll through the
-    ///     body naturally.
+    /// Adjust the scroll window so the whole selected-item block stays in
+    /// view. The layout builder supplies the exact typed range for the active
+    /// item, so user/model text and decorative marker glyphs cannot alter
+    /// navigation behavior.
     fn scroll_to_selected_item(&mut self) {
         let inner_w = self.last_inner_width.get();
         let inner_h = self.last_viewport_rows.get();
         if inner_w == 0 || inner_h == 0 {
             return;
         }
-        let state = self.view_state();
-        let lines =
-            crate::tui::context_panel::view::build_lines_with(&self.breakdown, inner_w, state);
-
-        // Find the marker row. Every selected-item header carries
-        // a literal `▸` in exactly one span — and only one item
-        // per section is selected at a time.
-        let Some(marker_row) = lines
-            .iter()
-            .position(|l| l.spans.iter().any(|s| s.content.as_ref().contains('▸')))
-        else {
+        let Some(item_lines) = crate::tui::context_panel::view::selected_item_line_range(
+            &self.breakdown,
+            inner_w,
+            self.view_state(),
+        ) else {
             return;
         };
-
-        // Walk forward to find the block's bottom: stop at the
-        // next marker row (another section's selected header —
-        // shouldn't happen since only one is selected, but safe),
-        // an empty line that ends the section (section separator),
-        // or the end of the line list.
-        let mut block_bottom = marker_row;
-        for (i, line) in lines.iter().enumerate().skip(marker_row + 1) {
-            let has_marker = line.spans.iter().any(|s| s.content.as_ref().contains('▸'));
-            if has_marker {
-                break;
-            }
-            if line.spans.is_empty() {
-                break;
-            }
-            // Stop at the next item's `└ ` row. A faster
-            // heuristic: the item marker row uses the indent
-            // `      ▸ └` / `    ▸ └` / `    ▸ └`. Sibling items
-            // that are not the selected one render `      ` (no
-            // ▸) followed by `└`. Use that as the cut — detect a
-            // fresh `└` in one of the first six columns.
-            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            // Heuristic: sibling item rows always start with some
-            // whitespace, contain `└ `, and stay above the
-            // preview-indent column (text_offset >= 13). Anything
-            // looking like a new `#N role` sibling wraps us up.
-            let trimmed = text.trim_start();
-            if trimmed.starts_with("└ #")
-                || trimmed.starts_with("└ bash")
-                || trimmed.starts_with("└ ") && trimmed.contains(" tokens")
-            {
-                break;
-            }
-            block_bottom = i;
-        }
-        let block_top = marker_row as u16;
-        let block_bot = block_bottom as u16;
+        let block_top = item_lines.start;
+        let block_bot = item_lines.end.saturating_sub(1);
         let block_height = block_bot.saturating_sub(block_top).saturating_add(1);
 
         let viewport_top = self.scroll;
@@ -510,6 +457,10 @@ impl BottomPaneView for ContextPanelView {
         Some(hint.into())
     }
 
+    fn owns_primary_canvas(&self) -> bool {
+        true
+    }
+
     fn reserve_status_footer(&self) -> bool {
         true
     }
@@ -546,6 +497,7 @@ mod tests {
             tool_schema_tokens: 5_000,
             user_message_tokens: 500,
             total_used: 29_500,
+            usage_source: Default::default(),
             budget_pressure: 0.295,
             compression_triggered: false,
         };
@@ -719,6 +671,12 @@ mod tests {
         let hint = v.hint_keys().unwrap();
         assert!(hint.contains("scroll"));
         assert!(hint.contains("close"));
+    }
+
+    #[test]
+    fn context_inspector_owns_the_primary_workspace() {
+        let v = ContextPanelView::new(ContextBreakdown::empty());
+        assert!(v.owns_primary_canvas());
     }
 
     // ─── Focus + expand ────────────────────────────────────────────
@@ -1095,20 +1053,17 @@ mod tests {
         for _ in 0..tools_n {
             v.handle_key(press(KeyCode::Down));
             let state = v.view_state();
-            let lines = crate::tui::context_panel::view::build_lines_with(
+            let selected = crate::tui::context_panel::view::selected_item_line_range(
                 &v.breakdown,
                 v.last_inner_width.get(),
                 state,
-            );
-            let marker = lines
-                .iter()
-                .position(|l| l.spans.iter().any(|s| s.content.as_ref().contains('▸')))
-                .unwrap() as u16;
+            )
+            .expect("expanded selectable section has typed item geometry");
             let viewport_top = v.scroll;
             let viewport_bottom = viewport_top + v.last_viewport_rows.get();
             assert!(
-                marker >= viewport_top && marker < viewport_bottom,
-                "selected-item marker must stay inside viewport (marker={marker}, top={viewport_top}, bot={viewport_bottom})"
+                selected.start >= viewport_top && selected.end <= viewport_bottom,
+                "selected item must stay inside viewport (range={selected:?}, top={viewport_top}, bot={viewport_bottom})"
             );
         }
     }

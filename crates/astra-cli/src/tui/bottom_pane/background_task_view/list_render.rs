@@ -3,7 +3,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 
@@ -84,9 +84,10 @@ pub(crate) fn render_list(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let dim = Style::default().fg(Color::DarkGray);
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
     let title_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
     let running = rows
         .iter()
@@ -96,6 +97,10 @@ pub(crate) fn render_list(
         .iter()
         .filter(|row| row.status == BackgroundTaskStatus::WaitingForInput)
         .count();
+    let stopping = rows
+        .iter()
+        .filter(|row| row.status == BackgroundTaskStatus::Stopping)
+        .count();
     let failed = rows
         .iter()
         .filter(|row| row.status == BackgroundTaskStatus::Failed)
@@ -103,6 +108,10 @@ pub(crate) fn render_list(
     let interrupted = rows
         .iter()
         .filter(|row| row.status == BackgroundTaskStatus::Interrupted)
+        .count();
+    let quiet = rows
+        .iter()
+        .filter(|row| row.no_recent_output_ms.is_some())
         .count();
     let header = if rows.is_empty() {
         "  Background tasks".to_string()
@@ -114,11 +123,17 @@ pub(crate) fn render_list(
         if waiting > 0 {
             parts.push(pluralize_with_count(waiting, "needs input", "need input"));
         }
+        if stopping > 0 {
+            parts.push(format!("{stopping} stopping"));
+        }
         if failed > 0 {
             parts.push(format!("{failed} failed"));
         }
         if interrupted > 0 {
             parts.push(format!("{interrupted} interrupted"));
+        }
+        if quiet > 0 {
+            parts.push(format!("{quiet} quiet"));
         }
         format!("  Background tasks · {}", parts.join(" · "))
     };
@@ -165,7 +180,8 @@ pub(crate) fn render_list(
                 let is_selected = *row_idx == selected;
                 let marker_style = if is_selected {
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.selected_fg)
+                        .bg(theme.selected_bg)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     dim
@@ -180,11 +196,22 @@ pub(crate) fn render_list(
                 visible_row_number += 1;
                 let marker = if is_selected { "› " } else { "  " };
                 let index = format!("{}. ", visible_row_number);
+                let activity = row
+                    .no_recent_output_ms
+                    .map(|ms| format!("  quiet {}", format_elapsed(ms)))
+                    .unwrap_or_default();
+                let control = row
+                    .live_control
+                    .list_label()
+                    .map(|label| format!("  {label}"))
+                    .unwrap_or_default();
                 let meta = format!(
-                    "{}  {}  {}  ",
+                    "{}  {}  {}{}{}  ",
                     row.kind.as_str(),
                     row.status.label(),
-                    format_elapsed(row.elapsed_ms)
+                    format_elapsed(row.elapsed_ms),
+                    activity,
+                    control,
                 );
                 let title = if *grouped {
                     fanout_slot_title(row)

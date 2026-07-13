@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 
@@ -14,6 +14,7 @@ use astra_tools::task_mgmt::SessionTaskStatusKind;
 /// Detail drill-in view for a TaskCell. Shows header + full children
 /// list with descriptions, durations, and output. Scrollable.
 pub(crate) struct TaskDetailView {
+    kind: DetailKind,
     title: String,
     lines: Vec<Line<'static>>,
     scroll: usize,
@@ -22,11 +23,36 @@ pub(crate) struct TaskDetailView {
     live_task_id: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum DetailKind {
+    Task,
+    Agent,
+}
+
+impl DetailKind {
+    fn title(self, description: &str) -> String {
+        let prefix = match self {
+            Self::Task => "Task details",
+            Self::Agent => "Agent inspector",
+        };
+        format!("{prefix} · {}", truncate_label(description, 50))
+    }
+}
+
 impl TaskDetailView {
     pub fn from_task_cell(cell: &TaskCell) -> Self {
-        let title = format!("Task details · {}", truncate_label(&cell.description, 50));
+        Self::from_cell(cell, DetailKind::Task)
+    }
+
+    pub fn from_agent_cell(cell: &TaskCell) -> Self {
+        Self::from_cell(cell, DetailKind::Agent)
+    }
+
+    fn from_cell(cell: &TaskCell, kind: DetailKind) -> Self {
+        let title = kind.title(&cell.description);
         let lines = build_detail_lines(cell);
         Self {
+            kind,
             title,
             lines,
             scroll: 0,
@@ -40,6 +66,7 @@ impl TaskDetailView {
         let title = format!("Task details · {}", truncate_label(&task.title, 50));
         let lines = build_session_task_lines(task);
         Self {
+            kind: DetailKind::Task,
             title,
             lines,
             scroll: 0,
@@ -62,7 +89,7 @@ impl TaskDetailView {
     fn refresh_from_task_cell(&mut self, cell: &TaskCell) {
         let old_max_scroll = self.lines.len().saturating_sub(MAX_VISIBLE);
         let was_pinned_to_bottom = self.scroll >= old_max_scroll;
-        self.title = format!("Task details · {}", truncate_label(&cell.description, 50));
+        self.title = self.kind.title(&cell.description);
         self.lines = build_detail_lines(cell);
         let new_max_scroll = self.lines.len().saturating_sub(MAX_VISIBLE);
         self.scroll = if was_pinned_to_bottom {
@@ -74,22 +101,45 @@ impl TaskDetailView {
 }
 
 fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
+    let theme = crate::tui::theme::current();
     let mut out = Vec::new();
-    let dim = Style::default().fg(Color::DarkGray);
-    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme.dim);
+    let bold = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
 
     let status_color = match task.status {
-        SessionTaskStatusKind::InProgress => Color::Yellow,
-        SessionTaskStatusKind::Completed => Color::Green,
-        SessionTaskStatusKind::Failed => Color::Red,
-        SessionTaskStatusKind::Cancelled => Color::Yellow,
-        _ => Color::White,
+        SessionTaskStatusKind::InProgress => theme.warn,
+        SessionTaskStatusKind::Completed => theme.success,
+        SessionTaskStatusKind::Failed => theme.error,
+        SessionTaskStatusKind::Cancelled => theme.warn,
+        _ => theme.fg,
     };
     out.push(Line::from(vec![
         Span::styled(task.status.as_str(), Style::default().fg(status_color)),
         Span::styled(" · ".to_string(), dim),
         Span::styled(task.id.clone(), dim),
     ]));
+
+    let plan_step = durable_plan_step_provenance(task);
+    if let Some((plan_id, version, step_id)) = plan_step {
+        out.push(Line::from(vec![
+            Span::styled("Kind · ".to_string(), dim),
+            Span::styled("Durable plan step", bold),
+        ]));
+        let mut plan_spans = vec![
+            Span::styled("Plan · ".to_string(), dim),
+            Span::styled(plan_id.to_string(), dim),
+        ];
+        if let Some(version) = version {
+            plan_spans.push(Span::styled(format!(" · v{version}"), dim));
+        }
+        out.push(Line::from(plan_spans));
+        out.push(Line::from(vec![
+            Span::styled("Step · ".to_string(), dim),
+            Span::styled(step_id.to_string(), dim),
+        ]));
+    }
 
     if let Some(ref owner) = task.owner {
         out.push(Line::from(vec![
@@ -109,7 +159,7 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
     if !task.blocked_by.is_empty() {
         out.push(Line::default());
         out.push(Line::from(vec![
-            Span::styled("Waiting on · ".to_string(), dim),
+            Span::styled("Depends on · ".to_string(), dim),
             Span::styled(task.blocked_by.join(", "), dim),
         ]));
     }
@@ -122,16 +172,16 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
         )));
         for sub in &task.subtasks {
             let (icon, icon_color) = match sub.status {
-                SessionTaskStatusKind::Completed => ("✓", Color::Green),
-                SessionTaskStatusKind::InProgress => ("◦", Color::Yellow),
-                SessionTaskStatusKind::Paused => ("⏸", Color::Yellow),
-                SessionTaskStatusKind::Pending => ("·", Color::DarkGray),
-                SessionTaskStatusKind::Failed => ("✗", Color::Red),
-                SessionTaskStatusKind::Cancelled => ("⏹", Color::Yellow),
+                SessionTaskStatusKind::Completed => ("✓", theme.success),
+                SessionTaskStatusKind::InProgress => ("◦", theme.warn),
+                SessionTaskStatusKind::Paused => ("⏸", theme.warn),
+                SessionTaskStatusKind::Pending => ("·", theme.dim),
+                SessionTaskStatusKind::Failed => ("✗", theme.error),
+                SessionTaskStatusKind::Cancelled => ("⏹", theme.warn),
                 SessionTaskStatusKind::Archived
                 | SessionTaskStatusKind::Deleted
                 | SessionTaskStatusKind::Migrated
-                | SessionTaskStatusKind::Other => ("·", Color::DarkGray),
+                | SessionTaskStatusKind::Other => ("·", theme.dim),
             };
             out.push(Line::from(vec![
                 Span::raw("  "),
@@ -142,34 +192,74 @@ fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
     }
 
     out.push(Line::default());
+    if !task.created_at.trim().is_empty() {
+        out.push(Line::from(vec![
+            Span::styled("Created · ".to_string(), dim),
+            Span::styled(task.created_at.clone(), dim),
+        ]));
+    }
     out.push(Line::from(vec![
-        Span::styled("Created · ".to_string(), dim),
-        Span::styled(task.created_at.clone(), dim),
-    ]));
-    out.push(Line::from(vec![
-        Span::styled("Updated · ".to_string(), dim),
+        Span::styled(
+            if plan_step.is_some() {
+                "Revision · "
+            } else {
+                "Updated · "
+            }
+            .to_string(),
+            dim,
+        ),
         Span::styled(task.updated_at.clone(), dim),
     ]));
 
     out
 }
 
+/// Proves plan provenance from both the reserved row namespace and typed
+/// metadata. User-authored checklist metadata alone must never make a row
+/// masquerade as a durable plan step.
+fn durable_plan_step_provenance(task: &SessionTask) -> Option<(&str, Option<u64>, &str)> {
+    if !task.id.starts_with("plan:") {
+        return None;
+    }
+    let metadata = task.metadata.as_ref()?;
+    if metadata.get("source")?.as_str()?.trim() != "plan" {
+        return None;
+    }
+    let plan_id = metadata.get("plan_id")?.as_str()?.trim();
+    let step_id = metadata.get("step_id")?.as_str()?.trim();
+    if plan_id.is_empty() || step_id.is_empty() {
+        return None;
+    }
+    Some((
+        plan_id,
+        metadata
+            .get("plan_version")
+            .and_then(serde_json::Value::as_u64),
+        step_id,
+    ))
+}
+
 use crate::cli::effects::truncate_label;
 
 fn status_style(status: &TaskStatus) -> Style {
+    let theme = crate::tui::theme::current();
     match status {
-        TaskStatus::Running => Style::default().fg(Color::Yellow),
-        TaskStatus::Completed => Style::default().fg(Color::Green),
-        TaskStatus::Interrupted => Style::default().fg(Color::Yellow),
-        TaskStatus::Failed => Style::default().fg(Color::Red),
+        TaskStatus::Running => Style::default().fg(theme.warn),
+        TaskStatus::Waiting => Style::default().fg(theme.warn),
+        TaskStatus::Completed => Style::default().fg(theme.success),
+        TaskStatus::Interrupted => Style::default().fg(theme.warn),
+        TaskStatus::Failed => Style::default().fg(theme.error),
+        TaskStatus::Cancelled => Style::default().fg(theme.dim),
+        TaskStatus::Unconfirmed => Style::default().fg(theme.dim),
     }
 }
 
 fn child_status_style(status: &ChildStatus) -> Style {
+    let theme = crate::tui::theme::current();
     match status {
-        ChildStatus::Running => Style::default().fg(Color::Yellow),
-        ChildStatus::Success => Style::default().fg(Color::Green),
-        ChildStatus::Failed => Style::default().fg(Color::Red),
+        ChildStatus::Running => Style::default().fg(theme.warn),
+        ChildStatus::Success => Style::default().fg(theme.success),
+        ChildStatus::Failed => Style::default().fg(theme.error),
     }
 }
 
@@ -182,29 +272,28 @@ fn child_status_icon(status: &ChildStatus) -> &'static str {
 }
 
 fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
+    let theme = crate::tui::theme::current();
     let mut out = Vec::new();
-    let dim = Style::default().fg(Color::DarkGray);
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let interrupted_wait = cell.is_interrupted_wait();
-
+    let dim = Style::default().fg(theme.dim);
+    let bold = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
     // Header
     let status_text = match cell.status {
         TaskStatus::Running => "Running",
+        TaskStatus::Waiting => "Waiting",
         TaskStatus::Completed => "Completed",
         TaskStatus::Interrupted => "Interrupted",
-        TaskStatus::Failed if interrupted_wait => "Interrupted",
         TaskStatus::Failed => "Failed",
+        TaskStatus::Cancelled => "Cancelled",
+        TaskStatus::Unconfirmed => "Status unconfirmed",
     };
-    let status_style = if interrupted_wait {
-        Style::default().fg(Color::Yellow)
-    } else {
-        status_style(&cell.status)
-    };
+    let status_style = status_style(&cell.status);
     out.push(Line::from(vec![
         Span::styled(status_text, status_style),
         Span::styled(" · ".to_string(), dim),
         Span::styled(
-            if matches!(cell.status, TaskStatus::Running) {
+            if cell.status.is_active() {
                 "live"
             } else {
                 "snapshot"
@@ -212,7 +301,12 @@ fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
             dim,
         ),
     ]));
-    if !matches!(cell.status, TaskStatus::Running) {
+    if matches!(cell.status, TaskStatus::Unconfirmed) {
+        out.push(Line::from(Span::styled(
+            "  Live updates ended before a terminal event was confirmed",
+            dim,
+        )));
+    } else if !cell.status.is_active() {
         out.push(Line::from(Span::styled("  Frozen at completion", dim)));
     }
 
@@ -224,10 +318,10 @@ fn build_detail_lines(cell: &TaskCell) -> Vec<Line<'static>> {
     }
 
     if let Some(ref err) = cell.error {
-        let err_style = if interrupted_wait {
-            Style::default().fg(Color::Yellow)
+        let err_style = if cell.status == TaskStatus::Interrupted {
+            Style::default().fg(theme.warn)
         } else {
-            Style::default().fg(Color::Red)
+            Style::default().fg(theme.error)
         };
         out.push(Line::from(vec![
             Span::styled("Error · ".to_string(), err_style),
@@ -401,14 +495,19 @@ impl BottomPaneView for TaskDetailView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        Some("↑↓/Pg scroll · Esc close".into())
+        Some(match self.kind {
+            DetailKind::Agent if self.live_task_id.is_some() => {
+                "↑↓/Pg scroll · Following live · Esc back".into()
+            }
+            DetailKind::Agent => "↑↓/Pg scroll · Esc back".into(),
+            DetailKind::Task => "↑↓/Pg scroll · Esc close".into(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::history_cell::HistoryCell;
     use crate::tui::history_cell::task::TaskCell;
     use astra_tools::task_mgmt::SessionTask;
 
@@ -443,6 +542,38 @@ mod tests {
     }
 
     #[test]
+    fn durable_plan_step_detail_keeps_provenance_and_dependencies_distinct() {
+        let mut task = mk_session_task("plan:plan-7:verify", "Verify release");
+        task.created_at.clear();
+        task.updated_at = "plan-v12".into();
+        task.blocked_by = vec!["plan:plan-7:build".into()];
+        task.metadata = Some(serde_json::Map::from_iter([
+            ("source".into(), serde_json::json!("plan")),
+            ("plan_id".into(), serde_json::json!("plan-7")),
+            ("plan_version".into(), serde_json::json!(12)),
+            ("step_id".into(), serde_json::json!("verify")),
+        ]));
+
+        let view = TaskDetailView::from_session_task(&task);
+        let rendered = view
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("Durable plan step"), "{rendered}");
+        assert!(rendered.contains("Plan · plan-7 · v12"), "{rendered}");
+        assert!(rendered.contains("Step · verify"), "{rendered}");
+        assert!(
+            rendered.contains("Depends on · plan:plan-7:build"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Revision · plan-v12"), "{rendered}");
+        assert!(!rendered.contains("Created ·"), "{rendered}");
+    }
+
+    #[test]
     fn from_task_cell_with_emoji_description_does_not_panic() {
         let cell = TaskCell::new_running("tool-1", "🚀🔥💥".repeat(20));
         let view = TaskDetailView::from_task_cell(&cell);
@@ -450,9 +581,14 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_get_agent_result_shows_interrupted_status() {
-        let mut cell = TaskCell::new_running("tool-1", "Get agent result: reviewer@abc");
-        cell.finalize();
+    fn explicit_interrupted_task_shows_interrupted_status() {
+        let mut cell = TaskCell::new_running("tool-1", "reviewer");
+        cell.complete(
+            "interrupted",
+            25,
+            Some("partial findings".into()),
+            Some("budget exhausted".into()),
+        );
 
         let view = TaskDetailView::from_task_cell(&cell);
         let rendered = view
@@ -463,7 +599,7 @@ mod tests {
             .join("");
 
         assert!(rendered.contains("Interrupted"), "{rendered}");
-        assert!(!rendered.contains("Status: Failed"), "{rendered}");
+        assert!(!rendered.contains("Failed"), "{rendered}");
     }
 
     /// C-TUI-1 regression: large scroll offset must not write past the
@@ -508,26 +644,6 @@ mod tests {
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf);
         // The render must not have wrapped to y=0..; that would be an overflow.
-    }
-
-    /// C-TUI-2 regression: title must use the theme accent rather than a
-    /// hardcoded `Color::Cyan`. We assert the source no longer carries
-    /// the literal so light-terminal users get a readable colour.
-    #[test]
-    fn title_does_not_hardcode_cyan() {
-        let src = include_str!("task_detail_view.rs");
-        // Walk the render() body specifically; other Color::Cyan refs
-        // (e.g. in tests) would be fine, but render() must not have one.
-        let render_start = src.find("fn render(&self").expect("render fn");
-        let render_end = src[render_start..]
-            .find("\n    }")
-            .map(|i| render_start + i)
-            .unwrap_or(src.len());
-        let render_src = &src[render_start..render_end];
-        assert!(
-            !render_src.contains("Color::Cyan"),
-            "render() still uses hardcoded Color::Cyan; should go through theme::current().accent"
-        );
     }
 
     #[test]
@@ -600,6 +716,21 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("after"));
         assert!(!view.refresh_task_cell("other-agent", &cell));
+    }
+
+    #[test]
+    fn agent_inspector_identifies_live_follow_and_keeps_identity_after_refresh() {
+        let mut cell = TaskCell::new_running("agent-1", "reviewer");
+        let mut view = TaskDetailView::from_agent_cell(&cell).with_live_task_id("agent-1");
+
+        assert_eq!(view.title, "Agent inspector · reviewer");
+        assert_eq!(
+            view.hint_keys().as_deref(),
+            Some("↑↓/Pg scroll · Following live · Esc back")
+        );
+        cell.description = "reviewer · updated objective".into();
+        assert!(view.refresh_task_cell("agent-1", &cell));
+        assert_eq!(view.title, "Agent inspector · reviewer · updated objective");
     }
 
     #[test]

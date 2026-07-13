@@ -39,6 +39,10 @@ pub struct CslManager {
     last_canonical_message_hashes: Vec<CanonicalMessageHash>,
     trace_id: Option<String>,
     last_session_state: SessionStateCompact,
+    /// A manager may be reconstructed while a prior projection is still
+    /// completing. Do not assume `last_seq == 0` means the store is empty:
+    /// load once before choosing the next append sequence.
+    loaded: bool,
 }
 
 impl CslManager {
@@ -57,6 +61,7 @@ impl CslManager {
             last_canonical_message_hashes: Vec::new(),
             trace_id: None,
             last_session_state: SessionStateCompact::default(),
+            loaded: false,
         })
     }
 
@@ -90,6 +95,7 @@ impl CslManager {
             .store
             .load_from_latest_snapshot(&self.session_id)
             .await?;
+        self.loaded = true;
         if entries.is_empty() {
             return Ok(None);
         }
@@ -118,6 +124,13 @@ impl CslManager {
         messages: &[serde_json::Value],
         session_state: &SessionStateCompact,
     ) -> Result<(), CslStoreError> {
+        // `CslManager::new` intentionally does not perform I/O. A fresh
+        // manager can therefore represent either a genuinely empty log or a
+        // manager rebuilt after a delayed projection. Reconcile once here so
+        // a new snapshot cannot race an existing sequence.
+        if !self.loaded {
+            self.load().await?;
+        }
         let canonical_messages = messages.to_vec();
         let canonical_message_count = canonical_messages.len();
         let meta = AppendMeta {
@@ -240,6 +253,7 @@ impl CslManager {
         self.last_turn = 0;
         self.last_canonical_message_hashes.clear();
         self.last_session_state = SessionStateCompact::default();
+        self.loaded = true;
         Ok(())
     }
 
@@ -397,6 +411,44 @@ mod tests {
         assert_eq!(mat.messages.len(), 2);
         assert_eq!(mat.last_seq, 1);
         assert_eq!(mat.messages[0]["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn fresh_manager_reconciles_existing_sequence_before_persisting() {
+        let tmp = TempDir::new().unwrap();
+        let mut first = test_manager(&tmp);
+        first
+            .persist_turn(
+                1,
+                &[user_msg("first"), assistant_msg("one")],
+                &default_state(),
+            )
+            .await
+            .unwrap();
+
+        // A worker can be rebuilt after a delayed write without an explicit
+        // caller-side `load()`. Its next persist must append a delta rather
+        // than collide with seq=1 by writing another snapshot.
+        let mut rebuilt = test_manager(&tmp);
+        rebuilt
+            .persist_turn(
+                2,
+                &[
+                    user_msg("first"),
+                    assistant_msg("one"),
+                    user_msg("second"),
+                    assistant_msg("two"),
+                ],
+                &default_state(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rebuilt.last_seq(), 2);
+        let mut loader = test_manager(&tmp);
+        let materialized = loader.load().await.unwrap().unwrap();
+        assert_eq!(materialized.messages.len(), 4);
+        assert_eq!(materialized.messages[3]["content"], "two");
     }
 
     #[tokio::test]
@@ -1400,7 +1452,7 @@ mod tests {
                 "content",
                 json!([
                     {"b": 2, "a": {"z": 0, "y": 1}},
-                    {"tool": {"name": "read_file", "args": {"path": "README.md", "limit": 20}}}
+                    {"tool": {"name": "read_file", "args": {"path": "README.md", "start_line": 1, "end_line": 20}}}
                 ]),
             ),
             (

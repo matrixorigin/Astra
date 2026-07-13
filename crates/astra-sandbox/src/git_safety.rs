@@ -381,6 +381,48 @@ fn shell_word_vec(command: &str) -> Vec<String> {
     words
 }
 
+/// Split top-level shell commands while preserving quoted content. Git global
+/// options apply only to their own simple command; scanning through a pipe or
+/// `&&` makes an unrelated `awk -c` / `python -c` look like `git -c`.
+fn shell_command_segments(command: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for (idx, ch) in command.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if !in_single && !in_double && (is_shell_operator_char(ch) || ch == '\n') {
+            let segment = command[start..idx].trim();
+            if !segment.is_empty() {
+                segments.push(segment);
+            }
+            start = idx + ch.len_utf8();
+        }
+    }
+    let segment = command[start..].trim();
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+    segments
+}
+
 fn contains_git_invocation(command: &str) -> bool {
     shell_word_vec(command).iter().any(|word| word_is_git(word))
 }
@@ -448,43 +490,49 @@ fn check_cd_git_compound(lower: &str, violations: &mut Vec<GitSafetyViolation>) 
 }
 
 fn check_git_config_flags(command: &str, violations: &mut Vec<GitSafetyViolation>) {
-    // Scan all words for dangerous git global flags.
-    // We don't try to parse git's complex flag grammar — just look for the dangerous
-    // flags anywhere after "git" and before common subcommands.
-    let words = shell_word_vec(command);
-    for (i, word) in words.iter().enumerate() {
-        if word == "git" || word.ends_with("/git") {
-            // Scan all subsequent words (don't stop at non-flag args, because
-            // flags like -C take a path argument that doesn't start with -).
-            for next in words.iter().skip(i + 1) {
-                if next == "-c" || next.starts_with("-c=") || next.starts_with("--config=") {
-                    violations.push(GitSafetyViolation::GitConfigFlag);
-                    return;
-                }
-                if next == "--exec-path" || next.starts_with("--exec-path=") {
-                    violations.push(GitSafetyViolation::GitExecPathFlag);
-                    return;
-                }
-                if next == "--config-env" || next.starts_with("--config-env=") {
-                    violations.push(GitSafetyViolation::GitExecPathFlag);
-                    return;
-                }
-                if next == "-C"
-                    || next.starts_with("-C=")
-                    || (next.starts_with("-C") && next.len() > 2)
+    // Git's config/working-tree flags are global options: they occur after the
+    // git executable and before its subcommand. Keep both boundaries explicit
+    // so flags belonging to `git grep` or a later pipeline command cannot be
+    // misclassified as process-wide Git configuration.
+    for segment in shell_command_segments(command) {
+        let words = shell_word_vec(segment);
+        for (i, word) in words.iter().enumerate() {
+            if word_is_git(word) {
+                for next in words
+                    .iter()
+                    .skip(i + 1)
+                    .take_while(|word| word.starts_with('-'))
                 {
-                    violations.push(GitSafetyViolation::GitBoundaryEscape { flag: "-C" });
-                    return;
-                }
-                if next == "--git-dir" || next.starts_with("--git-dir=") {
-                    violations.push(GitSafetyViolation::GitBoundaryEscape { flag: "--git-dir" });
-                    return;
-                }
-                if next == "--work-tree" || next.starts_with("--work-tree=") {
-                    violations.push(GitSafetyViolation::GitBoundaryEscape {
-                        flag: "--work-tree",
-                    });
-                    return;
+                    if next == "-c" || next.starts_with("-c=") || next.starts_with("--config=") {
+                        violations.push(GitSafetyViolation::GitConfigFlag);
+                        return;
+                    }
+                    if next == "--exec-path" || next.starts_with("--exec-path=") {
+                        violations.push(GitSafetyViolation::GitExecPathFlag);
+                        return;
+                    }
+                    if next == "--config-env" || next.starts_with("--config-env=") {
+                        violations.push(GitSafetyViolation::GitExecPathFlag);
+                        return;
+                    }
+                    if next == "-C"
+                        || next.starts_with("-C=")
+                        || (next.starts_with("-C") && next.len() > 2)
+                    {
+                        violations.push(GitSafetyViolation::GitBoundaryEscape { flag: "-C" });
+                        return;
+                    }
+                    if next == "--git-dir" || next.starts_with("--git-dir=") {
+                        violations
+                            .push(GitSafetyViolation::GitBoundaryEscape { flag: "--git-dir" });
+                        return;
+                    }
+                    if next == "--work-tree" || next.starts_with("--work-tree=") {
+                        violations.push(GitSafetyViolation::GitBoundaryEscape {
+                            flag: "--work-tree",
+                        });
+                        return;
+                    }
                 }
             }
         }
@@ -1029,6 +1077,37 @@ EOF
                         | GitSafetyViolation::GitBoundaryEscape { .. }
                 )),
                 "should block: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_global_flag_scan_stops_at_subcommand_and_shell_boundary() {
+        for cmd in [
+            "git grep -c needle",
+            "git diff origin/main...HEAD --stat | awk -c '{print $1}'",
+            "cd /workspace && git diff --stat | python -c 'print(1)'",
+            "git status && head -c 10 file",
+        ] {
+            let violations = validate_git_command(cmd);
+            assert!(
+                !violations
+                    .iter()
+                    .any(|violation| matches!(violation, GitSafetyViolation::GitConfigFlag)),
+                "non-global -c must not be attributed to git: {cmd}; got {violations:?}"
+            );
+        }
+
+        for cmd in [
+            "git -c core.fsmonitor=evil status",
+            "cd /workspace && git --config=core.fsmonitor=evil status",
+        ] {
+            let violations = validate_git_command(cmd);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| matches!(violation, GitSafetyViolation::GitConfigFlag)),
+                "git global config flag must remain visible: {cmd}; got {violations:?}"
             );
         }
     }

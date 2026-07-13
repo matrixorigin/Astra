@@ -344,6 +344,8 @@ pub enum SpawnAgentOutput {
     /// Agent completed synchronously.
     Completed {
         agent_id: String,
+        /// Immutable execution identity for the canonical child transcript.
+        run_id: String,
         result: String,
         tool_calls: u32,
         duration_ms: u64,
@@ -351,6 +353,8 @@ pub enum SpawnAgentOutput {
     /// Agent produced partial output but stopped before normal completion.
     Interrupted {
         agent_id: String,
+        /// Immutable execution identity for the canonical child transcript.
+        run_id: String,
         result: String,
         finish_reason: String,
         tool_calls: u32,
@@ -359,6 +363,8 @@ pub enum SpawnAgentOutput {
     /// Agent was cancelled synchronously.
     Cancelled {
         agent_id: String,
+        /// Immutable execution identity for the canonical child transcript.
+        run_id: String,
         reason: String,
         finish_reason: String,
         cancelled_by_user: bool,
@@ -368,6 +374,8 @@ pub enum SpawnAgentOutput {
     /// Agent is waiting for external input synchronously.
     Waiting {
         agent_id: String,
+        /// Immutable execution identity for the canonical child transcript.
+        run_id: String,
         reason: String,
         tool_calls: u32,
         duration_ms: u64,
@@ -375,12 +383,16 @@ pub enum SpawnAgentOutput {
     /// Agent launched in background.
     Launched {
         agent_id: String,
+        /// Immutable execution identity for the canonical child transcript.
+        run_id: String,
         description: String,
         messaging_address: Option<String>,
     },
     /// Failed to spawn.
     Failed {
         agent_id: String,
+        /// Immutable execution identity for the canonical child transcript.
+        run_id: String,
         error: String,
         finish_reason: String,
         duration_ms: u64,
@@ -388,9 +400,14 @@ pub enum SpawnAgentOutput {
 }
 
 impl SpawnAgentOutput {
-    pub fn launched(agent_id: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn launched(
+        agent_id: impl Into<String>,
+        run_id: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
         Self::Launched {
             agent_id: agent_id.into(),
+            run_id: run_id.into(),
             description: description.into(),
             messaging_address: None,
         }
@@ -714,6 +731,7 @@ mod tests {
     fn interrupted_spawn_output_serializes_as_distinct_wire_status() {
         let value = serde_json::to_value(SpawnAgentOutput::Interrupted {
             agent_id: "reviewer@abc123".to_string(),
+            run_id: "run-reviewer".to_string(),
             result: "partial findings".to_string(),
             finish_reason: "budget_exhausted".to_string(),
             tool_calls: 3,
@@ -726,6 +744,7 @@ mod tests {
             json!({
                 "status": "interrupted",
                 "agent_id": "reviewer@abc123",
+                "run_id": "run-reviewer",
                 "result": "partial findings",
                 "finish_reason": "budget_exhausted",
                 "tool_calls": 3,

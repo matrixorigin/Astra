@@ -14,14 +14,24 @@ pub(crate) fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> PipelineModules {
-    create_pipeline_modules_inner(api, profile, true)
+    create_pipeline_modules_inner(api, profile, true, true)
 }
 
 pub(crate) fn create_pipeline_modules_quiet(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> PipelineModules {
-    create_pipeline_modules_inner(api, profile, false)
+    create_pipeline_modules_inner(api, profile, false, true)
+}
+
+/// Build the local interactive baseline and defer every external provider.
+/// The TUI event loop owns and supervises convergence through
+/// [`discover_external_pipeline_capabilities`].
+pub(crate) fn create_tui_pipeline_modules(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> PipelineModules {
+    create_pipeline_modules_inner(api, profile, false, false)
 }
 
 pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskService> {
@@ -98,9 +108,10 @@ pub(crate) async fn resolve_task_store(
         .map(|s| s.trim_end_matches('/').to_string())
         .or_else(resolve_cloud_base);
     if let Some(cloud_base) = cloud_base {
-        let token = current_access_token(profile);
         let (store, notify_tx) =
-            crate::cli::session::session_todo_client::HttpTaskStore::new(cloud_base, token);
+            crate::cli::session::session_todo_client::HttpTaskStore::for_profile(
+                cloud_base, profile,
+            );
         return (store, Some(notify_tx));
     }
     (
@@ -176,6 +187,19 @@ pub(crate) struct PipelineModules {
     pub _skill_watcher: Option<astra_runtime::skills::watcher::SkillWatcherHandle>,
 }
 
+#[derive(Debug)]
+pub(crate) struct McpConnectionFailure {
+    pub name: String,
+    pub error: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExternalPipelineDiscoveryReport {
+    pub skills:
+        Result<astra_runtime::skills::SkillDiscoveryReport, astra_runtime::skills::SkillError>,
+    pub mcp_failures: Vec<McpConnectionFailure>,
+}
+
 /// Format an [`McpError`] as a concise user-facing message without redundant
 /// server-name prefixes (we print the server name separately).
 fn format_mcp_error(error: &crate::mcp_client::McpError) -> String {
@@ -205,10 +229,61 @@ fn format_mcp_error(error: &crate::mcp_client::McpError) -> String {
     }
 }
 
+async fn connect_mcp_configs(
+    configs: Vec<crate::mcp_client::McpServerConfig>,
+    manager: &std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
+    registry: &std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
+) -> Vec<(String, Result<(), String>)> {
+    let mut results = Vec::with_capacity(configs.len());
+    for config in configs {
+        let name = config.name.clone();
+        let result = {
+            let mut manager = manager.write().await;
+            mcp_client::connect_and_discover_skills(&mut manager, config, registry)
+                .await
+                .map(|_| ())
+                .map_err(|error| format_mcp_error(&error))
+        };
+        results.push((name, result));
+    }
+    results
+}
+
+/// Converge server skills and configured MCP providers without blocking the
+/// interactive event loop. The caller owns the task lifecycle and presents the
+/// typed report on its own UI surface.
+pub(crate) async fn discover_external_pipeline_capabilities(
+    registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
+    manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
+) -> ExternalPipelineDiscoveryReport {
+    let config_result =
+        tokio::task::spawn_blocking(manifest_loader::collect_mcp_server_configs).await;
+    let mut mcp_failures = Vec::new();
+    match config_result {
+        Ok(configs) => {
+            for (name, result) in connect_mcp_configs(configs, &manager, &registry).await {
+                if let Err(error) = result {
+                    mcp_failures.push(McpConnectionFailure { name, error });
+                }
+            }
+        }
+        Err(error) => mcp_failures.push(McpConnectionFailure {
+            name: "configuration".into(),
+            error: format!("MCP configuration discovery task stopped: {error}"),
+        }),
+    }
+
+    ExternalPipelineDiscoveryReport {
+        skills: registry.discover_all_report().await,
+        mcp_failures,
+    }
+}
+
 fn create_pipeline_modules_inner(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     announce_skills: bool,
+    connect_external: bool,
 ) -> PipelineModules {
     // Selector removed — the runtime now builds the turn-specific tool surface
     // directly from the local CLI catalog plus any mounted server/MCP schemas.
@@ -229,8 +304,11 @@ fn create_pipeline_modules_inner(
     let remote_catalog = Some(
         astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token_provider),
     );
-    let unified_skill_registry =
-        astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog);
+    let unified_skill_registry = if connect_external {
+        astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog)
+    } else {
+        astra_runtime::capabilities::build_cli_local_skill_registry_bootstrap(remote_catalog)
+    };
     let handle = tokio::runtime::Handle::current();
 
     // Initialize MCP client manager and connect any MCP servers declared in
@@ -253,7 +331,7 @@ fn create_pipeline_modules_inner(
         }
     }
 
-    {
+    if connect_external {
         let mcp_configs = manifest_loader::collect_mcp_server_configs();
         if !mcp_configs.is_empty() {
             let mgr = mcp_manager.clone();
@@ -261,26 +339,11 @@ fn create_pipeline_modules_inner(
             let _ = std::thread::scope(|s| {
                 s.spawn(|| {
                     handle.block_on(async {
-                        let mut manager = mgr.write().await;
-
-                        // Collect (name, Ok(()) | Err(msg)) for every server.
-                        let mut results: Vec<(String, Result<(), String>)> = Vec::new();
-                        for config in mcp_configs {
-                            let name = config.name.clone();
-                            match mcp_client::connect_and_discover_skills(
-                                &mut manager,
-                                config,
-                                &reg,
-                            )
-                            .await
-                            {
-                                Ok(_) => results.push((name, Ok(()))),
-                                Err(e) => results.push((name, Err(format_mcp_error(&e)))),
-                            }
-                        }
+                        let results = connect_mcp_configs(mcp_configs, &mgr, &reg).await;
 
                         if announce_skills {
                             // Count MCP tools per server (0 is fine — e.g. memoria).
+                            let manager = mgr.read().await;
                             let mut tool_counts: std::collections::HashMap<String, usize> =
                                 std::collections::HashMap::new();
                             for (server, _) in manager.all_tools() {
@@ -1061,13 +1124,13 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
 fn restored_turn_history_pairs(event: &session_journal::JournalEvent) -> Vec<(String, String)> {
     let base = event.user_input.clone().unwrap_or_default();
     let assistant = event.assistant_output.clone().unwrap_or_default();
-    let deferred = deferred_user_inputs_from_turn_metadata(event.metadata.as_ref());
+    let applied_intents = applied_user_intents_from_turn_metadata(event.metadata.as_ref());
 
-    let mut inputs = Vec::with_capacity(1 + deferred.len());
+    let mut inputs = Vec::with_capacity(1 + applied_intents.len());
     if !base.trim().is_empty() {
         inputs.push(base);
     }
-    inputs.extend(deferred);
+    inputs.extend(applied_intents);
 
     if inputs.is_empty() {
         return vec![(String::new(), assistant)];
@@ -1086,28 +1149,47 @@ fn restored_turn_history_pairs(event: &session_journal::JournalEvent) -> Vec<(St
     pairs
 }
 
-fn deferred_user_inputs_from_turn_metadata(metadata: Option<&serde_json::Value>) -> Vec<String> {
-    let mut inputs = metadata
-        .and_then(|metadata| metadata.get("deferred_user_inputs"))
+fn applied_user_intents_from_turn_metadata(metadata: Option<&serde_json::Value>) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct StoredUserIntent {
+        intent_id: String,
+        delivery: astra_turn_types::UserIntentDelivery,
+        status: astra_turn_types::UserIntentStatus,
+        event_index: usize,
+        content: String,
+    }
+
+    let mut intents = metadata
+        .and_then(|metadata| metadata.get("user_intents"))
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .enumerate()
-        .filter_map(|(idx, entry)| {
-            let content = entry.get("content").and_then(serde_json::Value::as_str)?;
-            let content = content.trim();
-            if content.is_empty() {
-                return None;
-            }
-            let event_index = entry
-                .get("event_index")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(u64::MAX);
-            Some((event_index, idx, content.to_string()))
-        })
+        .filter_map(
+            |entry| match serde_json::from_value::<StoredUserIntent>(entry.clone()) {
+                Ok(intent)
+                    if !intent.intent_id.trim().is_empty()
+                        && !intent.content.trim().is_empty()
+                        && intent.delivery
+                            == astra_turn_types::UserIntentDelivery::GuideCurrentRun
+                        && intent.status == astra_turn_types::UserIntentStatus::Applied =>
+                {
+                    Some(intent)
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::warn!(error = %error, "ignored malformed session user intent");
+                    None
+                }
+            },
+        )
         .collect::<Vec<_>>();
-    inputs.sort_by_key(|(event_index, idx, _)| (*event_index, *idx));
-    inputs.into_iter().map(|(_, _, content)| content).collect()
+    intents.sort_by_key(|intent| intent.event_index);
+    let mut seen = std::collections::HashSet::new();
+    intents
+        .into_iter()
+        .filter(|intent| seen.insert(intent.intent_id.clone()))
+        .map(|intent| intent.content.trim().to_string())
+        .collect()
 }
 
 pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) {
@@ -1467,11 +1549,11 @@ pub(crate) fn current_access_token(profile: Option<&str>) -> Option<String> {
 mod tests {
     use super::{
         ACCESS_TOKEN_REFRESH_SKEW_SECS, RestoredSessionState, SilentRefreshError,
-        access_token_needs_refresh, banner_session_display, banner_welcome_text,
-        context_window_for_model_from_models_response, current_access_token, current_git_root,
-        default_model_from_models_response, default_model_selection_from_models_response,
-        deferred_user_inputs_from_turn_metadata, ensure_state_default_model, fresh_access_token,
-        initialize_session_state, pending_recovery_status_line,
+        access_token_needs_refresh, applied_user_intents_from_turn_metadata,
+        banner_session_display, banner_welcome_text, context_window_for_model_from_models_response,
+        current_access_token, current_git_root, default_model_from_models_response,
+        default_model_selection_from_models_response, ensure_state_default_model,
+        fresh_access_token, initialize_session_state, pending_recovery_status_line,
         resolve_server_model_context_window, restore_history_from_journal,
         restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error,
@@ -1736,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_history_preserves_deferred_user_inputs_as_ordered_events() {
+    fn restore_history_preserves_applied_user_intents_as_ordered_events() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-restore-deferred-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
@@ -1754,7 +1836,13 @@ mod tests {
                     5,
                     100,
                 )
-                .with_deferred_user_inputs([(2, "2")]),
+                .with_applied_user_intents([(
+                    "intent-2",
+                    astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    astra_turn_types::UserIntentStatus::Applied,
+                    2,
+                    "2",
+                )]),
             )
             .unwrap();
 
@@ -1786,7 +1874,22 @@ mod tests {
                     5,
                     100,
                 )
-                .with_deferred_user_inputs([(2, "retry"), (3, "retry")]),
+                .with_applied_user_intents([
+                    (
+                        "intent-retry-1",
+                        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        astra_turn_types::UserIntentStatus::Applied,
+                        2,
+                        "retry",
+                    ),
+                    (
+                        "intent-retry-2",
+                        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        astra_turn_types::UserIntentStatus::Applied,
+                        3,
+                        "retry",
+                    ),
+                ]),
             )
             .unwrap();
 
@@ -1801,22 +1904,30 @@ mod tests {
     }
 
     #[test]
-    fn deferred_user_inputs_without_event_index_keep_array_order_after_indexed_inputs() {
+    fn applied_user_intents_restore_by_event_index_and_ignore_malformed_entries() {
         let metadata = serde_json::json!({
-            "deferred_user_inputs": [
+            "user_intents": [
                 {"content": "missing-a"},
-                {"event_index": 2, "content": "indexed"},
-                {"content": "missing-b"}
+                {
+                    "intent_id": "intent-3",
+                    "delivery": "guide_current_run",
+                    "status": "applied",
+                    "event_index": 3,
+                    "content": "third"
+                },
+                {
+                    "intent_id": "intent-2",
+                    "delivery": "guide_current_run",
+                    "status": "applied",
+                    "event_index": 2,
+                    "content": "second"
+                }
             ]
         });
 
         assert_eq!(
-            deferred_user_inputs_from_turn_metadata(Some(&metadata)),
-            vec![
-                "indexed".to_string(),
-                "missing-a".to_string(),
-                "missing-b".to_string()
-            ]
+            applied_user_intents_from_turn_metadata(Some(&metadata)),
+            vec!["second".to_string(), "third".to_string()]
         );
     }
 

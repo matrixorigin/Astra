@@ -3,6 +3,7 @@
 #![cfg(test)]
 
 use super::{SlashItem, SlashMenu, is_open_for};
+use std::borrow::Cow;
 
 fn items() -> Vec<SlashItem> {
     vec![
@@ -46,7 +47,7 @@ fn is_open_for_checks_first_line_only() {
 #[test]
 fn empty_filter_shows_all_items_in_registered_order() {
     let menu = SlashMenu::new(items());
-    let names: Vec<&str> = menu.matches().iter().map(|i| i.name).collect();
+    let names: Vec<&str> = menu.matches().iter().map(|i| i.name.as_ref()).collect();
     assert_eq!(
         names,
         vec![
@@ -67,7 +68,29 @@ fn empty_filter_shows_all_items_in_registered_order() {
 fn new_menu_selects_first_item() {
     let menu = SlashMenu::new(items());
     assert_eq!(menu.selected(), Some(0));
-    assert_eq!(menu.selected_item().map(|i| i.name), Some("/help"));
+    assert_eq!(menu.selected_item().map(|i| i.name.as_ref()), Some("/help"));
+}
+
+#[test]
+fn dynamic_subcommands_are_owned_by_the_menu_lifecycle() {
+    let mut menu = SlashMenu::new(vec![SlashItem {
+        name: "/mcp".into(),
+        description: "MCP discovery".into(),
+        extra_subcommands: vec![(
+            "inspect reviewer:check_diff".to_string(),
+            "reviewer · check_diff".to_string(),
+        )],
+        ..Default::default()
+    }]);
+
+    menu.set_filter("/mcp inspect reviewer");
+    let item = menu
+        .selected_item()
+        .expect("dynamic MCP completion must be selectable");
+    assert_eq!(item.name, "/mcp inspect reviewer:check_diff");
+    assert_eq!(item.description, "reviewer · check_diff");
+    assert!(matches!(&item.name, Cow::Owned(_)));
+    assert!(matches!(&item.description, Cow::Owned(_)));
 }
 
 // ─── Filter narrowing ─────────────────────────────────────────────
@@ -76,7 +99,7 @@ fn new_menu_selects_first_item() {
 fn set_filter_with_slash_narrows_to_prefix_matches() {
     let mut menu = SlashMenu::new(items());
     menu.set_filter("/re");
-    let names: Vec<&str> = menu.matches().iter().map(|i| i.name).collect();
+    let names: Vec<&str> = menu.matches().iter().map(|i| i.name.as_ref()).collect();
     // Prefix matches should all appear — order by fuzzy score.
     assert!(names.contains(&"/resume"));
     assert!(names.contains(&"/review"));
@@ -93,7 +116,7 @@ fn filter_uses_only_leading_slash_token() {
     // Trailing args after whitespace must NOT affect filtering.
     let mut menu = SlashMenu::new(items());
     menu.set_filter("/mo some extra args");
-    let names: Vec<&str> = menu.matches().iter().map(|i| i.name).collect();
+    let names: Vec<&str> = menu.matches().iter().map(|i| i.name.as_ref()).collect();
     // `/model` should rank first.
     assert_eq!(names.first().copied(), Some("/model"));
 }
@@ -102,7 +125,7 @@ fn filter_uses_only_leading_slash_token() {
 fn filter_is_case_insensitive() {
     let mut menu = SlashMenu::new(items());
     menu.set_filter("/HELP");
-    let names: Vec<&str> = menu.matches().iter().map(|i| i.name).collect();
+    let names: Vec<&str> = menu.matches().iter().map(|i| i.name.as_ref()).collect();
     assert_eq!(names.first().copied(), Some("/help"));
 }
 
@@ -111,7 +134,7 @@ fn fuzzy_match_scores_subsequence_hits() {
     // `/agtcr` should still match `/agent-create` through fuzzy.
     let mut menu = SlashMenu::new(items());
     menu.set_filter("/agtcr");
-    let names: Vec<&str> = menu.matches().iter().map(|i| i.name).collect();
+    let names: Vec<&str> = menu.matches().iter().map(|i| i.name.as_ref()).collect();
     assert!(
         names.contains(&"/agent-create"),
         "fuzzy should reach /agent-create; got {names:?}"
@@ -134,7 +157,7 @@ fn filter_accepts_empty_slash() {
     menu.set_filter("/");
     // With only '/' typed, show everything.
     assert_eq!(menu.len(), 7);
-    assert_eq!(menu.selected_item().map(|i| i.name), Some("/help"));
+    assert_eq!(menu.selected_item().map(|i| i.name.as_ref()), Some("/help"));
 }
 
 // ─── Selection navigation ─────────────────────────────────────────
@@ -206,14 +229,14 @@ fn empty_menu_ignores_navigation() {
 fn items_with_subs() -> Vec<SlashItem> {
     vec![
         SlashItem {
-            name: "/context",
-            description: "context panel",
+            name: "/context".into(),
+            description: "context panel".into(),
             subcommands: &[("dump", "Write a JSON snapshot to disk")],
             ..Default::default()
         },
         SlashItem {
-            name: "/skill",
-            description: "skills",
+            name: "/skill".into(),
+            description: "skills".into(),
             subcommands: &[
                 ("browse", "Browse marketplace"),
                 ("install", "Install from marketplace"),
@@ -230,7 +253,7 @@ fn space_after_command_switches_to_subcommand_mode() {
     let mut menu = SlashMenu::new(items_with_subs());
     menu.set_filter("/context ");
     assert!(menu.is_subcommand_mode());
-    let names: Vec<&str> = menu.matches().iter().map(|it| it.name).collect();
+    let names: Vec<&str> = menu.matches().iter().map(|it| it.name.as_ref()).collect();
     assert_eq!(names, vec!["/context dump"]);
     // Description tracks the subcommand row, not the parent.
     assert_eq!(
@@ -244,7 +267,7 @@ fn partial_subcommand_token_narrows_matches() {
     let mut menu = SlashMenu::new(items_with_subs());
     menu.set_filter("/skill br");
     assert!(menu.is_subcommand_mode());
-    let names: Vec<&str> = menu.matches().iter().map(|it| it.name).collect();
+    let names: Vec<&str> = menu.matches().iter().map(|it| it.name.as_ref()).collect();
     assert_eq!(names, vec!["/skill browse"]);
 }
 
@@ -252,7 +275,7 @@ fn partial_subcommand_token_narrows_matches() {
 fn empty_subcommand_token_lists_all_subs() {
     let mut menu = SlashMenu::new(items_with_subs());
     menu.set_filter("/skill ");
-    let names: Vec<&str> = menu.matches().iter().map(|it| it.name).collect();
+    let names: Vec<&str> = menu.matches().iter().map(|it| it.name.as_ref()).collect();
     assert_eq!(
         names,
         vec!["/skill browse", "/skill install", "/skill list"]
@@ -294,7 +317,7 @@ fn selected_item_in_subcommand_mode_returns_full_cmd_sub_name() {
     let mut menu = SlashMenu::new(items_with_subs());
     menu.set_filter("/context ");
     assert_eq!(
-        menu.selected_item().map(|it| it.name),
+        menu.selected_item().map(|it| it.name.as_ref()),
         Some("/context dump")
     );
 }

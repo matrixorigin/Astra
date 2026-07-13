@@ -8,7 +8,7 @@
 //!   destructive path outside cwd
 //!
 //! ▸ Yes    Yes, and don't ask again    No
-//!   ← → move · Enter confirm · Esc close
+//!   ← → move · Enter confirm · Ctrl+D reject
 //! ```
 //!
 //! The focused button uses a reversed pill (accent bg, contrasting fg);
@@ -35,6 +35,7 @@ use crate::tui::turn_event::TurnEvent;
 /// from the risk tag list. Order is fixed (worst-first) so the
 /// badge is stable across renders.
 fn highest_risk_color(labels: &[String]) -> Color {
+    let theme = crate::tui::theme::current();
     let critical = [
         "WritesSensitiveFile",
         "GitDestructive",
@@ -49,17 +50,17 @@ fn highest_risk_color(labels: &[String]) -> Color {
     ];
     let medium = ["WritesOutsidePackage", "SandboxExpansion"];
     if labels.iter().any(|l| critical.contains(&l.as_str())) {
-        return Color::Red;
+        return theme.error;
     }
     if labels.iter().any(|l| high.contains(&l.as_str())) {
-        return Color::LightRed;
+        return theme.error;
     }
     if labels.iter().any(|l| medium.contains(&l.as_str())) {
-        return Color::Yellow;
+        return theme.warn;
     }
     // BashExecute and other "vanilla" tags fall through to a
     // softer colour so the screen isn't shouting on every prompt.
-    Color::Cyan
+    theme.gutter
 }
 
 fn humanize_risk_tag(label: &str) -> &'static str {
@@ -390,9 +391,9 @@ impl ApprovalCell {
         // inter-button spacing here.
         let mut spans: Vec<Span<'static>> = Vec::new();
         let theme = crate::tui::theme::current();
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = Style::default().fg(theme.dim);
         let body = if self.focused {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.fg)
         } else {
             dim
         };
@@ -426,7 +427,7 @@ impl ApprovalCell {
                 } else {
                     format!(" {} ", btn.label)
                 };
-                spans.push(Span::styled(text, Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(text, Style::default().fg(theme.dim)));
             } else {
                 // Subtle bracket outline so all buttons have the same
                 // shape as the focused one — just without the fill.
@@ -457,9 +458,9 @@ impl HistoryCell for ApprovalCell {
         // for detail/reason rows and the unfocused hint.
         let theme = crate::tui::theme::current();
         let accent_style = Style::default().fg(theme.accent);
-        let muted = Style::default().fg(Color::DarkGray);
+        let muted = Style::default().fg(theme.dim);
         let body_style = if self.focused {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme.fg)
         } else {
             muted
         };
@@ -569,11 +570,9 @@ impl HistoryCell for ApprovalCell {
         // body style for "Saved" and yellow for "Failed".
         if let Some(outcome) = &self.save_outcome {
             let outcome_style = if outcome.starts_with("Failed") {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(theme.warn).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Green)
+                Style::default().fg(theme.success)
             };
             lines.push(Line::from(vec![
                 bar.clone(),
@@ -597,7 +596,7 @@ impl HistoryCell for ApprovalCell {
                 Span::styled(
                     format!("Can't remember · {reason_text}"),
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(theme.dim)
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]));
@@ -616,7 +615,7 @@ impl HistoryCell for ApprovalCell {
         // style. Unfocused: plain border close — the user isn't
         // looking at this card for actions yet.
         let bottom = if self.focused {
-            let hint = "←→ move · Enter select · Esc close";
+            let hint = "←→ move · Enter select · Ctrl+D reject";
             Line::from(vec![
                 Span::styled("╰─ ".to_string(), accent_style),
                 Span::styled(hint.to_string(), muted),
@@ -688,8 +687,8 @@ mod tests {
             "arrow-key hint missing on focused cell"
         );
         assert!(
-            rendered.contains("Esc close"),
-            "Esc close shortcut hint missing on focused cell"
+            rendered.contains("Ctrl+D reject"),
+            "explicit reject shortcut hint missing on focused cell"
         );
         assert!(
             rendered.contains("Enter select"),
@@ -855,20 +854,22 @@ mod tests {
     }
 
     #[test]
-    fn highest_risk_color_picks_red_for_critical() {
-        // Pure unit test on the colour-picker so a future CSS
-        // refactor doesn't downgrade catastrophic tags into the
-        // "vanilla" shade.
+    fn highest_risk_color_uses_semantic_risk_slots() {
+        let theme = crate::tui::theme::current();
         assert_eq!(
             highest_risk_color(&["BashExecute".into(), "WritesSensitiveFile".into(),]),
-            Color::Red
+            theme.error
         );
-        assert_eq!(highest_risk_color(&["GitDestructive".into()]), Color::Red);
+        assert_eq!(highest_risk_color(&["GitDestructive".into()]), theme.error);
         assert_eq!(
             highest_risk_color(&["NetworkExfiltration".into()]),
-            Color::LightRed
+            theme.error
         );
-        assert_eq!(highest_risk_color(&["BashExecute".into()]), Color::Cyan);
+        assert_eq!(
+            highest_risk_color(&["WritesOutsidePackage".into()]),
+            theme.warn
+        );
+        assert_eq!(highest_risk_color(&["BashExecute".into()]), theme.gutter);
     }
 
     // ── Issue #326 P3 / R2 Major 1: scope-picker policy ──────

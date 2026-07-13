@@ -302,7 +302,7 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         &skill_result,
     );
 
-    state.messages.push(serde_json::json!({
+    state.push_prompt_history_message(serde_json::json!({
         "role": "assistant",
         "content": null,
         "tool_calls": [{
@@ -323,7 +323,7 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
             crate::turn::skill_tool::SKILL_TOOL_NAME,
             &content_for_model,
         );
-    state.messages.push(tool_msg);
+    state.push_prompt_history_message(tool_msg);
     state.tool_results.push(tool_result);
     state.telemetry.all_selected_skills.push(skill_name.clone());
     state.skills.auto_route_attempts.insert(attempt_key);
@@ -1479,6 +1479,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             let mut parts = Vec::with_capacity(pending.len());
             for msg in &pending {
                 let from_label = &msg.from.agent_id;
+                host.on_agent_communication(astra_messaging::agent_communication_event(
+                    &mailbox.address,
+                    astra_messaging::AgentCommunicationDirection::Received,
+                    msg,
+                ));
 
                 match &msg.payload {
                     astra_messaging::types::MessagePayload::Ack { message_id } => {
@@ -1537,8 +1542,14 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 
                 if msg.requires_ack {
                     let ack_reply = msg.make_ack(mailbox.address.clone());
-                    if let Err(e) = mailbox.send(ack_reply).await {
+                    if let Err(e) = mailbox.send(ack_reply.clone()).await {
                         astra_core::agent_warn!("mailbox", "Failed to send ack: {e}");
+                    } else {
+                        host.on_agent_communication(astra_messaging::agent_communication_event(
+                            &mailbox.address,
+                            astra_messaging::AgentCommunicationDirection::Sent,
+                            &ack_reply,
+                        ));
                     }
                     if let Some(ref metrics) = state.messaging.metrics {
                         metrics.acks_sent.fetch_add(1, Ordering::Relaxed);
@@ -1550,11 +1561,17 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 {
                     let response_msg =
                         response.to_message(&mailbox.address, &msg.from, &correlation_id);
-                    if let Err(e) = mailbox.send(response_msg).await {
+                    if let Err(e) = mailbox.send(response_msg.clone()).await {
                         astra_core::agent_warn!(
                             "mailbox",
                             "Failed to send permission response: {e}"
                         );
+                    } else {
+                        host.on_agent_communication(astra_messaging::agent_communication_event(
+                            &mailbox.address,
+                            astra_messaging::AgentCommunicationDirection::Sent,
+                            &response_msg,
+                        ));
                     }
                     continue;
                 }
@@ -1579,6 +1596,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     astra_messaging::types::MessagePayload::Ack { .. } => {}
                     astra_messaging::types::MessagePayload::Nack { .. } => {}
                 }
+            }
+            if let Err(error) = mailbox.acknowledge_received(&pending).await {
+                astra_core::agent_warn!(
+                    "mailbox",
+                    "failed to confirm consumed messages; transport may redeliver them: {error}"
+                );
             }
             if !parts.is_empty() {
                 let mailbox_text = format!(
@@ -3047,8 +3070,7 @@ mod tests {
     // verify checkpoint and interruption record invariants.
 
     use crate::turn::run_control::{
-        QueuedRunInputEvent, RunControlStatus, RunInputProvider, RunQueuedInputPoll,
-        RunStatusProvider,
+        QueuedUserIntent, RunControlStatus, RunStatusProvider, UserIntentPoll, UserIntentProvider,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio_util::sync::CancellationToken;
@@ -3086,27 +3108,28 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl RunInputProvider for CountingStatusRunControl {
-        async fn poll_user_inputs(
+    impl UserIntentProvider for CountingStatusRunControl {
+        async fn poll_user_intents(
             &self,
             _user_id: &str,
             _run_id: &str,
             after_event_index: usize,
-        ) -> RunQueuedInputPoll {
-            RunQueuedInputPoll {
+        ) -> UserIntentPoll {
+            UserIntentPoll {
                 next_cursor: after_event_index,
-                inputs: Vec::<QueuedRunInputEvent>::new(),
+                inputs: Vec::<QueuedUserIntent>::new(),
+                issues: Vec::new(),
                 error: None,
             }
         }
 
-        async fn mark_user_inputs_released(
+        async fn mark_user_intents_applied(
             &self,
             _user_id: &str,
             _run_id: &str,
             _event_indices: &[usize],
-        ) -> Result<(), String> {
-            Ok(())
+        ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
+            Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
         }
     }
 
@@ -3122,27 +3145,28 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl RunInputProvider for FailingStatusRunControl {
-        async fn poll_user_inputs(
+    impl UserIntentProvider for FailingStatusRunControl {
+        async fn poll_user_intents(
             &self,
             _user_id: &str,
             _run_id: &str,
             after_event_index: usize,
-        ) -> RunQueuedInputPoll {
-            RunQueuedInputPoll {
+        ) -> UserIntentPoll {
+            UserIntentPoll {
                 next_cursor: after_event_index,
-                inputs: Vec::<QueuedRunInputEvent>::new(),
+                inputs: Vec::<QueuedUserIntent>::new(),
+                issues: Vec::new(),
                 error: None,
             }
         }
 
-        async fn mark_user_inputs_released(
+        async fn mark_user_intents_applied(
             &self,
             _user_id: &str,
             _run_id: &str,
             _event_indices: &[usize],
-        ) -> Result<(), String> {
-            Ok(())
+        ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
+            Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
         }
     }
 

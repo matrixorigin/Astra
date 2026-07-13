@@ -11,4 +11,4 @@ expression: "render_at(&cell, 80)"
 │ Can't remember · outside workspace
 │
 │  Yes   Yes, and don't ask again   No
-╰─ ←→ move · Enter select · Esc close
+╰─ ←→ move · Enter select · Ctrl+D reject

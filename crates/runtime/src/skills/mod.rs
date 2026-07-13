@@ -58,7 +58,8 @@ pub use astra_skills::improvement::{ImprovementProposal, ImprovementTracker, Ski
 pub use astra_skills::providers::DatabaseSkillProvider;
 pub use astra_skills::verify::SkillVerifier;
 pub use registry::{
-    SharedSkillRegistry, SkillHealthInputs, UnifiedSkillRegistry, UnifiedSkillResolver,
+    SharedSkillRegistry, SkillDiscoveryFailure, SkillDiscoveryReport, SkillHealthInputs,
+    UnifiedSkillRegistry, UnifiedSkillResolver,
 };
 
 /// Returns a shared reference to a static empty `UnifiedSkillRegistry`.

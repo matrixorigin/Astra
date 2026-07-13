@@ -1,16 +1,16 @@
 //! One-line live indicator rendered above the composer while a
 //! turn is running. Replaces the previous `orbiter_line` + framed
-//! thinking-window combo with a single Codex-style widget that
+//! thinking-window combo with a single compact activity widget that
 //! lives **outside** scrollback.
 //!
 //! Shape:
 //!
 //! ```text
-//! • Working · 16s · 5.1k tokens · Esc to stop
-//! • Working · Bash · 3s · Esc to stop
+//! • Working · 16s · 5.1k tokens · Ctrl+C to stop
+//! • Working · Bash · 3s · Ctrl+C to stop
 //! ```
 //!
-//! Design rules — drawn from Codex's `StatusIndicatorWidget`:
+//! Design rules:
 //!
 //! - Never part of the scrollback / `HistoryCell` chain. It's
 //!   ephemeral — if a user scrolls back they see the result
@@ -37,6 +37,9 @@ use ratatui::text::{Line, Span};
 pub(crate) enum IndicatorState {
     /// No turn active — render nothing.
     Idle,
+    /// Accepted by the local UI and being dispatched to the selected action
+    /// or run path. No remote/model acknowledgement has arrived yet.
+    Dispatching { started_at: Instant },
     /// Turn is running, model is thinking / producing tokens.
     Thinking { started_at: Instant },
     /// Tool is executing mid-turn.
@@ -51,7 +54,8 @@ impl IndicatorState {
     fn started_at(&self) -> Option<Instant> {
         match self {
             IndicatorState::Idle => None,
-            IndicatorState::Thinking { started_at }
+            IndicatorState::Dispatching { started_at }
+            | IndicatorState::Thinking { started_at }
             | IndicatorState::Tool { started_at, .. }
             | IndicatorState::WaitingModel { started_at }
             | IndicatorState::AwaitingApproval { started_at } => Some(*started_at),
@@ -88,14 +92,6 @@ pub(crate) struct StatusIndicator {
     turn_label: Option<&'static str>,
 }
 
-/// How long the model can be silent in `Thinking` state before the
-/// indicator shows the `· thinking Ns` chip. Tuned to match the
-/// "this is taking longer than usual" expectation: short enough to
-/// reassure the user during Bedrock extended-thinking pauses,
-/// long enough to avoid flickering in/out for a normal prompt.
-const SILENT_WINDOW_BEFORE_THOUGHT_CHIP: Duration = Duration::from_secs(5);
-const STALL_WARN_AFTER: Duration = Duration::from_secs(5);
-const STALL_ERROR_AFTER: Duration = Duration::from_secs(10);
 const DEFAULT_TURN_LABEL: &str = "Working";
 const TOKEN_COUNT_VISIBILITY_THRESHOLD: u64 = 100;
 
@@ -150,7 +146,7 @@ impl StatusIndicator {
     }
 
     /// Mark the start of a new turn. Drives the elapsed counter that
-    /// renders in the spinner suffix (`(7s · esc to interrupt)`).
+    /// renders in the spinner suffix (`7s · Ctrl+C to stop`).
     /// Called at the same moment the host transitions out of Idle —
     /// usually right alongside `set_state(Thinking { ... })` or
     /// `set_state(WaitingModel { ... })`.
@@ -158,6 +154,22 @@ impl StatusIndicator {
         self.turn_started_at = Some(at);
         self.turn_label = Some(DEFAULT_TURN_LABEL);
         self.stream_chars = 0;
+    }
+
+    /// Begin the local-acceptance phase before authentication, network, or
+    /// action dispatch. The subsequent runtime event promotes this label to
+    /// the stable `Working` turn label without resetting elapsed time.
+    pub fn begin_dispatch(&mut self, at: Instant) {
+        self.turn_started_at = Some(at);
+        self.turn_label = Some("Sending");
+        self.stream_chars = 0;
+        self.state = IndicatorState::Dispatching { started_at: at };
+    }
+
+    pub fn mark_dispatched(&mut self) {
+        if self.state.is_active() {
+            self.turn_label = Some(DEFAULT_TURN_LABEL);
+        }
     }
 
     pub fn bump_stream_chars(&mut self, n: usize) {
@@ -211,20 +223,22 @@ fn render_for_with_bash_hint(
         return None;
     }
 
-    let elapsed_origin = turn_started_at.or_else(|| state.started_at());
-    let elapsed = elapsed_origin.and_then(|t| now.checked_duration_since(t));
+    let elapsed = turn_started_at
+        .or_else(|| state.started_at())
+        .and_then(|t| now.checked_duration_since(t));
 
     let theme = crate::tui::theme::current();
-    let intensity_color = stall_intensity_color(elapsed, theme);
+    let state_color = indicator_state_color(state, theme);
     let star_style = Style::default()
-        .fg(intensity_color)
+        .fg(state_color)
         .add_modifier(Modifier::BOLD);
     let label_style = Style::default()
-        .fg(intensity_color)
+        .fg(state_color)
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(theme.dim);
 
     let state_label: String = match state {
+        IndicatorState::Dispatching { .. } => "Sending".into(),
         IndicatorState::Thinking { .. } => "Thinking".into(),
         IndicatorState::Tool { name, .. } => label_for_tool(name),
         IndicatorState::WaitingModel { .. } => "Starting".into(),
@@ -239,19 +253,12 @@ fn render_for_with_bash_hint(
             Some(state_label.as_str())
         };
 
-    // Surface a `· thinking Ns` chip during long silent stretches
-    // in Thinking state. Bedrock extended-thinking can churn 60-120s
-    // without any SSE delta — this chip is the only signal the user
-    // has that the model is alive on the other end.
-    let thought_for = thought_for_duration(state, stream_chars, elapsed);
-
     let mut spans = vec![Span::styled(format!("{} ", star_frame(now)), star_style)];
     spans.extend(label_spans(label, label_style, now));
     let suffix = suffix(
         state,
         elapsed,
         stream_chars,
-        thought_for,
         activity,
         bash_background_hint_enabled,
     );
@@ -286,48 +293,24 @@ fn label_for_tool(name: &str) -> String {
     }
 }
 
-/// Returns `Some(elapsed)` when the indicator should display the
-/// `· thinking Ns` chip. Conditions:
-/// 1. State is Thinking (chip is meaningless for tool execution etc.)
-/// 2. No tokens have streamed yet (token counter takes over once any
-///    have arrived — the counter itself proves the model is active)
-/// 3. We've been silent past the [`SILENT_WINDOW_BEFORE_THOUGHT_CHIP`]
-///    threshold
-fn thought_for_duration(
-    state: &IndicatorState,
-    stream_chars: u64,
-    elapsed: Option<Duration>,
-) -> Option<Duration> {
-    if !matches!(state, IndicatorState::Thinking { .. }) {
-        return None;
-    }
-    if stream_chars > 0 {
-        return None;
-    }
-    let d = elapsed?;
-    if d >= SILENT_WINDOW_BEFORE_THOUGHT_CHIP {
-        Some(d)
-    } else {
-        None
+fn indicator_state_color(state: &IndicatorState, theme: &crate::tui::theme::Theme) -> Color {
+    match state {
+        IndicatorState::AwaitingApproval { .. } => theme.warn,
+        IndicatorState::Dispatching { .. }
+        | IndicatorState::Thinking { .. }
+        | IndicatorState::Tool { .. }
+        | IndicatorState::WaitingModel { .. } => theme.accent,
+        IndicatorState::Idle => theme.dim,
     }
 }
 
-fn stall_intensity_color(elapsed: Option<Duration>, theme: &crate::tui::theme::Theme) -> Color {
-    match elapsed {
-        Some(d) if d >= STALL_ERROR_AFTER => theme.error,
-        Some(d) if d >= STALL_WARN_AFTER => theme.warn,
-        _ => theme.accent,
-    }
-}
-
-/// Inline suffix: `Bash · 35s · Esc to stop`.
+/// Inline suffix: `Bash · 35s · Ctrl+C to stop`.
 /// Ordered by user value: current activity first, then elapsed/progress,
 /// with the stop affordance anchored at the end.
 fn suffix(
     state: &IndicatorState,
     elapsed: Option<Duration>,
     stream_chars: u64,
-    thought_for: Option<Duration>,
     activity: Option<&str>,
     bash_background_hint_enabled: bool,
 ) -> String {
@@ -337,10 +320,6 @@ fn suffix(
     }
     if let Some(d) = elapsed {
         parts.push(fmt_duration_coarse(d));
-    }
-    if let Some(d) = thought_for {
-        let _ = d;
-        parts.push("still thinking".into());
     }
     let streamed_tokens = approx_tokens(stream_chars);
     if matches!(state, IndicatorState::Thinking { .. })
@@ -357,7 +336,7 @@ fn suffix(
             crate::tui::background_shortcut::ctrl_b_background_shortcut()
         ));
     }
-    parts.push("Esc to stop".into());
+    parts.push("Ctrl+C to stop".into());
     parts.join(" · ")
 }
 
@@ -426,16 +405,16 @@ fn color_to_rgb_approx(color: Color) -> Option<(u8, u8, u8)> {
 /// Rotating star glyph. Time-keyed to a 500 ms window — slow
 /// heartbeat, fast enough to reassure the terminal isn't frozen.
 fn star_frame(now: Instant) -> &'static str {
-    const FRAMES: [&str; 4] = ["·", "•", "●", "•"];
     let bucket = (crate::tui::shimmer::time_at(now).max(0.0) * 2.0).floor() as usize;
-    FRAMES[bucket % FRAMES.len()]
+    let frames = crate::tui::glyphs::current().activity_frames;
+    frames[bucket % frames.len()]
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         IndicatorState, StatusIndicator, approx_tokens, fmt_duration_coarse, fmt_tokens,
-        label_spans_for_mode, render_for, stall_intensity_color, star_frame,
+        indicator_state_color, label_spans_for_mode, render_for, star_frame,
     };
     use ratatui::style::{Color, Style};
     use ratatui::text::Line;
@@ -443,10 +422,6 @@ mod tests {
 
     fn text_of(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.to_string()).collect()
-    }
-
-    fn any_star(s: &str) -> bool {
-        ["✶", "✷", "✹", "✺"].iter().any(|g| s.contains(g))
     }
 
     // ── render rules ─────────────────────────────────────────────
@@ -522,35 +497,46 @@ mod tests {
         );
         assert!(text.contains("Thinking"));
         assert!(text.contains("3s"));
-        assert!(text.contains("Esc to stop"));
+        assert!(text.contains("Ctrl+C to stop"));
     }
 
     #[test]
-    fn thinking_stall_intensity_warns_at_5s_and_errors_at_10s() {
+    fn elapsed_time_does_not_invent_stall_severity() {
         let theme = crate::tui::theme::Theme::dark();
         assert_eq!(
-            stall_intensity_color(Some(Duration::from_secs(4)), &theme),
+            indicator_state_color(
+                &IndicatorState::Thinking {
+                    started_at: Instant::now(),
+                },
+                &theme,
+            ),
             theme.accent
-        );
-        assert_eq!(
-            stall_intensity_color(Some(Duration::from_secs(5)), &theme),
-            theme.warn
-        );
-        assert_eq!(
-            stall_intensity_color(Some(Duration::from_secs(10)), &theme),
-            theme.error
         );
     }
 
     #[test]
-    fn rendered_spinner_uses_stall_color_on_first_span() {
+    fn long_running_activity_stays_neutral_without_typed_failure_evidence() {
         let mut s = StatusIndicator::new();
         let t0 = Instant::now();
         s.set_state(IndicatorState::Thinking { started_at: t0 });
-        let line = s.render_at(t0 + Duration::from_secs(10)).unwrap();
+        let line = s.render_at(t0 + Duration::from_secs(600)).unwrap();
         assert_eq!(
             line.spans[0].style.fg,
-            Some(crate::tui::theme::current().error)
+            Some(crate::tui::theme::current().accent)
+        );
+    }
+
+    #[test]
+    fn approval_state_uses_warning_color_from_typed_state() {
+        let theme = crate::tui::theme::Theme::dark();
+        assert_eq!(
+            indicator_state_color(
+                &IndicatorState::AwaitingApproval {
+                    started_at: Instant::now(),
+                },
+                &theme,
+            ),
+            theme.warn
         );
     }
 
@@ -585,7 +571,7 @@ mod tests {
             )),
             "{text}"
         );
-        assert!(text.contains("Esc to stop"), "{text}");
+        assert!(text.contains("Ctrl+C to stop"), "{text}");
 
         s.set_state(IndicatorState::Idle);
         assert!(
@@ -871,88 +857,6 @@ mod tests {
         // Starting a fresh turn does reset.
         s.begin_turn(t0 + Duration::from_secs(60));
         assert_eq!(s.stream_chars, 0, "new turn must zero the counter");
-    }
-
-    /// Bedrock extended-thinking can churn for 60-120s with zero
-    /// SSE deltas. Pre-fix the user saw `• Thinking · Ns · Esc
-    /// stops` with N climbing but no other signal that the model
-    /// was actually working — indistinguishable from a hung UI.
-    /// Surface a `thinking Ns` chip after a short silence window
-    /// so the user can tell the difference.
-    #[test]
-    fn thought_for_suffix_appears_after_silent_window() {
-        let mut s = StatusIndicator::new();
-        let t0 = Instant::now();
-        s.set_state(IndicatorState::Thinking { started_at: t0 });
-
-        // Just after start: no silent-thinking chip yet (well within
-        // the silent-window threshold).
-        let line = s.render_at(t0 + Duration::from_secs(1)).unwrap();
-        assert!(
-            !text_of(&line).contains("still thinking"),
-            "fresh thinking shouldn't show the silent-thinking chip: {}",
-            text_of(&line)
-        );
-
-        // Past the window with still no token streamed — chip lights up.
-        let line = s.render_at(t0 + Duration::from_secs(7)).unwrap();
-        let text = text_of(&line);
-        assert!(
-            text.contains("still thinking"),
-            "after 7s of silence the chip should show: {text}"
-        );
-        assert!(
-            !text.contains("thinking 7s"),
-            "silent-thinking chip should not duplicate elapsed time: {text}"
-        );
-    }
-
-    #[test]
-    fn thought_for_suffix_clears_when_token_arrives() {
-        // Once any tokens have streamed, we know the model is
-        // actively producing — the silent-window chip would be
-        // misleading. The token counter takes over as the activity
-        // signal.
-        let mut s = StatusIndicator::new();
-        let t0 = Instant::now();
-        s.set_state(IndicatorState::Thinking { started_at: t0 });
-
-        // 7s in with no tokens — chip is showing.
-        let line = s.render_at(t0 + Duration::from_secs(7)).unwrap();
-        assert!(text_of(&line).contains("thinking"));
-
-        // First token streams.
-        s.bump_stream_chars(400); // ~100 tokens
-        let line = s.render_at(t0 + Duration::from_secs(8)).unwrap();
-        let text = text_of(&line);
-        assert!(
-            !text.contains("thinking 8s"),
-            "silent-thinking chip should hide once tokens stream: {text}"
-        );
-        assert!(text.contains("tokens"), "token counter takes over: {text}");
-    }
-
-    #[test]
-    fn thought_for_suffix_only_in_thinking_state() {
-        // Tool / Waiting / AwaitingApproval already have their own
-        // semantics — adding a "thinking Ns" chip would be
-        // nonsense.
-        let t0 = Instant::now();
-        let line = render_for(
-            &IndicatorState::Tool {
-                name: "bash".into(),
-                started_at: t0,
-            },
-            0,
-            None,
-            None,
-            t0 + Duration::from_secs(15),
-        )
-        .unwrap();
-        assert!(
-            !text_of(&line).contains("thinking 15s"),
-            "silent-thinking chip is Thinking-only"
-        );
     }
 
     #[test]

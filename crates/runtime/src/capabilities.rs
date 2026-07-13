@@ -287,15 +287,32 @@ pub fn build_server_skill_registry(
 pub fn build_cli_local_skill_registry(
     remote_catalog: Option<RemoteSkillCatalogProvider>,
 ) -> Arc<UnifiedSkillRegistry> {
+    let registry = cli_local_skill_registry(remote_catalog);
+    crate::skills::catalog::discover_registry_now(&registry);
+    registry
+}
+
+/// Build the immediately usable CLI registry without contacting external
+/// providers. Interactive clients use this baseline, then converge the same
+/// registry asynchronously once their event loop is live.
+pub fn build_cli_local_skill_registry_bootstrap(
+    remote_catalog: Option<RemoteSkillCatalogProvider>,
+) -> Arc<UnifiedSkillRegistry> {
+    let registry = cli_local_skill_registry(remote_catalog);
+    crate::skills::catalog::discover_local_registry_now(&registry);
+    registry
+}
+
+fn cli_local_skill_registry(
+    remote_catalog: Option<RemoteSkillCatalogProvider>,
+) -> Arc<UnifiedSkillRegistry> {
     let mut registry = UnifiedSkillRegistry::new();
     registry.add_provider(Box::new(LocalSkillProvider::standard()));
     registry.add_provider(Box::new(BundledSkillProvider::with_defaults()));
     if let Some(provider) = remote_catalog {
         registry.add_provider(Box::new(provider));
     }
-    let registry = Arc::new(registry);
-    crate::skills::catalog::discover_registry_now(&registry);
-    registry
+    Arc::new(registry)
 }
 
 /// HTTP-backed skill provider used by the local CLI to read the same

@@ -848,7 +848,7 @@ fn informative_error_line(result: &str) -> Option<&str> {
 pub fn tool_error_summary(tool_name: &str, result: &str) -> String {
     let trimmed = result.trim();
     if trimmed.is_empty() {
-        return format!("{tool_name} failed before returning output");
+        return format!("{tool_name} ended without a result payload");
     }
 
     if let Some(summary) = json_error_summary(trimmed) {
@@ -1564,6 +1564,14 @@ mod tests {
         let output = "banner\n\nError: Missing 'path' parameter";
         let summary = tool_error_summary("str_replace", output);
         assert_eq!(summary, "Error: Missing 'path' parameter");
+    }
+
+    #[test]
+    fn tool_error_summary_distinguishes_missing_payload_from_execution_failure() {
+        assert_eq!(
+            tool_error_summary("agent_fanout", ""),
+            "agent_fanout ended without a result payload"
+        );
     }
 
     #[test]

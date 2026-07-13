@@ -8,7 +8,7 @@ use crossterm::{
 };
 use ratatui::backend::Backend;
 use ratatui::layout::Size;
-use ratatui::style::{Color as RColor, Modifier};
+use ratatui::style::{Color as RColor, Modifier, Style};
 use ratatui::text::Line;
 use unicode_width::UnicodeWidthStr;
 
@@ -170,59 +170,58 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
 }
 
 fn write_history_line(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
+    write_history_line_content(writer, line)
+}
+
+/// Write one physical scrollback row. Diff surfaces are represented on spans
+/// (so syntax highlighting can preserve foreground colours), while a terminal
+/// scrollback writer has no buffer to paint after the final span. Erase the
+/// remainder of a semantic diff row with its background active. Printing
+/// spaces through the last physical column would arm terminal auto-wrap and
+/// can make the following CRLF insert a phantom blank row.
+fn write_history_line_content(writer: &mut impl Write, line: &Line<'_>) -> io::Result<()> {
     queue!(writer, SetAttribute(Attribute::Reset))?;
     queue!(writer, Clear(ClearType::UntilNewLine))?;
 
-    let mut content_width = 0usize;
     for span in &line.spans {
         let merged = line.style.patch(span.style);
-        content_width += unicode_width::UnicodeWidthStr::width(span.content.as_ref());
         write_styled_span(writer, &span.content, &merged)?;
     }
 
-    if let Some(bg) = line.style.bg {
-        let term_w = crossterm::terminal::size()
-            .map(|(c, _)| c as usize)
-            .unwrap_or(80);
-        let remaining = term_w.saturating_sub(content_width);
-        if remaining > 0 {
-            let (r, g, b) = color_to_rgb(bg);
-            write!(
-                writer,
-                "\x1b[48;2;{r};{g};{b}m{}\x1b[0m",
-                " ".repeat(remaining)
-            )?;
-        } else {
-            write!(writer, "\x1b[0m")?;
-        }
-    } else {
-        write!(writer, "\x1b[0m")?;
+    if let Some(bg) = full_row_background(line) {
+        apply_style_from_clean_state(writer, &Style::default().bg(bg))?;
+        queue!(writer, Clear(ClearType::UntilNewLine))?;
     }
+    queue!(writer, SetAttribute(Attribute::Reset))?;
 
     Ok(())
 }
 
-fn color_to_rgb(color: RColor) -> (u8, u8, u8) {
-    match custom_terminal::to_crossterm_color(color) {
-        CColor::Rgb { r, g, b } => (r, g, b),
-        CColor::Black => (0, 0, 0),
-        CColor::DarkRed => (128, 0, 0),
-        CColor::DarkGreen => (0, 128, 0),
-        CColor::DarkYellow => (128, 128, 0),
-        CColor::DarkBlue => (0, 0, 128),
-        CColor::DarkMagenta => (128, 0, 128),
-        CColor::DarkCyan => (0, 128, 128),
-        CColor::Grey => (192, 192, 192),
-        CColor::DarkGrey => (128, 128, 128),
-        CColor::Red => (255, 0, 0),
-        CColor::Green => (0, 255, 0),
-        CColor::Yellow => (255, 255, 0),
-        CColor::Blue => (0, 0, 255),
-        CColor::Magenta => (255, 0, 255),
-        CColor::Cyan => (0, 255, 255),
-        CColor::White => (255, 255, 255),
-        _ => (55, 55, 60),
+/// A full-width scrollback surface is reserved for a complete diff row.
+/// Ordinary spans may carry a local background (selection, emphasis, a code
+/// token) and must not accidentally turn into a horizontal stripe.
+fn full_row_background(line: &Line<'_>) -> Option<RColor> {
+    let candidate = line.style.bg.or_else(|| {
+        line.spans
+            .iter()
+            .find(|span| !span.content.is_empty())
+            .and_then(|span| line.style.patch(span.style).bg)
+    })?;
+    if line.style.bg.is_some() {
+        return line.style.bg;
     }
+
+    // A cell that deliberately paints a complete row supplies the same
+    // background on every structural span (gutter, line number, marker and
+    // content). A local highlight leaves another span on the default surface,
+    // so it stays local.
+    (line.spans.len() >= 2
+        && line
+            .spans
+            .iter()
+            .filter(|span| !span.content.is_empty())
+            .all(|span| line.style.patch(span.style).bg == Some(candidate)))
+    .then_some(candidate)
 }
 
 fn write_styled_span(
@@ -284,9 +283,10 @@ fn apply_style_from_clean_state(
 
 #[cfg(test)]
 mod tests {
-    use super::write_history_line;
+    use super::{full_row_background, write_history_line, write_history_line_content};
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn write_history_line_isolates_terminal_style_per_span() {
@@ -316,5 +316,59 @@ mod tests {
             reset_count >= 4,
             "line start, each span, and line end must each reset SGR state; rendered={rendered:?}"
         );
+    }
+
+    #[test]
+    fn diff_span_surface_is_extended_to_the_physical_scrollback_row() {
+        let theme = crate::tui::theme::Theme::dark();
+        let line = Line::from(vec![
+            Span::styled("  └ ", Style::default().bg(theme.diff_add_bg)),
+            Span::styled("   1 + changed", Style::default().bg(theme.diff_add_bg)),
+        ]);
+        assert_eq!(full_row_background(&line), Some(theme.diff_add_bg));
+
+        let mut out = Vec::new();
+        write_history_line_content(&mut out, &line).expect("history row writes");
+        let rendered = String::from_utf8(out).expect("history bytes are UTF-8");
+        let plain = crate::cli::theme::strip_ansi(&rendered);
+        assert_eq!(plain, "  └    1 + changed");
+        assert!(
+            rendered.matches("\x1b[K").count() >= 2,
+            "the semantic row must clear its remaining terminal cells under the diff background: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn blank_diff_row_still_paints_exactly_one_physical_scrollback_row() {
+        let theme = crate::tui::theme::Theme::dark();
+        let line = Line::from(vec![
+            Span::styled("    ", Style::default().bg(theme.diff_add_bg)),
+            Span::styled("   2 + ", Style::default().bg(theme.diff_add_bg)),
+        ]);
+
+        let mut out = Vec::new();
+        write_history_line_content(&mut out, &line).expect("blank diff row writes");
+        let rendered = String::from_utf8(out).expect("history bytes are UTF-8");
+        let plain = crate::cli::theme::strip_ansi(&rendered);
+
+        assert_eq!(plain, "       2 + ");
+        assert!(
+            !plain.contains('\n'),
+            "one diff item must not inject an extra row"
+        );
+        assert!(
+            UnicodeWidthStr::width(plain.as_ref()) < 40,
+            "semantic content must not be padded to the physical edge: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn a_locally_highlighted_span_does_not_become_a_full_row_surface() {
+        let theme = crate::tui::theme::Theme::dark();
+        let line = Line::from(vec![
+            Span::raw("ordinary "),
+            Span::styled("highlight", Style::default().bg(theme.diff_add_bg)),
+        ]);
+        assert_eq!(full_row_background(&line), None);
     }
 }

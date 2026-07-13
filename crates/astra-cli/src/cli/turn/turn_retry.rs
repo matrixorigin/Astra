@@ -145,6 +145,7 @@ mod tests {
         let ctx = TurnContext {
             api: &api,
             profile: None,
+            post_commit_tx: None,
         };
         let mut ui = crate::tests::TestUi::default();
         let mut state = SessionState {

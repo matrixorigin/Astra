@@ -338,6 +338,23 @@ fn tool_name_is_forbidden_model_surface(name: &str) -> bool {
 /// cut off required shape constraints like per-action fields or count
 /// invariants.
 fn short_description(schema: &Value) -> String {
+    let name = schema
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let curated = match name {
+        "agent" => Some(
+            "spawn: action+description+prompt; foreground only. get_result: action+agent_id. run_chain: action+steps. send_message: action+to+message. Use agent_fanout for parallel groups.",
+        ),
+        "agent_fanout" => Some(
+            "start: action+target_count+exactly target_count slots; each slot needs description+prompt. Shared config goes in defaults; no brief/agents/background. Results/stops use group_id.",
+        ),
+        _ => None,
+    };
+    if let Some(curated) = curated {
+        return curated.to_string();
+    }
     let raw = schema
         .get("function")
         .and_then(|f| f.get("description"))

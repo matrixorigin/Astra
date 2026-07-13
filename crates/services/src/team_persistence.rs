@@ -406,6 +406,7 @@ pub fn resolve_team(
     team: &TeamDefinition,
     task: &str,
     parent_run_id: &str,
+    session_id: &str,
     registry: Option<&AgentProfileRegistry>,
 ) -> Result<(DelegationRequest, Vec<AgentProfile>), String> {
     // Validate first
@@ -433,6 +434,7 @@ pub fn resolve_team(
 
     let request = DelegationRequest {
         delegation_id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
         parent_run_id: parent_run_id.to_string(),
         task: task.to_string(),
         pattern,
@@ -2672,11 +2674,13 @@ mod tests {
     #[test]
     fn resolve_team_returns_profiles_and_request() {
         let team = test_team();
-        let (request, profiles) = resolve_team(&team, "Fix auth", "run-1", None).unwrap();
+        let (request, profiles) =
+            resolve_team(&team, "Fix auth", "run-1", "test-session", None).unwrap();
 
         assert_eq!(profiles.len(), 2);
         assert_eq!(request.task, "Fix auth");
         assert_eq!(request.parent_run_id, "run-1");
+        assert_eq!(request.session_id, "test-session");
         assert_eq!(request.user_id, team.user_id);
         assert_eq!(request.depth, 0);
     }
@@ -2689,7 +2693,8 @@ mod tests {
         base.system_prompt = Some("Registered coder prompt.".to_string());
         registry.register(base).unwrap();
 
-        let (_request, profiles) = resolve_team(&team, "task", "run-1", Some(&registry)).unwrap();
+        let (_request, profiles) =
+            resolve_team(&team, "task", "run-1", "test-session", Some(&registry)).unwrap();
 
         // First profile (coder-agent) should use registry base prompt
         assert_eq!(
@@ -2707,7 +2712,7 @@ mod tests {
     fn resolve_team_rejects_invalid() {
         let mut team = test_team();
         team.members.clear();
-        let result = resolve_team(&team, "task", "run-1", None);
+        let result = resolve_team(&team, "task", "run-1", "test-session", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("at least one member"));
     }
@@ -2715,7 +2720,7 @@ mod tests {
     #[test]
     fn resolve_team_context_propagated_to_request() {
         let team = test_team();
-        let (request, _) = resolve_team(&team, "task", "run-1", None).unwrap();
+        let (request, _) = resolve_team(&team, "task", "run-1", "test-session", None).unwrap();
         assert_eq!(
             request.context.get("project"),
             Some(&serde_json::Value::String("test-project".to_string()))
@@ -2762,7 +2767,7 @@ mod tests {
     #[test]
     fn resolve_team_pipeline_pattern_stages() {
         let team = test_team(); // Pipeline coordination
-        let (request, _) = resolve_team(&team, "task", "run-1", None).unwrap();
+        let (request, _) = resolve_team(&team, "task", "run-1", "test-session", None).unwrap();
         match &request.pattern {
             CoordinationPattern::Pipeline { stages, .. } => {
                 assert_eq!(stages.len(), 2);
@@ -2780,7 +2785,7 @@ mod tests {
             max_rounds: 5,
             threshold: 0.9,
         };
-        let (request, _) = resolve_team(&team, "task", "run-1", None).unwrap();
+        let (request, _) = resolve_team(&team, "task", "run-1", "test-session", None).unwrap();
         match &request.pattern {
             CoordinationPattern::AdversarialReview {
                 producer_id,
@@ -2804,7 +2809,7 @@ mod tests {
         team.coordination = TeamCoordination::FanOut {
             aggregation: "best_of".to_string(),
         };
-        let (request, _) = resolve_team(&team, "task", "run-1", None).unwrap();
+        let (request, _) = resolve_team(&team, "task", "run-1", "test-session", None).unwrap();
         match &request.pattern {
             CoordinationPattern::FanOut { agent_ids, .. } => {
                 assert_eq!(agent_ids.len(), 2);

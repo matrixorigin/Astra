@@ -22,6 +22,10 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             get(session::session_handlers::get_session_state_handler),
         )
         .route(
+            "/sessions/{session_id}/runs",
+            get(session::session_run_tree::get_session_run_tree_handler),
+        )
+        .route(
             "/sessions/{session_id}/transcript",
             get(session::session_handlers::get_session_transcript_handler),
         )

@@ -17,7 +17,7 @@ pub(super) async fn build_runtime_wiring(
     let run_engine = crate::server::run::engine::RunEngine::new(run_store)
         .with_projection_store(Arc::clone(&state_projection_store))
         .with_metrics_registry(state.metrics_registry());
-    recover_active_runs(&run_engine).await;
+    let recovered_runs = recover_active_runs(&run_engine).await;
 
     let profile_registry = Arc::new(default_agent_profile_registry());
     let progress_broadcaster = Arc::new(crate::orchestration::ProgressBroadcaster::default());
@@ -25,6 +25,16 @@ pub(super) async fn build_runtime_wiring(
         crate::server::delegation::engine::DelegationTracker::new()
             .with_progress_broadcaster(Arc::clone(&progress_broadcaster)),
     );
+    delegation_tracker
+        .load_from_run_records(&recovered_runs)
+        .await;
+    astra_messaging::db_transport::ensure_schema(shared_pool.get()).await?;
+    let agent_mailbox_router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+        Arc::new(astra_messaging::DatabaseTransport::new(
+            shared_pool.get().clone(),
+        )),
+        delegation_tracker.clone(),
+    ));
     let user_id = "local";
     let matrix_rt = Arc::new(
         crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
@@ -49,6 +59,7 @@ pub(super) async fn build_runtime_wiring(
             Arc::clone(run_encryptor),
             state.edge_callback_ledger.clone(),
         )
+        .with_run_engine(run_engine.clone())
         .with_pool(shared_pool.clone())
         .with_edge_connection_pool(state.edge_connection_pool.clone())
         .with_skill_service(state.skill_service.clone())
@@ -65,6 +76,7 @@ pub(super) async fn build_runtime_wiring(
             delegation_tracker,
             sub_run_executor,
         )
+        .with_mailbox_router(Arc::clone(&agent_mailbox_router))
         .with_projection_store(Arc::clone(&state_projection_store)),
     );
 
@@ -111,6 +123,7 @@ pub(super) async fn build_runtime_wiring(
         run_engine,
     )
     .with_pool(shared_pool.clone())
+    .with_agent_mailbox_router(agent_mailbox_router)
     .with_delegation_engine(Arc::clone(&delegation_engine))
     .with_edge_connection_pool(state.edge_connection_pool.clone())
     .with_edge_dispatch_service(state.execution.edge_dispatch_service.clone())
@@ -148,7 +161,9 @@ pub(super) async fn build_runtime_wiring(
     })
 }
 
-async fn recover_active_runs(run_engine: &crate::server::run::engine::RunEngine) {
+async fn recover_active_runs(
+    run_engine: &crate::server::run::engine::RunEngine,
+) -> Vec<astra_services::runs::DurableRunRecord> {
     match run_engine.recover_active_runs().await {
         Ok(recovered_runs) => {
             if !recovered_runs.is_empty() {
@@ -170,6 +185,7 @@ async fn recover_active_runs(run_engine: &crate::server::run::engine::RunEngine)
                     "classified orphaned durable runs during startup"
                 );
             }
+            recovered_runs
         }
         Err(error) => {
             tracing::error!(
@@ -177,6 +193,7 @@ async fn recover_active_runs(run_engine: &crate::server::run::engine::RunEngine)
                 error = %error,
                 "failed to recover durable active runs during startup"
             );
+            Vec::new()
         }
     }
 }

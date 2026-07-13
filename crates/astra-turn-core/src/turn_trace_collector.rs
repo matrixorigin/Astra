@@ -221,13 +221,16 @@ impl TurnTraceCollector {
             }
             if budget.total_used > 0 {
                 existing.total_used = budget.total_used;
+                existing.usage_source = budget.usage_source;
             } else if existing.total_used == 0 {
                 existing.total_used = budget_component_total(existing);
+                existing.usage_source = astra_turn_types::ContextWindowUsageSource::Estimated;
             }
         } else {
             let mut budget = budget;
             if budget.total_used == 0 {
                 budget.total_used = budget_component_total(&budget);
+                budget.usage_source = astra_turn_types::ContextWindowUsageSource::Estimated;
             }
             state.token_budget = Some(budget);
         }
@@ -259,8 +262,9 @@ impl TurnTraceCollector {
         budget.memory_tokens = memory_tokens;
         budget.tool_schema_tokens = tool_schema_tokens;
         budget.user_message_tokens = user_message_tokens;
-        // Set estimated total (runtime will overwrite with actual measured value later)
-        if budget.total_used == 0 {
+        // A new assembly estimate supersedes an older estimate. A provider
+        // measurement is authoritative and must never be downgraded here.
+        if budget.usage_source == astra_turn_types::ContextWindowUsageSource::Estimated {
             budget.total_used = estimated_total;
         }
         if budget.max_tokens == 0 {
@@ -278,6 +282,9 @@ impl TurnTraceCollector {
             .token_budget
             .get_or_insert_with(TokenBudgetTrace::default);
         budget.system_prompt_tokens = tokens;
+        if budget.usage_source == astra_turn_types::ContextWindowUsageSource::Estimated {
+            budget.total_used = budget_component_total(budget);
+        }
     }
 
     /// Add a decision explanation.
@@ -457,6 +464,20 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_measurement_reconciles_an_estimated_context_total() {
+        let collector = TurnTraceCollector::new("turn-1", "session-1");
+        collector.record_token_budget_estimate(0, 5_000, 0, 3_000, 200, 8_200, 100_000, 0.082);
+        collector.set_system_prompt_tokens(12_000);
+
+        let trace = collector.finalize();
+        assert_eq!(trace.token_budget.total_used, 20_200);
+        assert_eq!(
+            trace.token_budget.usage_source,
+            astra_turn_types::ContextWindowUsageSource::Estimated
+        );
+    }
+
+    #[test]
     fn token_budget_component_total_saturates() {
         let collector = TurnTraceCollector::new("turn-0", "s1");
 
@@ -531,12 +552,14 @@ mod tests {
                 role: "user".into(),
                 tokens: 50,
                 has_tool_calls: false,
+                content_preview: String::new(),
             },
             crate::context_assembly_trace::TurnRetention {
                 turn_index: 1,
                 role: "assistant".into(),
                 tokens: 800,
                 has_tool_calls: true,
+                content_preview: String::new(),
             },
         ];
         collector.set_history_retained(&turns);

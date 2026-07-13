@@ -584,6 +584,24 @@ pub fn render_agent_tool_error_with_kind(
     body.to_string()
 }
 
+/// A malformed provider tool-call is not a failed sub-agent run. It is an
+/// unexecuted boundary failure, so preserve that distinction for the model,
+/// transcript, and TUI without echoing the corrupt argument bytes.
+pub fn render_agent_tool_malformed_arguments_error(tool_name: &str) -> String {
+    json!({
+        "status": AgentToolResultStatusKind::Failed.as_str(),
+        "error_kind": astra_core::ErrorKind::ToolInvalidArgs.as_str(),
+        "error": "Tool arguments were not valid JSON; no agent was started.",
+        "advisory": {
+            "kind": "malformed_tool_arguments",
+            "tool": tool_name,
+            "executed": false,
+            "next_step": "Create one new complete JSON tool call that matches the advertised schema.",
+        },
+    })
+    .to_string()
+}
+
 fn agent_tool_result_preview(result: &str) -> String {
     const MAX_LINES: usize = 80;
     const MAX_CHARS: usize = 8_000;
@@ -769,21 +787,21 @@ mod tests {
         assert_eq!(parsed["finish_reason"], "empty_completion");
         assert_eq!(parsed["incomplete"], true);
 
-        let guarded = render_completed_agent_result(
+        let safety_redacted = render_completed_agent_result(
             "a1",
             crate::response_guard::INTERNAL_PROTOCOL_FALLBACK,
-            Some(crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON),
+            Some(crate::response_guard::RESPONSE_GUARD_REDACTED_FINISH_REASON),
         );
-        let parsed: Value = serde_json::from_str(&guarded).unwrap();
+        let parsed: Value = serde_json::from_str(&safety_redacted).unwrap();
         assert_eq!(
             parsed["status"],
-            AgentToolResultStatusKind::Interrupted.as_str()
+            AgentToolResultStatusKind::Completed.as_str()
         );
         assert_eq!(
             parsed["finish_reason"],
-            crate::response_guard::RESPONSE_GUARD_BLOCKED_FINISH_REASON
+            crate::response_guard::RESPONSE_GUARD_REDACTED_FINISH_REASON
         );
-        assert_eq!(parsed["incomplete"], true);
+        assert_eq!(parsed["incomplete"], false);
     }
 
     #[test]

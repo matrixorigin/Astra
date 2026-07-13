@@ -1,4 +1,5 @@
-//! Tool-invocation history cell — the `• Ran Bash · 42ms` block.
+//! Tool-invocation history cell — the live `● Running Bash (42ms)` and
+//! terminal `● Ran Bash · 42ms` blocks.
 //!
 //! Three visual states:
 //! - **Running** — accent bullet, shimmer title, elapsed from
@@ -43,6 +44,10 @@ use unicode_width::UnicodeWidthStr;
 pub(crate) enum ToolStatus {
     Running,
     Success,
+    /// The execution receipt is incomplete while independent structured
+    /// evidence proves that work is present. It must remain distinguishable
+    /// from both a successful tool call and a failed one after persistence.
+    Uncertain,
     Failed,
 }
 
@@ -68,10 +73,6 @@ pub(crate) struct ToolCell {
     /// and edge-less sessions must not promise a shortcut that cannot
     /// work.
     pub ctrl_b_background_hint: bool,
-    /// Stamped on the live → terminal transition (either
-    /// `complete()` or `finalize()`). Lets the active-slot gradient
-    /// gutter pin its phase at the freeze moment.
-    frozen_at: super::FreezeStamp,
 }
 
 impl ToolCell {
@@ -88,7 +89,6 @@ impl ToolCell {
             progress_lines: 0,
             progress_bytes: 0,
             ctrl_b_background_hint: false,
-            frozen_at: super::FreezeStamp::default(),
         }
     }
 
@@ -120,10 +120,10 @@ impl ToolCell {
         output_summary: Option<String>,
         output: Option<String>,
     ) {
-        self.status = if tool_result_status_is_success(status_str) {
-            ToolStatus::Success
-        } else {
-            ToolStatus::Failed
+        self.status = match status_str {
+            "uncertain" => ToolStatus::Uncertain,
+            _ if tool_result_status_is_success(status_str) => ToolStatus::Success,
+            _ => ToolStatus::Failed,
         };
         self.duration_ms = Some(duration_ms);
         if !description.is_empty() {
@@ -132,7 +132,6 @@ impl ToolCell {
         self.output_summary = non_empty_tool_text(output_summary);
         self.output = non_empty_tool_text(output);
         self.ensure_failure_details();
-        self.frozen_at.stamp_now();
     }
 
     #[allow(dead_code)]
@@ -162,6 +161,7 @@ impl ToolCell {
         };
         let status = match status {
             PersistStatus::Success => ToolStatus::Success,
+            PersistStatus::Uncertain => ToolStatus::Uncertain,
             PersistStatus::Failed => ToolStatus::Failed,
         };
         let started_at = Instant::now()
@@ -179,10 +179,6 @@ impl ToolCell {
             progress_lines: 0,
             progress_bytes: 0,
             ctrl_b_background_hint: false,
-            // Resumed from persistence — already settled. See
-            // `FreezeStamp::revived` for the launch-independent
-            // phase rationale.
-            frozen_at: super::FreezeStamp::revived(),
         };
         cell.ensure_failure_details();
         Some(cell)
@@ -209,18 +205,18 @@ impl ToolCell {
     }
 
     fn bullet(&self) -> Span<'static> {
+        let theme = crate::tui::theme::current();
         match self.status {
-            // Running uses the theme accent so the in-progress row
-            // pops from dim scrollback — a dim bullet was
-            // invisible on many terminals and users reported fast
-            // tool calls felt like they skipped the "running"
-            // phase entirely.
+            // A solid state dot is easier to scan than a tiny middle dot.
+            // Running keeps the focus accent; success/failure use their
+            // narrow semantic roles and never recolor the surrounding prose.
             ToolStatus::Running => {
                 let theme = crate::tui::theme::current();
-                Span::styled("• ", Style::default().fg(theme.accent).bold())
+                Span::styled("● ", Style::default().fg(theme.accent).bold())
             }
-            ToolStatus::Success => Span::styled("• ", Style::default().fg(Color::Green).bold()),
-            ToolStatus::Failed => Span::styled("• ", Style::default().fg(Color::Red).bold()),
+            ToolStatus::Success => Span::styled("● ", Style::default().fg(theme.success).bold()),
+            ToolStatus::Uncertain => Span::styled("● ", Style::default().fg(theme.warn).bold()),
+            ToolStatus::Failed => Span::styled("● ", Style::default().fg(theme.error).bold()),
         }
     }
 
@@ -350,7 +346,7 @@ impl ToolCell {
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame_idx = ((elapsed_ms / 80) % FRAMES.len() as u64) as usize;
         let theme = crate::tui::theme::current();
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = Style::default().fg(crate::tui::theme::current().dim);
         let spinner = Span::styled(
             FRAMES[frame_idx].to_string(),
             Style::default().fg(theme.accent),
@@ -432,19 +428,91 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-impl HistoryCell for ToolCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+impl ToolCell {
+    /// True when the compact tool row omits arguments or result content that
+    /// the transcript can reveal. This is based on semantic payloads rather
+    /// than rendered error-message matching.
+    pub(crate) fn has_transcript_details(&self) -> bool {
+        if self.description.lines().count() > 2 {
+            return true;
+        }
+        if self
+            .edited_diff_preview()
+            .is_some_and(|edited| edited.diff.lines().count() > 12)
+        {
+            return true;
+        }
+
+        let preview = self.preview_text().filter(|text| !text.trim().is_empty());
+        let detail = self
+            .output
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                self.output_summary
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            });
+        match (preview.as_deref(), detail) {
+            (_, Some(detail))
+                if detail.lines().count()
+                    > if looks_like_unified_diff_preview(detail) {
+                        10
+                    } else {
+                        5
+                    } =>
+            {
+                true
+            }
+            (Some(preview), Some(detail)) => preview.trim() != detail.trim(),
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// Transcript-only projection with optional full arguments/result. The
+    /// canonical Tool event remains unchanged.
+    pub(crate) fn transcript_lines(&self, width: u16, expanded: bool) -> Vec<Line<'static>> {
+        let has_details = self.has_transcript_details();
+        let mut lines = self.display_lines_with_details(width, expanded && has_details);
+        if has_details && let Some(header) = lines.first_mut() {
+            let marker = if expanded { "▼ " } else { "▶ " };
+            if let Some(status_marker) = header.spans.first_mut() {
+                status_marker.content = Cow::Borrowed(marker);
+            }
+        }
+        lines
+    }
+
+    fn detailed_text(&self) -> Option<&str> {
+        self.output
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| {
+                self.output_summary
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            })
+    }
+
+    fn display_lines_with_details(&self, width: u16, expanded: bool) -> Vec<Line<'static>> {
         let dim = Style::default().dim();
         let w = width as usize;
 
         let label = self.display_name();
-        let meta_style = Style::default().fg(Color::DarkGray);
+        let theme = crate::tui::theme::current();
+        let meta_style = Style::default().fg(theme.dim);
         let edited_diff = if self.status == ToolStatus::Running {
             None
         } else {
             self.edited_diff_preview()
         };
-        let preview_text = self.preview_text().filter(|text| !text.trim().is_empty());
+        let preview_text = if expanded {
+            self.detailed_text().map(Cow::Borrowed)
+        } else {
+            self.preview_text()
+        }
+        .filter(|text| !text.trim().is_empty());
         let header = if let Some(edited) = edited_diff.as_ref() {
             let mut spans = vec![
                 self.bullet(),
@@ -467,12 +535,12 @@ impl HistoryCell for ToolCell {
                 spans.push(Span::styled(" · ", meta_style));
                 spans.push(Span::styled(
                     format!("+{}", edited.additions),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(theme.success),
                 ));
                 spans.push(Span::styled(" ", meta_style));
                 spans.push(Span::styled(
                     format!("-{}", edited.deletions),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(theme.error),
                 ));
             }
             Line::from(spans)
@@ -480,7 +548,7 @@ impl HistoryCell for ToolCell {
             let text = if let Some(task_header) = background_task_tool_header(&self.name) {
                 format!("{task_header} ({})", self.elapsed_str())
             } else {
-                format!("Ran {label} ({})", self.elapsed_str())
+                format!("Running {label} ({})", self.elapsed_str())
             };
             let mut spans = vec![self.bullet()];
             spans.extend(crate::tui::shimmer::shimmer_spans(&text));
@@ -530,7 +598,8 @@ impl HistoryCell for ToolCell {
             } else {
                 "    "
             };
-            for dl in description.lines().take(2) {
+            let description_limit = if expanded { usize::MAX } else { 2 };
+            for dl in description.lines().take(description_limit) {
                 let mut spans = vec![Span::styled(desc_prefix, dim)];
                 if self.name == "bash" {
                     if let Some(cmd) = dl.strip_prefix("$ ") {
@@ -568,7 +637,7 @@ impl HistoryCell for ToolCell {
                 lines.extend(wrap_prefixed_line(
                     Line::from(vec![
                         Span::styled(gutter.to_string(), dim),
-                        Span::styled((*detail_line).to_string(), Style::default().fg(Color::Red)),
+                        Span::styled((*detail_line).to_string(), Style::default().fg(theme.error)),
                     ]),
                     width,
                     Line::from(vec![Span::styled("  │ ".to_string(), dim)]),
@@ -577,33 +646,44 @@ impl HistoryCell for ToolCell {
         }
 
         if let Some(edited) = edited_diff {
-            let diff_lines = crate::tui::diff_render::render_diff_lines(&edited.diff, 12);
+            let diff_limit = if expanded {
+                edited.diff.lines().count().max(1)
+            } else {
+                12
+            };
+            let diff_lines = crate::tui::diff_render::render_diff_lines(&edited.diff, diff_limit);
             for (i, dl) in diff_lines.into_iter().enumerate() {
                 let prefix = if i == 0 { "  └ " } else { "    " };
                 let prefixed = prefix_tool_output_line(prefix, dl, dim);
                 lines.extend(
                     wrap_prefixed_diff_line(prefixed, width)
                         .into_iter()
-                        .map(|line| pad_line_background(line, width)),
+                        .map(mark_full_row_background),
                 );
             }
         } else if let Some(summary) = preview_text {
             let summary = sanitize_terminal_text(&summary);
             let has_diff = looks_like_unified_diff_preview(&summary);
             if has_diff {
-                let diff_lines = crate::tui::diff_render::render_diff_lines(&summary, 10);
+                let diff_limit = if expanded {
+                    summary.lines().count().max(1)
+                } else {
+                    10
+                };
+                let diff_lines = crate::tui::diff_render::render_diff_lines(&summary, diff_limit);
                 for (i, dl) in diff_lines.into_iter().enumerate() {
                     let prefix = if i == 0 { "  └ " } else { "    " };
                     let prefixed = prefix_tool_output_line(prefix, dl, dim);
                     lines.extend(
                         wrap_prefixed_diff_line(prefixed, width)
                             .into_iter()
-                            .map(|line| pad_line_background(line, width)),
+                            .map(mark_full_row_background),
                     );
                 }
             } else {
-                let out_lines: Vec<&str> = summary.lines().take(5).collect();
-                let has_more = summary.lines().count() > 5;
+                let output_limit = if expanded { usize::MAX } else { 5 };
+                let out_lines: Vec<&str> = summary.lines().take(output_limit).collect();
+                let has_more = !expanded && summary.lines().count() > 5;
                 let visible_count = out_lines.len();
                 for (i, ol) in out_lines.iter().enumerate() {
                     let is_last_visible = i + 1 == visible_count;
@@ -653,6 +733,12 @@ impl HistoryCell for ToolCell {
 
         lines
     }
+}
+
+impl HistoryCell for ToolCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.display_lines_with_details(width, false)
+    }
 
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -680,11 +766,6 @@ impl HistoryCell for ToolCell {
         self.output_summary = non_empty_tool_text(self.output_summary.take());
         self.output = non_empty_tool_text(self.output.take());
         self.ensure_failure_details();
-        self.frozen_at.stamp_now();
-    }
-
-    fn frozen_phase(&self) -> Option<f32> {
-        self.frozen_at.phase()
     }
 
     fn to_persist(&self) -> Option<TurnEvent> {
@@ -693,6 +774,7 @@ impl HistoryCell for ToolCell {
         // run first.
         let status = match self.status {
             ToolStatus::Success => PersistStatus::Success,
+            ToolStatus::Uncertain => PersistStatus::Uncertain,
             ToolStatus::Failed => PersistStatus::Failed,
             ToolStatus::Running => return None,
         };
@@ -768,23 +850,16 @@ fn blank_span_like(span: &Span<'_>) -> Span<'static> {
     )
 }
 
-fn pad_line_background(mut line: Line<'static>, width: u16) -> Line<'static> {
+fn mark_full_row_background(mut line: Line<'static>) -> Line<'static> {
     let Some(bg) = line.spans.iter().find_map(|span| span.style.bg) else {
         return line;
     };
-    let used = line
-        .spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum::<usize>();
-    let target = width as usize;
-    if used >= target {
-        return line;
-    }
-    line.spans.push(Span::styled(
-        " ".repeat(target - used),
-        Style::default().bg(bg),
-    ));
+    // Full-row colour is presentation metadata, not content. Padding a line
+    // with spaces to the terminal width leaves a real terminal in auto-wrap
+    // pending state; the next CRLF can then create a phantom blank row. Each
+    // renderer owns the physical surface (Paragraph via Line.style, scrollback
+    // via erase-to-end-of-line), while wrapping continues to see only content.
+    line.style = line.style.bg(bg);
     line
 }
 
@@ -862,16 +937,19 @@ fn non_empty_tool_text(value: Option<String>) -> Option<String> {
 
 fn failure_detail_fallback(name: &str, description: &str) -> String {
     let label = friendly_tool_display_name_for_context(name, description);
+    if name == "agent_fanout" {
+        return "Fanout did not return a usable launch receipt.\nThe launch outcome is unconfirmed; Ctrl+G shows any observed agents.".into();
+    }
     let description = description.trim();
     if description.is_empty() {
         format!(
-            "{label} failed before returning output.\n\
-             Origin: agent_tool_reporting_error; no error body returned."
+            "{label} ended without a result payload.\n\
+             The execution outcome could not be confirmed."
         )
     } else {
         format!(
-            "{label} failed before returning output: {description}.\n\
-             Origin: agent_tool_reporting_error; no error body returned."
+            "{label} ended without a result payload: {description}.\n\
+             The execution outcome could not be confirmed."
         )
     }
 }
@@ -1086,6 +1164,26 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_tool_outcome_survives_persistence_roundtrip() {
+        let mut live = ToolCell::new_running("agent_fanout", "review in parallel");
+        live.complete(
+            "uncertain",
+            42,
+            String::new(),
+            Some("a canonical run is visible".into()),
+            None,
+        );
+
+        let persisted = live.to_persist().expect("settled tool persists");
+        let restored = ToolCell::from_persist(persisted).expect("persisted tool restores");
+        assert_eq!(restored.status, ToolStatus::Uncertain);
+        assert_eq!(
+            restored.output_summary.as_deref(),
+            Some("a canonical run is visible")
+        );
+    }
+
+    #[test]
     fn finalize_demotes_stuck_running_to_failed() {
         // If a turn aborts mid-tool, finalize should still produce
         // a persistable record rather than silently losing the row.
@@ -1096,7 +1194,7 @@ mod tests {
         assert_eq!(
             t.output_summary.as_deref(),
             Some(
-                "Bash failed before returning output: slow op.\nOrigin: agent_tool_reporting_error; no error body returned."
+                "Bash ended without a result payload: slow op.\nThe execution outcome could not be confirmed."
             )
         );
         assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
@@ -1142,17 +1240,25 @@ mod tests {
         let t = ok_tool("bash", "ls /tmp", 42);
         let out = render(&t, 80, 3);
         assert!(
-            out.contains("• Ran Bash · 42ms"),
+            out.contains("● Ran Bash · 42ms"),
             "unexpected header: {out}"
         );
         assert!(out.contains("└ ls /tmp"));
     }
 
     #[test]
+    fn running_header_uses_present_tense_lifecycle() {
+        let t = ToolCell::new_running("agent_fanout", "agent_fanout");
+        let out = render(&t, 80, 3);
+        assert!(out.contains("Running Agent Fanout"), "{out}");
+        assert!(!out.contains("Ran Agent Fanout"), "{out}");
+    }
+
+    #[test]
     fn failed_header_uses_red_bullet_without_status_word() {
         let t = err_tool("bash", "false", 10);
         let out = render(&t, 80, 3);
-        assert!(out.contains("• Ran Bash · 10ms"));
+        assert!(out.contains("● Ran Bash · 10ms"));
         assert!(!out.contains("· failed"), "{out}");
     }
 
@@ -1183,7 +1289,7 @@ mod tests {
         let t = err_tool("read", "Reading: missing.txt", 10);
         let out = render(&t, 80, 4);
         assert!(
-            out.contains("Read failed before returning output: Reading: missing.txt"),
+            out.contains("Read ended without a result payload: Reading: missing.txt"),
             "{out}"
         );
         assert!(!out.contains("No details returned"), "{out}");
@@ -1195,15 +1301,33 @@ mod tests {
         t.complete("failed", 1200, String::new(), None, None);
         let summary = t.output_summary.as_deref().unwrap();
         assert!(
-            summary.contains("Bash failed before returning output: $ make check 2>&1"),
+            summary.contains("Bash ended without a result payload: $ make check 2>&1"),
             "{summary}"
         );
-        assert!(summary.contains("agent_tool_reporting_error"), "{summary}");
+        assert!(
+            summary.contains("outcome could not be confirmed"),
+            "{summary}"
+        );
         assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
         let out = render(&t, 100, 4);
-        assert!(out.contains("Bash failed before returning output"), "{out}");
-        assert!(out.contains("agent_tool_reporting_error"), "{out}");
+        assert!(out.contains("Bash ended without a result payload"), "{out}");
+        assert!(out.contains("outcome could not be confirmed"), "{out}");
         assert!(!out.contains("No details returned"), "{out}");
+    }
+
+    #[test]
+    fn fanout_without_receipt_points_to_live_agent_observation() {
+        let mut t = ToolCell::new_running("agent_fanout", "start parallel review");
+        t.complete("failed", 12, String::new(), None, None);
+
+        let out = render(&t, 100, 4);
+        assert!(
+            out.contains("Fanout did not return a usable launch receipt"),
+            "{out}"
+        );
+        assert!(out.contains("Ctrl+G"), "{out}");
+        assert!(!out.contains("agent_tool_reporting_error"), "{out}");
+        assert!(!out.contains("failed before returning output"), "{out}");
     }
 
     #[test]
@@ -1322,10 +1446,13 @@ mod tests {
         );
         let summary = t.output_summary.as_deref().unwrap();
         assert!(
-            summary.contains("Read failed before returning output: Reading: src/main.rs"),
+            summary.contains("Read ended without a result payload: Reading: src/main.rs"),
             "{summary}"
         );
-        assert!(summary.contains("agent_tool_reporting_error"), "{summary}");
+        assert!(
+            summary.contains("outcome could not be confirmed"),
+            "{summary}"
+        );
         assert_eq!(t.output.as_deref(), t.output_summary.as_deref());
     }
 
@@ -1497,7 +1624,7 @@ mod tests {
         );
 
         let out = render(&t, 100, 10);
-        assert!(out.contains("• Edited src/main.rs · +2 -1"), "{out}");
+        assert!(out.contains("● Edited src/main.rs · +2 -1"), "{out}");
         assert!(!out.contains("Ran Write file"), "{out}");
         assert!(out.contains("   1 - fn old_name() {}"), "{out}");
         assert!(out.contains("   2 + fn helper() {}"), "{out}");
@@ -1542,7 +1669,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_rows_pad_background_through_full_width() {
+    fn diff_rows_carry_full_surface_without_viewport_padding() {
         let mut t = ok_tool("str_replace", "src/main.rs", 120);
         t.output_summary = Some("@@ -1,1 +1,1 @@\n-fn old_name() {}\n+fn new_name() {}".into());
 
@@ -1559,13 +1686,122 @@ mod tests {
             })
             .expect("expected added diff line");
 
-        let last = diff_line.spans.last().expect("line should have spans");
+        assert_eq!(diff_line.style.bg, diff_line.spans[1].style.bg);
         assert!(
-            last.content.as_ref().ends_with(' '),
-            "diff row should pad to full width: {:?}",
+            diff_line.width() < 80,
+            "full-row background is semantic metadata; spaces must not encode viewport width: {:?}",
             diff_line.spans
         );
-        assert_eq!(last.style.bg, diff_line.spans[1].style.bg);
+    }
+
+    #[test]
+    fn diff_rows_paint_the_entire_rendered_terminal_row() {
+        let mut t = ok_tool("str_replace", "src/main.rs", 120);
+        t.output_summary = Some("@@ -1,1 +1,1 @@\n-fn old_name() {}\n+fn new_name() {}".into());
+
+        let width = 80;
+        let lines = sanitize_lines_for_terminal(t.display_lines(width));
+        let paragraph =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+        let buffer = draw_widget(paragraph, width, 12);
+        let added_row = (0..12)
+            .find(|&y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("new_name")
+            })
+            .expect("rendered added diff row");
+        let expected_bg = crate::tui::theme::current()
+            .diff_add_style()
+            .bg
+            .expect("diff add style always defines a row background");
+
+        assert!(
+            (0..width).all(|x| buffer[(x, added_row)].bg == expected_bg),
+            "an added edit row must retain its semantic background through the terminal edge"
+        );
+    }
+
+    #[test]
+    fn bash_unified_diff_uses_the_same_full_row_surface_as_edit() {
+        let mut t = ok_tool("bash", "$ git diff -- pkg/txn.go", 42);
+        t.output = Some("@@ -40,0 +40,2 @@\n+func sealAndRunWhenDrained() {}\n+\n".into());
+
+        let width = 96;
+        let lines = sanitize_lines_for_terminal(t.display_lines(width));
+        let paragraph =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+        let buffer = draw_widget(paragraph, width, 10);
+        let added_row = (0..10)
+            .find(|&y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("sealAndRunWhenDrained")
+            })
+            .expect("rendered added bash diff row");
+        let expected_bg = crate::tui::theme::current()
+            .diff_add_style()
+            .bg
+            .expect("diff add style always defines a row background");
+        assert!(
+            (0..width).all(|x| buffer[(x, added_row)].bg == expected_bg),
+            "a bash diff row must use the same full-width semantic surface as edit"
+        );
+    }
+
+    #[test]
+    fn blank_changed_lines_are_single_semantic_rows_not_visual_spacers() {
+        let mut t = ok_tool("bash", "$ git diff -- src/main.rs", 42);
+        t.output =
+            Some("@@ -10,0 +10,3 @@\n+fn before_blank() {}\n+\n+fn after_blank() {}\n".into());
+
+        let width = 72;
+        let lines = sanitize_lines_for_terminal(t.display_lines(width));
+        let rendered_line = |line: &ratatui::text::Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let before = lines
+            .iter()
+            .position(|line| rendered_line(line).contains("before_blank"))
+            .expect("first changed line");
+        let after = lines
+            .iter()
+            .position(|line| rendered_line(line).contains("after_blank"))
+            .expect("last changed line");
+        assert_eq!(after, before + 2, "blank source line must occupy one row");
+        let blank = &lines[before + 1];
+        assert!(
+            rendered_line(blank).contains("+ "),
+            "blank source line must retain its diff identity: {blank:?}"
+        );
+        assert_eq!(blank.style.bg, lines[before].style.bg);
+        assert_eq!(blank.style.bg, lines[after].style.bg);
+
+        let paragraph =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+        let buffer = draw_widget(paragraph, width, 10);
+        let find_row = |needle: &str| {
+            (0..10)
+                .find(|&y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .expect("changed line is visible")
+        };
+        let before_row = find_row("before_blank");
+        let after_row = find_row("after_blank");
+        assert_eq!(
+            after_row,
+            before_row + 2,
+            "the blank added source line must retain the edit surface without inserting a spacer"
+        );
     }
 
     #[test]

@@ -11,6 +11,14 @@ pub fn is_agent_runtime_tool(name: &str) -> bool {
     AGENT_RUNTIME_TOOL_NAMES.contains(&name)
 }
 
+/// A provider delivered a tool call whose argument envelope could not be
+/// decoded. This is deliberately distinct from a valid object that fails the
+/// tool schema: the runtime must not infer executable intent from corrupted
+/// text.
+pub fn has_malformed_tool_args(args: &Value) -> bool {
+    args.get("_parse_error").is_some()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentAction {
     Spawn,
@@ -49,7 +57,7 @@ impl AgentFanoutAction {
 
 pub fn agent_missing_action_message() -> String {
     format!(
-        "missing required parameter `action` for `agent`. Provide a top-level `action` string: one of {AGENT_ACTIONS_DISPLAY}. For a child agent, call `agent(action='spawn', description='...', prompt='...')`; do not wrap arguments under `spawn` and do not pass `agents:[...]`."
+        "missing required parameter `action` for `agent`. Provide a JSON object with `action` set to one of {AGENT_ACTIONS_DISPLAY}. For a child agent use {{\"action\":\"spawn\",\"description\":\"…\",\"prompt\":\"…\"}}; do not wrap arguments under `spawn` or pass `agents:[...]`."
     )
 }
 
@@ -62,11 +70,11 @@ pub fn agent_unknown_action_message(action: &str) -> String {
 }
 
 pub fn invalid_agent_spawn_wrapper_message() -> &'static str {
-    "invalid agent call shape. Use the top-level `action='spawn'` field, not a `spawn` wrapper key. Example: agent(action='spawn', description='...', prompt='...'). For parallel fan-out, use agent_fanout(action='start', target_count=N, slots=[...]); do not pass `agents:[...]`."
+    "invalid agent call shape. Use a top-level JSON `action` field, not a `spawn` wrapper key. For example: {\"action\":\"spawn\",\"description\":\"…\",\"prompt\":\"…\"}. For parallel fan-out, use the `agent_fanout` JSON schema; do not pass `agents:[...]`."
 }
 
 pub fn invalid_agent_agents_payload_message() -> &'static str {
-    "unsupported `agents` batch payload for `agent`. Each `agent(action='spawn', ...)` call launches exactly one child. Use `agent_fanout(action='start', target_count=N, slots=[...])` for atomic parallel fan-out."
+    "unsupported `agents` batch payload for `agent`. Each `agent` call launches exactly one child. Use the `agent_fanout` JSON schema for atomic parallel fan-out."
 }
 
 pub fn agent_action_from_args(args: &Value) -> Result<AgentAction, String> {
@@ -92,7 +100,7 @@ pub fn agent_action_from_args(args: &Value) -> Result<AgentAction, String> {
 
 pub fn agent_fanout_missing_action_message() -> String {
     format!(
-        "missing required parameter `action` for `agent_fanout`. Provide a top-level `action` string: one of {AGENT_FANOUT_ACTIONS_DISPLAY}. To start parallel agents, call `agent_fanout(action='start', target_count=N, slots=[{{description:'...', prompt:'...'}}])`; to collect an existing group, call `agent_fanout(action='get_results', group_id='...')`."
+        "missing required parameter `action` for `agent_fanout`. Provide one JSON object with `action` set to one of {AGENT_FANOUT_ACTIONS_DISPLAY}; follow the advertised schema exactly."
     )
 }
 
@@ -119,11 +127,11 @@ pub fn agent_fanout_action_from_args(args: &Value) -> Result<AgentFanoutAction, 
 }
 
 fn reject_malformed_tool_args(tool_name: &str, args: &Value) -> Result<(), String> {
-    let Some(parse_error) = args.get("_parse_error").and_then(Value::as_str) else {
+    if !has_malformed_tool_args(args) {
         return Ok(());
-    };
+    }
     Err(format!(
-        "malformed arguments JSON for `{tool_name}`: {parse_error}. Retry with valid JSON and reduce argument size if the previous tool call was truncated."
+        "`{tool_name}` arguments were not valid JSON, so the call was not executed. Emit one complete JSON object matching the tool schema; do not serialize arguments as text or include markup."
     ))
 }
 
@@ -148,12 +156,13 @@ mod tests {
 
     #[test]
     fn agent_fanout_parse_error_is_not_reported_as_missing_action() {
+        let raw_payload = "{\"action\":\"start\"";
         let err = agent_fanout_action_from_args(&json!({
-            "_parse_error": "Malformed arguments JSON: {\"action\":\"start\""
+            "_parse_error": {"kind": "invalid_json", "executed": false}
         }))
         .unwrap_err();
-        assert!(err.contains("malformed arguments JSON for `agent_fanout`"));
-        assert!(!err.contains("missing required parameter `action`"));
+        assert!(err.contains("agent_fanout"));
+        assert!(!err.contains(raw_payload));
     }
 
     #[test]
