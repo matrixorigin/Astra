@@ -968,10 +968,9 @@ fn task_type_section(task_type: Option<&str>, tool_names: &[&str]) -> String {
                    5. **If a read fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
                   \n\
                   ### Output\n\
-                  - Summary: 1–3 bullets on the change and risk.\n\
-                  - Findings: 0–5 material issues only; label must-fix/should-fix/suggestion, cite file:line, and give the fix. If none, say \"None\".\n\
-                  - Verification: say what you checked and what you could not verify\n\
-                  - Verdict: LGTM or Needs changes. NEVER say LGTM if you had read errors on logic-changed files.\n\
+                  Return exactly one JSON object and no surrounding prose or markdown fences:\n\
+                  {{\"summary\":\"1–3 concise points on change and risk\",\"findings\":[{{\"severity\":\"critical|high|medium|low|info\",\"summary\":\"material issue and fix\",\"evidence\":[\"file:line and observed fact\"]}}],\"verification\":\"what was checked and what remains unverified\",\"verdict\":\"lgtm|needs_changes\"}}\n\
+                  Emit 0–5 material findings. Use severity=critical only for evidence that must reach ancestor runs immediately. Use an empty findings array when there are no findings. NEVER use verdict=lgtm when reads failed on logic-changed files.\n\
                   \n\
                   ### Anti-patterns (NEVER do these)\n\
                    {git_antipattern}\n\
@@ -2037,6 +2036,15 @@ mod tests {
         assert!(
             p.contains("Default budget: no more than 3 read_file calls"),
             "should bound read_file fanout for review turns"
+        );
+        assert!(
+            p.contains("\"severity\":\"critical|high|medium|low|info\"")
+                && p.contains("Return exactly one JSON object"),
+            "review output must match the delegated finding wire contract"
+        );
+        assert!(
+            !p.contains("label must-fix/should-fix/suggestion"),
+            "the previous prose review contract must not remain prompt-facing"
         );
 
         let p_no_read_file = build_main_system_prompt(&["git", "bash"], "", Some("code_review"));

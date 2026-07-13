@@ -888,6 +888,10 @@ pub struct DynamicAgentSpawner {
     /// the pure fanout projection so runtime queries avoid scanning every
     /// group and slot.
     fanout_agent_index: Arc<RwLock<HashMap<String, String>>>,
+    /// Stable default `get_results` payload for terminal groups. Tool batches
+    /// are sequential, so an identical second control read reuses this result
+    /// instead of repeating child-result collection and durable reads.
+    fanout_terminal_result_cache: Arc<RwLock<HashMap<String, String>>>,
     /// Cached count of active fanout slots (Running status). Derived from
     /// `fanout_groups`; state-transition paths update it for cheap telemetry.
     ///
@@ -928,6 +932,7 @@ impl DynamicAgentSpawner {
             max_concurrent_agents: None,
             fanout_groups: Arc::new(RwLock::new(HashMap::new())),
             fanout_agent_index: Arc::new(RwLock::new(HashMap::new())),
+            fanout_terminal_result_cache: Arc::new(RwLock::new(HashMap::new())),
             cached_active_fanout_slots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             durable_reconciler: Arc::new(RwLock::new(None)),
             durable_observed_agent_ids: Arc::new(RwLock::new(HashSet::new())),
@@ -1319,6 +1324,27 @@ impl DynamicAgentSpawner {
         self.fanout_groups.read().await.get(&group_id).cloned()
     }
 
+    pub async fn cached_terminal_fanout_result(&self, group_id: &str) -> Option<String> {
+        self.fanout_terminal_result_cache
+            .read()
+            .await
+            .get(group_id)
+            .cloned()
+    }
+
+    pub async fn cache_terminal_fanout_result(&self, group_id: &str, result: String) {
+        let groups = self.fanout_groups.read().await;
+        if !groups
+            .get(group_id)
+            .is_some_and(AgentFanoutGroupProjection::is_terminal)
+        {
+            return;
+        }
+        let mut cache = self.fanout_terminal_result_cache.write().await;
+        cache.retain(|cached_group_id, _| groups.contains_key(cached_group_id));
+        cache.insert(group_id.to_string(), result);
+    }
+
     fn remember_background_agent_id(&self, agent_id: &str) {
         let mut ids = self
             .background_agent_ids
@@ -1484,6 +1510,15 @@ impl DynamicAgentSpawner {
         let mut groups = self.fanout_groups.write().await;
         let is_new = !groups.contains_key(&identity.group_id);
         let evicted_agent_ids = if is_new {
+            if let Some(existing) = groups
+                .values()
+                .find(|group| group.parent_run_id.as_deref() == Some(parent_run_id))
+            {
+                return Err(SpawnError::InvalidInput(format!(
+                    "parent run '{parent_run_id}' already owns fanout group '{}' with fixed target_count {}; a parent run may start only one fanout group",
+                    existing.group_id, existing.target_count
+                )));
+            }
             self.evict_terminal_fanout_group_if_full(&mut groups)?
         } else {
             Vec::new()
@@ -1582,6 +1617,10 @@ impl DynamicAgentSpawner {
             .map_err(SpawnError::InvalidInput)?;
         let active_after = group.summary().active;
         group.touch();
+        self.fanout_terminal_result_cache
+            .write()
+            .await
+            .remove(&identity.group_id);
         self.adjust_cached_active_fanout_slots(active_before, active_after);
         index.insert(agent_id.to_string(), identity.group_id.clone());
         Ok(())
@@ -1652,15 +1691,15 @@ impl DynamicAgentSpawner {
         }
     }
 
-    async fn fanout_group_for_parent_run(
+    pub async fn fanout_group_for_parent_run(
         &self,
         parent_run_id: &str,
-    ) -> Option<(String, usize, AgentFanoutStatus)> {
+    ) -> Option<AgentFanoutGroupProjection> {
         let groups = self.fanout_groups.read().await;
         groups
             .values()
             .find(|group| group.parent_run_id.as_deref() == Some(parent_run_id))
-            .map(|group| (group.group_id.clone(), group.target_count, group.status))
+            .cloned()
     }
 
     async fn record_fanout_terminal_state(&self, state: &SpawnedAgentState) {
@@ -1694,6 +1733,10 @@ impl DynamicAgentSpawner {
         }
         let active_after = group.summary().active;
         group.touch();
+        self.fanout_terminal_result_cache
+            .write()
+            .await
+            .remove(&identity.group_id);
         tracing::info!(
             target: "fanout",
             group_id = %identity.group_id,
@@ -2030,17 +2073,17 @@ impl DynamicAgentSpawner {
         // attempts that bypass the group contract. A later user turn has
         // a new parent_run_id and is unaffected.
         if fanout_slot.is_none() {
-            if let Some((group_id, target_count, status)) = self
+            if let Some(group) = self
                 .fanout_group_for_parent_run(&context.parent_run_id)
                 .await
             {
                 return Err(SpawnError::InvalidInput(format!(
                     "parent run '{}' already used agent_fanout group '{}' with fixed target_count {} (status: {}). Do not call agent(action='spawn') to add, retry, or replace agents in the same turn. Present the fanout results, use agent_fanout(action='get_results', group_id='{}') if needed, or ask the user before starting another fanout.",
                     context.parent_run_id,
-                    group_id,
-                    target_count,
-                    status.as_str(),
-                    group_id
+                    group.group_id,
+                    group.target_count,
+                    group.status.as_str(),
+                    group.group_id
                 )));
             }
         }
@@ -3036,6 +3079,7 @@ impl DynamicAgentSpawner {
             max_concurrent_agents: self.max_concurrent_agents,
             fanout_groups: Arc::clone(&self.fanout_groups),
             fanout_agent_index: Arc::clone(&self.fanout_agent_index),
+            fanout_terminal_result_cache: Arc::clone(&self.fanout_terminal_result_cache),
             cached_active_fanout_slots: Arc::clone(&self.cached_active_fanout_slots),
             durable_reconciler: Arc::clone(&self.durable_reconciler),
             durable_observed_agent_ids: Arc::clone(&self.durable_observed_agent_ids),

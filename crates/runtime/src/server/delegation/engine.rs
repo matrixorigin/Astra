@@ -45,6 +45,10 @@ use astra_services::coordination::{
     AggregationStrategy, CoordinationPattern, DelegationRequest, DelegationResult,
     agent_result_status_to_subrun_state, aggregate_results,
 };
+use astra_services::delegated_findings::{
+    DelegatedFindingEnvelope, DelegatedFindingParse, MAX_DELEGATED_FINDING_SUMMARY_CHARS,
+    truncate_chars,
+};
 use astra_services::runs::{
     DurableRunStatusKind, durable_run_status_kind, durable_run_status_to_subrun_state,
 };
@@ -65,6 +69,31 @@ use astra_prompts::team_prompts;
 /// scheduler tick, but below the interactive cancellation latency budget.
 const FANOUT_CANCELLATION_DRAIN_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(500);
+
+/// State projection is an observability aid, not a copy of the full run tree.
+/// Keep the source, its nearest ancestors, and the root within this write
+/// budget. The canonical transcript and durable run hierarchy remain complete.
+const MAX_FINDING_BUBBLE_TARGETS: usize = 8;
+
+/// Protect recovery from corrupt or externally imported parent maps while
+/// remaining far above the supported delegation depth of normal profiles.
+const MAX_ANCESTRY_TRAVERSAL: usize = 64;
+
+fn ancestry_from_parents(parents: &HashMap<String, String>, run_id: &str) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = run_id.to_string();
+    let mut visited = HashSet::from([current.clone()]);
+    while chain.len() < MAX_ANCESTRY_TRAVERSAL
+        && let Some(parent) = parents.get(&current)
+    {
+        if !visited.insert(parent.clone()) {
+            break;
+        }
+        chain.push(parent.clone());
+        current = parent.clone();
+    }
+    chain
+}
 
 fn cancelled_agent_result(agent_id: &str, run_id: &str) -> AgentResult {
     AgentResult {
@@ -127,63 +156,96 @@ fn parse_request_skill_sources_from_context(
     Ok(Some(parsed))
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct DelegatedFindingEnvelope {
-    findings: Vec<DelegatedFinding>,
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CriticalFindingExtraction {
+    summary: Option<String>,
+    contract_error: Option<String>,
+    used_legacy_review_format: bool,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct DelegatedFinding {
-    severity: DelegatedFindingSeverity,
-    summary: String,
-    #[serde(default)]
-    evidence: Vec<String>,
-}
-
-#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum DelegatedFindingSeverity {
-    Critical,
-    High,
-    Medium,
-    Low,
-    Info,
-}
-
-/// Extract only explicitly structured critical findings. Free-form output and
-/// error prose remain part of the child transcript, but never become control
-/// or cross-run projection signals through keyword matching.
-fn critical_finding_summary_from_agent_result(result: &AgentResult) -> Option<String> {
-    let envelope: DelegatedFindingEnvelope =
-        serde_json::from_str(result.output.as_deref()?).ok()?;
-    let summaries = envelope
-        .findings
-        .into_iter()
-        .filter(|finding| finding.severity == DelegatedFindingSeverity::Critical)
-        .filter_map(|finding| {
-            let summary = finding.summary.trim();
-            if summary.is_empty() {
-                return None;
+/// Extract typed findings and operational child failures. Free-form success
+/// prose never becomes a cross-run signal. The one accepted prose shape is the
+/// exact previous review contract, isolated in `DelegatedFindingEnvelope` as a
+/// deployment-window migration.
+fn critical_finding_from_agent_result(result: &AgentResult) -> CriticalFindingExtraction {
+    let mut extraction = CriticalFindingExtraction::default();
+    if let Some(output) = result.output.as_deref() {
+        match DelegatedFindingEnvelope::parse(output) {
+            DelegatedFindingParse::Structured(envelope) => {
+                extraction.summary = envelope.critical_summary();
             }
-            let evidence = finding
-                .evidence
-                .into_iter()
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-                .collect::<Vec<_>>();
-            Some(if evidence.is_empty() {
-                summary.to_string()
-            } else {
-                format!("{summary}\nEvidence:\n- {}", evidence.join("\n- "))
-            })
-        })
-        .collect::<Vec<_>>();
-    if summaries.is_empty() {
-        return None;
+            DelegatedFindingParse::LegacyReview(envelope) => {
+                extraction.used_legacy_review_format = true;
+                extraction.summary = envelope.critical_summary();
+            }
+            DelegatedFindingParse::Unstructured => {}
+            DelegatedFindingParse::MalformedJson(error) => {
+                extraction.contract_error = Some(error);
+            }
+            DelegatedFindingParse::ResourceLimitExceeded(error) => {
+                extraction.contract_error = Some(error);
+            }
+        }
     }
-    // Projection rows are navigation evidence, not an unbounded transcript
-    // replica. Preserve Unicode boundaries while capping one child's payload.
-    Some(summaries.join("\n\n").chars().take(4_000).collect())
+
+    // User/parent cancellation is already explicit lifecycle evidence and is
+    // not a critical defect. Failed, timed-out, or verification-failed work
+    // must remain visible even when no structured review envelope was emitted.
+    if result.is_failure() && result.status != STATUS_CANCELLED {
+        let failure = match result
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(error) => {
+                let error = truncate_chars(error, MAX_DELEGATED_FINDING_SUMMARY_CHARS);
+                format!(
+                    "Delegated agent '{}' failed with status '{}': {error}",
+                    result.agent_id, result.status
+                )
+            }
+            None => format!(
+                "Delegated agent '{}' failed with status '{}'",
+                result.agent_id, result.status
+            ),
+        };
+        extraction.summary = Some(truncate_chars(
+            &match extraction.summary.take() {
+                Some(finding) => format!("{finding}\n\nOperational failure:\n{failure}"),
+                None => failure,
+            },
+            MAX_DELEGATED_FINDING_SUMMARY_CHARS,
+        ));
+    }
+    extraction
+}
+
+fn finding_bubble_targets(
+    session_id: &str,
+    run_id: &str,
+    source_depth: u32,
+    ancestry: &[String],
+) -> Vec<BubbleUpTarget> {
+    let mut targets = vec![BubbleUpTarget {
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        depth: source_depth,
+    }];
+    let ancestor_budget = MAX_FINDING_BUBBLE_TARGETS.saturating_sub(1);
+    let mut selected = (0..ancestry.len().min(ancestor_budget)).collect::<Vec<_>>();
+    if ancestry.len() > ancestor_budget && ancestor_budget > 0 {
+        selected.pop();
+        selected.push(ancestry.len() - 1);
+    }
+    for idx in selected {
+        targets.push(BubbleUpTarget {
+            session_id: session_id.to_string(),
+            run_id: ancestry[idx].clone(),
+            depth: source_depth.saturating_sub((idx as u32) + 1),
+        });
+    }
+    targets
 }
 
 async fn bubble_up_critical_finding_from_tracker(
@@ -194,19 +256,8 @@ async fn bubble_up_critical_finding_from_tracker(
     run_id: String,
     summary: String,
 ) {
-    let source_depth = tracker.get_depth(&run_id).await.unwrap_or(0);
-    let mut targets = vec![BubbleUpTarget {
-        session_id: session_id.clone(),
-        run_id: run_id.clone(),
-        depth: source_depth,
-    }];
-    for (idx, parent_run_id) in tracker.get_ancestry(&run_id).await.into_iter().enumerate() {
-        targets.push(BubbleUpTarget {
-            session_id: session_id.clone(),
-            run_id: parent_run_id,
-            depth: source_depth.saturating_sub((idx as u32) + 1),
-        });
-    }
+    let (source_depth, ancestry) = tracker.finding_lineage_snapshot(&run_id).await;
+    let targets = finding_bubble_targets(&session_id, &run_id, source_depth, &ancestry);
     if let Err(error) = projection_store
         .bubble_up_finding(
             &user_id,
@@ -807,6 +858,22 @@ impl DelegationTracker {
         None
     }
 
+    /// Read depth and ancestry from one lock-ordered snapshot. Writers acquire
+    /// these maps in the same `delegations -> parents` order, so a finding can
+    /// never combine a pre-insert depth with a post-insert parent chain.
+    async fn finding_lineage_snapshot(&self, run_id: &str) -> (u32, Vec<String>) {
+        let delegations = self.delegations.read().await;
+        let parents = self.parents.read().await;
+        let depth = delegations
+            .values()
+            .flatten()
+            .find(|record| record.run_id == run_id)
+            .map(|record| record.depth)
+            .unwrap_or(0);
+        let ancestry = ancestry_from_parents(&parents, run_id);
+        (depth, ancestry)
+    }
+
     /// Get all sub-run IDs for a given parent run across all delegations.
     pub async fn get_children(&self, parent_run_id: &str) -> Vec<String> {
         self.parents
@@ -845,22 +912,7 @@ impl DelegationTracker {
     /// Get the full ancestry chain (run_id → parent → grandparent → ...).
     pub async fn get_ancestry(&self, run_id: &str) -> Vec<String> {
         let parents = self.parents.read().await;
-        let mut chain = Vec::new();
-        let mut current = run_id.to_string();
-        let mut visited = HashSet::from([current.clone()]);
-        while let Some(parent) = parents.get(&current) {
-            if !visited.insert(parent.clone()) {
-                tracing::warn!(
-                    run_id,
-                    repeated_run_id = parent,
-                    "delegation ancestry contains a cycle; returning the acyclic prefix"
-                );
-                break;
-            }
-            chain.push(parent.clone());
-            current = parent.clone();
-        }
-        chain
+        ancestry_from_parents(&parents, run_id)
     }
 
     // ── Pause / Resume ──────────────────────────────────────────────────────
@@ -1702,7 +1754,23 @@ impl DelegationEngine {
             return;
         };
         for result in results {
-            if let Some(summary) = critical_finding_summary_from_agent_result(result) {
+            let extraction = critical_finding_from_agent_result(result);
+            if let Some(error) = extraction.contract_error.as_deref() {
+                tracing::warn!(
+                    target: "astra_runtime::delegation",
+                    run_id = %result.run_id,
+                    error,
+                    "delegated finding output violated the bounded JSON contract"
+                );
+            }
+            if extraction.used_legacy_review_format {
+                tracing::debug!(
+                    target: "astra_runtime::delegation",
+                    run_id = %result.run_id,
+                    "accepted previous delegated review format during deployment migration"
+                );
+            }
+            if let Some(summary) = extraction.summary {
                 bubble_up_critical_finding_from_tracker(
                     projection_store.clone(),
                     self.tracker.clone(),
@@ -4686,9 +4754,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegation_tracker_ancestry_returns_full_acyclic_prefix_on_corruption() {
+    async fn delegation_tracker_ancestry_returns_full_acyclic_prefix_on_mid_chain_cycle() {
         let tracker = DelegationTracker::new();
-        for (run_id, parent_run_id, depth) in [("a", "b", 1), ("b", "c", 2), ("c", "a", 3)] {
+        for (run_id, parent_run_id, depth) in
+            [("a", "b", 4), ("b", "c", 3), ("c", "d", 2), ("d", "b", 1)]
+        {
             tracker
                 .record_sub_run(SubRunRecord {
                     run_id: run_id.into(),
@@ -4702,13 +4772,13 @@ mod tests {
                 .await;
         }
 
-        assert_eq!(tracker.get_ancestry("a").await, vec!["b", "c"]);
+        assert_eq!(tracker.get_ancestry("a").await, vec!["b", "c", "d"]);
     }
 
     #[tokio::test]
-    async fn delegation_tracker_ancestry_has_no_arbitrary_projection_depth_cutoff() {
+    async fn delegation_tracker_preserves_supported_deep_ancestry() {
         let tracker = DelegationTracker::new();
-        for depth in 1..=6 {
+        for depth in 1..=32 {
             tracker
                 .record_sub_run(SubRunRecord {
                     run_id: format!("run-{depth}"),
@@ -4722,46 +4792,106 @@ mod tests {
                 .await;
         }
 
-        assert_eq!(
-            tracker.get_ancestry("run-6").await,
-            vec!["run-5", "run-4", "run-3", "run-2", "run-1", "run-0"]
-        );
+        let ancestry = tracker.get_ancestry("run-32").await;
+        assert_eq!(ancestry.len(), 32);
+        assert_eq!(ancestry.first().map(String::as_str), Some("run-31"));
+        assert_eq!(ancestry.last().map(String::as_str), Some("run-0"));
     }
 
     #[test]
-    fn delegated_critical_findings_require_structured_evidence() {
-        let result = |output: &str| AgentResult {
+    fn delegated_critical_findings_are_typed_and_failures_remain_visible() {
+        let result = |output: Option<&str>, status: &str, error: Option<&str>| AgentResult {
             agent_id: "reviewer".into(),
             run_id: "run-review".into(),
-            status: STATUS_COMPLETED.into(),
-            output: Some(output.into()),
-            error: None,
+            status: status.into(),
+            output: output.map(str::to_string),
+            error: error.map(str::to_string),
             prompt_tokens: 0,
             completion_tokens: 0,
             tool_calls: 0,
         };
 
         assert_eq!(
-            critical_finding_summary_from_agent_result(&result(
-                "This prose mentions a critical blocker but carries no typed finding."
+            critical_finding_from_agent_result(&result(
+                Some("This prose mentions a critical blocker but carries no typed finding."),
+                STATUS_COMPLETED,
+                None,
             )),
-            None
+            CriticalFindingExtraction::default()
         );
         assert_eq!(
-            critical_finding_summary_from_agent_result(&result(
-                r#"{"findings":[{"severity":"high","summary":"Not critical"}]}"#
-            )),
+            critical_finding_from_agent_result(&result(
+                Some(r#"{"findings":[{"severity":"high","summary":"Not critical"}]}"#),
+                STATUS_COMPLETED,
+                None,
+            ))
+            .summary,
             None
         );
 
-        let summary = critical_finding_summary_from_agent_result(&result(
-            r#"{"findings":[{"severity":"critical","summary":"Tenant boundary bypass","evidence":["events.rs:42","cross-user request accepted"]}]}"#,
+        let summary = critical_finding_from_agent_result(&result(
+            Some(r#"{"findings":[{"severity":"Critical","summary":"Tenant boundary bypass","evidence":["events.rs:42","cross-user request accepted"]}]}"#),
+            STATUS_COMPLETED,
+            None,
         ))
+        .summary
         .expect("structured critical finding");
         assert_eq!(
             summary,
             "Tenant boundary bypass\nEvidence:\n- events.rs:42\n- cross-user request accepted"
         );
+
+        let failed = critical_finding_from_agent_result(&result(
+            None,
+            STATUS_FAILED,
+            Some("review process crashed"),
+        ));
+        assert_eq!(
+            failed.summary.as_deref(),
+            Some("Delegated agent 'reviewer' failed with status 'failed': review process crashed")
+        );
+
+        let cancelled = critical_finding_from_agent_result(&result(
+            None,
+            STATUS_CANCELLED,
+            Some("cancelled by user"),
+        ));
+        assert!(cancelled.summary.is_none());
+    }
+
+    #[test]
+    fn malformed_finding_json_is_observable_without_becoming_a_finding() {
+        let result = AgentResult {
+            agent_id: "reviewer".into(),
+            run_id: "run-review".into(),
+            status: STATUS_COMPLETED.into(),
+            output: Some(r#"{"findings":["#.into()),
+            error: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+        };
+
+        let extraction = critical_finding_from_agent_result(&result);
+        assert!(extraction.summary.is_none());
+        assert!(extraction.contract_error.is_some());
+    }
+
+    #[test]
+    fn finding_projection_targets_are_bounded_and_keep_the_root() {
+        let ancestry = (0..32)
+            .map(|idx| format!("ancestor-{idx}"))
+            .collect::<Vec<_>>();
+        let targets = finding_bubble_targets("session", "source", 32, &ancestry);
+
+        assert_eq!(targets.len(), MAX_FINDING_BUBBLE_TARGETS);
+        assert_eq!(targets[0].run_id, "source");
+        assert_eq!(targets[1].run_id, "ancestor-0");
+        assert_eq!(
+            targets.last().map(|target| target.run_id.as_str()),
+            Some("ancestor-31")
+        );
+        assert_eq!(targets.last().map(|target| target.depth), Some(0));
     }
 
     #[tokio::test]

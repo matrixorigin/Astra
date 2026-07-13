@@ -712,6 +712,66 @@ impl AgentRunRegistry {
         self.order.clone()
     }
 
+    /// The compact status strip represents one current work surface, not the
+    /// session archive. Prefer the newest live fanout and include its settled
+    /// siblings; when no fanout is live, briefly retain only the newest group.
+    fn status_strip_ids(&self) -> Vec<String> {
+        let live_group = self.order.iter().rev().find_map(|id| {
+            self.runs
+                .get(id)
+                .filter(|projection| projection.state.status.is_active())
+                .and_then(|_| self.fanout_membership.get(id))
+                .map(|fanout| fanout.group_id.as_str())
+        });
+        if let Some(group_id) = live_group {
+            return self
+                .order
+                .iter()
+                .filter(|id| {
+                    self.fanout_membership
+                        .get(*id)
+                        .is_some_and(|fanout| fanout.group_id == group_id)
+                })
+                .cloned()
+                .collect();
+        }
+
+        let standalone_live = self
+            .order
+            .iter()
+            .filter(|id| {
+                self.runs
+                    .get(*id)
+                    .is_some_and(|projection| projection.state.status.is_active())
+                    && !self.fanout_membership.contains_key(*id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !standalone_live.is_empty() {
+            return standalone_live;
+        }
+
+        let newest_group = self
+            .order
+            .iter()
+            .rev()
+            .find_map(|id| self.fanout_membership.get(id))
+            .map(|fanout| fanout.group_id.as_str());
+        match newest_group {
+            Some(group_id) => self
+                .order
+                .iter()
+                .filter(|id| {
+                    self.fanout_membership
+                        .get(*id)
+                        .is_some_and(|fanout| fanout.group_id == group_id)
+                })
+                .cloned()
+                .collect(),
+            None => self.order.last().cloned().into_iter().collect(),
+        }
+    }
+
     fn get(&self, id: &str) -> Option<&AgentRunProjection> {
         self.runs.get(id)
     }
@@ -1685,6 +1745,10 @@ impl ChatWidget {
     /// not transient control-plane tool call IDs such as `get_result`.
     pub fn agent_run_ids(&self) -> Vec<String> {
         self.agent_runs.ids()
+    }
+
+    pub(crate) fn agent_status_strip_ids(&self) -> Vec<String> {
+        self.agent_runs.status_strip_ids()
     }
 
     pub fn agent_run_cell(&self, id: &str) -> Option<&TaskCell> {
@@ -3027,10 +3091,21 @@ impl ChatWidget {
             let Some(slot_index) = slot_index.filter(|index| *index < target_count) else {
                 continue;
             };
-            let slot_label = agent
-                .get("id")
+            let requested_description = receipt
+                .get("fanout")
+                .and_then(|fanout| fanout.get("slots"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|slots| slots.get(slot_index))
+                .and_then(|slot| slot.get("requested_description"))
                 .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.trim().is_empty())
+                .filter(|value| !value.trim().is_empty());
+            let slot_label = requested_description
+                .or_else(|| {
+                    agent
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                })
                 .unwrap_or(agent_id.as_str());
             let membership =
                 crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership {
@@ -3042,7 +3117,7 @@ impl ChatWidget {
                 };
             self.agent_runs.ensure(
                 agent_id.clone(),
-                agent_display_name(&agent_id, Some(slot_label)),
+                slot_label.to_string(),
                 AgentRunState::observed(state),
             );
             self.agent_runs
@@ -6246,7 +6321,11 @@ mod tests {
                     "target_count": 2,
                     "transcript_location": "durable_server",
                     "fanout": {
-                        "parent_run_id": "root-run"
+                        "parent_run_id": "root-run",
+                        "slots": [
+                            {"requested_description": "Correctness boundary review"},
+                            {"requested_description": "Performance boundary review"}
+                        ]
                     },
                     "agents": [
                         {
@@ -6288,6 +6367,48 @@ mod tests {
                 && row.control_target.is_none()
                 && row.available_actions.is_empty()
         }));
+        assert_eq!(
+            widget
+                .agent_run_cell("reviewer@one")
+                .map(|cell| cell.description.as_str()),
+            Some("Correctness boundary review")
+        );
+    }
+
+    #[test]
+    fn compact_agent_strip_scopes_history_to_the_current_fanout_group() {
+        use crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership;
+
+        let mut registry = AgentRunRegistry::default();
+        for (group, state) in [
+            ("old", AgentRunStatus::Completed),
+            ("current", AgentRunStatus::Running),
+        ] {
+            for slot in 0..3 {
+                let id = format!("{group}-{slot}");
+                registry.ensure(
+                    id.clone(),
+                    format!("{group} slot {slot}"),
+                    AgentRunState::observed(state),
+                );
+                registry.set_fanout_membership(
+                    &id,
+                    Some(AgentFanoutMembership {
+                        group_id: group.into(),
+                        group_title: group.into(),
+                        target_count: 3,
+                        slot_index: slot,
+                        slot_label: format!("slot-{slot}"),
+                    }),
+                );
+            }
+        }
+
+        assert_eq!(
+            registry.status_strip_ids(),
+            vec!["current-0", "current-1", "current-2"]
+        );
+        assert_eq!(registry.ids().len(), 6, "workbench retains session history");
     }
 
     #[test]

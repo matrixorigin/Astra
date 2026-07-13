@@ -481,7 +481,7 @@ pub(crate) fn active_viewport(
     // after a short linger timeout. Users can still drill in via Ctrl+G.
     const STRIP_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
     let _ = inner_w; // retained for future per-row layout decisions
-    let agent_ids = chat_widget.agent_run_ids();
+    let agent_ids = chat_widget.agent_status_strip_ids();
     let multi_agent_active = if !agent_ids.is_empty() {
         let cells: Vec<MultiAgentEntry> = agent_ids
             .iter()

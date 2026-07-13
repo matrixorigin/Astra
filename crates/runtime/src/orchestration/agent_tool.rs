@@ -843,6 +843,40 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             );
         }
     }
+    if let Some(existing) = ctx.spawner.fanout_group_for_parent_run(&ctx.run_id).await {
+        let same_start = existing.group_id == group_id
+            || input._tool_call_id.as_deref().is_some_and(|tool_call_id| {
+                existing.created_by_tool_use_id.as_deref() == Some(tool_call_id)
+            });
+        if !same_start {
+            return render_agent_tool_error(
+                None,
+                &format!(
+                    "parent run '{}' already started fanout group '{}' with fixed target_count {}; a parent run may start only one fanout group",
+                    ctx.run_id, existing.group_id, existing.target_count
+                ),
+            );
+        }
+        if existing.is_terminal() {
+            return render_agent_fanout_results(
+                ctx,
+                &existing.group_id,
+                input._tool_call_id,
+                FanoutResultReadOptions::default(),
+            )
+            .await;
+        }
+        return json!({
+            "status": "started",
+            "group_id": existing.group_id,
+            "title": existing.title,
+            "target_count": existing.target_count,
+            "fanout": fanout_group_to_json(&existing),
+            "idempotent_replay": true,
+            "instruction": "This fanout start was already accepted. Observe the existing group with agent_fanout.get_results; no replacement agents were launched."
+        })
+        .to_string();
+    }
     // Budget transparency: detect silent max_turns inflation before slots
     // are moved, then surface it in every response branch below.
     let budget_notice = fanout_budget_adjustment_notice(&input);
@@ -1087,6 +1121,12 @@ impl Default for FanoutResultReadOptions {
 }
 
 impl FanoutResultReadOptions {
+    fn is_default(self) -> bool {
+        self.slot_index.is_none()
+            && self.offset == 0
+            && self.max_bytes == FANOUT_RESULT_DEFAULT_MAX_BYTES
+    }
+
     fn from_group_input(input: &AgentFanoutGroupInput) -> Result<Self, String> {
         if input.offset.unwrap_or(0) > 0 && input.slot_index.is_none() {
             return Err(
@@ -1110,6 +1150,11 @@ async fn render_agent_fanout_results(
     tool_call_id: Option<String>,
     read_options: FanoutResultReadOptions,
 ) -> String {
+    if read_options.is_default()
+        && let Some(cached) = ctx.spawner.cached_terminal_fanout_result(group_id).await
+    {
+        return cached;
+    }
     if let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
         tracing::warn!(
             target: "fanout",
@@ -1334,7 +1379,13 @@ async fn render_agent_fanout_results(
             ),
         );
     }
-    serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string())
+    let rendered = serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string());
+    if read_options.is_default() && updated.is_terminal() {
+        ctx.spawner
+            .cache_terminal_fanout_result(group_id, rendered.clone())
+            .await;
+    }
+    rendered
 }
 
 async fn handle_agent_fanout_stop_slot_action(
@@ -2751,6 +2802,50 @@ mod tests {
             executor.take_captured_model().as_deref(),
             Some("MiniMax-M2.7")
         );
+    }
+
+    #[tokio::test]
+    async fn parent_run_fanout_start_is_idempotent_and_rejects_a_second_group() {
+        let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let first_args = json!({
+            "action": "start",
+            "_tool_call_id": "call-first",
+            "group_id": "review-first",
+            "target_count": 1,
+            "slots": [{"id": "correctness", "description": "Review correctness", "prompt": "Review correctness."}]
+        });
+        let first = handle_agent_fanout_tool(&first_args, Some(&ctx)).await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&first).unwrap()["status"],
+            "completed"
+        );
+
+        let replay = handle_agent_fanout_tool(&first_args, Some(&ctx)).await;
+        let replay: Value = serde_json::from_str(&replay).unwrap();
+        assert_eq!(replay["group_id"], "review-first");
+        assert_eq!(spawner.list_fanout_groups().await.len(), 1);
+
+        let second = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "_tool_call_id": "call-second",
+                "group_id": "review-second",
+                "target_count": 1,
+                "slots": [{"id": "security", "description": "Review security", "prompt": "Review security."}]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let second: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second["status"], "failed");
+        assert!(
+            second["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("may start only one fanout group")),
+            "{second}"
+        );
+        assert_eq!(spawner.list_fanout_groups().await.len(), 1);
     }
 
     #[tokio::test]

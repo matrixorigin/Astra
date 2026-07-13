@@ -15,6 +15,7 @@ pub mod cost_ledger;
 pub mod data_versioning;
 pub mod db_row;
 pub mod decisions;
+pub mod delegated_findings;
 pub mod durable_task;
 pub mod edge_context;
 pub mod evaluation;
