@@ -326,7 +326,7 @@ mod tests {
         };
         stats.record_plan_pressure(0.45);
         stats.record_plan_pressure(0.70); // +0.25 in one turn
-        let alerts = evaluate_alerts(6, &f, &stats, &RecoveryState::default());
+        let alerts = evaluate_alerts(6, "model-a", &f, &stats, &RecoveryState::default());
         assert!(alerts.iter().any(|a| a.rule == "pressure_spike"));
     }
 
@@ -340,7 +340,7 @@ mod tests {
         };
         stats.record_plan_pressure(0.45);
         stats.record_plan_pressure(0.55); // +0.10 — below the spike delta
-        let alerts = evaluate_alerts(6, &f, &stats, &RecoveryState::default());
+        let alerts = evaluate_alerts(6, "model-a", &f, &stats, &RecoveryState::default());
         assert!(!alerts.iter().any(|a| a.rule == "pressure_spike"));
     }
 
@@ -353,7 +353,7 @@ mod tests {
             ..Default::default()
         };
         stats.record_plan_pressure(0.90);
-        let alerts = evaluate_alerts(1, &f, &stats, &RecoveryState::default());
+        let alerts = evaluate_alerts(1, "model-a", &f, &stats, &RecoveryState::default());
         assert!(!alerts.iter().any(|a| a.rule == "pressure_spike"));
     }
 
@@ -366,12 +366,12 @@ mod tests {
             ..Default::default()
         };
         stats.note_emergent_evictions(3); // 3 new evictions since last sync
-        let alerts = evaluate_alerts(6, &f, &stats, &RecoveryState::default());
+        let alerts = evaluate_alerts(6, "model-a", &f, &stats, &RecoveryState::default());
         assert!(alerts.iter().any(|a| a.rule == "emergent_overflow"));
 
         // Next cycle with no new evictions must not re-alert.
         stats.note_emergent_evictions(3);
-        let alerts = evaluate_alerts(7, &f, &stats, &RecoveryState::default());
+        let alerts = evaluate_alerts(7, "model-a", &f, &stats, &RecoveryState::default());
         assert!(!alerts.iter().any(|a| a.rule == "emergent_overflow"));
     }
 }
