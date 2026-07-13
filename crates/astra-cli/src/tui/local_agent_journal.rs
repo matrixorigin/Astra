@@ -7,7 +7,12 @@
 
 use std::collections::BTreeMap;
 
-use astra_services::session_journal::{JournalEvent, JournalEventType, read_journal_append_order};
+use astra_services::session_journal::{JournalEvent, JournalEventType, read_journal_tail};
+
+/// Enough lifecycle events to reconstruct a useful recent workbench without
+/// rereading an ever-growing JSONL journal on every session bind.
+const LOCAL_AGENT_EVENT_TAIL: usize = 4096;
+pub(crate) const RECENT_TERMINAL_RUN_LIMIT: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalJournalAgentRun {
@@ -25,7 +30,7 @@ pub(crate) struct LocalJournalAgentRun {
 /// completed/failed workbench row would fabricate a lifecycle fact. Current
 /// local spawners append both `agent_spawned` and `agent_terminated` events.
 pub(crate) fn load_terminal_runs(session_id: &str) -> Result<Vec<LocalJournalAgentRun>, String> {
-    let events = read_journal_append_order(session_id)
+    let events = read_journal_tail(session_id, LOCAL_AGENT_EVENT_TAIL)
         .map_err(|error| format!("Could not read local agent history: {error}"))?;
     Ok(terminal_runs_from_events(events))
 }
@@ -97,7 +102,11 @@ fn terminal_runs_from_events(
             .then(left.1.run_id.cmp(&right.1.run_id))
             .then(left.1.agent_id.cmp(&right.1.agent_id))
     });
-    runs.into_iter().map(|(_, run)| run).collect()
+    let keep_from = runs.len().saturating_sub(RECENT_TERMINAL_RUN_LIMIT);
+    runs.into_iter()
+        .skip(keep_from)
+        .map(|(_, run)| run)
+        .collect()
 }
 
 struct PendingRun {
@@ -206,5 +215,48 @@ mod tests {
         let string = serde_json::json!({"duration_ms": "43"});
         assert_eq!(metadata_u64(Some(&numeric), "duration_ms"), Some(42));
         assert_eq!(metadata_u64(Some(&string), "duration_ms"), Some(43));
+    }
+
+    #[test]
+    fn terminal_history_is_bounded_to_the_recent_working_set() {
+        let mut events = Vec::new();
+        for index in 0..(RECENT_TERMINAL_RUN_LIMIT + 5) {
+            let run_id = format!("run-{index}");
+            let agent_id = format!("agent-{index}");
+            events.push(JournalEvent::agent_spawned(
+                Some("session-1"),
+                &agent_id,
+                &run_id,
+                "root",
+                "review",
+                "review",
+                None,
+                false,
+                None,
+            ));
+            events.push(JournalEvent::agent_terminated(
+                Some("session-1"),
+                &agent_id,
+                &run_id,
+                "review",
+                "completed",
+                Some("normal"),
+                1,
+                0,
+                0,
+                0,
+                1,
+                None,
+            ));
+        }
+
+        let runs = terminal_runs_from_events(events);
+        assert_eq!(runs.len(), RECENT_TERMINAL_RUN_LIMIT);
+        assert_eq!(runs.first().map(|run| run.run_id.as_str()), Some("run-5"));
+        let expected_last = format!("run-{}", RECENT_TERMINAL_RUN_LIMIT + 4);
+        assert_eq!(
+            runs.last().map(|run| run.run_id.as_str()),
+            Some(expected_last.as_str())
+        );
     }
 }

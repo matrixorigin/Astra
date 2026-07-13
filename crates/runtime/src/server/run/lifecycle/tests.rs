@@ -1727,7 +1727,7 @@ fn server_subrun_empty_completion_remains_paused_regardless_of_task_board() {
     let outcome = Ok(AgenticLoopOutcome::Completed);
     assert_eq!(
         server_subrun_live_termination(&outcome, &state),
-        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
+        Some(astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted)
     );
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),
@@ -1736,7 +1736,7 @@ fn server_subrun_empty_completion_remains_paused_regardless_of_task_board() {
 }
 
 #[test]
-fn server_subrun_waiting_without_live_task_is_interrupted_not_cancelled() {
+fn server_subrun_waiting_is_recoverable_and_not_terminated() {
     let svc = test_service();
     let request = test_request("subrun waits for external input");
     let state = svc.build_initial_state(
@@ -1750,17 +1750,14 @@ fn server_subrun_waiting_without_live_task_is_interrupted_not_cancelled() {
     );
     let outcome = Ok(AgenticLoopOutcome::Waiting("approval".to_string()));
 
-    assert_eq!(
-        server_subrun_live_termination(&outcome, &state),
-        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
-    );
+    assert_eq!(server_subrun_live_termination(&outcome, &state), None);
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),
         Some("approval")
     );
     assert_eq!(
         server_subrun_outcome_status(&outcome, &state),
-        STATUS_PAUSED
+        STATUS_WAITING
     );
 }
 
@@ -1781,7 +1778,7 @@ fn server_subrun_cancel_is_terminal_across_live_and_durable_projections() {
 
     assert_eq!(
         server_subrun_live_termination(&outcome, &state),
-        astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled
+        Some(astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled)
     );
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),
@@ -1829,7 +1826,7 @@ fn server_subrun_requires_intervention_from_interruption_not_task_board() {
     let outcome = Ok(AgenticLoopOutcome::Completed);
     assert_eq!(
         server_subrun_live_termination(&outcome, &state),
-        astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted
+        Some(astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted)
     );
     assert_eq!(
         server_subrun_live_reason(&outcome, &state).as_deref(),

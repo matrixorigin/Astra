@@ -197,6 +197,12 @@ impl AgentProgressEmitter {
         self.emit(ProgressEventType::Idle);
     }
 
+    pub fn waiting(&self, reason: impl Into<String>) {
+        self.emit(ProgressEventType::Waiting {
+            reason: reason.into(),
+        });
+    }
+
     pub fn busy(&self, activity: impl Into<String>) {
         self.emit(ProgressEventType::Busy {
             activity: activity.into(),
@@ -395,6 +401,7 @@ mod tests {
         emitter.turn_completed(1, 3, "reading files");
         emitter.busy("processing data");
         emitter.idle();
+        emitter.waiting("executor_offline");
         emitter.completed("done", 10, (1000, 500), 5000);
 
         // Verify all events received
@@ -422,6 +429,12 @@ mod tests {
         let e5 = rx.recv().await.unwrap();
         assert!(matches!(
             e5.event_type,
+            ProgressEventType::Waiting { reason } if reason == "executor_offline"
+        ));
+
+        let e6 = rx.recv().await.unwrap();
+        assert!(matches!(
+            e6.event_type,
             ProgressEventType::Completed {
                 total_tool_calls: 10,
                 duration_ms: 5000,

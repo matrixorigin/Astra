@@ -656,6 +656,58 @@ struct AgentRunRegistry {
 }
 
 impl AgentRunRegistry {
+    fn prune_terminal_history(&mut self, max_recent_terminal: usize) {
+        let mut keep = self
+            .order
+            .iter()
+            .filter(|key| {
+                self.runs
+                    .get(*key)
+                    .is_some_and(|projection| projection.state.status.is_active())
+            })
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        keep.extend(
+            self.order
+                .iter()
+                .rev()
+                .filter(|key| {
+                    self.runs
+                        .get(*key)
+                        .is_some_and(|projection| projection.state.status.is_terminal())
+                })
+                .take(max_recent_terminal)
+                .cloned(),
+        );
+
+        // Preserve ancestors of retained rows so the workbench tree never
+        // turns recent grandchildren into unexplained roots.
+        loop {
+            let parents = keep
+                .iter()
+                .filter_map(|key| self.runs.get(key))
+                .filter_map(|projection| projection.parent_run_id.as_deref())
+                .filter_map(|parent_run_id| self.key_for_run_id(parent_run_id))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let before = keep.len();
+            keep.extend(parents);
+            if keep.len() == before {
+                break;
+            }
+        }
+
+        let evicted = self
+            .order
+            .iter()
+            .filter(|key| !keep.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in evicted {
+            self.remove(&key);
+        }
+    }
+
     fn ids(&self) -> Vec<String> {
         self.order.clone()
     }
@@ -1856,6 +1908,8 @@ impl ChatWidget {
                 projection.detail.completed_at = Some(std::time::Instant::now());
             }
         }
+        self.agent_runs
+            .prune_terminal_history(crate::tui::local_agent_journal::RECENT_TERMINAL_RUN_LIMIT);
         before != self.agent_runs.signature()
     }
 
@@ -1974,6 +2028,8 @@ impl ChatWidget {
             | ServerAgentTruthState::Unavailable => {}
         }
 
+        self.agent_runs
+            .prune_terminal_history(crate::tui::local_agent_journal::RECENT_TERMINAL_RUN_LIMIT);
         before != self.agent_runs.signature()
     }
 
@@ -2116,12 +2172,14 @@ impl ChatWidget {
 
     /// Full Agent Workbench projection for every row currently loaded from
     /// the local runtime, workspace recovery, and the bounded durable server
-    /// snapshot. Unlike the compact activity strip, the Workbench never
-    /// performs a second client-side terminal-history truncation.
+    /// snapshot. Active rows and a bounded recent terminal working set are
+    /// retained; older durable history remains available from transcript
+    /// paging instead of accumulating in the render model.
     pub(crate) fn agent_workbench_snapshot(
         &self,
     ) -> crate::tui::bottom_pane::in_flight_agents_view::AgentMonitorSnapshot {
-        let mut snapshot = self.agent_monitor_snapshot(usize::MAX);
+        let mut snapshot =
+            self.agent_monitor_snapshot(crate::tui::local_agent_journal::RECENT_TERMINAL_RUN_LIMIT);
         // The root transcript belongs in an actual run tree, not as a fake
         // agent row. With no observed children and a confirmed/unbound server
         // lane, Ctrl+G should acknowledge the empty state without stealing
@@ -3067,7 +3125,8 @@ impl ChatWidget {
             // distinct from model/tool activity.
             AgentLiveEventKind::Signal(
                 astra_turn_core::agent_live_event::AgentLiveSignal::AskUserPrompted { .. }
-                | astra_turn_core::agent_live_event::AgentLiveSignal::ApprovalRequired { .. },
+                | astra_turn_core::agent_live_event::AgentLiveSignal::ApprovalRequired { .. }
+                | astra_turn_core::agent_live_event::AgentLiveSignal::ExecutionWaiting { .. },
             ) => AgentRunStatus::Waiting,
             AgentLiveEventKind::OutputDelta(_)
             | AgentLiveEventKind::ThinkingDelta(_)
@@ -3170,6 +3229,7 @@ impl ChatWidget {
                     signal,
                     astra_turn_core::agent_live_event::AgentLiveSignal::AskUserPrompted { .. }
                         | astra_turn_core::agent_live_event::AgentLiveSignal::ApprovalRequired { .. }
+                        | astra_turn_core::agent_live_event::AgentLiveSignal::ExecutionWaiting { .. }
                 )
             {
                 projection.set_attention_summary(Some(agent_live_signal_summary(signal)));
@@ -3268,6 +3328,10 @@ impl ChatWidget {
                 duration_ms,
             ),
             None => {}
+        }
+        if is_terminal_event {
+            self.agent_runs
+                .prune_terminal_history(crate::tui::local_agent_journal::RECENT_TERMINAL_RUN_LIMIT);
         }
     }
 
@@ -3730,6 +3794,7 @@ pub(crate) fn agent_live_signal_summary(
     match signal {
         AgentLiveSignal::RunStarted { .. } => "Run started".into(),
         AgentLiveSignal::WaitingForModel => "Waiting for model".into(),
+        AgentLiveSignal::ExecutionWaiting { reason } => format!("Waiting · {reason}"),
         AgentLiveSignal::ModelResponding => "Model responding".into(),
         AgentLiveSignal::OutputSettled => "Reply ready".into(),
         AgentLiveSignal::TranscriptCommitted {
@@ -6060,6 +6125,31 @@ mod tests {
     }
 
     #[test]
+    fn execution_waiting_is_recoverable_attention_not_termination() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal,
+        };
+
+        let mut widget = fresh();
+        widget.handle_event(AppEvent::wire(WireEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-waiting".into(),
+            agent_id: "reviewer@waiting".into(),
+            kind: AgentLiveEventKind::Signal(AgentLiveSignal::ExecutionWaiting {
+                reason: "executor_offline".into(),
+            }),
+        })));
+
+        let rows = widget.agent_monitor_snapshot(0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state.status, AgentRunStatus::Waiting);
+        assert_eq!(
+            rows[0].attention_summary.as_deref(),
+            Some("Waiting · executor_offline")
+        );
+        assert!(!rows[0].state.status.is_terminal());
+    }
+
+    #[test]
     fn first_live_tool_event_binds_run_identity_without_run_started_signal() {
         use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
 
@@ -8178,5 +8268,38 @@ mod tests {
             restored_agent_run_status("cancelled"),
             Some(AgentRunStatus::Cancelled)
         );
+    }
+
+    #[test]
+    fn terminal_working_set_preserves_active_runs_and_recent_lineage() {
+        let mut registry = AgentRunRegistry::default();
+        for (key, status, parent) in [
+            ("parent", AgentRunStatus::Completed, None),
+            ("evict", AgentRunStatus::Completed, None),
+            ("child", AgentRunStatus::Completed, Some("run-parent")),
+            ("latest", AgentRunStatus::Completed, None),
+            ("active", AgentRunStatus::Running, None),
+        ] {
+            registry.ensure(
+                key.to_string(),
+                key.to_string(),
+                AgentRunState::observed(status),
+            );
+            registry.get_mut(key).unwrap().set_runtime_metadata(
+                AgentProjectionSource::LiveStream,
+                format!("run-{key}"),
+                parent.map(str::to_string),
+                u32::from(parent.is_some()),
+                0,
+            );
+        }
+
+        registry.prune_terminal_history(2);
+
+        assert!(registry.contains_key("active"));
+        assert!(registry.contains_key("child"));
+        assert!(registry.contains_key("latest"));
+        assert!(registry.contains_key("parent"));
+        assert!(!registry.contains_key("evict"));
     }
 }

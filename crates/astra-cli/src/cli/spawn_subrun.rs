@@ -237,6 +237,28 @@ pub(crate) fn emit_agent_terminated(
     }
 }
 
+pub(crate) fn emit_agent_execution_waiting(
+    sink: Option<&SharedAgentLiveEventSink>,
+    run_id: &str,
+    agent_id: &str,
+    reason: String,
+) {
+    use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal};
+    let Some(sink) = sink else {
+        return;
+    };
+    if let Err(err) = sink.send(AgentLiveEvent {
+        run_id: run_id.to_string(),
+        agent_id: agent_id.to_string(),
+        kind: AgentLiveEventKind::Signal(AgentLiveSignal::ExecutionWaiting { reason }),
+    }) {
+        astra_core::agent_warn!(
+            "spawn_subrun",
+            "dropping waiting live event for {agent_id}: {err:?}"
+        );
+    }
+}
+
 pub(crate) fn emit_agent_transcript_committed(
     sink: Option<&SharedAgentLiveEventSink>,
     run_id: &str,
@@ -1183,17 +1205,16 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 })
             }
             Ok(AgenticLoopOutcome::Waiting(reason)) => {
-                // The loop has returned, so there is no executor left to
-                // observe a same-run resume. Preserve the reason as evidence
-                // but project lifecycle as an interrupted terminal task.
                 if let Some(ref emitter) = progress_emitter {
-                    emitter.idle();
+                    emitter.waiting(reason.clone());
                 }
-                emit_terminated(
-                    astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted,
-                    Some(reason.clone()),
+                emit_agent_execution_waiting(
+                    live_event_sink_for_terminal.as_ref(),
+                    &run_id_for_terminal,
+                    &agent_id_for_terminal,
+                    reason.clone(),
                 );
-                let projection = project_subrun_status_to_spawn(astra_core::STATUS_PAUSED, None);
+                let projection = project_subrun_status_to_spawn(astra_core::STATUS_WAITING, None);
                 Ok(SpawnRunResult {
                     agent_id,
                     run_id,

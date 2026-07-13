@@ -74,6 +74,10 @@ use super::types::{AgentAddress, AgentMessage, MailboxError, MessageTarget};
 
 /// Default interval between DB polls for new messages.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Idle subscribers back off aggressively so hundreds of agents do not turn
+/// an empty mailbox into thousands of database queries per second. Any
+/// observed message resets immediately to the interactive cadence.
+const MAX_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const DIRECTORY_LEASE_DURATION: Duration = Duration::from_secs(30);
 const DIRECTORY_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const DIRECTORY_DB_NOW_MS: &str = "UNIX_TIMESTAMP(NOW(6)) * 1000";
@@ -126,6 +130,8 @@ pub struct TransportMetrics {
     pub messages_dropped: std::sync::atomic::AtomicU64,
     pub poll_errors: std::sync::atomic::AtomicU64,
     pub send_errors: std::sync::atomic::AtomicU64,
+    pub poll_cycles: std::sync::atomic::AtomicU64,
+    pub idle_poll_cycles: std::sync::atomic::AtomicU64,
 }
 
 // ─── Schema ─────────────────────────────────────────────────────────────────
@@ -913,6 +919,7 @@ async fn poll_loop(
     instance_id: String,
 ) {
     let mut consecutive_errors: u32 = 0;
+    let mut consecutive_idle_cycles: u32 = 0;
     let mut current_backoff = INITIAL_BACKOFF;
     let mut next_directory_renewal = tokio::time::Instant::now();
 
@@ -926,6 +933,10 @@ async fn poll_loop(
         }
 
         let mut had_error = false;
+        let mut had_activity = false;
+        metrics
+            .poll_cycles
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if let Some(delegation_id) = delegation_id.as_deref()
             && tokio::time::Instant::now() >= next_directory_renewal
@@ -995,6 +1006,7 @@ async fn poll_loop(
 
         match claim_result {
             Ok(result) if result.rows_affected() > 0 => {
+                had_activity = true;
                 // Fetch the messages we just claimed.
                 let fetch_result = query(
                     "SELECT message_id, payload_json FROM agent_message_queue
@@ -1189,6 +1201,7 @@ async fn poll_loop(
             .await;
 
             if let Ok(rows) = broadcast_result {
+                had_activity |= !rows.is_empty();
                 for row in rows {
                     let message_id: Option<String> = row.try_get("message_id").ok();
                     if message_id.is_none() {
@@ -1315,7 +1328,16 @@ async fn poll_loop(
         } else {
             consecutive_errors = 0;
             current_backoff = INITIAL_BACKOFF;
-            interval
+            if had_activity {
+                consecutive_idle_cycles = 0;
+                interval
+            } else {
+                consecutive_idle_cycles = consecutive_idle_cycles.saturating_add(1);
+                metrics
+                    .idle_poll_cycles
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                idle_poll_interval(interval, consecutive_idle_cycles, &consumer_id)
+            }
         };
 
         // Wait with shutdown awareness.
@@ -1326,6 +1348,21 @@ async fn poll_loop(
             }
         }
     }
+}
+
+fn idle_poll_interval(base: Duration, idle_cycles: u32, consumer_id: &str) -> Duration {
+    use std::hash::{Hash, Hasher};
+
+    let multiplier = 1_u32 << idle_cycles.saturating_sub(1).min(5);
+    let ceiling = (base * multiplier).min(MAX_IDLE_POLL_INTERVAL.max(base));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    consumer_id.hash(&mut hasher);
+    // A stable 80–100% phase spreads fanout subscribers created together
+    // while keeping MAX_IDLE_POLL_INTERVAL an actual upper bound. The base
+    // interval remains the minimum, so backoff is monotonic for every
+    // consumer rather than occasionally polling faster as it becomes idle.
+    let phase_percent = 80 + (hasher.finish() % 21) as u32;
+    ceiling.mul_f64(f64::from(phase_percent) / 100.0).max(base)
 }
 
 async fn reserve_broadcast_delivery(
@@ -1882,6 +1919,31 @@ mod tests {
         assert!(initial_backoff >= Duration::from_millis(100));
         assert!(max_backoff <= Duration::from_secs(30));
         assert!(max_backoff > initial_backoff);
+    }
+
+    #[test]
+    fn idle_polling_backs_off_and_activity_can_restore_base_cadence() {
+        let base = Duration::from_millis(100);
+        let first = idle_poll_interval(base, 1, "agent-a@run-a");
+        let sustained = idle_poll_interval(base, 20, "agent-a@run-a");
+
+        assert!(first >= base);
+        assert!(sustained >= Duration::from_millis(1600));
+        assert!(sustained <= MAX_IDLE_POLL_INTERVAL);
+        assert_eq!(idle_poll_interval(base, 0, "agent-a@run-a"), first);
+    }
+
+    #[test]
+    fn idle_polling_spreads_consumers_without_changing_bounds() {
+        let base = Duration::from_millis(100);
+        let intervals = (0..32)
+            .map(|index| idle_poll_interval(base, 20, &format!("agent-{index}@run")))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(intervals.len() > 1);
+        assert!(intervals.iter().all(|value| {
+            *value >= Duration::from_millis(1600) && *value <= MAX_IDLE_POLL_INTERVAL
+        }));
     }
 
     #[test]

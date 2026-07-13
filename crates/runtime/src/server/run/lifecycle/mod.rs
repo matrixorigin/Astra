@@ -1810,6 +1810,28 @@ struct ServerAgentSpawnerEntry {
     spawner: Arc<DynamicAgentSpawner>,
     executor: Arc<ServerSpawnAgentExecutor>,
     durable_restore: Arc<tokio::sync::OnceCell<()>>,
+    last_access: Arc<std::sync::Mutex<Instant>>,
+}
+
+const SERVER_AGENT_SPAWNER_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const SERVER_AGENT_SPAWNER_PRUNE_BATCH: usize = 32;
+
+impl ServerAgentSpawnerEntry {
+    fn touch(&self) {
+        *self
+            .last_access
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+
+    fn idle_for(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(
+            *self
+                .last_access
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
 }
 
 struct ServerDurableAgentReconciler {
@@ -2475,6 +2497,7 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         session_id: &str,
     ) -> ServerAgentSpawnerEntry {
+        self.prune_idle_server_agent_spawners().await;
         let registry_key = format!("{user_id}\0{session_id}");
         if let Some(entry) = self
             .server_agent_spawners
@@ -2483,11 +2506,13 @@ impl AgenticRunLifecycleService {
             .get(&registry_key)
             .cloned()
         {
+            entry.touch();
             return entry;
         }
 
         let mut guard = self.server_agent_spawners.write().await;
         if let Some(entry) = guard.get(&registry_key).cloned() {
+            entry.touch();
             return entry;
         }
 
@@ -2533,9 +2558,48 @@ impl AgenticRunLifecycleService {
             spawner: Arc::new(spawner),
             executor,
             durable_restore: Arc::new(tokio::sync::OnceCell::new()),
+            last_access: Arc::new(std::sync::Mutex::new(Instant::now())),
         };
         guard.insert(registry_key, entry.clone());
         entry
+    }
+
+    async fn prune_idle_server_agent_spawners(&self) {
+        let now = Instant::now();
+        let candidates = self
+            .server_agent_spawners
+            .read()
+            .await
+            .iter()
+            .filter(|(_, entry)| entry.idle_for(now) >= SERVER_AGENT_SPAWNER_IDLE_TTL)
+            .take(SERVER_AGENT_SPAWNER_PRUNE_BATCH)
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return;
+        }
+
+        let mut idle = Vec::new();
+        for (key, entry) in candidates {
+            if entry.spawner.background_task_count() == 0
+                && entry.spawner.list_all_agents().await.is_empty()
+            {
+                idle.push((key, entry.spawner));
+            }
+        }
+        if idle.is_empty() {
+            return;
+        }
+
+        let mut registry = self.server_agent_spawners.write().await;
+        for (key, observed_spawner) in idle {
+            if registry
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(&current.spawner, &observed_spawner))
+            {
+                registry.remove(&key);
+            }
+        }
     }
 
     /// Single source of truth: parse all three allowlist lanes from raw wire
@@ -9378,6 +9442,10 @@ impl ServerSpawnAgentExecutor {
             .insert(context.parent_run_id.clone(), context);
     }
 
+    async fn remove_runtime_context(&self, run_id: &str) {
+        self.runtime_contexts.write().await.remove(run_id);
+    }
+
     async fn runtime_context_for_config(
         &self,
         config: &SpawnRunConfig,
@@ -9573,6 +9641,29 @@ fn emit_server_subrun_agent_terminated(
     }
 }
 
+fn emit_server_subrun_execution_waiting(
+    sink: Option<&SharedAgentLiveEventSink>,
+    run_id: &str,
+    agent_id: &str,
+    reason: String,
+) {
+    let Some(sink) = sink else {
+        return;
+    };
+    if let Err(error) = sink.send(AgentLiveEvent {
+        run_id: run_id.to_string(),
+        agent_id: agent_id.to_string(),
+        kind: AgentLiveEventKind::Signal(AgentLiveSignal::ExecutionWaiting { reason }),
+    }) {
+        tracing::warn!(
+            target: "astra_runtime::work_surface",
+            agent_id,
+            error = ?error,
+            "failed to emit server subrun waiting live event"
+        );
+    }
+}
+
 fn emit_server_subrun_transcript_committed(
     sink: Option<&SharedAgentLiveEventSink>,
     run_id: &str,
@@ -9602,19 +9693,19 @@ fn emit_server_subrun_transcript_committed(
 fn server_subrun_live_termination(
     outcome: &Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
     loop_state: &AgenticLoopState,
-) -> AgentLiveTermination {
+) -> Option<AgentLiveTermination> {
     match outcome {
         Ok(AgenticLoopOutcome::Completed)
             if server_subrun_completed_status(loop_state) == STATUS_PAUSED =>
         {
-            AgentLiveTermination::Interrupted
+            Some(AgentLiveTermination::Interrupted)
         }
-        Ok(AgenticLoopOutcome::Completed) => AgentLiveTermination::Completed,
-        Ok(AgenticLoopOutcome::Cancelled) => AgentLiveTermination::Cancelled,
-        Ok(AgenticLoopOutcome::Waiting(_)) => AgentLiveTermination::Interrupted,
-        Ok(AgenticLoopOutcome::Delegated) => AgentLiveTermination::Delegated,
+        Ok(AgenticLoopOutcome::Completed) => Some(AgentLiveTermination::Completed),
+        Ok(AgenticLoopOutcome::Cancelled) => Some(AgentLiveTermination::Cancelled),
+        Ok(AgenticLoopOutcome::Waiting(_)) => None,
+        Ok(AgenticLoopOutcome::Delegated) => Some(AgentLiveTermination::Delegated),
         Ok(AgenticLoopOutcome::Error(_) | AgenticLoopOutcome::ControlRejected(_)) | Err(_) => {
-            AgentLiveTermination::Failed
+            Some(AgentLiveTermination::Failed)
         }
     }
 }
@@ -9649,7 +9740,7 @@ fn server_subrun_outcome_status(
         Ok(AgenticLoopOutcome::Completed) => server_subrun_completed_status(loop_state),
         Ok(AgenticLoopOutcome::Delegated) => STATUS_DELEGATED,
         Ok(AgenticLoopOutcome::Cancelled) => STATUS_CANCELLED,
-        Ok(AgenticLoopOutcome::Waiting(_)) => STATUS_PAUSED,
+        Ok(AgenticLoopOutcome::Waiting(_)) => STATUS_WAITING,
         Ok(AgenticLoopOutcome::Error(_) | AgenticLoopOutcome::ControlRejected(_)) | Err(_) => {
             STATUS_FAILED
         }
@@ -9781,7 +9872,14 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
         } else {
             executor
         };
-        let result = executor.execute(subrun).await?;
+        let execution = AssertUnwindSafe(executor.execute(subrun))
+            .catch_unwind()
+            .await;
+        self.remove_runtime_context(&config.run_id).await;
+        let result = match execution {
+            Ok(result) => result?,
+            Err(_) => return Err("server dynamic child executor panicked".to_string()),
+        };
         let projection = project_subrun_status_to_spawn(&result.status, result.error);
 
         Ok(SpawnRunResult {
@@ -9962,7 +10060,7 @@ impl ServerSubRunExecutor {
             .await
     }
 
-    async fn persist_durable_subrun_terminal_status(
+    async fn persist_durable_subrun_status(
         &self,
         user_id: &str,
         session_id: &str,
@@ -9992,7 +10090,7 @@ impl ServerSubRunExecutor {
                 run_id,
                 status,
                 error = %error,
-                "failed to persist durable subrun terminal status"
+                "failed to persist durable subrun status"
             );
         }
     }
@@ -10598,7 +10696,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let live_agent_id = config.agent_profile.agent_id.clone();
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
 
-        // Commit the terminal durable fact before slower transcript,
+        // Commit the durable lifecycle fact before slower transcript,
         // observability, and cleanup work. Otherwise a completed child can
         // remain visibly running for seconds while its executor has already
         // stopped, and a control request will be admitted against stale
@@ -10607,15 +10705,22 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let projected_status = server_subrun_outcome_status(&outcome, &loop_state);
         let durable_error = match &outcome {
             Ok(AgenticLoopOutcome::Error(error)) => Some(error.clone()),
+            Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
+                Some(format!("{}: {}", rejection.code, rejection.message))
+            }
             Err(error) => Some(error.to_string()),
             _ => None,
         };
-        self.persist_durable_subrun_terminal_status(
+        let waiting_for = match &outcome {
+            Ok(AgenticLoopOutcome::Waiting(reason)) => Some(reason.as_str()),
+            _ => None,
+        };
+        self.persist_durable_subrun_status(
             &durable_user_id,
             &durable_session_id,
             &durable_run_id,
             projected_status,
-            None,
+            waiting_for,
             durable_error.as_deref(),
         )
         .await;
@@ -10734,43 +10839,26 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 source_event_id,
             );
         }
-        emit_server_subrun_agent_terminated(
-            config.live_event_sink.as_ref(),
-            &config.run_id,
-            &live_agent_id,
-            live_started_at,
-            server_subrun_live_termination(&outcome, &loop_state),
-            server_subrun_live_reason(&outcome, &loop_state),
-        );
-
-        let prompt_tokens = loop_state.provider_input_tokens();
-        let projected_status = server_subrun_outcome_status(&outcome, &loop_state);
-        let durable_error = match &outcome {
-            Ok(AgenticLoopOutcome::Error(error)) => Some(error.clone()),
-            Ok(AgenticLoopOutcome::ControlRejected(rejection)) => {
-                Some(format!("{}: {}", rejection.code, rejection.message))
+        match &outcome {
+            Ok(AgenticLoopOutcome::Waiting(reason)) => emit_server_subrun_execution_waiting(
+                config.live_event_sink.as_ref(),
+                &config.run_id,
+                &live_agent_id,
+                reason.clone(),
+            ),
+            _ => {
+                if let Some(termination) = server_subrun_live_termination(&outcome, &loop_state) {
+                    emit_server_subrun_agent_terminated(
+                        config.live_event_sink.as_ref(),
+                        &config.run_id,
+                        &live_agent_id,
+                        live_started_at,
+                        termination,
+                        server_subrun_live_reason(&outcome, &loop_state),
+                    );
+                }
             }
-            Err(error) => Some(error.to_string()),
-            _ => None,
-        };
-        self.persist_durable_subrun_terminal_status(
-            &durable_user_id,
-            &durable_session_id,
-            &durable_run_id,
-            projected_status,
-            None,
-            durable_error.as_deref(),
-        )
-        .await;
-        self.persist_durable_subrun_usage(
-            &durable_user_id,
-            &durable_session_id,
-            &durable_run_id,
-            prompt_tokens,
-            loop_state.total_completion,
-            loop_state.total_tool_calls,
-        )
-        .await;
+        }
         match outcome {
             Ok(AgenticLoopOutcome::Delegated) => Ok(astra_services::coordination::AgentResult {
                 agent_id: config.agent_profile.agent_id,
@@ -10826,11 +10914,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 Ok(astra_services::coordination::AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
-                    // Durable state projects a waiting subrun to paused, but
-                    // the parent agent protocol must retain Waiting(reason).
-                    // Collapsing it here loses execution-boundary causes such
-                    // as executor_offline and lets the parent continue.
-                    status: astra_core::STATUS_WAITING.to_string(),
+                    status: STATUS_WAITING.to_string(),
                     output: Some(reason),
                     error: None,
                     prompt_tokens,

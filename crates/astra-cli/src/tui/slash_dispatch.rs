@@ -41,6 +41,10 @@ impl SlashResult {
 /// so they can complete after the user keeps composing without borrowing UI
 /// state across a filesystem or process wait.
 pub(crate) enum SlashBackgroundRead {
+    Clipboard {
+        text: String,
+        success_message: String,
+    },
     Worktrees,
     Timeline {
         session_id: String,
@@ -839,13 +843,12 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             match &ctx.state.last_response {
                 Some(resp) if !resp.is_empty() => {
                     let n = resp.chars().count();
-                    if let Err(error) = crate::cli::slash::slash_info::copy_to_clipboard(resp) {
-                        ctx.show_error(format!("Copy failed: {error}"));
-                    } else {
-                        let preview: String = resp.chars().take(60).collect();
-                        let suffix = if n > 60 { "…" } else { "" };
-                        ctx.show_response(format!("Copied {n} chars: {preview}{suffix}"));
-                    }
+                    let preview: String = resp.chars().take(60).collect();
+                    let suffix = if n > 60 { "…" } else { "" };
+                    return SlashResult::background_read(SlashBackgroundRead::Clipboard {
+                        text: resp.clone(),
+                        success_message: format!("Copied {n} chars: {preview}{suffix}"),
+                    });
                 }
                 _ => ctx.show_info("No response to copy".into()),
             }

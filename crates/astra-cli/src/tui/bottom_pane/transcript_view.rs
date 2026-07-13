@@ -844,24 +844,21 @@ impl TranscriptView {
             .join("\n")
     }
 
-    fn copy_selection_with<F>(&mut self, copy: F)
-    where
-        F: FnOnce(&str) -> Result<(), String>,
-    {
+    fn queue_selection_copy(&mut self) {
         let text = self.selected_text();
         if text.is_empty() {
             self.status = Some("Nothing to copy".to_string());
             return;
         }
         let line_count = text.lines().count();
-        match copy(&text) {
-            Ok(()) => {
-                self.status = Some(format!("Copied {line_count} line(s) to clipboard"));
-            }
-            Err(error) => {
-                self.status = Some(format!("Copy failed: {error}"));
-            }
-        }
+        self.pending_action = Some(ViewActionRequest {
+            action: BottomPaneViewAction::CopyToClipboard {
+                text,
+                success_message: format!("Copied {line_count} line(s) to clipboard"),
+            },
+            disposition: ViewActionDisposition::KeepOpen,
+        });
+        self.status = Some("Copy queued".to_string());
     }
 
     fn return_to_conversation_navigator(&mut self) {
@@ -1100,7 +1097,7 @@ impl BottomPaneView for TranscriptView {
                 self.status = None;
             }
             KeyCode::Char('y') | KeyCode::Char('c') => {
-                self.copy_selection_with(crate::cli::slash::slash_info::copy_to_clipboard);
+                self.queue_selection_copy();
             }
             _ => {}
         }
@@ -1314,20 +1311,24 @@ mod tests {
     }
 
     #[test]
-    fn selection_copies_full_range_text() {
+    fn selection_queues_full_range_text_for_async_clipboard() {
         let mut v = plain_view(lines(6), 0);
         v.move_cursor_to(1);
         v.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
         v.move_cursor_to(3);
 
-        let copied = std::cell::RefCell::new(String::new());
-        v.copy_selection_with(|text| {
-            copied.replace(text.to_string());
-            Ok(())
-        });
+        v.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
 
-        assert_eq!(copied.into_inner(), "line 1\nline 2\nline 3");
-        assert_eq!(v.status.as_deref(), Some("Copied 3 line(s) to clipboard"));
+        let request = v.take_action_request().expect("clipboard action");
+        assert!(matches!(
+            request.action,
+            BottomPaneViewAction::CopyToClipboard {
+                text,
+                success_message,
+            } if text == "line 1\nline 2\nline 3"
+                && success_message == "Copied 3 line(s) to clipboard"
+        ));
+        assert_eq!(v.status.as_deref(), Some("Copy queued"));
     }
 
     #[test]
@@ -1428,17 +1429,16 @@ mod tests {
     }
 
     #[test]
-    fn copy_without_selection_uses_cursor_line() {
+    fn copy_without_selection_queues_cursor_line() {
         let mut v = plain_view(lines(6), 0);
         v.move_cursor_to(4);
 
-        let copied = std::cell::RefCell::new(String::new());
-        v.copy_selection_with(|text| {
-            copied.replace(text.to_string());
-            Ok(())
-        });
+        v.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
 
-        assert_eq!(copied.into_inner(), "line 4");
+        assert!(matches!(
+            v.take_action_request().map(|request| request.action),
+            Some(BottomPaneViewAction::CopyToClipboard { text, .. }) if text == "line 4"
+        ));
     }
 
     #[test]

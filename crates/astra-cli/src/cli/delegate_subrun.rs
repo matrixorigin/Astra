@@ -688,7 +688,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 Ok(AgentResult {
                     agent_id,
                     run_id,
-                    status: "paused".to_string(),
+                    status: astra_core::STATUS_WAITING.to_string(),
                     output: Some(reason),
                     error: None,
                     prompt_tokens,
@@ -737,21 +737,40 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                     astra_turn_types::AgentTranscriptLocation::LocalJournal,
                 );
             }
-            let termination = match result.status.as_str() {
-                "completed" => astra_turn_core::agent_live_event::AgentLiveTermination::Completed,
-                "delegated" => astra_turn_core::agent_live_event::AgentLiveTermination::Delegated,
-                "cancelled" => astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled,
-                "paused" => astra_turn_core::agent_live_event::AgentLiveTermination::Interrupted,
-                _ => astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
-            };
-            emit_agent_terminated(
-                live_event_sink.as_ref(),
-                &terminal_run_id,
-                &live_agent_id,
-                started_at,
-                termination,
-                result.error.clone(),
-            );
+            if result.status == astra_core::STATUS_WAITING {
+                if let Some(sink) = live_event_sink.as_ref() {
+                    let _ = sink.send(astra_turn_core::agent_live_event::AgentLiveEvent {
+                        run_id: terminal_run_id.clone(),
+                        agent_id: live_agent_id.clone(),
+                        kind: astra_turn_core::agent_live_event::AgentLiveEventKind::Signal(
+                            astra_turn_core::agent_live_event::AgentLiveSignal::ExecutionWaiting {
+                                reason: result.output.clone().unwrap_or_else(|| "waiting".into()),
+                            },
+                        ),
+                    });
+                }
+            } else {
+                let termination = match result.status.as_str() {
+                    "completed" => {
+                        astra_turn_core::agent_live_event::AgentLiveTermination::Completed
+                    }
+                    "delegated" => {
+                        astra_turn_core::agent_live_event::AgentLiveTermination::Delegated
+                    }
+                    "cancelled" => {
+                        astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled
+                    }
+                    _ => astra_turn_core::agent_live_event::AgentLiveTermination::Failed,
+                };
+                emit_agent_terminated(
+                    live_event_sink.as_ref(),
+                    &terminal_run_id,
+                    &live_agent_id,
+                    started_at,
+                    termination,
+                    result.error.clone(),
+                );
+            }
         }
         result
     }

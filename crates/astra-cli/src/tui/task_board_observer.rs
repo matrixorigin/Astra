@@ -42,6 +42,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// avoiding a request every five seconds for the lifetime of an idle session.
 const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+/// A task source is an optional observability lane; a wedged driver must not
+/// leave the board permanently in Loading/Refreshing. The underlying request
+/// is cancelled and the last confirmed snapshot remains visible.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Faster poll right after a broadcast/rebind so the user sees writes
 /// land within UI-perceptible latency. Gated by the `dirty` atomic
 /// so a quiet board never re-reads the store; only fires when there
@@ -241,6 +245,12 @@ struct ObserverInner {
     /// fetches immediately, then clears it.
     single_dirty: AtomicBool,
     all_dirty: AtomicBool,
+}
+
+#[derive(Clone)]
+enum FetchIdentity {
+    Single { session_id: String, generation: u64 },
+    All,
 }
 
 /// Event + the Instant it was observed. Used to drive the
@@ -488,7 +498,20 @@ impl TaskBoardObserver {
         }
     }
 
-    fn spawn_fetch(&self, future: impl Future<Output = ()> + Send + 'static) {
+    fn spawn_fetch(
+        &self,
+        identity: FetchIdentity,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) {
+        self.spawn_fetch_with_timeout(identity, future, FETCH_TIMEOUT);
+    }
+
+    fn spawn_fetch_with_timeout(
+        &self,
+        identity: FetchIdentity,
+        future: impl Future<Output = ()> + Send + 'static,
+        timeout: Duration,
+    ) {
         let mut tasks = match self.fetch_tasks.lock() {
             Ok(tasks) => tasks,
             Err(poisoned) => {
@@ -497,7 +520,39 @@ impl TaskBoardObserver {
             }
         };
         tasks.retain(|task| !task.is_finished());
-        tasks.push(tokio::spawn(future));
+        let inner = self.inner.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut fetch = tokio::spawn(future);
+            let failure = match tokio::time::timeout(timeout, &mut fetch).await {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => format!("fetch task failed: {error}"),
+                Err(_) => {
+                    fetch.abort();
+                    let _ = fetch.await;
+                    format!("fetch timed out after {}ms", timeout.as_millis())
+                }
+            };
+
+            tracing::warn!(%failure, "task board refresh did not complete");
+            let (mut state, _) = lock_state(&inner, "fetch_supervisor_failed");
+            let health = inner.store.health_snapshot();
+            match identity {
+                FetchIdentity::Single {
+                    session_id,
+                    generation,
+                } if state.session_id == session_id
+                    && state.single_binding_generation == generation =>
+                {
+                    state.single_lane.request_failed(Instant::now(), health);
+                    inner.single_dirty.store(true, Ordering::Release);
+                }
+                FetchIdentity::All => {
+                    state.all_lane.request_failed(Instant::now(), health);
+                    inner.all_dirty.store(true, Ordering::Release);
+                }
+                FetchIdentity::Single { .. } => {}
+            }
+        }));
     }
 
     /// Current snapshot. Clones the stored vec under a sync mutex —
@@ -823,7 +878,7 @@ impl TaskBoardObserver {
             Due::Skip => {}
             Due::All => {
                 let inner = self.inner.clone();
-                self.spawn_fetch(async move {
+                self.spawn_fetch(FetchIdentity::All, async move {
                     let per_session = match inner
                         .store
                         .load_open_task_summaries(CROSS_SESSION_OPEN_LIMIT)
@@ -855,37 +910,45 @@ impl TaskBoardObserver {
                 generation,
             } => {
                 let inner = self.inner.clone();
-                self.spawn_fetch(async move {
-                    let tasks = match inner.store.load(&sid).await {
-                        Ok(tasks) => tasks,
-                        Err(error) => {
-                            tracing::warn!(
-                                %sid,
-                                error,
-                                "task board refresh failed; preserving last snapshot"
-                            );
-                            let (mut st, _) = lock_state(&inner, "fetch_failed");
-                            // Rebind can race this request. Identity must be
-                            // checked before mutating the new session's lane.
-                            if st.session_id != sid || st.single_binding_generation != generation {
+                self.spawn_fetch(
+                    FetchIdentity::Single {
+                        session_id: sid.clone(),
+                        generation,
+                    },
+                    async move {
+                        let tasks = match inner.store.load(&sid).await {
+                            Ok(tasks) => tasks,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %sid,
+                                    error,
+                                    "task board refresh failed; preserving last snapshot"
+                                );
+                                let (mut st, _) = lock_state(&inner, "fetch_failed");
+                                // Rebind can race this request. Identity must be
+                                // checked before mutating the new session's lane.
+                                if st.session_id != sid
+                                    || st.single_binding_generation != generation
+                                {
+                                    return;
+                                }
+                                st.single_lane
+                                    .request_failed(Instant::now(), inner.store.health_snapshot());
                                 return;
                             }
-                            st.single_lane
-                                .request_failed(Instant::now(), inner.store.health_snapshot());
+                        };
+                        let (mut st, _) = lock_state(&inner, "fetch_complete");
+                        // Bail if the observer was rebound mid-fetch — the
+                        // tasks we got belong to the old session id.
+                        if st.session_id != sid || st.single_binding_generation != generation {
                             return;
                         }
-                    };
-                    let (mut st, _) = lock_state(&inner, "fetch_complete");
-                    // Bail if the observer was rebound mid-fetch — the
-                    // tasks we got belong to the old session id.
-                    if st.session_id != sid || st.single_binding_generation != generation {
-                        return;
-                    }
-                    st.single_lane.request_succeeded(Instant::now());
-                    st.manual_tasks = tasks;
-                    let combined = merged_single_tasks(&st);
-                    replace_single_snapshot(&mut st, combined);
-                });
+                        st.single_lane.request_succeeded(Instant::now());
+                        st.manual_tasks = tasks;
+                        let combined = merged_single_tasks(&st);
+                        replace_single_snapshot(&mut st, combined);
+                    },
+                );
             }
         }
     }
@@ -2036,6 +2099,55 @@ mod tests {
             1,
             "dropping the observer must abort stalled fetches and release the store"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_fetch_times_out_and_releases_refresh_lane() {
+        struct StalledStore;
+
+        #[async_trait]
+        impl TaskStore for StalledStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                std::future::pending().await
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let observer = TaskBoardObserver::new(Arc::new(StalledStore), "sess-stalled");
+        {
+            let (mut state, _) = lock_state(&observer.inner, "test_stalled_fetch");
+            state.single_lane.request_started();
+        }
+        observer.spawn_fetch_with_timeout(
+            FetchIdentity::Single {
+                session_id: "sess-stalled".to_string(),
+                generation: 0,
+            },
+            std::future::pending(),
+            Duration::from_millis(10),
+        );
+        assert_eq!(observer.truth_state(), TaskBoardTruthState::Loading);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(observer.truth_state(), TaskBoardTruthState::Unavailable);
+        assert!(observer.request_refresh());
     }
 
     #[tokio::test]

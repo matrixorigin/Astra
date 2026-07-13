@@ -455,7 +455,9 @@ impl BottomPaneView for RootTranscriptView {
     }
 
     fn take_action_request(&mut self) -> Option<ViewActionRequest> {
-        self.pending_action.take()
+        self.pending_action
+            .take()
+            .or_else(|| self.transcript.take_action_request())
     }
 
     fn handle_paste(&mut self, text: &str) -> bool {
@@ -981,6 +983,27 @@ mod tests {
         assert!(body.contains("old durable question"), "{body}");
         assert!(body.contains("durable root answer"), "{body}");
         assert!(path.ends_with("main-session-1.md"), "{}", path.display());
+    }
+
+    #[test]
+    fn root_view_forwards_transcript_clipboard_actions() {
+        let mut view = RootTranscriptView::loading("session-1".into(), 100, 24);
+        view.refresh_root_transcript(RootTranscriptUpdate::Loaded {
+            session_id: "session-1".into(),
+            page: page(),
+            replace: true,
+            source: RootTranscriptSource::DurableServer,
+        });
+        view.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(matches!(
+            view.take_action_request(),
+            Some(super::ViewActionRequest {
+                action: super::BottomPaneViewAction::CopyToClipboard { text, .. },
+                ..
+            }) if !text.is_empty()
+        ));
     }
 
     #[test]

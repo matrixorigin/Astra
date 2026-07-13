@@ -76,6 +76,10 @@ enum ModelCatalogEffect {
 /// reaches the workbench, so the UI decides how to present an empty result,
 /// a load failure, or an interactive view without parsing display strings.
 enum SlashBackgroundReadEffect {
+    Clipboard {
+        success_message: String,
+        result: Result<(), String>,
+    },
     Worktrees(Vec<crate::tui::worktrees::model::WorktreeEntry>),
     Timeline {
         session_id: String,
@@ -317,6 +321,13 @@ fn dispatch_slash_background_read(
 ) {
     tasks.spawn(async move {
         let effect = match action {
+            slash_dispatch::SlashBackgroundRead::Clipboard {
+                text,
+                success_message,
+            } => SlashBackgroundReadEffect::Clipboard {
+                success_message,
+                result: crate::cli::slash::slash_info::copy_to_clipboard_async(text).await,
+            },
             slash_dispatch::SlashBackgroundRead::Worktrees => {
                 match tokio::task::spawn_blocking(load_worktree_entries).await {
                     Ok(entries) => SlashBackgroundReadEffect::Worktrees(entries),
@@ -655,6 +666,16 @@ fn apply_slash_background_read_effect(
     chat_widget: &mut chat_widget::ChatWidget,
 ) {
     match effect {
+        SlashBackgroundReadEffect::Clipboard {
+            success_message,
+            result,
+        } => match result {
+            Ok(()) => chat_widget
+                .commit_system(history_cell::system::SystemCell::response(success_message)),
+            Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(
+                format!("Copy failed: {error}"),
+            )),
+        },
         SlashBackgroundReadEffect::Worktrees(entries) if entries.is_empty() => {
             chat_widget.commit_system(history_cell::system::SystemCell::info(
                 "No worktrees found (or `git worktree list` failed).",
@@ -2131,6 +2152,10 @@ fn commit_explain_dag(
 
 #[derive(Debug)]
 enum AgentWorkbenchOutcome {
+    Clipboard {
+        success_message: String,
+        result: Result<(), String>,
+    },
     LocalJournalRuns {
         session_id: String,
         runs: Vec<crate::tui::local_agent_journal::LocalJournalAgentRun>,
@@ -2406,6 +2431,16 @@ fn drain_agent_workbench_outcomes(
 ) {
     while let Ok(outcome) = outcome_rx.try_recv() {
         match outcome {
+            AgentWorkbenchOutcome::Clipboard {
+                success_message,
+                result,
+            } => match result {
+                Ok(()) => chat_widget
+                    .commit_system(history_cell::system::SystemCell::response(success_message)),
+                Err(error) => chat_widget.commit_system(history_cell::system::SystemCell::error(
+                    format!("Copy failed: {error}"),
+                )),
+            },
             AgentWorkbenchOutcome::LocalJournalRuns { session_id, runs } => {
                 if active_session_id == Some(session_id.as_str()) {
                     chat_widget.reconcile_local_agent_journal_runs(&runs);
@@ -3840,6 +3875,22 @@ async fn dispatch_bottom_pane_view_action(
                 ));
             }
             bottom_pane.sync_popups();
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::CopyToClipboard {
+            text,
+            success_message,
+        } => {
+            let outcome_tx = backends.agent_workbench_tx.clone();
+            tokio::spawn(async move {
+                let result = crate::cli::slash::slash_info::copy_to_clipboard_async(text).await;
+                let _ = outcome_tx
+                    .send(AgentWorkbenchOutcome::Clipboard {
+                        success_message,
+                        result,
+                    })
+                    .await;
+            });
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::StopBackgroundTask { task_id } => {

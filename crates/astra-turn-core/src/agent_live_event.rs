@@ -96,6 +96,12 @@ pub enum AgentLiveSignal {
         transcript_location: astra_turn_types::AgentTranscriptLocation,
     },
     WaitingForModel,
+    /// The executor released this run at a recoverable runtime boundary.
+    /// Unlike `WaitingForModel`, this is a durable lifecycle state: another
+    /// executor can later resume the same canonical run.
+    ExecutionWaiting {
+        reason: String,
+    },
     ModelResponding,
     /// The child has settled all model-visible output. Durable completion can
     /// still follow after its own local turn settlement.
@@ -229,6 +235,27 @@ mod tests {
                 spawn_tool_call_id: Some(spawn_tool_call_id),
                 transcript_location: astra_turn_types::AgentTranscriptLocation::DurableServer,
             } if parent_run_id == "run-parent" && spawn_tool_call_id == "call-spawn-1"
+        ));
+    }
+
+    #[test]
+    fn execution_waiting_round_trips_as_nonterminal_lifecycle_evidence() {
+        let event = AgentLiveEvent {
+            run_id: "run-waiting".into(),
+            agent_id: "reviewer".into(),
+            kind: AgentLiveEventKind::Signal(AgentLiveSignal::ExecutionWaiting {
+                reason: "executor_offline".into(),
+            }),
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["kind"]["type"], "signal");
+        assert_eq!(wire["kind"]["signal"], "execution_waiting");
+        assert_eq!(wire["kind"]["reason"], "executor_offline");
+        assert!(matches!(
+            serde_json::from_value::<AgentLiveEvent>(wire).unwrap().kind,
+            AgentLiveEventKind::Signal(AgentLiveSignal::ExecutionWaiting { reason })
+                if reason == "executor_offline"
         ));
     }
 

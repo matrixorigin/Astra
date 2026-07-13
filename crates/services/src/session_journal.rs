@@ -2195,9 +2195,6 @@ pub fn read_journal_append_delta(
 /// This avoids loading the entire journal into memory for long-running sessions
 /// where only recent events are relevant (e.g. cache-hit diagnostics).
 pub fn read_journal_tail(session_id: &str, limit: usize) -> std::io::Result<Vec<JournalEvent>> {
-    use std::collections::VecDeque;
-    use std::io::BufRead;
-
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     if limit == 0 {
@@ -2208,21 +2205,10 @@ pub fn read_journal_tail(session_id: &str, limit: usize) -> std::io::Result<Vec<
         return Ok(Vec::new());
     }
 
-    let file = std::fs::File::open(&path)?;
-    let reader = std::io::BufReader::new(file);
-    let mut tail_lines = VecDeque::with_capacity(limit);
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if tail_lines.len() == limit {
-            tail_lines.pop_front();
-        }
-        tail_lines.push_back(line.to_string());
-    }
-
+    // Seek backwards from EOF instead of scanning the complete JSONL file.
+    // Long-lived CLI sessions can accumulate hundreds of thousands of
+    // events; a bounded tail read must bound I/O as well as retained memory.
+    let tail_lines = read_journal_tail_lines_exact(&path, limit)?;
     let mut events = Vec::with_capacity(tail_lines.len());
     for line in tail_lines {
         if let Ok(event) = serde_json::from_str::<JournalEvent>(&line) {
@@ -2981,6 +2967,45 @@ fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec
         .take(max_lines)
         .map(ToString::to_string)
         .collect();
+    lines.reverse();
+    Ok(lines)
+}
+
+/// Read an exact logical tail without scanning from the beginning of the
+/// journal. Unlike recovery's defensive tail reader, this public API promises
+/// up to `max_lines` events and therefore cannot silently apply the recovery
+/// byte cap.
+fn read_journal_tail_lines_exact(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek};
+
+    if max_lines == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    let mut pos = file.seek(std::io::SeekFrom::End(0))?;
+    let mut chunks = Vec::new();
+    let mut newline_count = 0usize;
+    while pos > 0 && newline_count <= max_lines {
+        let read_len = usize::min(RECOVERY_TAIL_CHUNK_BYTES, pos as usize);
+        pos -= read_len as u64;
+        file.seek(std::io::SeekFrom::Start(pos))?;
+        let mut chunk = vec![0; read_len];
+        file.read_exact(&mut chunk)?;
+        newline_count += chunk.iter().filter(|&&byte| byte == b'\n').count();
+        chunks.push(chunk);
+    }
+
+    chunks.reverse();
+    let bytes = chunks.into_iter().flatten().collect::<Vec<_>>();
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(max_lines)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
     lines.reverse();
     Ok(lines)
 }
@@ -6482,6 +6507,42 @@ mod tests {
             assert_eq!(non_empty_lines, 2);
             assert_eq!(malformed_lines, 1);
         }
+    }
+
+    #[test]
+    fn read_journal_tail_returns_exact_events_beyond_recovery_byte_budget() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "00000000-0000-0000-0000-000000000199";
+        let payload = "x".repeat(512);
+        let mut jsonl = String::new();
+        for turn in 1..=300 {
+            let event = JournalEvent::turn(
+                Some(sid),
+                turn,
+                Some("test-model"),
+                &payload,
+                &payload,
+                0,
+                0,
+                0,
+                0,
+            );
+            jsonl.push_str(&serde_json::to_string(&event).unwrap());
+            jsonl.push('\n');
+        }
+        let path = journal_file_path(sid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, jsonl).unwrap();
+
+        let tail = read_journal_tail(sid, 200).unwrap();
+        let turns = tail
+            .iter()
+            .filter_map(|event| event.turn)
+            .collect::<Vec<_>>();
+        assert_eq!(turns.len(), 200);
+        assert_eq!(turns.first(), Some(&101));
+        assert_eq!(turns.last(), Some(&300));
     }
 
     #[test]

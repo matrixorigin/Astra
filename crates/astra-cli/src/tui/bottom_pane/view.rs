@@ -168,6 +168,12 @@ pub(crate) enum BottomPaneViewAction {
         path: std::path::PathBuf,
         lines: Vec<String>,
     },
+    /// Copy a transcript selection without running a subprocess on the input
+    /// or render path.
+    CopyToClipboard {
+        text: String,
+        success_message: String,
+    },
     /// Ask the durable run-tree observer to bypass its current retry backoff.
     /// The request stays in the view/action boundary; the observer owns the
     /// eventual network effect and authoritative projection update.

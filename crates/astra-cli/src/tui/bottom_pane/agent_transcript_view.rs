@@ -788,6 +788,14 @@ impl AgentTranscriptView {
                 output.clone(),
             ),
             AgentLiveEventKind::Signal(signal) => {
+                if matches!(signal, AgentLiveSignal::ExecutionWaiting { .. }) {
+                    // The canonical run remains resumable, but this executor
+                    // has released it. Freeze the current suffix so the UI
+                    // does not keep animating output that can no longer
+                    // arrive; a later resumed delta calls `mark_active`.
+                    self.live.finish_all_model_items();
+                    self.live.mark_settled();
+                }
                 if let AgentLiveSignal::RunStarted {
                     transcript_location,
                     ..
@@ -1331,7 +1339,9 @@ impl BottomPaneView for AgentTranscriptView {
     }
 
     fn take_action_request(&mut self) -> Option<ViewActionRequest> {
-        self.pending_action.take()
+        self.pending_action
+            .take()
+            .or_else(|| self.transcript.take_action_request())
     }
 
     fn handle_paste(&mut self, text: &str) -> bool {
@@ -2517,5 +2527,21 @@ mod tests {
         assert!(body.contains("Finding 0"), "{body}");
         assert!(body.contains("Found the race."), "{body}");
         assert!(path.ends_with("agent-run-child.md"), "{}", path.display());
+    }
+
+    #[test]
+    fn agent_view_forwards_transcript_clipboard_actions() {
+        let mut view = loading_view(100, 24);
+        view.apply_page(page(), true, AgentTranscriptSource::DurableServer);
+        view.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(matches!(
+            view.take_action_request(),
+            Some(ViewActionRequest {
+                action: BottomPaneViewAction::CopyToClipboard { text, .. },
+                ..
+            }) if !text.is_empty()
+        ));
     }
 }
