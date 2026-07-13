@@ -127,19 +127,63 @@ fn parse_request_skill_sources_from_context(
     Ok(Some(parsed))
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct DelegatedFindingEnvelope {
+    findings: Vec<DelegatedFinding>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DelegatedFinding {
+    severity: DelegatedFindingSeverity,
+    summary: String,
+    #[serde(default)]
+    evidence: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DelegatedFindingSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Info,
+}
+
+/// Extract only explicitly structured critical findings. Free-form output and
+/// error prose remain part of the child transcript, but never become control
+/// or cross-run projection signals through keyword matching.
 fn critical_finding_summary_from_agent_result(result: &AgentResult) -> Option<String> {
-    let text = [result.output.as_deref(), result.error.as_deref()]
+    let envelope: DelegatedFindingEnvelope =
+        serde_json::from_str(result.output.as_deref()?).ok()?;
+    let summaries = envelope
+        .findings
         .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("critical finding") || lower.contains("critical") || lower.contains("blocker")
-    {
-        Some(text.chars().take(1_000).collect())
-    } else {
-        None
+        .filter(|finding| finding.severity == DelegatedFindingSeverity::Critical)
+        .filter_map(|finding| {
+            let summary = finding.summary.trim();
+            if summary.is_empty() {
+                return None;
+            }
+            let evidence = finding
+                .evidence
+                .into_iter()
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            Some(if evidence.is_empty() {
+                summary.to_string()
+            } else {
+                format!("{summary}\nEvidence:\n- {}", evidence.join("\n- "))
+            })
+        })
+        .collect::<Vec<_>>();
+    if summaries.is_empty() {
+        return None;
     }
+    // Projection rows are navigation evidence, not an unbounded transcript
+    // replica. Preserve Unicode boundaries while capping one child's payload.
+    Some(summaries.join("\n\n").chars().take(4_000).collect())
 }
 
 async fn bubble_up_critical_finding_from_tracker(
@@ -156,13 +200,7 @@ async fn bubble_up_critical_finding_from_tracker(
         run_id: run_id.clone(),
         depth: source_depth,
     }];
-    for (idx, parent_run_id) in tracker
-        .get_ancestry(&run_id)
-        .await
-        .into_iter()
-        .take(4)
-        .enumerate()
-    {
+    for (idx, parent_run_id) in tracker.get_ancestry(&run_id).await.into_iter().enumerate() {
         targets.push(BubbleUpTarget {
             session_id: session_id.clone(),
             run_id: parent_run_id,
@@ -809,7 +847,16 @@ impl DelegationTracker {
         let parents = self.parents.read().await;
         let mut chain = Vec::new();
         let mut current = run_id.to_string();
+        let mut visited = HashSet::from([current.clone()]);
         while let Some(parent) = parents.get(&current) {
+            if !visited.insert(parent.clone()) {
+                tracing::warn!(
+                    run_id,
+                    repeated_run_id = parent,
+                    "delegation ancestry contains a cycle; returning the acyclic prefix"
+                );
+                break;
+            }
             chain.push(parent.clone());
             current = parent.clone();
         }
@@ -4636,6 +4683,85 @@ mod tests {
 
         let ancestry = tracker.get_ancestry("grandchild").await;
         assert_eq!(ancestry, vec!["child", "parent"]);
+    }
+
+    #[tokio::test]
+    async fn delegation_tracker_ancestry_returns_full_acyclic_prefix_on_corruption() {
+        let tracker = DelegationTracker::new();
+        for (run_id, parent_run_id, depth) in [("a", "b", 1), ("b", "c", 2), ("c", "a", 3)] {
+            tracker
+                .record_sub_run(SubRunRecord {
+                    run_id: run_id.into(),
+                    parent_run_id: parent_run_id.into(),
+                    delegation_id: format!("d-{run_id}"),
+                    agent_id: run_id.into(),
+                    depth,
+                    state: SubRunState::Created,
+                    retry_of: None,
+                })
+                .await;
+        }
+
+        assert_eq!(tracker.get_ancestry("a").await, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn delegation_tracker_ancestry_has_no_arbitrary_projection_depth_cutoff() {
+        let tracker = DelegationTracker::new();
+        for depth in 1..=6 {
+            tracker
+                .record_sub_run(SubRunRecord {
+                    run_id: format!("run-{depth}"),
+                    parent_run_id: format!("run-{}", depth - 1),
+                    delegation_id: format!("d-{depth}"),
+                    agent_id: format!("agent-{depth}"),
+                    depth,
+                    state: SubRunState::Created,
+                    retry_of: None,
+                })
+                .await;
+        }
+
+        assert_eq!(
+            tracker.get_ancestry("run-6").await,
+            vec!["run-5", "run-4", "run-3", "run-2", "run-1", "run-0"]
+        );
+    }
+
+    #[test]
+    fn delegated_critical_findings_require_structured_evidence() {
+        let result = |output: &str| AgentResult {
+            agent_id: "reviewer".into(),
+            run_id: "run-review".into(),
+            status: STATUS_COMPLETED.into(),
+            output: Some(output.into()),
+            error: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+        };
+
+        assert_eq!(
+            critical_finding_summary_from_agent_result(&result(
+                "This prose mentions a critical blocker but carries no typed finding."
+            )),
+            None
+        );
+        assert_eq!(
+            critical_finding_summary_from_agent_result(&result(
+                r#"{"findings":[{"severity":"high","summary":"Not critical"}]}"#
+            )),
+            None
+        );
+
+        let summary = critical_finding_summary_from_agent_result(&result(
+            r#"{"findings":[{"severity":"critical","summary":"Tenant boundary bypass","evidence":["events.rs:42","cross-user request accepted"]}]}"#,
+        ))
+        .expect("structured critical finding");
+        assert_eq!(
+            summary,
+            "Tenant boundary bypass\nEvidence:\n- events.rs:42\n- cross-user request accepted"
+        );
     }
 
     #[tokio::test]
