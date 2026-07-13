@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compaction_types::CompactionTier;
 use crate::context_feedback::ContextFeedback;
 use crate::context_pipeline::PipelineRunMetrics;
 use crate::trace_alert::TraceAlert;
@@ -38,9 +39,13 @@ pub struct PipelineJournalEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub predictive_pressure: Option<f64>,
+    /// Typed tier, serialized in `CompactionTier`'s serde form
+    /// (`snake_case`). Kept typed end-to-end so renaming or adding a
+    /// variant is a loud deserialization failure downstream, never a
+    /// silently mislabeled row.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    pub tier: Option<String>,
+    pub tier: Option<CompactionTier>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub spilled: Option<u32>,
@@ -109,7 +114,7 @@ impl PipelineJournalEvent {
             turn: metrics.turn_index,
             raw_pressure: Some(metrics.raw_pressure),
             predictive_pressure: Some(metrics.predictive_pressure),
-            tier: Some(format!("{:?}", metrics.compact_tier)),
+            tier: Some(metrics.compact_tier),
             spilled: Some(metrics.spilled),
             output_reserve_tokens: Some(metrics.output_reserve_tokens),
             reserve_source: Some(reserve_source.to_string()),
@@ -270,7 +275,7 @@ mod tests {
         assert_eq!(evt.turn, 12);
         assert!((evt.raw_pressure.unwrap() - 0.2665).abs() < 1e-9);
         assert!((evt.predictive_pressure.unwrap() - 0.2985).abs() < 1e-9);
-        assert_eq!(evt.tier.as_deref(), Some("TrimSchemas"));
+        assert_eq!(evt.tier, Some(CompactionTier::TrimSchemas));
         assert_eq!(evt.spilled, Some(1));
         assert_eq!(evt.output_reserve_tokens, Some(4_000));
         assert_eq!(evt.reserve_source.as_deref(), Some("memory"));

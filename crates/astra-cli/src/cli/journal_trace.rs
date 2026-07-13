@@ -16,21 +16,11 @@
 //! in a session into one. Emission order is the only reliable join key.
 
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
-use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::pipeline_journal::{PipelineEventKind, PipelineJournalEvent};
 use astra_turn_core::pipeline_trace_export::{TraceRow, render_csv, render_markdown};
 
 use crate::cli::cli_config::cli_args;
 use crate::cli::journal_digest;
-
-fn parse_tier(raw: Option<&str>) -> CompactionTier {
-    match raw {
-        Some("TrimSchemas") => CompactionTier::TrimSchemas,
-        Some("CompactHistory") => CompactionTier::CompactHistory,
-        Some("AggressivePrune") => CompactionTier::AggressivePrune,
-        _ => CompactionTier::Normal,
-    }
-}
 
 /// Build one `TraceRow` per LLM call from a session's journaled pipeline
 /// events, in emission order.
@@ -64,7 +54,11 @@ fn rows_from_journal(events: &[JournalEvent]) -> Vec<TraceRow> {
                     turn: pipeline_evt.turn.saturating_add(1),
                     raw_pressure: pipeline_evt.raw_pressure.unwrap_or(0.0),
                     predictive_pressure: pipeline_evt.predictive_pressure.unwrap_or(0.0),
-                    tier: parse_tier(pipeline_evt.tier.as_deref()),
+                    // Typed end-to-end: an unknown tier variant fails the
+                    // event's deserialization above (the row is skipped
+                    // loudly), never silently mislabeled — only a metrics
+                    // event with the field absent falls back to Normal.
+                    tier: pipeline_evt.tier.unwrap_or_default(),
                     cache_hit_ratio: None,
                     event: String::new(),
                     spilled: pipeline_evt.spilled.unwrap_or(0),
@@ -140,6 +134,7 @@ pub(crate) fn run_trace(args: &cli_args::JournalTraceArgs) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_turn_core::compaction_types::CompactionTier;
     use serde_json::json;
 
     fn evt(event_type: JournalEventType, turn: u32, metadata: serde_json::Value) -> JournalEvent {
@@ -148,6 +143,8 @@ mod tests {
         e
     }
 
+    /// `tier` is the serde (snake_case) form, matching what
+    /// `PipelineJournalEvent::from_metrics` actually serializes.
     fn metrics_payload(turn: u32, raw: f64, tier: &str) -> serde_json::Value {
         json!({
             "kind": "Metrics",
@@ -177,7 +174,7 @@ mod tests {
             evt(
                 JournalEventType::PipelineMetrics,
                 0,
-                metrics_payload(0, 0.10, "Normal"),
+                metrics_payload(0, 0.10, "normal"),
             ),
             evt(
                 JournalEventType::PipelineFeedback,
@@ -187,7 +184,7 @@ mod tests {
             evt(
                 JournalEventType::PipelineMetrics,
                 1,
-                metrics_payload(1, 0.55, "TrimSchemas"),
+                metrics_payload(1, 0.55, "trim_schemas"),
             ),
             evt(
                 JournalEventType::PipelineFeedback,
@@ -202,7 +199,7 @@ mod tests {
             evt(
                 JournalEventType::PipelineMetrics,
                 2,
-                metrics_payload(2, 0.60, "TrimSchemas"),
+                metrics_payload(2, 0.60, "trim_schemas"),
             ),
             evt(
                 JournalEventType::PipelineFeedback,
@@ -232,7 +229,7 @@ mod tests {
             evt(
                 JournalEventType::PipelineMetrics,
                 5,
-                metrics_payload(5, 0.62, "TrimSchemas"),
+                metrics_payload(5, 0.62, "trim_schemas"),
             ),
             evt(
                 JournalEventType::PipelineAlert,
@@ -269,20 +266,67 @@ mod tests {
             evt(
                 JournalEventType::PipelineMetrics,
                 0,
-                metrics_payload(0, 0.3, "Normal"),
+                metrics_payload(0, 0.3, "normal"),
             ),
         ];
         assert_eq!(rows_from_journal(&events).len(), 1);
     }
 
     #[test]
-    fn unknown_tier_string_falls_back_to_normal() {
-        assert_eq!(parse_tier(Some("SomethingNew")), CompactionTier::Normal);
-        assert_eq!(parse_tier(None), CompactionTier::Normal);
-        assert_eq!(
-            parse_tier(Some("AggressivePrune")),
-            CompactionTier::AggressivePrune
-        );
+    fn unknown_tier_variant_skips_event_loudly_instead_of_masking_as_normal() {
+        // Version skew (a tier variant this binary doesn't know) must drop
+        // the row — visible as a shorter table — not silently relabel it
+        // Normal in a paper-facing evidence table.
+        let events = vec![
+            evt(
+                JournalEventType::PipelineMetrics,
+                0,
+                metrics_payload(0, 0.62, "some_future_tier"),
+            ),
+            evt(
+                JournalEventType::PipelineMetrics,
+                1,
+                metrics_payload(1, 0.30, "trim_schemas"),
+            ),
+        ];
+        let rows = rows_from_journal(&events);
+        assert_eq!(rows.len(), 1, "unknown-variant event must be skipped");
+        assert_eq!(rows[0].tier, CompactionTier::TrimSchemas);
+    }
+
+    #[test]
+    fn round_trip_from_metrics_serialization_parses_back() {
+        // Pin the writer↔reader seam end-to-end: serialize with the REAL
+        // producer (from_metrics) and assemble from that exact payload.
+        use astra_turn_core::context_pipeline::PipelineRunMetrics;
+        let metrics = PipelineRunMetrics {
+            turn_index: 4,
+            input_tokens: 40_000,
+            output_reserve_tokens: 1_200,
+            raw_pressure: 0.61,
+            predictive_pressure: 0.66,
+            compact_tier: CompactionTier::TrimSchemas,
+            sections: 5,
+            messages: 40,
+            tool_schemas: 9,
+            cache_markers: 2,
+            tokens_cleared: 0,
+            avg_cache_hit_ratio: 0.9,
+            spilled: 3,
+            api_calls_total: 5,
+        };
+        let payload = serde_json::to_value(
+            astra_turn_core::pipeline_journal::PipelineJournalEvent::from_metrics(
+                &metrics, "memory",
+            ),
+        )
+        .expect("serialize");
+        let rows = rows_from_journal(&[evt(JournalEventType::PipelineMetrics, 4, payload)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tier, CompactionTier::TrimSchemas);
+        assert_eq!(rows[0].turn, 5);
+        assert_eq!(rows[0].spilled, 3);
+        assert!((rows[0].raw_pressure - 0.61).abs() < 1e-9);
     }
 
     #[test]
@@ -290,7 +334,7 @@ mod tests {
         let rows = rows_from_journal(&[evt(
             JournalEventType::PipelineMetrics,
             0,
-            metrics_payload(0, 0.42, "Normal"),
+            metrics_payload(0, 0.42, "normal"),
         )]);
         assert!(render_markdown(&rows).contains("| 1 |"));
         assert!(render_csv(&rows).starts_with("turn,raw_pressure"));

@@ -2560,9 +2560,13 @@ impl InProcessChatTurnBridge {
                             reserve_source,
                         );
                     if let Ok(payload) = serde_json::to_value(&metrics_evt) {
+                        // Outer turn follows the sibling pipeline_feedback/
+                        // pipeline_alert events (session-level, 1-based per
+                        // the JournalEvent.turn contract); the per-call round
+                        // counter travels in the metadata's own turn field.
                         buf.record(astra_services::session_journal::JournalEvent::pipeline_metrics(
                             (!session_id.is_empty()).then_some(session_id.as_str()),
-                            metrics.turn_index,
+                            bridge_pipeline_event_turn(trace_turn),
                             payload,
                         ));
                     }
