@@ -192,7 +192,9 @@ mod tests {
             spilled: 0,
             api_calls_total: 6,
         };
-        let feedback = ContextFeedback::from_usage(1000, 800, 200, 100, false);
+        // 100 fresh + 800 cache-read + 100 cache-creation → hit ratio 0.8,
+        // coherent with the metrics literal's avg_cache_hit_ratio above.
+        let feedback = ContextFeedback::from_usage(100, 800, 100, 100, false);
         let alerts = vec![
             TraceAlert {
                 severity: AlertSeverity::Warning,
