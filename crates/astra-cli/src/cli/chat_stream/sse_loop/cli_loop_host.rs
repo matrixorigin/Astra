@@ -611,21 +611,34 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             &self.executor.sandbox_policy,
             state.skills.sandbox_policy.clone(),
         );
-        self.executor.set_send_message_context(
-            state
-                .messaging
-                .mailbox
-                .as_ref()
-                .map(
-                    |mailbox| crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
-                        agent_id: mailbox.address.agent_id.clone(),
-                        router: mailbox.router(),
-                        metrics: state.messaging.metrics.clone(),
-                        delegation_id: mailbox.delegation_id.clone(),
-                    },
-                )
-                .or_else(|| self.root_send_message_context.clone()),
-        );
+        let send_message_context = state
+            .messaging
+            .mailbox
+            .as_ref()
+            .map(
+                |mailbox| crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
+                    agent_id: mailbox.address.agent_id.clone(),
+                    run_id: state
+                        .current_run_id
+                        .clone()
+                        .unwrap_or_else(|| mailbox.address.run_id.clone()),
+                    router: mailbox.router(),
+                    metrics: state.messaging.metrics.clone(),
+                    delegation_id: mailbox
+                        .delegation_id
+                        .clone()
+                        .or_else(|| state.current_run_id.clone()),
+                },
+            )
+            .or_else(|| self.root_send_message_context.clone())
+            .map(|mut context| {
+                if let Some(run_id) = state.current_run_id.clone() {
+                    context.run_id = run_id.clone();
+                    context.delegation_id.get_or_insert(run_id);
+                }
+                context
+            });
+        self.executor.set_send_message_context(send_message_context);
 
         // Inject task board context into the agent's system prompt so it
         // stays aware of what it should be working on this turn.

@@ -2137,7 +2137,10 @@ impl DelegationEngine {
                 run_id: request.parent_run_id.clone(),
                 agent_id: source_agent_id.to_string(),
             };
-            match router.register_if_absent(parent_addr, None).await {
+            match router
+                .register_if_absent(parent_addr, Some(request.delegation_id.clone()))
+                .await
+            {
                 Ok(mb) => mb, // Some(mailbox) if newly registered, None if already present
                 Err(e) => {
                     tracing::warn!(

@@ -180,6 +180,40 @@ impl MessageTransport for InProcessTransport {
         }))
     }
 
+    async fn resolve_agent(
+        &self,
+        delegation_id: &str,
+        agent_id: &str,
+    ) -> Result<AgentAddress, MailboxError> {
+        self.memberships
+            .read()
+            .await
+            .iter()
+            .find_map(|(address, member_delegation)| {
+                (member_delegation == delegation_id && address.agent_id == agent_id)
+                    .then(|| address.clone())
+            })
+            .ok_or_else(|| MailboxError::AgentNotFound(AgentAddress::new("", agent_id)))
+    }
+
+    async fn list_agents(&self, delegation_id: &str) -> Result<Vec<AgentAddress>, MailboxError> {
+        let mut agents = self
+            .memberships
+            .read()
+            .await
+            .iter()
+            .filter_map(|(address, member_delegation)| {
+                (member_delegation == delegation_id).then(|| address.clone())
+            })
+            .collect::<Vec<_>>();
+        agents.sort_by(|left, right| {
+            left.agent_id
+                .cmp(&right.agent_id)
+                .then_with(|| left.run_id.cmp(&right.run_id))
+        });
+        Ok(agents)
+    }
+
     async fn send(&self, msg: Arc<AgentMessage>) -> Result<(), MailboxError> {
         if self.is_shutdown.load(Ordering::Relaxed) {
             return Err(MailboxError::Transport("transport is shut down".into()));

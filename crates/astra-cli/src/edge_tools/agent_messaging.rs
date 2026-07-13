@@ -144,6 +144,8 @@ pub struct MessageRouting {
 pub struct SendMessageRuntimeContext {
     /// Current agent's ID
     pub agent_id: String,
+    /// Canonical run that owns the current mailbox.
+    pub run_id: String,
     /// Mailbox router for message delivery
     pub router: Arc<AgentMailboxRouter>,
     /// Metrics for observability
@@ -222,10 +224,16 @@ async fn send_direct_message(
     content: &str,
     input: &SendMessageInput,
 ) -> Result<String, String> {
-    // Create AgentAddress for sender (use run_id if available, else agent_id as pseudo-run)
-    let run_id = ctx.delegation_id.as_deref().unwrap_or(&ctx.agent_id);
-    let from_addr = AgentAddress::new(run_id, &ctx.agent_id);
-    let to_addr = AgentAddress::new("", recipient);
+    let delegation_id = ctx
+        .delegation_id
+        .as_deref()
+        .ok_or("Direct messaging requires an active delegation namespace")?;
+    let from_addr = AgentAddress::new(&ctx.run_id, &ctx.agent_id);
+    let to_addr = ctx
+        .router
+        .resolve_agent(delegation_id, recipient)
+        .await
+        .map_err(|error| format!("Recipient resolution failed: {error}"))?;
 
     // Build payload based on message_type
     let payload = MessagePayload::Text {
@@ -275,7 +283,7 @@ async fn broadcast_message(
         .ok_or("Broadcast requires active delegation context")?;
 
     // Create sender address
-    let from_addr = AgentAddress::new(delegation_id, &ctx.agent_id);
+    let from_addr = AgentAddress::new(&ctx.run_id, &ctx.agent_id);
 
     // Build payload
     let payload = MessagePayload::Text {
@@ -308,10 +316,12 @@ async fn broadcast_message(
     // Get list of recipients from router (excluding self)
     let recipients = ctx
         .router
-        .list_registered_agents()
+        .list_registered_agents(delegation_id)
         .await
+        .map_err(|error| format!("Recipient listing failed: {error}"))?
         .into_iter()
-        .filter(|a| a != &ctx.agent_id)
+        .map(|address| address.agent_id)
+        .filter(|agent_id| agent_id != &ctx.agent_id)
         .collect();
 
     // Update metrics
@@ -483,15 +493,19 @@ mod tests {
         let tracker = Arc::new(DelegationTracker::new());
         let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
         let mut recipient = router
-            .register(AgentAddress::new("run-123", "worker"), None)
+            .register(
+                AgentAddress::new("run-123", "worker"),
+                Some("delegation-1".into()),
+            )
             .await
             .expect("recipient mailbox");
 
         let ctx = SendMessageRuntimeContext {
             agent_id: "main".to_string(),
+            run_id: "run-main".to_string(),
             router: router.clone(),
             metrics: None,
-            delegation_id: None,
+            delegation_id: Some("delegation-1".into()),
         };
         let output = execute_send_message(
             SendMessageInput {

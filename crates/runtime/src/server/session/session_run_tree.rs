@@ -119,10 +119,7 @@ fn effective_run_status(
             ),
         )
     })?;
-    if matches!(
-        local_status,
-        RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
-    ) {
+    if local_status.is_terminal() {
         cache.insert(run.run_id.clone(), (local_status, false));
         return Ok((local_status, false));
     }
@@ -236,7 +233,7 @@ fn project_run_node_with_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_core::{STATUS_COMPLETED, STATUS_DELEGATED, STATUS_PAUSED};
+    use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_PAUSED};
     use astra_services::auth::{
         SessionActivityCursor, SessionActivityRecord, SessionCreateRequestData, SessionListFilter,
         SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
@@ -458,6 +455,28 @@ mod tests {
         );
         assert!(snapshot.runs[0].available_actions.is_empty());
         assert!(snapshot.runs[0].status.is_terminal());
+    }
+
+    #[test]
+    fn delegated_descendant_is_not_reopened_by_ancestor_control() {
+        for ancestor_status in [STATUS_PAUSED, STATUS_CANCELLED] {
+            let ancestor = run("root", ancestor_status, 0);
+            let descendant = run("child", STATUS_DELEGATED, 1);
+            let page = astra_services::runs::DurableSessionRunPage {
+                runs: vec![descendant, ancestor],
+                limit: 200,
+                truncated: false,
+            };
+
+            let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
+            let descendant = snapshot
+                .runs
+                .iter()
+                .find(|run| run.run_id == "child")
+                .unwrap();
+            assert_eq!(descendant.status, SessionRunLifecycleStatus::Delegated);
+            assert!(descendant.available_actions.is_empty());
+        }
     }
 
     #[test]

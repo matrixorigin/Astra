@@ -364,6 +364,13 @@ impl AgentMessage {
 pub enum MailboxError {
     /// Target agent is not registered.
     AgentNotFound(AgentAddress),
+    /// A direct address is incomplete and cannot be routed canonically.
+    InvalidAddress(AgentAddress),
+    /// Another live mailbox owns the same agent identity in this delegation.
+    AgentIdentityConflict {
+        delegation_id: String,
+        agent_id: String,
+    },
     /// The agent's receive channel has been closed.
     ChannelClosed,
     /// No parent agent found for `MessageTarget::Parent`.
@@ -389,6 +396,14 @@ impl std::fmt::Display for MailboxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AgentNotFound(addr) => write!(f, "agent not found: {addr}"),
+            Self::InvalidAddress(addr) => write!(f, "invalid agent address: {addr}"),
+            Self::AgentIdentityConflict {
+                delegation_id,
+                agent_id,
+            } => write!(
+                f,
+                "agent '{agent_id}' already has a live mailbox in delegation '{delegation_id}'"
+            ),
             Self::ChannelClosed => write!(f, "message channel closed"),
             Self::NoParent => write!(f, "no parent agent in delegation hierarchy"),
             Self::Transport(msg) => write!(f, "transport error: {msg}"),

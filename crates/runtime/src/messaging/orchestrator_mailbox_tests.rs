@@ -295,9 +295,13 @@ mod tests {
 
         // After delegation completes, the auto-registered parent should be
         // unregistered so it doesn't leak resources or collide with future runs.
-        let registered = h.router.list_registered_agents().await;
+        let registered = h
+            .router
+            .list_registered_agents("del-cleanup")
+            .await
+            .unwrap();
         assert!(
-            !registered.contains(&"orch".to_string()),
+            !registered.iter().any(|address| address.agent_id == "orch"),
             "parent should be unregistered after delegation, still registered: {registered:?}"
         );
     }
@@ -323,10 +327,14 @@ mod tests {
         let result = h.engine.execute(request, "orch", None).await;
         assert!(result.is_ok());
 
-        let registered = h.router.list_registered_agents().await;
+        let registered = h
+            .router
+            .list_registered_agents("del-all-cleanup")
+            .await
+            .unwrap();
         // Parent ("orch") must be cleaned up by the engine.
         assert!(
-            !registered.contains(&"orch".to_string()),
+            !registered.iter().any(|address| address.agent_id == "orch"),
             "parent should be unregistered after delegation, still registered: {registered:?}"
         );
     }
@@ -691,7 +699,11 @@ mod tests {
         // Give the Drop-spawned unregister tasks time to complete.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let registered = h.router.list_registered_agents().await;
+        let registered = h
+            .router
+            .list_registered_agents("del-drop-cleanup")
+            .await
+            .unwrap();
         assert!(
             registered.is_empty(),
             "all mailboxes (parent + children) should be cleaned up via Drop, still registered: {registered:?}"
@@ -843,6 +855,24 @@ mod tests {
             result2.unwrap().is_none(),
             "second registration should return None"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_register_if_absent_has_one_owner() {
+        let tracker = Arc::new(DelegationTracker::new());
+        let transport = Arc::new(astra_messaging::in_process::InProcessTransport::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
+        let address = AgentAddress::new("run-concurrent", "agent-concurrent");
+
+        let (left, right) = tokio::join!(
+            router.register_if_absent(address.clone(), Some("delegation".into())),
+            router.register_if_absent(address, Some("delegation".into())),
+        );
+        let owners = [left.unwrap(), right.unwrap()]
+            .into_iter()
+            .filter(Option::is_some)
+            .count();
+        assert_eq!(owners, 1);
     }
 
     /// register_if_absent with different run_id registers both.

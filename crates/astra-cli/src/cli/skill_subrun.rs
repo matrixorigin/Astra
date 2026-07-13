@@ -349,11 +349,16 @@ impl AgenticLoopHost for SubRunHost {
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         self.executor
             .set_send_message_context(state.messaging.mailbox.as_ref().map(|mailbox| {
+                let run_id = state
+                    .current_run_id
+                    .clone()
+                    .unwrap_or_else(|| mailbox.address.run_id.clone());
                 crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
                     agent_id: mailbox.address.agent_id.clone(),
+                    run_id: run_id.clone(),
                     router: mailbox.router(),
                     metrics: state.messaging.metrics.clone(),
-                    delegation_id: mailbox.delegation_id.clone(),
+                    delegation_id: mailbox.delegation_id.clone().or_else(|| Some(run_id)),
                 }
             }));
 

@@ -2583,8 +2583,7 @@ async fn fire_server_loop_observer(
         metrics_registry,
         DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
     )
-    .await;
-    Ok(())
+    .await
 }
 
 async fn fire_server_loop_observer_with_async_limit(
@@ -2594,20 +2593,22 @@ async fn fire_server_loop_observer_with_async_limit(
     state: &AgenticLoopState,
     metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
     async_concurrency_limit: usize,
-) {
+) -> Result<(), String> {
     let Some(request) = build_server_loop_observer_request(user_id, session_id, state) else {
         record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "none", "skipped_empty");
-        return;
+        return Ok(());
     };
 
     let Some(permit) = try_acquire_turn_observer_async_permit(async_concurrency_limit) else {
         record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", "dropped_full");
-        tracing::debug!(
+        tracing::warn!(
             session_id = %session_id,
             concurrency_limit = async_concurrency_limit,
-            "server-loop observer async concurrency full; dropping best-effort request"
+            "server-loop observer async concurrency full; durable turn was saved but observer evidence was not scheduled"
         );
-        return;
+        return Err(format!(
+            "observer capacity exhausted for session {session_id}; evidence requires retry"
+        ));
     };
     record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", "scheduled");
     let session_id = session_id.to_string();
@@ -2622,6 +2623,7 @@ async fn fire_server_loop_observer_with_async_limit(
         )
         .await;
     });
+    Ok(())
 }
 
 fn build_server_loop_observer_request(
@@ -2924,7 +2926,8 @@ mod tests {
             ),
         )
         .await
-        .expect("async observer dispatch should return without waiting for worker");
+        .expect("async observer dispatch should return without waiting for worker")
+        .expect("available observer capacity should schedule the worker");
 
         tokio::time::timeout(std::time::Duration::from_millis(500), started)
             .await
@@ -2936,7 +2939,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(turn_observer_async)]
-    async fn server_loop_observer_async_limit_drops_extra_request() {
+    async fn server_loop_observer_async_limit_reports_saturation_without_blocking() {
         let first = Arc::new(CaptureObserverWorker::new(true));
         let second = Arc::new(CaptureObserverWorker::new(false));
         let first_started = first.started.notified();
@@ -2950,14 +2953,15 @@ mod tests {
             None,
             1,
         )
-        .await;
+        .await
+        .expect("first observer should acquire the only permit");
         tokio::time::timeout(std::time::Duration::from_millis(500), first_started)
             .await
             .expect("first observer should start");
         wait_for_observer_calls(first.as_ref(), 1).await;
         wait_for_observer_in_flight(1).await;
 
-        tokio::time::timeout(
+        let saturated = tokio::time::timeout(
             std::time::Duration::from_millis(50),
             fire_server_loop_observer_with_async_limit(
                 second.clone(),
@@ -2969,7 +2973,11 @@ mod tests {
             ),
         )
         .await
-        .expect("full async observer pool should drop without blocking");
+        .expect("full async observer pool should report without blocking");
+        assert!(
+            saturated.is_err(),
+            "saturation must be visible to the persistence caller"
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         assert_eq!(second.call_count(), 0);
@@ -2992,7 +3000,8 @@ mod tests {
             Some(registry.clone()),
             DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
         )
-        .await;
+        .await
+        .expect("available observer capacity should schedule the worker");
         wait_for_observer_calls(observer.as_ref(), 1).await;
 
         let rendered = registry.render_prometheus();

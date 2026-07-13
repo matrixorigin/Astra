@@ -92,7 +92,6 @@ impl RunStatus {
         Self::Cancelled,
     ];
 
-    #[cfg(test)]
     pub const TERMINAL: [Self; 4] = [
         Self::Completed,
         Self::Delegated,
@@ -161,7 +160,6 @@ impl RunStatus {
         matches!(self, Self::Paused | Self::Waiting)
     }
 
-    #[cfg(test)]
     pub fn is_terminal(&self) -> bool {
         Self::TERMINAL.contains(self)
     }

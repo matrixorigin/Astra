@@ -4504,14 +4504,21 @@ mod tests {
 
         // Mailbox should be unregistered after completion.
         for _ in 0..20 {
-            if router.list_registered_agents().await.is_empty() {
+            if router
+                .list_registered_agents(&context.parent_run_id)
+                .await
+                .is_ok_and(|agents| agents.is_empty())
+            {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
         }
 
         assert!(
-            router.list_registered_agents().await.is_empty(),
+            router
+                .list_registered_agents(&context.parent_run_id)
+                .await
+                .is_ok_and(|agents| agents.is_empty()),
             "background completion should unregister mailbox"
         );
     }

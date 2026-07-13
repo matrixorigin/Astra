@@ -596,7 +596,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
 
     assert_eq!(result.full_text, "Hello!");
     assert!(
-        router.list_registered_agents().await.is_empty(),
+        !router.is_run_registered("persisted-run").await,
         "ephemeral root mailbox should be unregistered after the turn"
     );
 }

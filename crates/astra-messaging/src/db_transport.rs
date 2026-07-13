@@ -74,6 +74,9 @@ use super::types::{AgentAddress, AgentMessage, MailboxError, MessageTarget};
 
 /// Default interval between DB polls for new messages.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DIRECTORY_LEASE_DURATION: Duration = Duration::from_secs(30);
+const DIRECTORY_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+const DIRECTORY_DB_NOW_MS: &str = "UNIX_TIMESTAMP(NOW(6)) * 1000";
 
 /// Maximum number of messages to fetch per poll cycle.
 const POLL_BATCH_SIZE: i64 = 100;
@@ -172,6 +175,20 @@ pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
     ensure_broadcast_delivery_claim_columns(pool).await?;
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_mailbox_directory (
+            delegation_id VARCHAR(128) NOT NULL,
+            agent_id VARCHAR(256) NOT NULL,
+            run_id VARCHAR(128) NOT NULL,
+            owner_instance_id VARCHAR(64) NOT NULL,
+            lease_expires_at_ms BIGINT NOT NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (delegation_id, agent_id),
+            INDEX idx_agent_mailbox_directory_lease (lease_expires_at_ms)
+        )",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -309,12 +326,13 @@ pub struct DatabaseTransport {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     /// Active poll task abort handles — aborted on shutdown for clean drain.
-    poll_abort_handles: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    poll_abort_handles: std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
     /// Observable metrics.
     metrics: Arc<TransportMetrics>,
     /// Lazily started maintenance task for reclaiming stale claims and pruning
     /// expired rows.
     cleanup_scheduler: Mutex<Option<CleanupScheduler>>,
+    instance_id: String,
 }
 
 /// Default visibility timeout (how long before an unclaimed message reappears).
@@ -337,9 +355,10 @@ impl DatabaseTransport {
             registrations: Arc::new(RwLock::new(HashMap::new())),
             shutdown_tx,
             shutdown_rx,
-            poll_abort_handles: std::sync::Mutex::new(Vec::new()),
+            poll_abort_handles: std::sync::Mutex::new(HashMap::new()),
             metrics: Arc::new(TransportMetrics::default()),
             cleanup_scheduler: Mutex::new(None),
+            instance_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -476,6 +495,86 @@ impl DatabaseTransport {
         Ok(counts)
     }
 
+    async fn register_directory_entry(
+        &self,
+        delegation_id: &str,
+        addr: &AgentAddress,
+    ) -> Result<(), MailboxError> {
+        let lease_duration_ms = DIRECTORY_LEASE_DURATION.as_millis() as i64;
+        let renewed = query(&format!(
+            "UPDATE agent_mailbox_directory
+             SET lease_expires_at_ms = {DIRECTORY_DB_NOW_MS} + ?, updated_at = NOW(6)
+             WHERE delegation_id = ? AND agent_id = ? AND run_id = ?
+               AND owner_instance_id = ?"
+        ))
+        .bind(lease_duration_ms)
+        .bind(delegation_id)
+        .bind(&addr.agent_id)
+        .bind(&addr.run_id)
+        .bind(&self.instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| MailboxError::Transport(format!("directory renew: {error}")))?;
+        if renewed.rows_affected() > 0 {
+            return Ok(());
+        }
+
+        // Expired ownership is reclaimable. Live ownership is never silently
+        // overwritten, even when another replica races this registration.
+        query(&format!(
+            "DELETE FROM agent_mailbox_directory
+             WHERE delegation_id = ? AND agent_id = ?
+               AND lease_expires_at_ms <= {DIRECTORY_DB_NOW_MS}"
+        ))
+        .bind(delegation_id)
+        .bind(&addr.agent_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| MailboxError::Transport(format!("directory reclaim: {error}")))?;
+
+        let inserted = query(&format!(
+            "INSERT IGNORE INTO agent_mailbox_directory
+             (delegation_id, agent_id, run_id, owner_instance_id, lease_expires_at_ms)
+             VALUES (?, ?, ?, ?, {DIRECTORY_DB_NOW_MS} + ?)"
+        ))
+        .bind(delegation_id)
+        .bind(&addr.agent_id)
+        .bind(&addr.run_id)
+        .bind(&self.instance_id)
+        .bind(lease_duration_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| MailboxError::Transport(format!("directory register: {error}")))?;
+        if inserted.rows_affected() > 0 {
+            return Ok(());
+        }
+
+        Err(MailboxError::AgentIdentityConflict {
+            delegation_id: delegation_id.to_string(),
+            agent_id: addr.agent_id.clone(),
+        })
+    }
+
+    async fn unregister_directory_entry(
+        &self,
+        delegation_id: &str,
+        addr: &AgentAddress,
+    ) -> Result<(), MailboxError> {
+        query(
+            "DELETE FROM agent_mailbox_directory
+             WHERE delegation_id = ? AND agent_id = ? AND run_id = ?
+               AND owner_instance_id = ?",
+        )
+        .bind(delegation_id)
+        .bind(&addr.agent_id)
+        .bind(&addr.run_id)
+        .bind(&self.instance_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| MailboxError::Transport(format!("directory unregister: {error}")))?;
+        Ok(())
+    }
+
     /// Insert a message into the database.
     async fn insert_message(
         &self,
@@ -536,18 +635,52 @@ impl MessageTransport for DatabaseTransport {
         if self.is_shutdown() {
             return Err(MailboxError::Transport("transport is shut down".into()));
         }
+        if let Some(delegation_id) = delegation_id.as_deref() {
+            self.register_directory_entry(delegation_id, &addr).await?;
+        }
         self.registrations.write().await.insert(addr, delegation_id);
         self.ensure_cleanup_scheduler_started();
         Ok(())
     }
 
     async fn unregister(&self, addr: &AgentAddress) -> Result<(), MailboxError> {
-        self.registrations.write().await.remove(addr);
+        let delegation_id = self.registrations.write().await.remove(addr).flatten();
+        let mut first_error = if let Some(delegation_id) = delegation_id.as_deref() {
+            self.unregister_directory_entry(delegation_id, addr)
+                .await
+                .err()
+        } else {
+            None
+        };
         let consumer_id = format!("{}@{}", addr.agent_id, addr.run_id);
-        release_claimed_for_consumer_in_pool(&self.pool, &consumer_id, self.max_delivery_attempts)
-            .await?;
-        release_claimed_broadcast_for_consumer_in_pool(&self.pool, &consumer_id).await?;
-        Ok(())
+        if let Some(handle) = self
+            .poll_abort_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&consumer_id)
+        {
+            handle.abort();
+        }
+        if let Err(error) = release_claimed_for_consumer_in_pool(
+            &self.pool,
+            &consumer_id,
+            self.max_delivery_attempts,
+        )
+        .await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if let Err(error) =
+            release_claimed_broadcast_for_consumer_in_pool(&self.pool, &consumer_id).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn subscribe(&self, addr: &AgentAddress) -> Result<Box<dyn MessageStream>, MailboxError> {
@@ -574,11 +707,16 @@ impl MessageTransport for DatabaseTransport {
             self.shutdown_rx.clone(),
             Arc::clone(&self.metrics),
             consumer_id.clone(),
+            self.instance_id.clone(),
         ));
-        self.poll_abort_handles
+        if let Some(previous) = self
+            .poll_abort_handles
             .lock()
             .unwrap()
-            .push(poll_task.abort_handle());
+            .insert(consumer_id.clone(), poll_task.abort_handle())
+        {
+            previous.abort();
+        }
 
         Ok(Box::new(DatabaseMessageStream {
             buffer_rx: rx,
@@ -586,6 +724,53 @@ impl MessageTransport for DatabaseTransport {
             consumer_id,
             _poll_task: AbortOnDrop(poll_task),
         }))
+    }
+
+    async fn resolve_agent(
+        &self,
+        delegation_id: &str,
+        agent_id: &str,
+    ) -> Result<AgentAddress, MailboxError> {
+        let row = query(&format!(
+            "SELECT run_id FROM agent_mailbox_directory
+             WHERE delegation_id = ? AND agent_id = ?
+               AND lease_expires_at_ms > {DIRECTORY_DB_NOW_MS}"
+        ))
+        .bind(delegation_id)
+        .bind(agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| MailboxError::Transport(format!("directory resolve: {error}")))?;
+        let Some(row) = row else {
+            return Err(MailboxError::AgentNotFound(AgentAddress::new("", agent_id)));
+        };
+        let run_id: String = row
+            .try_get("run_id")
+            .map_err(|error| MailboxError::Transport(format!("directory decode: {error}")))?;
+        Ok(AgentAddress::new(run_id, agent_id))
+    }
+
+    async fn list_agents(&self, delegation_id: &str) -> Result<Vec<AgentAddress>, MailboxError> {
+        let rows = query(&format!(
+            "SELECT run_id, agent_id FROM agent_mailbox_directory
+             WHERE delegation_id = ? AND lease_expires_at_ms > {DIRECTORY_DB_NOW_MS}
+             ORDER BY agent_id ASC, run_id ASC"
+        ))
+        .bind(delegation_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| MailboxError::Transport(format!("directory list: {error}")))?;
+        rows.into_iter()
+            .map(|row| {
+                let run_id: String = row.try_get("run_id").map_err(|error| {
+                    MailboxError::Transport(format!("directory run decode: {error}"))
+                })?;
+                let agent_id: String = row.try_get("agent_id").map_err(|error| {
+                    MailboxError::Transport(format!("directory agent decode: {error}"))
+                })?;
+                Ok(AgentAddress::new(run_id, agent_id))
+            })
+            .collect()
     }
 
     async fn send(&self, msg: Arc<AgentMessage>) -> Result<(), MailboxError> {
@@ -666,7 +851,7 @@ impl MessageTransport for DatabaseTransport {
             );
         }
         // Abort any poll tasks that haven't noticed the signal yet.
-        for h in self
+        for (_, h) in self
             .poll_abort_handles
             .lock()
             .unwrap_or_else(|poisoned| {
@@ -676,7 +861,7 @@ impl MessageTransport for DatabaseTransport {
                 );
                 poisoned.into_inner()
             })
-            .drain(..)
+            .drain()
         {
             h.abort();
         }
@@ -697,6 +882,13 @@ impl MessageTransport for DatabaseTransport {
             .await?;
             release_claimed_broadcast_for_consumer_in_pool(&self.pool, &consumer_id).await?;
         }
+        query("DELETE FROM agent_mailbox_directory WHERE owner_instance_id = ?")
+            .bind(&self.instance_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| {
+                MailboxError::Transport(format!("directory shutdown cleanup: {error}"))
+            })?;
         Ok(())
     }
 }
@@ -718,9 +910,11 @@ async fn poll_loop(
     mut shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<TransportMetrics>,
     consumer_id: String,
+    instance_id: String,
 ) {
     let mut consecutive_errors: u32 = 0;
     let mut current_backoff = INITIAL_BACKOFF;
+    let mut next_directory_renewal = tokio::time::Instant::now();
 
     loop {
         // Check shutdown signal or receiver drop.
@@ -732,6 +926,52 @@ async fn poll_loop(
         }
 
         let mut had_error = false;
+
+        if let Some(delegation_id) = delegation_id.as_deref()
+            && tokio::time::Instant::now() >= next_directory_renewal
+        {
+            let lease_duration_ms = DIRECTORY_LEASE_DURATION.as_millis() as i64;
+            match query(&format!(
+                "UPDATE agent_mailbox_directory
+                 SET lease_expires_at_ms = {DIRECTORY_DB_NOW_MS} + ?, updated_at = NOW(6)
+                 WHERE delegation_id = ? AND agent_id = ? AND run_id = ?
+                   AND owner_instance_id = ?"
+            ))
+            .bind(lease_duration_ms)
+            .bind(delegation_id)
+            .bind(&addr.agent_id)
+            .bind(&addr.run_id)
+            .bind(&instance_id)
+            .execute(&pool)
+            .await
+            {
+                Ok(result) if result.rows_affected() > 0 => {
+                    next_directory_renewal = tokio::time::Instant::now() + DIRECTORY_RENEW_INTERVAL;
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        target: "astra_runtime::messaging::db_transport",
+                        %delegation_id,
+                        addr = %addr,
+                        "mailbox directory lease ownership was lost; stopping subscriber"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    had_error = true;
+                    metrics
+                        .poll_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        target: "astra_runtime::messaging::db_transport",
+                        %delegation_id,
+                        addr = %addr,
+                        %error,
+                        "mailbox directory lease renewal failed"
+                    );
+                }
+            }
+        }
 
         // 1. Claim direct messages atomically (UPDATE then SELECT).
         //    This ensures no two consumers process the same direct message.

@@ -448,6 +448,7 @@ pub(crate) async fn stream_chat_sse(
     let root_send_message_context = p.agent_spawner.as_ref().map(|spawner| {
         edge_tools::agent_messaging::SendMessageRuntimeContext {
             agent_id: root_agent_id.to_string(),
+            run_id: root_agent_id.to_string(),
             router: spawner.mailbox_router(),
             metrics: p.messaging_metrics.clone(),
             delegation_id: None,

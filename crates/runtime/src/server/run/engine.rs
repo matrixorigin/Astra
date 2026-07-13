@@ -63,6 +63,14 @@ const USER_INTENT_APPLY_RETRY_MAX_DELAY_MS: u64 = 80;
 const RUN_RECOVERY_MAX_CONCURRENCY: usize = 8;
 const OWNER_LEASE_RENEWAL_STATUSES: &[&str] = &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED];
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum TerminalTransitionOutcome {
+    Committed,
+    /// Another durable transition won the CAS. The enclosed record is the
+    /// authority callers must project instead of their stale local outcome.
+    Superseded(DurableRunRecord),
+}
+
 fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
     [
         serde_json::json!({
@@ -862,7 +870,7 @@ impl RunEngine {
     /// treat it as committed when the stored status and terminal event batch are
     /// both present. If the status committed but the expected events are missing,
     /// repair the event batch before reporting success.
-    pub async fn transition_terminal_status_with_events_if_current(
+    async fn try_transition_terminal_status_with_events_if_current(
         &self,
         user_id: &str,
         run_id: &str,
@@ -922,6 +930,41 @@ impl RunEngine {
             }
         }
         Err(last_error.unwrap_or_else(|| "terminal transition retry exhausted".to_string()))
+    }
+
+    /// Commit a terminal transition and return the authoritative durable fact.
+    /// A lost CAS is not an ambiguous `false`: callers receive the winning row
+    /// and must not publish their stale local terminal result.
+    pub async fn commit_terminal_status_with_events_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<TerminalTransitionOutcome, String> {
+        if self
+            .try_transition_terminal_status_with_events_if_current(
+                user_id,
+                run_id,
+                expected_statuses,
+                status,
+                waiting_for,
+                error_message,
+                events,
+            )
+            .await?
+        {
+            return Ok(TerminalTransitionOutcome::Committed);
+        }
+
+        let durable = self
+            .load_run(user_id, run_id)
+            .await?
+            .ok_or_else(|| format!("run {run_id} disappeared after terminal transition CAS"))?;
+        Ok(TerminalTransitionOutcome::Superseded(durable))
     }
 
     async fn reconcile_terminal_transition_after_store_error(
@@ -2837,8 +2880,8 @@ mod tests {
             "data": {"status": STATUS_COMPLETED}
         })];
 
-        let updated = engine
-            .transition_terminal_status_with_events_if_current(
+        let outcome = engine
+            .commit_terminal_status_with_events_if_current(
                 "user-1",
                 "run-terminal-retry",
                 &[STATUS_RUNNING],
@@ -2850,7 +2893,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(updated);
+        assert_eq!(outcome, TerminalTransitionOutcome::Committed);
         assert_eq!(store.attempts(), 2);
         let run = engine
             .load_run("user-1", "run-terminal-retry")
@@ -2886,8 +2929,8 @@ mod tests {
             "data": {"status": STATUS_COMPLETED}
         })];
 
-        let updated = engine
-            .transition_terminal_status_with_events_if_current(
+        let outcome = engine
+            .commit_terminal_status_with_events_if_current(
                 "user-1",
                 "run-terminal-reconcile",
                 &[STATUS_RUNNING],
@@ -2899,7 +2942,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(updated);
+        assert_eq!(outcome, TerminalTransitionOutcome::Committed);
         assert_eq!(store.attempts(), 2);
         let run = engine
             .load_run("user-1", "run-terminal-reconcile")
@@ -2951,8 +2994,8 @@ mod tests {
             }),
         ];
 
-        let updated = engine
-            .transition_terminal_status_with_events_if_current(
+        let outcome = engine
+            .commit_terminal_status_with_events_if_current(
                 "user-1",
                 "run-terminal-repair",
                 &[STATUS_RUNNING],
@@ -2964,7 +3007,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(updated);
+        assert_eq!(outcome, TerminalTransitionOutcome::Committed);
         assert_eq!(store.attempts(), 2);
         let run = engine
             .load_run("user-1", "run-terminal-repair")
@@ -3011,8 +3054,8 @@ mod tests {
             "data": {"status": STATUS_COMPLETED}
         })];
 
-        let updated = engine
-            .transition_terminal_status_with_events_if_current(
+        let outcome = engine
+            .commit_terminal_status_with_events_if_current(
                 "user-1",
                 "run-terminal-cancel-race",
                 &[STATUS_RUNNING],
@@ -3024,7 +3067,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!updated);
+        assert!(matches!(
+            outcome,
+            TerminalTransitionOutcome::Superseded(ref run) if run.status == STATUS_CANCELLED
+        ));
         assert_eq!(store.attempts(), 2);
         let run = engine
             .load_run("user-1", "run-terminal-cancel-race")

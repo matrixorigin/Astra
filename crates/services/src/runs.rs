@@ -830,6 +830,36 @@ fn sort_session_run_tree(runs: &mut [DurableRunRecord]) {
     });
 }
 
+/// A bounded working set must remain a valid tree. Selection limits apply to
+/// work/history candidates; the ancestors required to interpret those
+/// candidates are structural context and are added after selection.
+fn include_session_run_ancestors(
+    selected: &mut Vec<DurableRunRecord>,
+    candidates_by_id: &HashMap<String, DurableRunRecord>,
+) {
+    let mut included = selected
+        .iter()
+        .map(|run| run.run_id.clone())
+        .collect::<HashSet<_>>();
+    let mut frontier = selected
+        .iter()
+        .filter_map(|run| run.parent_run_id.clone())
+        .collect::<Vec<_>>();
+
+    while let Some(parent_id) = frontier.pop() {
+        if !included.insert(parent_id.clone()) {
+            continue;
+        }
+        let Some(parent) = candidates_by_id.get(&parent_id) else {
+            continue;
+        };
+        if let Some(grandparent_id) = parent.parent_run_id.clone() {
+            frontier.push(grandparent_id);
+        }
+        selected.push(parent.clone());
+    }
+}
+
 pub fn run_list_cursor_db_updated_at(cursor: &RunListCursor) -> Result<String, String> {
     let updated_at = cursor.updated_at.trim();
     if updated_at.is_empty() {
@@ -2540,14 +2570,20 @@ impl RunStateStore for InMemoryRunStateStore {
     ) -> Result<DurableSessionRunPage, String> {
         let limit = validate_run_list_limit(limit);
         let runs = self.runs.read().await;
-        let mut session_runs = runs
+        let all_session_runs = runs
             .values()
             .filter(|run| run.user_id == user_id && run.session_id == session_id)
             .cloned()
             .collect::<Vec<_>>();
+        let candidates_by_id = all_session_runs
+            .iter()
+            .map(|run| (run.run_id.clone(), run.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut session_runs = all_session_runs;
         sort_session_run_candidates(&mut session_runs);
         let truncated = session_runs.len() > limit as usize;
         session_runs.truncate(limit as usize);
+        include_session_run_ancestors(&mut session_runs, &candidates_by_id);
         sort_session_run_tree(&mut session_runs);
         Ok(DurableSessionRunPage {
             runs: session_runs,
@@ -5334,7 +5370,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let sql = format!(
             "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
              WHERE user_id = ? AND session_id = ? \
-             ORDER BY CASE WHEN status IN (?, ?, ?) THEN 1 ELSE 0 END ASC, \
+             ORDER BY CASE WHEN status IN (?, ?, ?, ?) THEN 1 ELSE 0 END ASC, \
                       updated_at DESC, created_at DESC, run_id DESC \
              LIMIT ?"
         );
@@ -5342,6 +5378,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(user_id)
             .bind(session_id)
             .bind(STATUS_COMPLETED)
+            .bind(STATUS_DELEGATED)
             .bind(STATUS_FAILED)
             .bind(STATUS_CANCELLED)
             .bind(session_run_query_limit(limit))
@@ -5355,6 +5392,59 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|error| error.to_string())?;
         let truncated = runs.len() > limit as usize;
         runs.truncate(limit as usize);
+
+        // Preserve the ancestry required to interpret every selected node.
+        // Fetch one parent level per round in a single batch; delegation depth
+        // is bounded, and the visited set also makes malformed cycles finite.
+        let mut included = runs
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<HashSet<_>>();
+        let mut frontier = runs
+            .iter()
+            .filter_map(|run| run.parent_run_id.clone())
+            .filter(|run_id| !included.contains(run_id))
+            .collect::<HashSet<_>>();
+        while !frontier.is_empty() {
+            let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
+                "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs WHERE user_id = "
+            ));
+            builder
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND run_id IN (");
+            let mut separated = builder.separated(", ");
+            for run_id in &frontier {
+                separated.push_bind(run_id);
+            }
+            separated.push_unseparated(")");
+            let parent_rows =
+                builder
+                    .build()
+                    .fetch_all(self.pool.get())
+                    .await
+                    .map_err(|source| {
+                        db_error("list_session_run_ancestors", session_id, source).to_string()
+                    })?;
+            let parents = parent_rows
+                .into_iter()
+                .map(run_record_from_row)
+                .collect::<DbStoreResult<Vec<_>>>()
+                .map_err(|error| error.to_string())?;
+            frontier.clear();
+            for parent in parents {
+                if !included.insert(parent.run_id.clone()) {
+                    continue;
+                }
+                if let Some(grandparent_id) = parent.parent_run_id.clone()
+                    && !included.contains(&grandparent_id)
+                {
+                    frontier.insert(grandparent_id);
+                }
+                runs.push(parent);
+            }
+        }
         sort_session_run_tree(&mut runs);
         Ok(DurableSessionRunPage {
             runs,
@@ -8377,7 +8467,7 @@ mod tests {
                 .iter()
                 .map(|run| run.run_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["old-terminal", "active-child"]
+            vec!["root", "old-terminal", "active-child"]
         );
         assert!(page.runs.iter().any(|run| run.run_id == "active-child"));
         assert!(page.runs.iter().all(|run| run.user_id == "u1"));
@@ -8516,6 +8606,57 @@ mod tests {
         assert!(!page.runs.iter().any(|run| run.run_id == older_terminal_id));
 
         for run_id in run_ids {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_session_run_snapshot_ranks_delegated_as_terminal() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-delegated-user-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-delegated-session-{}", Uuid::new_v4());
+        let active_id = format!("runs-it-delegated-active-{}", Uuid::new_v4());
+        let delegated_id = format!("runs-it-delegated-terminal-{}", Uuid::new_v4());
+        let completed_id = format!("runs-it-completed-terminal-{}", Uuid::new_v4());
+
+        for (run_id, status, updated_at) in [
+            (&active_id, STATUS_WAITING, "2026-07-11 00:00:01.000000"),
+            (
+                &delegated_id,
+                STATUS_DELEGATED,
+                "2026-07-11 00:00:05.000000",
+            ),
+            (
+                &completed_id,
+                STATUS_COMPLETED,
+                "2026-07-11 00:00:04.000000",
+            ),
+        ] {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+            let mut run = durable_run_record(run_id);
+            run.user_id = user_id.clone();
+            run.session_id = session_id.clone();
+            run.status = status.into();
+            store.insert_run(run).await.unwrap();
+            sqlx::query("UPDATE agent_runs SET updated_at = ? WHERE user_id = ? AND run_id = ?")
+                .bind(updated_at)
+                .bind(&user_id)
+                .bind(run_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+
+        let page = store
+            .list_session_runs(&user_id, &session_id, 2)
+            .await
+            .unwrap();
+        assert!(page.runs.iter().any(|run| run.run_id == active_id));
+        assert!(page.runs.iter().any(|run| run.run_id == delegated_id));
+        assert!(!page.runs.iter().any(|run| run.run_id == completed_id));
+
+        for run_id in [&active_id, &delegated_id, &completed_id] {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
         }
     }

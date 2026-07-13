@@ -47,14 +47,18 @@ mod tests {
 
     /// Clean up test messages between tests.
     async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>) {
-        sqlx::query("DELETE FROM agent_message_broadcast_delivery WHERE consumer_id LIKE '%run-%' OR delegation_id LIKE 'del-%' OR message_id LIKE 'test-%'")
+        sqlx::query("DELETE FROM agent_message_broadcast_delivery WHERE consumer_id LIKE '%@run-db-%' OR consumer_id LIKE '%@run-directory-%' OR delegation_id IN ('del-db-bcast-ttl', 'del-db-test', 'del-directory-a', 'del-directory-b') OR message_id LIKE 'test-%'")
             .execute(pool)
             .await
             .expect("cleanup messaging DB transport broadcast delivery fixture rows");
-        sqlx::query("DELETE FROM agent_message_queue WHERE message_id LIKE 'test-%' OR from_run_id LIKE 'run-%'")
+        sqlx::query("DELETE FROM agent_message_queue WHERE message_id LIKE 'test-%' OR from_run_id LIKE 'run-db-%' OR from_run_id LIKE 'run-directory-%'")
             .execute(pool)
             .await
             .expect("cleanup messaging DB transport fixture rows");
+        sqlx::query("DELETE FROM agent_mailbox_directory WHERE delegation_id IN ('del-db-bcast-ttl', 'del-db-test', 'del-directory-a', 'del-directory-b')")
+            .execute(pool)
+            .await
+            .expect("cleanup messaging directory fixture rows");
     }
 
     macro_rules! skip_without_db {
@@ -76,6 +80,67 @@ mod tests {
         // Call twice — should not error.
         ensure_schema(&pool).await.unwrap();
         ensure_schema(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mailbox_directory_resolves_across_replicas_and_isolates_delegations() {
+        skip_without_db!(pool);
+        let first_replica = DatabaseTransport::new(pool.clone());
+        let second_replica = DatabaseTransport::new(pool.clone());
+        let first = addr("run-directory-a", "reviewer");
+        let second = addr("run-directory-b", "reviewer");
+
+        first_replica
+            .register(first.clone(), Some("del-directory-a".into()))
+            .await
+            .unwrap();
+        second_replica
+            .register(second.clone(), Some("del-directory-b".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second_replica
+                .resolve_agent("del-directory-a", "reviewer")
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            first_replica
+                .resolve_agent("del-directory-b", "reviewer")
+                .await
+                .unwrap(),
+            second
+        );
+        assert_eq!(
+            first_replica.list_agents("del-directory-a").await.unwrap(),
+            vec![first.clone()]
+        );
+
+        let competing_replica = DatabaseTransport::new(pool.clone());
+        let competing = addr("run-directory-competing", "reviewer");
+        assert!(
+            competing_replica
+                .register(competing.clone(), Some("del-directory-a".into()))
+                .await
+                .is_err(),
+            "a live scoped identity must have exactly one mailbox owner"
+        );
+
+        first_replica.unregister(&first).await.unwrap();
+        assert!(
+            second_replica
+                .resolve_agent("del-directory-a", "reviewer")
+                .await
+                .is_err()
+        );
+        competing_replica
+            .register(competing.clone(), Some("del-directory-a".into()))
+            .await
+            .expect("released scoped identity should be reclaimable immediately");
+        competing_replica.unregister(&competing).await.unwrap();
+        second_replica.unregister(&second).await.unwrap();
     }
 
     // ── Direct Messages ─────────────────────────────────────────────────────

@@ -202,7 +202,7 @@ struct AgentRunProjection {
     depth: u32,
     metadata_source: Option<AgentProjectionSource>,
     runtime_facts: astra_thin_client::SessionRunRuntimeFacts,
-    runtime_source: Option<AgentProjectionSource>,
+    runtime_sources: RuntimeFactSources,
     control_target: Option<crate::tui::agent_run_projection::AgentControlTarget>,
     available_actions: Vec<astra_thin_client::SessionRunAction>,
     control_source: Option<AgentProjectionSource>,
@@ -218,6 +218,19 @@ struct AgentRunProjection {
         std::collections::VecDeque<astra_turn_core::agent_live_event::AgentLiveEvent>,
     live_transcript_bytes: usize,
     live_transcript_dropped: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RuntimeFactSources {
+    runtime_profile: Option<AgentProjectionSource>,
+    model_name: Option<AgentProjectionSource>,
+    model_gateway: Option<AgentProjectionSource>,
+    agent_binding_id: Option<AgentProjectionSource>,
+    agent_binding_name: Option<AgentProjectionSource>,
+    agent_binding_schema_version: Option<AgentProjectionSource>,
+    capability_server_refs: Option<AgentProjectionSource>,
+    background: Option<AgentProjectionSource>,
+    permission: Option<AgentProjectionSource>,
 }
 
 impl AgentRunProjection {
@@ -236,7 +249,7 @@ impl AgentRunProjection {
             depth: 1,
             metadata_source: None,
             runtime_facts: Default::default(),
-            runtime_source: None,
+            runtime_sources: Default::default(),
             control_target: None,
             available_actions: Vec::new(),
             control_source: None,
@@ -254,6 +267,21 @@ impl AgentRunProjection {
     }
 
     fn set_state(&mut self, state: AgentRunState) -> bool {
+        if state.source != AgentProjectionSource::LocalIntent
+            && matches!(
+                self.state.status,
+                AgentRunStatus::Pausing | AgentRunStatus::Resuming | AgentRunStatus::Cancelling
+            )
+            && let Some(requested_from) = self.control_requested_from
+        {
+            if state.status == requested_from.status {
+                // A poll that still reports the pre-request state is older
+                // than the pending local control operation. Keep the overlay
+                // until an authoritative transition or rejection arrives.
+                return false;
+            }
+            self.control_requested_from = None;
+        }
         if !should_accept_agent_state(self.state, state) {
             return false;
         }
@@ -263,9 +291,6 @@ impl AgentRunProjection {
             AgentRunStatus::Waiting | AgentRunStatus::Paused
         ) {
             self.attention_summary = None;
-        }
-        if state.source != AgentProjectionSource::LocalIntent {
-            self.control_requested_from = None;
         }
         self.state_observed_at = std::time::Instant::now();
         if state.status.is_terminal() {
@@ -384,15 +409,34 @@ impl AgentRunProjection {
     fn set_runtime_facts(
         &mut self,
         source: AgentProjectionSource,
-        facts: astra_thin_client::SessionRunRuntimeFacts,
+        mut facts: astra_thin_client::SessionRunRuntimeFacts,
     ) {
-        if self.runtime_source.is_some_and(|current| {
-            agent_projection_source_rank(current) > agent_projection_source_rank(source)
-        }) {
-            return;
+        fn accepts(
+            current: Option<AgentProjectionSource>,
+            incoming: AgentProjectionSource,
+        ) -> bool {
+            current.is_none_or(|current| {
+                agent_projection_source_rank(incoming) >= agent_projection_source_rank(current)
+            })
         }
-        self.runtime_source = Some(source);
-        self.runtime_facts = facts;
+
+        macro_rules! merge_fact {
+            ($field:ident) => {
+                if facts.$field.is_some() && accepts(self.runtime_sources.$field, source) {
+                    self.runtime_facts.$field = facts.$field.take();
+                    self.runtime_sources.$field = Some(source);
+                }
+            };
+        }
+        merge_fact!(runtime_profile);
+        merge_fact!(model_name);
+        merge_fact!(model_gateway);
+        merge_fact!(agent_binding_id);
+        merge_fact!(agent_binding_name);
+        merge_fact!(agent_binding_schema_version);
+        merge_fact!(capability_server_refs);
+        merge_fact!(background);
+        merge_fact!(permission);
     }
 
     fn activity_counts(
@@ -511,13 +555,15 @@ fn should_accept_agent_state(current: AgentRunState, incoming: AgentRunState) ->
         return false;
     }
     if current.status.is_terminal() {
-        // A terminal result can only be corrected by an equally or more
-        // authoritative terminal observation, or reopened by a stronger
-        // owning source (for example a durable-server repair).
+        // Confirmed terminal facts are monotonic for one immutable run id.
+        // An observed live terminal may still be corrected by an owning
+        // runtime before durable settlement (for example an interrupted live
+        // stream that the local runtime proves is still running).
         return if incoming.status.is_terminal() {
             incoming_rank >= current_rank
         } else {
-            incoming_rank > current_rank
+            current.confidence != AgentProjectionConfidence::Confirmed
+                && incoming.confidence == AgentProjectionConfidence::Confirmed
         };
     }
 
@@ -571,7 +617,7 @@ struct AgentRunSignature {
     depth: u32,
     metadata_source: Option<AgentProjectionSource>,
     runtime_facts: astra_thin_client::SessionRunRuntimeFacts,
-    runtime_source: Option<AgentProjectionSource>,
+    runtime_sources: RuntimeFactSources,
     output: Option<(usize, u64)>,
     error: Option<(usize, u64)>,
     fanout: Option<crate::tui::bottom_pane::in_flight_agents_view::AgentFanoutMembership>,
@@ -844,7 +890,7 @@ impl AgentRunRegistry {
                         depth: projection.depth,
                         metadata_source: projection.metadata_source,
                         runtime_facts: projection.runtime_facts.clone(),
-                        runtime_source: projection.runtime_source,
+                        runtime_sources: projection.runtime_sources,
                         output: agent_text_fingerprint(projection.detail.output_summary.as_deref()),
                         error: agent_text_fingerprint(projection.detail.error.as_deref()),
                         fanout: self.fanout_membership.get(id).cloned(),
@@ -875,7 +921,7 @@ fn merge_agent_projections(target: &mut AgentRunProjection, source: AgentRunProj
     let source_depth = source.depth;
     let source_metadata_source = source.metadata_source;
     let source_runtime_facts = source.runtime_facts;
-    let source_runtime_source = source.runtime_source;
+    let source_runtime_sources = source.runtime_sources;
     let source_control_target = source.control_target;
     let source_available_actions = source.available_actions;
     let source_control_source = source.control_source;
@@ -914,9 +960,24 @@ fn merge_agent_projections(target: &mut AgentRunProjection, source: AgentRunProj
             source_reported_child_agents,
         );
     }
-    if let Some(runtime_source) = source_runtime_source {
-        target.set_runtime_facts(runtime_source, source_runtime_facts);
+    macro_rules! merge_runtime_fact_from_projection {
+        ($field:ident) => {
+            if let Some(runtime_source) = source_runtime_sources.$field {
+                let mut facts = astra_thin_client::SessionRunRuntimeFacts::default();
+                facts.$field = source_runtime_facts.$field.clone();
+                target.set_runtime_facts(runtime_source, facts);
+            }
+        };
     }
+    merge_runtime_fact_from_projection!(runtime_profile);
+    merge_runtime_fact_from_projection!(model_name);
+    merge_runtime_fact_from_projection!(model_gateway);
+    merge_runtime_fact_from_projection!(agent_binding_id);
+    merge_runtime_fact_from_projection!(agent_binding_name);
+    merge_runtime_fact_from_projection!(agent_binding_schema_version);
+    merge_runtime_fact_from_projection!(capability_server_refs);
+    merge_runtime_fact_from_projection!(background);
+    merge_runtime_fact_from_projection!(permission);
 
     if let (Some(control_source), Some(control_target)) =
         (source_control_source, source_control_target)
@@ -7769,6 +7830,12 @@ mod tests {
             AgentRunState::confirmed_local(AgentRunStatus::Completed),
             "late stream terminal state must not replace the runtime terminal state"
         );
+        projection.set_state(AgentRunState::confirmed_server(AgentRunStatus::Running));
+        assert_eq!(
+            projection.state,
+            AgentRunState::confirmed_local(AgentRunStatus::Completed),
+            "a stale higher-ranked server poll must not reopen a confirmed terminal run"
+        );
 
         let mut repaired = AgentRunProjection::new(
             "agent".into(),
@@ -7788,6 +7855,62 @@ mod tests {
             AgentProjectionConfidence::Confirmed,
             "same-status live events must not erase owner confirmation"
         );
+    }
+
+    #[test]
+    fn sparse_runtime_facts_merge_per_field_without_erasing_local_evidence() {
+        let mut projection = AgentRunProjection::new(
+            "agent".into(),
+            "agent".into(),
+            AgentRunState::confirmed_local(AgentRunStatus::Running),
+        );
+        projection.set_runtime_facts(
+            AgentProjectionSource::LocalRuntime,
+            astra_thin_client::SessionRunRuntimeFacts {
+                background: Some(true),
+                permission: Some(astra_thin_client::SessionRunPermissionFacts {
+                    has_issues: true,
+                    requests: 2,
+                    approved: 1,
+                    tools_blocked: 1,
+                }),
+                ..Default::default()
+            },
+        );
+        projection.set_runtime_facts(
+            AgentProjectionSource::DurableServer,
+            astra_thin_client::SessionRunRuntimeFacts {
+                model_name: Some("gpt-5".into()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(projection.runtime_facts.background, Some(true));
+        assert!(projection.runtime_facts.permission.is_some());
+        assert_eq!(
+            projection.runtime_facts.model_name.as_deref(),
+            Some("gpt-5")
+        );
+    }
+
+    #[test]
+    fn stale_poll_does_not_clear_pending_control_overlay() {
+        let mut projection = AgentRunProjection::new(
+            "agent".into(),
+            "agent".into(),
+            AgentRunState::confirmed_server(AgentRunStatus::Running),
+        );
+        projection.available_actions = vec![astra_thin_client::SessionRunAction::Pause];
+        assert!(projection.begin_control(astra_thin_client::SessionRunAction::Pause));
+        assert_eq!(projection.state.status, AgentRunStatus::Pausing);
+
+        assert!(!projection.set_state(AgentRunState::confirmed_server(AgentRunStatus::Running)));
+        assert_eq!(projection.state.status, AgentRunStatus::Pausing);
+        assert!(projection.control_requested_from.is_some());
+
+        assert!(projection.set_state(AgentRunState::confirmed_server(AgentRunStatus::Paused)));
+        assert_eq!(projection.state.status, AgentRunStatus::Paused);
+        assert!(projection.control_requested_from.is_none());
     }
 
     #[test]

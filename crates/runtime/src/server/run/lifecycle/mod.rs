@@ -128,7 +128,7 @@ use crate::server::deployment_tool_policy::{
     apply_deployment_tool_policy, load_deployment_tool_policy,
 };
 use crate::server::model_gateway_runtime;
-use crate::server::run::engine::{RunEngine, RunStartContext};
+use crate::server::run::engine::{RunEngine, RunStartContext, TerminalTransitionOutcome};
 use crate::server::run::handlers as run_handlers;
 use crate::server::runtime_mcp;
 use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
@@ -216,7 +216,15 @@ async fn wait_for_shared_run_interaction(
                 .await,
             Ok(false)
         ) {
-            return None;
+            // Resolution and status release commit atomically, but they may
+            // become visible between the first event read and this status
+            // read. Re-read the event after observing the released status so
+            // a concurrent peer resolution cannot be mistaken for absence.
+            return run_engine
+                .load_run_interaction_event(user_id, run_id, request_id, resolved_event_type)
+                .await
+                .ok()
+                .flatten();
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -7117,12 +7125,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
-                // Schedule eviction of the terminal run from the in-memory cache.
-                // Waiting and paused runs are NOT evicted — they may still be resumed.
-                if !persisted_status.is_resumable() {
-                    Self::schedule_run_eviction(&runs, bg_run_id.clone());
-                }
-
                 let mut durable_status_committed = !persist_status_update;
                 let mut terminal_events_committed = false;
                 if !persist_terminal_events {
@@ -7140,7 +7142,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &[]
                     };
                     match run_engine
-                        .transition_terminal_status_with_events_if_current(
+                        .commit_terminal_status_with_events_if_current(
                             &bg_user_id,
                             &bg_run_id,
                             &[STATUS_RUNNING, STATUS_WAITING],
@@ -7151,7 +7153,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         )
                         .await
                     {
-                        Ok(true) => {
+                        Ok(TerminalTransitionOutcome::Committed) => {
                             durable_status_committed = true;
                             terminal_events_committed =
                                 persist_terminal_events && !terminal_events.is_empty();
@@ -7164,8 +7166,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 );
                             }
                         }
-                        Ok(false) => {
+                        Ok(TerminalTransitionOutcome::Superseded(durable)) => {
                             persist_terminal_events = false;
+                            if let Some(authoritative_status) =
+                                RunStatus::from_durable_status(&durable.status)
+                            {
+                                persisted_status = authoritative_status;
+                                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                                    run.status = authoritative_status;
+                                    run.waiting_for = durable.waiting_for.clone();
+                                    run.live_tx = None;
+                                }
+                            } else {
+                                runs.write().await.remove(&bg_run_id);
+                            }
                             record_durable_run_event_batch_metrics(
                                 bg_metrics_registry.as_ref(),
                                 "non_streaming_terminal",
@@ -7181,6 +7195,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         }
                         Err(error) => {
                             persist_terminal_events = false;
+                            // The durable result is unknown. Remove the stale
+                            // process-local projection so later reads must
+                            // reconcile from the durable authority.
+                            runs.write().await.remove(&bg_run_id);
                             record_durable_run_event_batch_metrics(
                                 bg_metrics_registry.as_ref(),
                                 "non_streaming_terminal",
@@ -7195,6 +7213,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             );
                         }
                     }
+                }
+
+                // Evict only after the durable outcome is authoritative. A
+                // lost or unknown CAS must never evict based on stale local
+                // completion.
+                if (durable_status_committed || !persist_status_update)
+                    && !persisted_status.is_resumable()
+                {
+                    Self::schedule_run_eviction(&runs, bg_run_id.clone());
                 }
                 astra_core::log_persist!(
                     run_engine
@@ -8136,11 +8163,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let mut persisted_status = final_status;
                 let mut persist_status_update = true;
                 let mut persist_streaming_events = true;
+                let mut publish_stream_terminal = true;
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
                     run.execution_live = false;
                     if run.status == RunStatus::Cancelled {
                         persist_status_update = false;
                         persist_streaming_events = false;
+                        publish_stream_terminal = false;
                         merge_cancelled_run_events(run, terminal_state_events);
                         if final_status != RunStatus::Waiting {
                             run.live_tx = None;
@@ -8184,12 +8213,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
-                // Schedule eviction of the terminal run from the in-memory cache.
-                // Waiting and paused runs are NOT evicted — they may still be resumed.
-                if !persisted_status.is_resumable() {
-                    Self::schedule_run_eviction(&runs, bg_run_id.clone());
-                }
-
                 // Record tokens consumed regardless of cancel — cancelled runs still
                 // consumed tokens and must count toward the daily budget.
                 if let Some(ref gov) = bg_resource_governor {
@@ -8216,7 +8239,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &[]
                     };
                     match run_engine
-                        .transition_terminal_status_with_events_if_current(
+                        .commit_terminal_status_with_events_if_current(
                             &bg_user_id,
                             &bg_run_id,
                             &[STATUS_RUNNING, STATUS_WAITING],
@@ -8227,7 +8250,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         )
                         .await
                     {
-                        Ok(true) => {
+                        Ok(TerminalTransitionOutcome::Committed) => {
                             durable_status_committed = true;
                             streaming_events_committed = persist_streaming_events
                                 && !streaming_events_for_durable.is_empty();
@@ -8240,8 +8263,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 );
                             }
                         }
-                        Ok(false) => {
+                        Ok(TerminalTransitionOutcome::Superseded(durable)) => {
                             persist_streaming_events = false;
+                            publish_stream_terminal = false;
+                            if let Some(authoritative_status) =
+                                RunStatus::from_durable_status(&durable.status)
+                            {
+                                persisted_status = authoritative_status;
+                                if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
+                                    run.status = authoritative_status;
+                                    run.waiting_for = durable.waiting_for.clone();
+                                    run.live_tx = None;
+                                }
+                            } else {
+                                runs.write().await.remove(&bg_run_id);
+                            }
                             record_durable_run_event_batch_metrics(
                                 bg_metrics_registry.as_ref(),
                                 "streaming_terminal",
@@ -8257,6 +8293,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         }
                         Err(error) => {
                             persist_streaming_events = false;
+                            publish_stream_terminal = false;
+                            runs.write().await.remove(&bg_run_id);
                             record_durable_run_event_batch_metrics(
                                 bg_metrics_registry.as_ref(),
                                 "streaming_terminal",
@@ -8271,6 +8309,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             );
                         }
                     }
+                }
+
+                if (durable_status_committed || !persist_status_update)
+                    && !persisted_status.is_resumable()
+                {
+                    Self::schedule_run_eviction(&runs, bg_run_id.clone());
                 }
 
                 // Persist usage unconditionally — cancelled runs still consumed tokens
@@ -8348,16 +8392,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
-                for event in streamed_final_events {
-                    if event_tx.send(event).await.is_err() {
-                        break;
+                if publish_stream_terminal {
+                    for event in streamed_final_events {
+                        if event_tx.send(event).await.is_err() {
+                            break;
+                        }
                     }
                 }
 
                 // `turn_complete` carries successful assistant reconciliation data.
                 // Failed/cancelled/waiting turns terminate via their run lifecycle
                 // event (`run_error`, `run_finished`, `run_waiting`) instead.
-                if should_emit_stream_turn_complete(&final_status) {
+                if publish_stream_terminal && should_emit_stream_turn_complete(&persisted_status) {
                     let mut completion_facts =
                         astra_turn_core::complete::TurnCompletionFacts::from_tool_signatures(
                             &state.stall.turn_sigs,
