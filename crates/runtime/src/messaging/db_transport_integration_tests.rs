@@ -7,7 +7,9 @@
 //! ASTRA_TEST_DB_URL="mysql://root:111@127.0.0.1:6001/astra_test" cargo test -p astra-runtime db_transport_integration
 //! ```
 //!
-//! If `ASTRA_TEST_DB_URL` is not set, all tests in this module are skipped.
+//! If `ASTRA_TEST_DB_URL` is not set, all tests in this module are skipped. If
+//! it is set, connection failure or timeout fails the suite: an explicitly
+//! requested online test can never silently degrade into a skip.
 
 #[cfg(test)]
 mod tests {
@@ -25,23 +27,22 @@ mod tests {
         AgentAddress::new(run, agent)
     }
 
-    /// Connect to test DB or skip the test.
+    /// Connect to the explicitly configured test DB. Absence means the online
+    /// suite was not requested; a configured but unhealthy endpoint is a real
+    /// test failure and must never be reported as a skip.
     async fn test_pool() -> Option<sqlx::Pool<sqlx::MySql>> {
         let url = match std::env::var("ASTRA_TEST_DB_URL") {
             Ok(u) => u,
             Err(_) => return None,
         };
-        match sqlx::mysql::MySqlPoolOptions::new()
+        let connect = sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(5)
             .acquire_timeout(Duration::from_secs(3))
-            .connect(&url)
-            .await
-        {
-            Ok(pool) => Some(pool),
-            Err(e) => {
-                eprintln!("⚠ DB connection failed (skipping): {e}");
-                None
-            }
+            .connect(&url);
+        match tokio::time::timeout(Duration::from_secs(5), connect).await {
+            Ok(Ok(pool)) => Some(pool),
+            Ok(Err(error)) => panic!("configured ASTRA_TEST_DB_URL is not usable: {error}"),
+            Err(_) => panic!("configured ASTRA_TEST_DB_URL did not connect within 5s"),
         }
     }
 
@@ -75,6 +76,7 @@ mod tests {
     // ── Schema ──────────────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn ensure_schema_is_idempotent() {
         skip_without_db!(pool);
         // Call twice — should not error.
@@ -83,6 +85,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn mailbox_directory_resolves_across_replicas_and_isolates_delegations() {
         skip_without_db!(pool);
         let first_replica = DatabaseTransport::new(pool.clone());
@@ -146,6 +149,7 @@ mod tests {
     // ── Direct Messages ─────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn direct_message_send_and_receive() {
         skip_without_db!(pool);
 
@@ -221,6 +225,7 @@ mod tests {
     // ── Broadcast ───────────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn broadcast_delivers_to_all_members() {
         skip_without_db!(pool);
 
@@ -281,6 +286,7 @@ mod tests {
     // ── Multiple Messages in Order ──────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn messages_arrive_in_fifo_order() {
         skip_without_db!(pool);
 
@@ -328,6 +334,7 @@ mod tests {
     // ── TTL Expiry ──────────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn expired_direct_messages_are_marked_failed() {
         skip_without_db!(pool);
 
@@ -405,6 +412,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn invalid_direct_payloads_are_marked_failed() {
         skip_without_db!(pool);
 
@@ -467,6 +475,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn direct_failure_identity_uses_message_id() {
         skip_without_db!(pool);
 
@@ -530,6 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn ack_message_requires_matching_consumer_and_clears_claim_metadata() {
         skip_without_db!(pool);
 
@@ -625,6 +635,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn nack_message_requires_matching_consumer_and_clears_claim_metadata() {
         skip_without_db!(pool);
 
@@ -702,6 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn current_claim_fetch_excludes_preexisting_claimed_rows_with_other_token() {
         skip_without_db!(pool);
 
@@ -803,6 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn expired_broadcast_messages_are_marked_failed() {
         skip_without_db!(pool);
 
@@ -870,6 +883,7 @@ mod tests {
     // ── Cleanup Utilities ───────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn cleanup_expired_removes_old_messages() {
         skip_without_db!(pool);
 
@@ -903,6 +917,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn cleanup_older_than_preserves_pending_and_claimed_messages() {
         skip_without_db!(pool);
 
@@ -1067,6 +1082,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn reclaim_stale_requeues_retryable_and_dead_letters_exhausted_messages() {
         skip_without_db!(pool);
 
@@ -1171,6 +1187,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn register_starts_cleanup_scheduler_and_reclaims_stale_claims() {
         skip_without_db!(pool);
 
@@ -1235,6 +1252,7 @@ mod tests {
     // ── Unregister stops stream ─────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn unregister_stops_poll_task() {
         skip_without_db!(pool);
 
@@ -1260,6 +1278,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn unregister_releases_claimed_rows_immediately() {
         skip_without_db!(pool);
 
@@ -1357,6 +1376,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn shutdown_releases_claimed_rows_immediately() {
         skip_without_db!(pool);
 
@@ -1456,6 +1476,7 @@ mod tests {
     // ── Subscribe requires registration ─────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn subscribe_requires_registration() {
         skip_without_db!(pool);
 
@@ -1467,6 +1488,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn shutdown_rejects_new_local_operations() {
         skip_without_db!(pool);
 
