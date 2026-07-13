@@ -423,6 +423,29 @@ fn event_matches_bridge_cache_source(
     event_source(event).is_none_or(|source| source == BRIDGE_CACHE_SOURCE)
 }
 
+/// Overlay the in-process reserve registry onto a journal-replayed baseline.
+///
+/// Within a server process the registry is strictly fresher: journal events
+/// buffer until turn end and full LLM capture is a per-request opt-in, so at
+/// round N of a turn the journal has nothing from rounds 1..N-1 while the
+/// registry has all of them. The journal wins only when it has seen more
+/// rounds — i.e. right after a server restart with capture enabled. Returns
+/// the winning source for the pressure audit log.
+fn overlay_session_reserves(
+    baseline: &mut BridgePipelineBaseline,
+    session_id: &str,
+) -> &'static str {
+    match super::session_reserves::stats_snapshot(session_id) {
+        Some(memory) if memory.turns_executed > baseline.stats.turns_executed => {
+            baseline.stats = memory;
+            "memory"
+        }
+        Some(_) => "journal",
+        None if baseline.stats.turns_executed > 0 => "journal",
+        None => "cold",
+    }
+}
+
 /// Rebuild per-session pipeline state by replaying the journal tail.
 ///
 /// The bridge has a per-request lifecycle, so this replay is its substitute
@@ -1084,6 +1107,27 @@ fn record_full_llm_response_event(
     outcome: &str,
     response: Value,
 ) {
+    // Always-on reserve learning, BEFORE any capture gating: only success
+    // payloads carry a `usage` object, and the next round's planner needs
+    // this response's tokens regardless of journaling config — tying
+    // learning to the capture opt-in is what pinned the PR559 pilot's
+    // reserves to the 500-token cold floor for entire sessions.
+    if !session_id.is_empty()
+        && let Some(usage_map) = response.get("usage").and_then(Value::as_object)
+    {
+        let parsed = crate::turn::token_usage::TokenUsage::from_partial_json_map(usage_map);
+        let parsed = if parsed.is_empty() {
+            crate::turn::token_usage::extract_usage(
+                crate::turn::token_usage::UsageDialect::for_provider(provider),
+                usage_map,
+            )
+        } else {
+            Some(parsed)
+        };
+        if let Some(usage) = parsed {
+            super::session_reserves::record_response_usage(session_id, model, &usage);
+        }
+    }
     if session_id.is_empty() || !full_llm_capture {
         return;
     }
@@ -2452,6 +2496,8 @@ impl InProcessChatTurnBridge {
             // reused below for tool-schema stabilization and cache-break
             // diagnostics, so keep this the single load per request.
             let mut bridge_pipeline_baseline = load_bridge_pipeline_baseline(&session_id);
+            let reserve_source =
+                overlay_session_reserves(&mut bridge_pipeline_baseline, &session_id);
             let pipeline_outcome = crate::turn::llm::context::assemble_bridge_context(
                 crate::turn::llm::context::BridgeContextAssemblyInput {
                     tool_surface:
@@ -2500,6 +2546,7 @@ impl InProcessChatTurnBridge {
                     raw_pressure = metrics.raw_pressure,
                     predictive_pressure = metrics.predictive_pressure,
                     output_reserve_tokens = metrics.output_reserve_tokens,
+                    reserve_source,
                     tier = ?pipeline_outcome.tier,
                     "bridge pipeline pressure"
                 );
@@ -7466,6 +7513,97 @@ mod tests {
                 .is_none(),
             "reconstructed detector state should treat the next stable turn as a hit"
         );
+    }
+
+    #[test]
+    fn response_event_records_reserves_even_with_capture_disabled() {
+        // PR559 regression, through the REAL writer path: with full LLM
+        // capture off and no turn event buffer, no journal event is written —
+        // but reserve learning must still happen, or the planner stays on the
+        // 500-token cold floor for the whole session (568/568 decisions in
+        // the 07-13 pilot). The registry write sits before both gates.
+        let session_id = "sess-writer-path-capture-off";
+        let usage_map: Map<String, Value> = serde_json::from_value(json!({
+            "input_tokens": 1_000,
+            "cached_input_tokens": 9_000,
+            "cache_creation_tokens": 0,
+            "output_tokens": 4_000
+        }))
+        .expect("usage map");
+        let trace = BridgeTraceCorrelation {
+            session_turn_source: String::new(),
+            turn_chain_id: String::new(),
+            user_query_event_id: String::new(),
+        };
+        let mut buffer = None;
+        for _ in 0..2 {
+            record_full_llm_response_event(
+                &mut buffer,
+                false,
+                session_id,
+                1,
+                &trace,
+                "bridge_inprocess",
+                "model-a",
+                "openai",
+                0,
+                "success",
+                bridge_success_response_payload("done", "", &[], &usage_map, "stop"),
+            );
+        }
+        let stats = crate::turn::bridge::session_reserves::stats_snapshot(session_id)
+            .expect("reserve registry must record despite capture being off");
+        assert_eq!(stats.turns_executed, 2);
+        let reserves = stats.response_token_estimates.reserve_for(
+            "model-a",
+            crate::turn::prompt_cache::BRIDGE_PIPELINE_QUERY_SOURCE,
+            &astra_turn_core::recovery_state::RecoveryState::default(),
+        );
+        assert_eq!(
+            reserves.output_tokens, 4_000,
+            "observed completions must reach the planner reserve without capture"
+        );
+    }
+
+    #[test]
+    fn overlay_prefers_fresher_in_memory_reserves() {
+        let session_id = "sess-overlay-memory-wins";
+        crate::turn::bridge::session_reserves::record_response_usage(
+            session_id,
+            "model-a",
+            &crate::turn::token_usage::TokenUsage {
+                input_tokens: 1_000,
+                cached_input_tokens: 9_000,
+                cache_creation_tokens: 0,
+                output_tokens: 4_000,
+            },
+        );
+        let mut baseline = BridgePipelineBaseline::default();
+        assert_eq!(
+            overlay_session_reserves(&mut baseline, session_id),
+            "memory"
+        );
+        assert_eq!(baseline.stats.turns_executed, 1);
+
+        // Journal ahead of the registry (server restart with capture on):
+        // the replayed baseline must be kept, not clobbered.
+        let mut journal_ahead = BridgePipelineBaseline::default();
+        journal_ahead.stats.turns_executed = 5;
+        assert_eq!(
+            overlay_session_reserves(&mut journal_ahead, session_id),
+            "journal"
+        );
+        assert_eq!(journal_ahead.stats.turns_executed, 5);
+    }
+
+    #[test]
+    fn overlay_reports_cold_start_when_nothing_learned() {
+        let mut baseline = BridgePipelineBaseline::default();
+        assert_eq!(
+            overlay_session_reserves(&mut baseline, "sess-overlay-cold-never-seen"),
+            "cold"
+        );
+        assert_eq!(baseline.stats.turns_executed, 0);
     }
 
     #[test]
