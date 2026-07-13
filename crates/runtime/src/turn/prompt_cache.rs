@@ -224,7 +224,17 @@ pub(crate) struct BridgePipelineOutcome {
     pub tier: astra_turn_core::compaction_types::CompactionTier,
     /// Tool schemas already pruned to `tier` by the pipeline's Optimize phase.
     pub tool_schemas: Vec<Value>,
+    /// Planner/optimizer metrics for this turn — pressure, tier, reserves.
+    /// `None` only when the pipeline aborted and the bridge fell back to an
+    /// empty system message.
+    pub metrics: Option<astra_turn_core::context_pipeline::PipelineRunMetrics>,
 }
+
+/// Stats bucket + query-source tag for bridge-originated pipeline turns.
+/// The planner reads response-token reserves under `(model_id, query_source)`,
+/// so journal-replay seeding (`load_bridge_pipeline_baseline`) must record
+/// observed responses under this same source string.
+pub(crate) const BRIDGE_PIPELINE_QUERY_SOURCE: &str = "bridge";
 
 /// Resolve the context-pipeline cache policy from the same provider+model
 /// classification used by [`PromptCacheConfig::latch`].
@@ -322,6 +332,8 @@ pub(crate) fn assemble_system_message_via_pipeline(
         "",
         "",
         "2026-05-25",
+        0,
+        None,
     );
     (
         outcome.primary_system,
@@ -355,6 +367,16 @@ pub(crate) fn assemble_system_message_via_pipeline(
 /// * `memory_entries` — per-turn Memoria retrieval results. Bound through
 ///   the Memory section (None scope), where the core binder applies rank,
 ///   deduplication, and token-budget trimming.
+/// * `estimated_input_tokens` — pre-assembly estimate of the request the
+///   bridge is about to send (conversation messages + effective tool
+///   schemas). This is the planner's `used` term: raw pressure is
+///   `estimate / model_limit`, so passing `0` pins every turn to the
+///   `Normal` tier and disables pressure-adaptive behavior entirely.
+/// * `pipeline_stats_seed` — planner-relevant stats replayed from the
+///   session journal (`load_bridge_pipeline_baseline`). Seeds the
+///   response-token reserve estimator (predictive pressure) and turn
+///   counters so the per-request session plans like the persistent one
+///   the agentic loop carries.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_bridge_pipeline_outcome(
     tool_names: &[&str],
@@ -376,6 +398,8 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     deferred_tools_block: &str,
     skill_listing_block: &str,
     current_date: &str,
+    estimated_input_tokens: u64,
+    pipeline_stats_seed: Option<astra_turn_core::pipeline_stats::PipelineStats>,
 ) -> BridgePipelineOutcome {
     use astra_turn_core::context_sources::{
         AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
@@ -504,26 +528,55 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         tool_schemas: tool_schemas.to_vec(),
         ..Default::default()
     };
+    let turn_index = pipeline_stats_seed
+        .as_ref()
+        .map_or(0, |stats| stats.turns_executed);
+    // Tripwire: a non-first bridge turn always carries conversation history,
+    // so a zero estimate means the caller's token wiring regressed and the
+    // planner is back to permanent-Normal (the PR559 pilot failure mode).
+    if estimated_input_tokens == 0 && turn_index > 0 {
+        tracing::warn!(
+            session_id = %session_id,
+            turn_index,
+            "bridge pipeline received a zero input-token estimate on a \
+             non-first turn — pressure tiers cannot engage; check \
+             request_messages wiring at the call site"
+        );
+    }
     let turn_state = TurnState {
+        // Conversation history stays in the provider messages array (the
+        // bridge client owns it); its size reaches the planner through
+        // `tokens` below, which is all pressure math consumes.
         messages: Vec::new(),
         tool_results: Vec::new(),
-        tokens: Default::default(),
+        tokens: astra_turn_core::token_accounting::TokenAccounting::from_fields(
+            estimated_input_tokens,
+            0,
+            0,
+            0,
+        ),
         active_skills: Vec::new(),
         recent_file_reads: Default::default(),
         remaining_turns: 20,
-        turn_index: 0,
+        turn_index,
         recovery: Default::default(),
         last_user_message: String::new(),
     };
     let statics = prompts::build_pipeline_static_sections();
 
-    // Ephemeral per-request session. Bridge doesn't persist a session across
-    // turns — its compaction lives elsewhere — so a fresh session per call
-    // is the right lifecycle. Stats/recovery/latches all start at default.
+    // The session object is per-request (bridge HTTP lifecycle), but its
+    // planner-relevant state is not cold: `pipeline_stats_seed` carries the
+    // journal-replayed stats (response-token reserve digests, turn counts,
+    // cache-hit EMA), so predictive pressure and tier selection behave like
+    // the persistent session the agentic loop carries. History compaction
+    // still lives with the bridge client, not here.
     let mut session = PipelineSession::new(PipelineConfig {
         provider_policy: provider_policy.clone(),
         ..crate::turn::pipeline_env::env_pipeline_config()
     });
+    if let Some(stats) = pipeline_stats_seed {
+        session.stats = stats;
+    }
     let input = AdaptiveTurnInput {
         statics: &statics,
         agent: &agent,
@@ -547,6 +600,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
                 prompt_sections: Vec::new(),
                 tier: astra_turn_core::compaction_types::CompactionTier::Normal,
                 tool_schemas: tool_schemas.to_vec(),
+                metrics: None,
             };
         }
     };
@@ -652,6 +706,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         prompt_sections: sections,
         tier,
         tool_schemas: pruned_tool_schemas,
+        metrics: Some(output.metrics),
     }
 }
 
@@ -1118,6 +1173,8 @@ mod tests {
             "",
             "",
             "2026-05-25",
+            0,
+            None,
         );
 
         // Low-pressure turn: planner stays at Normal, tool count preserved.
@@ -1139,6 +1196,125 @@ mod tests {
                 .unwrap_or(""),
             tool_schemas[0]["function"]["description"].as_str().unwrap(),
             "Normal tier must not strip description text"
+        );
+    }
+
+    #[test]
+    fn bridge_pipeline_pressure_engages_tiers_from_estimated_input() {
+        // PR559 pilot regression: the bridge passed a zeroed token estimate,
+        // so raw pressure was 0.0 on 353/353 planner decisions and no tier
+        // ever engaged. A real estimate must move raw pressure and, past the
+        // threshold, the selected tier.
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let outcome = assemble_bridge_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            &cache_cfg,
+            None,
+            "sid-pressure",
+            "gpt-4o",
+            Some(100_000),
+            "openai",
+            None,
+            None,
+            None,
+            "",
+            "",
+            "2026-05-25",
+            1_000_000,
+            None,
+        );
+        let metrics = outcome
+            .metrics
+            .expect("successful assembly must expose planner metrics");
+        assert!(
+            metrics.raw_pressure >= 1.0,
+            "estimate past the window must saturate raw pressure, got {}",
+            metrics.raw_pressure
+        );
+        assert_eq!(
+            outcome.tier,
+            astra_turn_core::compaction_types::CompactionTier::AggressivePrune,
+            "saturated pressure must escalate to the top tier"
+        );
+    }
+
+    #[test]
+    fn bridge_pipeline_seeded_stats_feed_predictive_reserve() {
+        // Journal-replayed stats must reach the planner: the response-token
+        // digest replaces the 500-token cold floor with an observed p75, and
+        // turns_executed drives the reported turn index. Without seeding the
+        // predictive and reactive arms differ by only 500 tokens of reserve —
+        // unmeasurable on a 100k+ window.
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: false,
+            is_anthropic: false,
+        };
+        let mut stats = astra_turn_core::pipeline_stats::PipelineStats::default();
+        for _ in 0..4 {
+            let feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
+                10_000, 0, 0, 40_000, false,
+            );
+            stats.response_token_estimates.record(
+                "gpt-4o",
+                BRIDGE_PIPELINE_QUERY_SOURCE,
+                &feedback,
+            );
+        }
+        stats.turns_executed = 7;
+        let outcome = assemble_bridge_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            &cache_cfg,
+            None,
+            "sid-reserve",
+            "gpt-4o",
+            Some(100_000),
+            "openai",
+            None,
+            None,
+            None,
+            "",
+            "",
+            "2026-05-25",
+            50_000,
+            Some(stats),
+        );
+        let metrics = outcome
+            .metrics
+            .expect("successful assembly must expose planner metrics");
+        assert!(
+            metrics.raw_pressure > 0.0,
+            "estimated input must produce nonzero raw pressure"
+        );
+        assert_eq!(
+            metrics.output_reserve_tokens, 40_000,
+            "seeded p75 completion history must replace the cold floor"
+        );
+        assert!(
+            metrics.predictive_pressure > metrics.raw_pressure,
+            "reserve must widen predictive over raw"
+        );
+        assert_eq!(
+            metrics.turn_index, 7,
+            "turn index must follow seeded turns_executed"
         );
     }
 
@@ -1187,6 +1363,8 @@ mod tests {
             "",
             "",
             "2026-05-25",
+            0,
+            None,
         );
         let trace_text = outcome
             .prompt_sections
@@ -1253,6 +1431,8 @@ mod tests {
             "",
             "",
             "2026-05-25",
+            0,
+            None,
         );
 
         let dynamic_text = outcome
@@ -1303,6 +1483,8 @@ mod tests {
             "",
             "",
             "2026-05-25",
+            0,
+            None,
         );
 
         let primary_text = outcome
@@ -1360,6 +1542,8 @@ mod tests {
             "",
             "",
             "2026-05-25",
+            0,
+            None,
         );
 
         let primary_text = outcome
@@ -1419,6 +1603,8 @@ mod tests {
             "",
             "",
             "2026-05-25",
+            0,
+            None,
         );
 
         let primary_text = outcome
@@ -1480,6 +1666,8 @@ mod tests {
                 "",
                 "",
                 "2026-07-10",
+                0,
+                None,
             )
         };
 
@@ -1524,6 +1712,8 @@ mod tests {
             "<deferred-tools>\ngithub\n</deferred-tools>",
             "",
             "2026-05-25",
+            0,
+            None,
         );
 
         let primary_text = outcome
@@ -1580,6 +1770,8 @@ mod tests {
             "",
             "",
             "2026-05-25",
+            0,
+            None,
         );
 
         let primary_text = outcome
@@ -2129,6 +2321,8 @@ mod tests {
             "",
             "",
             "2026-05-25",
+            0,
+            None,
         );
 
         // Marker-style capability keeps model identity outside the

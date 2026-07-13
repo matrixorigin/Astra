@@ -423,6 +423,15 @@ fn event_matches_bridge_cache_source(
     event_source(event).is_none_or(|source| source == BRIDGE_CACHE_SOURCE)
 }
 
+/// Rebuild per-session pipeline state by replaying the journal tail.
+///
+/// The bridge has a per-request lifecycle, so this replay is its substitute
+/// for the persistent `PipelineSession` the agentic loop carries: cache-hit
+/// ratios and turn counts feed diagnostics, and the response-token reserve
+/// digest feeds the planner's predictive pressure (via
+/// `BridgeContextAssemblyInput::pipeline_stats_seed`). Reads at most the
+/// last 500 events, so digests reflect the recent tail of very long
+/// sessions — acceptable for percentile reserves.
 fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     if session_id.is_empty() {
         return BridgePipelineBaseline {
@@ -452,7 +461,9 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     #[cfg(test)]
     let mut max_turn = 0u32;
     let mut pending_request_snapshot = None;
+    let mut pending_request_model: Option<String> = None;
     let mut last_tool_schemas = Vec::new();
+    let mut stats = astra_turn_core::pipeline_stats::PipelineStats::default();
 
     for event in events {
         #[cfg(test)]
@@ -478,6 +489,12 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
                     last_tool_schemas = tools;
                 }
                 pending_request_snapshot = bridge_prompt_snapshot_from_journal_event(&event);
+                pending_request_model = event
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
             }
             astra_services::session_journal::JournalEventType::LlmResponseFull => {
                 if !event_matches_bridge_cache_source(&event) {
@@ -495,6 +512,35 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
                         .saturating_add(usage.cache_creation_tokens);
                     if total_input > 0 {
                         raw_ratios.push(usage.cached_input_tokens as f64 / total_input as f64);
+                    }
+                    // Seed the planner's response-token reserve digest with
+                    // this session's observed completions, bucketed under the
+                    // same (model, query_source) key the bridge planner reads.
+                    // Without this, predictive pressure stays at the 500-token
+                    // cold floor for the whole session.
+                    let response_model = event
+                        .metadata
+                        .as_ref()
+                        .and_then(|meta| meta.get("model"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| pending_request_model.clone());
+                    if let Some(model) = response_model
+                        && usage.output_tokens > 0
+                    {
+                        let feedback =
+                            astra_turn_core::context_feedback::ContextFeedback::from_usage(
+                                usage.input_tokens,
+                                usage.cached_input_tokens,
+                                usage.cache_creation_tokens,
+                                usage.output_tokens,
+                                false,
+                            );
+                        stats.response_token_estimates.record(
+                            &model,
+                            crate::turn::prompt_cache::BRIDGE_PIPELINE_QUERY_SOURCE,
+                            &feedback,
+                        );
                     }
                 }
                 if let Some(snapshot) = pending_request_snapshot.take() {
@@ -520,14 +566,13 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
         ratios.iter().sum::<f64>() / ratios.len() as f64
     };
 
+    stats.turns_executed = ratios.len() as u32;
+    stats.avg_cache_hit_ratio = avg_cache_hit_ratio;
+
     BridgePipelineBaseline {
         #[cfg(test)]
         next_turn: max_turn.max(response_count).saturating_add(1),
-        stats: astra_turn_core::pipeline_stats::PipelineStats {
-            turns_executed: ratios.len() as u32,
-            avg_cache_hit_ratio,
-            ..Default::default()
-        },
+        stats,
         cache_detector,
         last_tool_schemas,
     }
@@ -2401,6 +2446,12 @@ impl InProcessChatTurnBridge {
             } else {
                 None
             };
+            // Journal-replayed pipeline state, loaded BEFORE assembly so the
+            // planner sees this session's history: response-token reserves
+            // (predictive pressure), turn counts, and cache-hit ratios. Also
+            // reused below for tool-schema stabilization and cache-break
+            // diagnostics, so keep this the single load per request.
+            let mut bridge_pipeline_baseline = load_bridge_pipeline_baseline(&session_id);
             let pipeline_outcome = crate::turn::llm::context::assemble_bridge_context(
                 crate::turn::llm::context::BridgeContextAssemblyInput {
                     tool_surface:
@@ -2432,8 +2483,27 @@ impl InProcessChatTurnBridge {
                     )
                     .with_context_window(model_context_window)
                     .with_skill_listing_block(skill_listing_hint_text.as_deref().unwrap_or("")),
+                    request_messages: &messages,
+                    pipeline_stats_seed: Some(bridge_pipeline_baseline.stats.clone()),
                 },
             );
+            // Per-call pressure trace: the greppable ground truth that tier
+            // selection is operating on real inputs (the PR559 pilot showed
+            // 353/353 decisions at raw_pressure=0.0 because the estimate was
+            // never wired).
+            if let Some(metrics) = pipeline_outcome.metrics.as_ref() {
+                tracing::info!(
+                    target: "astra_runtime::turn::bridge",
+                    session_id = %session_id,
+                    turn_index = metrics.turn_index,
+                    input_tokens = metrics.input_tokens,
+                    raw_pressure = metrics.raw_pressure,
+                    predictive_pressure = metrics.predictive_pressure,
+                    output_reserve_tokens = metrics.output_reserve_tokens,
+                    tier = ?pipeline_outcome.tier,
+                    "bridge pipeline pressure"
+                );
+            }
             let mut system_msg = pipeline_outcome.primary_system;
             let mut dynamic_msg = pipeline_outcome.dynamic_system;
             let mut prompt_sections = pipeline_outcome.prompt_sections;
@@ -2576,6 +2646,10 @@ impl InProcessChatTurnBridge {
                                         .with_skill_listing_block(
                                             skill_listing_hint_text.as_deref().unwrap_or(""),
                                         ),
+                                    request_messages: &messages,
+                                    pipeline_stats_seed: Some(
+                                        bridge_pipeline_baseline.stats.clone(),
+                                    ),
                                 },
                             )
                         },
@@ -2653,8 +2727,6 @@ impl InProcessChatTurnBridge {
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
             let mut last_measured_prompt: Option<u64> = None;
-            let mut bridge_pipeline_baseline = load_bridge_pipeline_baseline(&session_id);
-
 
             // Single LLM call per HTTP request (no multi-round tool loop).
             let round_ix = 0i64;
@@ -7393,6 +7465,91 @@ mod tests {
                 .record_turn_for_source(BRIDGE_CACHE_SOURCE, current, Some(500))
                 .is_none(),
             "reconstructed detector state should treat the next stable turn as a hit"
+        );
+    }
+
+    #[test]
+    fn load_bridge_pipeline_baseline_seeds_response_token_reserves() {
+        // PR559 pilot follow-up: the replayed baseline must carry observed
+        // completion sizes into the planner's reserve digest, keyed under the
+        // same (model, query_source) bucket the bridge planner reads —
+        // otherwise predictive pressure never leaves the 500-token cold floor
+        // and the Predictive/Reactive arms are indistinguishable.
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "00000000-0000-0000-0000-000000000189";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id)
+            .expect("journal writer");
+
+        let request_metadata = json!({
+            "model": "test-model",
+            "provider": "openai",
+            "request": {
+                "messages": [
+                    {"role": "system", "content": "stable prompt"},
+                    {"role": "user", "content": "ping"}
+                ],
+                "tools": []
+            }
+        });
+        let response_metadata = |output_tokens: u64| {
+            json!({
+                "provider": "openai",
+                "response": {
+                    "response": {
+                        "usage": {
+                            "input_tokens": 1_000,
+                            "cached_input_tokens": 9_000,
+                            "cache_creation_tokens": 0,
+                            "output_tokens": output_tokens
+                        }
+                    }
+                }
+            })
+        };
+
+        for (turn, output_tokens) in [(1, 4_000u64), (2, 4_000), (3, 4_000), (4, 1_000)] {
+            writer
+                .append(
+                    &astra_services::session_journal::JournalEvent::llm_request_full(
+                        Some(session_id),
+                        turn,
+                        0,
+                        request_metadata.clone(),
+                    ),
+                )
+                .unwrap();
+            writer
+                .append(
+                    &astra_services::session_journal::JournalEvent::llm_response_full(
+                        Some(session_id),
+                        turn,
+                        0,
+                        response_metadata(output_tokens),
+                    ),
+                )
+                .unwrap();
+        }
+
+        let baseline = load_bridge_pipeline_baseline(session_id);
+        assert_eq!(baseline.stats.turns_executed, 4);
+        let reserves = baseline.stats.response_token_estimates.reserve_for(
+            "test-model",
+            crate::turn::prompt_cache::BRIDGE_PIPELINE_QUERY_SOURCE,
+            &astra_turn_core::recovery_state::RecoveryState::default(),
+        );
+        assert_eq!(
+            reserves.output_tokens, 4_000,
+            "p75 of replayed completions must reach the planner reserve"
+        );
+        let cold = baseline.stats.response_token_estimates.reserve_for(
+            "other-model",
+            crate::turn::prompt_cache::BRIDGE_PIPELINE_QUERY_SOURCE,
+            &astra_turn_core::recovery_state::RecoveryState::default(),
+        );
+        assert_eq!(
+            cold.output_tokens, 500,
+            "unseen model buckets must stay on the cold floor"
         );
     }
 

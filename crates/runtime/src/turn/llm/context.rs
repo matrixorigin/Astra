@@ -436,6 +436,15 @@ pub(crate) struct BridgeContextAssemblyInput<'a> {
     pub tool_surface: ToolSurfacePlan<'a>,
     pub runtime_signals: BridgeRuntimeSignals<'a>,
     pub session: BridgeSessionContextInput<'a>,
+    /// Conversation messages of the request being assembled. Only their token
+    /// estimate reaches the pipeline (history itself stays in the provider
+    /// messages array), but without it the planner sees `used = 0` and
+    /// pressure tiers never engage (PR559 pilot failure mode).
+    pub request_messages: &'a [Value],
+    /// Planner-relevant stats replayed from the session journal
+    /// (`load_bridge_pipeline_baseline`). Seeds response-token reserves and
+    /// turn counters for the per-request pipeline session.
+    pub pipeline_stats_seed: Option<astra_turn_core::pipeline_stats::PipelineStats>,
 }
 
 fn tool_name(schema: &Value) -> Option<&str> {
@@ -588,6 +597,9 @@ pub(crate) struct BridgeContextAssemblyOutput {
     pub tier: astra_turn_core::compaction_types::CompactionTier,
     pub tool_schemas: Vec<Value>,
     pub manifest_trace: LlmContextManifestTrace,
+    /// Planner/optimizer metrics for this turn (pressure, tier, reserves).
+    /// `None` only when the pipeline aborted.
+    pub metrics: Option<astra_turn_core::context_pipeline::PipelineRunMetrics>,
 }
 
 /// Input for the final wire-message stitching phase.
@@ -801,6 +813,22 @@ pub(crate) fn assemble_bridge_context(
         input.tool_surface.required_tools.len(),
         input.tool_surface.restricted_tools.len(),
     );
+    // Pre-assembly `used` estimate for pressure planning: the conversation
+    // we are about to send plus the effective tool schemas. The system
+    // prompt is excluded (it does not exist until the pipeline assembles
+    // it), which under-counts by a few percent of the window — conservative
+    // in the safe direction for tier selection.
+    let estimated_input_tokens = input
+        .request_messages
+        .iter()
+        .map(estimate_json_tokens_u64)
+        .sum::<u64>()
+        .saturating_add(
+            effective_tool_schemas
+                .iter()
+                .map(estimate_json_tokens_u64)
+                .sum::<u64>(),
+        );
     let outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
         &effective_tool_names,
         &effective_tool_schemas,
@@ -821,6 +849,8 @@ pub(crate) fn assemble_bridge_context(
         input.tool_surface.deferred_tools_block,
         input.session.skill_listing_block,
         input.session.current_date,
+        estimated_input_tokens,
+        input.pipeline_stats_seed,
     );
     let system_prompt_tokens = estimate_json_tokens(&outcome.primary_system).saturating_add(
         outcome
@@ -847,6 +877,7 @@ pub(crate) fn assemble_bridge_context(
         prompt_sections: outcome.prompt_sections,
         tier: outcome.tier,
         tool_schemas: outcome.tool_schemas,
+        metrics: outcome.metrics,
         manifest_trace: LlmContextManifestTrace {
             source: "llm_context_bridge",
             provider: input.session.provider.to_string(),
@@ -2103,6 +2134,8 @@ mod context_cache_contract_tests {
                 "2026-07-01",
             )
             .with_context_window(Some(1_000_000)),
+            request_messages: &[],
+            pipeline_stats_seed: None,
         });
 
         assert_eq!(
