@@ -1,5 +1,6 @@
-//! End-to-end: §5.5 HTTP handlers write into the same ledger the bridge consumes, keys match
-//! [`astra_turn_core::edge_ledger`], and `take_ledger_entry` removes rows.
+//! End-to-end: §5.5 HTTP callbacks enforce their durable interaction
+//! contracts, while tool-result callbacks still use the same same-pod ledger
+//! consumed by the bridge.
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -7,19 +8,14 @@ use std::time::Duration;
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
-    turn::cloud_tool_delivery::{
-        ApprovalAuditContext, EdgeToolDeliveryRequest,
-        deliver_tool_calls_through_edge_ledger_with_approval_audit, wait_approval_ledger_for_tool,
-    },
-    turn::edge_ledger::{
-        LEDGER_MAX_ENTRIES, approval_callback_key, take_ledger_entry, tool_callback_key,
-    },
+    turn::edge_ledger::{LEDGER_MAX_ENTRIES, take_ledger_entry, tool_callback_key},
 };
 use astra_services::multi_agent::EdgeDispatchIdentity;
-use astra_services::session_journal::{
-    JournalDirGuard, JournalEventType, find_latest_approval_decision_for_run, read_journal,
+use astra_services::runs::{
+    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunInteractionKind,
+    DurableRunInteractionResolveOutcome, RunLifecycleService, RunListCursor, RunListRecord,
+    RunStatusRecord,
 };
-use astra_turn_core::contracts::{TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter};
 use async_trait::async_trait;
 use axum::{
     Router, body,
@@ -105,39 +101,210 @@ impl AuthService for E2eAuth {
     }
 }
 
-#[derive(Clone, Default)]
-struct RecordingAuxiliaryEventWriter {
-    events: Arc<StdMutex<Vec<TurnAuxiliaryEventRecord>>>,
-}
-
-#[async_trait]
-impl TurnAuxiliaryEventWriter for RecordingAuxiliaryEventWriter {
-    async fn persist_events(&self, events: Vec<TurnAuxiliaryEventRecord>) -> Result<(), String> {
-        self.events.lock().unwrap().extend(events);
-        Ok(())
-    }
-}
-
-fn approval_audit(session_id: &str, run_id: &str) -> ApprovalAuditContext {
-    ApprovalAuditContext {
-        user_id: "e2e-user".to_string(),
-        session_id: session_id.to_string(),
-        run_id: run_id.to_string(),
-        turn: 3,
-        agent_id: None,
-        parent_event_id: None,
-        parent_event_ids: Vec::new(),
-        causal_chain_id: format!("chain-{run_id}"),
-        auxiliary_event_writer: Arc::new(RecordingAuxiliaryEventWriter::default()),
-    }
-}
-
 fn e2e_app() -> (
     Router,
     Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
 ) {
     let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(E2eAuth));
+    let ledger = state.edge_callback_ledger();
+    let app = build_app(state);
+    (app, ledger)
+}
+
+#[derive(Clone, Default)]
+struct E2eRunLifecycle {
+    runs: Arc<StdMutex<std::collections::HashMap<String, String>>>,
+    required: Arc<StdMutex<std::collections::HashMap<(String, String), serde_json::Value>>>,
+    resolved: Arc<StdMutex<std::collections::HashMap<(String, String), serde_json::Value>>>,
+}
+
+impl E2eRunLifecycle {
+    fn add_approval_required(&self, session_id: &str, run_id: &str, request_id: &str) {
+        self.add_approval_required_with_tool(
+            session_id,
+            run_id,
+            request_id,
+            "write_file",
+            "standard",
+        );
+    }
+
+    fn add_approval_required_with_tool(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        request_id: &str,
+        tool: &str,
+        approval_kind: &str,
+    ) {
+        self.runs
+            .lock()
+            .unwrap()
+            .insert(run_id.to_string(), session_id.to_string());
+        self.required.lock().unwrap().insert(
+            (run_id.to_string(), request_id.to_string()),
+            json!({
+                "event_type": "approval_required",
+                "data": {
+                    "request_id": request_id,
+                    "tool": tool,
+                    "approval_kind": approval_kind,
+                }
+            }),
+        );
+    }
+
+    fn resolved(&self, run_id: &str, request_id: &str) -> Option<serde_json::Value> {
+        self.resolved
+            .lock()
+            .unwrap()
+            .get(&(run_id.to_string(), request_id.to_string()))
+            .cloned()
+    }
+
+    fn resolved_count(&self) -> usize {
+        self.resolved.lock().unwrap().len()
+    }
+}
+
+#[async_trait]
+impl RunLifecycleService for E2eRunLifecycle {
+    async fn create_run(
+        &self,
+        _user_id: String,
+        _request: ChatRequestData,
+    ) -> Result<ChatRunRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!("approval callback e2e only resolves an existing run")
+    }
+
+    async fn stream_chat(
+        &self,
+        _user_id: String,
+        _request: ChatRequestData,
+    ) -> Result<ChatStreamRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!("approval callback e2e only resolves an existing run")
+    }
+
+    async fn get_run_status(
+        &self,
+        run_id: String,
+        user_id: String,
+    ) -> Result<RunStatusRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        if user_id != "e2e-user" {
+            return Err((
+                StatusCode::NOT_FOUND,
+                axum::Json(ErrorResponse::new("run not found")),
+            ));
+        }
+        let Some(session_id) = self.runs.lock().unwrap().get(&run_id).cloned() else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                axum::Json(ErrorResponse::new("run not found")),
+            ));
+        };
+        Ok(RunStatusRecord {
+            run_id,
+            session_id,
+            status: "waiting".into(),
+            waiting_for: Some("tool_approval".into()),
+            events_count: 1,
+            workspace: None,
+            executor: None,
+            transport: None,
+        })
+    }
+
+    async fn get_run_interaction_event(
+        &self,
+        run_id: String,
+        user_id: String,
+        request_id: String,
+        event_type: String,
+    ) -> Result<Option<serde_json::Value>, (StatusCode, axum::Json<ErrorResponse>)> {
+        if user_id != "e2e-user" || event_type != "approval_required" {
+            return Ok(None);
+        }
+        Ok(self
+            .required
+            .lock()
+            .unwrap()
+            .get(&(run_id, request_id))
+            .cloned())
+    }
+
+    async fn resolve_run_interaction(
+        &self,
+        run_id: String,
+        user_id: String,
+        request_id: String,
+        kind: DurableRunInteractionKind,
+        response_data: serde_json::Value,
+    ) -> Result<DurableRunInteractionResolveOutcome, (StatusCode, axum::Json<ErrorResponse>)> {
+        if user_id != "e2e-user" || kind != DurableRunInteractionKind::Approval {
+            return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
+        }
+        if !self
+            .required
+            .lock()
+            .unwrap()
+            .contains_key(&(run_id.clone(), request_id.clone()))
+        {
+            return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
+        }
+        let key = (run_id, request_id);
+        let mut resolved = self.resolved.lock().unwrap();
+        if let Some(existing) = resolved.get(&key) {
+            return Ok(if existing.get("data") == Some(&response_data) {
+                DurableRunInteractionResolveOutcome::Idempotent(existing.clone())
+            } else {
+                DurableRunInteractionResolveOutcome::Conflict(existing.clone())
+            });
+        }
+        let event = json!({
+            "event_type": kind.resolved_event_type(),
+            "data": response_data,
+        });
+        resolved.insert(key, event.clone());
+        Ok(DurableRunInteractionResolveOutcome::Resolved(event))
+    }
+
+    async fn stream_run(
+        &self,
+        _run_id: String,
+        _user_id: String,
+        _last_index: u32,
+    ) -> Result<Vec<serde_json::Value>, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!("approval callback e2e does not stream runs")
+    }
+
+    async fn cancel_run(
+        &self,
+        _run_id: String,
+        _user_id: String,
+    ) -> Result<CancelRunRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!("approval callback e2e does not cancel runs")
+    }
+
+    async fn list_runs_cursor(
+        &self,
+        _user_id: String,
+        _limit: u32,
+        _cursor: Option<RunListCursor>,
+    ) -> Result<RunListRecord, (StatusCode, axum::Json<ErrorResponse>)> {
+        unreachable!("approval callback e2e does not list runs")
+    }
+}
+
+fn e2e_app_with_lifecycle(
+    lifecycle: Arc<E2eRunLifecycle>,
+) -> (
+    Router,
+    Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+) {
+    let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+        .with_auth_service(Arc::new(E2eAuth))
+        .with_run_lifecycle_service(lifecycle);
     let ledger = state.edge_callback_ledger();
     let app = build_app(state);
     (app, ledger)
@@ -165,14 +332,6 @@ async fn post_json(
         .unwrap();
     let json = serde_json::from_slice(&bytes).unwrap_or(json!({}));
     (status, json)
-}
-
-fn write_tool_call(id: &str) -> serde_json::Value {
-    json!({
-        "id": id,
-        "type": "function",
-        "function": {"name": "write_file", "arguments": r#"{"path":"z.rs","content":"1"}"#}
-    })
 }
 
 fn scoped_tool_identity(
@@ -243,9 +402,10 @@ async fn post_tools_result_populates_ledger_then_take_consumes() {
 }
 
 #[tokio::test]
-async fn post_approval_respond_populates_ledger_then_take_consumes() {
-    let (app, ledger) = e2e_app();
-    let key = approval_callback_key("e2e-user", "sess-ledger", "run-ledger", "ap-9");
+async fn post_approval_respond_resolves_durable_interaction_without_local_ledger() {
+    let lifecycle = Arc::new(E2eRunLifecycle::default());
+    lifecycle.add_approval_required("sess-ledger", "run-ledger", "ap-9");
+    let (app, ledger) = e2e_app_with_lifecycle(Arc::clone(&lifecycle));
     let (st, j) = post_json(
         app.clone(),
         "/approval/respond",
@@ -259,18 +419,22 @@ async fn post_approval_respond_populates_ledger_then_take_consumes() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(j["ok"], true);
-    assert!(ledger.lock().await.contains_key(&key));
-    let got = take_ledger_entry(&ledger, &key, Duration::from_millis(200))
-        .await
-        .expect("row present");
-    assert_eq!(got["kind"], "approval_respond");
+    assert_eq!(j["durable"], true);
+    assert!(ledger.lock().await.is_empty());
+    let resolved = lifecycle
+        .resolved("run-ledger", "ap-9")
+        .expect("durable approval resolved");
+    assert_eq!(resolved["event_type"], "approval_resolved");
+    assert_eq!(resolved["data"]["decision"], "allow");
+    assert_eq!(resolved["data"]["tool"], "write_file");
+    assert_eq!(resolved["data"]["approval_kind"], "standard");
 }
 
 #[tokio::test]
-async fn post_approval_respond_journals_when_ledger_is_full() {
-    let temp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(temp.path());
-    let (app, ledger) = e2e_app();
+async fn post_approval_respond_is_not_blocked_by_full_local_ledger() {
+    let lifecycle = Arc::new(E2eRunLifecycle::default());
+    lifecycle.add_approval_required("sess-approval", "run-approval", "ap-overflow");
+    let (app, ledger) = e2e_app_with_lifecycle(Arc::clone(&lifecycle));
     {
         let mut guard = ledger.lock().await;
         for idx in 0..LEDGER_MAX_ENTRIES {
@@ -278,7 +442,6 @@ async fn post_approval_respond_journals_when_ledger_is_full() {
         }
     }
 
-    let key = approval_callback_key("e2e-user", "sess-approval", "run-approval", "ap-overflow");
     let (st, j) = post_json(
         app.clone(),
         "/approval/respond",
@@ -295,27 +458,21 @@ async fn post_approval_respond_journals_when_ledger_is_full() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(j["ok"], true);
-    assert_eq!(j["ledger_enqueued"], false);
-    assert!(!ledger.lock().await.contains_key(&key));
+    assert_eq!(j["durable"], true);
     assert_eq!(ledger.lock().await.len(), LEDGER_MAX_ENTRIES);
-
-    let found =
-        find_latest_approval_decision_for_run("sess-approval", "ap-overflow", "run-approval")
-            .unwrap()
-            .expect("journal decision");
-    assert_eq!(found.run_id.as_deref(), Some("run-approval"));
-    assert_eq!(found.decision, "deny");
-    assert_eq!(found.reason.as_deref(), Some("policy"));
-    assert_eq!(found.tool_name.as_deref(), Some("write_file"));
-    assert_eq!(found.approval_kind.as_deref(), Some("standard"));
+    let resolved = lifecycle
+        .resolved("run-approval", "ap-overflow")
+        .expect("durable approval resolved despite local ledger capacity");
+    assert_eq!(resolved["data"]["decision"], "deny");
+    assert_eq!(resolved["data"]["reason"], "policy");
 }
 
 #[tokio::test]
-async fn approval_callback_on_other_appstate_replays_from_journal_without_sticky_ledger() {
-    let temp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(temp.path());
-    let (callback_app, callback_ledger) = e2e_app();
-    let (_waiter_app, waiter_ledger) = e2e_app();
+async fn approval_callback_on_other_appstate_uses_shared_lifecycle_without_sticky_ledger() {
+    let lifecycle = Arc::new(E2eRunLifecycle::default());
+    lifecycle.add_approval_required("sess-no-sticky", "run-no-sticky", "ap-no-sticky");
+    let (callback_app, callback_ledger) = e2e_app_with_lifecycle(Arc::clone(&lifecycle));
+    let (other_app, other_ledger) = e2e_app_with_lifecycle(Arc::clone(&lifecycle));
 
     let (st, j) = post_json(
         callback_app,
@@ -333,62 +490,40 @@ async fn approval_callback_on_other_appstate_replays_from_journal_without_sticky
     .await;
     assert_eq!(st, StatusCode::OK, "callback pod approval response: {j:?}");
     assert_eq!(j["ok"], true);
-    assert!(
-        callback_ledger
-            .lock()
-            .await
-            .contains_key(&approval_callback_key(
-                "e2e-user",
-                "sess-no-sticky",
-                "run-no-sticky",
-                "ap-no-sticky"
-            )),
-        "callback pod may keep its same-pod fast-path ledger entry"
-    );
-    assert!(
-        waiter_ledger.lock().await.is_empty(),
-        "waiter pod intentionally has no same-pod ledger entry"
-    );
+    assert!(callback_ledger.lock().await.is_empty());
+    assert!(other_ledger.lock().await.is_empty());
 
-    let aux_writer = RecordingAuxiliaryEventWriter::default();
-    let recorded_events = Arc::clone(&aux_writer.events);
-    let audit = ApprovalAuditContext {
-        user_id: "e2e-user".to_string(),
-        session_id: "sess-no-sticky".to_string(),
-        run_id: "run-no-sticky".to_string(),
-        turn: 3,
-        agent_id: None,
-        parent_event_id: None,
-        parent_event_ids: Vec::new(),
-        causal_chain_id: "chain-no-sticky".to_string(),
-        auxiliary_event_writer: Arc::new(aux_writer),
-    };
-
-    wait_approval_ledger_for_tool(
-        &waiter_ledger,
-        "e2e-user",
-        &write_tool_call("ap-no-sticky"),
-        Duration::from_millis(200),
-        Some(&audit),
+    let (idempotent_status, idempotent_body) = post_json(
+        other_app,
+        "/approval/respond",
+        json!({
+            "request_id": "ap-no-sticky",
+            "decision": "allow",
+            "reason": "approved on callback pod",
+            "session_id": "sess-no-sticky",
+            "run_id": "run-no-sticky",
+            "tool_name": "write_file",
+            "approval_kind": "standard"
+        }),
     )
-    .await
-    .expect("waiter pod should replay approval decision from journal without sticky ledger");
-
-    assert!(waiter_ledger.lock().await.is_empty());
-    let events = recorded_events.lock().unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].event_type, "approval_decision");
-    let metadata = events[0].metadata.as_ref().expect("approval metadata");
-    assert_eq!(metadata["outcome_source"].as_str(), Some("journal"));
-    assert_eq!(metadata["decision"].as_str(), Some("allow"));
-    assert_eq!(metadata["run_id"].as_str(), Some("run-no-sticky"));
+    .await;
+    assert_eq!(
+        idempotent_status,
+        StatusCode::OK,
+        "shared durable state should make duplicate callback idempotent: {idempotent_body:?}"
+    );
+    assert_eq!(lifecycle.resolved_count(), 1);
 }
 
 #[test]
-fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
-    let temp = tempfile::tempdir().unwrap();
-    let journal_dir = temp.path().to_path_buf();
-    let (app, ledger) = e2e_app();
+fn concurrent_duplicate_approval_responses_resolve_once_durably() {
+    let lifecycle = Arc::new(E2eRunLifecycle::default());
+    lifecycle.add_approval_required(
+        "sess-concurrent-dup",
+        "run-concurrent-dup",
+        "ap-concurrent-dup",
+    );
+    let (app, ledger) = e2e_app_with_lifecycle(Arc::clone(&lifecycle));
     let payload = json!({
         "request_id": "ap-concurrent-dup",
         "decision": "allow",
@@ -401,10 +536,8 @@ fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
 
     std::thread::scope(|scope| {
         let first_app = app.clone();
-        let first_dir = journal_dir.clone();
         let first_payload = payload.clone();
         let first = scope.spawn(move || {
-            let _guard = JournalDirGuard::new(&first_dir);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -413,10 +546,8 @@ fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
         });
 
         let second_app = app.clone();
-        let second_dir = journal_dir.clone();
         let second_payload = payload.clone();
         let second = scope.spawn(move || {
-            let _guard = JournalDirGuard::new(&second_dir);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -444,40 +575,8 @@ fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
         );
     });
 
-    let _guard = JournalDirGuard::new(&journal_dir);
-    let approval_decisions = read_journal("sess-concurrent-dup")
-        .unwrap()
-        .into_iter()
-        .filter(|event| event.event_type == JournalEventType::ApprovalDecision)
-        .filter(|event| {
-            event
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("approval"))
-                .and_then(|approval| approval.get("request_id"))
-                .and_then(|request_id| request_id.as_str())
-                == Some("ap-concurrent-dup")
-                && event
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get("approval"))
-                    .and_then(|approval| approval.get("run_id"))
-                    .and_then(|run_id| run_id.as_str())
-                    == Some("run-concurrent-dup")
-        })
-        .count();
-    assert_eq!(
-        approval_decisions, 1,
-        "concurrent duplicate approvals should record one approval decision"
-    );
-
-    let key = approval_callback_key(
-        "e2e-user",
-        "sess-concurrent-dup",
-        "run-concurrent-dup",
-        "ap-concurrent-dup",
-    );
-    assert!(ledger.blocking_lock().contains_key(&key));
+    assert_eq!(lifecycle.resolved_count(), 1);
+    assert!(ledger.blocking_lock().is_empty());
 }
 
 /// Complement of the identical-payload idempotency test above: when two
@@ -486,9 +585,9 @@ fn concurrent_duplicate_approval_responses_record_one_journal_decision() {
 /// delayed/malicious replay cannot flip an already-recorded decision.
 #[tokio::test]
 async fn distinct_payload_duplicate_approval_second_is_409_conflict() {
-    let temp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(temp.path());
-    let (app, ledger) = e2e_app();
+    let lifecycle = Arc::new(E2eRunLifecycle::default());
+    lifecycle.add_approval_required("sess-conflict", "run-conflict", "ap-conflict");
+    let (app, ledger) = e2e_app_with_lifecycle(Arc::clone(&lifecycle));
 
     let (st1, j1) = post_json(
         app.clone(),
@@ -527,17 +626,14 @@ async fn distinct_payload_duplicate_approval_second_is_409_conflict() {
         "distinct-payload duplicate must return 409: {j2:?}"
     );
 
-    let key = approval_callback_key("e2e-user", "sess-conflict", "run-conflict", "ap-conflict");
-    let stored = ledger
-        .lock()
-        .await
-        .get(&key)
-        .cloned()
+    let stored = lifecycle
+        .resolved("run-conflict", "ap-conflict")
         .expect("first approval stored");
     assert_eq!(
-        stored["body"]["decision"], "allow",
-        "original ledger value must not be overwritten: {stored:?}"
+        stored["data"]["decision"], "allow",
+        "original durable decision must not be overwritten: {stored:?}"
     );
+    assert!(ledger.lock().await.is_empty());
 }
 
 #[tokio::test]
@@ -575,71 +671,46 @@ async fn post_tool_result_rejects_when_ledger_is_full() {
 
 #[tokio::test]
 async fn http_handler_payload_matches_delivery_parser() {
-    let (app, ledger) = e2e_app();
+    let lifecycle = Arc::new(E2eRunLifecycle::default());
+    lifecycle.add_approval_required_with_tool(
+        "sess-chain",
+        "run-chain",
+        "w-chain",
+        "write_file",
+        "standard",
+    );
+    let (app, ledger) = e2e_app_with_lifecycle(Arc::clone(&lifecycle));
     let (status, body) = post_json(
         app.clone(),
         "/approval/respond",
         json!({
             "request_id": "w-chain",
             "decision": "allow",
+            "tool_name": "write_file",
+            "approval_kind": "standard",
             "session_id": "sess-chain",
             "run_id": "run-chain"
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
-    let tc = json!({
-        "id": "w-chain",
-        "type": "function",
-        "function": {"name": "write_file", "arguments": r#"{"path":"z.rs","content":"1"}"#}
-    });
-    tokio::spawn({
-        let ledger = ledger.clone();
-        async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            ledger.lock().await.insert(
-                scoped_tool_key("sess-chain", "run-chain", "chain-chain", "w-chain"),
-                json!({"body": {"request_id": "w-chain", "status": "completed", "output": "ok"}}),
-            );
-        }
-    });
-    let audit = approval_audit("sess-chain", "run-chain");
-    let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(EdgeToolDeliveryRequest {
-        ledger: &ledger,
-        user_id: "e2e-user",
-        session_id: "sess-chain",
-        run_id: "run-chain",
-        turn_chain_id: "chain-chain",
-        tool_calls: &[tc],
-        ledger_wait: Duration::from_secs(2),
-        approval_audit: Some(&audit),
-    })
-    .await;
-    let approval = d
-        .sse_maps
-        .iter()
-        .find(|m| m.get("type").and_then(|v| v.as_str()) == Some("approval_required"))
-        .expect("approval_required event");
-    assert_eq!(
-        approval.get("approval_kind").and_then(|v| v.as_str()),
-        Some("standard")
-    );
-    assert!(
-        d.sse_maps
-            .iter()
-            .any(|m| m.get("type").and_then(|v| v.as_str()) == Some("tool_request"))
-    );
-    assert!(
-        d.tool_messages[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("ok")
-    );
+    assert!(ledger.lock().await.is_empty());
+    let resolved = lifecycle
+        .resolved("run-chain", "w-chain")
+        .expect("approval response resolved");
+    assert_eq!(resolved["data"]["request_id"], "w-chain");
+    assert_eq!(resolved["data"]["decision"], "allow");
+    assert_eq!(resolved["data"]["tool"], "write_file");
+    assert_eq!(resolved["data"]["approval_kind"], "standard");
 }
 
 #[tokio::test]
 async fn http_handler_payload_supports_batched_approval_delivery() {
-    let (app, ledger) = e2e_app();
+    let lifecycle = Arc::new(E2eRunLifecycle::default());
+    for request_id in ["w-batch-1", "w-batch-2"] {
+        lifecycle.add_approval_required("sess-batch", "run-batch", request_id);
+    }
+    let (app, ledger) = e2e_app_with_lifecycle(Arc::clone(&lifecycle));
     for request_id in ["w-batch-1", "w-batch-2"] {
         let (status, body) = post_json(
             app.clone(),
@@ -654,71 +725,12 @@ async fn http_handler_payload_supports_batched_approval_delivery() {
         .await;
         assert_eq!(status, StatusCode::OK, "{body:?}");
     }
-    tokio::spawn({
-        let ledger = ledger.clone();
-        async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let mut guard = ledger.lock().await;
-            guard.insert(
-                scoped_tool_key("sess-batch", "run-batch", "chain-batch", "w-batch-1"),
-                json!({"body": {"request_id": "w-batch-1", "status": "completed", "output": "ok-1"}}),
-            );
-            guard.insert(
-                scoped_tool_key("sess-batch", "run-batch", "chain-batch", "w-batch-2"),
-                json!({"body": {"request_id": "w-batch-2", "status": "completed", "output": "ok-2"}}),
-            );
-        }
-    });
-    let tcs = vec![
-        json!({
-            "id": "w-batch-1",
-            "type": "function",
-            "function": {"name": "write_file", "arguments": r#"{"path":"a.rs","content":"1"}"#}
-        }),
-        json!({
-            "id": "w-batch-2",
-            "type": "function",
-            "function": {"name": "write_file", "arguments": r#"{"path":"b.rs","content":"2"}"#}
-        }),
-    ];
-    let audit = approval_audit("sess-batch", "run-batch");
-    let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(EdgeToolDeliveryRequest {
-        ledger: &ledger,
-        user_id: "e2e-user",
-        session_id: "sess-batch",
-        run_id: "run-batch",
-        turn_chain_id: "chain-batch",
-        tool_calls: &tcs,
-        ledger_wait: Duration::from_secs(2),
-        approval_audit: Some(&audit),
-    })
-    .await;
-
-    assert!(
-        d.sse_maps
-            .iter()
-            .all(|m| m.get("type").and_then(|v| v.as_str()) != Some("approval_required"))
-    );
-    let batch = d
-        .sse_maps
-        .iter()
-        .find(|m| m.get("type").and_then(|v| v.as_str()) == Some("approval_batch_required"))
-        .expect("approval_batch_required event");
-    assert_eq!(batch["requests"].as_array().unwrap().len(), 2);
-
-    let tool_request_positions: Vec<_> = d
-        .sse_maps
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, m)| {
-            (m.get("type").and_then(|v| v.as_str()) == Some("tool_request")).then_some(idx)
-        })
-        .collect();
-    assert_eq!(tool_request_positions.len(), 2);
-    let first_end = d
-        .sse_maps
-        .iter()
-        .position(|m| m.get("type").and_then(|v| v.as_str()) == Some("tool_call_end"))
-        .expect("tool_call_end");
-    assert!(tool_request_positions.iter().all(|idx| *idx < first_end));
+    assert_eq!(lifecycle.resolved_count(), 2);
+    assert!(ledger.lock().await.is_empty());
+    for request_id in ["w-batch-1", "w-batch-2"] {
+        assert_eq!(
+            lifecycle.resolved("run-batch", request_id).unwrap()["data"]["decision"],
+            "allow"
+        );
+    }
 }

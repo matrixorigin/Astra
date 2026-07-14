@@ -3462,53 +3462,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_agent_fanout_start_refuses_ambiguous_parent_groups() {
+    async fn agent_fanout_start_refuses_second_group_for_same_parent() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
-        for group_id in ["review-one", "review-two"] {
-            let start = handle_agent_fanout_tool(
-                &json!({
-                    "action": "start",
-                    "group_id": group_id,
-                    "target_count": 1,
-                    "slots": [
-                        {"description": format!("Review {group_id}"), "prompt": "Review changes"}
-                    ]
-                }),
-                Some(&ctx),
-            )
-            .await;
-            let value: Value = serde_json::from_str(&start).unwrap();
-            assert_eq!(value["status"], "completed");
-        }
-        assert_eq!(executor.spawn_count(), 2);
-
-        let recovered = recover_agent_fanout_tool_result(
+        let first = handle_agent_fanout_tool(
             &json!({
                 "action": "start",
+                "group_id": "review-one",
                 "target_count": 1,
                 "slots": [
-                    {"description": "Review unknown", "prompt": "Review changes"}
+                    {"description": "Review first", "prompt": "Review changes"}
                 ]
             }),
-            None,
             Some(&ctx),
         )
         .await;
-        let value: Value = serde_json::from_str(&recovered).unwrap();
+        let first_value: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first_value["status"], "completed");
 
-        assert_eq!(value["status"], "failed");
+        let second = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "review-two",
+                "target_count": 1,
+                "slots": [
+                    {"description": "Review second", "prompt": "Review changes"}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let second_value: Value = serde_json::from_str(&second).unwrap();
+
+        assert_eq!(second_value["status"], "failed");
         assert!(
-            value["error"]
+            second_value["error"]
                 .as_str()
-                .is_some_and(|text| text.contains("multiple fanout groups")),
-            "{recovered}"
+                .is_some_and(|text| text.contains("a parent run may start only one fanout group")),
+            "{second}"
         );
         assert_eq!(
             executor.spawn_count(),
-            2,
-            "ambiguous recovery must not guess by spawning a replacement group"
+            1,
+            "a rejected second group must not spawn any replacement child"
         );
     }
 

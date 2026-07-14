@@ -68,7 +68,7 @@ pub enum TerminalTransitionOutcome {
     Committed,
     /// Another durable transition won the CAS. The enclosed record is the
     /// authority callers must project instead of their stale local outcome.
-    Superseded(DurableRunRecord),
+    Superseded(Box<DurableRunRecord>),
 }
 
 fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
@@ -745,33 +745,23 @@ impl RunEngine {
             DurableRunStatusKind::Paused => {
                 (STATUS_PAUSED, vec![STATUS_RUNNING, STATUS_PAUSED], false)
             }
-            DurableRunStatusKind::Completed => (
-                STATUS_COMPLETED,
-                vec![STATUS_RUNNING, STATUS_WAITING, STATUS_COMPLETED],
-                true,
-            ),
-            DurableRunStatusKind::Delegated => (
-                STATUS_DELEGATED,
-                vec![STATUS_RUNNING, STATUS_WAITING, STATUS_DELEGATED],
-                true,
-            ),
-            DurableRunStatusKind::Failed => (
-                STATUS_FAILED,
-                vec![STATUS_RUNNING, STATUS_WAITING, STATUS_FAILED],
-                true,
-            ),
-            DurableRunStatusKind::Cancelled => (
-                STATUS_CANCELLED,
-                vec![STATUS_RUNNING, STATUS_WAITING, STATUS_CANCELLED],
-                true,
-            ),
+            DurableRunStatusKind::Completed => {
+                (STATUS_COMPLETED, vec![STATUS_RUNNING, STATUS_WAITING], true)
+            }
+            DurableRunStatusKind::Delegated => {
+                (STATUS_DELEGATED, vec![STATUS_RUNNING, STATUS_WAITING], true)
+            }
+            DurableRunStatusKind::Failed => {
+                (STATUS_FAILED, vec![STATUS_RUNNING, STATUS_WAITING], true)
+            }
+            DurableRunStatusKind::Cancelled => {
+                (STATUS_CANCELLED, vec![STATUS_RUNNING, STATUS_WAITING], true)
+            }
             // Verification failure is an AgentResult detail, not a
             // separate durable lifecycle state.
-            DurableRunStatusKind::Other if status == "verification_failed" => (
-                STATUS_FAILED,
-                vec![STATUS_RUNNING, STATUS_WAITING, STATUS_FAILED],
-                true,
-            ),
+            DurableRunStatusKind::Other if status == "verification_failed" => {
+                (STATUS_FAILED, vec![STATUS_RUNNING, STATUS_WAITING], true)
+            }
             DurableRunStatusKind::Other => {
                 return Err(format!(
                     "unsupported delegation outcome status '{status}' for run {run_id}"
@@ -1084,7 +1074,7 @@ impl RunEngine {
             .load_run(user_id, run_id)
             .await?
             .ok_or_else(|| format!("run {run_id} disappeared after terminal transition CAS"))?;
-        Ok(TerminalTransitionOutcome::Superseded(durable))
+        Ok(TerminalTransitionOutcome::Superseded(Box::new(durable)))
     }
 
     async fn reconcile_terminal_transition_after_store_error(
@@ -2306,6 +2296,63 @@ mod tests {
             event.get("event_type").and_then(serde_json::Value::as_str) == Some("run_finished")
                 && event["data"]["status"] == STATUS_FAILED
         }));
+    }
+
+    #[tokio::test]
+    async fn repeated_delegation_terminal_outcome_does_not_append_duplicate_events() {
+        let engine = test_engine();
+        let run_id = "delegation-terminal-replay";
+        engine
+            .start_run(run_id, "user-1", "session-1")
+            .await
+            .unwrap();
+
+        assert!(
+            engine
+                .persist_delegation_outcome_status(
+                    "user-1",
+                    run_id,
+                    STATUS_FAILED,
+                    None,
+                    Some("worker failed"),
+                )
+                .await
+                .unwrap()
+        );
+        let first = engine.load_run("user-1", run_id).await.unwrap().unwrap();
+
+        assert!(
+            !engine
+                .persist_delegation_outcome_status(
+                    "user-1",
+                    run_id,
+                    STATUS_FAILED,
+                    None,
+                    Some("worker failed"),
+                )
+                .await
+                .unwrap(),
+            "a replay must observe the existing terminal authority, not recommit it"
+        );
+        let replayed = engine.load_run("user-1", run_id).await.unwrap().unwrap();
+
+        assert_eq!(replayed.events, first.events);
+        assert_eq!(
+            replayed
+                .events
+                .iter()
+                .filter(|event| event["event_type"] == "run_finished")
+                .count(),
+            1
+        );
+        assert_eq!(
+            replayed
+                .events
+                .iter()
+                .filter(|event| event["event_type"] == "run_error")
+                .count(),
+            1
+        );
     }
 
     #[test]

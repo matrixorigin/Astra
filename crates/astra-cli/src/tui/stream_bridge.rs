@@ -585,7 +585,9 @@ mod tests {
         .unwrap();
 
         let mut saw_terminal = false;
+        let mut saw_gap = false;
         let mut batches = 0usize;
+        let mut gap_events = 0usize;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         while tokio::time::Instant::now() < deadline && !saw_terminal {
             let Some(event) =
@@ -595,20 +597,38 @@ mod tests {
             else {
                 break;
             };
-            batches += 1;
             let events = match event {
-                TuiAppEvent::AgentLive(event) => vec![event],
-                TuiAppEvent::AgentLiveBatch(events) => events,
+                TuiAppEvent::AgentLive(event) => {
+                    batches += 1;
+                    vec![event]
+                }
+                TuiAppEvent::AgentLiveBatch(events) => {
+                    batches += 1;
+                    events
+                }
+                TuiAppEvent::AgentLiveGap(gap) => {
+                    saw_gap = true;
+                    gap_events += 1;
+                    assert_eq!(gap.run_id, "test-run");
+                    assert_eq!(gap.agent_id, "reviewer@abc12345");
+                    assert!(gap.dropped_event_count > 0);
+                    continue;
+                }
                 other => panic!("unexpected event: {other:?}"),
             };
             saw_terminal |= events
                 .iter()
                 .any(|event| matches!(event.kind, AgentLiveEventKind::ToolCompleted { .. }));
         }
+        assert!(saw_gap, "dropped live output must surface a repair gap");
         assert!(saw_terminal, "terminal live events must survive floods");
         assert!(
             batches < 200,
             "flood should be coalesced into bounded batches, got {batches}"
+        );
+        assert!(
+            gap_events <= LIVE_AGENT_GAP_QUEUE_CAPACITY,
+            "gap lane should stay bounded, got {gap_events}"
         );
     }
 

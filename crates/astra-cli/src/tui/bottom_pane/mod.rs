@@ -573,6 +573,12 @@ impl BottomPane {
         refreshed
     }
 
+    pub(crate) fn has_pending_agent_transcript_identity(&self) -> bool {
+        self.view_stack
+            .iter()
+            .any(|view| view.has_pending_agent_transcript_identity())
+    }
+
     /// Take an action emitted by a projection refresh rather than a keypress.
     /// The event loop dispatches it through the exact same typed effect path
     /// as a user-triggered view action.

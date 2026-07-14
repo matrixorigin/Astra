@@ -272,6 +272,12 @@ pub trait AgenticLoopHost: Send {
     /// messages or infer control state from its display text.
     fn on_agent_communication(&mut self, _event: astra_messaging::AgentCommunicationEvent) {}
 
+    /// Notify the host that the runtime has a canonical session id for this
+    /// turn. Streams can discover this after host construction; interactive
+    /// hosts use the hook to late-bind session-scoped executors before tool
+    /// execution starts.
+    fn on_session_bound(&mut self, _session_id: &str) {}
+
     /// Headless round terminal output.
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String);
 

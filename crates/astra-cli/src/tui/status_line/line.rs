@@ -608,14 +608,29 @@ impl StatusLine {
         );
 
         let mut right_segments = self.right.clone();
-        if !should_render_context_segment(area.width, &self.left, &right_segments)
-            && right_segments.len() >= 2
+        while right_segments.len() > 1
+            && status_line_total_width(&self.left, &right_segments) > usize::from(area.width)
         {
-            // Context is an active capacity signal. On narrow terminals drop
-            // environmental decoration (cwd) before hiding it.
-            right_segments.remove(0);
+            // Context capacity is operational state. Drop optional decoration
+            // by meaning, not by its incidental position in the vector.
+            let remove_index = right_segments
+                .iter()
+                .rposition(|segment| segment.text.starts_with('$'))
+                .or_else(|| {
+                    right_segments
+                        .iter()
+                        .rposition(|segment| segment.text.starts_with("⎇ "))
+                })
+                .or_else(|| {
+                    right_segments
+                        .iter()
+                        .position(|segment| !segment.text.starts_with("Ctx "))
+                });
+            let Some(remove_index) = remove_index else {
+                break;
+            };
+            right_segments.remove(remove_index);
         }
-
         tighten_primary_right_segment(&self.left, &mut right_segments, area.width);
         let mut ordered = ordered_render_segments(&self.left, &right_segments);
         loop {
@@ -628,6 +643,19 @@ impl StatusLine {
                 all.push(Span::styled(" ".repeat(padding), Style::default().bg(bg)));
                 Widget::render(Line::from(all), area, buf);
                 break;
+            }
+            if compact_last_context_segment(&mut ordered, area.width) {
+                continue;
+            }
+            if ordered
+                .last()
+                .is_some_and(|segment| segment.text.starts_with("Ctx "))
+                && ordered.len() > 2
+            {
+                // Keep the primary left identity and capacity signal; shed a
+                // secondary left chip before discarding context altogether.
+                ordered.remove(ordered.len() - 2);
+                continue;
             }
             ordered.pop();
         }
@@ -681,6 +709,20 @@ fn ordered_render_segments(left: &[Segment], right: &[Segment]) -> Vec<Segment> 
     ordered
 }
 
+fn status_line_total_width(left: &[Segment], right: &[Segment]) -> usize {
+    let segments = left.len() + right.len();
+    if segments == 0 {
+        return 0;
+    }
+    let segment_width: usize = left
+        .iter()
+        .chain(right.iter())
+        .map(|seg| seg.text.width())
+        .sum();
+    let separator_width = segments.saturating_sub(1) * " · ".width();
+    2 + segment_width + separator_width + 2
+}
+
 fn tighten_ordered_cwd_segment(ordered: &mut [Segment], total_width: u16) {
     if ordered.len() < 2 {
         return;
@@ -707,7 +749,7 @@ fn tighten_ordered_cwd_segment(ordered: &mut [Segment], total_width: u16) {
 }
 
 fn tighten_primary_right_segment(left: &[Segment], right: &mut [Segment], total_width: u16) {
-    if left.is_empty() || right.is_empty() {
+    if left.is_empty() || right.is_empty() || right[0].text.starts_with("Ctx ") {
         return;
     }
 
@@ -844,6 +886,68 @@ fn truncate_end(text: &str, max_width: usize) -> String {
     format!("{head}…")
 }
 
+fn compact_last_context_segment(ordered: &mut [Segment], total_width: u16) -> bool {
+    let Some(last_text) = ordered.last().map(|seg| seg.text.as_str()) else {
+        return false;
+    };
+    if !last_text.starts_with("Ctx ") {
+        return false;
+    }
+
+    let sep_w = " · ".width();
+    let lead_indent = 2usize;
+    let trailing_margin = 2usize;
+    let fixed_width: usize = ordered
+        .iter()
+        .take(ordered.len().saturating_sub(1))
+        .map(|seg| seg.text.width())
+        .sum::<usize>()
+        + ordered.len().saturating_sub(1) * sep_w
+        + lead_indent
+        + trailing_margin;
+    let available = usize::from(total_width).saturating_sub(fixed_width);
+    if last_text.width() <= available {
+        return false;
+    }
+
+    let compact = compact_context_text(last_text, available);
+    if compact == last_text {
+        return false;
+    }
+    if let Some(last) = ordered.last_mut() {
+        last.text = compact;
+    }
+    true
+}
+
+fn compact_context_text(text: &str, max_width: usize) -> String {
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+
+    let Some((prefix, tokens)) = text.rsplit_once(" · ") else {
+        return truncate_end(text, max_width);
+    };
+    let limit = tokens
+        .rsplit_once('/')
+        .map(|(_, limit)| limit)
+        .unwrap_or(tokens);
+    let limit_only = format!("…/{limit}");
+    if limit_only.width() > max_width {
+        return truncate_end(&limit_only, max_width);
+    }
+
+    let with_prefix = format!("{prefix} · {limit_only}");
+    if with_prefix.width() <= max_width {
+        with_prefix
+    } else {
+        limit_only
+    }
+}
+
 fn truncate_left_segments_to_fit(
     segments: &[Segment],
     right_width: usize,
@@ -882,26 +986,17 @@ fn truncate_left_segments_to_fit(
     }
 }
 
-fn should_render_context_segment(total_width: u16, left: &[Segment], right: &[Segment]) -> bool {
-    if right.len() < 2 {
-        return true;
-    }
-    let left_primary = left.first().map(|seg| seg.text.width()).unwrap_or_default();
-    let cwd_width = right
-        .first()
-        .map(|seg| seg.text.width())
-        .unwrap_or_default();
-    let budget_width = right.get(1).map(|seg| seg.text.width()).unwrap_or_default();
-    let minimum_useful = 2 + left_primary + 2 + cwd_width.min(14) + 3 + budget_width;
-    usize::from(total_width) >= minimum_useful
-}
-
 /// "25000" → "25k"; preserves exact count under 1k.
 fn format_tokens_compact(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
     } else if n < 1_000_000 {
-        format!("{}k", n / 1_000)
+        let rounded_k = (n + 500) / 1_000;
+        if rounded_k >= 1_000 {
+            "1.0M".to_string()
+        } else {
+            format!("{rounded_k}k")
+        }
     } else {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     }

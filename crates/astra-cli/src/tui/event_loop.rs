@@ -2599,6 +2599,9 @@ struct ViewActionBackends {
 /// event loop as the sole owner of effects while allowing an already-open
 /// transcript to upgrade itself when later typed metadata makes a durable
 /// read possible.
+// Central event-loop dispatch deliberately exposes every mutable subsystem it
+// may advance, avoiding an ambient bag that could be retained across awaits.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_projection_actions(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     server_agent_observer: &crate::tui::server_agent_observer::ServerAgentObserver,
@@ -3355,6 +3358,9 @@ fn dispatch_root_transcript_load(
     });
 }
 
+// This is a one-shot UI-to-runtime command boundary; identity, routing, and
+// repaint capabilities remain explicit and independently testable.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_agent_guide(
     agent_id: String,
     agent_name: String,
@@ -3625,6 +3631,9 @@ fn rebind_workbench_observers(
     *board_user_pin = None;
 }
 
+// Central event-loop dispatch deliberately exposes every mutable subsystem it
+// may advance, avoiding an ambient bag that could be retained across awaits.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_bottom_pane_view_action(
     action: BottomPaneViewAction,
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
@@ -11710,6 +11719,7 @@ mod tests {
         bottom_pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
             agent_id: "agent-a".into(),
             name: "agent-a".into(),
+            spawn_tool_call_id: None,
             activity: crate::tui::agent_run_projection::AgentActivityCounts::default(),
             run_id: Some("run-agent-a".into()),
             parent_run_id: Some("root-run".into()),
@@ -11776,6 +11786,7 @@ mod tests {
         open.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
             agent_id: "agent-a".into(),
             name: "agent-a".into(),
+            spawn_tool_call_id: None,
             activity: crate::tui::agent_run_projection::AgentActivityCounts::default(),
             run_id: Some("run-agent-a".into()),
             parent_run_id: Some("root-run".into()),

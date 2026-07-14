@@ -633,7 +633,7 @@ pub(crate) fn commit_primary_turn(
                 true
             }
             Err(error) => {
-                issues.record_error("append primary turn batch", error);
+                issues.record_error("append turn event", error);
                 false
             }
         };
@@ -664,7 +664,7 @@ pub(crate) fn commit_primary_turn(
             deferred_sidecars,
         };
     } else if state.session_id.is_some() {
-        issues.record_error("commit durable turn state", "session journal missing");
+        issues.record_error("append turn event", "session journal missing");
     }
 
     let persistence_error = issues.into_summary();
@@ -1120,7 +1120,7 @@ mod tests {
             .session_persistence_error
             .as_deref()
             .expect("journal append failure should degrade persistence state");
-        assert!(error.contains("append primary turn batch"), "{error}");
+        assert!(error.contains("append turn event"), "{error}");
         assert!(
             astra_services::session_workspace::read_workspace_optional(
                 state.session_id.as_deref().unwrap()

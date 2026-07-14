@@ -752,7 +752,7 @@ async fn scenario_complex_team_full_roundtrip() {
 
     // Coordination
     assert_eq!(team["coordination"]["type"], "fan_out");
-    assert_eq!(team["coordination"]["aggregation"], "merge");
+    assert_eq!(team["coordination"]["aggregation"], "all_results");
 
     // Budget
     let b = &team["budget"];

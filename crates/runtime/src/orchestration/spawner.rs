@@ -804,6 +804,15 @@ pub struct SpawnRunResult {
 pub trait SpawnAgentExecutor: Send + Sync {
     /// Execute a spawned agent run.
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String>;
+
+    /// Bind a parent session after the executor has been installed.
+    ///
+    /// Interactive clients can learn the server session from the first streamed
+    /// `session_info` event, after the per-turn spawner already exists but
+    /// before any child spawn executes. Executors that persist child transcript
+    /// state should use this as the same binding as construction-time session
+    /// setup. Stateless executors can ignore it.
+    fn bind_parent_session(&self, _session_id: &str) {}
 }
 
 /// Loads a bounded authoritative session snapshot for agents observed from a
@@ -834,7 +843,7 @@ pub struct DynamicAgentSpawner {
     /// Optional executor for running agents (provided by CLI layer).
     executor: Option<Arc<dyn SpawnAgentExecutor>>,
     /// Optional session ID for persisting agent state to journal.
-    session_id: Option<String>,
+    session_id: Arc<std::sync::RwLock<Option<String>>>,
     /// Agent type registry (builtins + user-defined).
     agent_registry: astra_turn_core::orchestration_team_config::AgentRegistry,
     /// Completed agents archive for history queries.
@@ -917,7 +926,7 @@ impl DynamicAgentSpawner {
             progress_broadcaster: Arc::new(ProgressBroadcaster::default()),
             context_cache: Arc::new(SharedContextCache::default()),
             executor: None,
-            session_id: None,
+            session_id: Arc::new(std::sync::RwLock::new(None)),
             agent_registry:
                 astra_turn_core::orchestration_team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(VecDeque::new())),
@@ -1009,7 +1018,7 @@ impl DynamicAgentSpawner {
         projections: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     ) -> usize {
         let journal_events = self
-            .session_id
+            .current_session_id()
             .as_deref()
             .and_then(|session_id| astra_services::session_journal::read_journal(session_id).ok())
             .unwrap_or_default();
@@ -1852,9 +1861,41 @@ impl DynamicAgentSpawner {
     }
 
     /// Enable journal persistence for agent lifecycle events.
-    pub fn with_session(mut self, session_id: String) -> Self {
-        self.session_id = Some(session_id);
+    pub fn with_session(self, session_id: String) -> Self {
+        self.bind_session(session_id);
         self
+    }
+
+    /// Late-bind the parent session for lifecycle journaling and executor-owned
+    /// child transcript persistence.
+    pub fn bind_session(&self, session_id: impl Into<String>) {
+        let session_id = session_id.into();
+        if session_id.trim().is_empty() {
+            return;
+        }
+        {
+            let mut guard = self
+                .session_id
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.as_deref() == Some(session_id.as_str()) {
+                if let Some(executor) = self.executor.as_ref() {
+                    executor.bind_parent_session(&session_id);
+                }
+                return;
+            }
+            *guard = Some(session_id.clone());
+        }
+        if let Some(executor) = self.executor.as_ref() {
+            executor.bind_parent_session(&session_id);
+        }
+    }
+
+    fn current_session_id(&self) -> Option<String> {
+        self.session_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn trace_event_id(kind: &str, parts: &[&str]) -> String {
@@ -2458,9 +2499,9 @@ impl DynamicAgentSpawner {
         };
 
         // Emit agent_spawned journal event for unified timeline.
-        if let Some(ref sid) = self.session_id {
+        if let Some(sid) = self.current_session_id() {
             let evt = astra_services::session_journal::JournalEvent::agent_spawned(
-                Some(sid),
+                Some(&sid),
                 &agent_id,
                 &run_id,
                 &context.parent_run_id,
@@ -2470,7 +2511,7 @@ impl DynamicAgentSpawner {
                 run_config.inherited_prefix.is_some(),
                 run_config.execution_metadata.as_ref(),
             );
-            if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+            if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&sid) {
                 let _ = writer.append(&evt);
             }
         }
@@ -2868,10 +2909,10 @@ impl DynamicAgentSpawner {
         status: &str,
         finish_reason: Option<&str>,
     ) {
-        let Some(ref sid) = self.session_id else {
+        let Some(sid) = self.current_session_id() else {
             return;
         };
-        let writer = match astra_services::session_journal::JournalWriter::new(sid) {
+        let writer = match astra_services::session_journal::JournalWriter::new(&sid) {
             Ok(w) => w,
             Err(e) => {
                 astra_core::agent_warn!(

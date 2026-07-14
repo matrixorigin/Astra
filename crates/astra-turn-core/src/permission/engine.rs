@@ -47,6 +47,9 @@
 //! added here first and consumed by call sites instead of being copied.
 
 use astra_sandbox::{GitSafetyViolation, is_soft_violation, validate_git_command};
+use astra_tools::agent_tool_contract::{
+    AgentAction, AgentFanoutAction, agent_action_from_args, agent_fanout_action_from_args,
+};
 use serde_json::Value;
 
 use crate::action_compensation::{explicit_approval_reason, primary_approval_reason};
@@ -116,6 +119,7 @@ pub enum DecisionSource {
         origin: RuleOrigin,
     },
     ReadShortCircuit,
+    InternalOrchestration,
     SessionOverride {
         allowed: bool,
     },
@@ -996,6 +1000,23 @@ pub fn evaluate_permission(
         "no allow rule matched",
     );
 
+    if ctx.mode() != PermissionMode::Deny && is_internal_orchestration_control(tool_name, args) {
+        let decision = HardDecision::Allow;
+        push_matched(
+            &mut trace,
+            EvaluationStep::Mode,
+            &decision,
+            "internal orchestration control",
+        );
+        return envelope(
+            decision,
+            DecisionSource::InternalOrchestration,
+            trace,
+            will_save,
+            risk_tags,
+        );
+    }
+
     let mode = ctx.mode();
     let (decision, mode_label) = if mode.auto_resolves_approval_prompts() {
         (HardDecision::Allow, mode.to_string())
@@ -1488,6 +1509,20 @@ fn accept_edits_auto_allows(tool_name: &str, args: &Value) -> bool {
         ),
         (Some(CloudGatedToolKind::Write), AllowMatchTarget::Prefix(_))
     )
+}
+
+fn is_internal_orchestration_control(tool_name: &str, args: &Value) -> bool {
+    match tool_name {
+        "agent" => matches!(
+            agent_action_from_args(args),
+            Ok(AgentAction::Spawn | AgentAction::GetResult | AgentAction::SendMessage)
+        ),
+        "agent_fanout" => matches!(
+            agent_fanout_action_from_args(args),
+            Ok(AgentFanoutAction::Start | AgentFanoutAction::GetResults)
+        ),
+        _ => false,
+    }
 }
 
 fn content_aware_fingerprint(tool_name: &str, args: &Value) -> ApprovalFingerprint {
@@ -1985,6 +2020,128 @@ mod tests {
 
         assert!(matches!(envelope.decision, HardDecision::Allow));
         assert_eq!(envelope.source, DecisionSource::ReadShortCircuit);
+    }
+
+    #[test]
+    fn prompt_mode_allows_agent_lifecycle_control_without_external_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                ..Default::default()
+            },
+        );
+
+        for (tool, args) in [
+            (
+                "agent",
+                serde_json::json!({
+                    "action": "spawn",
+                    "description": "Review",
+                    "prompt": "Check the diff"
+                }),
+            ),
+            (
+                "agent",
+                serde_json::json!({
+                    "action": "get_result",
+                    "agent_id": "agent-1"
+                }),
+            ),
+            (
+                "agent_fanout",
+                serde_json::json!({
+                    "action": "start",
+                    "group_id": "review",
+                    "target_count": 1,
+                    "slots": [{"id": "slot-1", "prompt": "Review"}]
+                }),
+            ),
+            (
+                "agent_fanout",
+                serde_json::json!({
+                    "action": "get_results",
+                    "group_id": "review"
+                }),
+            ),
+        ] {
+            let envelope = evaluate_permission(tool, &args, &ctx);
+            assert!(
+                matches!(envelope.decision, HardDecision::Allow),
+                "{tool} {args} should be internal orchestration control; got {:?} from {:?}",
+                envelope.decision,
+                envelope.source
+            );
+            assert_eq!(envelope.source, DecisionSource::InternalOrchestration);
+        }
+    }
+
+    #[test]
+    fn prompt_mode_still_prompts_agent_actions_that_can_mutate_runtime_state() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                ..Default::default()
+            },
+        );
+
+        for (tool, args) in [
+            (
+                "agent",
+                serde_json::json!({
+                    "action": "run_chain",
+                    "prompt": "Run the release pipeline"
+                }),
+            ),
+            (
+                "agent_fanout",
+                serde_json::json!({
+                    "action": "stop_slot",
+                    "group_id": "review",
+                    "slot_index": 0
+                }),
+            ),
+        ] {
+            let envelope = evaluate_permission(tool, &args, &ctx);
+            assert!(
+                matches!(envelope.decision, HardDecision::NeedExternal { .. }),
+                "{tool} {args} should still route through prompt mode; got {:?} from {:?}",
+                envelope.decision,
+                envelope.source
+            );
+            assert_eq!(
+                envelope.source,
+                DecisionSource::Mode {
+                    mode: "prompt".to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn ask_rule_precedes_internal_orchestration_short_circuit() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                ask_rules: vec![crate::permission::types::PermissionRule::tool("agent")],
+                ..Default::default()
+            },
+        );
+
+        let envelope = evaluate_permission(
+            "agent",
+            &serde_json::json!({
+                "action": "spawn",
+                "description": "Review",
+                "prompt": "Check the diff"
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(
+            envelope.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+        assert!(matches!(envelope.source, DecisionSource::AskRule { .. }));
     }
 
     #[test]
@@ -2682,7 +2839,7 @@ mod tests {
             envelope.source,
             DecisionSource::ExecuteHardDeny { .. }
         ));
-        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+        assert!(envelope.risk_tags.contains(&RiskTag::BashExecute));
     }
 
     #[test]

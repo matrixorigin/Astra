@@ -910,12 +910,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent_fanout",
-                "description": "Launch one atomic parallel agent group. Submit one complete JSON object; do not emit a DSL or a partial object.\n\n\
+                "description": "Launch one atomic parallel agent group: start requires exactly target_count slots, each with description+prompt, and no brief/agents/background fields. Submit one complete JSON object; do not emit a DSL or a partial object.\n\n\
          Actions:\n\
-         - `start`: requires `action`, `target_count`, and exactly that many `slots`. Every slot has `description` and `prompt`; optional `id` is only a caller-facing label. Minimal valid start: `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Review API\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"Review UI\",\"prompt\":\"Review the UI and report findings.\"}]}`. Shared optional configuration belongs in `defaults`; omit it unless needed.\n\
+         - `start`: requires `action`, `target_count`, and exactly target_count slots. Every slot has description+prompt; optional `id` is only a caller-facing label. Minimal valid start: `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Review API\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"Review UI\",\"prompt\":\"Review the UI and report findings.\"}]}`. Shared optional configuration belongs in `defaults`; omit it unless needed.\n\
          - `get_results`: requires `action` and returned `group_id`. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
-         Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Foreground results wait for accepted children; Ctrl+B is the user-controlled background action.",
+         Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Foreground results wait for accepted children; Ctrl+B is the user-controlled background action.",
                 "parameters": {
                     "type": "object",
                     "properties": {

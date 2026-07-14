@@ -266,6 +266,10 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     /// Root-level messaging context used when the current turn has no mailbox.
     pub root_send_message_context:
         Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
+    /// Shared dynamic-agent runtime for this session. It may be constructed
+    /// before the server has allocated the session id, so the host late-binds it
+    /// when the first streamed snapshot names the canonical session.
+    pub agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// REPL turn counter (0-based) for correct turn_id in trace collector.
     pub chat_turn_index: u32,
     /// Cross-turn tool output cache for edge-path dedup.
@@ -1012,6 +1016,16 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::AgentCommunication(
             event,
         ));
+    }
+
+    fn on_session_bound(&mut self, session_id: &str) {
+        if session_id.trim().is_empty() {
+            return;
+        }
+        self.executor.set_active_session_id(session_id.to_string());
+        if let Some(spawner) = self.agent_spawner.as_ref() {
+            spawner.bind_session(session_id.to_string());
+        }
     }
 
     fn is_quiet(&self) -> bool {

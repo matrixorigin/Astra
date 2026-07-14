@@ -869,9 +869,10 @@ async fn migrate_legacy_edge_pending_dispatch_if_needed(
     .fetch_optional(pool)
     .await?;
     if active_row.is_some() {
-        return Err(sqlx::Error::Protocol(format!(
+        return Err(sqlx::Error::Protocol(
             "legacy edge_pending_dispatch contains active rows without session/run/turn identity; drain them with the pre-turn-scoped Astra release before upgrade"
-        )));
+                .to_string(),
+        ));
     }
     query(&format!(
         "RENAME TABLE {} TO {}",

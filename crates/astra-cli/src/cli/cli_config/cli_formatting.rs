@@ -159,19 +159,20 @@ fn render_terminal_diff_change(
     truecolor_bg: Color,
     ansi_fg: Color,
 ) -> String {
+    let padded = pad_terminal_row(body);
     if terminal_supports_truecolor() {
-        let padded = pad_terminal_row(body);
         format!("{}", style(padded).with(truecolor_fg).on(truecolor_bg))
     } else {
-        format!("{}", style(body).with(ansi_fg))
+        format!("{}", style(padded).with(ansi_fg))
     }
 }
 
 fn render_terminal_diff_stat_row(body: String) -> String {
+    let padded = pad_terminal_row(body);
     if terminal_supports_truecolor() {
         format!(
             "{}",
-            style(pad_terminal_row(body))
+            style(padded)
                 .with(Color::Rgb {
                     r: 204,
                     g: 215,
@@ -184,7 +185,7 @@ fn render_terminal_diff_stat_row(body: String) -> String {
                 })
         )
     } else {
-        format!("{}", style(body).with(Color::Cyan))
+        format!("{}", style(padded).with(Color::Cyan))
     }
 }
 

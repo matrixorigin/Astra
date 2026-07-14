@@ -46,6 +46,12 @@ pub(crate) fn refresh_open_agent_detail_for_event(
     chat_widget: &chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
 ) -> bool {
+    let rebound_pending_transcript = matches!(
+        ae,
+        TuiAppEvent::AgentLive(_) | TuiAppEvent::AgentLiveBatch(_)
+    ) && bottom_pane.has_pending_agent_transcript_identity()
+        && bottom_pane.refresh_agent_monitor(chat_widget.agent_workbench_snapshot());
+
     // The conversation view consumes the original typed live event. A task
     // card is only a compact navigator summary; it must never fill gaps in a
     // run transcript.
@@ -63,18 +69,18 @@ pub(crate) fn refresh_open_agent_detail_for_event(
     };
 
     let Some(open_id) = bottom_pane.active_live_task_id() else {
-        return transcript_updated;
+        return rebound_pending_transcript || transcript_updated;
     };
     let task_updated = match ae {
         TuiAppEvent::AgentLive(event) => {
             if open_id != event.agent_id {
-                return false;
+                return rebound_pending_transcript || transcript_updated;
             }
             refresh_open_agent_detail_by_id(&event.agent_id, chat_widget, bottom_pane)
         }
         TuiAppEvent::AgentLiveBatch(events) => {
             let Some(event) = events.iter().rev().find(|event| open_id == event.agent_id) else {
-                return false;
+                return rebound_pending_transcript || transcript_updated;
             };
             refresh_open_agent_detail_by_id(&event.agent_id, chat_widget, bottom_pane)
         }
@@ -94,7 +100,7 @@ pub(crate) fn refresh_open_agent_detail_for_event(
         }
         _ => false,
     };
-    transcript_updated || task_updated
+    rebound_pending_transcript || transcript_updated || task_updated
 }
 
 pub(crate) fn agent_live_event_affects_monitor_row(event: &AgentLiveEvent) -> bool {
@@ -179,6 +185,7 @@ pub(crate) fn refresh_open_agent_detail_by_id(
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use astra_turn_core::agent_live_event::AgentLiveSignal;
     use crossterm::event::KeyEvent;
     use ratatui::{buffer::Buffer, layout::Rect};
 
@@ -232,5 +239,59 @@ mod tests {
             &mut bottom_pane,
         ));
         assert_eq!(seen.lock().unwrap().as_slice(), ["agent-1", "agent-1"]);
+    }
+
+    #[test]
+    fn pending_transcript_rebinds_before_delivering_first_token_event() {
+        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        chat_widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::AgentLive(AgentLiveEvent {
+                run_id: "run-child".into(),
+                agent_id: "reviewer@run-child".into(),
+                kind: AgentLiveEventKind::Signal(AgentLiveSignal::RunStarted {
+                    parent_run_id: Some("run-root".into()),
+                    depth: 1,
+                    spawn_tool_call_id: Some("call-spawn-child".into()),
+                    transcript_location: astra_turn_types::AgentTranscriptLocation::LocalJournal,
+                }),
+            }),
+        ));
+
+        let mut bottom_pane = BottomPane::new();
+        bottom_pane.push_view(Box::new(
+            crate::tui::bottom_pane::agent_transcript_view::AgentTranscriptView::live_unbound(
+                "pending:call-spawn-child".into(),
+                "Mock child review".into(),
+                String::new(),
+                None,
+                "agents",
+                80,
+                12,
+            ),
+        ));
+
+        let output = TuiAppEvent::AgentLive(AgentLiveEvent {
+            run_id: "run-child".into(),
+            agent_id: "reviewer@run-child".into(),
+            kind: AgentLiveEventKind::OutputDelta("child_evidence_visible".into()),
+        });
+        chat_widget.handle_event(chat_widget::AppEvent::wire(
+            chat_widget::WireEvent::AgentLive(match &output {
+                TuiAppEvent::AgentLive(event) => event.clone(),
+                _ => unreachable!(),
+            }),
+        ));
+
+        assert!(refresh_open_agent_detail_for_event(
+            &output,
+            &chat_widget,
+            &mut bottom_pane,
+        ));
+
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buffer = Buffer::empty(area);
+        bottom_pane.render(area, &mut buffer);
+        let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+        assert!(rendered.contains("child_evidence_visible"), "{rendered}");
     }
 }

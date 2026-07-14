@@ -468,6 +468,32 @@ fn narrow_footer_keeps_context_and_drops_cwd_first() {
 }
 
 #[test]
+fn medium_footer_does_not_keep_cwd_at_contexts_expense() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let c = StatusContext {
+        model: Some("astra-model".into()),
+        cwd: Some("~/very/long/project/path".into()),
+        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
+            25_000, 100_000,
+        )),
+        git_branch: Some("feature/long-lived-context-work".into()),
+        ..ctx()
+    };
+    let status = StatusLine::from_context(&c);
+    let area = Rect::new(0, 0, 55, 1);
+    let mut buf = Buffer::empty(area);
+    status.render(area, &mut buf);
+    let rendered: String = (0..area.width)
+        .map(|x| buf[(x, 0)].symbol().to_string())
+        .collect();
+
+    assert!(rendered.contains("Ctx 25%"), "{rendered:?}");
+    assert!(!rendered.contains("project/path"), "{rendered:?}");
+}
+
+#[test]
 fn cost_formats_with_two_decimals_and_dollar_sign() {
     let c = StatusContext {
         cost_usd: Some(1.2345),

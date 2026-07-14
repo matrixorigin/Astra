@@ -6255,6 +6255,21 @@ mod tests {
     }
 
     #[test]
+    fn agent_spawn_does_not_prompt_in_prompt_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let args = serde_json::json!({
+            "action": "spawn",
+            "description": "Review",
+            "prompt": "Check the diff"
+        });
+
+        let decision = pm.check_nonblocking("agent", &args);
+
+        assert!(matches!(decision, GateOutcome::Allow));
+    }
+
+    #[test]
     fn empty_user_settings_no_effect() {
         let pm = PermissionManager::new(false);
         assert!(pm.cached_user_allow.is_empty());

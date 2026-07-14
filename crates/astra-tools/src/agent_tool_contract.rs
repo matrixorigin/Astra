@@ -70,7 +70,7 @@ pub fn agent_unknown_action_message(action: &str) -> String {
 }
 
 pub fn invalid_agent_spawn_wrapper_message() -> &'static str {
-    "invalid agent call shape. Use a top-level JSON `action` field, not a `spawn` wrapper key. For example: {\"action\":\"spawn\",\"description\":\"…\",\"prompt\":\"…\"}. For parallel fan-out, use the `agent_fanout` JSON schema; do not pass `agents:[...]`."
+    "invalid agent call shape. Use a top-level `action='spawn'` JSON field, not a `spawn` wrapper key. For example: {\"action\":\"spawn\",\"description\":\"…\",\"prompt\":\"…\"}. For parallel fan-out, use the `agent_fanout` JSON schema; do not pass `agents:[...]`."
 }
 
 pub fn invalid_agent_agents_payload_message() -> &'static str {

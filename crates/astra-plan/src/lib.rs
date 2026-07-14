@@ -10,8 +10,8 @@ pub use execution::{
     subtask_requires_browser_verification,
 };
 pub use repository::{
-    CloudPlanRepository, InMemoryPlanRepository, NewStepRun, PlanListFilter, PlanLoadError,
-    PlanRepository, PlanStepRun, SavedPlanInfo,
+    CloudPlanRepository, FinalizeStepRun, InMemoryPlanRepository, NewStepRun, PlanListFilter,
+    PlanLoadError, PlanRepository, PlanStepRun, RecordCompletedStepRun, SavedPlanInfo,
 };
 pub use resume::{
     PlanResumeSnapshot, plan_mode_authoring_active, plan_resume_digest,

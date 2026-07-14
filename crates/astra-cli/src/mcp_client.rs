@@ -6,8 +6,7 @@
 
 pub use astra_mcp::{
     CallLogEntry, ConnectionState, MAX_RESULT_CONTENT_LENGTH, McpClientManager, McpError,
-    McpServerConfig, PreparedMcpConnection, RetryConfig, Transport, extract_result_text_with_limit,
-    sanitize_tool_name,
+    McpServerConfig, RetryConfig, Transport, extract_result_text_with_limit, sanitize_tool_name,
 };
 
 /// Connect an MCP server and register any `skill://` resources it exposes.

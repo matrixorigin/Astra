@@ -810,6 +810,9 @@ fn wrap_prefixed_line(
 }
 
 fn wrap_prefixed_diff_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    if line.width() <= usize::from(width) {
+        return vec![line];
+    }
     let indent = if line.spans.len() >= 3 {
         Line::from(vec![
             blank_span_like(&line.spans[0]),

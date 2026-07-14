@@ -294,6 +294,74 @@ fn is_agent_journey_child_request(request: &serde_json::Value) -> bool {
             == Some(astra_cli::cli::mock_llm::AGENT_JOURNEY_CHILD_TASK)
 }
 
+fn summarize_mock_request(request: &serde_json::Value) -> String {
+    let edge_tool_names = request
+        .get("edge_tools")
+        .and_then(serde_json::Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.pointer("/function/name")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let tool_result_names = request
+        .get("tool_results")
+        .and_then(serde_json::Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .map(|result| {
+                    result
+                        .get("name")
+                        .or_else(|| result.get("tool"))
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| {
+                            result
+                                .get("tool_call_id")
+                                .and_then(serde_json::Value::as_str)
+                        })
+                        .unwrap_or("<unknown>")
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let assistant_tool_calls = request
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                })
+                .flat_map(|message| {
+                    message
+                        .get("tool_calls")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter_map(|call| {
+                    call.pointer("/function/name")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    format!(
+        "agent_id={:?} agent_type={:?} edge_tools={edge_tool_names:?} assistant_tool_calls={assistant_tool_calls:?} tool_results={tool_result_names:?}",
+        request.get("agent_id").and_then(serde_json::Value::as_str),
+        request
+            .get("agent_type")
+            .and_then(serde_json::Value::as_str),
+    )
+}
+
 async fn wait_for_agent_journey_child_request(
     mock: &astra_cli::cli::mock_llm::MockLlmServer,
     astra: &mut PtyAstra,
@@ -311,7 +379,7 @@ async fn wait_for_agent_journey_child_request(
             requests.len(),
             requests
                 .last()
-                .map(ToString::to_string)
+                .map(summarize_mock_request)
                 .unwrap_or_else(|| "<none>".to_string()),
             astra.output_tail(),
         );

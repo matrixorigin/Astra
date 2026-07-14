@@ -247,6 +247,9 @@ fn build_skill_listing_section_with_budget_and_caps(
              `agents:[...]` payload. If `agent_fanout` is not present in \
              `tools[]`, first call `tool_search(query=\"select:agent_fanout\")` \
              to fetch its full schema. Then submit one complete JSON argument \
+             object with `agent_fanout(action='start', ...)`, and later collect \
+             with `agent_fanout(action='get_results', ...)`. JSON-call syntax is still required; these strings name the route. \
+             For example submit an argument \
              object, for example \
              `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"API review\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"UI review\",\"prompt\":\"Review the UI and report findings.\"}]}`. \
              Put each child's full brief in that slot's `prompt`, then collect \
@@ -970,7 +973,7 @@ fn task_type_section(task_type: Option<&str>, tool_names: &[&str]) -> String {
                   ### Output\n\
                   Return exactly one JSON object and no surrounding prose or markdown fences:\n\
                   {{\"summary\":\"1–3 concise points on change and risk\",\"findings\":[{{\"severity\":\"critical|high|medium|low|info\",\"summary\":\"material issue and fix\",\"evidence\":[\"file:line and observed fact\"]}}],\"verification\":\"what was checked and what remains unverified\",\"verdict\":\"lgtm|needs_changes\"}}\n\
-                  Emit 0–5 material findings. Use severity=critical only for evidence that must reach ancestor runs immediately. Use an empty findings array when there are no findings. NEVER use verdict=lgtm when reads failed on logic-changed files.\n\
+                  Emit 0–5 material findings. Use severity=critical only for evidence that must reach ancestor runs immediately; map any must-fix concern to high or critical severity rather than a separate label. Use an empty findings array when there are no findings. NEVER say LGTM when evidence is incomplete; NEVER use verdict=lgtm when reads failed on logic-changed files.\n\
                   \n\
                   ### Anti-patterns (NEVER do these)\n\
                    {git_antipattern}\n\

@@ -179,6 +179,11 @@ impl From<&DecisionSource> for SourceLabel {
                 matched_rule: None,
                 origin: None,
             },
+            DecisionSource::InternalOrchestration => Self {
+                step: "internal_orchestration".into(),
+                matched_rule: None,
+                origin: None,
+            },
             DecisionSource::SessionOverride { allowed } => Self {
                 step: "session_override".into(),
                 matched_rule: Some(format!("allowed={allowed}")),

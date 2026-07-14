@@ -413,11 +413,11 @@ pub fn close_user_prompt_at_deadline(
     if let Some(response) =
         find_latest_ask_user_response_for_run(&context.session_id, request_id, &context.run_id)?
     {
-        return Ok(UserPromptDeadlineClose::Resolved(
-            decision_from_journal_response(response, &context.session_id, user_id).unwrap_or(
-                AskUserDecision::Error("ask_user response is still pending at deadline".into()),
-            ),
-        ));
+        if let Some(decision) =
+            decision_from_journal_response(response, &context.session_id, user_id)
+        {
+            return Ok(UserPromptDeadlineClose::Resolved(decision));
+        }
     }
 
     match append_ask_user_response_for_run_if_absent(

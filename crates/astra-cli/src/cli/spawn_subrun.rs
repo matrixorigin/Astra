@@ -38,6 +38,12 @@ use crate::edge_tools;
 /// Re-export from runtime so all CLI components share one type.
 pub type TokenProvider = astra_runtime::capabilities::TokenProvider;
 
+#[derive(Default)]
+struct SessionTranscriptBinding {
+    active_session_id: Option<String>,
+    journal: Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
+}
+
 /// CLI implementation of [`SpawnAgentExecutor`].
 ///
 /// Runs spawned agents using the same agentic loop as delegation,
@@ -58,14 +64,15 @@ pub struct CliSpawnAgentExecutor {
     project_root: PathBuf,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    active_session_id: Option<String>,
+    /// Parent session transcript binding. This can arrive after executor
+    /// construction when the first streamed `session_info` event names a new
+    /// session.
+    session_transcript: std::sync::Mutex<SessionTranscriptBinding>,
     /// Optional sink for fork-cache telemetry. When `None` the
     /// executor still forwards `inherited_prefix` so child messages
     /// prepend the parent prefix — but no ForkCacheEvent is emitted.
     /// Zero-cost when unset.
     fork_cache_sink: Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
-    /// Parent session journal writer for unified timeline.
-    journal: Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
     /// Shared command queue for the parent's BackgroundTaskRegistry.
     /// Threaded into the child's ToolExecutor so spawned sub-agents
     /// can inspect or stop background shell tasks promoted in the TUI.
@@ -430,9 +437,8 @@ impl CliSpawnAgentExecutor {
             project_root,
             cancel_token,
             skill_resolver: None,
-            active_session_id: None,
+            session_transcript: std::sync::Mutex::new(SessionTranscriptBinding::default()),
             fork_cache_sink: None,
-            journal: None,
             bg_task_commands: None,
             bg_task_list_cache: None,
             default_model: None,
@@ -511,9 +517,39 @@ impl CliSpawnAgentExecutor {
     /// a transcript. Journal availability is an observability degradation, not
     /// a reason to reject useful agent work: the executor keeps its session
     /// identity for tools and logs the persistence failure.
-    pub(crate) fn with_session_transcript(mut self, session_id: impl Into<String>) -> Self {
-        let session_id = session_id.into();
-        self.journal = match astra_services::session_journal::JournalWriter::new(&session_id) {
+    pub(crate) fn with_session_transcript(self, session_id: impl Into<String>) -> Self {
+        self.bind_session_transcript(session_id.into());
+        self
+    }
+
+    fn session_transcript_snapshot(
+        &self,
+    ) -> (
+        Option<String>,
+        Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
+    ) {
+        let guard = self
+            .session_transcript
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (guard.active_session_id.clone(), guard.journal.clone())
+    }
+
+    fn bind_session_transcript(&self, session_id: String) {
+        if session_id.trim().is_empty() {
+            return;
+        }
+        {
+            let guard = self
+                .session_transcript
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.active_session_id.as_deref() == Some(session_id.as_str()) {
+                return;
+            }
+        }
+
+        let journal = match astra_services::session_journal::JournalWriter::new(&session_id) {
             Ok(writer) => Some(Arc::new(writer)),
             Err(error) => {
                 tracing::warn!(
@@ -524,8 +560,13 @@ impl CliSpawnAgentExecutor {
                 None
             }
         };
-        self.active_session_id = Some(session_id);
-        self
+
+        let mut guard = self
+            .session_transcript
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.active_session_id = Some(session_id);
+        guard.journal = journal;
     }
 
     /// Install a fork-cache event sink. When present, every child
@@ -550,6 +591,10 @@ impl CliSpawnAgentExecutor {
 
 #[async_trait]
 impl SpawnAgentExecutor for CliSpawnAgentExecutor {
+    fn bind_parent_session(&self, session_id: &str) {
+        self.bind_session_transcript(session_id.to_string());
+    }
+
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         let all_schemas = edge_tools::local_tool_schemas();
         let valid_tool_names = tool_names_from_schemas(&all_schemas);
@@ -636,7 +681,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         if let Some(ref cache) = self.bg_task_list_cache {
             executor = executor.with_bg_task_list_cache(cache.clone());
         }
-        if let Some(session_id) = self.active_session_id.as_deref() {
+        let (active_session_id, journal) = self.session_transcript_snapshot();
+        if let Some(session_id) = active_session_id.as_deref() {
             executor.set_active_session_id(session_id.to_string());
         }
 
@@ -674,7 +720,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             inherited_prefix: config.inherited_prefix.clone(),
             fork_cache_sink: self.fork_cache_sink.clone(),
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
-            journal: self.journal.clone(),
+            journal,
             journal_identity: None,
         };
 
@@ -719,7 +765,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             force_reasoning_field,
         );
         if host.journal.is_some() {
-            if let Some(session_id) = self.active_session_id.as_ref() {
+            if let Some(session_id) = active_session_id.as_ref() {
                 host.journal_identity = Some(SubRunJournalIdentity {
                     session_id: session_id.clone(),
                     run_id: config.run_id.clone(),
@@ -887,7 +933,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
                     astra_runtime::turn::session_current_date::resolve_session_current_date(
-                        self.active_session_id.as_deref().unwrap_or(""),
+                        active_session_id.as_deref().unwrap_or(""),
                     ),
                 ),
             ),
@@ -1311,8 +1357,9 @@ mod tests {
              one via with_token_provider"
         );
         assert!(executor.default_model.is_none());
-        assert!(executor.journal.is_none());
-        assert!(executor.active_session_id.is_none());
+        let (session_id, journal) = executor.session_transcript_snapshot();
+        assert!(session_id.is_none());
+        assert!(journal.is_none());
     }
 
     #[test]
@@ -1324,12 +1371,30 @@ mod tests {
             CliSpawnAgentExecutor::new(api, "token".to_string(), PathBuf::from("/tmp"), None)
                 .with_session_transcript(session_id.clone());
 
+        let (active_session_id, journal) = executor.session_transcript_snapshot();
+        assert_eq!(active_session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(
-            executor.active_session_id.as_deref(),
-            Some(session_id.as_str())
+            journal.as_ref().map(|journal| journal.path()),
+            Some(&astra_services::session_journal::journal_file_path(
+                &session_id
+            ))
         );
+    }
+
+    #[test]
+    fn late_session_transcript_binding_installs_matching_journal_and_identity() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
+        let session_id = format!("spawn-transcript-late-{}", uuid::Uuid::new_v4());
+        let executor =
+            CliSpawnAgentExecutor::new(api, "token".to_string(), PathBuf::from("/tmp"), None);
+
+        executor.bind_parent_session(&session_id);
+
+        let (active_session_id, journal) = executor.session_transcript_snapshot();
+        assert_eq!(active_session_id.as_deref(), Some(session_id.as_str()));
         assert_eq!(
-            executor.journal.as_ref().map(|journal| journal.path()),
+            journal.as_ref().map(|journal| journal.path()),
             Some(&astra_services::session_journal::journal_file_path(
                 &session_id
             ))

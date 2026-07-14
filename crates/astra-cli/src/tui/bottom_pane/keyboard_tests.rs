@@ -74,6 +74,7 @@ fn terminal_agent_workbench_remains_until_explicit_close() {
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
         agent_id: "reviewer@done".into(),
         name: "reviewer".into(),
+        spawn_tool_call_id: None,
         activity: crate::tui::agent_run_projection::AgentActivityCounts::default(),
         run_id: Some("run-done".into()),
         parent_run_id: Some("root-run".into()),
@@ -106,6 +107,7 @@ fn typed_inspect_action_keeps_run_navigator_as_transcript_parent() {
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
+        spawn_tool_call_id: None,
         activity: crate::tui::agent_run_projection::AgentActivityCounts::default(),
         run_id: Some("run-active".into()),
         parent_run_id: Some("root-run".into()),
@@ -220,6 +222,7 @@ fn returning_to_run_tree_preserves_agent_conversation_tab() {
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
+        spawn_tool_call_id: None,
         activity: crate::tui::agent_run_projection::AgentActivityCounts::default(),
         run_id: Some("run-active".into()),
         parent_run_id: Some("root-run".into()),
@@ -343,6 +346,7 @@ fn hidden_run_tree_receives_updates_while_an_agent_transcript_is_focused() {
     let row = AgentRow {
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
+        spawn_tool_call_id: None,
         activity: crate::tui::agent_run_projection::AgentActivityCounts::default(),
         run_id: Some("run-active".into()),
         parent_run_id: Some("root-run".into()),
@@ -408,6 +412,7 @@ fn transcript_location_refresh_emits_one_typed_durable_load_action() {
     let row = AgentRow {
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
+        spawn_tool_call_id: None,
         activity: crate::tui::agent_run_projection::AgentActivityCounts::default(),
         run_id: Some("run-active".into()),
         parent_run_id: Some("root-run".into()),
@@ -480,6 +485,7 @@ fn typed_cancel_action_keeps_owning_view_open() {
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
+        spawn_tool_call_id: None,
         activity: crate::tui::agent_run_projection::AgentActivityCounts::default(),
         run_id: Some("run-active".into()),
         parent_run_id: Some("root-run".into()),

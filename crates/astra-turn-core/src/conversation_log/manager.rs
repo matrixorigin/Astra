@@ -1469,7 +1469,7 @@ mod tests {
                 "content",
                 json!([
                     {"a": {"y": 1, "z": 0}, "b": 2},
-                    {"tool": {"args": {"limit": 20, "path": "README.md"}, "name": "read_file"}}
+                    {"tool": {"args": {"end_line": 20, "path": "README.md", "start_line": 1}, "name": "read_file"}}
                 ]),
             ),
             ("role", json!("assistant")),
@@ -1483,7 +1483,7 @@ mod tests {
                 "content",
                 json!([
                     {"a": {"y": 1, "z": 0}, "b": 2},
-                    {"tool": {"args": {"limit": 20, "path": "README.md"}, "name": "read_file"}}
+                    {"tool": {"args": {"end_line": 20, "path": "README.md", "start_line": 1}, "name": "read_file"}}
                 ]),
             ),
             ("role", json!("assistant")),

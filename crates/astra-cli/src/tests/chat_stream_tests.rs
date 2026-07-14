@@ -492,6 +492,140 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
 }
 
 #[tokio::test]
+async fn stream_chat_sse_executes_bound_agent_spawn_to_child_request() {
+    let mock = crate::cli::mock_llm::MockLlmServer::start(
+        crate::cli::mock_llm::MockScenario::AgentThenComplete,
+    )
+    .await
+    .expect("start scripted parent and child LLM server");
+    let api = astra_thin_client::ThinClient::new(&mock.base_url, None).unwrap();
+    let unified_skill_registry = astra_runtime::skills::empty_unified_registry().clone();
+    let spawner = crate::cli::agent_runtime::build_one_shot_spawner(
+        &api,
+        "fake-token".to_string(),
+        unified_skill_registry.clone(),
+        None,
+        Some("mock-model".to_string()),
+    )
+    .await;
+    let mut pm = PermissionManager::new(true);
+    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        stream_chat_sse(ChatTurnParams {
+            api: &api,
+            token: "fake-token",
+            auth_profile: None,
+            message: "delegate_one_child_and_keep_it_observable",
+            user_intent: "delegate_one_child_and_keep_it_observable",
+            input_runtime_required_texts: &[],
+            input_runtime_volatile_texts: &[],
+            semantic_query_override: None,
+            session_id: None,
+            model_id: None,
+            model: Some("mock-model"),
+            provider: None,
+            explain: ExplainMode::Off,
+            render_md: false,
+            history: &[],
+            perm_manager: &mut pm,
+            verbose_mode: false,
+            render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
+            cli_context: None,
+            recent_tools: &[],
+            activated_deferred_tool_names: None,
+            resume_restricted_tools: &[],
+            tool_health_entries: &[],
+            session_lessons: &[],
+            latest_skill_diagnosis: None,
+            latest_turn_quality_feedback: None,
+            unified_skill_registry: &unified_skill_registry,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            delegation_engine: None,
+            cancel_token: None,
+            run_control: None,
+            incremental_state: None,
+            plan_assemble_line_release: None,
+            stream_event_tx: None,
+            agent_live_event_sink: None,
+            approval_request_tx: None,
+            ask_user_request_tx: None,
+            plan_review_request_tx: None,
+            mcp_manager: None,
+            skill_quality_tracker: &mut skill_qt,
+            discovered_skills: None,
+            messaging_metrics: None,
+            agent_spawner: Some(spawner),
+            root_agent_id: Some("main"),
+            root_mailbox_slot: None,
+            observability_hub: None,
+            observability_session: None,
+            file_journal: None,
+            file_state: None,
+            database_snapshot_journal: None,
+            git_stash_journal: None,
+            git_commit_journal: None,
+            git_worktree_journal: None,
+            session_state_journal: None,
+            task_manager: None,
+            task_notify_tx: None,
+            bg_task_commands: None,
+            bg_task_list_cache: None,
+            bash_detach_slot: None,
+            turn_index: DEFAULT_TURN_INDEX,
+            pipeline_state: None,
+            compaction_state: None,
+            consecutive_context_window_errors: 0,
+            idempotency_cache: None,
+            pre_loaded_messages: None,
+            append_system_prompt: None,
+            session_memory_extractor: None,
+            #[cfg(feature = "harness")]
+            harness_sink: None,
+            #[cfg(feature = "harness")]
+            harness_trace: None,
+            #[cfg(feature = "harness")]
+            benchmark_profile: None,
+        }),
+    )
+    .await
+    .expect("agent spawn turn should not hang")
+    .expect("agent spawn turn should complete");
+
+    assert!(
+        result
+            .full_text
+            .contains("Parent synthesized the child evidence"),
+        "parent should continue after one child result: {:?}",
+        result.full_text
+    );
+    let child_requests = mock
+        .received_requests()
+        .into_iter()
+        .filter(|request| {
+            request
+                .get("agent_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("general-purpose")
+                && request
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|messages| {
+                        messages.iter().rev().find(|message| {
+                            message.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                        })
+                    })
+                    .and_then(|message| message.get("content"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(crate::cli::mock_llm::AGENT_JOURNEY_CHILD_TASK)
+        })
+        .count();
+    assert_eq!(child_requests, 1);
+}
+
+#[tokio::test]
 async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
     let app = Router::new().route(
         "/chat/turn",

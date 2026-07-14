@@ -690,6 +690,7 @@ pub(crate) async fn stream_chat_sse(
         ask_user_request_tx: p.ask_user_request_tx,
         plan_review_request_tx: p.plan_review_request_tx,
         root_send_message_context,
+        agent_spawner: p.agent_spawner.clone(),
         chat_turn_index: current_session_turn,
         tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(
             resolved_tool_policy.max_identical_tool_calls,

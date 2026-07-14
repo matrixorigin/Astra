@@ -1313,12 +1313,12 @@ pub(super) async fn post_completed_step_run_handler(
     let expected_version = plan_state.version;
     let run_id = match state
         .plan_repo
-        .save_existing_and_record_completed_step_run(
-            &user.user_id,
-            &plan_id,
-            &mut plan_state,
+        .save_existing_and_record_completed_step_run(astra_plan::RecordCompletedStepRun {
+            user_id: &user.user_id,
+            plan_id: &plan_id,
+            state: &mut plan_state,
             expected_version,
-            astra_plan::NewStepRun {
+            input: astra_plan::NewStepRun {
                 plan_id: &plan_id,
                 subtask_id: &req.subtask_id,
                 attempt: req.attempt,
@@ -1326,9 +1326,9 @@ pub(super) async fn post_completed_step_run_handler(
                 session_id: &req.session_id,
                 request_id: &req.request_id,
             },
-            req.error.as_deref(),
-            req.artifact_ref.as_deref(),
-        )
+            error: req.error.as_deref(),
+            artifact_ref: req.artifact_ref.as_deref(),
+        })
         .await
     {
         Ok(run_id) => run_id,
@@ -1407,16 +1407,16 @@ pub(super) async fn finish_step_run_handler(
     let expected_version = plan_state.version;
     if let Err(error) = state
         .plan_repo
-        .save_existing_and_finalize_step_run(
-            &user.user_id,
-            &plan_id,
-            &mut plan_state,
+        .save_existing_and_finalize_step_run(astra_plan::FinalizeStepRun {
+            user_id: &user.user_id,
+            plan_id: &plan_id,
+            state: &mut plan_state,
             expected_version,
-            &run_id,
-            req.status,
-            req.error.as_deref(),
-            req.artifact_ref.as_deref(),
-        )
+            run_id: &run_id,
+            status: req.status,
+            error: req.error.as_deref(),
+            artifact_ref: req.artifact_ref.as_deref(),
+        })
         .await
     {
         return Err(map_plan_load_err(error));

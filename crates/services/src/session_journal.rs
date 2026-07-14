@@ -27,8 +27,8 @@ use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
 use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
 
 use crate::interaction_contract::{
-    InteractionContract, InteractionIdentity, InteractionKind, approval_decision_status,
-    ask_user_response_status,
+    InteractionContract, InteractionIdentity, InteractionKind, InteractionStatus,
+    approval_decision_status, ask_user_response_status,
 };
 use crate::{OwnerScope, SessionArtifactStore};
 
@@ -2631,6 +2631,9 @@ pub fn append_ask_user_response_for_run_if_absent(
         let Some(existing) = ask_user_response_from_event(event, request_id, run_id) else {
             continue;
         };
+        if ask_user_response_status(&existing.status) == InteractionStatus::Pending {
+            continue;
+        }
         return if existing.status == status && existing.answers == answers {
             Ok(AskUserResponseAppendOutcome::Idempotent)
         } else {

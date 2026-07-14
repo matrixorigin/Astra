@@ -173,6 +173,8 @@ impl LiveTranscript {
         });
     }
 
+    // Mirrors the typed ToolCompleted wire payload at the reducer boundary.
+    #[allow(clippy::too_many_arguments)]
     fn tool_completed(
         &mut self,
         tool_use_id: String,
@@ -296,6 +298,9 @@ struct PendingTranscriptCommit {
 }
 
 impl AgentTranscriptView {
+    // View identity, data source, and viewport are intentionally explicit;
+    // none is an optional builder concern after construction.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn loading(
         agent_id: String,
         agent_name: String,
@@ -1239,26 +1244,35 @@ impl BottomPaneView for AgentTranscriptView {
         snapshot: crate::tui::bottom_pane::in_flight_agents_view::AgentMonitorSnapshot,
     ) -> bool {
         let mut changed = false;
+        let pending_tool_call_id = self.agent_id.strip_prefix("pending:");
+        let matched_row = snapshot.rows.iter().find(|row| {
+            row.agent_id == self.agent_id
+                || pending_tool_call_id.is_some_and(|tool_call_id| {
+                    row.spawn_tool_call_id.as_deref() == Some(tool_call_id)
+                })
+        });
+        let Some(row) = matched_row else {
+            return false;
+        };
+        if row.agent_id != self.agent_id {
+            self.agent_id = row.agent_id.clone();
+            self.agent_name = row.name.clone();
+            self.error = None;
+            changed = true;
+        }
         if self.run_id.trim().is_empty()
-            && let Some(run_id) = snapshot
-                .rows
-                .iter()
-                .find(|row| row.agent_id == self.agent_id)
-                .and_then(|row| row.run_id.as_deref())
+            && let Some(run_id) = row
+                .run_id
+                .as_deref()
                 .filter(|run_id| !run_id.trim().is_empty())
         {
             self.run_id = run_id.to_string();
             self.error = None;
             changed = true;
         }
-        let Some(target) = snapshot
-            .rows
-            .iter()
-            .find(|row| {
-                row.agent_id == self.agent_id && row.run_id.as_deref() == Some(self.run_id.as_str())
-            })
-            .and_then(|row| row.transcript_target)
-        else {
+        let Some(target) = row.transcript_target.filter(|_| {
+            self.run_id.trim().is_empty() || row.run_id.as_deref() == Some(self.run_id.as_str())
+        }) else {
             if changed {
                 self.rebuild_transcript();
             }
@@ -1282,6 +1296,10 @@ impl BottomPaneView for AgentTranscriptView {
             self.rebuild_transcript();
         }
         true
+    }
+
+    fn has_pending_agent_transcript_identity(&self) -> bool {
+        self.run_id.trim().is_empty() || self.agent_id.starts_with("pending:")
     }
 
     fn refresh_agent_live_event(&mut self, event: &AgentLiveEvent) -> bool {
@@ -1437,6 +1455,7 @@ mod tests {
         crate::tui::bottom_pane::in_flight_agents_view::AgentRow {
             agent_id: "agent-1".into(),
             name: "Reviewer".into(),
+            spawn_tool_call_id: None,
             activity: Default::default(),
             run_id: Some("run-child".into()),
             parent_run_id: None,

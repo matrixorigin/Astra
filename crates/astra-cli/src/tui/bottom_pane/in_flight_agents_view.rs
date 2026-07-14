@@ -44,6 +44,7 @@ pub(crate) struct AgentFanoutMembership {
 pub(crate) struct AgentRow {
     pub agent_id: String,
     pub name: String,
+    pub spawn_tool_call_id: Option<String>,
     pub activity: AgentActivityCounts,
     pub run_id: Option<String>,
     pub parent_run_id: Option<String>,
@@ -1352,6 +1353,7 @@ mod tests {
             .map(|i| AgentRow {
                 agent_id: format!("agent-{i}"),
                 name: format!("task {i}"),
+                spawn_tool_call_id: None,
                 activity: AgentActivityCounts {
                     tool_calls: i,
                     child_agents: 0,

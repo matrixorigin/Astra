@@ -269,6 +269,8 @@ pub(crate) async fn handle_chat_input_with_ui(
         }
     };
 
+    ensure_multi_agent_runtime_for_turn(state, ctx.api, token, ctx.profile).await;
+
     if state.session_id.is_none() && state.pending_recovery.is_some() {
         clear_pending_recovery_for_ordinary_chat_input(state);
     }
@@ -331,11 +333,31 @@ pub(crate) async fn handle_chat_input_with_ui(
     settle_turn_attempt(state, &mut dispatch, attempt, run_chat_turn_boxed).await
 }
 
+async fn ensure_multi_agent_runtime_for_turn(
+    state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    profile: Option<&str>,
+) {
+    if state.agent_spawner.is_some() {
+        return;
+    }
+    crate::cli::agent_runtime::initialize_multi_agent_runtime(
+        state,
+        api,
+        token.to_string(),
+        profile,
+    )
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ShellPassthroughDecision, classify_shell_passthrough, model_selection_preflight_failure,
+        ShellPassthroughDecision, classify_shell_passthrough, ensure_multi_agent_runtime_for_turn,
+        model_selection_preflight_failure,
     };
+    use crate::cli::session::session_state::SessionState;
 
     #[test]
     fn shell_passthrough_returns_none_for_ordinary_input() {
@@ -367,6 +389,20 @@ mod tests {
             )
             .is_none(),
             "thinking selectors are concrete model choices and must reach payload assembly"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_boundary_initializes_multi_agent_runtime_when_startup_did_not() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+
+        ensure_multi_agent_runtime_for_turn(&mut state, &api, "turn-token", Some("test-profile"))
+            .await;
+
+        assert!(
+            state.agent_spawner.is_some(),
+            "a turn with a fresh token must have an agent executor binding"
         );
     }
 

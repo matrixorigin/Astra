@@ -76,6 +76,9 @@ where
     }
 }
 
+// Settlement owns several independent commit sinks; keeping them explicit
+// makes partial-failure handling auditable at this transaction boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_user_cancelled_turn(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,

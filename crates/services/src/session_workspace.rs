@@ -587,9 +587,7 @@ impl WorkspaceMetadata {
 
     /// Record a checkpoint at the current turn.
     pub fn record_checkpoint(&mut self) {
-        if !self.checkpoints.contains(&self.turn_count) {
-            self.checkpoints.push(self.turn_count);
-        }
+        self.checkpoints.push(self.turn_count);
         self.updated_at = chrono::Utc::now().to_rfc3339();
     }
 
@@ -1020,12 +1018,12 @@ mod tests {
         ws.record_turn(10, 5, 0, 0);
         ws.record_checkpoint();
         ws.record_checkpoint();
-        assert_eq!(ws.checkpoints, vec![3]);
+        assert_eq!(ws.checkpoints, vec![3, 3]);
 
         ws.record_turn(10, 5, 0, 0);
         ws.record_turn(10, 5, 0, 0);
         ws.record_checkpoint();
-        assert_eq!(ws.checkpoints, vec![3, 5]);
+        assert_eq!(ws.checkpoints, vec![3, 3, 5]);
     }
 
     #[test]

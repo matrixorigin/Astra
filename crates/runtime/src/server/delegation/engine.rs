@@ -57,8 +57,8 @@ use astra_services::{BubbleUpTarget, DatabaseStateProjectionStore, LlmTokenServi
 
 pub use astra_core::SubRunState;
 use astra_core::{
-    InvalidTransition, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED,
-    STATUS_RUNNING, STATUS_VERIFICATION_FAILED, STATUS_WAITING,
+    InvalidTransition, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
+    STATUS_PAUSED, STATUS_RUNNING, STATUS_VERIFICATION_FAILED, STATUS_WAITING,
 };
 
 use crate::server::run::engine::RunEngine;
@@ -68,7 +68,8 @@ use astra_prompts::team_prompts;
 /// Grace period for cooperative children to publish a canonical terminal
 /// result after their parent is cancelled. Keep this comfortably above a
 /// scheduler tick, but below the interactive cancellation latency budget.
-const FANOUT_CANCELLATION_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const FANOUT_CANCELLATION_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 /// State projection is an observability aid, not a copy of the full run tree.
 /// Keep the source, its nearest ancestors, and the root within this write
@@ -246,6 +247,120 @@ fn cancelled_agent_result(agent_id: &str, run_id: &str) -> AgentResult {
         completion_tokens: 0,
         tool_calls: 0,
     }
+}
+
+/// Convert the richer delegated-agent outcome taxonomy to the canonical
+/// durable run lifecycle. Details such as timeout/partial/verification failure
+/// remain on `AgentResult`; the run row intentionally stores only lifecycle
+/// states understood by every control-plane consumer.
+fn durable_status_for_agent_result(status: &str) -> &'static str {
+    match agent_result_status_kind(status) {
+        AgentResultStatusKind::Completed => STATUS_COMPLETED,
+        AgentResultStatusKind::Delegated => STATUS_DELEGATED,
+        AgentResultStatusKind::Waiting => STATUS_WAITING,
+        AgentResultStatusKind::Paused => STATUS_PAUSED,
+        AgentResultStatusKind::Cancelled => STATUS_CANCELLED,
+        AgentResultStatusKind::Timeout
+        | AgentResultStatusKind::VerificationFailed
+        | AgentResultStatusKind::Partial
+        | AgentResultStatusKind::Failed
+        | AgentResultStatusKind::Other => STATUS_FAILED,
+    }
+}
+
+/// Commit an executor result and return the outcome permitted by durable
+/// authority. A pause/cancel/terminal CAS winner must shape the result returned
+/// to the parent; otherwise the database, tracker, and aggregation can report
+/// contradictory facts for the same child run.
+async fn reconcile_agent_result_with_durable_authority(
+    run_engine: &RunEngine,
+    user_id: &str,
+    mut result: AgentResult,
+) -> AgentResult {
+    let attempted_status = durable_status_for_agent_result(&result.status);
+    let persistence = run_engine
+        .persist_delegation_outcome_status(
+            user_id,
+            &result.run_id,
+            attempted_status,
+            None,
+            result.error.as_deref(),
+        )
+        .await;
+    if matches!(persistence, Ok(true)) {
+        return result;
+    }
+
+    let persistence_detail = match &persistence {
+        Ok(false) => "outcome lost its durable status compare-and-set".to_string(),
+        Err(error) => format!("could not commit delegated outcome: {error}"),
+        Ok(true) => unreachable!(),
+    };
+    let durable = match run_engine.load_run(user_id, &result.run_id).await {
+        Ok(Some(durable)) => durable,
+        Ok(None) => {
+            result.status = STATUS_FAILED.to_string();
+            result.output = None;
+            result.error = Some(format!(
+                "{persistence_detail}; durable run {} is missing",
+                result.run_id
+            ));
+            return result;
+        }
+        Err(load_error) => {
+            result.status = STATUS_FAILED.to_string();
+            result.output = None;
+            result.error = Some(format!(
+                "{persistence_detail}; failed to load durable winner for run {}: {load_error}",
+                result.run_id
+            ));
+            return result;
+        }
+    };
+
+    // A replay can lose its CAS because the exact same terminal fact is
+    // already durable. Preserve the richer executor taxonomy/output in that
+    // idempotent case; no competing authority disagrees with it.
+    if durable.status == attempted_status {
+        return result;
+    }
+
+    tracing::info!(
+        target: "astra_runtime::delegation",
+        run_id = %result.run_id,
+        executor_status = %result.status,
+        attempted_durable_status = attempted_status,
+        durable_status = %durable.status,
+        "replaced stale delegated executor outcome with durable authority"
+    );
+    result.output = None;
+    match durable_run_status_kind(&durable.status) {
+        DurableRunStatusKind::Running => {
+            // `running` is not a terminal AgentResult. Project it as a
+            // recoverable wait so parent aggregation remains unfinished.
+            result.status = STATUS_WAITING.to_string();
+            result.error = None;
+        }
+        DurableRunStatusKind::Waiting | DurableRunStatusKind::Paused => {
+            result.status = durable.status;
+            result.error = None;
+        }
+        DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated => {
+            result.status = durable.status;
+            result.error = None;
+        }
+        DurableRunStatusKind::Cancelled => {
+            result.status = STATUS_CANCELLED.to_string();
+            result.error = durable
+                .error_message
+                .or_else(|| Some("cancelled by a concurrent durable control decision".to_string()));
+        }
+        DurableRunStatusKind::Failed | DurableRunStatusKind::Other => {
+            result.status = STATUS_FAILED.to_string();
+            result.error = durable.error_message.or(Some(persistence_detail));
+        }
+    }
+    result
 }
 
 fn normalize_context_allowlist_entry(entry: &str, key: &str) -> Result<String, String> {
@@ -2088,28 +2203,6 @@ impl DelegationEngine {
                         // Exhausted retries — mark as verification failure
                         let verification_error =
                             format!("verification gate failed after {attempt} attempts: {reason}");
-                        self.tracker
-                            .complete_sub_run_with_result(
-                                &current.run_id,
-                                SubRunState::VerificationFailed,
-                                Some(verification_error.as_str()),
-                                current.output.as_deref(),
-                            )
-                            .await;
-                        astra_core::log_persist!(
-                            self.run_engine
-                                .persist_delegation_outcome_status(
-                                    user_id,
-                                    &current.run_id,
-                                    STATUS_VERIFICATION_FAILED,
-                                    None,
-                                    Some(&reason),
-                                )
-                                .await,
-                            "delegation",
-                            &current.run_id,
-                            "verification_failed"
-                        );
                         return AgentResult {
                             status: STATUS_VERIFICATION_FAILED.to_string(),
                             error: Some(verification_error),
@@ -2125,28 +2218,6 @@ impl DelegationEngine {
                         Err(error) => {
                             let retry_error =
                                 format!("verification retry template unavailable: {error}");
-                            self.tracker
-                                .complete_sub_run_with_result(
-                                    &original_run_id,
-                                    SubRunState::Failed,
-                                    Some(retry_error.as_str()),
-                                    current.output.as_deref(),
-                                )
-                                .await;
-                            astra_core::log_persist!(
-                                self.run_engine
-                                    .persist_delegation_outcome_status(
-                                        user_id,
-                                        &original_run_id,
-                                        STATUS_FAILED,
-                                        None,
-                                        Some(retry_error.as_str()),
-                                    )
-                                    .await,
-                                "delegation",
-                                &original_run_id,
-                                "retry_template_unavailable"
-                            );
                             return AgentResult {
                                 status: STATUS_FAILED.to_string(),
                                 error: Some(retry_error),
@@ -2177,28 +2248,6 @@ impl DelegationEngine {
                         };
                     if cancelled_during_backoff {
                         let cancellation = "cancelled during verification retry backoff";
-                        self.tracker
-                            .complete_sub_run_with_result(
-                                &original_run_id,
-                                SubRunState::Cancelled,
-                                Some(cancellation),
-                                current.output.as_deref(),
-                            )
-                            .await;
-                        astra_core::log_persist!(
-                            self.run_engine
-                                .persist_delegation_outcome_status(
-                                    user_id,
-                                    &original_run_id,
-                                    STATUS_CANCELLED,
-                                    None,
-                                    Some(cancellation),
-                                )
-                                .await,
-                            "delegation",
-                            &original_run_id,
-                            "verification_retry_cancelled"
-                        );
                         return AgentResult {
                             status: STATUS_CANCELLED.to_string(),
                             error: Some(cancellation.to_string()),
@@ -2279,13 +2328,26 @@ impl DelegationEngine {
                         ),
                     );
 
-                    // Mark the original as verification-failed before retrying
+                    // Close the original attempt before retrying. The original
+                    // executor success was deliberately not committed yet;
+                    // verification is part of the terminal outcome contract.
+                    let rejected = reconcile_agent_result_with_durable_authority(
+                        &self.run_engine,
+                        user_id,
+                        AgentResult {
+                            status: STATUS_VERIFICATION_FAILED.to_string(),
+                            error: Some(reason.clone()),
+                            ..current.clone()
+                        },
+                    )
+                    .await;
+                    let rejected_state = agent_result_status_to_subrun_state(&rejected.status);
                     self.tracker
-                        .complete_sub_run_with_result(
+                        .apply_sub_run_result_state(
                             &original_run_id,
-                            SubRunState::VerificationFailed,
-                            Some(reason.as_str()),
-                            current.output.as_deref(),
+                            rejected_state,
+                            rejected.error.as_deref(),
+                            rejected.output.as_deref(),
                         )
                         .await;
 
@@ -2329,45 +2391,17 @@ impl DelegationEngine {
                     } else {
                         retry_exec.await
                     } {
-                        Ok(r) => {
-                            let result_state = agent_result_status_to_subrun_state(&r.status);
-                            self.tracker
-                                .apply_sub_run_result_state(
-                                    &r.run_id,
-                                    result_state,
-                                    r.error.as_deref(),
-                                    r.output.as_deref(),
-                                )
-                                .await;
-                            astra_core::log_persist!(
-                                self.run_engine
-                                    .persist_delegation_outcome_status(
-                                        user_id,
-                                        &r.run_id,
-                                        &r.status,
-                                        None,
-                                        r.error.as_deref(),
-                                    )
-                                    .await,
-                                "delegation",
-                                &r.run_id,
-                                "status"
-                            );
-                            current = r;
-                        }
+                        Ok(result) => current = result,
                         Err(e) => {
-                            self.tracker
-                                .complete_sub_run_with_result(
-                                    &retry_run_id,
-                                    SubRunState::Failed,
-                                    Some(e.as_str()),
-                                    None,
-                                )
-                                .await;
                             return AgentResult {
+                                agent_id: retry_agent_id,
+                                run_id: retry_run_id,
                                 status: STATUS_FAILED.to_string(),
                                 error: Some(format!("retry execution failed: {e}")),
-                                ..current
+                                output: None,
+                                prompt_tokens: 0,
+                                completion_tokens: 0,
+                                tool_calls: 0,
                             };
                         }
                     }
@@ -2934,22 +2968,19 @@ impl DelegationEngine {
 
         // Use JoinSet for abort-on-drop semantics: if caller times out before
         // collecting all results, remaining tasks are aborted automatically.
-        let mut join_set: tokio::task::JoinSet<(Result<AgentResult, String>, String, String)> =
+        let mut join_set: tokio::task::JoinSet<(AgentResult, String, String)> =
             tokio::task::JoinSet::new();
         // Track agent_id/run_id for panic recovery (JoinSet doesn't preserve spawn order)
         let mut id_map: HashMap<tokio::task::Id, (String, String)> = HashMap::new();
 
         for config in configs {
             let executor = self.executor.clone();
-            let run_engine = self.run_engine.clone();
-            let tracker = self.tracker.clone();
             let sem = semaphore.clone();
             let cancel = cancel_token.cloned();
             let agent_timeout = per_agent_timeout;
             // Capture identity before moving config into the closure (panic context)
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
-            let request_user_id = config.user_id.clone();
             let abort_handle = join_set.spawn(async move {
                 let run_id = config.run_id.clone();
                 let agent_id = config.agent_profile.agent_id.clone();
@@ -2998,51 +3029,19 @@ impl DelegationEngine {
                         None => executor.execute(config).await,
                     }
                 };
-                let result = exec_future.await;
-                // Determine final state and persist
-                let final_state = match &result {
-                    Ok(r) => {
-                        astra_core::log_persist!(
-                            run_engine
-                                .persist_delegation_outcome_status(
-                                    &request_user_id,
-                                    &run_id,
-                                    &r.status,
-                                    None,
-                                    r.error.as_deref(),
-                                )
-                                .await,
-                            "delegation",
-                            &run_id,
-                            "status"
-                        );
-                        agent_result_status_to_subrun_state(&r.status)
-                    }
-                    Err(e) => {
-                        astra_core::log_persist!(
-                            run_engine
-                                .persist_delegation_outcome_status(
-                                    &request_user_id,
-                                    &run_id,
-                                    STATUS_FAILED,
-                                    None,
-                                    Some(e.as_str()),
-                                )
-                                .await,
-                            "delegation",
-                            &run_id,
-                            "status"
-                        );
-                        SubRunState::Failed
-                    }
+                let result = match exec_future.await {
+                    Ok(result) => result,
+                    Err(error) => AgentResult {
+                        agent_id: agent_id.clone(),
+                        run_id: run_id.clone(),
+                        status: STATUS_FAILED.to_string(),
+                        output: None,
+                        error: Some(error),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
                 };
-                let (error, output_preview) = match &result {
-                    Ok(r) => (r.error.as_deref(), r.output.as_deref()),
-                    Err(e) => (Some(e.as_str()), None),
-                };
-                tracker
-                    .apply_sub_run_result_state(&run_id, final_state, error, output_preview)
-                    .await;
                 (result, agent_id, run_id)
             });
             id_map.insert(abort_handle.id(), (captured_agent_id, captured_run_id));
@@ -3094,19 +3093,7 @@ impl DelegationEngine {
             }
         } {
             match join_result {
-                Ok((Ok(result), _, _)) => results.push(result),
-                Ok((Err(e), agent_id, run_id)) => {
-                    results.push(AgentResult {
-                        agent_id,
-                        run_id,
-                        status: STATUS_FAILED.to_string(),
-                        output: None,
-                        error: Some(e),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    });
-                }
+                Ok((result, _, _)) => results.push(result),
                 Err(e) => {
                     // JoinError (panic) — look up identity from id_map using task ID
                     let (panic_agent_id, panic_run_id) = id_map
@@ -3114,55 +3101,10 @@ impl DelegationEngine {
                         .cloned()
                         .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
                     if e.is_cancelled() && cancel_token.is_some_and(|token| token.is_cancelled()) {
-                        let cancelled = cancelled_agent_result(&panic_agent_id, &panic_run_id);
-                        astra_core::log_persist!(
-                            self.run_engine
-                                .persist_delegation_outcome_status(
-                                    &request.user_id,
-                                    &panic_run_id,
-                                    STATUS_CANCELLED,
-                                    None,
-                                    cancelled.error.as_deref(),
-                                )
-                                .await,
-                            "delegation",
-                            &panic_run_id,
-                            "status"
-                        );
-                        self.tracker
-                            .apply_sub_run_result_state(
-                                &panic_run_id,
-                                SubRunState::Cancelled,
-                                cancelled.error.as_deref(),
-                                None,
-                            )
-                            .await;
-                        results.push(cancelled);
+                        results.push(cancelled_agent_result(&panic_agent_id, &panic_run_id));
                         continue;
                     }
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_delegation_outcome_status(
-                                &request.user_id,
-                                &panic_run_id,
-                                STATUS_FAILED,
-                                None,
-                                Some(&format!("task panicked: {e}"))
-                            )
-                            .await,
-                        "delegation",
-                        &panic_run_id,
-                        "status"
-                    );
                     let panic_error = format!("task join error (panic): {e}");
-                    self.tracker
-                        .complete_sub_run_with_result(
-                            &panic_run_id,
-                            SubRunState::Failed,
-                            Some(panic_error.as_str()),
-                            None,
-                        )
-                        .await;
                     results.push(AgentResult {
                         agent_id: panic_agent_id,
                         run_id: panic_run_id,
@@ -3241,6 +3183,27 @@ impl DelegationEngine {
             }
             results = gated_results;
         }
+
+        let mut authoritative_results = Vec::with_capacity(results.len());
+        for result in results {
+            let result = reconcile_agent_result_with_durable_authority(
+                &self.run_engine,
+                &request.user_id,
+                result,
+            )
+            .await;
+            let final_state = agent_result_status_to_subrun_state(&result.status);
+            self.tracker
+                .apply_sub_run_result_state(
+                    &result.run_id,
+                    final_state,
+                    result.error.as_deref(),
+                    result.output.as_deref(),
+                )
+                .await;
+            authoritative_results.push(result);
+        }
+        let results = authoritative_results;
 
         let aggregated = aggregate_results(aggregation, &results);
         Ok(DelegationResult::from_results(
@@ -3434,68 +3397,18 @@ impl DelegationEngine {
             };
 
             let result = match exec_result {
-                Ok(r) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_delegation_outcome_status(
-                                &request.user_id,
-                                &sub_run_id,
-                                &r.status,
-                                None,
-                                r.error.as_deref(),
-                            )
-                            .await,
-                        "delegation",
-                        &sub_run_id,
-                        "status"
-                    );
-                    let final_state = agent_result_status_to_subrun_state(&r.status);
-                    self.tracker
-                        .apply_sub_run_result_state(
-                            &sub_run_id,
-                            final_state,
-                            r.error.as_deref(),
-                            r.output.as_deref(),
-                        )
-                        .await;
-                    r
-                }
-                Err(e) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_delegation_outcome_status(
-                                &request.user_id,
-                                &sub_run_id,
-                                STATUS_FAILED,
-                                None,
-                                Some(e.as_str()),
-                            )
-                            .await,
-                        "delegation",
-                        &sub_run_id,
-                        "status"
-                    );
-                    self.tracker
-                        .complete_sub_run_with_result(
-                            &sub_run_id,
-                            SubRunState::Failed,
-                            Some(e.as_str()),
-                            None,
-                        )
-                        .await;
-                    AgentResult {
-                        agent_id: agent_id.clone(),
-                        run_id: sub_run_id,
-                        status: STATUS_FAILED.to_string(),
-                        output: None,
-                        error: Some(e),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    }
-                }
+                Ok(result) => result,
+                Err(error) => AgentResult {
+                    agent_id: agent_id.clone(),
+                    run_id: sub_run_id.clone(),
+                    status: STATUS_FAILED.to_string(),
+                    output: None,
+                    error: Some(error),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
             };
-
             // ── Verification gate with retry for sequential sub-runs ──
             let result = if self.gate.is_some() {
                 let delegation_id = request.delegation_id.clone();
@@ -3553,6 +3466,21 @@ impl DelegationEngine {
             } else {
                 result
             };
+            let result = reconcile_agent_result_with_durable_authority(
+                &self.run_engine,
+                &request.user_id,
+                result,
+            )
+            .await;
+            let final_state = agent_result_status_to_subrun_state(&result.status);
+            self.tracker
+                .apply_sub_run_result_state(
+                    &result.run_id,
+                    final_state,
+                    result.error.as_deref(),
+                    result.output.as_deref(),
+                )
+                .await;
 
             // Feed output to the next stage (pipeline semantics).
             previous_output = result.output.clone();
@@ -3753,68 +3681,18 @@ impl DelegationEngine {
                 None => self.executor.execute(prod_config).await,
             };
             let prod_result = match prod_exec {
-                Ok(r) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_delegation_outcome_status(
-                                &request.user_id,
-                                &prod_run_id,
-                                &r.status,
-                                None,
-                                r.error.as_deref(),
-                            )
-                            .await,
-                        "delegation",
-                        &prod_run_id,
-                        "status"
-                    );
-                    let final_state = agent_result_status_to_subrun_state(&r.status);
-                    self.tracker
-                        .apply_sub_run_result_state(
-                            &prod_run_id,
-                            final_state,
-                            r.error.as_deref(),
-                            r.output.as_deref(),
-                        )
-                        .await;
-                    r
-                }
-                Err(e) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_delegation_outcome_status(
-                                &request.user_id,
-                                &prod_run_id,
-                                STATUS_FAILED,
-                                None,
-                                Some(e.as_str()),
-                            )
-                            .await,
-                        "delegation",
-                        &prod_run_id,
-                        "status"
-                    );
-                    self.tracker
-                        .complete_sub_run_with_result(
-                            &prod_run_id,
-                            SubRunState::Failed,
-                            Some(e.as_str()),
-                            None,
-                        )
-                        .await;
-                    AgentResult {
-                        agent_id: producer_id.to_string(),
-                        run_id: prod_run_id,
-                        status: STATUS_FAILED.to_string(),
-                        output: None,
-                        error: Some(e),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    }
-                }
+                Ok(result) => result,
+                Err(error) => AgentResult {
+                    agent_id: producer_id.to_string(),
+                    run_id: prod_run_id.clone(),
+                    status: STATUS_FAILED.to_string(),
+                    output: None,
+                    error: Some(error),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
             };
-
             // ── Gate on producer output before reviewer sees it ──
             let prod_result = if self.gate.is_some() {
                 let did = request.delegation_id.clone();
@@ -3864,6 +3742,21 @@ impl DelegationEngine {
             } else {
                 prod_result
             };
+            let prod_result = reconcile_agent_result_with_durable_authority(
+                &self.run_engine,
+                &request.user_id,
+                prod_result,
+            )
+            .await;
+            let final_state = agent_result_status_to_subrun_state(&prod_result.status);
+            self.tracker
+                .apply_sub_run_result_state(
+                    &prod_result.run_id,
+                    final_state,
+                    prod_result.error.as_deref(),
+                    prod_result.output.as_deref(),
+                )
+                .await;
 
             last_producer_output = prod_result.output.clone();
             results.push(prod_result);
@@ -3994,67 +3887,33 @@ impl DelegationEngine {
                 None => self.executor.execute(rev_config).await,
             };
             let rev_result = match rev_exec {
-                Ok(r) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_delegation_outcome_status(
-                                &request.user_id,
-                                &rev_run_id,
-                                &r.status,
-                                None,
-                                r.error.as_deref(),
-                            )
-                            .await,
-                        "delegation",
-                        &rev_run_id,
-                        "status"
-                    );
-                    let final_state = agent_result_status_to_subrun_state(&r.status);
-                    self.tracker
-                        .apply_sub_run_result_state(
-                            &rev_run_id,
-                            final_state,
-                            r.error.as_deref(),
-                            r.output.as_deref(),
-                        )
-                        .await;
-                    r
-                }
-                Err(e) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_delegation_outcome_status(
-                                &request.user_id,
-                                &rev_run_id,
-                                STATUS_FAILED,
-                                None,
-                                Some(e.as_str()),
-                            )
-                            .await,
-                        "delegation",
-                        &rev_run_id,
-                        "status"
-                    );
-                    self.tracker
-                        .complete_sub_run_with_result(
-                            &rev_run_id,
-                            SubRunState::Failed,
-                            Some(e.as_str()),
-                            None,
-                        )
-                        .await;
-                    AgentResult {
-                        agent_id: reviewer_id.to_string(),
-                        run_id: rev_run_id,
-                        status: STATUS_FAILED.to_string(),
-                        output: None,
-                        error: Some(e),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    }
-                }
+                Ok(result) => result,
+                Err(error) => AgentResult {
+                    agent_id: reviewer_id.to_string(),
+                    run_id: rev_run_id.clone(),
+                    status: STATUS_FAILED.to_string(),
+                    output: None,
+                    error: Some(error),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
             };
+            let rev_result = reconcile_agent_result_with_durable_authority(
+                &self.run_engine,
+                &request.user_id,
+                rev_result,
+            )
+            .await;
+            let final_state = agent_result_status_to_subrun_state(&rev_result.status);
+            self.tracker
+                .apply_sub_run_result_state(
+                    &rev_run_id,
+                    final_state,
+                    rev_result.error.as_deref(),
+                    rev_result.output.as_deref(),
+                )
+                .await;
             results.push(rev_result);
         }
 
@@ -4113,7 +3972,7 @@ impl DelegationEngine {
         } else {
             None
         };
-        let mut handles: tokio::task::JoinSet<(Result<AgentResult, String>, String, String)> =
+        let mut handles: tokio::task::JoinSet<(AgentResult, String, String)> =
             tokio::task::JoinSet::new();
         let mut fork_id_map: HashMap<tokio::task::Id, (String, String)> = HashMap::new();
         for (i, task) in tasks.iter().enumerate() {
@@ -4304,51 +4163,33 @@ impl DelegationEngine {
                         None => executor.execute(config).await,
                     }
                 };
-                let result = exec_future.await;
-                let final_state = match &result {
-                    Ok(r) => {
-                        if let Err(e) = run_engine
-                            .persist_delegation_outcome_status(
-                                &request_user_id,
-                                &run_id,
-                                &r.status,
-                                None,
-                                r.error.as_deref(),
-                            )
-                            .await
-                        {
-                            astra_core::agent_warn!(
-                                "delegation",
-                                "Fork: failed to persist final status for {run_id}: {e}"
-                            );
-                        }
-                        agent_result_status_to_subrun_state(&r.status)
-                    }
-                    Err(e) => {
-                        if let Err(pe) = run_engine
-                            .persist_delegation_outcome_status(
-                                &request_user_id,
-                                &run_id,
-                                STATUS_FAILED,
-                                None,
-                                Some(e),
-                            )
-                            .await
-                        {
-                            astra_core::agent_warn!(
-                                "delegation",
-                                "Fork: failed to persist error status for {run_id}: {pe}"
-                            );
-                        }
-                        SubRunState::Failed
-                    }
+                let result = match exec_future.await {
+                    Ok(result) => result,
+                    Err(error) => AgentResult {
+                        agent_id: agent_id.clone(),
+                        run_id: run_id.clone(),
+                        status: STATUS_FAILED.to_string(),
+                        output: None,
+                        error: Some(error),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
                 };
-                let (error, output_preview) = match &result {
-                    Ok(r) => (r.error.as_deref(), r.output.as_deref()),
-                    Err(e) => (Some(e.as_str()), None),
-                };
+                let result = reconcile_agent_result_with_durable_authority(
+                    &run_engine,
+                    &request_user_id,
+                    result,
+                )
+                .await;
+                let final_state = agent_result_status_to_subrun_state(&result.status);
                 tracker
-                    .apply_sub_run_result_state(&run_id, final_state, error, output_preview)
+                    .apply_sub_run_result_state(
+                        &run_id,
+                        final_state,
+                        result.error.as_deref(),
+                        result.output.as_deref(),
+                    )
                     .await;
                 (result, agent_id, run_id)
             });
@@ -4399,86 +4240,55 @@ impl DelegationEngine {
             }
         } {
             match join_result {
-                Ok((Ok(r), _, _)) => results.push(r),
-                Ok((Err(e), agent_id, run_id)) => results.push(AgentResult {
-                    agent_id,
-                    run_id,
-                    status: "failed".to_string(),
-                    output: None,
-                    error: Some(e),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                }),
+                Ok((result, _, _)) => results.push(result),
                 Err(e) => {
                     let (panic_agent_id, panic_run_id) = fork_id_map
                         .get(&e.id())
                         .cloned()
                         .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
                     if e.is_cancelled() && cancel_token.is_some_and(|token| token.is_cancelled()) {
-                        let cancelled = cancelled_agent_result(&panic_agent_id, &panic_run_id);
-                        if let Err(error) = self
-                            .run_engine
-                            .persist_delegation_outcome_status(
-                                &request.user_id,
-                                &panic_run_id,
-                                STATUS_CANCELLED,
-                                None,
-                                cancelled.error.as_deref(),
-                            )
-                            .await
-                        {
-                            astra_core::agent_warn!(
-                                "delegation",
-                                "Fork: failed to persist cancelled status for {panic_run_id}: {error}"
-                            );
-                        }
+                        let cancelled = reconcile_agent_result_with_durable_authority(
+                            &self.run_engine,
+                            &request.user_id,
+                            cancelled_agent_result(&panic_agent_id, &panic_run_id),
+                        )
+                        .await;
                         self.tracker
                             .apply_sub_run_result_state(
                                 &panic_run_id,
-                                SubRunState::Cancelled,
+                                agent_result_status_to_subrun_state(&cancelled.status),
                                 cancelled.error.as_deref(),
-                                None,
+                                cancelled.output.as_deref(),
                             )
                             .await;
                         results.push(cancelled);
                         continue;
                     }
-                    if let Err(e2) = self
-                        .run_engine
-                        .persist_delegation_outcome_status(
-                            &request.user_id,
-                            &panic_run_id,
-                            STATUS_FAILED,
-                            None,
-                            Some(&format!("fork task panicked: {e}")),
-                        )
-                        .await
-                    {
-                        astra_core::agent_warn!(
-                            "delegation",
-                            "Fork: failed to persist panic status for {panic_run_id}: {e2}"
-                        );
-                    }
                     let panic_error = format!("fork task panicked: {e}");
+                    let panic_result = reconcile_agent_result_with_durable_authority(
+                        &self.run_engine,
+                        &request.user_id,
+                        AgentResult {
+                            agent_id: panic_agent_id,
+                            run_id: panic_run_id.clone(),
+                            status: STATUS_FAILED.to_string(),
+                            output: None,
+                            error: Some(panic_error),
+                            prompt_tokens: 0,
+                            completion_tokens: 0,
+                            tool_calls: 0,
+                        },
+                    )
+                    .await;
                     self.tracker
-                        .complete_sub_run_with_result(
+                        .apply_sub_run_result_state(
                             &panic_run_id,
-                            SubRunState::Failed,
-                            Some(panic_error.as_str()),
-                            None,
+                            agent_result_status_to_subrun_state(&panic_result.status),
+                            panic_result.error.as_deref(),
+                            panic_result.output.as_deref(),
                         )
                         .await;
-                    results.push(AgentResult {
-                        agent_id: panic_agent_id,
-                        run_id: panic_run_id,
-                        status: "failed".to_string(),
-                        output: None,
-                        error: Some(panic_error),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    });
+                    results.push(panic_result);
                 }
             }
         }
@@ -6831,6 +6641,89 @@ mod tests {
             .unwrap();
         assert_eq!(durable.status, STATUS_WAITING);
         assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
+    }
+
+    #[tokio::test]
+    async fn durable_control_decision_replaces_stale_executor_result() {
+        for (run_id, durable_status) in [
+            ("stale-after-pause", STATUS_PAUSED),
+            ("stale-after-cancel", STATUS_CANCELLED),
+        ] {
+            let (_, engine, _) = setup();
+            engine
+                .start_run(run_id, "user-1", "session-1")
+                .await
+                .unwrap();
+            engine
+                .persist_status(
+                    "user-1",
+                    run_id,
+                    durable_status,
+                    Some("control-plane"),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let authoritative = reconcile_agent_result_with_durable_authority(
+                &engine,
+                "user-1",
+                AgentResult {
+                    agent_id: "coder".into(),
+                    run_id: run_id.into(),
+                    status: STATUS_COMPLETED.into(),
+                    output: Some("stale executor output".into()),
+                    error: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 5,
+                    tool_calls: 1,
+                },
+            )
+            .await;
+
+            assert_eq!(authoritative.status, durable_status);
+            assert!(authoritative.output.is_none());
+            if durable_status == STATUS_CANCELLED {
+                assert!(authoritative.error.is_some());
+            } else {
+                assert!(authoritative.error.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_terminal_replay_preserves_richer_agent_result() {
+        let (_, engine, _) = setup();
+        let run_id = "completed-result-replay";
+        engine
+            .start_run(run_id, "user-1", "session-1")
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .persist_delegation_outcome_status("user-1", run_id, STATUS_COMPLETED, None, None,)
+                .await
+                .unwrap()
+        );
+
+        let replayed = reconcile_agent_result_with_durable_authority(
+            &engine,
+            "user-1",
+            AgentResult {
+                agent_id: "coder".into(),
+                run_id: run_id.into(),
+                status: STATUS_COMPLETED.into(),
+                output: Some("full answer".into()),
+                error: None,
+                prompt_tokens: 3,
+                completion_tokens: 5,
+                tool_calls: 1,
+            },
+        )
+        .await;
+
+        assert_eq!(replayed.status, STATUS_COMPLETED);
+        assert_eq!(replayed.output.as_deref(), Some("full answer"));
     }
 
     // ─── Verification Gate Tests ────────────────────────────────────────────

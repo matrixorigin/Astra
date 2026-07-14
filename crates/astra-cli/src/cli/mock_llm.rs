@@ -408,7 +408,8 @@ async fn body_agent_then_complete(body: &Value) -> String {
                 "prompt": AGENT_JOURNEY_CHILD_TASK,
                 "agent_type": "general-purpose"
             });
-            stream.push_str(&tool_call_start("call-spawn-child", "agent", args));
+            stream.push_str(&tool_call_start("call-spawn-child", "agent", args.clone()));
+            stream.push_str(&tool_request("call-spawn-child", "agent", args));
             stream.push_str(&done_event(80));
             stream
         }
@@ -677,9 +678,9 @@ impl MockLlmServer {
 #[cfg(test)]
 mod tests {
     use super::{
-        MockScenario, body_complete, body_fail, body_malformed_json, body_multi_turn,
-        body_rate_limited, body_sse_chunk_split, body_text_only, body_tool_then_complete,
-        root_has_tool_result,
+        MockScenario, body_agent_then_complete, body_complete, body_fail, body_malformed_json,
+        body_multi_turn, body_rate_limited, body_sse_chunk_split, body_text_only,
+        body_tool_then_complete, root_has_tool_result,
     };
     use serde_json::Value;
 
@@ -736,6 +737,59 @@ mod tests {
 
         assert!(root_has_tool_result(&request, "agent"));
         assert!(!root_has_tool_result(&request, "tool_search"));
+    }
+
+    #[tokio::test]
+    async fn agent_then_complete_spawn_round_emits_executable_tool_request() {
+        let request = serde_json::json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call-activate-agent",
+                        "type": "function",
+                        "function": {"name": "tool_search", "arguments": "{}"}
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-activate-agent",
+                    "content": "selected agent"
+                }
+            ],
+            "tool_results": [{
+                "tool_call_id": "call-activate-agent",
+                "name": "tool_search",
+                "result": "selected agent"
+            }]
+        });
+        let body = body_agent_then_complete(&request).await;
+        let mut accum = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+
+        for event in parse_sse_events(&body) {
+            astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut pending,
+            );
+        }
+
+        let agent_request = pending
+            .iter()
+            .find_map(|item| match item {
+                astra_turn_core::chat_turn_sse_dispatch::ChatTurnEdgePending::ToolRequest {
+                    request_id,
+                    tool,
+                    args,
+                    ..
+                } if tool == "agent" => Some((request_id, args)),
+                _ => None,
+            })
+            .expect("spawn round must expose an executable agent tool_request");
+        assert_eq!(agent_request.0, "call-spawn-child");
+        assert_eq!(agent_request.1["action"], "spawn");
+        assert_eq!(agent_request.1["prompt"], super::AGENT_JOURNEY_CHILD_TASK);
     }
 
     #[test]

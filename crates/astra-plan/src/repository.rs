@@ -94,6 +94,32 @@ pub struct NewStepRun<'a> {
     pub request_id: &'a str,
 }
 
+/// One atomic command that persists a terminal plan transition and appends
+/// its already-completed attempt. Grouping these values makes the transaction
+/// boundary explicit and prevents positional argument drift at call sites.
+pub struct RecordCompletedStepRun<'a> {
+    pub user_id: &'a str,
+    pub plan_id: &'a str,
+    pub state: &'a mut PlanModeState,
+    pub expected_version: u64,
+    pub input: NewStepRun<'a>,
+    pub error: Option<&'a str>,
+    pub artifact_ref: Option<&'a str>,
+}
+
+/// One atomic command that persists a terminal plan transition and closes an
+/// existing open attempt.
+pub struct FinalizeStepRun<'a> {
+    pub user_id: &'a str,
+    pub plan_id: &'a str,
+    pub state: &'a mut PlanModeState,
+    pub expected_version: u64,
+    pub run_id: &'a str,
+    pub status: TaskStatus,
+    pub error: Option<&'a str>,
+    pub artifact_ref: Option<&'a str>,
+}
+
 /// Summary info for a saved plan.
 #[derive(Debug, Clone)]
 pub struct SavedPlanInfo {
@@ -210,13 +236,7 @@ pub trait PlanRepository: Send + Sync {
     /// cannot be modelled as two best-effort writes.
     async fn save_existing_and_record_completed_step_run(
         &self,
-        _user_id: &str,
-        _plan_id: &str,
-        _state: &mut PlanModeState,
-        _expected_version: u64,
-        _input: NewStepRun<'_>,
-        _error: Option<&str>,
-        _artifact_ref: Option<&str>,
+        _command: RecordCompletedStepRun<'_>,
     ) -> Result<String, PlanLoadError> {
         Err(PlanLoadError::Internal(
             "plan repository does not support atomic completed-step persistence".to_string(),
@@ -227,14 +247,7 @@ pub trait PlanRepository: Send + Sync {
     /// existing open attempt.
     async fn save_existing_and_finalize_step_run(
         &self,
-        _user_id: &str,
-        _plan_id: &str,
-        _state: &mut PlanModeState,
-        _expected_version: u64,
-        _run_id: &str,
-        _status: TaskStatus,
-        _error: Option<&str>,
-        _artifact_ref: Option<&str>,
+        _command: FinalizeStepRun<'_>,
     ) -> Result<(), PlanLoadError> {
         Err(PlanLoadError::Internal(
             "plan repository does not support atomic step-finalization persistence".to_string(),
@@ -937,14 +950,17 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn save_existing_and_record_completed_step_run(
         &self,
-        user_id: &str,
-        plan_id: &str,
-        state: &mut PlanModeState,
-        expected_version: u64,
-        input: NewStepRun<'_>,
-        error: Option<&str>,
-        artifact_ref: Option<&str>,
+        command: RecordCompletedStepRun<'_>,
     ) -> Result<String, PlanLoadError> {
+        let RecordCompletedStepRun {
+            user_id,
+            plan_id,
+            state,
+            expected_version,
+            input,
+            error,
+            artifact_ref,
+        } = command;
         let run_id = Uuid::new_v4().to_string();
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         Self::save_existing_in_transaction(&mut tx, user_id, plan_id, state, expected_version)
@@ -977,15 +993,18 @@ impl PlanRepository for CloudPlanRepository {
 
     async fn save_existing_and_finalize_step_run(
         &self,
-        user_id: &str,
-        plan_id: &str,
-        state: &mut PlanModeState,
-        expected_version: u64,
-        run_id: &str,
-        status: TaskStatus,
-        error: Option<&str>,
-        artifact_ref: Option<&str>,
+        command: FinalizeStepRun<'_>,
     ) -> Result<(), PlanLoadError> {
+        let FinalizeStepRun {
+            user_id,
+            plan_id,
+            state,
+            expected_version,
+            run_id,
+            status,
+            error,
+            artifact_ref,
+        } = command;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         Self::save_existing_in_transaction(&mut tx, user_id, plan_id, state, expected_version)
             .await?;
@@ -1588,14 +1607,17 @@ impl PlanRepository for InMemoryPlanRepository {
 
     async fn save_existing_and_record_completed_step_run(
         &self,
-        user_id: &str,
-        plan_id: &str,
-        state: &mut PlanModeState,
-        expected_version: u64,
-        input: NewStepRun<'_>,
-        error: Option<&str>,
-        artifact_ref: Option<&str>,
+        command: RecordCompletedStepRun<'_>,
     ) -> Result<String, PlanLoadError> {
+        let RecordCompletedStepRun {
+            user_id,
+            plan_id,
+            state,
+            expected_version,
+            input,
+            error,
+            artifact_ref,
+        } = command;
         validate_plan_id(plan_id)?;
         ensure_state_owner(user_id, state)?;
         let run_id = Uuid::new_v4().to_string();
@@ -1642,15 +1664,18 @@ impl PlanRepository for InMemoryPlanRepository {
 
     async fn save_existing_and_finalize_step_run(
         &self,
-        user_id: &str,
-        plan_id: &str,
-        state: &mut PlanModeState,
-        expected_version: u64,
-        run_id: &str,
-        status: TaskStatus,
-        error: Option<&str>,
-        artifact_ref: Option<&str>,
+        command: FinalizeStepRun<'_>,
     ) -> Result<(), PlanLoadError> {
+        let FinalizeStepRun {
+            user_id,
+            plan_id,
+            state,
+            expected_version,
+            run_id,
+            status,
+            error,
+            artifact_ref,
+        } = command;
         validate_plan_id(plan_id)?;
         ensure_state_owner(user_id, state)?;
         let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
@@ -1921,28 +1946,28 @@ mod tests {
 
         let mut finished = repo.load("u-1", "plan-atomic").await.unwrap();
         finished.plan.subtasks[0].status = TaskStatus::Completed;
-        repo.save_existing_and_finalize_step_run(
-            "u-1",
-            "plan-atomic",
-            &mut finished,
-            2,
-            &run_id,
-            TaskStatus::Completed,
-            None,
-            Some("artifact://build"),
-        )
+        repo.save_existing_and_finalize_step_run(FinalizeStepRun {
+            user_id: "u-1",
+            plan_id: "plan-atomic",
+            state: &mut finished,
+            expected_version: 2,
+            run_id: &run_id,
+            status: TaskStatus::Completed,
+            error: None,
+            artifact_ref: Some("artifact://build"),
+        })
         .await
         .expect("atomically finish step");
 
         let mut completed = repo.load("u-1", "plan-atomic").await.unwrap();
         completed.plan.subtasks[1].status = TaskStatus::Completed;
         let completed_run_id = repo
-            .save_existing_and_record_completed_step_run(
-                "u-1",
-                "plan-atomic",
-                &mut completed,
-                3,
-                NewStepRun {
+            .save_existing_and_record_completed_step_run(RecordCompletedStepRun {
+                user_id: "u-1",
+                plan_id: "plan-atomic",
+                state: &mut completed,
+                expected_version: 3,
+                input: NewStepRun {
                     plan_id: "plan-atomic",
                     subtask_id: "verify",
                     attempt: 1,
@@ -1950,9 +1975,9 @@ mod tests {
                     session_id: "session-a",
                     request_id: "run-b",
                 },
-                None,
-                Some("artifact://verify"),
-            )
+                error: None,
+                artifact_ref: Some("artifact://verify"),
+            })
             .await
             .expect("atomically record completed step");
 
@@ -2017,12 +2042,12 @@ mod tests {
         let mut stale = initial;
         stale.plan.subtasks[0].status = TaskStatus::Completed;
         let error = repo
-            .save_existing_and_record_completed_step_run(
-                "u-1",
-                "plan-conflict",
-                &mut stale,
-                1,
-                NewStepRun {
+            .save_existing_and_record_completed_step_run(RecordCompletedStepRun {
+                user_id: "u-1",
+                plan_id: "plan-conflict",
+                state: &mut stale,
+                expected_version: 1,
+                input: NewStepRun {
                     plan_id: "plan-conflict",
                     subtask_id: "step",
                     attempt: 2,
@@ -2030,9 +2055,9 @@ mod tests {
                     session_id: "session-a",
                     request_id: "run-b",
                 },
-                None,
-                None,
-            )
+                error: None,
+                artifact_ref: None,
+            })
             .await
             .expect_err("stale plan version must not append an orphan attempt");
         assert!(matches!(error, PlanLoadError::Conflict { .. }));

@@ -522,13 +522,13 @@ impl TaskBoardObserver {
         tasks.retain(|task| !task.is_finished());
         let inner = self.inner.clone();
         tasks.push(tokio::spawn(async move {
-            let mut fetch = tokio::spawn(future);
-            let failure = match tokio::time::timeout(timeout, &mut fetch).await {
+            let mut fetch = AbortOnDrop::new(tokio::spawn(future));
+            let failure = match tokio::time::timeout(timeout, fetch.handle_mut()).await {
                 Ok(Ok(())) => return,
                 Ok(Err(error)) => format!("fetch task failed: {error}"),
                 Err(_) => {
                     fetch.abort();
-                    let _ = fetch.await;
+                    let _ = fetch.handle_mut().await;
                     format!("fetch timed out after {}ms", timeout.as_millis())
                 }
             };
@@ -974,6 +974,30 @@ impl TaskBoardObserver {
             .unwrap_or_else(Instant::now);
         dirty.store(true, Ordering::Relaxed);
         true
+    }
+}
+
+struct AbortOnDrop<T> {
+    handle: tokio::task::JoinHandle<T>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self { handle }
+    }
+
+    fn handle_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+        &mut self.handle
+    }
+
+    fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 

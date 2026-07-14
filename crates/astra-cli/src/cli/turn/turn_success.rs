@@ -40,6 +40,9 @@ pub(crate) fn apply_turn_success(
     }
 }
 
+// Settlement owns several independent commit sinks; keeping them explicit
+// makes partial-failure handling auditable at this transaction boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_turn_success_async(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,

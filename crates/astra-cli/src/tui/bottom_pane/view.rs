@@ -256,6 +256,12 @@ pub(crate) trait BottomPaneView: Send {
         false
     }
 
+    /// Whether an open agent transcript still needs the monitor's typed
+    /// spawn/run correlation before it can accept canonical live events.
+    fn has_pending_agent_transcript_identity(&self) -> bool {
+        false
+    }
+
     fn refresh_task_board(
         &mut self,
         _projection: &crate::tui::task_board_observer::TaskBoardProjection,

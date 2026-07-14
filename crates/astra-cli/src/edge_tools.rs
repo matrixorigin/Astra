@@ -6309,6 +6309,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_agent_spawn_executes_through_runtime_context() {
+        let spawner = test_spawner();
+        let ctx = fanout_test_context(spawner);
+        let executor = test_executor().with_spawn_context(ctx);
+
+        let result = executor
+            .execute(
+                "agent",
+                &serde_json::json!({
+                    "action": "spawn",
+                    "description": "Review one area",
+                    "prompt": "Return a short result.",
+                    "agent_type": "general-purpose"
+                }),
+            )
+            .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("agent spawn result must be structured JSON");
+
+        assert_eq!(parsed["status"], "completed", "{result}");
+        assert_eq!(parsed["result"], "child result", "{result}");
+        assert!(
+            !result.contains("multi-agent runtime is not connected"),
+            "bound spawn context must not be treated as missing: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn task_list_bg_surfaces_recoverable_fanout_results_without_background_runner() {
         let spawner = test_spawner();
         let ctx = fanout_test_context(spawner);

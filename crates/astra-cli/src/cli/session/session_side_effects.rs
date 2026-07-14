@@ -103,10 +103,10 @@ pub(crate) fn enqueue_ingestion_batch_pub(
 }
 
 pub(crate) fn enqueue_ingestion_for_immediate_drain_pub(
-    state: &SessionState,
+    _state: &SessionState,
     event: &session_journal::JournalEvent,
 ) {
-    enqueue_ingestion(state, event);
+    enqueue_ingestion_batch_without_runtime(std::slice::from_ref(event));
 }
 
 pub(crate) fn drop_unattributed_memory_recalls_at_turn_end(session_id: Option<&str>) -> usize {
@@ -276,8 +276,6 @@ pub(crate) fn append_one_shot_journal_events(
     let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
         return Ok(());
     };
-    let writer = session_journal::JournalWriter::new(session_id)
-        .map_err(|error| format!("failed to create session journal for {session_id}: {error}"))?;
     let existing_events = match session_journal::read_journal(session_id) {
         Ok(events) => events,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -299,6 +297,8 @@ pub(crate) fn append_one_shot_journal_events(
     }) {
         return Ok(());
     }
+    let writer = session_journal::JournalWriter::new(session_id)
+        .map_err(|error| format!("failed to create session journal for {session_id}: {error}"))?;
 
     let mut append_events = build_bridge_pipeline_journal_events(
         Some(session_id),

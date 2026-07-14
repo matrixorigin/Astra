@@ -66,7 +66,7 @@ fn execute_memory_profile(tool_name: &str, args: &Value) -> PermissionMemoryProf
 }
 
 fn command_match_target(command: &str) -> AllowMatchTarget {
-    if !validate_git_command(command).is_empty() {
+    if !validate_git_command(command).is_empty() || command_contains_secondary_git_step(command) {
         return AllowMatchTarget::Exact;
     }
 
@@ -76,6 +76,18 @@ fn command_match_target(command: &str) -> AllowMatchTarget {
     } else {
         AllowMatchTarget::Prefix(prefix)
     }
+}
+
+fn command_contains_secondary_git_step(command: &str) -> bool {
+    let parsed = tokenize_compound_command(command);
+    if parsed.steps.len() == 1 || is_cd_wrapper_single_command(&parsed) {
+        return false;
+    }
+
+    parsed
+        .steps
+        .iter()
+        .any(|step| step.command.split_whitespace().next() == Some("git"))
 }
 
 fn shell_persistent_block(
@@ -316,11 +328,23 @@ mod tests {
     }
 
     #[test]
+    fn plain_git_commit_uses_command_family() {
+        let args = serde_json::json!({"command": "git commit -m 'fix'"});
+        let profile = permission_memory_profile("bash", &args);
+        assert_eq!(
+            profile.match_target,
+            AllowMatchTarget::Prefix("git commit".to_string())
+        );
+        assert_eq!(profile.persistent_block, None);
+        assert!(profile.has_stable_target);
+    }
+
+    #[test]
     fn git_safety_commands_stay_exact() {
         for command in [
             "git restore --staged --worktree crates/foo/src/lib.rs",
             "git push --force-with-lease origin main",
-            "cd /repo && git diff origin/main...HEAD --stat",
+            "git commit --no-verify -m 'skip hooks'",
         ] {
             let args = serde_json::json!({"command": command});
             let profile = permission_memory_profile("bash", &args);
@@ -328,5 +352,17 @@ mod tests {
             assert_eq!(profile.persistent_block, None, "{command}");
             assert!(profile.has_stable_target, "{command}");
         }
+    }
+
+    #[test]
+    fn multi_step_git_command_stays_exact() {
+        let args = serde_json::json!({"command": "cargo test && git status"});
+        let profile = permission_memory_profile("bash", &args);
+        assert_eq!(profile.match_target, AllowMatchTarget::Exact);
+        assert_eq!(
+            profile.persistent_block,
+            Some(PersistentMemoryBlock::CompoundCommand)
+        );
+        assert!(profile.has_stable_target);
     }
 }
