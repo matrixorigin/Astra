@@ -1161,6 +1161,26 @@ fn record_full_llm_response_event(
     buf.record(evt);
 }
 
+/// Wrap a serialized `PipelineJournalEvent` payload as an SSE meta event.
+///
+/// The bridge journals pipeline telemetry server-side, but per-cell
+/// experiment exports carry the CLI-side artifact set — the CLI's journal
+/// and event log can only contain what the server streams. Every pipeline
+/// event type must therefore go over the stream with a `type` tag, exactly
+/// like the pipeline_metrics events the experiment harness already consumes.
+fn pipeline_meta_stream_event(event_type: &str, payload: Value) -> Value {
+    let mut event = match payload {
+        Value::Object(map) => map,
+        other => {
+            let mut map = Map::new();
+            map.insert("payload".to_string(), other);
+            map
+        }
+    };
+    event.insert("type".to_string(), Value::String(event_type.to_string()));
+    Value::Object(event)
+}
+
 fn bridge_success_response_payload(
     full_text: &str,
     reasoning: &str,
@@ -4155,7 +4175,15 @@ impl InProcessChatTurnBridge {
                 }
 
                 // ── Formal pipeline feedback / alerts ──
-                if let Some(buf) = turn_event_buffer.as_mut() {
+                // Computed unconditionally: these feed BOTH the server-side
+                // journal (when the turn event buffer exists) AND the SSE
+                // stream. Streaming is the part the E2 pilot proved matters:
+                // per-cell exports carry the CLI-side artifact set, and the
+                // CLI can only see what the server streams — pipeline_metrics
+                // reached every trace while feedback/alerts, journaled
+                // server-side only, never did (hit/event columns empty in
+                // 36/36 cells).
+                {
                     let current_turn = bridge_pipeline_event_turn(trace_turn);
                     let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
                         usage_snapshot.input_tokens,
@@ -4195,13 +4223,19 @@ impl InProcessChatTurnBridge {
                         )
                         .with_api_calls_total(bridge_pipeline_baseline.stats.api_calls);
                     if let Ok(payload) = serde_json::to_value(&feedback_evt) {
-                        buf.record(
-                            astra_services::session_journal::JournalEvent::pipeline_feedback(
-                                (!session_id.is_empty()).then_some(session_id.as_str()),
-                                current_turn,
-                                payload,
-                            ),
-                        );
+                        if let Some(buf) = turn_event_buffer.as_mut() {
+                            buf.record(
+                                astra_services::session_journal::JournalEvent::pipeline_feedback(
+                                    (!session_id.is_empty()).then_some(session_id.as_str()),
+                                    current_turn,
+                                    payload.clone(),
+                                ),
+                            );
+                        }
+                        yield render_sse(&pipeline_meta_stream_event(
+                            "pipeline_feedback",
+                            payload,
+                        ));
                     }
 
                     for alert in astra_turn_core::trace_alert::evaluate_alerts(
@@ -4216,13 +4250,19 @@ impl InProcessChatTurnBridge {
                                 &alert,
                             );
                         if let Ok(payload) = serde_json::to_value(&alert_evt) {
-                            buf.record(
-                                astra_services::session_journal::JournalEvent::pipeline_alert(
-                                    (!session_id.is_empty()).then_some(session_id.as_str()),
-                                    current_turn,
-                                    payload,
-                                ),
-                            );
+                            if let Some(buf) = turn_event_buffer.as_mut() {
+                                buf.record(
+                                    astra_services::session_journal::JournalEvent::pipeline_alert(
+                                        (!session_id.is_empty()).then_some(session_id.as_str()),
+                                        current_turn,
+                                        payload.clone(),
+                                    ),
+                                );
+                            }
+                            yield render_sse(&pipeline_meta_stream_event(
+                                "pipeline_alert",
+                                payload,
+                            ));
                         }
                     }
                 }
@@ -7534,6 +7574,69 @@ mod tests {
                 .is_none(),
             "reconstructed detector state should treat the next stable turn as a hit"
         );
+    }
+
+    #[test]
+    fn pipeline_meta_stream_event_tags_feedback_payload() {
+        // E2 regression: feedback/alert telemetry was journaled server-side
+        // only, so CLI-side exports (the only side experiment cells carry)
+        // had metrics-only traces — hit/event columns empty in 36/36 cells.
+        // Every pipeline event must also go over the stream, type-tagged.
+        let feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
+            1_000, 8_000, 1_000, 500, false,
+        );
+        let payload = serde_json::to_value(
+            astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
+                3, "model-a", &feedback,
+            ),
+        )
+        .expect("serialize");
+        let event = pipeline_meta_stream_event("pipeline_feedback", payload);
+        assert_eq!(
+            event.get("type").and_then(Value::as_str),
+            Some("pipeline_feedback")
+        );
+        assert_eq!(event.get("kind").and_then(Value::as_str), Some("Feedback"));
+        assert!(
+            (event
+                .get("cache_hit_ratio")
+                .and_then(Value::as_f64)
+                .unwrap()
+                - 0.8)
+                .abs()
+                < 1e-9
+        );
+        assert_eq!(event.get("turn").and_then(Value::as_u64), Some(3));
+    }
+
+    #[test]
+    fn pipeline_meta_stream_event_tags_alert_payload_and_wraps_non_objects() {
+        let alert = astra_turn_core::trace_alert::TraceAlert {
+            severity: astra_turn_core::trace_alert::AlertSeverity::Warning,
+            rule: "pressure_spike".into(),
+            message: "jump".into(),
+            turn: 7,
+        };
+        let payload = serde_json::to_value(
+            astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(&alert),
+        )
+        .expect("serialize");
+        let event = pipeline_meta_stream_event("pipeline_alert", payload);
+        assert_eq!(
+            event.get("type").and_then(Value::as_str),
+            Some("pipeline_alert")
+        );
+        assert_eq!(
+            event.get("alert_rule").and_then(Value::as_str),
+            Some("pressure_spike")
+        );
+
+        let wrapped = pipeline_meta_stream_event("pipeline_alert", Value::from(42));
+        assert_eq!(
+            wrapped.get("type").and_then(Value::as_str),
+            Some("pipeline_alert")
+        );
+        assert_eq!(wrapped.get("payload").and_then(Value::as_u64), Some(42));
     }
 
     #[test]
