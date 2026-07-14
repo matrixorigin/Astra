@@ -415,6 +415,10 @@ impl RunEngine {
         self
     }
 
+    pub(crate) fn metrics_registry(&self) -> Option<&Arc<MetricsRegistry>> {
+        self.metrics_registry.as_ref()
+    }
+
     /// Start renewing the store owner's active-run lease until the returned
     /// guard is dropped. Stores without shared owner leases return `None`.
     pub(crate) fn start_owner_lease_heartbeat(

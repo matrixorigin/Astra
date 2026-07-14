@@ -784,7 +784,7 @@ mod tests {
                 None,
                 None,
                 &allowed_tools,
-                crate::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+                crate::turn::agentic_recursion_guard::ABSOLUTE_MAX_AGENT_RECURSION_DEPTH,
                 None,
                 None,
             )
@@ -792,7 +792,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.contains("recursion depth") && err.contains("reached maximum"),
+            err.contains("recursion depth") && err.contains("absolute safety ceiling"),
             "error must cite depth limit; got: {err}"
         );
     }

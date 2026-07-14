@@ -4,8 +4,6 @@
 //!   * Server-side `SUBRUN_MAX_TURNS` (30) and
 //!     `SUBRUN_MAX_CUMULATIVE_TOKENS` (500_000) — asymmetric-by-design
 //!     vs CLI ceilings, so drift on either side is surfaced.
-//!   * `MAX_AGENT_RECURSION_DEPTH` (3) — capping nested delegations,
-//!     skill forks, and spawned agents.
 //!   * `SubRunResult` carries a typed terminal outcome independently from
 //!     partial text output.
 //!
@@ -19,7 +17,6 @@ use astra_runtime::server::server_skill_subrun::{
     SUBRUN_MAX_TURNS as SERVER_SUBRUN_MAX_TURNS,
 };
 use astra_runtime::skills::executor::isolated::{SubRunOutcome, SubRunResult};
-use astra_runtime::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH;
 
 #[test]
 fn server_subrun_max_turns_is_exactly_30() {
@@ -38,11 +35,6 @@ fn server_subrun_tokens_strictly_exceeds_cli_subrun_tokens() {
     // refactor unifying the two constants trips this guard at compile
     // time (const block) rather than test time.
     const _: () = assert!(SERVER_SUBRUN_MAX_TOKENS > 120_000);
-}
-
-#[test]
-fn agent_recursion_depth_cap_is_exactly_3() {
-    assert_eq!(MAX_AGENT_RECURSION_DEPTH, 3u8);
 }
 
 #[test]

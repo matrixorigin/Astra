@@ -37,10 +37,6 @@ pub fn fan_out_agent_prompt(
             "Results will be compared for consensus — be precise and evidence-based so your \
              output can be meaningfully compared with peers."
         }
-        "LlmGuided" => {
-            "An LLM will synthesize all agent outputs — structure your output clearly with \
-             headers and key findings so it can be effectively merged."
-        }
         _ => {
             // AllResults or unknown
             "All agent outputs will be collected — be thorough but avoid redundancy with \
@@ -277,7 +273,7 @@ mod tests {
 
     #[test]
     fn fan_out_aggregation_strategies() {
-        for strategy in &["FirstSuccess", "Consensus", "LlmGuided", "AllResults"] {
+        for strategy in &["FirstSuccess", "Consensus", "AllResults"] {
             let prompt = fan_out_agent_prompt("a", &["a", "b"], strategy, false);
             assert!(
                 prompt.contains(strategy),

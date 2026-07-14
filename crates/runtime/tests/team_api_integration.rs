@@ -285,7 +285,7 @@ fn fanout_research_payload() -> Value {
         "description": "Fan-out: 3 researchers investigate in parallel, results merged",
         "coordination": {
             "type": "fan_out",
-            "aggregation": "best_score"
+            "aggregation": "all_results"
         },
         "members": [
             {
@@ -670,7 +670,7 @@ async fn scenario_complex_team_full_roundtrip() {
         "description": "Complex team exercising every field",
         "coordination": {
             "type": "fan_out",
-            "aggregation": "merge"
+            "aggregation": "all_results"
         },
         "members": [
             {

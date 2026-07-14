@@ -423,7 +423,7 @@ fn infer_coordination(team: &Team) -> astra_services::team_persistence::TeamCoor
 
     // Default: FanOut for parallel teams
     TeamCoordination::FanOut {
-        aggregation: "merge".to_string(),
+        aggregation: astra_services::team_persistence::TeamAggregation::AllResults,
     }
 }
 
@@ -619,7 +619,8 @@ pub(crate) async fn handle_team_command(
                     ),
                     "fanout" | "fan-out" => {
                         Some(astra_services::team_persistence::TeamCoordination::FanOut {
-                            aggregation: "merge".to_string(),
+                            aggregation:
+                                astra_services::team_persistence::TeamAggregation::AllResults,
                         })
                     }
                     "sequential" => Some(
@@ -2482,7 +2483,7 @@ mod tests {
             name: "from-store".into(),
             description: "loaded from store".into(),
             coordination: TeamCoordination::FanOut {
-                aggregation: "merge".into(),
+                aggregation: astra_services::team_persistence::TeamAggregation::AllResults,
             },
             members: vec![TeamMemberDef {
                 role: "worker".into(),

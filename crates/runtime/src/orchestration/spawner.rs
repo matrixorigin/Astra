@@ -4647,7 +4647,8 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
-            recursion_depth: astra_turn_core::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+            recursion_depth:
+                astra_turn_core::agentic_recursion_guard::ABSOLUTE_MAX_AGENT_RECURSION_DEPTH,
             parent_is_fork_child: false,
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],

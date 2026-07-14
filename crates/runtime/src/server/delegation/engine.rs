@@ -42,8 +42,9 @@ fn canonical_agent_id(id: &str) -> String {
 
 use astra_services::coordination::{
     AGENT_RESULT_STATUS_FAILED, AgentProfile, AgentProfileRegistry, AgentResult,
-    AggregationStrategy, CoordinationPattern, DelegationRequest, DelegationResult,
-    agent_result_status_to_subrun_state, aggregate_results,
+    AgentResultStatusKind, AggregationStrategy, CoordinationPattern, DelegationRequest,
+    DelegationResult, DelegationResultStatusKind, agent_result_status_kind,
+    agent_result_status_to_subrun_state, aggregate_results, delegation_result_status_kind,
 };
 use astra_services::delegated_findings::{
     DelegatedFindingEnvelope, DelegatedFindingParse, MAX_DELEGATED_FINDING_SUMMARY_CHARS,
@@ -78,6 +79,114 @@ const MAX_FINDING_BUBBLE_TARGETS: usize = 8;
 /// Protect recovery from corrupt or externally imported parent maps while
 /// remaining far above the supported delegation depth of normal profiles.
 const MAX_ANCESTRY_TRAVERSAL: usize = 64;
+
+const VERIFICATION_RETRY_BASE_DELAY_MS: u64 = 200;
+const VERIFICATION_RETRY_MAX_DELAY_MS: u64 = 2_000;
+const VERIFICATION_RETRY_JITTER_MS: u64 = 100;
+
+const METRIC_DELEGATION_EXECUTIONS_TOTAL: &str = "astra_delegation_executions_total";
+const METRIC_DELEGATION_DURATION_MS_TOTAL: &str = "astra_delegation_duration_ms_total";
+const METRIC_DELEGATION_SUB_RUNS_TOTAL: &str = "astra_delegation_sub_runs_total";
+const METRIC_DELEGATION_TOKENS_TOTAL: &str = "astra_delegation_tokens_total";
+
+fn register_delegation_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
+    registry.register_counter(
+        METRIC_DELEGATION_EXECUTIONS_TOTAL,
+        "Delegation executions by coordination pattern and terminal outcome.",
+    );
+    registry.register_counter(
+        METRIC_DELEGATION_DURATION_MS_TOTAL,
+        "Total delegation wall time in milliseconds by pattern and outcome.",
+    );
+    registry.register_counter(
+        METRIC_DELEGATION_SUB_RUNS_TOTAL,
+        "Delegated sub-runs by pattern and canonical terminal status.",
+    );
+    registry.register_counter(
+        METRIC_DELEGATION_TOKENS_TOTAL,
+        "Delegated agent tokens by pattern and token kind.",
+    );
+}
+
+fn delegation_outcome_label(result: &Result<DelegationResult, String>) -> &'static str {
+    match result {
+        Ok(result) => match delegation_result_status_kind(&result.status) {
+            DelegationResultStatusKind::Completed => "completed",
+            DelegationResultStatusKind::Partial => "partial",
+            DelegationResultStatusKind::Unfinished => "unfinished",
+            DelegationResultStatusKind::Failed | DelegationResultStatusKind::Other => "failed",
+        },
+        Err(_) => "error",
+    }
+}
+
+fn sub_run_status_label(status: &str) -> &'static str {
+    match agent_result_status_kind(status) {
+        AgentResultStatusKind::Completed | AgentResultStatusKind::Delegated => "completed",
+        AgentResultStatusKind::Waiting => "waiting",
+        AgentResultStatusKind::Paused => "paused",
+        AgentResultStatusKind::Cancelled => "cancelled",
+        AgentResultStatusKind::Timeout => "timeout",
+        AgentResultStatusKind::VerificationFailed => "verification_failed",
+        AgentResultStatusKind::Partial => "partial",
+        AgentResultStatusKind::Failed | AgentResultStatusKind::Other => "failed",
+    }
+}
+
+fn record_delegation_metrics(
+    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    pattern: &str,
+    elapsed: std::time::Duration,
+    result: &Result<DelegationResult, String>,
+) {
+    let Some(registry) = registry else { return };
+    let outcome = delegation_outcome_label(result);
+    let labels = [("pattern", pattern), ("outcome", outcome)];
+    registry.increment_counter(METRIC_DELEGATION_EXECUTIONS_TOTAL, &labels, 1);
+    registry.increment_counter(
+        METRIC_DELEGATION_DURATION_MS_TOTAL,
+        &labels,
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    );
+    if let Ok(result) = result {
+        for sub_run in &result.agent_results {
+            registry.increment_counter(
+                METRIC_DELEGATION_SUB_RUNS_TOTAL,
+                &[
+                    ("pattern", pattern),
+                    ("status", sub_run_status_label(&sub_run.status)),
+                ],
+                1,
+            );
+        }
+        registry.increment_counter(
+            METRIC_DELEGATION_TOKENS_TOTAL,
+            &[("pattern", pattern), ("kind", "prompt")],
+            result.total_prompt_tokens,
+        );
+        registry.increment_counter(
+            METRIC_DELEGATION_TOKENS_TOTAL,
+            &[("pattern", pattern), ("kind", "completion")],
+            result.total_completion_tokens,
+        );
+    }
+}
+
+/// Bounded exponential delay for verification retries. The stable per-run
+/// jitter prevents a failed fanout from synchronizing its retries while
+/// keeping behavior deterministic enough to diagnose and test.
+fn verification_retry_delay(retry_attempt: u32, run_id: &str) -> std::time::Duration {
+    let exponent = retry_attempt.saturating_sub(2).min(4);
+    let exponential = VERIFICATION_RETRY_BASE_DELAY_MS
+        .saturating_mul(1_u64 << exponent)
+        .min(VERIFICATION_RETRY_MAX_DELAY_MS);
+    let hash = run_id.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        hash.wrapping_mul(0x100000001b3) ^ u64::from(byte)
+    });
+    std::time::Duration::from_millis(
+        exponential.saturating_add(hash % (VERIFICATION_RETRY_JITTER_MS + 1)),
+    )
+}
 
 fn ancestry_from_parents(parents: &HashMap<String, String>, run_id: &str) -> Vec<String> {
     let mut chain = Vec::new();
@@ -641,14 +750,26 @@ pub trait CheckpointGate: Send + Sync {
 // SubRunRecord and DelegationProgress are now defined in astra-server-types.
 pub use astra_server_types::team_orchestrator_traits::{DelegationProgress, SubRunRecord};
 
-/// In-memory tracker for delegation hierarchies and pause state.
+/// Canonical in-memory projection of the durable delegation hierarchy.
 ///
-/// Optionally persists state changes to a session journal for crash recovery.
+/// Keeping the records, delegation membership, and parent edges behind one
+/// lock makes insertion/recovery/cleanup atomic. A run lookup is O(1) instead
+/// of scanning every user's delegation, which also removes an avoidable
+/// cross-tenant performance coupling in server deployments.
+#[derive(Default)]
+struct DelegationTrackerState {
+    runs: HashMap<String, SubRunRecord>,
+    delegation_runs: HashMap<String, Vec<String>>,
+    parents: HashMap<String, String>,
+}
+
+/// Process-local projection for live delegation controls.
+///
+/// Durable run records are authoritative and rebuild this projection after a
+/// restart. The optional session journal is diagnostic evidence, not the
+/// source of truth for recovery.
 pub struct DelegationTracker {
-    /// delegation_id → sub-run records
-    delegations: RwLock<HashMap<String, Vec<SubRunRecord>>>,
-    /// run_id → parent_run_id (for quick lookups)
-    parents: RwLock<HashMap<String, String>>,
+    state: RwLock<DelegationTrackerState>,
     /// run_id → cooperative pause flag (shared with the sub-run's loop)
     pause_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
     /// run_id → cancellation token (shared with the sub-run's loop)
@@ -664,8 +785,7 @@ pub struct DelegationTracker {
 impl DelegationTracker {
     pub fn new() -> Self {
         Self {
-            delegations: RwLock::new(HashMap::new()),
-            parents: RwLock::new(HashMap::new()),
+            state: RwLock::new(DelegationTrackerState::default()),
             pause_flags: RwLock::new(HashMap::new()),
             cancel_tokens: RwLock::new(HashMap::new()),
             session_id: None,
@@ -677,8 +797,7 @@ impl DelegationTracker {
     /// Create a tracker with journal persistence enabled.
     pub fn with_session(session_id: String) -> Self {
         Self {
-            delegations: RwLock::new(HashMap::new()),
-            parents: RwLock::new(HashMap::new()),
+            state: RwLock::new(DelegationTrackerState::default()),
             pause_flags: RwLock::new(HashMap::new()),
             cancel_tokens: RwLock::new(HashMap::new()),
             session_id: Some(session_id),
@@ -743,8 +862,7 @@ impl DelegationTracker {
     /// Called at startup to recover delegation state after a crash.
     /// Only records with `parent_run_id` set are considered (sub-runs).
     pub async fn load_from_run_records(&self, records: &[astra_services::runs::DurableRunRecord]) {
-        let mut delegations = self.delegations.write().await;
-        let mut parents = self.parents.write().await;
+        let mut state = self.state.write().await;
         let mut pause_flags = self.pause_flags.write().await;
 
         for rec in records {
@@ -775,11 +893,17 @@ impl DelegationTracker {
                 retry_of: rec.retry_of.clone(),
             };
 
-            delegations
+            let delegation_runs = state
+                .delegation_runs
                 .entry(delegation_id.clone())
-                .or_default()
-                .push(sub);
-            parents.insert(rec.run_id.clone(), parent_run_id.clone());
+                .or_default();
+            if !delegation_runs.contains(&rec.run_id) {
+                delegation_runs.push(rec.run_id.clone());
+            }
+            state
+                .parents
+                .insert(rec.run_id.clone(), parent_run_id.clone());
+            state.runs.insert(rec.run_id.clone(), sub);
 
             // Re-create pause flags for paused sub-runs
             if rec.status == STATUS_PAUSED {
@@ -795,6 +919,30 @@ impl DelegationTracker {
         let parent_id = record.parent_run_id.clone();
         let delegation_id = record.delegation_id.clone();
         let agent_id = record.agent_id.clone();
+
+        let mut state = self.state.write().await;
+        if let Some(existing) = state.runs.get(&run_id) {
+            if existing.parent_run_id != parent_id || existing.delegation_id != delegation_id {
+                tracing::warn!(
+                    target: "astra_runtime::delegation",
+                    run_id,
+                    existing_parent_run_id = %existing.parent_run_id,
+                    attempted_parent_run_id = %parent_id,
+                    existing_delegation_id = %existing.delegation_id,
+                    attempted_delegation_id = %delegation_id,
+                    "ignored conflicting duplicate sub-run identity"
+                );
+            }
+            return;
+        }
+        state
+            .delegation_runs
+            .entry(delegation_id.clone())
+            .or_default()
+            .push(run_id.clone());
+        state.parents.insert(run_id.clone(), parent_id.clone());
+        state.runs.insert(run_id.clone(), record);
+        drop(state);
 
         // Emit SSE event for web clients
         if let Some(ref broadcaster) = self.progress_broadcaster {
@@ -815,70 +963,58 @@ impl DelegationTracker {
                 metadata: None,
             });
         }
-
-        // LOCK ORDER: delegations → parents (matches `cleanup_delegation` and
-        // `load_from_run_records`). Both maps must be inserted into atomically
-        // so concurrent `is_sub_run` cannot observe the parents map without the
-        // matching delegations entry (and vice-versa).
-        let mut delegations = self.delegations.write().await;
-        let mut parents = self.parents.write().await;
-        delegations.entry(delegation_id).or_default().push(record);
-        parents.insert(run_id, parent_id);
     }
 
     /// Get all sub-runs for a delegation.
     pub async fn get_sub_runs(&self, delegation_id: &str) -> Vec<SubRunRecord> {
-        self.delegations
-            .read()
-            .await
+        let state = self.state.read().await;
+        state
+            .delegation_runs
             .get(delegation_id)
-            .cloned()
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter_map(|run_id| state.runs.get(run_id).cloned())
+            .collect()
     }
 
     /// Get the parent run ID for a given run.
     pub async fn get_parent(&self, run_id: &str) -> Option<String> {
-        self.parents.read().await.get(run_id).cloned()
+        self.state.read().await.parents.get(run_id).cloned()
     }
 
     /// Check if a run is a sub-run (has a parent).
     pub async fn is_sub_run(&self, run_id: &str) -> bool {
-        self.parents.read().await.contains_key(run_id)
+        self.state.read().await.parents.contains_key(run_id)
     }
 
     /// Get the recorded delegation depth for a run, if known.
     pub async fn get_depth(&self, run_id: &str) -> Option<u32> {
-        for records in self.delegations.read().await.values() {
-            for record in records {
-                if record.run_id == run_id {
-                    return Some(record.depth);
-                }
-            }
-        }
-        None
+        self.state
+            .read()
+            .await
+            .runs
+            .get(run_id)
+            .map(|record| record.depth)
     }
 
-    /// Read depth and ancestry from one lock-ordered snapshot. Writers acquire
-    /// these maps in the same `delegations -> parents` order, so a finding can
-    /// never combine a pre-insert depth with a post-insert parent chain.
+    /// Read depth and ancestry from one atomic hierarchy snapshot.
     async fn finding_lineage_snapshot(&self, run_id: &str) -> (u32, Vec<String>) {
-        let delegations = self.delegations.read().await;
-        let parents = self.parents.read().await;
-        let depth = delegations
-            .values()
-            .flatten()
-            .find(|record| record.run_id == run_id)
+        let state = self.state.read().await;
+        let depth = state
+            .runs
+            .get(run_id)
             .map(|record| record.depth)
             .unwrap_or(0);
-        let ancestry = ancestry_from_parents(&parents, run_id);
+        let ancestry = ancestry_from_parents(&state.parents, run_id);
         (depth, ancestry)
     }
 
     /// Get all sub-run IDs for a given parent run across all delegations.
     pub async fn get_children(&self, parent_run_id: &str) -> Vec<String> {
-        self.parents
+        self.state
             .read()
             .await
+            .parents
             .iter()
             .filter(|(_, parent)| parent.as_str() == parent_run_id)
             .map(|(child, _)| child.clone())
@@ -887,32 +1023,28 @@ impl DelegationTracker {
 
     /// Get the agent_id for a run. Returns `None` for top-level (non-sub) runs.
     pub async fn get_agent_id(&self, run_id: &str) -> Option<String> {
-        for records in self.delegations.read().await.values() {
-            for record in records {
-                if record.run_id == run_id {
-                    return Some(record.agent_id.clone());
-                }
-            }
-        }
-        None
+        self.state
+            .read()
+            .await
+            .runs
+            .get(run_id)
+            .map(|record| record.agent_id.clone())
     }
 
     /// Get the current state of a sub-run by its run_id.
     pub async fn get_sub_run_state(&self, run_id: &str) -> Option<SubRunState> {
-        for records in self.delegations.read().await.values() {
-            for record in records {
-                if record.run_id == run_id {
-                    return Some(record.state);
-                }
-            }
-        }
-        None
+        self.state
+            .read()
+            .await
+            .runs
+            .get(run_id)
+            .map(|record| record.state)
     }
 
     /// Get the full ancestry chain (run_id → parent → grandparent → ...).
     pub async fn get_ancestry(&self, run_id: &str) -> Vec<String> {
-        let parents = self.parents.read().await;
-        ancestry_from_parents(&parents, run_id)
+        let state = self.state.read().await;
+        ancestry_from_parents(&state.parents, run_id)
     }
 
     // ── Pause / Resume ──────────────────────────────────────────────────────
@@ -1092,12 +1224,12 @@ impl DelegationTracker {
     /// minimizing the time a freshly-spawned grandchild has to do work
     /// before being cancelled. Cycle-safe via `visited`.
     async fn collect_descendants(&self, root: &str) -> Vec<String> {
-        let parents = self.parents.read().await;
+        let state = self.state.read().await;
         // Build child-by-parent index once so the walk is O(N) total
         // rather than O(N) per level.
         let mut by_parent: std::collections::HashMap<&str, Vec<&str>> =
             std::collections::HashMap::new();
-        for (child, parent) in parents.iter() {
+        for (child, parent) in state.parents.iter() {
             by_parent
                 .entry(parent.as_str())
                 .or_default()
@@ -1142,42 +1274,36 @@ impl DelegationTracker {
         run_id: &str,
         to: SubRunState,
     ) -> Result<SubRunState, InvalidTransition> {
-        let mut delegations = self.delegations.write().await;
-        for records in delegations.values_mut() {
-            for record in records.iter_mut() {
-                if record.run_id == run_id {
-                    let new_state = record.state.try_transition(to)?;
-                    record.state = new_state;
+        let mut state = self.state.write().await;
+        if let Some(record) = state.runs.get_mut(run_id) {
+            let new_state = record.state.try_transition(to)?;
+            record.state = new_state;
 
-                    // Capture values before releasing the lock
-                    let delegation_id = record.delegation_id.clone();
-                    let agent_id = record.agent_id.clone();
-                    let parent_run_id = record.parent_run_id.clone();
-                    let depth = record.depth;
-                    let retry_of = record.retry_of.clone();
-                    drop(delegations);
+            let delegation_id = record.delegation_id.clone();
+            let agent_id = record.agent_id.clone();
+            let parent_run_id = record.parent_run_id.clone();
+            let depth = record.depth;
+            let retry_of = record.retry_of.clone();
+            drop(state);
 
-                    if new_state == SubRunState::Running {
-                        self.persist_event(
-                            astra_services::session_journal::JournalEventType::DelegationSubRunStarted,
-                            serde_json::json!({
-                                "delegation_id": delegation_id,
-                                "sub_run_id": run_id,
-                                "parent_run_id": parent_run_id,
-                                "agent_id": agent_id,
-                                "status": new_state.as_str(),
-                                "depth": depth,
-                                "retry_of": retry_of,
-                            }),
-                        );
-                    }
-
-                    // Update progress tracking
-                    self.update_progress(&delegation_id, &agent_id, new_state)
-                        .await;
-                    return Ok(new_state);
-                }
+            if new_state == SubRunState::Running {
+                self.persist_event(
+                    astra_services::session_journal::JournalEventType::DelegationSubRunStarted,
+                    serde_json::json!({
+                        "delegation_id": delegation_id,
+                        "sub_run_id": run_id,
+                        "parent_run_id": parent_run_id,
+                        "agent_id": agent_id,
+                        "status": new_state.as_str(),
+                        "depth": depth,
+                        "retry_of": retry_of,
+                    }),
+                );
             }
+
+            self.update_progress(&delegation_id, &agent_id, new_state)
+                .await;
+            return Ok(new_state);
         }
         // Run not tracked — allow the transition (e.g. root runs)
         Ok(to)
@@ -1239,25 +1365,17 @@ impl DelegationTracker {
         let mut parent_run_id = None;
         let mut final_state = result_state;
         {
-            let mut delegations = self.delegations.write().await;
-            for records in delegations.values_mut() {
-                for record in records.iter_mut() {
-                    if record.run_id == run_id {
-                        // Best-effort: if transition fails, force the requested result state.
-                        record.state = record
-                            .state
-                            .try_transition(result_state)
-                            .unwrap_or(result_state);
-                        final_state = record.state;
-                        delegation_id = Some(record.delegation_id.clone());
-                        agent_id = Some(record.agent_id.clone());
-                        parent_run_id = Some(record.parent_run_id.clone());
-                        break;
-                    }
-                }
-                if delegation_id.is_some() {
-                    break;
-                }
+            let mut state = self.state.write().await;
+            if let Some(record) = state.runs.get_mut(run_id) {
+                // Best-effort: if transition fails, force the requested result state.
+                record.state = record
+                    .state
+                    .try_transition(result_state)
+                    .unwrap_or(result_state);
+                final_state = record.state;
+                delegation_id = Some(record.delegation_id.clone());
+                agent_id = Some(record.agent_id.clone());
+                parent_run_id = Some(record.parent_run_id.clone());
             }
         }
 
@@ -1343,12 +1461,18 @@ impl DelegationTracker {
     /// progress entries, pause flags, parent mappings, and delegation records.
     /// Call after the delegation lifecycle is fully complete.
     pub async fn cleanup_delegation(&self, delegation_id: &str) -> Result<(), String> {
-        // Acquire the authoritative delegation map before checking terminality.
-        // `record_sub_run` follows the same delegations → parents order, so a
-        // concurrent child cannot appear between validation and cleanup and
-        // leave an orphan parent/token entry behind.
-        let mut delegations = self.delegations.write().await;
-        let records = delegations.get(delegation_id).cloned().unwrap_or_default();
+        // The hierarchy projection is one atomic state: no child can appear
+        // between terminality validation and index cleanup.
+        let mut state = self.state.write().await;
+        let run_ids = state
+            .delegation_runs
+            .get(delegation_id)
+            .cloned()
+            .unwrap_or_default();
+        let records: Vec<SubRunRecord> = run_ids
+            .iter()
+            .filter_map(|run_id| state.runs.get(run_id).cloned())
+            .collect();
         let non_terminal: Vec<String> = records
             .iter()
             .filter(|record| !record.state.is_terminal())
@@ -1360,20 +1484,19 @@ impl DelegationTracker {
                 non_terminal.join(", ")
             ));
         }
-        let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
+        state.delegation_runs.remove(delegation_id);
+        for run_id in &run_ids {
+            state.runs.remove(run_id);
+            state.parents.remove(run_id);
+        }
+        drop(state);
 
-        // Acquire locks in consistent order: delegations → parents → pause_flags → cancel_tokens → progress
-        // (same order as load_from_run_records to prevent deadlock)
-        let mut parents = self.parents.write().await;
         let mut pause_flags = self.pause_flags.write().await;
         let mut cancel_tokens = self.cancel_tokens.write().await;
         let mut progress_map = self.progress.write().await;
-
-        delegations.remove(delegation_id);
-        for rid in &run_ids {
-            parents.remove(rid);
-            pause_flags.remove(rid);
-            cancel_tokens.remove(rid);
+        for run_id in &run_ids {
+            pause_flags.remove(run_id);
+            cancel_tokens.remove(run_id);
         }
         progress_map.remove(delegation_id);
         Ok(())
@@ -1381,51 +1504,42 @@ impl DelegationTracker {
 
     /// Get the full retry chain for a run: [original, retry1, retry2, ...]
     pub async fn get_retry_chain(&self, run_id: &str) -> Vec<String> {
-        let delegations = self.delegations.read().await;
+        let state = self.state.read().await;
+        let Some(record) = state.runs.get(run_id) else {
+            return vec![run_id.to_string()];
+        };
+        let Some(group) = state.delegation_runs.get(&record.delegation_id) else {
+            return vec![run_id.to_string()];
+        };
 
-        // Find which delegation this run belongs to
-        for records in delegations.values() {
-            // First find the original (walk backward via retry_of)
-            let mut original_id = run_id.to_string();
-            let mut visited = std::collections::HashSet::new();
-            loop {
-                if !visited.insert(original_id.clone()) {
-                    break; // Cycle detected
-                }
-                let previous = records
-                    .iter()
-                    .find(|record| record.run_id == original_id)
-                    .and_then(|record| record.retry_of.as_ref());
-                match previous {
-                    Some(previous) => original_id = previous.clone(),
-                    None => break,
-                }
-            }
-
-            // Now collect forward: original → retries
-            let mut chain = vec![original_id.clone()];
-            let mut current = original_id;
-            visited.clear();
-            loop {
-                if !visited.insert(current.clone()) {
-                    break; // Cycle detected
-                }
-                let next = records
-                    .iter()
-                    .find(|r| r.retry_of.as_deref() == Some(&current));
-                match next {
-                    Some(r) => {
-                        chain.push(r.run_id.clone());
-                        current = r.run_id.clone();
-                    }
-                    None => break,
-                }
-            }
-            if chain.len() > 1 || chain.first().map(|s| s.as_str()) == Some(run_id) {
-                return chain;
-            }
+        let mut original_id = run_id.to_string();
+        let mut visited = HashSet::new();
+        while visited.insert(original_id.clone()) {
+            let Some(previous) = state
+                .runs
+                .get(&original_id)
+                .and_then(|record| record.retry_of.as_ref())
+            else {
+                break;
+            };
+            original_id = previous.clone();
         }
-        vec![run_id.to_string()]
+
+        let mut chain = vec![original_id.clone()];
+        let mut current = original_id;
+        visited.clear();
+        while visited.insert(current.clone()) {
+            let next = group.iter().find_map(|candidate| {
+                state
+                    .runs
+                    .get(candidate)
+                    .filter(|record| record.retry_of.as_deref() == Some(current.as_str()))
+            });
+            let Some(next) = next else { break };
+            chain.push(next.run_id.clone());
+            current = next.run_id.clone();
+        }
+        chain
     }
 
     // ── Progress Tracking ───────────────────────────────────────────────────
@@ -1551,6 +1665,9 @@ impl DelegationEngine {
         run_engine: Arc<RunEngine>,
         tracker: Arc<DelegationTracker>,
     ) -> Self {
+        if let Some(metrics) = run_engine.metrics_registry() {
+            register_delegation_metrics(metrics);
+        }
         #[cfg(debug_assertions)]
         eprintln!(
             "  ⚠ DelegationEngine: using StubSubRunExecutor — call with_executor() for production"
@@ -1574,6 +1691,9 @@ impl DelegationEngine {
         tracker: Arc<DelegationTracker>,
         executor: Arc<dyn SubRunExecutor>,
     ) -> Self {
+        if let Some(metrics) = run_engine.metrics_registry() {
+            register_delegation_metrics(metrics);
+        }
         Self {
             registry,
             run_engine,
@@ -1953,6 +2073,55 @@ impl DelegationEngine {
                     let retry_run_id = retry_config.run_id.clone();
                     let retry_depth = self.tracker.get_depth(&original_run_id).await.unwrap_or(0);
 
+                    let retry_delay = verification_retry_delay(attempt, &original_run_id);
+                    tracing::debug!(
+                        target: "astra_runtime::delegation",
+                        run_id = %original_run_id,
+                        retry_attempt = attempt,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        "verification retry scheduled with bounded backoff"
+                    );
+                    let cancelled_during_backoff =
+                        if let Some(token) = retry_config.cancel_token.as_ref() {
+                            tokio::select! {
+                                _ = tokio::time::sleep(retry_delay) => false,
+                                _ = token.cancelled() => true,
+                            }
+                        } else {
+                            tokio::time::sleep(retry_delay).await;
+                            false
+                        };
+                    if cancelled_during_backoff {
+                        let cancellation = "cancelled during verification retry backoff";
+                        self.tracker
+                            .complete_sub_run_with_result(
+                                &original_run_id,
+                                SubRunState::Cancelled,
+                                Some(cancellation),
+                                current.output.as_deref(),
+                            )
+                            .await;
+                        astra_core::log_persist!(
+                            self.run_engine
+                                .persist_status(
+                                    user_id,
+                                    &original_run_id,
+                                    STATUS_CANCELLED,
+                                    None,
+                                    Some(cancellation),
+                                )
+                                .await,
+                            "delegation",
+                            &original_run_id,
+                            "verification_retry_cancelled"
+                        );
+                        return AgentResult {
+                            status: STATUS_CANCELLED.to_string(),
+                            error: Some(cancellation.to_string()),
+                            ..current
+                        };
+                    }
+
                     astra_core::log_persist!(
                         self.run_engine
                             .start_run_ext(
@@ -2281,6 +2450,7 @@ impl DelegationEngine {
         // Drop impl, which spawns a background unregister task. On the normal
         // path, we unregister explicitly below for proper error handling.
 
+        let execution_started_at = std::time::Instant::now();
         let result = match &request.pattern {
             CoordinationPattern::FanOut {
                 agent_ids,
@@ -2423,6 +2593,12 @@ impl DelegationEngine {
                 ),
             );
         }
+        record_delegation_metrics(
+            self.run_engine.metrics_registry(),
+            pattern_name,
+            execution_started_at.elapsed(),
+            &result,
+        );
 
         // Note: cleanup_delegation() is intentionally NOT called here.
         // The caller (e.g., TeamExecutionOrchestrator) should call
@@ -2432,7 +2608,8 @@ impl DelegationEngine {
         result
     }
 
-    /// Write a journal event (best-effort, non-blocking).
+    /// Write a journal event synchronously on the local diagnostic path.
+    /// Durable run state is committed separately by `RunEngine`.
     fn write_journal_event(session_id: &str, event: astra_services::session_journal::JournalEvent) {
         if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
             if let Err(e) = writer.append(&event) {
@@ -2463,7 +2640,6 @@ impl DelegationEngine {
             AggregationStrategy::FirstSuccess => "FirstSuccess",
             AggregationStrategy::AllResults => "AllResults",
             AggregationStrategy::Consensus => "Consensus",
-            AggregationStrategy::LlmGuided { .. } => "LlmGuided",
         };
         let budget_prompt = Self::extract_budget_prompt(&request.context);
         let agent_id_strs: Vec<&str> = agent_ids.iter().map(|s| s.as_str()).collect();
@@ -4542,6 +4718,57 @@ mod tests {
         DelegationEngine::ensure_source_in_delegation_chain(&mut request, "orch");
 
         assert_eq!(request.delegation_chain, vec!["orch".to_string()]);
+    }
+
+    #[test]
+    fn verification_retry_backoff_is_bounded_exponential_with_stable_jitter() {
+        let first = verification_retry_delay(2, "run-a");
+        let second = verification_retry_delay(3, "run-a");
+        let saturated = verification_retry_delay(20, "run-a");
+
+        assert!((200..=300).contains(&(first.as_millis() as u64)));
+        assert!((400..=500).contains(&(second.as_millis() as u64)));
+        assert!((2_000..=2_100).contains(&(saturated.as_millis() as u64)));
+        assert_eq!(first, verification_retry_delay(2, "run-a"));
+    }
+
+    #[test]
+    fn delegation_metrics_expose_low_cardinality_outcomes_and_usage() {
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        register_delegation_metrics(&registry);
+        let result = Ok(DelegationResult::from_results(
+            "d1",
+            vec![AgentResult {
+                agent_id: "reviewer".into(),
+                run_id: "run-1".into(),
+                status: "completed".into(),
+                output: Some("done".into()),
+                error: None,
+                prompt_tokens: 120,
+                completion_tokens: 30,
+                tool_calls: 2,
+            }],
+            Some("done".into()),
+        ));
+
+        record_delegation_metrics(
+            Some(&registry),
+            "fan_out",
+            std::time::Duration::from_millis(25),
+            &result,
+        );
+
+        let rendered = registry.render_prometheus();
+        assert!(rendered.contains(
+            "astra_delegation_executions_total{outcome=\"completed\",pattern=\"fan_out\"} 1"
+        ));
+        assert!(rendered.contains(
+            "astra_delegation_sub_runs_total{pattern=\"fan_out\",status=\"completed\"} 1"
+        ));
+        assert!(
+            rendered
+                .contains("astra_delegation_tokens_total{kind=\"prompt\",pattern=\"fan_out\"} 120")
+        );
     }
 
     #[test]
@@ -7808,6 +8035,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new, SubRunState::Completed);
+    }
+
+    #[tokio::test]
+    async fn tracker_recording_is_idempotent_by_durable_run_identity() {
+        let tracker = DelegationTracker::new();
+        let mut record = SubRunRecord {
+            run_id: "r1".into(),
+            parent_run_id: "parent".into(),
+            delegation_id: "d1".into(),
+            agent_id: "a1".into(),
+            depth: 1,
+            state: SubRunState::Created,
+            retry_of: None,
+        };
+        tracker.record_sub_run(record.clone()).await;
+        record.state = SubRunState::Running;
+        tracker.record_sub_run(record).await;
+
+        let records = tracker.get_sub_runs("d1").await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, SubRunState::Created);
+        assert_eq!(tracker.get_depth("r1").await, Some(1));
+        assert_eq!(tracker.get_agent_id("r1").await.as_deref(), Some("a1"));
     }
 
     #[tokio::test]

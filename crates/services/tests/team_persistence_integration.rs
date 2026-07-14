@@ -9,8 +9,8 @@
 
 use astra_core::SharedPool;
 use astra_services::team_persistence::{
-    MatrixOneTeamStore, TeamBudget, TeamCoordination, TeamDefinition, TeamMemberDef,
-    TeamPersistenceService, TeamSnapshotRecord, WorktreeMode,
+    MatrixOneTeamStore, TeamAggregation, TeamBudget, TeamCoordination, TeamDefinition,
+    TeamMemberDef, TeamPersistenceService, TeamSnapshotRecord, WorktreeMode,
 };
 use serial_test::serial;
 use std::collections::HashMap;
@@ -197,7 +197,7 @@ async fn execution_history_lifecycle() {
     let team = test_team(
         "exec-hist",
         TeamCoordination::FanOut {
-            aggregation: "merge".into(),
+            aggregation: TeamAggregation::AllResults,
         },
     );
     cleanup_team(&pool, &team.team_id).await;
@@ -301,7 +301,7 @@ async fn coordination_variants_roundtrip() {
         (
             "fanout",
             TeamCoordination::FanOut {
-                aggregation: "best_score".into(),
+                aggregation: TeamAggregation::AllResults,
             },
         ),
         (

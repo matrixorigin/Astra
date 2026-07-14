@@ -1285,14 +1285,14 @@ mod tests {
             &tool_call,
             "run-1",
             "sess-1",
-            astra_turn_core::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+            astra_turn_core::agentic_recursion_guard::ABSOLUTE_MAX_AGENT_RECURSION_DEPTH,
             None,
         );
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
-                .contains("recursion depth 3 reached maximum 3")
+                .contains("recursion depth 8 reached absolute safety ceiling 8")
         );
     }
 

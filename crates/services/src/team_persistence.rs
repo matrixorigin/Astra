@@ -135,6 +135,24 @@ pub struct TeamBudget {
     pub max_duration_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamAggregation {
+    FirstSuccess,
+    AllResults,
+    Consensus,
+}
+
+impl From<TeamAggregation> for AggregationStrategy {
+    fn from(value: TeamAggregation) -> Self {
+        match value {
+            TeamAggregation::FirstSuccess => Self::FirstSuccess,
+            TeamAggregation::AllResults => Self::AllResults,
+            TeamAggregation::Consensus => Self::Consensus,
+        }
+    }
+}
+
 /// Coordination strategy for a team — maps to [`CoordinationPattern`] at execution time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -142,7 +160,7 @@ pub enum TeamCoordination {
     /// Producer + reviewer loop.
     Adversarial { max_rounds: u32, threshold: f64 },
     /// Parallel dispatch with aggregation.
-    FanOut { aggregation: String },
+    FanOut { aggregation: TeamAggregation },
     /// Sequential chain: output of member N feeds member N+1.
     Pipeline,
     /// One-by-one with optional early exit.
@@ -475,7 +493,7 @@ fn build_coordination_pattern(
         }
         TeamCoordination::FanOut { aggregation } => CoordinationPattern::FanOut {
             agent_ids: profiles.iter().map(|p| p.agent_id.clone()).collect(),
-            aggregation: parse_aggregation(aggregation),
+            aggregation: (*aggregation).into(),
             timeout_sec: 300,
         },
         TeamCoordination::Pipeline => CoordinationPattern::Pipeline {
@@ -492,19 +510,6 @@ fn build_coordination_pattern(
             agent_ids: profiles.iter().map(|p| p.agent_id.clone()).collect(),
             stop_on_success: *stop_on_success,
             timeout_sec: 0,
-        },
-    }
-}
-
-// ─── Bridge: Team → DelegationRequest ───────────────────────────────────────
-
-fn parse_aggregation(s: &str) -> AggregationStrategy {
-    match s {
-        "first_success" => AggregationStrategy::FirstSuccess,
-        "consensus" => AggregationStrategy::Consensus,
-        "all_results" | "concatenate" => AggregationStrategy::AllResults,
-        other => AggregationStrategy::LlmGuided {
-            prompt_template: other.to_string(),
         },
     }
 }
@@ -2057,30 +2062,6 @@ mod tests {
         assert_eq!(parsed, coord);
     }
 
-    #[test]
-    fn aggregation_parsing() {
-        assert!(matches!(
-            parse_aggregation("first_success"),
-            AggregationStrategy::FirstSuccess
-        ));
-        assert!(matches!(
-            parse_aggregation("consensus"),
-            AggregationStrategy::Consensus
-        ));
-        assert!(matches!(
-            parse_aggregation("all_results"),
-            AggregationStrategy::AllResults
-        ));
-        assert!(matches!(
-            parse_aggregation("concatenate"),
-            AggregationStrategy::AllResults
-        ));
-        assert!(matches!(
-            parse_aggregation("custom prompt"),
-            AggregationStrategy::LlmGuided { .. }
-        ));
-    }
-
     // ── MatrixOne serialization helpers ──
 
     #[test]
@@ -2092,7 +2073,7 @@ mod tests {
                 threshold: 0.85,
             },
             TeamCoordination::FanOut {
-                aggregation: "consensus".to_string(),
+                aggregation: TeamAggregation::Consensus,
             },
             TeamCoordination::Pipeline,
             TeamCoordination::Sequential {
@@ -2807,15 +2788,28 @@ mod tests {
     fn resolve_team_fan_out_pattern() {
         let mut team = test_team();
         team.coordination = TeamCoordination::FanOut {
-            aggregation: "best_of".to_string(),
+            aggregation: TeamAggregation::AllResults,
         };
         let (request, _) = resolve_team(&team, "task", "run-1", "test-session", None).unwrap();
         match &request.pattern {
-            CoordinationPattern::FanOut { agent_ids, .. } => {
+            CoordinationPattern::FanOut {
+                agent_ids,
+                aggregation: AggregationStrategy::AllResults,
+                ..
+            } => {
                 assert_eq!(agent_ids.len(), 2);
             }
             _ => panic!("expected FanOut pattern"),
         }
+    }
+
+    #[test]
+    fn team_coordination_rejects_unimplemented_aggregation_on_deserialize() {
+        let result = serde_json::from_value::<TeamCoordination>(serde_json::json!({
+            "type": "fan_out",
+            "aggregation": "merge"
+        }));
+        assert!(result.is_err());
     }
 
     // ── Execution Recording ──

@@ -360,8 +360,6 @@ pub enum AggregationStrategy {
     AllResults,
     /// Majority/consensus among results.
     Consensus,
-    /// Use an LLM to synthesize a merged result.
-    LlmGuided { prompt_template: String },
 }
 
 // ─── Delegation Request / Result ────────────────────────────────────────────
@@ -658,37 +656,33 @@ pub fn aggregate_results(
         }
 
         AggregationStrategy::Consensus => {
-            // Simple majority: find the most common output
-            let mut counts: HashMap<&str, usize> = HashMap::new();
-            for r in results.iter().filter(|r| r.is_success()) {
-                if let Some(ref out) = r.output {
-                    *counts.entry(out.as_str()).or_default() += 1;
-                }
+            // Consensus is a strict-majority contract, not an arbitrary
+            // plurality. Normalize only transport-insignificant whitespace;
+            // semantic synthesis belongs to the parent agent and must not be
+            // guessed with fuzzy string similarity.
+            let outputs: Vec<&str> = results
+                .iter()
+                .filter(|result| result.is_success())
+                .filter_map(|result| result.output.as_deref())
+                .filter(|output| !output.trim().is_empty())
+                .collect();
+            let mut counts: HashMap<String, (usize, &str)> = HashMap::new();
+            for output in &outputs {
+                let normalized = output
+                    .lines()
+                    .map(str::trim_end)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string();
+                let entry = counts.entry(normalized).or_insert((0, output));
+                entry.0 += 1;
             }
             counts
-                .into_iter()
-                .max_by_key(|(_, count)| *count)
-                .map(|(output, _)| output.to_string())
-        }
-
-        AggregationStrategy::LlmGuided { .. } => {
-            // LLM-guided aggregation requires an LLM call — return all outputs
-            // formatted for the caller to pass to an LLM.
-            let outputs: Vec<String> = results
-                .iter()
-                .filter(|r| r.is_success())
-                .enumerate()
-                .filter_map(|(i, r)| {
-                    r.output
-                        .as_ref()
-                        .map(|o| format!("Agent {} ({}):\n{}", i + 1, r.agent_id, o))
-                })
-                .collect();
-            if outputs.is_empty() {
-                None
-            } else {
-                Some(outputs.join("\n\n"))
-            }
+                .into_values()
+                .filter(|(count, _)| count.saturating_mul(2) > outputs.len())
+                .max_by_key(|(count, _)| *count)
+                .map(|(_, output)| output.trim().to_string())
         }
     }
 }
@@ -1009,6 +1003,34 @@ mod tests {
     }
 
     #[test]
+    fn validate_delegation_honors_explicit_profile_depth_above_default() {
+        let mut reg = AgentProfileRegistry::new();
+        let mut source = orchestrator();
+        source.max_delegation_depth = 6;
+        reg.register(source).unwrap();
+        reg.register(system_agent("s1")).unwrap();
+
+        let req = DelegationRequest {
+            session_id: "test-session".into(),
+            delegation_id: "d-deep".into(),
+            parent_run_id: "run-deep".into(),
+            task: "bounded recursive orchestration".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["s1".into()],
+                stop_on_success: true,
+                timeout_sec: 0,
+            },
+            user_id: "u1".into(),
+            depth: 4,
+            delegation_chain: vec!["root".into(), "planner".into()],
+            context: HashMap::new(),
+            execution_metadata: None,
+        };
+
+        assert!(reg.validate_delegation(&req, "orch-1").is_ok());
+    }
+
+    #[test]
     fn validate_delegation_wrong_tier() {
         let mut reg = AgentProfileRegistry::new();
         reg.register(system_agent("s1")).unwrap();
@@ -1261,19 +1283,24 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_llm_guided_formats_outputs() {
-        let results = vec![make_result("a1", "output1"), make_result("a2", "output2")];
-        let out = aggregate_results(
-            &AggregationStrategy::LlmGuided {
-                prompt_template: "merge: {outputs}".into(),
-            },
-            &results,
-        )
-        .unwrap();
-        assert!(out.contains("Agent 1 (a1)"));
-        assert!(out.contains("Agent 2 (a2)"));
-        assert!(out.contains("output1"));
-        assert!(out.contains("output2"));
+    fn aggregate_consensus_requires_a_strict_majority() {
+        let results = vec![
+            make_result("a1", "alpha"),
+            make_result("a2", "beta"),
+            make_result("a3", "gamma"),
+        ];
+        assert!(aggregate_results(&AggregationStrategy::Consensus, &results).is_none());
+    }
+
+    #[test]
+    fn aggregate_consensus_ignores_transport_whitespace_only() {
+        let results = vec![
+            make_result("a1", "answer  \r\nsecond line\n"),
+            make_result("a2", "answer\nsecond line"),
+            make_result("a3", "different"),
+        ];
+        let out = aggregate_results(&AggregationStrategy::Consensus, &results);
+        assert_eq!(out.as_deref(), Some("answer  \r\nsecond line"));
     }
 
     // ── DelegationResult ───

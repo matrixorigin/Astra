@@ -12,8 +12,8 @@ use tokio::sync::RwLock;
 use astra_services::coordination::{AgentProfile, AgentProfileRegistry, AgentResult, AgentTier};
 use astra_services::runs::InMemoryRunStateStore;
 use astra_services::team_persistence::{
-    InMemoryTeamStore, TeamCoordination, TeamDefinition, TeamMemberDef, TeamPersistenceService,
-    WorktreeMode,
+    InMemoryTeamStore, TeamAggregation, TeamCoordination, TeamDefinition, TeamMemberDef,
+    TeamPersistenceService, WorktreeMode,
 };
 
 use astra_runtime::server::delegation::engine::{
@@ -191,7 +191,7 @@ async fn full_fan_out_team_execution() {
     let team = test_team(
         "fan",
         TeamCoordination::FanOut {
-            aggregation: "all_results".into(),
+            aggregation: TeamAggregation::AllResults,
         },
         vec![
             ("analyst-a", Some("Analyze A")),
@@ -463,7 +463,7 @@ async fn orchestrator_writes_start_then_complete_not_duplicate() {
     let team = test_team(
         "lifecycle-order",
         TeamCoordination::FanOut {
-            aggregation: "all_results".into(),
+            aggregation: TeamAggregation::AllResults,
         },
         vec![
             ("analyzer", Some("Analyze agent")),
@@ -587,7 +587,7 @@ async fn fan_out_respects_max_parallel() {
     let mut team = test_team(
         "parallel-test",
         TeamCoordination::FanOut {
-            aggregation: "all_results".into(),
+            aggregation: TeamAggregation::AllResults,
         },
         vec![
             ("a", Some("Agent A")),
@@ -731,7 +731,7 @@ async fn fan_out_returns_partial_success_with_failures() {
     let team = test_team(
         "partial",
         TeamCoordination::FanOut {
-            aggregation: "all_results".into(),
+            aggregation: TeamAggregation::AllResults,
         },
         vec![
             ("researcher1", Some("Research topic A")),
@@ -1171,7 +1171,7 @@ async fn team_execution_respects_cancellation() {
     let team = test_team(
         "cancellable",
         TeamCoordination::FanOut {
-            aggregation: "all_results".into(),
+            aggregation: TeamAggregation::AllResults,
         },
         vec![("worker1", Some("Worker 1")), ("worker2", Some("Worker 2"))],
     );
@@ -1249,7 +1249,7 @@ async fn error_messages_preserved_in_results() {
     let team = test_team(
         "error-details",
         TeamCoordination::FanOut {
-            aggregation: "all_results".to_string(),
+            aggregation: TeamAggregation::AllResults,
         },
         vec![
             ("healthy", Some("Healthy agent")),
@@ -1323,7 +1323,7 @@ async fn team_report_includes_error_summary() {
     let team = test_team(
         "multi-error",
         TeamCoordination::FanOut {
-            aggregation: "all_results".into(),
+            aggregation: TeamAggregation::AllResults,
         },
         vec![("a", Some("Agent A")), ("b", Some("Agent B"))],
     );
