@@ -100,11 +100,15 @@ pub trait RunPersistence: Send + Sync {
         retry_of: Option<&str>,
     ) -> Result<(), String>;
 
-    /// Persist a status change.
-    async fn persist_status(
+    /// Persist a status only while the durable run still has one of the
+    /// expected statuses. Orchestrators must use this for outcomes so a stale
+    /// worker cannot overwrite a concurrent pause, cancellation, or terminal
+    /// decision.
+    async fn persist_status_if_current(
         &self,
         user_id: &str,
         run_id: &str,
+        expected_statuses: &[&str],
         status: &str,
         waiting_for: Option<&str>,
         error_message: Option<&str>,

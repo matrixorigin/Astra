@@ -2176,15 +2176,25 @@ impl astra_server_types::team_orchestrator_traits::RunPersistence for RunEngine 
         .await
     }
 
-    async fn persist_status(
+    async fn persist_status_if_current(
         &self,
         user_id: &str,
         run_id: &str,
+        expected_statuses: &[&str],
         status: &str,
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
-        RunEngine::persist_status(self, user_id, run_id, status, waiting_for, error_message).await
+        RunEngine::persist_status_if_current(
+            self,
+            user_id,
+            run_id,
+            expected_statuses,
+            status,
+            waiting_for,
+            error_message,
+        )
+        .await
     }
 
     async fn persist_usage(

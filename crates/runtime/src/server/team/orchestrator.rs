@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use astra_core::{STATUS_COMPLETED, STATUS_FAILED, STATUS_RUNNING};
 use astra_services::coordination::{
     AgentProfile, AgentProfileRegistry, AgentTier, DelegationResult,
 };
@@ -46,6 +47,18 @@ pub struct TeamExecutionReport {
     pub merge_result: Option<MergeResult>,
     pub status: TeamExecutionStatus,
     pub error: Option<String>,
+}
+
+fn durable_status_for_team_outcome(status: &TeamExecutionStatus) -> &'static str {
+    match status {
+        TeamExecutionStatus::Completed | TeamExecutionStatus::CompletedWithConflicts => {
+            STATUS_COMPLETED
+        }
+        TeamExecutionStatus::Unfinished
+        | TeamExecutionStatus::Partial
+        | TeamExecutionStatus::CompletedOverBudget
+        | TeamExecutionStatus::Failed => STATUS_FAILED,
+    }
 }
 
 // ─── Orchestrator ───────────────────────────────────────────────────────────
@@ -100,6 +113,34 @@ impl TeamExecutionOrchestrator {
     ) -> Self {
         self.conflict_resolver = Some(resolver);
         self
+    }
+
+    async fn persist_active_run_outcome(&self, run_id: &str, status: &str, error: Option<&str>) {
+        match self
+            .run_engine
+            .persist_status_if_current(
+                &self.config.user_id,
+                run_id,
+                &[STATUS_RUNNING],
+                status,
+                None,
+                error,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::info!(
+                run_id,
+                attempted_status = status,
+                "team outcome did not overwrite a newer durable run decision"
+            ),
+            Err(persist_error) => tracing::warn!(
+                run_id,
+                attempted_status = status,
+                error = %persist_error,
+                "failed to persist team run outcome"
+            ),
+        }
     }
 
     /// Execute the full 4-phase lifecycle for a team task.
@@ -182,18 +223,8 @@ impl TeamExecutionOrchestrator {
             Ok(r) => r,
             Err(e) => {
                 drop(registry);
-                warn_persist!(
-                    self.run_engine
-                        .persist_status(
-                            &self.config.user_id,
-                            &parent_run_id,
-                            "failed",
-                            None,
-                            Some(&e),
-                        )
-                        .await,
-                    "Failed to run_engine.persist_status"
-                );
+                self.persist_active_run_outcome(&parent_run_id, STATUS_FAILED, Some(&e))
+                    .await;
                 return self.fail_report(
                     team_name,
                     "",
@@ -278,18 +309,13 @@ impl TeamExecutionOrchestrator {
                         });
                     }
                     Err(e) => {
-                        warn_persist!(
-                            self.run_engine
-                                .persist_status(
-                                    &self.config.user_id,
-                                    &parent_run_id,
-                                    "failed",
-                                    None,
-                                    Some(&e.to_string())
-                                )
-                                .await,
-                            "Failed to run_engine.persist_status"
-                        );
+                        let error = e.to_string();
+                        self.persist_active_run_outcome(
+                            &parent_run_id,
+                            STATUS_FAILED,
+                            Some(&error),
+                        )
+                        .await;
                         return self.fail_report(
                             team_name,
                             &delegation_id,
@@ -426,18 +452,8 @@ impl TeamExecutionOrchestrator {
         let delegation_result = match delegation_outcome {
             Ok(r) => r,
             Err(e) => {
-                warn_persist!(
-                    self.run_engine
-                        .persist_status(
-                            &self.config.user_id,
-                            &parent_run_id,
-                            "failed",
-                            None,
-                            Some(&e),
-                        )
-                        .await,
-                    "Failed to run_engine.persist_status"
-                );
+                self.persist_active_run_outcome(&parent_run_id, STATUS_FAILED, Some(&e))
+                    .await;
                 if let Some(ref mut mgr) = worktree_mgr {
                     if let Err(ce) = mgr.cleanup().await {
                         eprintln!(
@@ -589,19 +605,16 @@ impl TeamExecutionOrchestrator {
             status: status.clone(),
         });
 
-        // Persist final run status
-        warn_persist!(
-            self.run_engine
-                .persist_status(
-                    &self.config.user_id,
-                    &parent_run_id,
-                    &status.to_string(),
-                    None,
-                    error.as_deref(),
-                )
-                .await,
-            "Failed to run_engine.persist_status"
-        );
+        // Team report status is a product-level outcome, not a durable run
+        // lifecycle state. Keep the detailed value in the report/execution
+        // record and project only canonical terminal states to the run row.
+        let durable_status = durable_status_for_team_outcome(&status);
+        let durable_error = error.clone().or_else(|| {
+            (durable_status == STATUS_FAILED)
+                .then(|| format!("team execution ended with status {status}"))
+        });
+        self.persist_active_run_outcome(&parent_run_id, durable_status, durable_error.as_deref())
+            .await;
 
         // Record execution completion (started in Phase 1)
         let result_summary = serde_json::json!({
@@ -838,6 +851,20 @@ mod tests {
             "completed_over_budget"
         );
         assert_eq!(TeamExecutionStatus::Failed.to_string(), "failed");
+        for status in [
+            TeamExecutionStatus::Completed,
+            TeamExecutionStatus::CompletedWithConflicts,
+        ] {
+            assert_eq!(durable_status_for_team_outcome(&status), STATUS_COMPLETED);
+        }
+        for status in [
+            TeamExecutionStatus::Unfinished,
+            TeamExecutionStatus::Partial,
+            TeamExecutionStatus::CompletedOverBudget,
+            TeamExecutionStatus::Failed,
+        ] {
+            assert_eq!(durable_status_for_team_outcome(&status), STATUS_FAILED);
+        }
     }
 
     #[tokio::test]
@@ -1366,6 +1393,18 @@ mod tests {
                 .contains("token budget exceeded")
         );
         assert!(report.delegation_result.is_some());
+        let durable = run_engine
+            .load_run("u1", &report.parent_run_id)
+            .await
+            .unwrap()
+            .expect("team parent run");
+        assert_eq!(durable.status, STATUS_FAILED);
+        assert!(
+            durable
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.contains("token budget exceeded"))
+        );
     }
 
     /// Executor that returns configurable token counts to trigger budget checks.
